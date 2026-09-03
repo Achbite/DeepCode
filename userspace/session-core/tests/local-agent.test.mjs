@@ -130,6 +130,59 @@ test('A: message uses one prepared runtime through composition, completion, cach
   await actor.dispose();
 });
 
+test('A0: Provider reasoning is projected while the turn is still running', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:reasoning-draft';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation();
+  let continueStream;
+  const streamHeld = new Promise((resolve) => { continueStream = resolve; });
+  const provider = {
+    async *stream(request) {
+      yield providerEvent(request.requestId, 'reasoning.delta', {
+        text: 'Inspecting the current workspace state.',
+      });
+      await streamHeld;
+      yield providerEvent(request.requestId, 'assistant.message', {
+        messageId: 'provider-message:reasoning-draft',
+        content: 'The inspection is complete.',
+        reasoningContent: 'Inspecting the current workspace state.',
+      });
+      yield providerEvent(request.requestId, 'completed', {});
+    },
+  };
+  const actor = actorWith(
+    journal,
+    sessionId,
+    provider,
+    emptyKernel(),
+    preparation.port,
+    'reasoning-draft',
+  );
+
+  await actor.submit(messageCommand(
+    sessionId,
+    'command:reasoning-draft',
+    'Inspect the workspace before answering.',
+  ));
+  const running = await waitForProjection(actor, (value) => (
+    value.assistantDraft?.reasoningContent === 'Inspecting the current workspace state.'
+  ));
+  assert.equal(running.run.status, 'running');
+  assert.equal(running.assistantDraft.content, '');
+
+  continueStream();
+  const completed = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.equal(completed.assistantDraft, null);
+  const events = await readEvents(journal, sessionId);
+  assert.equal(
+    singleEvent(events, 'provider.turn.settled').payload.reasoningContent,
+    'Inspecting the current workspace state.',
+  );
+
+  await actor.dispose();
+});
+
 test('A1: filesystem references reach Provider as logical metadata without embedded file content', async () => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:filesystem-reference';

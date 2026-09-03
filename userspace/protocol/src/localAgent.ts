@@ -840,6 +840,7 @@ export interface AssistantDraftProjection {
   runId: string;
   turnId: string;
   content: string;
+  reasoningContent?: string;
 }
 
 export type PlanProjectionStatus =
@@ -1047,6 +1048,12 @@ export type ProviderEvent =
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
       requestId: string;
       type: 'text.delta';
+      data: { text: string };
+    }
+  | {
+      schemaVersion: typeof PROVIDER_EVENT_VERSION;
+      requestId: string;
+      type: 'reasoning.delta';
       data: { text: string };
     }
   | {

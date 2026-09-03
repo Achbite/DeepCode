@@ -520,6 +520,7 @@ function decodeProviderFrame(frame: string): ProviderEvent {
   ) throw new Error('provider_event_invalid');
   switch (value.type) {
     case 'text.delta':
+    case 'reasoning.delta':
       if (!isExactRecord(value.data, ['text']) || typeof value.data.text !== 'string') {
         throw new Error('provider_event_invalid');
       }

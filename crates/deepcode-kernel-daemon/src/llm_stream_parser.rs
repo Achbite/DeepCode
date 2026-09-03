@@ -316,7 +316,7 @@ impl ProviderStreamAccumulator {
                 .or_else(|| delta.get("reasoning"))
                 .and_then(Value::as_str)
             {
-                self.reasoning.push_str(reasoning);
+                self.push_reasoning(reasoning, &mut emissions);
             }
             for call in delta
                 .get("tool_calls")
@@ -375,7 +375,7 @@ impl ProviderStreamAccumulator {
                 let block = value.get("content_block").unwrap_or(&Value::Null);
                 if block.get("type").and_then(Value::as_str) == Some("thinking") {
                     if let Some(thinking) = block.get("thinking").and_then(Value::as_str) {
-                        self.reasoning.push_str(thinking);
+                        self.push_reasoning(thinking, &mut emissions);
                     }
                     if let Some(signature) = block.get("signature").and_then(Value::as_str) {
                         self.reasoning_signature.push_str(signature);
@@ -413,7 +413,7 @@ impl ProviderStreamAccumulator {
                     }
                     Some("thinking_delta") => {
                         if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
-                            self.reasoning.push_str(text);
+                            self.push_reasoning(text, &mut emissions);
                         }
                     }
                     Some("signature_delta") => {
@@ -474,7 +474,7 @@ impl ProviderStreamAccumulator {
             self.push_text(text, &mut emissions);
         }
         if let Some(reasoning) = message.get("thinking").and_then(Value::as_str) {
-            self.reasoning.push_str(reasoning);
+            self.push_reasoning(reasoning, &mut emissions);
         }
         for (index, call) in message
             .get("tool_calls")
@@ -521,6 +521,16 @@ impl ProviderStreamAccumulator {
         self.content.push_str(text);
         emissions.push(ProviderEmission {
             event: json!({ "type": "text_delta", "content": text }),
+        });
+    }
+
+    fn push_reasoning(&mut self, text: &str, emissions: &mut Vec<ProviderEmission>) {
+        if text.is_empty() {
+            return;
+        }
+        self.reasoning.push_str(text);
+        emissions.push(ProviderEmission {
+            event: json!({ "type": "reasoning_delta", "content": text }),
         });
     }
 }
@@ -715,6 +725,33 @@ mod tests {
         let result = parser.finalize().unwrap();
         assert_eq!(result.output.content, "OK");
         assert!(result.output.reasoning.is_none());
+    }
+
+    #[test]
+    fn openai_reasoning_is_emitted_incrementally_and_preserved() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
+        let first = parser
+            .ingest_payload(br#"{"choices":[{"delta":{"reasoning_content":"inspect "}}]}"#)
+            .unwrap();
+        let second = parser
+            .ingest_payload(
+                br#"{"choices":[{"delta":{"reasoning_content":"workspace"},"finish_reason":"tool_calls"}]}"#,
+            )
+            .unwrap();
+        parser.ingest_payload(b"[DONE]").unwrap();
+
+        assert_eq!(
+            first[0].event,
+            json!({ "type": "reasoning_delta", "content": "inspect " })
+        );
+        assert_eq!(
+            second[0].event,
+            json!({ "type": "reasoning_delta", "content": "workspace" })
+        );
+        assert_eq!(
+            parser.finalize().unwrap().output.reasoning.as_deref(),
+            Some("inspect workspace")
+        );
     }
 
     #[test]

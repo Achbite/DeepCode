@@ -895,21 +895,20 @@ pub(crate) fn local_agent_provider_stream_response(
                     }
                 };
                 for emission in emissions {
-                    if emission.event.get("type").and_then(Value::as_str)
-                        == Some("text_delta")
-                    {
-                        if let Some(text) = emission
-                            .event
-                            .get("content")
-                            .and_then(Value::as_str)
-                        {
-                            yield Ok(Bytes::from(provider_event(
-                                &request_id,
-                                "text.delta",
-                                json!({ "text": text }),
-                            )));
-                        }
-                    }
+                    let event_type = emission.event.get("type").and_then(Value::as_str);
+                    let Some(text) = emission.event.get("content").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let provider_type = match event_type {
+                        Some("text_delta") => "text.delta",
+                        Some("reasoning_delta") => "reasoning.delta",
+                        _ => continue,
+                    };
+                    yield Ok(Bytes::from(provider_event(
+                        &request_id,
+                        provider_type,
+                        json!({ "text": text }),
+                    )));
                 }
             }
             if accumulator.source_done() || eof {

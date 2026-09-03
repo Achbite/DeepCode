@@ -602,10 +602,15 @@ function isNarrative(value: unknown): boolean {
 }
 
 function isAssistantDraft(value: unknown): boolean {
-  return isExactRecord(value, ['runId', 'turnId', 'content'])
+  return isExactRecord(
+    value,
+    ['runId', 'turnId', 'content'],
+    ['reasoningContent'],
+  )
     && isIdentifier(value.runId)
     && isIdentifier(value.turnId)
-    && typeof value.content === 'string';
+    && typeof value.content === 'string'
+    && (value.reasoningContent === undefined || typeof value.reasoningContent === 'string');
 }
 
 function isInteraction(value: unknown): boolean {

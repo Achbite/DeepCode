@@ -1431,7 +1431,7 @@ impl PreparedEffect {
 
     fn preview(&self, tool_name: &str) -> Value {
         json!({
-            "summary": effect_summary(tool_name, &self.logical_targets),
+            "summary": effect_summary(tool_name, &self.logical_targets, &self.canonical_arguments),
             "effects": process_effect_names(self),
             "logicalTargets": self.logical_targets,
         })
@@ -1859,7 +1859,14 @@ fn process_effect_names(prepared: &PreparedEffect) -> Vec<&'static str> {
     effects
 }
 
-fn effect_summary(tool_name: &str, targets: &[String]) -> String {
+fn effect_summary(tool_name: &str, targets: &[String], canonical_arguments: &Value) -> String {
+    if tool_name == "bash" {
+        let command = canonical_arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .expect("canonical bash arguments include command");
+        return format!("执行 bash：{command}");
+    }
     if targets.is_empty() {
         format!("执行 {tool_name}")
     } else {
@@ -2084,6 +2091,15 @@ fn sqlite_is_empty(connection: &Connection) -> Result<bool, LocalAgentKernelErro
 #[cfg(test)]
 mod attempt_control_tests {
     use super::*;
+
+    #[test]
+    fn bash_effect_summary_preserves_the_complete_canonical_command() {
+        let command = "docker image inspect cpp-dev:latest >/dev/null 2>&1 && {\n  docker build -t cpp-dev:latest .\n}";
+        assert_eq!(
+            effect_summary("bash", &[".".to_string()], &json!({ "command": command })),
+            format!("执行 bash：{command}"),
+        );
+    }
 
     #[test]
     fn first_cancel_phase_is_frozen_for_the_execution_owner() {

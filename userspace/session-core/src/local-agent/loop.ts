@@ -798,6 +798,8 @@ async function consumeCompactionProvider(
       case 'text.delta':
         deltas += event.data.text;
         break;
+      case 'reasoning.delta':
+        break;
       case 'assistant.message':
         if (completeMessage !== undefined) {
           throw new LoopFailure(
@@ -876,6 +878,7 @@ async function consumeProvider(
   signal: AbortSignal,
 ): Promise<ProviderTurn> {
   let deltas = '';
+  let reasoningDeltas = '';
   let completeMessage: {
     messageId: string;
     content: string;
@@ -898,12 +901,23 @@ async function consumeProvider(
       );
     }
     switch (event.type) {
+      case 'reasoning.delta': {
+        reasoningDeltas += event.data.text;
+        deps.updateAssistantDraft({
+          runId,
+          turnId: request.requestId,
+          content: deltas,
+          reasoningContent: reasoningDeltas,
+        });
+        break;
+      }
       case 'text.delta': {
         deltas += event.data.text;
         deps.updateAssistantDraft({
           runId,
           turnId: request.requestId,
           content: deltas,
+          ...(reasoningDeltas ? { reasoningContent: reasoningDeltas } : {}),
         });
         break;
       }
@@ -971,6 +985,15 @@ async function consumeProvider(
     if (deltas && completeMessage.content !== deltas) {
       throw new LoopFailure('provider_message_mismatch', 'Provider 最终消息与流式文本不一致。');
     }
+    if (
+      reasoningDeltas
+      && completeMessage.reasoningContent !== reasoningDeltas
+    ) {
+      throw new LoopFailure(
+        'provider_reasoning_message_mismatch',
+        'Provider 最终 reasoningContent 与流式 reasoning 不一致。',
+      );
+    }
     if (!deltas) {
       deltas = completeMessage.content;
       if (deltas) {
@@ -978,10 +1001,17 @@ async function consumeProvider(
           runId,
           turnId: request.requestId,
           content: deltas,
+          ...(completeMessage.reasoningContent !== undefined
+            ? { reasoningContent: completeMessage.reasoningContent }
+            : {}),
         });
       }
     }
   }
+
+  const reasoningContent = completeMessage?.reasoningContent ?? (
+    reasoningDeltas || undefined
+  );
 
   const usage = contextUsage
     ? {
@@ -1025,8 +1055,8 @@ async function consumeProvider(
     purpose: 'agent',
     providerRuntimeRef: request.providerRuntimeRef,
     orderedCallIds: calls.map((call) => call.callId),
-    ...(completeMessage?.reasoningContent !== undefined
-      ? { reasoningContent: completeMessage.reasoningContent }
+    ...(reasoningContent !== undefined
+      ? { reasoningContent }
       : {}),
     ...(completeMessage?.reasoningSignature !== undefined
       ? { reasoningSignature: completeMessage.reasoningSignature }

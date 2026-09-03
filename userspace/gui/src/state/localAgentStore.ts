@@ -793,7 +793,8 @@ function sameAssistantDraft(
   if (left === null || right === null) return left === right;
   return left.runId === right.runId
     && left.turnId === right.turnId
-    && left.content === right.content;
+    && left.content === right.content
+    && left.reasoningContent === right.reasoningContent;
 }
 
 function requiredFilesystemPluginSelections(

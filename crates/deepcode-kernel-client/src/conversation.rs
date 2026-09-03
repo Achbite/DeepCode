@@ -950,6 +950,7 @@ pub struct AssistantDraftProjection {
     pub run_id: String,
     pub turn_id: String,
     pub content: String,
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

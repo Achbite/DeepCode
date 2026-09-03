@@ -21,7 +21,7 @@ import SessionModelSelector from '../../deepcode-gui/panel/SessionModelSelector'
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import { useSettingsStore } from '../../state/settingsStore';
 import { usePresentedCommittedContent } from '../../presentation/PresentationRuntime';
-import { BufferedMarkdown } from './BufferedMarkdown';
+import { BufferedMarkdown, MarkdownContent } from './BufferedMarkdown';
 import PlanCard from './PlanCard';
 import { shouldOfferFocusCommand, shouldSubmitComposerKey } from './composerKeyboard';
 import {
@@ -314,10 +314,10 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   }, [projectionPollingActive, refresh, sessionId]);
 
   useLayoutEffect(() => {
-    if (assistantDraftStreamIdentity) {
+    if (assistantDraftStreamIdentity && assistantDraft?.content) {
       transitioningProviderStreamsRef.current.add(assistantDraftStreamIdentity);
     }
-  }, [assistantDraftStreamIdentity]);
+  }, [assistantDraft?.content, assistantDraftStreamIdentity]);
 
   useLayoutEffect(() => {
     const previousKey = activeComposerStateKeyRef.current;
@@ -421,7 +421,13 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
 
   useEffect(() => {
     if (followingLatest) scheduleScrollToLatest();
-  }, [assistantDraft?.content, followingLatest, scheduleScrollToLatest, timelineExtentKey]);
+  }, [
+    assistantDraft?.content,
+    assistantDraft?.reasoningContent,
+    followingLatest,
+    scheduleScrollToLatest,
+    timelineExtentKey,
+  ]);
 
   useEffect(() => {
     if (typeof ResizeObserver === 'undefined' || !transcriptRef.current) return undefined;
@@ -1044,7 +1050,20 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
               onOpenWorkspaceResource={openWorkspaceResource}
             />
           ))}
-          {assistantDraft && assistantDraftStreamIdentity && (
+          {assistantDraft?.reasoningContent && (
+            <article className="local-agent__reasoning-draft">
+              {!assistantDraft.content && (
+                <div className="local-agent__run-thinking" role="status" aria-live="polite">
+                  <span className="local-agent__run-spinner" aria-hidden="true" />
+                  <span>{t(language, 'agent.run.thinking')}</span>
+                </div>
+              )}
+              <div className="local-agent__reasoning-draft-content">
+                <MarkdownContent>{assistantDraft.reasoningContent}</MarkdownContent>
+              </div>
+            </article>
+          )}
+          {assistantDraft?.content && assistantDraftStreamIdentity && (
             <article className="local-agent__message local-agent__message--assistant local-agent__message--draft">
               <div className="local-agent__message-content">
                 <BufferedMarkdown
@@ -1059,7 +1078,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
               </div>
             </article>
           )}
-          {projection?.run?.status === 'running' && (
+          {projection?.run?.status === 'running' && !assistantDraft?.reasoningContent && (
             <div className="local-agent__run-thinking" role="status" aria-live="polite">
               <span className="local-agent__run-spinner" aria-hidden="true" />
               <span>{t(

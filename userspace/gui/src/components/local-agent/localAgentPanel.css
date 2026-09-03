@@ -340,6 +340,25 @@
   caret-color: transparent;
 }
 
+.local-agent__reasoning-draft {
+  margin: 2px 0 12px;
+  color: var(--dc-faint);
+  font-size: var(--dc-font-body);
+  font-style: italic;
+}
+
+.local-agent__reasoning-draft .local-agent__run-thinking {
+  margin-bottom: 6px;
+}
+
+.local-agent__reasoning-draft-content > :first-child {
+  margin-top: 0;
+}
+
+.local-agent__reasoning-draft-content > :last-child {
+  margin-bottom: 0;
+}
+
 .local-agent__run-thinking {
   display: flex;
   min-height: 28px;
@@ -1014,6 +1033,8 @@
   color: var(--dc-foreground-strong);
   font-size: var(--dc-font-body-large);
   line-height: var(--dc-line-body);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .local-agent__decision-heading span {
