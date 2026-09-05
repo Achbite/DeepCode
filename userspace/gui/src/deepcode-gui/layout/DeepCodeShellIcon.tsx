@@ -11,6 +11,7 @@ export type DeepCodeShellIconName =
   | 'settings'
   | 'activity'
   | 'tool'
+  | 'search'
   | 'extension'
   | 'artifact'
   | 'session'
@@ -59,6 +60,8 @@ const DeepCodeShellIcon: React.FC<DeepCodeShellIconProps> = ({ name, className }
       return <svg {...common}><path d="M4 12h3l2-6 4 12 2-6h5" /></svg>;
     case 'tool':
       return <svg {...common}><path d="M14.5 6.5a4 4 0 0 0-5 5L4 17l3 3 5.5-5.5a4 4 0 0 0 5-5l-2.2 2.2-3-3 2.2-2.2Z" /></svg>;
+    case 'search':
+      return <svg {...common}><circle cx="11" cy="11" r="6.5" /><path d="m16 16 4 4" /></svg>;
     case 'extension':
       return <svg {...common}><path d="M8 4h4v4h4v4h4v4h-4v4h-4v-4H8v-4H4V8h4V4Z" /><path d="M8 8h8v8H8Z" /></svg>;
     case 'artifact':

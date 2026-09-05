@@ -573,6 +573,10 @@
   color: var(--dc-danger);
 }
 
+.local-agent__tool-group--expanded {
+  width: calc(100% - 8px);
+}
+
 .local-agent .local-agent__tool-group-summary {
   display: inline-flex;
   width: auto;
@@ -601,6 +605,12 @@
   font-weight: var(--dc-weight-medium);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.local-agent__tool-group-summary[aria-expanded='true'] > strong {
+  overflow: visible;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .local-agent__tool-group-summary > span:nth-last-child(2) {

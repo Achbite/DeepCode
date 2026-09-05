@@ -4,6 +4,7 @@ import type {
   ArtifactProjection,
   PendingPlanProjection,
   PlanProjection,
+  ProviderOutputBlock,
   RunSettlement,
   RunRuntimeSnapshot,
   SessionEvent,
@@ -12,7 +13,11 @@ import type {
   ToolExecutionRecord,
   WorkspaceBindingDisplay,
 } from '@deepcode/protocol';
-import { SESSION_PROJECTION_VERSION } from '@deepcode/protocol';
+import {
+  SESSION_CONTROL_INTERACTION_REQUEST,
+  SESSION_CONTROL_PLAN_PUBLISH,
+  SESSION_PROJECTION_VERSION,
+} from '@deepcode/protocol';
 
 export interface SessionState {
   sessionId: string;
@@ -57,12 +62,16 @@ export interface ProviderTurnState {
   orderedCallIds?: string[];
   reasoningContent?: string;
   reasoningSignature?: string;
+  hostedWebSearchCalls?: Record<string, unknown>[];
+  orderedOutputBlocks?: ProviderOutputBlock[];
   error?: { code: string; message: string };
   sequence: number;
 }
 
 export interface ProviderCallFactState {
   runId: string;
+  providerCallId: string;
+  toolName: string;
   sequence: number;
 }
 
@@ -262,7 +271,18 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         };
         if (event.payload.role === 'assistant') {
           if (!event.runId) throw new Error('assistant_message_run_identity_missing');
-          requiredProviderTurn(next, event.runId, event.payload.providerRequestId, 'agent');
+          const turn = requiredProviderTurn(
+            next,
+            event.runId,
+            event.payload.providerRequestId,
+            'agent',
+          );
+          assertProviderMessageReference(
+            turn,
+            'finalMessage',
+            event.payload.messageId,
+            event.payload.content,
+          );
           next.messages.push({
             ...common,
             role: 'assistant',
@@ -287,7 +307,12 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     }
     case 'narrative.committed':
-      requiredProviderTurn(next, event.runId, event.payload.providerRequestId, 'agent');
+      assertProviderMessageReference(
+        requiredProviderTurn(next, event.runId, event.payload.providerRequestId, 'agent'),
+        'narrative',
+        event.payload.narrativeId,
+        event.payload.content,
+      );
       next.narratives.push({
         narrativeId: event.payload.narrativeId,
         runId: event.runId,
@@ -298,7 +323,14 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       });
       break;
     case 'interaction.requested':
-      recordProviderCallFact(next, event.callId, event.runId, event.sequence);
+      recordProviderCallFact(
+        next,
+        event.callId,
+        event.runId,
+        event.payload.providerCallId,
+        SESSION_CONTROL_INTERACTION_REQUEST,
+        event.sequence,
+      );
       next.pendingInteraction = {
         interactionId: event.payload.interactionId,
         runId: event.runId,
@@ -337,7 +369,14 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         throw new Error('plan_revision_duplicate');
       }
       const plan = projectPlan(event);
-      recordProviderCallFact(next, event.callId, event.runId, event.sequence);
+      recordProviderCallFact(
+        next,
+        event.callId,
+        event.runId,
+        event.payload.providerCallId,
+        SESSION_CONTROL_PLAN_PUBLISH,
+        event.sequence,
+      );
       next.plans.push(plan);
       next.pendingPlan = { ...clonePlanProjection(plan), responseMode: 'confirmReviseOrCancel' };
       next.activities[planActivityId(event.payload.planId, event.payload.revision)] = {
@@ -545,7 +584,14 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     }
     case 'tool.requested':
-      recordProviderCallFact(next, event.callId, event.runId, event.sequence);
+      recordProviderCallFact(
+        next,
+        event.callId,
+        event.runId,
+        event.payload.providerCallId,
+        event.payload.toolName,
+        event.sequence,
+      );
       next.activities[toolActivityId(event.callId)] = {
         activityId: toolActivityId(event.callId),
         kind: 'tool',
@@ -607,7 +653,14 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     case 'session.control.rejected':
       assertRunningRun(next, event.runId, 'session_control_rejection_run_not_active');
-      recordProviderCallFact(next, event.callId, event.runId, event.sequence);
+      recordProviderCallFact(
+        next,
+        event.callId,
+        event.runId,
+        event.payload.providerCallId,
+        event.payload.toolName,
+        event.sequence,
+      );
       break;
     case 'context.compaction.requested':
       assertRunningRun(next, event.runId, 'context_compaction_run_not_active');
@@ -666,14 +719,14 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       if (next.providerTurns[event.payload.providerRequestId]) {
         throw new Error('provider_turn_completion_duplicate');
       }
-      const currentTurnCallIds = Object.entries(next.providerCallFacts)
+      const currentTurnCallFacts = Object.entries(next.providerCallFacts)
         .filter(([, fact]) => (
           fact.runId === event.runId
           && fact.sequence > receipt.sequence
           && fact.sequence < event.sequence
         ))
-        .sort((left, right) => left[1].sequence - right[1].sequence)
-        .map(([callId]) => callId);
+        .sort((left, right) => left[1].sequence - right[1].sequence);
+      const currentTurnCallIds = currentTurnCallFacts.map(([callId]) => callId);
       const settlement = event.payload;
       if (settlement.outcome === 'completed') {
         if (new Set(settlement.orderedCallIds).size !== settlement.orderedCallIds.length) {
@@ -686,6 +739,33 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
           ))
         ) {
           throw new Error('provider_turn_call_order_mismatch');
+        }
+        if (settlement.orderedOutputBlocks !== undefined) {
+          validateOrderedProviderOutputBlocks(
+            settlement.orderedOutputBlocks,
+            settlement.orderedCallIds,
+          );
+          const orderedToolCalls = settlement.orderedOutputBlocks.filter((block) => (
+            block.kind === 'toolCall'
+          ));
+          if (orderedToolCalls.some((block, index) => {
+            const fact = currentTurnCallFacts[index];
+            return !fact
+              || fact[0] !== block.callId
+              || fact[1].providerCallId !== block.providerCallId
+              || fact[1].toolName !== block.toolName;
+          })) {
+            throw new Error('provider_turn_call_identity_mismatch');
+          }
+          if (settlement.purpose !== 'agent') {
+            throw new Error('provider_output_blocks_purpose_invalid');
+          }
+          if (
+            settlement.orderedOutputBlocks.some((block) => block.kind === 'providerHosted')
+            && runtime.webSearch.owner !== 'providerHosted'
+          ) {
+            throw new Error('provider_hosted_search_owner_mismatch');
+          }
         }
       } else if (currentTurnCallIds.length > 0) {
         throw new Error('provider_turn_terminal_call_facts_invalid');
@@ -705,10 +785,48 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
               ...(event.payload.reasoningSignature !== undefined
                 ? { reasoningSignature: event.payload.reasoningSignature }
                 : {}),
+              ...(event.payload.hostedWebSearchCalls !== undefined
+                ? {
+                    hostedWebSearchCalls: event.payload.hostedWebSearchCalls
+                      .map((item) => structuredClone(item)),
+                  }
+                : {}),
+              ...(event.payload.orderedOutputBlocks !== undefined
+                ? {
+                    orderedOutputBlocks: event.payload.orderedOutputBlocks.map((block) => ({
+                      ...block,
+                      item: structuredClone(block.item),
+                    })),
+                  }
+                : {}),
             }
           : { error: { ...event.payload.error } }),
         sequence: event.sequence,
       };
+      if (settlement.outcome === 'completed') {
+        for (const block of settlement.orderedOutputBlocks ?? []) {
+          if (block.kind !== 'providerHosted') continue;
+          const status = block.item.status;
+          const action = block.item.action;
+          if (
+            status !== 'completed' && status !== 'failed'
+            || !isRecord(action)
+          ) throw new Error('provider_hosted_search_item_invalid');
+          next.activities[block.activityId] = {
+            activityId: block.activityId,
+            kind: 'providerHosted',
+            status,
+            label: 'web.search',
+            runId: event.runId,
+            sequence: event.sequence,
+            providerHosted: {
+              providerToolType: block.providerToolType,
+              providerCallId: block.providerCallId,
+              action: structuredClone(action),
+            },
+          };
+        }
+      }
       next.tokenUsage = withProviderCompletion(next.tokenUsage);
       const runUsage = next.tokenUsageHistory[event.runId];
       if (!runUsage) throw new Error('token_usage_run_missing');
@@ -898,7 +1016,7 @@ export function projectSession(
     })),
     narratives: state.narratives.map((narrative) => ({ ...narrative })),
     timeline: projectTimeline(state),
-    assistantDraft: assistantDraft ? { ...assistantDraft } : null,
+    assistantDraft: assistantDraft ? structuredClone(assistantDraft) : null,
     pendingInteraction: cloneInteraction(state.pendingInteraction),
     pendingApproval: cloneApproval(state.pendingApproval),
     plans: state.plans.map((plan) => clonePlanProjection(plan)),
@@ -965,6 +1083,7 @@ function cloneRunRuntimeSnapshot(snapshot: RunRuntimeSnapshot): RunRuntimeSnapsh
   return {
     ...snapshot,
     provider: { ...snapshot.provider },
+    webSearch: { ...snapshot.webSearch },
     instructions: snapshot.instructions.map((instruction) => ({ ...instruction })),
     tools: snapshot.tools.map((tool) => ({
       ...tool,
@@ -987,8 +1106,120 @@ function cloneProviderTurn(turn: ProviderTurnState): ProviderTurnState {
   return {
     ...turn,
     ...(turn.orderedCallIds ? { orderedCallIds: [...turn.orderedCallIds] } : {}),
+    ...(turn.hostedWebSearchCalls
+      ? { hostedWebSearchCalls: turn.hostedWebSearchCalls.map((item) => structuredClone(item)) }
+      : {}),
+    ...(turn.orderedOutputBlocks
+      ? {
+          orderedOutputBlocks: turn.orderedOutputBlocks.map((block) => ({
+            ...block,
+            item: structuredClone(block.item),
+          })),
+        }
+      : {}),
     ...(turn.error ? { error: { ...turn.error } } : {}),
   };
+}
+
+function validateOrderedProviderOutputBlocks(
+  blocks: readonly ProviderOutputBlock[],
+  orderedCallIds: readonly string[],
+): void {
+  if (blocks.length === 0) throw new Error('provider_output_blocks_empty');
+  const callIds: string[] = [];
+  const referenceIds = new Set<string>();
+  const providerCallIds = new Set<string>();
+  let previousOutputIndex = -1;
+  let finalMessageCount = 0;
+  const addUnique = (values: Set<string>, value: string): boolean => {
+    if (values.has(value)) return false;
+    values.add(value);
+    return true;
+  };
+  for (const block of blocks) {
+    if (
+      !Number.isSafeInteger(block.outputIndex)
+      || block.outputIndex < 0
+      || block.outputIndex <= previousOutputIndex
+      || !isRecord(block.item)
+    ) throw new Error('provider_output_block_invalid');
+    previousOutputIndex = block.outputIndex;
+    switch (block.kind) {
+      case 'reasoning':
+        if (block.item.type !== 'reasoning') throw new Error('provider_output_block_invalid');
+        break;
+      case 'narrative':
+        if (
+          block.item.type !== 'message'
+          || !addUnique(referenceIds, `narrative:${block.narrativeId}`)
+        ) throw new Error('provider_output_block_invalid');
+        break;
+      case 'finalMessage':
+        finalMessageCount += 1;
+        if (
+          block.item.type !== 'message'
+          || !addUnique(referenceIds, `message:${block.messageId}`)
+        ) throw new Error('provider_output_block_invalid');
+        break;
+      case 'toolCall':
+        if (
+          block.item.type !== 'function_call'
+          || block.item.call_id !== block.providerCallId
+          || !addUnique(providerCallIds, block.providerCallId)
+        ) throw new Error('provider_output_block_invalid');
+        callIds.push(block.callId);
+        break;
+      case 'providerHosted':
+        if (
+          block.providerToolType !== 'web_search'
+          || block.item.type !== 'web_search_call'
+          || block.item.id !== block.providerCallId
+          || !addUnique(providerCallIds, block.providerCallId)
+          || !addUnique(referenceIds, `activity:${block.activityId}`)
+        ) throw new Error('provider_output_block_invalid');
+        break;
+    }
+  }
+  if (
+    finalMessageCount > 1
+    || callIds.length !== orderedCallIds.length
+    || callIds.some((callId, index) => callId !== orderedCallIds[index])
+    || callIds.length === 0 && finalMessageCount !== 1
+    || callIds.length > 0 && finalMessageCount !== 0
+  ) throw new Error('provider_output_block_normalization_invalid');
+}
+
+function assertProviderMessageReference(
+  turn: ProviderTurnState,
+  kind: 'narrative' | 'finalMessage',
+  referenceId: string,
+  content: string,
+): void {
+  if (!turn.orderedOutputBlocks) return;
+  const matches = turn.orderedOutputBlocks.filter((block) => (
+    block.kind === kind
+    && (kind === 'narrative'
+      ? block.kind === 'narrative' && block.narrativeId === referenceId
+      : block.kind === 'finalMessage' && block.messageId === referenceId)
+  ));
+  if (
+    matches.length !== 1
+    || providerOutputMessageText(matches[0]!.item) !== content
+  ) throw new Error('provider_output_message_reference_invalid');
+}
+
+function providerOutputMessageText(item: Record<string, unknown>): string {
+  if (item.type !== 'message' || !Array.isArray(item.content)) {
+    throw new Error('provider_output_message_item_invalid');
+  }
+  let text = '';
+  for (const part of item.content) {
+    if (!isRecord(part) || part.type !== 'output_text') continue;
+    if (typeof part.text !== 'string') throw new Error('provider_output_message_item_invalid');
+    text += part.text;
+  }
+  if (!text.trim()) throw new Error('provider_output_message_item_invalid');
+  return text;
 }
 
 function requiredRunRuntimeSnapshot(state: SessionState, runId: string): RunRuntimeSnapshot {
@@ -1039,6 +1270,11 @@ function projectTimeline(state: SessionState): SessionProjection['timeline'] {
       && candidate.providerRequestId === turn.providerRequestId
     ));
     if (!composition) throw new Error('provider_turn_composition_missing');
+    if (turn.orderedOutputBlocks) {
+      const items = projectOrderedProviderTurnTimeline(state, turn);
+      if (items.length > 0) groups.push({ sequence: composition.sequence, items });
+      continue;
+    }
     const items: SessionProjection['timeline'] = [];
     const message = state.messages.find((candidate) => (
       candidate.role === 'assistant'
@@ -1099,6 +1335,97 @@ function projectTimeline(state: SessionState): SessionProjection['timeline'] {
   return groups
     .sort((left, right) => left.sequence - right.sequence)
     .flatMap((group) => group.items);
+}
+
+function projectOrderedProviderTurnTimeline(
+  state: SessionState,
+  turn: ProviderTurnState,
+): SessionProjection['timeline'] {
+  const items: SessionProjection['timeline'] = [];
+  let groupedActivities: ActivityProjection[] = [];
+  let activityGroupIndex = 0;
+  const flushActivities = (): void => {
+    if (groupedActivities.length === 0) return;
+    items.push({
+      kind: 'toolGroup',
+      timelineId: `provider-turn:${turn.providerRequestId}:activities:${activityGroupIndex}`,
+      sequence: Math.max(...groupedActivities.map((activity) => activity.sequence)),
+      providerRequestId: turn.providerRequestId,
+      activityIds: groupedActivities.map((activity) => activity.activityId),
+    });
+    activityGroupIndex += 1;
+    groupedActivities = [];
+  };
+  for (const block of turn.orderedOutputBlocks ?? []) {
+    switch (block.kind) {
+      case 'reasoning':
+        break;
+      case 'narrative': {
+        flushActivities();
+        const narrative = state.narratives.find((candidate) => (
+          candidate.narrativeId === block.narrativeId
+          && candidate.providerRequestId === turn.providerRequestId
+        ));
+        if (!narrative) throw new Error('provider_output_narrative_missing');
+        items.push({
+          kind: 'narrative',
+          timelineId: `provider-turn:${turn.providerRequestId}:narrative:${block.outputIndex}`,
+          sequence: narrative.sequence,
+          providerRequestId: turn.providerRequestId,
+          narrativeId: narrative.narrativeId,
+          outputIndex: block.outputIndex,
+        });
+        break;
+      }
+      case 'finalMessage': {
+        flushActivities();
+        const message = state.messages.find((candidate) => (
+          candidate.role === 'assistant'
+          && candidate.messageId === block.messageId
+          && candidate.providerRequestId === turn.providerRequestId
+        ));
+        if (!message) throw new Error('provider_output_final_message_missing');
+        items.push({
+          kind: 'message',
+          timelineId: `message:${message.messageId}`,
+          sequence: message.sequence,
+          messageId: message.messageId,
+          outputIndex: block.outputIndex,
+        });
+        break;
+      }
+      case 'providerHosted': {
+        const activity = state.activities[block.activityId];
+        if (!activity || activity.kind !== 'providerHosted') {
+          throw new Error('provider_hosted_activity_missing');
+        }
+        groupedActivities.push(activity);
+        break;
+      }
+      case 'toolCall': {
+        const plan = state.plans.find((candidate) => candidate.callId === block.callId);
+        if (plan) {
+          flushActivities();
+          items.push({
+            kind: 'plan',
+            timelineId: `provider-turn:${turn.providerRequestId}:plan:${block.callId}`,
+            sequence: plan.sequence,
+            providerRequestId: turn.providerRequestId,
+            planId: plan.planId,
+            revision: plan.revision,
+          });
+          break;
+        }
+        const activity = Object.values(state.activities).find((candidate) => (
+          candidate.kind === 'tool' && candidate.callId === block.callId
+        ));
+        if (activity) groupedActivities.push(activity);
+        break;
+      }
+    }
+  }
+  flushActivities();
+  return items;
 }
 
 function cloneApproval(
@@ -1339,6 +1666,14 @@ function cloneActivity(activity: ActivityProjection): ActivityProjection {
           },
         }
       : {}),
+    ...(activity.providerHosted
+      ? {
+          providerHosted: {
+            ...activity.providerHosted,
+            action: structuredClone(activity.providerHosted.action),
+          },
+        }
+      : {}),
   };
 }
 
@@ -1350,10 +1685,12 @@ function recordProviderCallFact(
   state: SessionState,
   callId: string,
   runId: string,
+  providerCallId: string,
+  toolName: string,
   sequence: number,
 ): void {
   if (state.providerCallFacts[callId] !== undefined) throw new Error('provider_call_fact_duplicate');
-  state.providerCallFacts[callId] = { runId, sequence };
+  state.providerCallFacts[callId] = { runId, providerCallId, toolName, sequence };
 }
 
 function assertRunningRun(state: SessionState, runId: string, code: string): void {

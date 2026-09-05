@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 
 pub const CONVERSATION_COMMAND_VERSION: &str = "deepcode.command.v3";
-pub const SESSION_PROJECTION_VERSION: &str = "deepcode.session-projection.v4";
+pub const SESSION_PROJECTION_VERSION: &str = "deepcode.session-projection.v5";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -166,6 +166,16 @@ impl SessionProjection {
                     .run
                     .as_ref()
                     .is_none_or(|run| run.run_id != draft.run_id)
+                || draft.ordered_blocks.as_ref().is_some_and(|blocks| {
+                    draft.content != ""
+                        || draft.reasoning_content.is_some()
+                        || blocks.is_empty()
+                        || blocks.iter().enumerate().any(|(index, block)| {
+                            block.invalid()
+                                || index > 0
+                                    && block.output_index() <= blocks[index - 1].output_index()
+                        })
+                })
         }) {
             return Err("shared Session projection has an invalid assistant draft".to_string());
         }
@@ -396,7 +406,7 @@ impl SessionProjection {
                 || !activity_ids.insert(activity.activity_id.as_str())
                 || !matches!(
                     activity.kind.as_str(),
-                    "run" | "tool" | "approval" | "plan" | "interaction"
+                    "run" | "tool" | "providerHosted" | "approval" | "plan" | "interaction"
                 )
                 || !matches!(
                     activity.status.as_str(),
@@ -411,6 +421,13 @@ impl SessionProjection {
                 )
                 || activity.kind == "tool" && activity.call_id.as_deref().is_none_or(str::is_empty)
                 || activity.kind != "tool" && activity.tool.is_some()
+                || activity.kind != "providerHosted" && activity.provider_hosted.is_some()
+                || activity.kind == "providerHosted"
+                    && activity.provider_hosted.as_ref().is_none_or(|hosted| {
+                        hosted.provider_tool_type != "web_search"
+                            || hosted.provider_call_id.is_empty()
+                            || !hosted.action.is_object()
+                    })
                 || activity.tool.as_ref().is_some_and(|tool| {
                     tool.operation.is_empty()
                         || tool.shell.as_ref().is_some_and(|shell| {
@@ -525,7 +542,11 @@ impl SessionProjection {
                         || activity_ids.iter().any(|activity_id| {
                             !timeline_activity_ids.insert(activity_id.as_str())
                                 || self.activities.iter().all(|activity| {
-                                    activity.activity_id != *activity_id || activity.kind != "tool"
+                                    activity.activity_id != *activity_id
+                                        || !matches!(
+                                            activity.kind.as_str(),
+                                            "tool" | "providerHosted"
+                                        )
                                 })
                         })
                 }
@@ -545,7 +566,7 @@ impl SessionProjection {
                 != self
                     .activities
                     .iter()
-                    .filter(|activity| activity.kind == "tool")
+                    .filter(|activity| matches!(activity.kind.as_str(), "tool" | "providerHosted"))
                     .count()
         {
             return Err("shared Session projection canonical timeline is incomplete".to_string());
@@ -573,6 +594,8 @@ pub enum SessionTimelineItem {
         sequence: u64,
         #[serde(rename = "messageId")]
         message_id: String,
+        #[serde(rename = "outputIndex")]
+        output_index: Option<u64>,
     },
     #[serde(rename = "narrative")]
     Narrative {
@@ -583,6 +606,8 @@ pub enum SessionTimelineItem {
         provider_request_id: String,
         #[serde(rename = "narrativeId")]
         narrative_id: String,
+        #[serde(rename = "outputIndex")]
+        output_index: Option<u64>,
     },
     #[serde(rename = "plan")]
     Plan {
@@ -732,6 +757,14 @@ fn invalid_context_messages(messages: &[ContextCompositionMessage]) -> bool {
                         || result_for_call_id.is_empty()
                         || !call_ids.contains(result_for_call_id.as_str())
                 }
+                ContextCompositionMessageBlock::HostedWebSearch {
+                    block_index: actual,
+                    provider_call_id,
+                } => {
+                    *actual != block_index as u64
+                        || message.role != "assistant"
+                        || provider_call_id.is_empty()
+                }
             };
             if invalid {
                 return true;
@@ -814,7 +847,7 @@ fn invalid_context_tools(tools: &[ContextCompositionTool]) -> bool {
             || !wire_names.insert(tool.wire_name.as_str())
             || !matches!(
                 tool.origin.as_str(),
-                "coreBuiltin" | "extension" | "sessionControl"
+                "coreBuiltin" | "extension" | "sessionControl" | "providerHosted"
             )
             || tool.availability != "callable"
             || if tool.origin == "extension" {
@@ -951,6 +984,72 @@ pub struct AssistantDraftProjection {
     pub turn_id: String,
     pub content: String,
     pub reasoning_content: Option<String>,
+    pub ordered_blocks: Option<Vec<AssistantDraftBlockProjection>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum AssistantDraftBlockProjection {
+    #[serde(rename = "narrative")]
+    Narrative {
+        #[serde(rename = "outputIndex")]
+        output_index: u64,
+        content: String,
+    },
+    #[serde(rename = "finalMessage")]
+    FinalMessage {
+        #[serde(rename = "outputIndex")]
+        output_index: u64,
+        content: String,
+    },
+    #[serde(rename = "message")]
+    Message {
+        #[serde(rename = "outputIndex")]
+        output_index: u64,
+        content: String,
+    },
+    #[serde(rename = "providerHosted")]
+    ProviderHosted {
+        #[serde(rename = "outputIndex")]
+        output_index: u64,
+        #[serde(rename = "providerCallId")]
+        provider_call_id: String,
+        #[serde(rename = "providerToolType")]
+        provider_tool_type: String,
+        status: String,
+        action: Value,
+    },
+}
+
+impl AssistantDraftBlockProjection {
+    fn output_index(&self) -> u64 {
+        match self {
+            Self::Narrative { output_index, .. }
+            | Self::FinalMessage { output_index, .. }
+            | Self::Message { output_index, .. }
+            | Self::ProviderHosted { output_index, .. } => *output_index,
+        }
+    }
+
+    fn invalid(&self) -> bool {
+        match self {
+            Self::Narrative { content, .. }
+            | Self::FinalMessage { content, .. }
+            | Self::Message { content, .. } => content.trim().is_empty(),
+            Self::ProviderHosted {
+                provider_call_id,
+                provider_tool_type,
+                status,
+                action,
+                ..
+            } => {
+                provider_call_id.is_empty()
+                    || provider_tool_type != "web_search"
+                    || !matches!(status.as_str(), "completed" | "failed")
+                    || !action.is_object()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1199,6 +1298,10 @@ pub enum ContextCompositionMessageBlock {
         block_index: u64,
         result_for_call_id: String,
     },
+    HostedWebSearch {
+        block_index: u64,
+        provider_call_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1241,6 +1344,15 @@ pub struct ActivityProjection {
     pub call_id: Option<String>,
     pub sequence: u64,
     pub tool: Option<ToolActivityProjection>,
+    pub provider_hosted: Option<ProviderHostedActivityProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderHostedActivityProjection {
+    pub provider_tool_type: String,
+    pub provider_call_id: String,
+    pub action: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1999,6 +2111,39 @@ mod tests {
             projection.activities[0].call_id.as_deref(),
             Some("call:read")
         );
+    }
+
+    #[test]
+    fn validates_provider_hosted_context_tool() {
+        let mut value = projection_value();
+        value["contextCompositions"][0]["tools"][0] = json!({
+            "itemId": "web.search",
+            "label": "web_search",
+            "canonicalName": "web.search",
+            "wireName": "web_search",
+            "origin": "providerHosted",
+            "availability": "callable"
+        });
+        value["contextCompositions"][0]["messages"]
+            .as_array_mut()
+            .expect("context messages")
+            .push(json!({
+                "messageIndex": 1,
+                "contributionId": "journal:hosted-answer",
+                "contributionKind": "journalMessages",
+                "label": "assistant message",
+                "role": "assistant",
+                "blocks": [{
+                    "blockIndex": 0,
+                    "kind": "hostedWebSearch",
+                    "providerCallId": "ws_1"
+                }],
+                "filesystemReferences": []
+            }));
+
+        let projection: SessionProjection =
+            serde_json::from_value(value).expect("provider-hosted tool projection decodes");
+        assert_eq!(projection.validate(), Ok(()));
     }
 
     #[test]

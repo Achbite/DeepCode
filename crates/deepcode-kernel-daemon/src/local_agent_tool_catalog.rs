@@ -1,8 +1,8 @@
 use crate::local_agent_mcp::{McpRuntime, McpTool, McpToolBindingRequirement, McpToolEffectScope};
 use deepcode_kernel_runtime::executors::{
-    builtin_executors, KernelExecutorConfig, KernelExecutorRegistry, KernelToolExecutionContext,
-    KernelToolExecutionFailure, KernelToolExecutionOutcome, KernelToolExecutionResult,
-    KernelToolInvocation, SecretProvider,
+    builtin_executors, web_search_availability, KernelExecutorConfig, KernelExecutorRegistry,
+    KernelToolExecutionContext, KernelToolExecutionFailure, KernelToolExecutionOutcome,
+    KernelToolExecutionResult, KernelToolInvocation, SecretProvider,
 };
 use deepcode_kernel_tools::{
     hash_bytes, KernelToolRegistry, ToolAvailability, ToolEffectClass, ToolEffectScope,
@@ -77,14 +77,21 @@ struct BuiltinToolProvider {
     registry: Arc<KernelToolRegistry>,
     executors: Arc<KernelExecutorRegistry>,
     binding_identity: String,
+    web_search_availability: ToolAvailability,
 }
 
 impl BuiltinToolProvider {
     fn prepare(
         executor_config: KernelExecutorConfig,
         secret_provider: Arc<dyn SecretProvider>,
+        enable_web_search: bool,
     ) -> Result<Self, ToolCatalogError> {
         let binding_identity = builtin_binding_identity(&executor_config)?;
+        let web_search_availability = if enable_web_search {
+            web_search_availability(&executor_config)
+        } else {
+            ToolAvailability::Blocked
+        };
         let registry = Arc::new(KernelToolRegistry::new());
         let executors = Arc::new(KernelExecutorRegistry::from_executors(builtin_executors(
             registry.as_ref(),
@@ -95,6 +102,7 @@ impl BuiltinToolProvider {
             registry,
             executors,
             binding_identity,
+            web_search_availability,
         })
     }
 }
@@ -121,7 +129,11 @@ impl ToolProvider for BuiltinToolProvider {
                     ToolEffectScope::NetworkRead => CatalogEffectScope::Network,
                     ToolEffectScope::Process => CatalogEffectScope::Process,
                 },
-                availability: descriptor.availability,
+                availability: if descriptor.name == "web.search" {
+                    self.web_search_availability
+                } else {
+                    descriptor.availability
+                },
                 logical_target: None,
                 binding: ToolExecutorBinding::Builtin {
                     registry: Arc::clone(&self.registry),
@@ -289,6 +301,7 @@ impl ToolCatalogSnapshot {
         executor_config: KernelExecutorConfig,
         secret_provider: Arc<dyn SecretProvider>,
         mcp: McpRuntime,
+        enable_web_search: bool,
     ) -> Result<Arc<Self>, ToolCatalogError> {
         validate_ref("extensionGenerationRef", extension_generation_ref)?;
         validate_ref("kernelRuntimeGenerationKey", kernel_runtime_generation_key)?;
@@ -296,6 +309,7 @@ impl ToolCatalogSnapshot {
             Box::new(BuiltinToolProvider::prepare(
                 executor_config,
                 secret_provider,
+                enable_web_search,
             )?),
             Box::new(McpToolProvider::prepare(mcp)?),
         ];
@@ -692,10 +706,11 @@ mod tests {
     use deepcode_kernel_runtime::executors::EmptySecretProvider;
 
     #[test]
-    fn default_builtin_provider_exposes_only_the_seven_basic_tools() {
+    fn default_builtin_provider_exposes_the_seven_basic_tools_and_blocks_web_search() {
         let provider = BuiltinToolProvider::prepare(
             KernelExecutorConfig::default(),
             Arc::new(EmptySecretProvider),
+            true,
         )
         .expect("prepare builtin provider");
         let installed = Box::new(provider)
@@ -723,6 +738,77 @@ mod tests {
         for tool in &installed.tools {
             assert!(tool.input_schema["properties"].get("workspaceId").is_none());
         }
+        assert_eq!(
+            installed
+                .tools
+                .iter()
+                .find(|tool| tool.name == "web.search")
+                .expect("web.search contribution")
+                .availability,
+            ToolAvailability::Blocked
+        );
+        (installed.dispose)().expect("dispose builtin provider");
+    }
+
+    #[test]
+    fn web_search_is_callable_with_brave_secret_ref_or_explicit_endpoint() {
+        for executor_config in [
+            KernelExecutorConfig {
+                web_search_endpoint_template: String::new(),
+                web_search_auth_header_name: "Authorization".to_string(),
+                web_search_auth_secret_ref: "local-secret:brave".to_string(),
+            },
+            KernelExecutorConfig {
+                web_search_endpoint_template: "https://search.example/v1?q={query}&limit={limit}"
+                    .to_string(),
+                web_search_auth_header_name: "Authorization".to_string(),
+                web_search_auth_secret_ref: String::new(),
+            },
+        ] {
+            let provider =
+                BuiltinToolProvider::prepare(executor_config, Arc::new(EmptySecretProvider), true)
+                    .expect("prepare builtin provider");
+            let installed = Box::new(provider)
+                .install()
+                .expect("install builtin provider");
+            assert_eq!(
+                installed
+                    .tools
+                    .iter()
+                    .find(|tool| tool.name == "web.search")
+                    .expect("web.search contribution")
+                    .availability,
+                ToolAvailability::Callable
+            );
+            (installed.dispose)().expect("dispose builtin provider");
+        }
+    }
+
+    #[test]
+    fn run_owner_can_disable_kernel_search_before_catalog_snapshot_is_built() {
+        let provider = BuiltinToolProvider::prepare(
+            KernelExecutorConfig {
+                web_search_endpoint_template: String::new(),
+                web_search_auth_header_name: "X-Subscription-Token".to_string(),
+                web_search_auth_secret_ref: "local-secret:brave".to_string(),
+            },
+            Arc::new(EmptySecretProvider),
+            false,
+        )
+        .expect("prepare builtin provider");
+        let installed = Box::new(provider)
+            .install()
+            .expect("install builtin provider");
+
+        assert_eq!(
+            installed
+                .tools
+                .iter()
+                .find(|tool| tool.name == "web.search")
+                .expect("web.search contribution")
+                .availability,
+            ToolAvailability::Blocked
+        );
         (installed.dispose)().expect("dispose builtin provider");
     }
 }

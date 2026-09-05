@@ -181,7 +181,18 @@ export async function buildAgentProviderRequest(input: {
     workspaceBindings: input.workspaceBindings.map((binding) => ({ ...binding })),
     messages: providerSelected.map((item) => cloneModelMessage(item.message)),
     tools: toolCodec.definitions,
+    hostedTools: input.runtime.webSearch.owner === 'providerHosted'
+      ? [{ type: 'webSearch', providerToolType: input.runtime.webSearch.providerToolType }]
+      : [],
   };
+  const hostedReceiptTools: ContextCompositionTool[] = request.hostedTools.map((tool) => ({
+    itemId: 'web.search',
+    label: tool.providerToolType,
+    canonicalName: 'web.search',
+    wireName: tool.providerToolType,
+    origin: 'providerHosted',
+    availability: 'callable',
+  }));
   return {
     request,
     toolCodec,
@@ -192,8 +203,9 @@ export async function buildAgentProviderRequest(input: {
       providerSelected,
       toolCodec.kernelDefinitions,
       toolCodec.controlDefinitions,
+      request.hostedTools,
       toolCodec.canonicalByWire,
-      toolCodec.receiptTools,
+      [...toolCodec.receiptTools, ...hostedReceiptTools],
       input.runtime,
       input.workspaceBindings,
       input.events,
@@ -208,6 +220,17 @@ export function messagesFromJournal(
 ): ContextMessageContribution[] {
   const messages: ContextMessageContribution[] = [];
   const completionResults = new Map<string, ContextMessageContribution>();
+  const orderedProviderTurns = new Map(events.flatMap((event) => (
+    event.type === 'provider.turn.settled'
+    && event.payload.outcome === 'completed'
+    && event.payload.orderedOutputBlocks !== undefined
+      ? [[event.payload.providerRequestId, event.payload.orderedOutputBlocks] as const]
+      : []
+  )));
+  const orderedProviderCallIds = new Set([...orderedProviderTurns.values()].flatMap((blocks) => (
+    blocks.flatMap((block) => block.kind === 'toolCall' ? [block.callId] : [])
+  )));
+  const providerCallIdByLogicalCallId = providerCallIdsFromEvents(events);
   const interactionCallIds = new Map(events.flatMap((event) => (
     event.type === 'interaction.requested'
       ? [[event.payload.interactionId, event.callId] as const]
@@ -234,6 +257,10 @@ export function messagesFromJournal(
       && !(event.type === 'message.committed' && event.payload.messageId === retainedRunInputId)
     ) continue;
     if (event.type === 'message.committed') {
+      if (
+        event.payload.role === 'assistant'
+        && orderedProviderTurns.has(event.payload.providerRequestId)
+      ) continue;
       const reasoning = event.payload.role === 'assistant'
         ? providerReasoning(events, event.payload.providerRequestId)
         : {};
@@ -248,6 +275,7 @@ export function messagesFromJournal(
         },
       });
     } else if (event.type === 'narrative.committed') {
+      if (orderedProviderTurns.has(event.payload.providerRequestId)) continue;
       if (!mergeNarrativeIntoProviderCall(messages, events, event)) {
         messages.push({
           contributionId: `narrative:${event.payload.narrativeId}`,
@@ -261,8 +289,10 @@ export function messagesFromJournal(
         });
       }
     } else if (event.type === 'interaction.requested') {
+      if (orderedProviderCallIds.has(event.callId)) continue;
       attachToolCall(messages, {
         callId: event.callId,
+        providerCallId: event.payload.providerCallId,
         name: SESSION_CONTROL_INTERACTION_REQUEST,
         input: {
           kind: event.payload.kind,
@@ -283,12 +313,15 @@ export function messagesFromJournal(
         message: {
           role: 'tool',
           toolCallId: callId,
+          providerCallId: requiredProviderCallId(providerCallIdByLogicalCallId, callId),
           content: JSON.stringify({ response: event.payload.response }),
         },
       });
     } else if (event.type === 'plan.published') {
+      if (orderedProviderCallIds.has(event.callId)) continue;
       attachToolCall(messages, {
         callId: event.callId,
+        providerCallId: event.payload.providerCallId,
         name: SESSION_CONTROL_PLAN_PUBLISH,
         input: {
           title: event.payload.title,
@@ -305,6 +338,7 @@ export function messagesFromJournal(
         message: {
           role: 'tool',
           toolCallId: event.callId,
+          providerCallId: requiredProviderCallId(providerCallIdByLogicalCallId, event.callId),
           content: JSON.stringify({
             response: { kind: 'confirm' },
             planId: event.payload.planId,
@@ -321,6 +355,7 @@ export function messagesFromJournal(
         message: {
           role: 'tool',
           toolCallId: event.callId,
+          providerCallId: requiredProviderCallId(providerCallIdByLogicalCallId, event.callId),
           content: JSON.stringify({
             response: { kind: 'requestRevision', text: event.payload.text },
             planId: event.payload.planId,
@@ -336,6 +371,7 @@ export function messagesFromJournal(
         message: {
           role: 'tool',
           toolCallId: event.callId,
+          providerCallId: requiredProviderCallId(providerCallIdByLogicalCallId, event.callId),
           content: JSON.stringify({
             response: { kind: 'cancel' },
             planId: event.payload.planId,
@@ -366,11 +402,14 @@ export function messagesFromJournal(
     ) {
       continue;
     } else if (event.type === 'session.control.rejected') {
-      attachToolCall(messages, {
-        callId: event.callId,
-        name: event.payload.toolName,
-        input: event.payload.input,
-      });
+      if (!orderedProviderCallIds.has(event.callId)) {
+        attachToolCall(messages, {
+          callId: event.callId,
+          providerCallId: event.payload.providerCallId,
+          name: event.payload.toolName,
+          input: event.payload.input,
+        });
+      }
       completionResults.set(event.callId, {
         contributionId: `session-control-rejection:${event.callId}`,
         contributionKind: 'journalMessages',
@@ -378,12 +417,15 @@ export function messagesFromJournal(
         message: {
           role: 'tool',
           toolCallId: event.callId,
+          providerCallId: event.payload.providerCallId,
           content: JSON.stringify({ accepted: false, error: event.payload.error }),
         },
       });
     } else if (event.type === 'tool.requested') {
+      if (orderedProviderCallIds.has(event.callId)) continue;
       attachToolCall(messages, {
         callId: event.callId,
+        providerCallId: event.payload.providerCallId,
         name: event.payload.toolName,
         input: event.payload.input,
       });
@@ -395,10 +437,26 @@ export function messagesFromJournal(
         message: {
           role: 'tool',
           toolCallId: event.callId,
+          providerCallId: requiredProviderCallId(providerCallIdByLogicalCallId, event.callId),
           content: JSON.stringify(toolResultForModel(event.payload.record)),
         },
       });
     } else if (event.type === 'provider.turn.settled' && event.payload.outcome === 'completed') {
+      if (event.payload.orderedOutputBlocks !== undefined) {
+        messages.push({
+          contributionId: `provider-output:${event.payload.providerRequestId}`,
+          contributionKind: 'journalMessages',
+          label: 'Provider output',
+          message: {
+            role: 'assistant',
+            content: '',
+            providerOutputBlocks: event.payload.orderedOutputBlocks.map((block) => ({
+              ...block,
+              item: structuredClone(block.item),
+            })),
+          },
+        });
+      }
       for (const callId of event.payload.orderedCallIds) {
         const result = completionResults.get(callId);
         if (!result) continue;
@@ -492,6 +550,7 @@ export function buildContextCompositionReceipt(
   selected: readonly ContextMessageContribution[],
   kernelTools: readonly ProviderToolDefinition[],
   controlTools: readonly ProviderToolDefinition[],
+  hostedTools: readonly ProviderRequest['hostedTools'][number][],
   canonicalByWire: ReadonlyMap<string, string>,
   receiptTools: readonly ContextCompositionTool[],
   runtime: RunRuntimeSnapshot,
@@ -520,10 +579,19 @@ export function buildContextCompositionReceipt(
     label: binding.displayName,
   }));
   const toolItems = receiptTools.map((tool) => ({ ...tool }));
-  if (toolItems.length !== kernelTools.length + controlTools.length) {
+  if (toolItems.length !== kernelTools.length + controlTools.length + hostedTools.length) {
     throw new LoopFailure('provider_tool_receipt_incomplete', 'Context receipt 工具数量不完整。');
   }
   for (const tool of toolItems) {
+    if (tool.origin === 'providerHosted') {
+      if (tool.canonicalName !== 'web.search' || tool.wireName !== 'web_search') {
+        throw new LoopFailure(
+          'provider_hosted_tool_receipt_invalid',
+          'Context receipt 的 Provider hosted search 工具无效。',
+        );
+      }
+      continue;
+    }
     if (canonicalByWire.get(tool.wireName) !== tool.canonicalName) {
       throw new LoopFailure(
         'provider_tool_alias_receipt_missing',
@@ -574,6 +642,7 @@ export function buildContextCompositionReceipt(
       selected,
       kernelTools,
       controlTools,
+      hostedTools,
       workspaceBindings,
       filesystemReferenceFactsByContributionId,
     ),
@@ -645,7 +714,54 @@ export function cloneModelMessage(message: ModelMessage): ModelMessage {
           })),
         }
       : {}),
+    ...(message.providerItems
+      ? { providerItems: message.providerItems.map((item) => structuredClone(item)) }
+      : {}),
+    ...(message.providerOutputBlocks
+      ? {
+          providerOutputBlocks: message.providerOutputBlocks.map((block) => ({
+            ...block,
+            item: structuredClone(block.item),
+          })),
+        }
+      : {}),
   };
+}
+
+function providerCallIdsFromEvents(events: readonly SessionEvent[]): Map<string, string> {
+  const byLogicalCallId = new Map<string, string>();
+  for (const event of events) {
+    if (
+      event.type !== 'tool.requested'
+      && event.type !== 'interaction.requested'
+      && event.type !== 'plan.published'
+      && event.type !== 'session.control.rejected'
+    ) continue;
+    const providerCallId = event.payload.providerCallId;
+    const existing = byLogicalCallId.get(event.callId);
+    if (existing !== undefined && existing !== providerCallId) {
+      throw new LoopFailure(
+        'provider_call_identity_conflict',
+        `LogicalCallId ${event.callId} 对应了多个 ProviderCallId。`,
+      );
+    }
+    byLogicalCallId.set(event.callId, providerCallId);
+  }
+  return byLogicalCallId;
+}
+
+function requiredProviderCallId(
+  providerCallIds: ReadonlyMap<string, string>,
+  logicalCallId: string,
+): string {
+  const providerCallId = providerCallIds.get(logicalCallId);
+  if (!providerCallId) {
+    throw new LoopFailure(
+      'provider_call_identity_missing',
+      `LogicalCallId ${logicalCallId} 缺少 ProviderCallId。`,
+    );
+  }
+  return providerCallId;
 }
 
 export function runInputMessageEvent(
@@ -665,7 +781,7 @@ export function runInputMessageEvent(
 function providerReasoning(
   events: readonly SessionEvent[],
   providerRequestId: string,
-): Pick<ModelMessage, 'reasoningContent' | 'reasoningSignature'> {
+): Pick<ModelMessage, 'reasoningContent' | 'reasoningSignature' | 'providerItems'> {
   const completion = events.find((event): event is CompletedProviderTurnEvent => (
     isCompletedProviderTurn(event)
     && event.payload.providerRequestId === providerRequestId
@@ -682,6 +798,12 @@ function providerReasoning(
       : {}),
     ...(completion.payload.reasoningSignature !== undefined
       ? { reasoningSignature: completion.payload.reasoningSignature }
+      : {}),
+    ...(completion.payload.hostedWebSearchCalls !== undefined
+      ? {
+          providerItems: completion.payload.hostedWebSearchCalls
+            .map((item) => structuredClone(item)),
+        }
       : {}),
   };
 }
@@ -766,6 +888,10 @@ function applyProviderTurnCompletions(
       if (event.payload.reasoningSignature !== undefined) {
         message.reasoningSignature = event.payload.reasoningSignature;
       }
+      if (event.payload.hostedWebSearchCalls !== undefined) {
+        message.providerItems = event.payload.hostedWebSearchCalls
+          .map((item) => structuredClone(item));
+      }
     }
   }
 }
@@ -804,6 +930,7 @@ function buildContextCompositionPartitions(
   selected: readonly ContextMessageContribution[],
   kernelTools: readonly ProviderToolDefinition[],
   controlTools: readonly ProviderToolDefinition[],
+  hostedTools: readonly ProviderRequest['hostedTools'][number][],
   workspaceBindings: readonly WorkspaceBindingDisplay[],
   filesystemReferenceFactsByContributionId: ReadonlyMap<string, readonly unknown[]>,
 ): NonNullable<ContextCompositionReceipt['partitions']> {
@@ -838,7 +965,11 @@ function buildContextCompositionPartitions(
     }
   }
   add('sessionControls', controlTools.length, sumShapeUnits(controlTools));
-  add('tools', kernelTools.length, sumShapeUnits(kernelTools));
+  add(
+    'tools',
+    kernelTools.length + hostedTools.length,
+    sumShapeUnits(kernelTools) + sumShapeUnits(hostedTools),
+  );
   return CONTEXT_PARTITION_ORDER.map((kind) => ({ kind, ...metrics.get(kind)! }));
 }
 
@@ -857,7 +988,8 @@ function contextCompositionBlocks(message: ModelMessage): ContextCompositionMess
     block:
       | { kind: 'text' | 'reasoning' }
       | { kind: 'toolCall'; callId: string; toolName: string }
-      | { kind: 'toolResult'; resultForCallId: string },
+      | { kind: 'toolResult'; resultForCallId: string }
+      | { kind: 'hostedWebSearch'; providerCallId: string },
   ): void => {
     blocks.push({ ...block, blockIndex: blocks.length } as ContextCompositionMessage['blocks'][number]);
   };
@@ -865,7 +997,32 @@ function contextCompositionBlocks(message: ModelMessage): ContextCompositionMess
     append({ kind: 'toolResult', resultForCallId: message.toolCallId });
     return blocks;
   }
+  if (message.providerOutputBlocks) {
+    for (const block of message.providerOutputBlocks) {
+      switch (block.kind) {
+        case 'reasoning':
+          append({ kind: 'reasoning' });
+          break;
+        case 'narrative':
+        case 'finalMessage':
+          append({ kind: 'text' });
+          break;
+        case 'toolCall':
+          append({ kind: 'toolCall', callId: block.callId, toolName: block.toolName });
+          break;
+        case 'providerHosted':
+          append({ kind: 'hostedWebSearch', providerCallId: block.providerCallId });
+          break;
+      }
+    }
+    return blocks;
+  }
   if (message.reasoningContent) append({ kind: 'reasoning' });
+  for (const item of message.providerItems ?? []) {
+    if (item.type === 'web_search_call' && typeof item.id === 'string') {
+      append({ kind: 'hostedWebSearch', providerCallId: item.id });
+    }
+  }
   if (message.content) append({ kind: 'text' });
   for (const call of message.toolCalls ?? []) {
     append({ kind: 'toolCall', callId: call.callId, toolName: call.name });

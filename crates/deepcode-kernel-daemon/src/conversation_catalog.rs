@@ -357,6 +357,7 @@ impl ConversationCatalog {
         &mut self,
         session_id: &str,
         automatic_title: Option<&str>,
+        profile_id: Option<&str>,
         now: &str,
     ) -> bool {
         let Some(session) = self
@@ -370,6 +371,9 @@ impl ConversationCatalog {
             if let Some(title) = automatic_title.filter(|title| !title.is_empty()) {
                 session.title = title.to_string();
             }
+        }
+        if let Some(profile_id) = profile_id {
+            session.profile_id = Some(profile_id.to_string());
         }
         session.updated_at = now.to_string();
         true
@@ -734,6 +738,31 @@ mod tests {
         let session = &public["sessions"][0];
         assert!(session.get("projectId").is_none());
         assert!(session.get("profileId").is_none());
+    }
+
+    #[test]
+    fn accepted_run_updates_the_catalog_profile_selection() {
+        let mut catalog = ConversationCatalog::default();
+        catalog.insert_session(ConversationSessionRecord {
+            id: "session:model-selection".to_string(),
+            title: "新对话".to_string(),
+            workspace_bindings: Vec::new(),
+            project_id: None,
+            profile_id: Some("profile:old".to_string()),
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
+        });
+
+        assert!(catalog.touch_session(
+            "session:model-selection",
+            Some("Keep the latest model"),
+            Some("profile:new"),
+            "later",
+        ));
+
+        let session = catalog.session("session:model-selection").unwrap();
+        assert_eq!(session.profile_id.as_deref(), Some("profile:new"));
+        assert_eq!(session.updated_at, "later");
     }
 
     #[test]

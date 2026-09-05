@@ -8,9 +8,11 @@ import React, {
 } from 'react';
 import type {
   ActivityProjection,
+  AssistantDraftBlockProjection,
   MessageFeedback,
   PlanResponse,
   PluginSelectionInput,
+  ProviderHostedActivityProjection,
   RunProjection,
   SessionProjection,
 } from '@deepcode/protocol';
@@ -21,7 +23,7 @@ import SessionModelSelector from '../../deepcode-gui/panel/SessionModelSelector'
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import { useSettingsStore } from '../../state/settingsStore';
 import { usePresentedCommittedContent } from '../../presentation/PresentationRuntime';
-import { BufferedMarkdown, MarkdownContent } from './BufferedMarkdown';
+import { BufferedMarkdown } from './BufferedMarkdown';
 import PlanCard from './PlanCard';
 import { shouldOfferFocusCommand, shouldSubmitComposerKey } from './composerKeyboard';
 import {
@@ -101,6 +103,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const submitting = useLocalAgentStore((state) => state.submitting);
   const catalogBusy = useLocalAgentStore((state) => state.catalogBusy);
   const error = useLocalAgentStore((state) => state.error);
+  const refreshProfiles = useLocalAgentStore((state) => state.refreshProfiles);
   const refresh = useLocalAgentStore((state) => state.refresh);
   const sendMessage = useLocalAgentStore((state) => state.sendMessage);
   const focusContext = useLocalAgentStore((state) => state.focusContext);
@@ -128,6 +131,14 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [uiActionError, setUiActionError] = useState<string | null>(null);
   const [, setProviderStreamCompletionRevision] = useState(0);
+
+  useEffect(() => {
+    const handleProfilesUpdated = () => {
+      void refreshProfiles();
+    };
+    window.addEventListener('deepcode:llm-profiles-updated', handleProfilesUpdated);
+    return () => window.removeEventListener('deepcode:llm-profiles-updated', handleProfilesUpdated);
+  }, [refreshProfiles]);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
@@ -168,9 +179,20 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     || t(language, 'agent.session.newTitle');
   const conversationItems = useMemo(() => projectionItems(projection), [projection]);
   const assistantDraft = projection?.assistantDraft ?? null;
-  const assistantDraftStreamIdentity = projection && assistantDraft
+  const legacyAssistantDraftStreamIdentity = projection && assistantDraft?.content
     ? providerStreamIdentity(projection.sessionId, assistantDraft.runId, assistantDraft.turnId)
     : null;
+  const orderedAssistantDraftItems = useMemo(
+    () => assistantDraftItems(assistantDraft),
+    [assistantDraft],
+  );
+  const assistantDraftLayoutKey = assistantDraft
+    ? `${assistantDraft.content.length}:${assistantDraft.orderedBlocks?.map((block) => (
+        `${block.outputIndex}:${block.kind}:${block.kind === 'providerHosted'
+          ? block.status
+          : block.content.length}`
+      )).join('|') ?? ''}`
+    : '';
   const projectionPollingActive = Boolean(
     projection?.run && ['running', 'waiting', 'releasing'].includes(projection.run.status),
   );
@@ -211,11 +233,17 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const committedProviderContent = (
     runId: string,
     providerRequestId: string,
+    outputIndex: number | undefined,
     content: string,
     committed: React.ReactNode,
   ): React.ReactNode => {
     if (!projection) throw new Error('conversation_projection_missing_for_committed_content');
-    const identity = providerStreamIdentity(projection.sessionId, runId, providerRequestId);
+    const identity = providerStreamIdentity(
+      projection.sessionId,
+      runId,
+      providerRequestId,
+      outputIndex,
+    );
     if (!transitioningProviderStreamsRef.current.has(identity)) return committed;
     return (
       <BufferedMarkdown
@@ -333,10 +361,20 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   }, [projectionPollingActive, refresh, sessionId]);
 
   useLayoutEffect(() => {
-    if (assistantDraftStreamIdentity && assistantDraft?.content) {
-      transitioningProviderStreamsRef.current.add(assistantDraftStreamIdentity);
+    if (legacyAssistantDraftStreamIdentity) {
+      transitioningProviderStreamsRef.current.add(legacyAssistantDraftStreamIdentity);
     }
-  }, [assistantDraft?.content, assistantDraftStreamIdentity]);
+    if (!projection || !assistantDraft?.orderedBlocks) return;
+    for (const block of assistantDraft.orderedBlocks) {
+      if (block.kind === 'providerHosted') continue;
+      transitioningProviderStreamsRef.current.add(providerStreamIdentity(
+        projection.sessionId,
+        assistantDraft.runId,
+        assistantDraft.turnId,
+        block.outputIndex,
+      ));
+    }
+  }, [assistantDraft, legacyAssistantDraftStreamIdentity, projection]);
 
   useLayoutEffect(() => {
     const previousKey = activeComposerStateKeyRef.current;
@@ -448,8 +486,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   useEffect(() => {
     if (followingLatest) scheduleScrollToLatest();
   }, [
-    assistantDraft?.content,
-    assistantDraft?.reasoningContent,
+    assistantDraftLayoutKey,
     followingLatest,
     scheduleScrollToLatest,
     timelineExtentKey,
@@ -1062,6 +1099,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                   ? committedProviderContent(
                       item.value.runId,
                       item.value.providerRequestId,
+                      item.outputIndex,
                       item.value.content,
                       presentation.content(`message:${item.value.messageId}:content`),
                     )
@@ -1139,6 +1177,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                 {committedProviderContent(
                   item.value.runId,
                   item.value.providerRequestId,
+                  item.outputIndex,
                   item.value.content,
                   presentation.content(`narrative:${item.value.narrativeId}`),
                 )}
@@ -1156,39 +1195,58 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
               activities={item.values}
               key={item.groupId}
               language={language}
+              onExpand={() => setLatestFollowMode(false)}
               onOpenWorkspaceResource={openWorkspaceResource}
             />
           ))}
-          {assistantDraft?.reasoningContent && (
-            <details className="local-agent__reasoning-draft">
-              <summary>
-                {!assistantDraft.content && (
-                  <span className="local-agent__run-spinner" aria-hidden="true" />
-                )}
-                <span role="status" aria-live="polite">
-                  {t(
-                    language,
-                    assistantDraft.content
-                      ? 'agent.reasoning.available'
-                      : 'agent.reasoning.running',
+          {orderedAssistantDraftItems.map((item) => item.type === 'text' ? (
+            <article
+              className={item.block.kind === 'narrative'
+                ? 'local-agent__narrative local-agent__narrative--draft'
+                : 'local-agent__message local-agent__message--assistant local-agent__message--draft'}
+              key={`draft:${item.block.outputIndex}`}
+            >
+              <div className={item.block.kind === 'narrative'
+                ? undefined
+                : 'local-agent__message-content'}
+              >
+                <BufferedMarkdown
+                  text={item.block.content}
+                  streamIdentity={providerStreamIdentity(
+                    projection!.sessionId,
+                    assistantDraft!.runId,
+                    assistantDraft!.turnId,
+                    item.block.outputIndex,
                   )}
-                </span>
-                <DeepCodeShellIcon name="chevronDown" />
-              </summary>
-              <div className="local-agent__reasoning-draft-content">
-                <MarkdownContent>{assistantDraft.reasoningContent}</MarkdownContent>
+                  initialVisibleLength={providerStreamProgressRef.current.get(
+                    providerStreamIdentity(
+                      projection!.sessionId,
+                      assistantDraft!.runId,
+                      assistantDraft!.turnId,
+                      item.block.outputIndex,
+                    ),
+                  ) ?? 0}
+                  onVisibleLengthChange={recordProviderStreamProgress}
+                />
               </div>
-            </details>
-          )}
-          {assistantDraft?.content && assistantDraftStreamIdentity && (
+            </article>
+          ) : (
+            <ProviderHostedDraftGroup
+              blocks={item.blocks}
+              key={item.groupId}
+              language={language}
+              onExpand={() => setLatestFollowMode(false)}
+            />
+          ))}
+          {assistantDraft?.content && legacyAssistantDraftStreamIdentity && (
             <article className="local-agent__message local-agent__message--assistant local-agent__message--draft">
               <div className="local-agent__message-content">
                 <BufferedMarkdown
-                  key={assistantDraftStreamIdentity}
+                  key={legacyAssistantDraftStreamIdentity}
                   text={assistantDraft.content}
-                  streamIdentity={assistantDraftStreamIdentity}
+                  streamIdentity={legacyAssistantDraftStreamIdentity}
                   initialVisibleLength={providerStreamProgressRef.current.get(
-                    assistantDraftStreamIdentity,
+                    legacyAssistantDraftStreamIdentity,
                   ) ?? 0}
                   onVisibleLengthChange={recordProviderStreamProgress}
                 />
@@ -1797,12 +1855,76 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
 interface ToolActivityGroupProps {
   activities: ActivityProjection[];
   language: UiLanguage;
+  onExpand(): void;
   onOpenWorkspaceResource(workspaceId: string, logicalPath: string): void;
 }
+
+interface ProviderHostedDraftGroupProps {
+  blocks: Array<Extract<AssistantDraftBlockProjection, { kind: 'providerHosted' }>>;
+  language: UiLanguage;
+  onExpand(): void;
+}
+
+const ProviderHostedDraftGroup: React.FC<ProviderHostedDraftGroupProps> = ({
+  blocks,
+  language,
+  onExpand,
+}) => {
+  const [expanded, setExpanded] = useState(false);
+  const failed = blocks.some((block) => block.status === 'failed');
+  const firstTarget = blocks.length === 1
+    ? providerHostedActionTarget(blocks[0]?.action)
+    : '';
+  const summary = blocks.length === 1
+    ? failed
+      ? firstTarget
+        ? t(language, 'agent.providerHosted.summary.didNotCompleteTarget', { target: firstTarget })
+        : t(language, 'agent.providerHosted.summary.didNotComplete')
+      : firstTarget
+        ? t(language, 'agent.providerHosted.summary.completedTarget', { target: firstTarget })
+        : t(language, 'agent.providerHosted.summary.completed')
+    : failed
+      ? t(language, 'agent.providerHosted.summary.didNotCompleteMany', { count: blocks.length })
+      : t(language, 'agent.providerHosted.summary.completedMany', { count: blocks.length });
+  return (
+    <article className={`local-agent__tool-group${expanded ? ' local-agent__tool-group--expanded' : ''}${failed ? ' local-agent__tool-group--failed' : ''}`}>
+      <button
+        type="button"
+        className="local-agent__tool-group-summary"
+        aria-expanded={expanded}
+        onClick={() => {
+          if (!expanded) onExpand();
+          setExpanded((current) => !current);
+        }}
+      >
+        <span className="local-agent__tool-group-icon">
+          <DeepCodeShellIcon name="search" />
+        </span>
+        <strong>{summary}</strong>
+        <span className="local-agent__tool-group-chevron" aria-hidden="true">
+          <DeepCodeShellIcon name="chevronRight" />
+        </span>
+      </button>
+      {expanded && (
+        <div className="local-agent__tool-group-items">
+          {blocks.map((block) => (
+            <ProviderHostedEntry
+              key={block.providerCallId}
+              hosted={block}
+              status={block.status}
+              language={language}
+            />
+          ))}
+        </div>
+      )}
+    </article>
+  );
+};
 
 const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
   activities,
   language,
+  onExpand,
   onOpenWorkspaceResource,
 }) => {
   const terminal = activities.every((activity) => isTerminalActivity(activity.status));
@@ -1813,15 +1935,22 @@ const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
   const groupStatus = toolGroupStatus(activities);
 
   return (
-    <article className={`local-agent__tool-group${hasFailure ? ' local-agent__tool-group--failed' : ''}`}>
+    <article className={`local-agent__tool-group${expanded ? ' local-agent__tool-group--expanded' : ''}${hasFailure ? ' local-agent__tool-group--failed' : ''}`}>
       <button
         type="button"
         className="local-agent__tool-group-summary"
         aria-expanded={expanded}
-        onClick={() => setExpanded((current) => !current)}
+        onClick={() => {
+          if (!expanded) onExpand();
+          setExpanded((current) => !current);
+        }}
       >
         <span className="local-agent__tool-group-icon">
-          <DeepCodeShellIcon name="tool" />
+          <DeepCodeShellIcon
+            name={activities.every((activity) => activity.kind === 'providerHosted')
+              ? 'search'
+              : 'tool'}
+          />
         </span>
         <strong>{toolGroupSummary(activities, language)}</strong>
         {groupStatus !== 'completed' && (
@@ -1847,6 +1976,59 @@ const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
   );
 };
 
+interface ProviderHostedEntryProps {
+  hosted: ProviderHostedActivityProjection;
+  status: ActivityProjection['status'];
+  language: UiLanguage;
+}
+
+const ProviderHostedEntry: React.FC<ProviderHostedEntryProps> = ({ hosted, status, language }) => {
+  const actionType = providerHostedActionType(hosted.action);
+  const fieldLabels: Record<string, string> = {
+    queries: 'agent.providerHosted.detail.queries',
+    query: 'agent.providerHosted.detail.queries',
+    url: 'agent.providerHosted.detail.url',
+    pattern: 'agent.providerHosted.detail.pattern',
+    sources: 'agent.providerHosted.detail.sources',
+  };
+  return (
+    <div className={`local-agent__tool-entry local-agent__tool-entry--${status}`}>
+      <div className="local-agent__tool-entry-details">
+        <dl>
+          <div>
+            <dt>{t(language, 'agent.providerHosted.detail.status')}</dt>
+            <dd>{toolActivityStatus(status, language)}</dd>
+          </div>
+          {actionType && (
+            <div>
+              <dt>{t(language, 'agent.providerHosted.detail.action')}</dt>
+              <dd><code>{actionType}</code></dd>
+            </div>
+          )}
+          {Object.entries(hosted.action).filter(([field]) => field !== 'type').map(([field, value]) => (
+            <div key={field}>
+              <dt>{fieldLabels[field] ? t(language, fieldLabels[field]) : field}</dt>
+              <dd><code>{typeof value === 'string'
+                ? value
+                : Array.isArray(value) && value.every((item) => typeof item === 'string')
+                  ? value.join('\n')
+                  : JSON.stringify(value, null, 2)}</code></dd>
+            </div>
+          ))}
+          <div>
+            <dt>{t(language, 'agent.providerHosted.detail.providerTool')}</dt>
+            <dd><code>{hosted.providerToolType}</code></dd>
+          </div>
+          <div>
+            <dt>{t(language, 'agent.providerHosted.detail.providerCallId')}</dt>
+            <dd><code>{hosted.providerCallId}</code></dd>
+          </div>
+        </dl>
+      </div>
+    </div>
+  );
+};
+
 interface ToolActivityEntryProps {
   activity: ActivityProjection;
   language: UiLanguage;
@@ -1862,6 +2044,15 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
   const tool = activity.tool;
   const shell = tool?.shell;
   const result = shell?.result;
+  if (activity.providerHosted) {
+    return (
+      <ProviderHostedEntry
+        hosted={activity.providerHosted}
+        status={activity.status}
+        language={language}
+      />
+    );
+  }
   return (
     <div className={`local-agent__tool-entry local-agent__tool-entry--${activity.status}`}>
       <button
@@ -2024,8 +2215,18 @@ function samePlanReference(
 }
 
 type ProjectionItem =
-  | { type: 'message'; sequence: number; value: SessionProjection['messages'][number] }
-  | { type: 'narrative'; sequence: number; value: SessionProjection['narratives'][number] }
+  | {
+      type: 'message';
+      sequence: number;
+      outputIndex?: number;
+      value: SessionProjection['messages'][number];
+    }
+  | {
+      type: 'narrative';
+      sequence: number;
+      outputIndex?: number;
+      value: SessionProjection['narratives'][number];
+    }
   | { type: 'plan'; sequence: number; value: SessionProjection['plans'][number] }
   | {
       type: 'toolGroup';
@@ -2033,6 +2234,44 @@ type ProjectionItem =
       groupId: string;
       values: ActivityProjection[];
     };
+
+type AssistantDraftItem =
+  | {
+      type: 'text';
+      block: Exclude<AssistantDraftBlockProjection, { kind: 'providerHosted' }>;
+    }
+  | {
+      type: 'providerHostedGroup';
+      groupId: string;
+      blocks: Array<Extract<AssistantDraftBlockProjection, { kind: 'providerHosted' }>>;
+    };
+
+function assistantDraftItems(
+  draft: SessionProjection['assistantDraft'],
+): AssistantDraftItem[] {
+  if (!draft?.orderedBlocks) return [];
+  const items: AssistantDraftItem[] = [];
+  let hostedBlocks: Array<Extract<AssistantDraftBlockProjection, { kind: 'providerHosted' }>> = [];
+  const flushHostedBlocks = (): void => {
+    if (hostedBlocks.length === 0) return;
+    items.push({
+      type: 'providerHostedGroup',
+      groupId: `draft-hosted:${draft.turnId}:${hostedBlocks[0]!.outputIndex}`,
+      blocks: hostedBlocks,
+    });
+    hostedBlocks = [];
+  };
+  for (const block of draft.orderedBlocks) {
+    if (block.kind !== 'providerHosted') {
+      flushHostedBlocks();
+      items.push({ type: 'text', block });
+      continue;
+    }
+    hostedBlocks.push(block);
+  }
+  flushHostedBlocks();
+  return items;
+}
 
 function projectionItems(projection: SessionProjection | null): ProjectionItem[] {
   if (!projection) return [];
@@ -2042,6 +2281,7 @@ function projectionItems(projection: SessionProjection | null): ProjectionItem[]
         return {
           type: 'message',
           sequence: item.sequence,
+          ...(item.outputIndex !== undefined ? { outputIndex: item.outputIndex } : {}),
           value: requiredProjectionValue(
             projection.messages,
             (message) => message.messageId === item.messageId,
@@ -2052,6 +2292,7 @@ function projectionItems(projection: SessionProjection | null): ProjectionItem[]
         return {
           type: 'narrative',
           sequence: item.sequence,
+          ...(item.outputIndex !== undefined ? { outputIndex: item.outputIndex } : {}),
           value: requiredProjectionValue(
             projection.narratives,
             (narrative) => narrative.narrativeId === item.narrativeId,
@@ -2098,6 +2339,22 @@ function toolGroupSummary(
   language: UiLanguage,
 ): string {
   const status = toolGroupStatus(activities);
+  if (activities.every((activity) => activity.kind === 'providerHosted')) {
+    if (activities.length === 1) return toolActivitySummary(activities[0], language);
+    if (status === 'completed') {
+      return t(language, 'agent.providerHosted.summary.completedMany', {
+        count: activities.length,
+      });
+    }
+    if (['failed', 'cancelled', 'indeterminate', 'denied'].includes(status)) {
+      return t(language, 'agent.providerHosted.summary.didNotCompleteMany', {
+        count: activities.length,
+      });
+    }
+    return t(language, 'agent.providerHosted.summary.activeMany', {
+      count: activities.length,
+    });
+  }
   const operation = activities.length === 1
     ? (activities[0].tool?.operation ?? activities[0].label)
     : null;
@@ -2134,6 +2391,23 @@ function toolGroupSummary(
 }
 
 function toolActivitySummary(activity: ActivityProjection, language: UiLanguage): string {
+  if (activity.kind === 'providerHosted' && activity.providerHosted) {
+    const target = providerHostedActionTarget(activity.providerHosted.action);
+    const failed = ['failed', 'denied', 'indeterminate', 'cancelled'].includes(activity.status);
+    if (activity.status === 'completed') {
+      return target
+        ? t(language, 'agent.providerHosted.summary.completedTarget', { target })
+        : t(language, 'agent.providerHosted.summary.completed');
+    }
+    if (failed) {
+      return target
+        ? t(language, 'agent.providerHosted.summary.didNotCompleteTarget', { target })
+        : t(language, 'agent.providerHosted.summary.didNotComplete');
+    }
+    return target
+      ? t(language, 'agent.providerHosted.summary.activeTarget', { target })
+      : t(language, 'agent.providerHosted.summary.active');
+  }
   const operation = activity.tool?.operation ?? activity.label;
   const target = activity.tool?.resources[0]?.label;
   const command = activity.tool?.shell?.command;
@@ -2168,6 +2442,25 @@ function toolActivitySummary(activity: ActivityProjection, language: UiLanguage)
     operation,
     target: target ? ` · ${target}` : '',
   });
+}
+
+function providerHostedActionType(action: Record<string, unknown> | undefined): string {
+  return typeof action?.type === 'string' ? action.type : '';
+}
+
+function providerHostedActionTarget(action: Record<string, unknown> | undefined): string {
+  if (!action) return '';
+  if (Array.isArray(action.queries)) {
+    const queries = action.queries.filter((query): query is string => (
+      typeof query === 'string' && query.length > 0
+    ));
+    if (queries.length > 0) return queries.join(' · ');
+  }
+  for (const field of ['query', 'url', 'pattern']) {
+    const value = action[field];
+    if (typeof value === 'string' && value) return value;
+  }
+  return '';
 }
 
 function isFileMutationOperation(operation: string | undefined): boolean {
@@ -2229,8 +2522,11 @@ function providerStreamIdentity(
   sessionId: string,
   runId: string,
   providerRequestId: string,
+  outputIndex?: number,
 ): string {
-  return `${sessionId}\u0000${runId}\u0000${providerRequestId}`;
+  return outputIndex === undefined
+    ? `${sessionId}\u0000${runId}\u0000${providerRequestId}`
+    : `${sessionId}\u0000${runId}\u0000${providerRequestId}\u0000${outputIndex}`;
 }
 
 function nextPanelId(kind: string): string {

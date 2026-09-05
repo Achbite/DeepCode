@@ -1,4 +1,5 @@
 import type {
+  AssistantDraftBlockProjection,
   AssistantDraftProjection,
   ExecutionPlan,
   JsonObject,
@@ -10,6 +11,7 @@ import type {
   PlanOperation,
   ProviderTokenUsage,
   ProviderEvent,
+  ProviderOutputBlock,
   ProviderRequest,
   RunSettlement,
   RunRuntimeSnapshot,
@@ -89,6 +91,7 @@ export interface AgentLoopDeps {
 
 type ProviderTurnCommon = {
   completion: ProviderTurnCompletion;
+  narratives?: Array<{ narrativeId: string; content: string }>;
   contextUsage?: ProviderTokenUsage & {
     providerRequestId: string;
     providerRuntimeRef: string;
@@ -102,7 +105,24 @@ interface ProviderTurnCompletion {
   orderedCallIds: string[];
   reasoningContent?: string;
   reasoningSignature?: string;
+  hostedWebSearchCalls?: JsonObject[];
+  orderedOutputBlocks?: ProviderOutputBlock[];
 }
+
+type DecodedProviderOutputBlock = {
+  outputIndex: number;
+  item: JsonObject;
+} & (
+  | { kind: 'reasoning'; content: string }
+  | { kind: 'message'; content: string }
+  | {
+      kind: 'toolCall';
+      providerCallId: string;
+      name: string;
+      input: Record<string, unknown>;
+    }
+  | { kind: 'providerHosted'; providerCallId: string }
+);
 
 interface ExpectedToolRecordIdentity {
   sessionId: string;
@@ -385,14 +405,20 @@ export async function runAgentLoop(
       );
       const providerCallFacts: NewSessionEvent[] = [];
       const completionDerivedFacts: NewSessionEvent[] = [];
-      if ('narrative' in turn && turn.narrative) {
+      const turnNarratives = [
+        ...(turn.narratives ?? []),
+        ...('narrative' in turn && turn.narrative
+          ? [{ narrativeId: deps.nextId('narrative'), content: turn.narrative }]
+          : []),
+      ];
+      for (const narrative of turnNarratives) {
         completionDerivedFacts.push({
           type: 'narrative.committed',
           sessionId: snapshot.state.sessionId,
           runId,
           payload: {
-            narrativeId: deps.nextId('narrative'),
-            content: turn.narrative,
+            narrativeId: narrative.narrativeId,
+            content: narrative.content,
             providerRequestId: turn.completion.providerRequestId,
           },
         });
@@ -669,11 +695,12 @@ export async function runAgentLoop(
     }
     const unknownTurn = uncompletedProviderComposition(snapshot, runId);
     if (unknownTurn && !hasSettlement(snapshot.events, runId)) {
+      const cause = localAgentError(error);
       const settlement: RunSettlement = {
         outcome: 'indeterminate',
         error: {
           code: 'provider_turn_outcome_unknown',
-          message: `Provider request ${unknownTurn.providerRequestId} 的完成结果不可判定。`,
+          message: `Provider request ${unknownTurn.providerRequestId} 的完成结果不可判定；原始错误 ${cause.code}：${cause.message}`,
         },
       };
       await commit([
@@ -784,6 +811,7 @@ async function consumeCompactionProvider(
 }> {
   let deltas = '';
   let completeMessage: Extract<ProviderEvent, { type: 'assistant.message' }>['data'] | undefined;
+  const orderedOutputItems: Array<{ outputIndex: number; item: JsonObject }> = [];
   let contextUsage: ProviderTokenUsage | undefined;
   let completed = false;
   for await (const event of deps.composition.provider.stream(request, signal)) {
@@ -800,6 +828,33 @@ async function consumeCompactionProvider(
         break;
       case 'reasoning.delta':
         break;
+      case 'output.item.completed':
+        if (
+          orderedOutputItems.at(-1)?.outputIndex !== undefined
+          && event.data.outputIndex <= orderedOutputItems.at(-1)!.outputIndex
+        ) {
+          throw new LoopFailure(
+            'provider_output_item_order_invalid',
+            '上下文压缩 output item 没有按原生 output_index 递增返回。',
+          );
+        }
+        if (event.data.item.type === 'function_call') {
+          throw new LoopFailure(
+            'context_compaction_tool_call_invalid',
+            '上下文压缩请求不能调用工具或 Session control。',
+          );
+        }
+        if (event.data.item.type === 'web_search_call') {
+          throw new LoopFailure(
+            'context_compaction_hosted_tool_invalid',
+            '上下文压缩请求不能调用 Provider hosted search。',
+          );
+        }
+        orderedOutputItems.push({
+          outputIndex: event.data.outputIndex,
+          item: structuredClone(event.data.item),
+        });
+        break;
       case 'assistant.message':
         if (completeMessage !== undefined) {
           throw new LoopFailure(
@@ -814,6 +869,11 @@ async function consumeCompactionProvider(
           'context_compaction_tool_call_invalid',
           '上下文压缩请求不能调用工具或 Session control。',
         );
+      case 'hosted.web-search.completed':
+        throw new LoopFailure(
+          'context_compaction_hosted_tool_invalid',
+          '上下文压缩请求不能调用 Provider hosted search。',
+        );
       case 'completed':
         contextUsage = decodeContextUsage(event.data);
         completed = true;
@@ -825,10 +885,34 @@ async function consumeCompactionProvider(
   if (!completed) {
     throw new LoopFailure('provider_stream_incomplete', '上下文压缩 Provider 流未产生完成事件。');
   }
+  if (orderedOutputItems.length > 0 && completeMessage !== undefined) {
+    throw new LoopFailure(
+      'provider_output_contract_mixed',
+      '上下文压缩同一 turn 混用了有序 output item 与聚合完成事件。',
+    );
+  }
   if (completeMessage !== undefined && deltas && completeMessage.content !== deltas) {
     throw new LoopFailure('provider_message_mismatch', '上下文压缩最终消息与流式文本不一致。');
   }
-  const summary = (completeMessage?.content ?? deltas).trim();
+  const orderedMessages = orderedOutputItems.flatMap((output) => (
+    output.item.type === 'message'
+      ? [providerOutputItemText(output.item, 'output_text', true)]
+      : []
+  ));
+  if (orderedMessages.length > 1) {
+    throw new LoopFailure(
+      'context_compaction_message_count_invalid',
+      '上下文压缩必须只产生一个最终消息。',
+    );
+  }
+  const orderedSummary = orderedMessages[0];
+  if (orderedSummary !== undefined && deltas && orderedSummary !== deltas) {
+    throw new LoopFailure(
+      'provider_output_text_mismatch',
+      '上下文压缩有序 message item 与流式文本不一致。',
+    );
+  }
+  const summary = (orderedSummary ?? completeMessage?.content ?? deltas).trim();
   if (!summary) {
     throw new LoopFailure('context_compaction_empty', '上下文压缩没有产生摘要。');
   }
@@ -890,6 +974,9 @@ async function consumeProvider(
     name: string;
     input: Record<string, unknown>;
   }> = [];
+  const hostedWebSearchCalls: JsonObject[] = [];
+  const orderedOutputItems: Array<{ outputIndex: number; item: JsonObject }> = [];
+  const streamedTextByOutputIndex = new Map<number, string>();
   let contextUsage: ProviderTokenUsage | undefined;
   let completed = false;
   for await (const event of deps.composition.provider.stream(request, signal)) {
@@ -903,22 +990,66 @@ async function consumeProvider(
     switch (event.type) {
       case 'reasoning.delta': {
         reasoningDeltas += event.data.text;
-        deps.updateAssistantDraft({
-          runId,
-          turnId: request.requestId,
-          content: deltas,
-          reasoningContent: reasoningDeltas,
-        });
         break;
       }
       case 'text.delta': {
         deltas += event.data.text;
-        deps.updateAssistantDraft({
-          runId,
-          turnId: request.requestId,
-          content: deltas,
-          ...(reasoningDeltas ? { reasoningContent: reasoningDeltas } : {}),
+        if (event.data.outputIndex !== undefined) {
+          if (orderedOutputItems.some((output) => output.outputIndex === event.data.outputIndex)) {
+            throw new LoopFailure(
+              'provider_output_delta_after_completion',
+              'Provider 在 output item 完成后继续发送该 item 的正文增量。',
+            );
+          }
+          streamedTextByOutputIndex.set(
+            event.data.outputIndex,
+            `${streamedTextByOutputIndex.get(event.data.outputIndex) ?? ''}${event.data.text}`,
+          );
+          deps.updateAssistantDraft({
+            runId,
+            turnId: request.requestId,
+            content: '',
+            orderedBlocks: assistantDraftBlocks(
+              orderedOutputItems,
+              toolCodec,
+              streamedTextByOutputIndex,
+            ),
+          });
+        } else if (orderedOutputItems.length === 0) {
+          deps.updateAssistantDraft({
+            runId,
+            turnId: request.requestId,
+            content: deltas,
+          });
+        }
+        break;
+      }
+      case 'output.item.completed': {
+        const previous = orderedOutputItems.at(-1);
+        if (previous && event.data.outputIndex <= previous.outputIndex) {
+          throw new LoopFailure(
+            'provider_output_item_order_invalid',
+            'Provider output item 没有按原生 output_index 递增返回。',
+          );
+        }
+        orderedOutputItems.push({
+          outputIndex: event.data.outputIndex,
+          item: structuredClone(event.data.item),
         });
+        streamedTextByOutputIndex.delete(event.data.outputIndex);
+        const orderedBlocks = assistantDraftBlocks(
+          orderedOutputItems,
+          toolCodec,
+          streamedTextByOutputIndex,
+        );
+        deps.updateAssistantDraft(orderedBlocks.length > 0
+          ? {
+              runId,
+              turnId: request.requestId,
+              content: '',
+              orderedBlocks,
+            }
+          : null);
         break;
       }
       case 'assistant.message':
@@ -945,6 +1076,9 @@ async function consumeProvider(
         });
         break;
       }
+      case 'hosted.web-search.completed':
+        hostedWebSearchCalls.push(structuredClone(event.data.item));
+        break;
       case 'completed':
         contextUsage = decodeContextUsage(event.data);
         completed = true;
@@ -954,6 +1088,15 @@ async function consumeProvider(
     }
   }
   if (!completed) throw new LoopFailure('provider_stream_incomplete', 'Provider 流未产生完成事件。');
+  if (
+    orderedOutputItems.length > 0
+    && (completeMessage !== undefined || providerCalls.length > 0 || hostedWebSearchCalls.length > 0)
+  ) {
+    throw new LoopFailure(
+      'provider_output_contract_mixed',
+      'Provider 同一 turn 混用了有序 output item 与聚合完成事件。',
+    );
+  }
   if (completeMessage) {
     if (
       completeMessage.reasoningContent !== undefined
@@ -1001,17 +1144,49 @@ async function consumeProvider(
           runId,
           turnId: request.requestId,
           content: deltas,
-          ...(completeMessage.reasoningContent !== undefined
-            ? { reasoningContent: completeMessage.reasoningContent }
-            : {}),
         });
       }
     }
   }
 
-  const reasoningContent = completeMessage?.reasoningContent ?? (
-    reasoningDeltas || undefined
-  );
+  const decodedOutputBlocks = orderedOutputItems.map((output) => (
+    decodeProviderOutputBlock(output, toolCodec)
+  ));
+  if (decodedOutputBlocks.length > 0) {
+    const outputText = decodedOutputBlocks
+      .filter((block): block is Extract<DecodedProviderOutputBlock, { kind: 'message' }> => (
+        block.kind === 'message'
+      ))
+      .map((block) => block.content)
+      .join('');
+    if (deltas && outputText !== deltas) {
+      throw new LoopFailure(
+        'provider_output_text_mismatch',
+        'Provider 有序 message items 与流式文本不一致。',
+      );
+    }
+    if (!deltas && outputText) {
+      deltas = outputText;
+    }
+    for (const block of decodedOutputBlocks) {
+      if (block.kind === 'toolCall') {
+        providerCalls.push({
+          providerCallId: block.providerCallId,
+          name: block.name,
+          input: block.input,
+        });
+      }
+    }
+  }
+
+  const orderedReasoningContent = decodedOutputBlocks
+    .filter((block): block is Extract<DecodedProviderOutputBlock, { kind: 'reasoning' }> => (
+      block.kind === 'reasoning'
+    ))
+    .map((block) => block.content)
+    .join('');
+  const reasoningContent = completeMessage?.reasoningContent
+    ?? (orderedReasoningContent || reasoningDeltas || undefined);
 
   const usage = contextUsage
     ? {
@@ -1022,7 +1197,7 @@ async function consumeProvider(
         },
       }
     : {};
-  const narrative = deltas.trim() ? deltas : undefined;
+  const narrative = decodedOutputBlocks.length === 0 && deltas.trim() ? deltas : undefined;
   const seenCalls = new Set<string>();
   for (const call of providerCalls) {
     if (!call.providerCallId || seenCalls.has(call.providerCallId)) {
@@ -1032,6 +1207,27 @@ async function consumeProvider(
       );
     }
     seenCalls.add(call.providerCallId);
+  }
+  const seenHostedSearchCalls = new Set<string>();
+  for (const item of hostedWebSearchCalls) {
+    const callId = typeof item.id === 'string' ? item.id : '';
+    if (!callId || seenHostedSearchCalls.has(callId)) {
+      throw new LoopFailure(
+        'provider_hosted_search_call_duplicate',
+        'Provider hosted search 调用标识为空或重复。',
+      );
+    }
+    seenHostedSearchCalls.add(callId);
+  }
+  for (const block of decodedOutputBlocks) {
+    if (block.kind !== 'providerHosted') continue;
+    if (seenHostedSearchCalls.has(block.providerCallId)) {
+      throw new LoopFailure(
+        'provider_hosted_search_call_duplicate',
+        'Provider hosted search 调用标识为空或重复。',
+      );
+    }
+    seenHostedSearchCalls.add(block.providerCallId);
   }
   const logicalCallIds = new Set<string>();
   const calls = providerCalls.map((call) => {
@@ -1050,6 +1246,79 @@ async function consumeProvider(
       input: call.input,
     };
   });
+  const logicalCallByProviderCallId = new Map(calls.map((call) => (
+    [call.providerCallId, call.callId] as const
+  )));
+  const orderedMessageBlocks = decodedOutputBlocks.filter(
+    (block): block is Extract<DecodedProviderOutputBlock, { kind: 'message' }> => (
+      block.kind === 'message'
+    ),
+  );
+  const finalOrderedMessage = calls.length === 0 ? orderedMessageBlocks.at(-1) : undefined;
+  if (decodedOutputBlocks.length > 0 && calls.length === 0 && !finalOrderedMessage) {
+    throw new LoopFailure(
+      'provider_answer_empty',
+      'Provider 有序 output items 没有产生最终答复消息。',
+    );
+  }
+  const orderedNarratives: Array<{ narrativeId: string; content: string }> = [];
+  let orderedFinalMessage: { messageId: string; content: string } | undefined;
+  const orderedOutputBlocks = decodedOutputBlocks.map((block): ProviderOutputBlock => {
+    switch (block.kind) {
+      case 'reasoning':
+        return {
+          outputIndex: block.outputIndex,
+          kind: 'reasoning',
+          item: structuredClone(block.item),
+        };
+      case 'message': {
+        if (block.outputIndex === finalOrderedMessage?.outputIndex) {
+          const messageId = deps.nextId('message');
+          orderedFinalMessage = { messageId, content: block.content };
+          return {
+            outputIndex: block.outputIndex,
+            kind: 'finalMessage',
+            messageId,
+            item: structuredClone(block.item),
+          };
+        }
+        const narrativeId = deps.nextId('narrative');
+        orderedNarratives.push({ narrativeId, content: block.content });
+        return {
+          outputIndex: block.outputIndex,
+          kind: 'narrative',
+          narrativeId,
+          item: structuredClone(block.item),
+        };
+      }
+      case 'toolCall': {
+        const callId = logicalCallByProviderCallId.get(block.providerCallId);
+        if (!callId) {
+          throw new LoopFailure(
+            'provider_turn_call_fact_mismatch',
+            'Provider output toolCall 缺少对应的 Session LogicalCallId。',
+          );
+        }
+        return {
+          outputIndex: block.outputIndex,
+          kind: 'toolCall',
+          callId,
+          providerCallId: block.providerCallId,
+          toolName: block.name,
+          item: structuredClone(block.item),
+        };
+      }
+      case 'providerHosted':
+        return {
+          outputIndex: block.outputIndex,
+          kind: 'providerHosted',
+          activityId: deps.nextId('activity'),
+          providerCallId: block.providerCallId,
+          providerToolType: 'web_search',
+          item: structuredClone(block.item),
+        };
+    }
+  });
   const completion: ProviderTurnCompletion = {
     providerRequestId: request.requestId,
     purpose: 'agent',
@@ -1060,6 +1329,12 @@ async function consumeProvider(
       : {}),
     ...(completeMessage?.reasoningSignature !== undefined
       ? { reasoningSignature: completeMessage.reasoningSignature }
+      : {}),
+    ...(hostedWebSearchCalls.length > 0
+      ? { hostedWebSearchCalls }
+      : {}),
+    ...(orderedOutputBlocks.length > 0
+      ? { orderedOutputBlocks }
       : {}),
   };
 
@@ -1088,6 +1363,7 @@ async function consumeProvider(
           error: { code: error.code, message: error.message },
         },
         ...(narrative ? { narrative } : {}),
+        ...(orderedNarratives.length > 0 ? { narratives: orderedNarratives } : {}),
         ...usage,
         completion,
       };
@@ -1106,7 +1382,11 @@ async function consumeProvider(
     );
   }
 
-  const common = { ...usage, completion };
+  const common = {
+    ...usage,
+    completion,
+    ...(orderedNarratives.length > 0 ? { narratives: orderedNarratives } : {}),
+  };
   const control = blockingControls[0];
   if (control?.kind === 'interaction') {
     const interactionId = deps.nextId('interaction');
@@ -1144,7 +1424,10 @@ async function consumeProvider(
       ...common,
     };
   }
-  if (!narrative) {
+  const answer = orderedFinalMessage ?? (narrative
+    ? { content: narrative, messageId: completeMessage?.messageId }
+    : undefined);
+  if (!answer) {
     throw new LoopFailure(
       'provider_answer_empty',
       'Provider turn 正常结束，但没有产生最终答复文本。',
@@ -1152,10 +1435,208 @@ async function consumeProvider(
   }
   return {
     kind: 'answer',
-    content: narrative,
-    ...(completeMessage ? { messageId: completeMessage.messageId } : {}),
+    content: answer.content,
+    ...(answer.messageId ? { messageId: answer.messageId } : {}),
     ...common,
   };
+}
+
+function decodeProviderOutputBlock(
+  output: { outputIndex: number; item: JsonObject },
+  toolCodec: ProviderToolCodec,
+): DecodedProviderOutputBlock {
+  const item = structuredClone(output.item);
+  switch (item.type) {
+    case 'reasoning':
+      return {
+        outputIndex: output.outputIndex,
+        kind: 'reasoning',
+        content: providerOutputItemText(item, 'reasoning_text', false),
+        item,
+      };
+    case 'message': {
+      if (item.role !== 'assistant') {
+        throw new LoopFailure(
+          'provider_output_message_invalid',
+          'Provider output message 不是 assistant 消息。',
+        );
+      }
+      return {
+        outputIndex: output.outputIndex,
+        kind: 'message',
+        content: providerOutputItemText(item, 'output_text', true),
+        item,
+      };
+    }
+    case 'function_call': {
+      const providerCallId = typeof item.call_id === 'string' ? item.call_id : '';
+      const wireName = typeof item.name === 'string' ? item.name : '';
+      const canonicalName = toolCodec.canonicalByWire.get(wireName);
+      if (!providerCallId || !wireName || !canonicalName || typeof item.arguments !== 'string') {
+        throw new LoopFailure(
+          canonicalName ? 'provider_tool_call_invalid' : 'provider_tool_alias_unknown',
+          canonicalName
+            ? 'Provider function_call 终态事实无效。'
+            : `Provider 返回了当前 run 未声明的工具别名：${wireName}`,
+        );
+      }
+      let input: unknown;
+      try {
+        input = JSON.parse(item.arguments);
+      } catch {
+        throw new LoopFailure(
+          'provider_tool_call_arguments_invalid',
+          'Provider function_call arguments 不是有效 JSON。',
+        );
+      }
+      if (!isRecord(input)) {
+        throw new LoopFailure(
+          'provider_tool_call_arguments_invalid',
+          'Provider function_call arguments 必须是 JSON 对象。',
+        );
+      }
+      return {
+        outputIndex: output.outputIndex,
+        kind: 'toolCall',
+        providerCallId,
+        name: canonicalName,
+        input: decodeProviderToolInput(toolCodec, canonicalName, input),
+        item,
+      };
+    }
+    case 'web_search_call': {
+      const providerCallId = typeof item.id === 'string' ? item.id : '';
+      if (
+        !providerCallId
+        || item.status !== 'completed' && item.status !== 'failed'
+        || !isRecord(item.action)
+      ) {
+        throw new LoopFailure(
+          'provider_hosted_search_item_invalid',
+          'Provider hosted search 终态事实无效。',
+        );
+      }
+      return {
+        outputIndex: output.outputIndex,
+        kind: 'providerHosted',
+        providerCallId,
+        item,
+      };
+    }
+    default:
+      throw new LoopFailure(
+        'provider_output_item_type_unsupported',
+        `Provider 返回了当前合同未支持的 output item 类型：${String(item.type)}`,
+      );
+  }
+}
+
+function assistantDraftBlocks(
+  outputs: readonly { outputIndex: number; item: JsonObject }[],
+  toolCodec: ProviderToolCodec,
+  streamedTextByOutputIndex: ReadonlyMap<number, string> = new Map(),
+): AssistantDraftBlockProjection[] {
+  const blocks = outputs.flatMap((output): AssistantDraftBlockProjection[] => {
+    const block = decodeProviderOutputBlock(output, toolCodec);
+    switch (block.kind) {
+      case 'reasoning':
+      case 'toolCall':
+        return [];
+      case 'message': {
+        const phase = block.item.phase;
+        if (phase !== undefined && phase !== null && typeof phase !== 'string') {
+          throw new LoopFailure(
+            'provider_output_message_phase_invalid',
+            'Provider output message 的 phase 不是字符串。',
+          );
+        }
+        const kind = phase === 'commentary'
+          ? 'narrative'
+          : phase === 'final_answer'
+            ? 'finalMessage'
+            : phase === undefined || phase === null
+              ? 'message'
+              : undefined;
+        if (!kind) {
+          throw new LoopFailure(
+            'provider_output_message_phase_unsupported',
+            `Provider output message 返回了当前合同未支持的 phase：${phase}`,
+          );
+        }
+        return [{
+          outputIndex: block.outputIndex,
+          kind,
+          content: block.content,
+        }];
+      }
+      case 'providerHosted': {
+        const status = block.item.status;
+        const action = block.item.action;
+        if (
+          status !== 'completed'
+          && status !== 'failed'
+          || !isRecord(action)
+        ) {
+          throw new LoopFailure(
+            'provider_hosted_search_item_invalid',
+            'Provider hosted search 终态事实无效。',
+          );
+        }
+        return [{
+          outputIndex: block.outputIndex,
+          kind: 'providerHosted',
+          providerCallId: block.providerCallId,
+          providerToolType: 'web_search',
+          status,
+          action: structuredClone(action),
+        }];
+      }
+    }
+  });
+  const completedOutputIndexes = new Set(outputs.map((output) => output.outputIndex));
+  for (const [outputIndex, content] of streamedTextByOutputIndex) {
+    if (completedOutputIndexes.has(outputIndex)) {
+      throw new LoopFailure(
+        'provider_output_delta_after_completion',
+        'Provider 在 output item 完成后继续发送该 item 的正文增量。',
+      );
+    }
+    blocks.push({ outputIndex, kind: 'message', content });
+  }
+  return blocks.sort((left, right) => left.outputIndex - right.outputIndex);
+}
+
+function providerOutputItemText(
+  item: JsonObject,
+  partType: 'output_text' | 'reasoning_text',
+  required: boolean,
+): string {
+  const parts = item.content;
+  if (!Array.isArray(parts)) {
+    if (!required && parts === undefined) return '';
+    throw new LoopFailure(
+      'provider_output_item_content_invalid',
+      'Provider output item content 不是数组。',
+    );
+  }
+  let text = '';
+  for (const part of parts) {
+    if (!isRecord(part) || part.type !== partType) continue;
+    if (typeof part.text !== 'string') {
+      throw new LoopFailure(
+        'provider_output_item_content_invalid',
+        'Provider output item 文本 part 缺少 text。',
+      );
+    }
+    text += part.text;
+  }
+  if (required && !text.trim()) {
+    throw new LoopFailure(
+      'provider_output_item_content_invalid',
+      'Provider output message 没有可显示正文。',
+    );
+  }
+  return text;
 }
 
 function selectedPlanAuthorities(events: readonly SessionEvent[]): PlanAuthority[] {
@@ -1768,6 +2249,20 @@ function providerTurnSettledEvent(
         : {}),
       ...(completion.reasoningSignature !== undefined
         ? { reasoningSignature: completion.reasoningSignature }
+        : {}),
+      ...(completion.hostedWebSearchCalls !== undefined
+        ? {
+            hostedWebSearchCalls: completion.hostedWebSearchCalls
+              .map((item) => structuredClone(item)),
+          }
+        : {}),
+      ...(completion.orderedOutputBlocks !== undefined
+        ? {
+            orderedOutputBlocks: completion.orderedOutputBlocks.map((block) => ({
+              ...block,
+              item: structuredClone(block.item),
+            })),
+          }
         : {}),
     },
   };

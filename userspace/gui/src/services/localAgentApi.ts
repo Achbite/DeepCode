@@ -3,6 +3,8 @@ import type {
   ConversationCatalog,
   ConversationCatalogManagement,
   ConversationCommand,
+  ContextCompositionMessageBlock,
+  ContextCompositionTool,
   FilesystemReference,
   PluginCatalogProjection,
   SessionProjection,
@@ -23,6 +25,23 @@ interface ApiEnvelope<T> {
 }
 
 const API_BASE = getKernelApiBase();
+
+const CONTEXT_TOOL_ORIGINS: Readonly<Record<ContextCompositionTool['origin'], true>> = {
+  coreBuiltin: true,
+  extension: true,
+  sessionControl: true,
+  providerHosted: true,
+};
+
+const CONTEXT_MESSAGE_BLOCK_KINDS: Readonly<
+  Record<ContextCompositionMessageBlock['kind'], true>
+> = {
+  text: true,
+  reasoning: true,
+  toolCall: true,
+  toolResult: true,
+  hostedWebSearch: true,
+};
 
 export interface ConversationResourceReadResult {
   workspaceId: string;
@@ -340,14 +359,22 @@ function isTimelineItem(value: unknown): boolean {
   }
   switch (value.kind) {
     case 'message':
-      return isExactRecord(value, ['kind', 'timelineId', 'sequence', 'messageId'])
-        && isIdentifier(value.messageId);
+      return isExactRecord(
+        value,
+        ['kind', 'timelineId', 'sequence', 'messageId'],
+        ['outputIndex'],
+      )
+        && isIdentifier(value.messageId)
+        && (value.outputIndex === undefined || isNaturalNumber(value.outputIndex));
     case 'narrative':
-      return isExactRecord(value, [
-        'kind', 'timelineId', 'sequence', 'providerRequestId', 'narrativeId',
-      ])
+      return isExactRecord(
+        value,
+        ['kind', 'timelineId', 'sequence', 'providerRequestId', 'narrativeId'],
+        ['outputIndex'],
+      )
         && isIdentifier(value.providerRequestId)
-        && isIdentifier(value.narrativeId);
+        && isIdentifier(value.narrativeId)
+        && (value.outputIndex === undefined || isNaturalNumber(value.outputIndex));
     case 'plan':
       return isExactRecord(value, [
         'kind', 'timelineId', 'sequence', 'providerRequestId', 'planId', 'revision',
@@ -380,13 +407,18 @@ function timelineReferencesAreValid(
   const narrativeIds = new Set<string>();
   const planRefs = new Set<string>();
   const activityIds = new Set<string>();
+  const addUnique = (values: Set<string>, value: string): boolean => {
+    if (values.has(value)) return false;
+    values.add(value);
+    return true;
+  };
   const valid = timeline.every((item) => {
     const timelineId = item.timelineId as string;
-    if (!timelineIds.add(timelineId)) return false;
+    if (!addUnique(timelineIds, timelineId)) return false;
     switch (item.kind) {
       case 'message': {
         const messageId = item.messageId as string;
-        return messageIds.add(messageId)
+        return addUnique(messageIds, messageId)
           && messages.some((message) => (
             message.messageId === messageId
             && ['user', 'assistant'].includes(String(message.role))
@@ -394,7 +426,7 @@ function timelineReferencesAreValid(
       }
       case 'narrative': {
         const narrativeId = item.narrativeId as string;
-        return narrativeIds.add(narrativeId)
+        return addUnique(narrativeIds, narrativeId)
           && narratives.some((narrative) => (
             narrative.narrativeId === narrativeId
             && narrative.providerRequestId === item.providerRequestId
@@ -405,13 +437,15 @@ function timelineReferencesAreValid(
           planId: item.planId as string,
           revision: item.revision as number,
         });
-        return planRefs.add(reference) && plans.some((plan) => planReferenceKey(plan) === reference);
+        return addUnique(planRefs, reference)
+          && plans.some((plan) => planReferenceKey(plan) === reference);
       }
       case 'toolGroup':
         return (item.activityIds as string[]).every((activityId) => (
-          activityIds.add(activityId)
+          addUnique(activityIds, activityId)
           && activities.some((activity) => (
-            activity.activityId === activityId && activity.kind === 'tool'
+            activity.activityId === activityId
+            && ['tool', 'providerHosted'].includes(String(activity.kind))
           ))
         ));
       default:
@@ -424,7 +458,9 @@ function timelineReferencesAreValid(
     )).length
     && narrativeIds.size === narratives.length
     && planRefs.size === plans.length
-    && activityIds.size === activities.filter((activity) => activity.kind === 'tool').length;
+    && activityIds.size === activities.filter((activity) => (
+      ['tool', 'providerHosted'].includes(String(activity.kind))
+    )).length;
 }
 
 function decodeCommandReply(value: unknown): CommandReply {
@@ -602,15 +638,46 @@ function isNarrative(value: unknown): boolean {
 }
 
 function isAssistantDraft(value: unknown): boolean {
-  return isExactRecord(
+  if (!isExactRecord(
     value,
     ['runId', 'turnId', 'content'],
-    ['reasoningContent'],
+    ['reasoningContent', 'orderedBlocks'],
   )
-    && isIdentifier(value.runId)
-    && isIdentifier(value.turnId)
-    && typeof value.content === 'string'
-    && (value.reasoningContent === undefined || typeof value.reasoningContent === 'string');
+    || !isIdentifier(value.runId)
+    || !isIdentifier(value.turnId)
+    || typeof value.content !== 'string'
+    || value.reasoningContent !== undefined && typeof value.reasoningContent !== 'string'
+  ) return false;
+  if (value.orderedBlocks === undefined) return true;
+  const orderedBlocks = value.orderedBlocks;
+  if (
+    value.content !== ''
+    || value.reasoningContent !== undefined
+    || !Array.isArray(orderedBlocks)
+    || orderedBlocks.length === 0
+    || !orderedBlocks.every(isAssistantDraftBlock)
+  ) return false;
+  return orderedBlocks.every((block, index) => (
+    index === 0 || block.outputIndex > orderedBlocks[index - 1].outputIndex
+  ));
+}
+
+function isAssistantDraftBlock(value: unknown): value is Record<string, unknown> & {
+  outputIndex: number;
+} {
+  if (!isRecord(value) || !isNaturalNumber(value.outputIndex)) return false;
+  if (value.kind === 'narrative' || value.kind === 'finalMessage' || value.kind === 'message') {
+    return isExactRecord(value, ['outputIndex', 'kind', 'content'])
+      && isNonEmptyText(value.content);
+  }
+  return value.kind === 'providerHosted'
+    && isExactRecord(value, [
+      'outputIndex', 'kind', 'providerCallId', 'providerToolType', 'status', 'action',
+    ])
+    && isIdentifier(value.providerCallId)
+    && value.providerToolType === 'web_search'
+    && (value.status === 'completed' || value.status === 'failed')
+    && isRecord(value.action);
 }
 
 function isInteraction(value: unknown): boolean {
@@ -941,6 +1008,7 @@ function isContextMessage(value: unknown, messageIndex: number): boolean {
 
 function isContextMessageBlock(value: unknown, blockIndex: number): boolean {
   if (!isRecord(value) || value.blockIndex !== blockIndex) return false;
+  if (!Object.hasOwn(CONTEXT_MESSAGE_BLOCK_KINDS, String(value.kind))) return false;
   if (value.kind === 'text' || value.kind === 'reasoning') {
     return isExactRecord(value, ['blockIndex', 'kind']);
   }
@@ -952,6 +1020,10 @@ function isContextMessageBlock(value: unknown, blockIndex: number): boolean {
   if (value.kind === 'toolResult') {
     return isExactRecord(value, ['blockIndex', 'kind', 'resultForCallId'])
       && isIdentifier(value.resultForCallId);
+  }
+  if (value.kind === 'hostedWebSearch') {
+    return isExactRecord(value, ['blockIndex', 'kind', 'providerCallId'])
+      && isIdentifier(value.providerCallId);
   }
   return false;
 }
@@ -972,7 +1044,7 @@ function isContextTool(value: unknown): boolean {
     && isNonEmptyText(value.label)
     && isNonEmptyText(value.canonicalName)
     && isNonEmptyText(value.wireName)
-    && ['coreBuiltin', 'extension', 'sessionControl'].includes(String(value.origin))
+    && Object.hasOwn(CONTEXT_TOOL_ORIGINS, String(value.origin))
     && ['callable', 'blocked'].includes(String(value.availability))
     && (value.pluginUri === undefined
       || typeof value.pluginUri === 'string'
@@ -1084,17 +1156,28 @@ function isActivity(value: unknown): boolean {
   return isExactRecord(
     value,
     ['activityId', 'kind', 'status', 'label', 'runId', 'sequence'],
-    ['callId', 'tool'],
+    ['callId', 'tool', 'providerHosted'],
   )
     && isIdentifier(value.activityId)
-    && ['run', 'tool', 'approval', 'plan', 'interaction'].includes(String(value.kind))
+    && ['run', 'tool', 'providerHosted', 'approval', 'plan', 'interaction']
+      .includes(String(value.kind))
     && ['active', 'requested', 'waiting', 'completed', 'denied', 'failed', 'cancelled', 'indeterminate']
       .includes(String(value.status))
     && isNonEmptyText(value.label)
     && isIdentifier(value.runId)
     && (value.callId === undefined || isIdentifier(value.callId))
     && isNaturalNumber(value.sequence)
-    && (value.tool === undefined || isToolActivity(value.tool, String(value.status)));
+    && (value.tool === undefined || isToolActivity(value.tool, String(value.status)))
+    && (value.providerHosted === undefined || isProviderHostedActivity(value.providerHosted))
+    && (value.kind === 'tool') === (value.tool !== undefined)
+    && (value.kind === 'providerHosted') === (value.providerHosted !== undefined);
+}
+
+function isProviderHostedActivity(value: unknown): boolean {
+  return isExactRecord(value, ['providerToolType', 'providerCallId', 'action'])
+    && value.providerToolType === 'web_search'
+    && isIdentifier(value.providerCallId)
+    && isRecord(value.action);
 }
 
 function isToolActivity(value: unknown, activityStatus: string): boolean {

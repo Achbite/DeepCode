@@ -35,6 +35,9 @@ pub(crate) struct RunProviderRuntime {
     pub(crate) profile_id: String,
     pub(crate) context_window_tokens: u64,
     pub(crate) max_output_tokens: u32,
+    pub(crate) api_surface: String,
+    pub(crate) hosted_web_search: String,
+    pub(crate) web_search_owner: String,
 }
 
 impl LocalAgentJournal {
@@ -1308,7 +1311,12 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
                             "outcome",
                             "orderedCallIds",
                         ],
-                        &["reasoningContent", "reasoningSignature"],
+                        &[
+                            "reasoningContent",
+                            "reasoningSignature",
+                            "hostedWebSearchCalls",
+                            "orderedOutputBlocks",
+                        ],
                     )?;
                     let ordered_call_ids = payload
                         .get("orderedCallIds")
@@ -1361,6 +1369,54 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
                             "session_event_invalid",
                             "provider.turn.settled reasoningSignature 缺少 reasoningContent。",
                         ));
+                    }
+                    if let Some(calls) = payload.get("hostedWebSearchCalls") {
+                        if required_string(payload, "purpose")? != "agent" {
+                            return Err(LocalAgentStoreError::new(
+                                "session_event_invalid",
+                                "只有普通 Agent turn 可以记录 Provider hosted search。",
+                            ));
+                        }
+                        let calls = calls
+                            .as_array()
+                            .filter(|calls| !calls.is_empty())
+                            .ok_or_else(|| {
+                                LocalAgentStoreError::new(
+                                    "session_event_invalid",
+                                    "provider.turn.settled hostedWebSearchCalls 必须是非空数组。",
+                                )
+                            })?;
+                        let mut seen = std::collections::HashSet::with_capacity(calls.len());
+                        for call in calls {
+                            if !crate::llm_transport::valid_responses_hosted_search_item(call) {
+                                return Err(LocalAgentStoreError::new(
+                                    "session_event_invalid",
+                                    "Provider hosted search item 结构无效。",
+                                ));
+                            }
+                            let call_id = required_string(call, "id")?;
+                            validate_runtime_identity("providerHostedSearchCallId", call_id)?;
+                            if !seen.insert(call_id) {
+                                return Err(LocalAgentStoreError::new(
+                                    "session_event_invalid",
+                                    "Provider hosted search call id 不能重复。",
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(blocks) = payload.get("orderedOutputBlocks") {
+                        if required_string(payload, "purpose")? != "agent" {
+                            return Err(LocalAgentStoreError::new(
+                                "session_event_invalid",
+                                "只有普通 Agent turn 可以记录 orderedOutputBlocks。",
+                            ));
+                        }
+                        validate_provider_turn_output_blocks(
+                            blocks,
+                            payload
+                                .get("orderedCallIds")
+                                .expect("validated orderedCallIds"),
+                        )?;
                     }
                 }
                 "failed" | "indeterminate" => {
@@ -2054,6 +2110,22 @@ fn validate_event_facts(
                     "context.composed purpose 与压缩请求事实不一致。",
                 ));
             }
+            let runtime = run_provider_runtime_from_connection(transaction, session_id, run_id)?;
+            let hosted_search_tool_count = payload
+                .get("tools")
+                .and_then(Value::as_array)
+                .expect("validated context tools")
+                .iter()
+                .filter(|tool| tool.get("origin").and_then(Value::as_str) == Some("providerHosted"))
+                .count();
+            let expected_hosted_search_tool =
+                purpose == "agent" && runtime.web_search_owner == "providerHosted";
+            if hosted_search_tool_count != usize::from(expected_hosted_search_tool) {
+                return Err(LocalAgentStoreError::new(
+                    "context_composition_search_owner_mismatch",
+                    "context.composed 搜索工具与 run.started 固定的执行 owner 不一致。",
+                ));
+            }
         }
         "provider.turn.settled" => {
             let run_id = required_string(event, "runId")?;
@@ -2089,6 +2161,22 @@ fn validate_event_facts(
                     "provider.turn.settled runtime 与 run.started snapshot 不一致。",
                 ));
             }
+            let has_ordered_hosted_search = payload
+                .get("orderedOutputBlocks")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        block.get("kind").and_then(Value::as_str) == Some("providerHosted")
+                    })
+                });
+            if (payload.get("hostedWebSearchCalls").is_some() || has_ordered_hosted_search)
+                && runtime.web_search_owner != "providerHosted"
+            {
+                return Err(LocalAgentStoreError::new(
+                    "provider_hosted_search_owner_mismatch",
+                    "Provider hosted search 事实与 run.started 固定的执行 owner 不一致。",
+                ));
+            }
             let duplicate: bool = transaction
                 .query_row(
                     "SELECT EXISTS(
@@ -2108,7 +2196,14 @@ fn validate_event_facts(
             }
             let mut statement = transaction
                 .prepare(
-                    "SELECT call_id FROM session_events
+                    "SELECT call_id,
+                            json_extract(payload_json, '$.providerCallId'),
+                            CASE event_type
+                              WHEN 'interaction.requested' THEN 'interaction.request'
+                              WHEN 'plan.published' THEN 'plan.publish'
+                              ELSE json_extract(payload_json, '$.toolName')
+                            END
+                     FROM session_events
                      WHERE session_id=?1 AND run_id=?2 AND sequence>?3
                        AND event_type IN (
                          'interaction.requested', 'plan.published',
@@ -2117,13 +2212,21 @@ fn validate_event_facts(
                      ORDER BY sequence ASC",
                 )
                 .map_err(sql_error("session_event_fact_read_failed"))?;
-            let actual_call_ids = statement
+            let actual_call_facts = statement
                 .query_map(params![session_id, run_id, composition_sequence], |row| {
-                    row.get::<_, String>(0)
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })
                 .map_err(sql_error("session_event_fact_read_failed"))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(sql_error("session_event_fact_read_failed"))?;
+            let actual_call_ids = actual_call_facts
+                .iter()
+                .map(|(call_id, _, _)| call_id.clone())
+                .collect::<Vec<_>>();
             if required_string(payload, "outcome")? == "completed" {
                 let ordered_call_ids = payload
                     .get("orderedCallIds")
@@ -2142,6 +2245,31 @@ fn validate_event_facts(
                         "provider_turn_call_fact_invalid",
                         "provider.turn.settled orderedCallIds 必须与本次 composition 后写入的 call facts 完整同序一致。",
                     ));
+                }
+                if let Some(blocks) = payload.get("orderedOutputBlocks").and_then(Value::as_array) {
+                    let ordered_tool_calls = blocks
+                        .iter()
+                        .filter(|block| {
+                            block.get("kind").and_then(Value::as_str) == Some("toolCall")
+                        })
+                        .collect::<Vec<_>>();
+                    let identities_match = ordered_tool_calls.len() == actual_call_facts.len()
+                        && ordered_tool_calls.iter().zip(actual_call_facts.iter()).all(
+                            |(block, (call_id, provider_call_id, tool_name))| {
+                                block.get("callId").and_then(Value::as_str)
+                                    == Some(call_id.as_str())
+                                    && block.get("providerCallId").and_then(Value::as_str)
+                                        == Some(provider_call_id.as_str())
+                                    && block.get("toolName").and_then(Value::as_str)
+                                        == Some(tool_name.as_str())
+                            },
+                        );
+                    if !identities_match {
+                        return Err(LocalAgentStoreError::new(
+                            "provider_turn_call_identity_mismatch",
+                            "provider.turn.settled toolCall blocks 必须与已写入的 LogicalCallId、ProviderCallId 和 canonical toolName 完整同序一致。",
+                        ));
+                    }
                 }
             } else if !actual_call_ids.is_empty() {
                 return Err(LocalAgentStoreError::new(
@@ -3101,6 +3229,7 @@ fn validate_context_messages(value: &Value) -> Result<(), LocalAgentStoreError> 
                 )
             })?;
         let mut result_count = 0usize;
+        let mut hosted_search_ids = std::collections::HashSet::new();
         for (block_index, block) in blocks.iter().enumerate() {
             if required_u64(block, "blockIndex")? != block_index as u64 {
                 return Err(LocalAgentStoreError::new(
@@ -3163,6 +3292,23 @@ fn validate_context_messages(value: &Value) -> Result<(), LocalAgentStoreError> 
                     }
                     result_count += 1;
                 }
+                "hostedWebSearch" => {
+                    exact_object(block, &["blockIndex", "kind", "providerCallId"], &[])?;
+                    if role != "assistant" {
+                        return Err(LocalAgentStoreError::new(
+                            "session_event_invalid",
+                            "hostedWebSearch block 只能属于 assistant message。",
+                        ));
+                    }
+                    let call_id = required_string(block, "providerCallId")?;
+                    validate_runtime_identity("providerHostedSearchCallId", call_id)?;
+                    if !hosted_search_ids.insert(call_id) {
+                        return Err(LocalAgentStoreError::new(
+                            "session_event_invalid",
+                            "context hosted search call id 不能重复。",
+                        ));
+                    }
+                }
                 _ => {
                     return Err(LocalAgentStoreError::new(
                         "session_event_invalid",
@@ -3194,6 +3340,173 @@ fn validate_context_messages(value: &Value) -> Result<(), LocalAgentStoreError> 
                 "context filesystemReferences 只能属于 user message。",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_provider_turn_output_blocks(
+    value: &Value,
+    ordered_call_ids: &Value,
+) -> Result<(), LocalAgentStoreError> {
+    let blocks = value
+        .as_array()
+        .filter(|blocks| !blocks.is_empty())
+        .ok_or_else(|| {
+            LocalAgentStoreError::new(
+                "session_event_invalid",
+                "provider.turn.settled orderedOutputBlocks 必须是非空数组。",
+            )
+        })?;
+    let expected_call_ids = ordered_call_ids
+        .as_array()
+        .expect("validated orderedCallIds")
+        .iter()
+        .map(|value| value.as_str().expect("validated orderedCallId"))
+        .collect::<Vec<_>>();
+    let mut previous_output_index = None;
+    let mut call_ids = Vec::new();
+    let mut provider_call_ids = std::collections::HashSet::new();
+    let mut projection_refs = std::collections::HashSet::new();
+    let mut final_message_count = 0usize;
+    for block in blocks {
+        let output_index = block
+            .get("outputIndex")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "provider output block 缺少非负整数 outputIndex。",
+                )
+            })?;
+        if previous_output_index.is_some_and(|previous| output_index <= previous) {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "provider output blocks 没有按 outputIndex 递增。",
+            ));
+        }
+        previous_output_index = Some(output_index);
+        let kind = required_string(block, "kind")?;
+        let item = block
+            .get("item")
+            .filter(|item| item.is_object())
+            .ok_or_else(|| {
+                LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "provider output block 缺少原生 item。",
+                )
+            })?;
+        match kind {
+            "reasoning" => {
+                exact_object(block, &["outputIndex", "kind", "item"], &[])?;
+                if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+                    return Err(LocalAgentStoreError::new(
+                        "session_event_invalid",
+                        "reasoning block 与原生 item 类型不一致。",
+                    ));
+                }
+            }
+            "narrative" => {
+                exact_object(block, &["outputIndex", "kind", "narrativeId", "item"], &[])?;
+                let id = required_string(block, "narrativeId")?;
+                validate_id("narrativeId", id)?;
+                if item.get("type").and_then(Value::as_str) != Some("message")
+                    || !projection_refs.insert(("narrative", id))
+                {
+                    return Err(LocalAgentStoreError::new(
+                        "session_event_invalid",
+                        "narrative block 无效或重复。",
+                    ));
+                }
+            }
+            "finalMessage" => {
+                exact_object(block, &["outputIndex", "kind", "messageId", "item"], &[])?;
+                let id = required_string(block, "messageId")?;
+                validate_id("messageId", id)?;
+                final_message_count += 1;
+                if item.get("type").and_then(Value::as_str) != Some("message")
+                    || !projection_refs.insert(("message", id))
+                {
+                    return Err(LocalAgentStoreError::new(
+                        "session_event_invalid",
+                        "finalMessage block 无效或重复。",
+                    ));
+                }
+            }
+            "toolCall" => {
+                exact_object(
+                    block,
+                    &[
+                        "outputIndex",
+                        "kind",
+                        "callId",
+                        "providerCallId",
+                        "toolName",
+                        "item",
+                    ],
+                    &[],
+                )?;
+                let call_id = required_string(block, "callId")?;
+                let provider_call_id = required_string(block, "providerCallId")?;
+                validate_id("callId", call_id)?;
+                validate_runtime_identity("providerCallId", provider_call_id)?;
+                required_string(block, "toolName")?;
+                if item.get("type").and_then(Value::as_str) != Some("function_call")
+                    || item.get("call_id").and_then(Value::as_str) != Some(provider_call_id)
+                    || !provider_call_ids.insert(provider_call_id)
+                {
+                    return Err(LocalAgentStoreError::new(
+                        "session_event_invalid",
+                        "toolCall block 与原生 item 不一致。",
+                    ));
+                }
+                call_ids.push(call_id);
+            }
+            "providerHosted" => {
+                exact_object(
+                    block,
+                    &[
+                        "outputIndex",
+                        "kind",
+                        "activityId",
+                        "providerCallId",
+                        "providerToolType",
+                        "item",
+                    ],
+                    &[],
+                )?;
+                let activity_id = required_string(block, "activityId")?;
+                let provider_call_id = required_string(block, "providerCallId")?;
+                validate_id("activityId", activity_id)?;
+                validate_runtime_identity("providerCallId", provider_call_id)?;
+                if required_string(block, "providerToolType")? != "web_search"
+                    || item.get("id").and_then(Value::as_str) != Some(provider_call_id)
+                    || !crate::llm_transport::valid_responses_hosted_search_item(item)
+                    || !provider_call_ids.insert(provider_call_id)
+                    || !projection_refs.insert(("activity", activity_id))
+                {
+                    return Err(LocalAgentStoreError::new(
+                        "session_event_invalid",
+                        "providerHosted block 与原生 item 不一致。",
+                    ));
+                }
+            }
+            _ => {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "provider output block kind 无效。",
+                ));
+            }
+        }
+    }
+    if call_ids != expected_call_ids
+        || final_message_count > 1
+        || call_ids.is_empty() && final_message_count != 1
+        || !call_ids.is_empty() && final_message_count != 0
+    {
+        return Err(LocalAgentStoreError::new(
+            "session_event_invalid",
+            "provider output blocks 与完成事实不一致。",
+        ));
     }
     Ok(())
 }
@@ -3260,15 +3573,24 @@ fn validate_context_tools(value: &Value) -> Result<(), LocalAgentStoreError> {
             ));
         }
         let origin = required_string(tool, "origin")?;
-        if !matches!(origin, "coreBuiltin" | "extension" | "sessionControl")
-            || required_string(tool, "availability")? != "callable"
+        if !matches!(
+            origin,
+            "coreBuiltin" | "extension" | "sessionControl" | "providerHosted"
+        ) || required_string(tool, "availability")? != "callable"
         {
             return Err(LocalAgentStoreError::new(
                 "session_event_invalid",
                 "context tool origin 或 availability 无效。",
             ));
         }
-        if origin == "extension" {
+        if origin == "providerHosted"
+            && (canonical_name != "web.search" || wire_name != "web_search" || has_plugin_uri)
+        {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "Provider hosted context tool 必须是 web_search。",
+            ));
+        } else if origin == "extension" {
             let plugin_uri = required_string(tool, "pluginUri")?;
             if !plugin_uri.starts_with("plugin://")
                 || plugin_uri.split('@').count() != 2
@@ -3742,6 +4064,7 @@ fn validate_run_runtime_snapshot(
             "extensionGenerationRef",
             "kernelCatalogSnapshotRef",
             "provider",
+            "webSearch",
             "instructions",
             "tools",
             "toolPromptContributions",
@@ -3780,6 +4103,8 @@ fn validate_run_runtime_snapshot(
             "profileId",
             "contextWindowTokens",
             "maxOutputTokens",
+            "apiSurface",
+            "hostedWebSearch",
         ],
         &[],
     )?;
@@ -3789,6 +4114,19 @@ fn validate_run_runtime_snapshot(
     validate_runtime_identity("profileId", profile_id)?;
     let context_window_tokens = required_u64(provider, "contextWindowTokens")?;
     let max_output_tokens = required_u64(provider, "maxOutputTokens")?;
+    let api_surface = required_string(provider, "apiSurface")?;
+    let hosted_web_search = required_string(provider, "hostedWebSearch")?;
+    if !matches!(
+        api_surface,
+        "chatCompletions" | "responses" | "anthropicMessages" | "ollamaChat"
+    ) || !matches!(hosted_web_search, "none" | "web_search")
+        || hosted_web_search == "web_search" && api_surface != "responses"
+    {
+        return Err(LocalAgentStoreError::new(
+            "session_event_invalid",
+            "runtimeSnapshot Provider API surface 或 hosted search capability 无效。",
+        ));
+    }
     let max_output_tokens = u32::try_from(max_output_tokens).map_err(|_| {
         LocalAgentStoreError::new(
             "session_event_invalid",
@@ -4134,6 +4472,54 @@ fn validate_run_runtime_snapshot(
         ));
     }
 
+    let web_search = value.get("webSearch").ok_or_else(|| {
+        LocalAgentStoreError::new(
+            "session_event_invalid",
+            "runtimeSnapshot 缺少 webSearch binding。",
+        )
+    })?;
+    let web_search_owner = required_string(web_search, "owner")?;
+    let kernel_search_callable = callable_tool_names.contains("web.search");
+    match web_search_owner {
+        "providerHosted" => {
+            exact_object(web_search, &["owner", "providerToolType"], &[])?;
+            if required_string(web_search, "providerToolType")? != "web_search"
+                || api_surface != "responses"
+                || hosted_web_search != "web_search"
+                || kernel_search_callable
+            {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "Provider hosted search binding 与 runtime capability 不一致。",
+                ));
+            }
+        }
+        "kernelAdapter" => {
+            exact_object(web_search, &["owner", "toolName"], &[])?;
+            if required_string(web_search, "toolName")? != "web.search" || !kernel_search_callable {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "Kernel search adapter binding 缺少 callable web.search。",
+                ));
+            }
+        }
+        "unavailable" => {
+            exact_object(web_search, &["owner"], &[])?;
+            if kernel_search_callable {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "Unavailable search binding 不能同时暴露 callable web.search。",
+                ));
+            }
+        }
+        _ => {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "runtimeSnapshot webSearch owner 无效。",
+            ));
+        }
+    }
+
     let selected_plugins = value.get("selectedPlugins").ok_or_else(|| {
         LocalAgentStoreError::new(
             "session_event_invalid",
@@ -4217,6 +4603,9 @@ fn validate_run_runtime_snapshot(
         profile_id: profile_id.to_string(),
         context_window_tokens,
         max_output_tokens,
+        api_surface: api_surface.to_string(),
+        hosted_web_search: hosted_web_search.to_string(),
+        web_search_owner: web_search_owner.to_string(),
     })
 }
 
@@ -4490,8 +4879,11 @@ mod tests {
                 "providerRuntimeRef": "provider-runtime:test",
                 "profileId": "profile:test",
                 "contextWindowTokens": 1000,
-                "maxOutputTokens": 100
+                "maxOutputTokens": 100,
+                "apiSurface": "chatCompletions",
+                "hostedWebSearch": "none"
             },
+            "webSearch": {"owner":"unavailable"},
             "instructions": [],
             "tools": [],
             "toolPromptContributions": [],
@@ -4842,6 +5234,124 @@ mod tests {
         let error = validate_new_event(&reused, false).expect_err("identity reuse must fail");
         assert_eq!(error.code, "session_event_invalid");
         assert!(error.message.contains("不能复用"));
+    }
+
+    #[test]
+    fn ordered_tool_call_identity_must_match_the_committed_provider_call_fact() {
+        let path = std::env::temp_dir().join(format!(
+            "deepcode-session-ordered-call-{}.sqlite3",
+            random_id("test").unwrap().replace(':', "-")
+        ));
+        let journal = LocalAgentJournal::open(&path).expect("open ordered call journal");
+        journal
+            .create_session(
+                "session:ordered-call",
+                "Ordered call",
+                &json!([]),
+                Some("profile:test"),
+            )
+            .expect("create ordered call session");
+        journal
+            .append(&json!({
+                "type":"run.started",
+                "sessionId":"session:ordered-call",
+                "runId":"run:ordered-call",
+                "payload":{
+                    "inputMessageId":"message:ordered-call",
+                    "workspaceBindings":[],
+                    "runtimeSnapshot":runtime_snapshot()
+                }
+            }))
+            .expect("start ordered call run");
+        journal
+            .append(&json!({
+                "type":"context.composed",
+                "sessionId":"session:ordered-call",
+                "runId":"run:ordered-call",
+                "payload":{
+                    "providerRequestId":"provider-request:ordered-call",
+                    "purpose":"agent",
+                    "responseConstraint":"normal",
+                    "stableCoreHash":"context-hash-v1:0000000000000001",
+                    "baseToolSchemaHash":"context-hash-v1:0000000000000002",
+                    "selectedPluginSnapshotHash":"context-hash-v1:0000000000000003",
+                    "dynamicInstructionBytes":1,
+                    "messages":[],
+                    "workspaceBindings":[],
+                    "tools":[],
+                    "partitions":[
+                        {"kind":"instructions","itemCount":0,"requestShapeUnits":1},
+                        {"kind":"sessionControls","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"tools","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"workspaceBindings","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"contextProviders","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"journalMessages","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"filesystemReferences","itemCount":0,"requestShapeUnits":0}
+                    ]
+                }
+            }))
+            .expect("record ordered call composition");
+        journal
+            .append(&json!({
+                "type":"plan.published",
+                "sessionId":"session:ordered-call",
+                "runId":"run:ordered-call",
+                "callId":"call:ordered-plan",
+                "payload":{
+                    "providerCallId":"provider-call:ordered-plan",
+                    "planId":"plan:ordered-call",
+                    "revision":1,
+                    "title":"Inspect",
+                    "summary":"Inspect the workspace.",
+                    "steps":[{"stepId":"step:ordered","title":"Inspect","details":"Inspect files."}],
+                    "mutationManifest":[]
+                }
+            }))
+            .expect("record ordered plan call fact");
+
+        let settlement = |provider_call_id: &str, tool_name: &str| {
+            json!({
+                "type":"provider.turn.settled",
+                "sessionId":"session:ordered-call",
+                "runId":"run:ordered-call",
+                "payload":{
+                    "outcome":"completed",
+                    "providerRequestId":"provider-request:ordered-call",
+                    "purpose":"agent",
+                    "providerRuntimeRef":"provider-runtime:test",
+                    "orderedCallIds":["call:ordered-plan"],
+                    "orderedOutputBlocks":[{
+                        "outputIndex":0,
+                        "kind":"toolCall",
+                        "callId":"call:ordered-plan",
+                        "providerCallId":provider_call_id,
+                        "toolName":tool_name,
+                        "item":{
+                            "type":"function_call",
+                            "id":"provider-item:ordered-plan",
+                            "call_id":provider_call_id,
+                            "name":"plan_publish",
+                            "arguments":"{}",
+                            "status":"completed"
+                        }
+                    }]
+                }
+            })
+        };
+        let error = journal
+            .append(&settlement("provider-call:wrong", "plan.publish"))
+            .expect_err("mismatched provider call identity must fail");
+        assert_eq!(error.code, "provider_turn_call_identity_mismatch");
+        let error = journal
+            .append(&settlement("provider-call:ordered-plan", "fs.read"))
+            .expect_err("mismatched canonical tool name must fail");
+        assert_eq!(error.code, "provider_turn_call_identity_mismatch");
+        journal
+            .append(&settlement("provider-call:ordered-plan", "plan.publish"))
+            .expect("matching ordered tool call identity must persist");
+
+        drop(journal);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

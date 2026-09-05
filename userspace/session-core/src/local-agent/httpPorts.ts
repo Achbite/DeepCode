@@ -15,6 +15,7 @@ import type {
   ReleaseRunRuntimeRequest,
   ReleaseRunRuntimeResult,
   RunPreparationPort,
+  RunRuntimeSnapshot,
   SelectedPluginSnapshot,
   SessionCreationInput,
   SessionEvent,
@@ -268,6 +269,7 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
       'sessionId',
       'runId',
       'provider',
+      'webSearch',
       'extensionGenerationRef',
       'kernelCatalogSnapshotRef',
       'tools',
@@ -298,6 +300,7 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
         throw new Error('run_runtime_profile_identity_mismatch');
       }
       const tools = [...decodePreparedToolDescriptors(value.tools)];
+      const webSearch = decodeWebSearchBinding(value.webSearch, provider, tools);
       const selectedPlugins = decodeSelectedPluginSnapshot(
         value.selectedPlugins,
         value.extensionGenerationRef,
@@ -328,6 +331,7 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
           extensionGenerationRef: value.extensionGenerationRef,
           kernelCatalogSnapshotRef: value.kernelCatalogSnapshotRef,
           provider,
+          webSearch,
           instructions: [...runtimeInstructions(this.#stableCoreInstructions, pluginConfig, {
             interactionRequest: wireName(SESSION_CONTROL_INTERACTION_REQUEST),
             planPublish: wireName(SESSION_CONTROL_PLAN_PUBLISH),
@@ -367,19 +371,57 @@ function decodeProviderRuntime(value: unknown): ProviderRuntimeSnapshot {
       'profileId',
       'contextWindowTokens',
       'maxOutputTokens',
+      'apiSurface',
+      'hostedWebSearch',
     ])
     || !isNonEmptyText(value.providerRuntimeRef)
     || !isNonEmptyText(value.profileId)
     || !isPositiveSafeInteger(value.contextWindowTokens)
     || !isPositiveSafeInteger(value.maxOutputTokens)
     || value.maxOutputTokens >= value.contextWindowTokens
+    || !['chatCompletions', 'responses', 'anthropicMessages', 'ollamaChat']
+      .includes(String(value.apiSurface))
+    || value.hostedWebSearch !== 'none' && value.hostedWebSearch !== 'web_search'
+    || value.hostedWebSearch === 'web_search' && value.apiSurface !== 'responses'
   ) throw new Error('provider_runtime_snapshot_invalid');
   return Object.freeze({
     providerRuntimeRef: value.providerRuntimeRef,
     profileId: value.profileId,
     contextWindowTokens: value.contextWindowTokens,
     maxOutputTokens: value.maxOutputTokens,
+    apiSurface: value.apiSurface as ProviderRuntimeSnapshot['apiSurface'],
+    hostedWebSearch: value.hostedWebSearch as ProviderRuntimeSnapshot['hostedWebSearch'],
   });
+}
+
+function decodeWebSearchBinding(
+  value: unknown,
+  provider: ProviderRuntimeSnapshot,
+  tools: readonly PreparedToolDescriptor[],
+): RunRuntimeSnapshot['webSearch'] {
+  const kernelSearchCallable = tools.some((tool) => (
+    tool.name === 'web.search' && tool.availability === 'callable'
+  ));
+  if (
+    isExactRecord(value, ['owner', 'providerToolType'])
+    && value.owner === 'providerHosted'
+    && value.providerToolType === 'web_search'
+    && provider.apiSurface === 'responses'
+    && provider.hostedWebSearch === 'web_search'
+    && !kernelSearchCallable
+  ) return Object.freeze({ owner: 'providerHosted', providerToolType: 'web_search' });
+  if (
+    isExactRecord(value, ['owner', 'toolName'])
+    && value.owner === 'kernelAdapter'
+    && value.toolName === 'web.search'
+    && kernelSearchCallable
+  ) return Object.freeze({ owner: 'kernelAdapter', toolName: 'web.search' });
+  if (
+    isExactRecord(value, ['owner'])
+    && value.owner === 'unavailable'
+    && !kernelSearchCallable
+  ) return Object.freeze({ owner: 'unavailable' });
+  throw new Error('run_runtime_web_search_binding_invalid');
 }
 
 function decodeSelectedPluginSnapshot(
@@ -521,9 +563,28 @@ function decodeProviderFrame(frame: string): ProviderEvent {
   switch (value.type) {
     case 'text.delta':
     case 'reasoning.delta':
-      if (!isExactRecord(value.data, ['text']) || typeof value.data.text !== 'string') {
-        throw new Error('provider_event_invalid');
+      {
+        const fields = ['text'];
+        if (Object.hasOwn(value.data, 'outputIndex')) fields.push('outputIndex');
+        if (
+          !isExactRecord(value.data, fields)
+          || typeof value.data.text !== 'string'
+          || value.data.outputIndex !== undefined
+            && (!Number.isSafeInteger(value.data.outputIndex) || Number(value.data.outputIndex) < 0)
+        ) {
+          throw new Error('provider_event_invalid');
+        }
       }
+      break;
+    case 'output.item.completed':
+      if (
+        !isExactRecord(value.data, ['outputIndex', 'item'])
+        || !Number.isSafeInteger(value.data.outputIndex)
+        || Number(value.data.outputIndex) < 0
+        || !isRecord(value.data.item)
+        || !['message', 'reasoning', 'function_call', 'web_search_call']
+          .includes(String(value.data.item.type))
+      ) throw new Error('provider_event_invalid');
       break;
     case 'assistant.message':
       {
@@ -549,6 +610,17 @@ function decodeProviderFrame(frame: string): ProviderEvent {
         || !isNonEmptyText(value.data.callId)
         || !isNonEmptyText(value.data.name)
         || !isRecord(value.data.input)
+      ) throw new Error('provider_event_invalid');
+      break;
+    case 'hosted.web-search.completed':
+      if (
+        !isExactRecord(value.data, ['item'])
+        || !isRecord(value.data.item)
+        || value.data.item.type !== 'web_search_call'
+        || !isNonEmptyText(value.data.item.id)
+        || value.data.item.status !== 'completed'
+          && value.data.item.status !== 'failed'
+        || !isRecord(value.data.item.action)
       ) throw new Error('provider_event_invalid');
       break;
     case 'completed':

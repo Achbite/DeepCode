@@ -202,7 +202,7 @@ impl KernelCanonicalInvocation {
                 validate_text("command", command, false)?;
                 validate_u32("timeout", *timeout, 1, 600)?;
                 if let Some(terminal) = terminal {
-                    if terminal.stdin.as_bytes().len() > MAX_TERMINAL_STDIN_BYTES {
+                    if terminal.stdin.len() > MAX_TERMINAL_STDIN_BYTES {
                         return Err(field_too_large("terminal.stdin", MAX_TERMINAL_STDIN_BYTES));
                     }
                 }

@@ -778,7 +778,7 @@ export class SessionActor {
           if (draft && draft.runId !== command.runId) {
             throw new Error('assistant_draft_run_identity_mismatch');
           }
-          this.#assistantDraft = draft ? { ...draft } : null;
+          this.#assistantDraft = draft ? structuredClone(draft) : null;
           if (!this.#projectionState) throw new Error('session_projection_state_missing');
         },
         nextId: this.#nextId,

@@ -374,9 +374,12 @@ fn invoke_terminal_shell(
         command.env("TEMP", process_temp.path());
     }
 
-    let mut spawned_child = pty.slave.spawn_command(command).map_err(|error| {
+    let spawned_child = pty.slave.spawn_command(command).map_err(|error| {
         KernelError::Other(format!("spawn bash pty in {}: {error}", cwd.display()))
     })?;
+    #[cfg(unix)]
+    let mut spawned_child = spawned_child;
+    #[cfg(unix)]
     let Some(process_id) = spawned_child.process_id() else {
         let _ = spawned_child.kill();
         let _ = spawned_child.wait();
@@ -384,7 +387,10 @@ fn invoke_terminal_shell(
             "bash pty child process identity is unavailable".to_string(),
         ));
     };
+    #[cfg(unix)]
     let mut child = PtyChildGuard::new(spawned_child, process_id);
+    #[cfg(not(unix))]
+    let mut child = PtyChildGuard::new(spawned_child);
     #[cfg(target_os = "macos")]
     let mut process_scope_guard = process_scope_id
         .map(|process_scope_id| ProcessScopeGuard::new(process_id, process_scope_id));
@@ -582,15 +588,25 @@ fn shell_write_scope(execution_scope: &str, workspace_mode: &str) -> &'static st
 
 struct PtyChildGuard {
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    #[cfg(unix)]
     process_id: u32,
     active: bool,
 }
 
 impl PtyChildGuard {
+    #[cfg(unix)]
     fn new(child: Box<dyn portable_pty::Child + Send + Sync>, process_id: u32) -> Self {
         Self {
             child,
             process_id,
+            active: true,
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
+        Self {
+            child,
             active: true,
         }
     }
@@ -834,14 +850,14 @@ fn prepared_process_cwd(
         KernelError::InvalidCommand(format!("bash workspace root is unavailable: {error}"))
     })?;
     if canonical_cwd != root {
-        return Err(KernelError::PermissionDenied(format!(
-            "bash PreparedEffect target does not match the bound workspace root"
-        )));
+        return Err(KernelError::PermissionDenied(
+            "bash PreparedEffect target does not match the bound workspace root".to_string(),
+        ));
     }
     if !canonical_cwd.is_dir() {
-        return Err(KernelError::InvalidCommand(format!(
-            "bash workspace root is not a directory"
-        )));
+        return Err(KernelError::InvalidCommand(
+            "bash workspace root is not a directory".to_string(),
+        ));
     }
     Ok(canonical_cwd)
 }

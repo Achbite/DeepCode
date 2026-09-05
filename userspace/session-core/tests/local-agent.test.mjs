@@ -130,18 +130,21 @@ test('A: message uses one prepared runtime through composition, completion, cach
   await actor.dispose();
 });
 
-test('A0: Provider reasoning is projected while the turn is still running', async () => {
+test('A0: raw Provider reasoning stays out of the user presentation while the turn is running', async () => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:reasoning-draft';
   await createSession(journal, sessionId, [workspaceBinding]);
   const preparation = fakeRunPreparation();
   let continueStream;
   const streamHeld = new Promise((resolve) => { continueStream = resolve; });
+  let reasoningConsumed;
+  const reasoningWasConsumed = new Promise((resolve) => { reasoningConsumed = resolve; });
   const provider = {
     async *stream(request) {
       yield providerEvent(request.requestId, 'reasoning.delta', {
         text: 'Inspecting the current workspace state.',
       });
+      reasoningConsumed();
       await streamHeld;
       yield providerEvent(request.requestId, 'assistant.message', {
         messageId: 'provider-message:reasoning-draft',
@@ -165,11 +168,12 @@ test('A0: Provider reasoning is projected while the turn is still running', asyn
     'command:reasoning-draft',
     'Inspect the workspace before answering.',
   ));
+  await reasoningWasConsumed;
   const running = await waitForProjection(actor, (value) => (
-    value.assistantDraft?.reasoningContent === 'Inspecting the current workspace state.'
+    value.run?.status === 'running' && value.assistantDraft === null
   ));
   assert.equal(running.run.status, 'running');
-  assert.equal(running.assistantDraft.content, '');
+  assert.equal(running.assistantDraft, null);
 
   continueStream();
   const completed = await waitForProjection(actor, (value) => value.run?.status === 'completed');
@@ -179,6 +183,436 @@ test('A0: Provider reasoning is projected while the turn is still running', asyn
     singleEvent(events, 'provider.turn.settled').payload.reasoningContent,
     'Inspecting the current workspace state.',
   );
+
+  await actor.dispose();
+});
+
+test('B-hosted: run binding exposes hosted search once and replays its Provider item unchanged', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:hosted-web-search';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const hostedItems = [{
+    type: 'web_search_call',
+    id: 'ws_1',
+    status: 'completed',
+    action: { type: 'search', queries: ['current compiler release'] },
+  }, {
+    type: 'web_search_call',
+    id: 'ws_2',
+    status: 'failed',
+    action: { type: 'open_page', url: 'https://example.com/unavailable' },
+  }];
+  const preparation = fakeRunPreparation({
+    apiSurface: 'responses',
+    hostedWebSearch: 'web_search',
+    webSearch: { owner: 'providerHosted', providerToolType: 'web_search' },
+  });
+  const providerRequests = [];
+  const provider = {
+    async *stream(request) {
+      providerRequests.push(structuredClone(request));
+      assert.deepEqual(request.hostedTools, [{
+        type: 'webSearch',
+        providerToolType: 'web_search',
+      }]);
+      assert.equal(request.tools.some((tool) => tool.name === 'web.search'), false);
+      if (providerRequests.length === 1) {
+        for (const item of hostedItems) {
+          yield providerEvent(request.requestId, 'hosted.web-search.completed', {
+            item: structuredClone(item),
+          });
+        }
+        yield providerEvent(request.requestId, 'assistant.message', {
+          messageId: 'provider-message:hosted-first',
+          content: 'First current answer.',
+        });
+      } else {
+        const replay = request.messages.find((message) => (
+          message.role === 'assistant'
+          && message.content === 'First current answer.'
+        ));
+        assert.ok(replay, 'prior hosted-search answer must be in the next context');
+        assert.deepEqual(replay.providerItems, hostedItems);
+        yield providerEvent(request.requestId, 'assistant.message', {
+          messageId: 'provider-message:hosted-second',
+          content: 'Second answer after exact replay.',
+        });
+      }
+      yield providerEvent(request.requestId, 'completed', {});
+    },
+  };
+  const actor = actorWith(
+    journal,
+    sessionId,
+    provider,
+    emptyKernel(),
+    preparation.port,
+    'hosted-web-search',
+  );
+
+  await actor.submit(messageCommand(
+    sessionId,
+    'command:hosted-first',
+    'Find the current compiler release.',
+  ));
+  await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  await actor.submit(messageCommand(
+    sessionId,
+    'command:hosted-second',
+    'Use the prior result in this follow-up.',
+  ));
+  await waitUntil(() => providerRequests.length === 2, 'second hosted Provider request');
+  await waitForProjection(actor, (value) => (
+    value.run?.status === 'completed'
+    && value.messages.some((message) => message.content === 'Second answer after exact replay.')
+  ));
+
+  const events = await readEvents(journal, sessionId);
+  const settlements = events.filter((event) => event.type === 'provider.turn.settled');
+  assert.deepEqual(settlements[0].payload.hostedWebSearchCalls, hostedItems);
+  const firstAssistant = events.find((event) => (
+    event.type === 'message.committed'
+    && event.payload.content === 'First current answer.'
+  ));
+  assert.equal(firstAssistant.payload.providerRequestId, settlements[0].payload.providerRequestId);
+  const compositions = events.filter((event) => event.type === 'context.composed');
+  assert.ok(compositions[0].payload.tools.some((tool) => (
+    tool.origin === 'providerHosted'
+    && tool.canonicalName === 'web.search'
+    && tool.wireName === 'web_search'
+  )));
+  assert.ok(compositions[1].payload.messages.some((message) => (
+    message.blocks.some((block) => (
+      block.kind === 'hostedWebSearch' && block.providerCallId === hostedItems[0].id
+    ))
+  )));
+
+  await actor.dispose();
+});
+
+test('B-ordered: Responses output items preserve narrative, hosted activity, and final-message order', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:ordered-provider-output';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const nativeItems = [{
+    type: 'message',
+    id: 'provider-message:search-intro',
+    role: 'assistant',
+    phase: 'commentary',
+    status: 'completed',
+    content: [{ type: 'output_text', text: 'I will search first.' }],
+  }, {
+    type: 'web_search_call',
+    id: 'provider-search:first',
+    status: 'completed',
+    action: { type: 'search', queries: ['current compiler release'] },
+  }, {
+    type: 'message',
+    id: 'provider-message:search-follow-up',
+    role: 'assistant',
+    phase: 'commentary',
+    status: 'completed',
+    content: [{ type: 'output_text', text: 'I found a release page and will inspect it.' }],
+  }, {
+    type: 'web_search_call',
+    id: 'provider-search:second',
+    status: 'failed',
+    action: { type: 'open_page', url: 'https://example.com/compiler-release' },
+  }, {
+    type: 'message',
+    id: 'provider-message:search-final',
+    role: 'assistant',
+    phase: 'final_answer',
+    status: 'completed',
+    content: [{ type: 'output_text', text: 'The current release is recorded in the cited result.' }],
+  }];
+  const preparation = fakeRunPreparation({
+    apiSurface: 'responses',
+    hostedWebSearch: 'web_search',
+    webSearch: { owner: 'providerHosted', providerToolType: 'web_search' },
+  });
+  const providerRequests = [];
+  let completeFinalItem;
+  const finalItemHeld = new Promise((resolve) => { completeFinalItem = resolve; });
+  let completeFirstTurn;
+  const firstTurnHeld = new Promise((resolve) => { completeFirstTurn = resolve; });
+  const provider = {
+    async *stream(request) {
+      providerRequests.push(structuredClone(request));
+      if (providerRequests.length === 1) {
+        for (const [outputIndex, item] of nativeItems.entries()) {
+          if (item.type === 'message') {
+            yield providerEvent(request.requestId, 'text.delta', {
+              text: item.content[0].text,
+              outputIndex,
+            });
+            if (outputIndex === nativeItems.length - 1) await finalItemHeld;
+          }
+          yield providerEvent(request.requestId, 'output.item.completed', {
+            outputIndex,
+            item: structuredClone(item),
+          });
+        }
+        await firstTurnHeld;
+      } else {
+        const replay = request.messages.find((message) => message.providerOutputBlocks);
+        assert.ok(replay, 'the next turn must replay the ordered Provider output');
+        assert.equal(replay.content, '');
+        assert.deepEqual(
+          replay.providerOutputBlocks.map((block) => block.kind),
+          ['narrative', 'providerHosted', 'narrative', 'providerHosted', 'finalMessage'],
+        );
+        assert.deepEqual(
+          replay.providerOutputBlocks.map((block) => block.item),
+          nativeItems,
+        );
+        yield providerEvent(request.requestId, 'assistant.message', {
+          messageId: 'provider-message:ordered-follow-up',
+          content: 'The ordered output was replayed.',
+        });
+      }
+      yield providerEvent(request.requestId, 'completed', {});
+    },
+  };
+  const actor = actorWith(
+    journal,
+    sessionId,
+    provider,
+    emptyKernel(),
+    preparation.port,
+    'ordered-provider-output',
+  );
+
+  await actor.submit(messageCommand(
+    sessionId,
+    'command:ordered-first',
+    'Search for the current compiler release.',
+  ));
+  const finalStreamingProjection = await waitForProjection(actor, (value) => (
+    value.assistantDraft?.orderedBlocks?.at(-1)?.outputIndex === nativeItems.length - 1
+    && value.assistantDraft.orderedBlocks.at(-1)?.kind === 'message'
+  ));
+  assert.equal(
+    finalStreamingProjection.assistantDraft.orderedBlocks.at(-1).content,
+    nativeItems.at(-1).content[0].text,
+  );
+  completeFinalItem();
+  const streamingProjection = await waitForProjection(actor, (value) => (
+    value.assistantDraft?.orderedBlocks?.length === nativeItems.length
+    && value.assistantDraft.orderedBlocks.at(-1)?.kind === 'finalMessage'
+  ));
+  assert.equal(streamingProjection.assistantDraft.content, '');
+  assert.equal(streamingProjection.assistantDraft.reasoningContent, undefined);
+  assert.deepEqual(
+    streamingProjection.assistantDraft.orderedBlocks.map((block) => block.kind),
+    ['narrative', 'providerHosted', 'narrative', 'providerHosted', 'finalMessage'],
+  );
+  assert.deepEqual(
+    streamingProjection.assistantDraft.orderedBlocks.map((block) => block.outputIndex),
+    [0, 1, 2, 3, 4],
+  );
+  completeFirstTurn();
+  const firstProjection = await waitForProjection(
+    actor,
+    (value) => value.run?.status === 'completed',
+  );
+  const firstEvents = await readEvents(journal, sessionId);
+  const firstSettlement = singleEvent(firstEvents, 'provider.turn.settled');
+  assert.deepEqual(
+    firstSettlement.payload.orderedOutputBlocks.map((block) => block.kind),
+    ['narrative', 'providerHosted', 'narrative', 'providerHosted', 'finalMessage'],
+  );
+  assert.deepEqual(
+    firstSettlement.payload.orderedOutputBlocks.map((block) => block.item),
+    nativeItems,
+  );
+  assert.equal(firstEvents.some((event) => (
+    event.type === 'tool.requested' || event.type === 'tool.completed'
+  )), false, 'Provider-hosted activity must not create Kernel tool facts');
+
+  const orderedBlocks = firstSettlement.payload.orderedOutputBlocks;
+  const narrativeIds = new Set(orderedBlocks.flatMap((block) => (
+    block.kind === 'narrative' ? [block.narrativeId] : []
+  )));
+  const activityIds = new Set(orderedBlocks.flatMap((block) => (
+    block.kind === 'providerHosted' ? [block.activityId] : []
+  )));
+  const finalMessageId = orderedBlocks.find((block) => block.kind === 'finalMessage').messageId;
+  const orderedTimelineKinds = firstProjection.timeline.flatMap((item) => {
+    if (item.kind === 'narrative' && narrativeIds.has(item.narrativeId)) return ['narrative'];
+    if (
+      item.kind === 'toolGroup'
+      && item.activityIds.some((activityId) => activityIds.has(activityId))
+    ) return ['providerHosted'];
+    if (item.kind === 'message' && item.messageId === finalMessageId) return ['finalMessage'];
+    return [];
+  });
+  assert.deepEqual(
+    orderedTimelineKinds,
+    ['narrative', 'providerHosted', 'narrative', 'providerHosted', 'finalMessage'],
+  );
+  assert.deepEqual(
+    firstProjection.timeline.flatMap((item) => (
+      item.kind === 'narrative' && narrativeIds.has(item.narrativeId)
+        || item.kind === 'message' && item.messageId === finalMessageId
+        ? [item.outputIndex]
+        : []
+    )),
+    [0, 2, 4],
+  );
+  assert.deepEqual(
+    [...activityIds].map((activityId) => firstProjection.activities.find((activity) => (
+      activity.activityId === activityId
+    ))?.kind),
+    ['providerHosted', 'providerHosted'],
+  );
+  assert.equal(
+    firstProjection.messages.find((message) => message.messageId === finalMessageId)?.content,
+    'The current release is recorded in the cited result.',
+  );
+
+  await actor.submit(messageCommand(
+    sessionId,
+    'command:ordered-follow-up',
+    'Continue from that result.',
+  ));
+  await waitUntil(() => providerRequests.length === 2, 'ordered Provider replay request');
+  await waitForProjection(actor, (value) => (
+    value.run?.status === 'completed'
+    && value.messages.some((message) => message.content === 'The ordered output was replayed.')
+  ));
+
+  await actor.dispose();
+});
+
+test('B-ordered-tool: native function_call identity survives settlement, execution, and replay', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:ordered-provider-tool';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparedTool = {
+    toolBindingRef: 'tool-binding:ordered-read:g1',
+    name: 'fs.read',
+    description: 'Read one fixture path.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['path'],
+      properties: { path: { type: 'string' } },
+    },
+    possibleEffects: ['workspaceRead'],
+    availability: 'callable',
+    origin: 'coreBuiltin',
+  };
+  const preparation = fakeRunPreparation({
+    apiSurface: 'responses',
+    tools: [preparedTool],
+  });
+  const kernelRequests = [];
+  const kernel = emptyKernel({
+    async execute(request) {
+      kernelRequests.push(structuredClone(request));
+      return completedExecutionReply(request, { content: 'ordered fixture contents' });
+    },
+  });
+  const providerRequests = [];
+  let nativeItems;
+  const provider = {
+    async *stream(request) {
+      providerRequests.push(structuredClone(request));
+      if (providerRequests.length === 1) {
+        const definition = request.tools.find((candidate) => (
+          candidate.inputSchema?.properties?.path !== undefined
+        ));
+        assert.ok(definition, 'prepared Kernel tool must be exposed to Responses');
+        nativeItems = [{
+          type: 'message',
+          id: 'provider-message:ordered-read-intro',
+          role: 'assistant',
+          status: 'completed',
+          content: [{ type: 'output_text', text: 'I will read the fixture.' }],
+        }, {
+          type: 'function_call',
+          id: 'provider-item:ordered-read',
+          call_id: 'provider-call:ordered-read',
+          name: definition.name,
+          arguments: JSON.stringify({ workspace: 'primary', path: 'README.md' }),
+          status: 'completed',
+        }];
+        yield providerEvent(request.requestId, 'text.delta', {
+          text: 'I will read the fixture.',
+          outputIndex: 0,
+        });
+        for (const [outputIndex, item] of nativeItems.entries()) {
+          yield providerEvent(request.requestId, 'output.item.completed', {
+            outputIndex,
+            item: structuredClone(item),
+          });
+        }
+      } else {
+        const replay = request.messages.find((message) => message.providerOutputBlocks);
+        assert.ok(replay, 'continuation must replay the native ordered output items');
+        assert.deepEqual(replay.providerOutputBlocks.map((block) => block.item), nativeItems);
+        const replayedCall = replay.providerOutputBlocks.find((block) => block.kind === 'toolCall');
+        assert.ok(replayedCall);
+        assert.equal(replayedCall.providerCallId, 'provider-call:ordered-read');
+        assert.ok(request.messages.some((message) => (
+          message.role === 'tool'
+          && message.toolCallId === replayedCall.callId
+          && message.providerCallId === replayedCall.providerCallId
+        )), 'tool result must retain the exact native provider call identity');
+        const finalItem = {
+          type: 'message',
+          id: 'provider-message:ordered-read-final',
+          role: 'assistant',
+          status: 'completed',
+          content: [{ type: 'output_text', text: 'The ordered read completed.' }],
+        };
+        yield providerEvent(request.requestId, 'text.delta', {
+          text: 'The ordered read completed.',
+          outputIndex: 0,
+        });
+        yield providerEvent(request.requestId, 'output.item.completed', {
+          outputIndex: 0,
+          item: finalItem,
+        });
+      }
+      yield providerEvent(request.requestId, 'completed', {});
+    },
+  };
+  const actor = actorWith(
+    journal,
+    sessionId,
+    provider,
+    kernel,
+    preparation.port,
+    'ordered-provider-tool',
+  );
+
+  await actor.submit(messageCommand(
+    sessionId,
+    'command:ordered-tool',
+    'Read the fixture with the available tool.',
+  ));
+  const projection = await waitForProjection(actor, (value) => (
+    value.run?.status === 'completed'
+    && value.messages.some((message) => message.content === 'The ordered read completed.')
+  ));
+  const events = await readEvents(journal, sessionId);
+  const settlements = events.filter((event) => event.type === 'provider.turn.settled');
+  const toolRequested = singleEvent(events, 'tool.requested');
+  assert.deepEqual(
+    settlements[0].payload.orderedOutputBlocks.map((block) => block.kind),
+    ['narrative', 'toolCall'],
+  );
+  const toolBlock = settlements[0].payload.orderedOutputBlocks[1];
+  assert.equal(toolBlock.callId, toolRequested.callId);
+  assert.equal(toolBlock.providerCallId, toolRequested.payload.providerCallId);
+  assert.equal(toolBlock.toolName, toolRequested.payload.toolName);
+  assert.equal(toolRequested.payload.providerCallId, 'provider-call:ordered-read');
+  assert.equal(kernelRequests.length, 1);
+  assert.ok(projection.activities.some((activity) => (
+    activity.kind === 'tool' && activity.callId === toolRequested.callId
+  )));
 
   await actor.dispose();
 });
@@ -773,8 +1207,11 @@ test('B: snapshot-scoped wire tool resolves to exact Kernel bindings, durable To
       assert.ok(assistantToolCall, 'continuation must include the previous tool call');
       assert.deepEqual(assistantToolCall.input, { workspace: 'primary', path: 'README.md' });
       assert.notEqual(assistantToolCall.callId, 'provider-call:read');
+      assert.equal(assistantToolCall.providerCallId, 'provider-call:read');
       assert.ok(request.messages.some((entry) => (
-        entry.role === 'tool' && entry.toolCallId === assistantToolCall.callId
+        entry.role === 'tool'
+        && entry.toolCallId === assistantToolCall.callId
+        && entry.providerCallId === 'provider-call:read'
       )), 'continuation must include the ToolRecord result');
 
       yield providerEvent(request.requestId, 'assistant.message', {
@@ -2095,6 +2532,7 @@ test('H1: Provider cache fields are absent together or exactly partition one cal
     const failed = await waitForProjection(actor, (value) => value.run?.status === 'indeterminate');
     await waitUntil(() => preparation.released.length === 1, 'invalid cache runtime release');
     assert.equal(failed.terminalError?.code, 'provider_turn_outcome_unknown');
+    assert.match(failed.terminalError?.message ?? '', /provider_usage_invalid/u);
     const events = await readEvents(journal, sessionId);
     assert.equal(events.some((event) => event.type === 'context.updated'), false);
     await actor.dispose();
@@ -2149,6 +2587,7 @@ test('I0: current Todo state precedes later inserted user input without splittin
       callId: 'call:interaction',
       payload: {
         interactionId: 'interaction:one',
+        providerCallId: 'provider-call:interaction',
         kind: 'question',
         prompt: 'Choose one option.',
         allowFreeform: true,
@@ -2588,8 +3027,10 @@ async function verifyComposedDisposeRelease() {
   assert.equal(composition.payload.providerRequestId, providerRequestId);
   assert.equal(providerSettlement.payload.outcome, 'indeterminate');
   assert.equal(providerSettlement.payload.error.code, 'provider_turn_outcome_unknown');
+  assert.match(providerSettlement.payload.error.message, /fixture_provider_interrupted/u);
   assert.equal(settlement.payload.outcome, 'indeterminate');
   assert.equal(settlement.payload.error.code, 'provider_turn_outcome_unknown');
+  assert.match(settlement.payload.error.message, /fixture_provider_interrupted/u);
   assertEventOrder(composition, providerSettlement, settlement);
   assert.deepEqual(preparation.released, [{
     sessionId,
@@ -2730,6 +3171,9 @@ function fakeRunPreparation(options = {}) {
           profileId: request.profileId ?? options.profileId ?? 'profile:default',
           contextWindowTokens: options.contextWindowTokens,
           maxOutputTokens: options.maxOutputTokens,
+          apiSurface: options.apiSurface,
+          hostedWebSearch: options.hostedWebSearch,
+          webSearch: options.webSearch,
           tools: options.tools,
           toolPromptContributions: options.toolPromptContributions,
         });
@@ -2749,6 +3193,19 @@ function fakeRunPreparation(options = {}) {
 
 function runtimeSnapshot(runId, options = {}) {
   const tools = (options.tools ?? []).map((tool) => structuredClone(tool));
+  const provider = {
+    providerRuntimeRef: 'provider-runtime:g1',
+    profileId: options.profileId ?? 'profile:default',
+    contextWindowTokens: options.contextWindowTokens ?? 4_096,
+    maxOutputTokens: options.maxOutputTokens ?? 512,
+    apiSurface: options.apiSurface ?? 'chatCompletions',
+    hostedWebSearch: options.hostedWebSearch ?? 'none',
+  };
+  const webSearch = options.webSearch ?? (
+    tools.some((tool) => tool.name === 'web.search' && tool.availability === 'callable')
+      ? { owner: 'kernelAdapter', toolName: 'web.search' }
+      : { owner: 'unavailable' }
+  );
   const providerToolAliases = [
     ...tools.filter((tool) => tool.availability === 'callable').map((tool) => tool.name),
     ...sessionControlToolDefinitions().map((tool) => tool.name),
@@ -2762,12 +3219,8 @@ function runtimeSnapshot(runId, options = {}) {
     runRuntimeSnapshotRef: `runtime-snapshot:${runId}`,
     extensionGenerationRef: 'extension-generation:g1',
     kernelCatalogSnapshotRef: `kernel-catalog:${runId}`,
-    provider: {
-      providerRuntimeRef: 'provider-runtime:g1',
-      profileId: options.profileId ?? 'profile:default',
-      contextWindowTokens: options.contextWindowTokens ?? 4_096,
-      maxOutputTokens: options.maxOutputTokens ?? 512,
-    },
+    provider,
+    webSearch,
     instructions: [{ id: 'deepcode.coding-agent', text: 'Stable core instruction.' }],
     tools,
     toolPromptContributions: (options.toolPromptContributions ?? [])

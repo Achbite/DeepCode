@@ -43,6 +43,7 @@ type StoreErrorSource =
   | 'projection'
   | 'catalog'
   | 'pluginCatalog'
+  | 'profiles'
   | 'command'
   | 'operation';
 
@@ -61,6 +62,7 @@ interface LocalAgentState {
   error: string | null;
   errorSource: StoreErrorSource | null;
   initialize(): Promise<void>;
+  refreshProfiles(): Promise<void>;
   refreshCatalog(): Promise<void>;
   refreshPluginCatalog(): Promise<void>;
   startNewSession(projectId?: string | null): void;
@@ -165,7 +167,11 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
           pluginCatalog,
           profiles,
           defaultProfileId,
-          selectedProfileId: candidate?.profileId ?? defaultProfileId,
+          selectedProfileId: resolveEnabledProfileId(
+            profiles,
+            candidate?.profileId,
+            defaultProfileId,
+          ),
           sessionId: projection?.sessionId ?? candidate?.id ?? null,
           projection,
           draftProjectId: null,
@@ -189,6 +195,37 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
     } finally {
       initialization = null;
     }
+  },
+
+  refreshProfiles: async () => {
+    const profileResult = await getLlmProfiles();
+    if (!profileResult.ok) {
+      set({
+        error: profileResult.message ?? 'llm_profiles_unavailable',
+        errorSource: 'profiles',
+      });
+      return;
+    }
+    const profiles = (profileResult.data?.profiles ?? []).filter((profile) => profile.enabled);
+    const defaultProfileId = enabledProfileId(
+      profiles,
+      profileResult.data?.defaultProfileId,
+    );
+    set((state) => {
+      const summary = state.sessionId
+        ? state.catalog.sessions.find((session) => session.id === state.sessionId)
+        : undefined;
+      return {
+        profiles,
+        defaultProfileId,
+        selectedProfileId: resolveEnabledProfileId(
+          profiles,
+          state.selectedProfileId ?? summary?.profileId,
+          defaultProfileId,
+        ),
+        ...(state.errorSource === 'profiles' ? { error: null, errorSource: null } : {}),
+      };
+    });
   },
 
   refreshCatalog: async () => {
@@ -253,7 +290,11 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
       rememberSession(sessionId);
       set({
         sessionId,
-        selectedProfileId: summary.profileId ?? get().defaultProfileId,
+        selectedProfileId: resolveEnabledProfileId(
+          get().profiles,
+          summary.profileId,
+          get().defaultProfileId,
+        ),
         projection,
         loading: false,
       });
@@ -777,6 +818,17 @@ function enabledProfileId(
   return profiles.find((profile) => profile.id === preferred)?.id ?? profiles[0]?.id ?? null;
 }
 
+function resolveEnabledProfileId(
+  profiles: readonly LlmProviderProfile[],
+  preferred: string | null | undefined,
+  configuredDefault: string | null,
+): string | null {
+  return profiles.find((profile) => profile.id === preferred)?.id
+    ?? profiles.find((profile) => profile.id === configuredDefault)?.id
+    ?? profiles[0]?.id
+    ?? null;
+}
+
 function shouldApplyProjection(
   current: SessionProjection | null,
   incoming: SessionProjection,
@@ -794,7 +846,8 @@ function sameAssistantDraft(
   return left.runId === right.runId
     && left.turnId === right.turnId
     && left.content === right.content
-    && left.reasoningContent === right.reasoningContent;
+    && left.reasoningContent === right.reasoningContent
+    && JSON.stringify(left.orderedBlocks) === JSON.stringify(right.orderedBlocks);
 }
 
 function requiredFilesystemPluginSelections(

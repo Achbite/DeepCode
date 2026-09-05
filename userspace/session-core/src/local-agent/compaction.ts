@@ -99,6 +99,7 @@ export function prepareContextCompaction(input: {
     workspaceBindings: input.workspaceBindings.map((binding) => ({ ...binding })),
     messages: providerSelected.map((item) => cloneModelMessage(item.message)),
     tools: [],
+    hostedTools: [],
   };
   return {
     request,
@@ -107,6 +108,7 @@ export function prepareContextCompaction(input: {
       'contextCompaction',
       'answerOnly',
       providerSelected,
+      [],
       [],
       [],
       toolCodec.canonicalByWire,

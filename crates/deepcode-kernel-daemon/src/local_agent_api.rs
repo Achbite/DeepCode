@@ -1,12 +1,16 @@
 use crate::local_agent_kernel::{
     LocalAgentKernel, LocalAgentKernelError, LocalAgentPermissionPolicy, LocalToolExecutionRequest,
-    PrepareToolCatalogRequest, ReleaseToolCatalogRequest, WorkspaceResolverPort,
+    PermissionMode, PrepareToolCatalogRequest, ReleaseToolCatalogRequest, WorkspaceResolverPort,
 };
-use crate::local_agent_provider_runtime::ProviderRuntimeRegistry;
-use crate::local_agent_store::{delete_session_archive, LocalAgentJournal, LocalAgentStoreError};
+use crate::local_agent_provider_runtime::{ProviderRuntimeRegistry, ProviderRuntimeSnapshot};
+use crate::local_agent_store::{
+    delete_session_archive, LocalAgentJournal, LocalAgentStoreError, RunProviderRuntime,
+};
 use crate::prelude::*;
 use crate::*;
 use axum::http::HeaderMap;
+use deepcode_kernel_runtime::executors::web_search_availability;
+use deepcode_kernel_tools::ToolAvailability;
 
 const SESSION_SERVICE_TOKEN_HEADER: &str = "x-deepcode-session-service-token";
 
@@ -196,6 +200,13 @@ impl LocalAgentRuntime {
             })?;
         let permissions = LocalAgentPermissionPolicy::from_settings(settings)
             .map_err(RunPreparationError::from)?;
+        let web_search = prepare_web_search_binding(
+            &provider_runtime,
+            permissions,
+            web_search_availability(&executor_config) == ToolAvailability::Callable,
+        );
+        let enable_kernel_web_search =
+            web_search.get("owner").and_then(Value::as_str) == Some("kernelAdapter");
         let prepared = LocalAgentKernel::prepare_generation(
             &extension_generation_ref,
             &next_kernel_runtime_key,
@@ -203,6 +214,7 @@ impl LocalAgentRuntime {
             Arc::new(secrets),
             mcp,
             permissions,
+            enable_kernel_web_search,
         )
         .map_err(RunPreparationError::from)?;
         *self.active_runtime_settings.lock().map_err(|_| {
@@ -257,6 +269,7 @@ impl LocalAgentRuntime {
             "sessionId": request.session_id,
             "runId": request.run_id,
             "provider": provider_runtime,
+            "webSearch": web_search,
             "extensionGenerationRef": plugin_config["extensionGenerationRef"],
             "kernelCatalogSnapshotRef": catalog["kernelCatalogSnapshotRef"],
             "tools": catalog["tools"],
@@ -328,6 +341,30 @@ impl LocalAgentRuntime {
             .get(SESSION_SERVICE_TOKEN_HEADER)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value == self.token.as_ref())
+    }
+}
+
+fn prepare_web_search_binding(
+    provider: &ProviderRuntimeSnapshot,
+    permissions: LocalAgentPermissionPolicy,
+    kernel_adapter_callable: bool,
+) -> Value {
+    if permissions.network_mode() == PermissionMode::Deny {
+        return json!({ "owner": "unavailable" });
+    }
+    if permissions.network_mode() == PermissionMode::Allow
+        && provider.api_surface == "responses"
+        && provider.hosted_web_search == "web_search"
+    {
+        return json!({
+            "owner": "providerHosted",
+            "providerToolType": "web_search",
+        });
+    }
+    if kernel_adapter_callable {
+        json!({ "owner": "kernelAdapter", "toolName": "web.search" })
+    } else {
+        json!({ "owner": "unavailable" })
     }
 }
 
@@ -418,6 +455,7 @@ struct LocalProviderRequest {
     workspace_bindings: Vec<LocalProviderWorkspaceBinding>,
     messages: Vec<LocalProviderMessage>,
     tools: Vec<LocalProviderTool>,
+    hosted_tools: Vec<LocalProviderHostedTool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -435,13 +473,17 @@ struct LocalProviderMessage {
     reasoning_content: Option<String>,
     reasoning_signature: Option<String>,
     tool_call_id: Option<String>,
+    provider_call_id: Option<String>,
     tool_calls: Option<Vec<LocalProviderToolCall>>,
+    provider_items: Option<Vec<Value>>,
+    provider_output_blocks: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LocalProviderToolCall {
     call_id: String,
+    provider_call_id: String,
     name: String,
     input: Value,
 }
@@ -452,6 +494,14 @@ struct LocalProviderTool {
     name: String,
     description: String,
     input_schema: Value,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalProviderHostedTool {
+    #[serde(rename = "type")]
+    tool_type: String,
+    provider_tool_type: String,
 }
 
 pub(crate) async fn local_agent_session_create(
@@ -726,6 +776,31 @@ pub(crate) async fn local_agent_provider_stream(
             "Provider 请求与 run.started 固定的 runtime snapshot 不一致。",
         );
     }
+    if frozen_provider_runtime.api_surface != "responses"
+        && body.messages.iter().any(|message| {
+            message
+                .provider_items
+                .as_ref()
+                .is_some_and(|items| !items.is_empty())
+                || message
+                    .provider_output_blocks
+                    .as_ref()
+                    .is_some_and(|blocks| !blocks.is_empty())
+        })
+    {
+        return local_provider_error(
+            &request_id,
+            "provider_item_api_surface_mismatch",
+            "Provider 原生响应项只能回放到 Responses API surface。",
+        );
+    }
+    if let Err((code, message)) = validate_provider_search_binding(
+        &frozen_provider_runtime,
+        &body.purpose,
+        &body.hosted_tools,
+    ) {
+        return local_provider_error(&request_id, code, message);
+    }
     let frozen_workspace_ids = match state
         .local_agent
         .journal
@@ -783,35 +858,38 @@ pub(crate) async fn local_agent_provider_stream(
     let request_envelope = json!({
         "messages": body.messages,
         "tools": body.tools,
+        "hostedTools": body.hosted_tools,
         "requireToolCall": body.response_constraint == "toolRequired",
     });
     local_agent_provider_stream_response(runtime.profile(), request_envelope, request_id)
 }
 
+fn valid_provider_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && value.len() <= 512
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_provider_tool_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), String> {
-    let valid_text = |value: &str| {
-        !value.is_empty()
-            && value.trim() == value
-            && value.len() <= 512
-            && !value.chars().any(char::is_control)
-    };
-    let valid_tool_name = |value: &str| {
-        !value.is_empty()
-            && value.len() <= 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    };
     for (name, value) in [
         ("requestId", body.request_id.as_str()),
         ("sessionId", body.session_id.as_str()),
         ("runId", body.run_id.as_str()),
     ] {
-        if !valid_text(value) {
+        if !valid_provider_text(value) {
             return Err(format!("Provider 请求的 {name} 无效。"));
         }
     }
-    if !valid_text(&body.profile_id) || !valid_text(&body.provider_runtime_ref) {
+    if !valid_provider_text(&body.profile_id) || !valid_provider_text(&body.provider_runtime_ref) {
         return Err("Provider 请求的 profileId 无效。".to_string());
     }
     if !matches!(
@@ -834,6 +912,7 @@ fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), St
         "contextCompaction" => {
             if body.response_constraint != "answerOnly"
                 || !body.tools.is_empty()
+                || !body.hosted_tools.is_empty()
                 || body.max_output_tokens == 0
             {
                 return Err(
@@ -846,7 +925,7 @@ fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), St
     }
     let mut workspace_ids = std::collections::HashSet::new();
     for binding in &body.workspace_bindings {
-        if !valid_text(&binding.workspace_id)
+        if !valid_provider_text(&binding.workspace_id)
             || binding.display_name.trim().is_empty()
             || binding.display_name.len() > 160
             || !workspace_ids.insert(binding.workspace_id.as_str())
@@ -867,7 +946,10 @@ fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), St
                 || message.reasoning_content.is_some()
                 || message.reasoning_signature.is_some()
                 || message.tool_call_id.is_some()
-                || message.tool_calls.is_some())
+                || message.provider_call_id.is_some()
+                || message.tool_calls.is_some()
+                || message.provider_items.is_some()
+                || message.provider_output_blocks.is_some())
         {
             return Err("Provider 请求的 system/user 消息结构无效。".to_string());
         }
@@ -875,15 +957,21 @@ fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), St
             if message.reasoning_content.is_some()
                 || message.reasoning_signature.is_some()
                 || message.tool_calls.is_some()
+                || message.provider_items.is_some()
+                || message.provider_output_blocks.is_some()
                 || message
                     .tool_call_id
                     .as_deref()
-                    .is_none_or(|call_id| !valid_text(call_id))
+                    .is_none_or(|call_id| !valid_provider_text(call_id))
+                || message
+                    .provider_call_id
+                    .as_deref()
+                    .is_none_or(|call_id| !valid_provider_text(call_id))
             {
                 return Err("Provider 请求的 tool 消息结构无效。".to_string());
             }
-        } else if message.tool_call_id.is_some() {
-            return Err("只有 tool 消息可以携带 toolCallId。".to_string());
+        } else if message.tool_call_id.is_some() || message.provider_call_id.is_some() {
+            return Err("只有 tool 消息可以携带 toolCallId 与 providerCallId。".to_string());
         }
         if message.role != "assistant" && message.reasoning_content.is_some() {
             return Err("只有 assistant 消息可以携带 reasoningContent。".to_string());
@@ -911,26 +999,60 @@ fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), St
         if message.role != "assistant" && message.tool_calls.is_some() {
             return Err("只有 assistant 消息可以携带 toolCalls。".to_string());
         }
+        if message.role != "assistant" && message.provider_items.is_some() {
+            return Err("只有 assistant 消息可以携带 providerItems。".to_string());
+        }
+        if message.role != "assistant" && message.provider_output_blocks.is_some() {
+            return Err("只有 assistant 消息可以携带 providerOutputBlocks。".to_string());
+        }
+        let provider_items = message.provider_items.as_deref().unwrap_or_default();
+        let mut provider_item_ids = std::collections::HashSet::new();
+        for item in provider_items {
+            let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+            if !crate::llm_transport::valid_responses_hosted_search_item(item)
+                || !valid_provider_text(item_id)
+                || !provider_item_ids.insert(item_id)
+            {
+                return Err("Provider 请求的 providerItems 无效或重复。".to_string());
+            }
+        }
         for call in message.tool_calls.as_deref().unwrap_or_default() {
-            if !valid_text(&call.call_id)
-                || !valid_tool_name(&call.name)
+            if !valid_provider_text(&call.call_id)
+                || !valid_provider_text(&call.provider_call_id)
+                || !valid_provider_tool_name(&call.name)
                 || !call.input.is_object()
                 || !call_ids.insert(call.call_id.as_str())
             {
                 return Err("Provider 请求的 toolCalls 无效或重复。".to_string());
             }
         }
+        if let Some(blocks) = message.provider_output_blocks.as_deref() {
+            validate_provider_output_blocks(blocks)?;
+            if !message.content.is_empty()
+                || message.reasoning_content.is_some()
+                || message.reasoning_signature.is_some()
+                || message.tool_calls.is_some()
+                || message.provider_items.is_some()
+            {
+                return Err("providerOutputBlocks 不能与聚合 assistant 字段混用。".to_string());
+            }
+        }
         if message.role == "assistant"
             && message.content.is_empty()
             && message.reasoning_content.is_none()
             && message.tool_calls.as_ref().is_none_or(Vec::is_empty)
+            && provider_items.is_empty()
+            && message
+                .provider_output_blocks
+                .as_ref()
+                .is_none_or(Vec::is_empty)
         {
             return Err("Provider 请求的 assistant 消息没有正文或工具调用。".to_string());
         }
     }
     let mut tool_names = std::collections::HashSet::new();
     for tool in &body.tools {
-        if !valid_tool_name(&tool.name)
+        if !valid_provider_tool_name(&tool.name)
             || tool.description.trim().is_empty()
             || !tool.input_schema.is_object()
             || !tool_names.insert(tool.name.as_str())
@@ -938,7 +1060,122 @@ fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), St
             return Err("Provider 请求的工具目录无效或重复。".to_string());
         }
     }
+    if body.hosted_tools.len() > 1
+        || body
+            .hosted_tools
+            .iter()
+            .any(|tool| tool.tool_type != "webSearch" || tool.provider_tool_type != "web_search")
+    {
+        return Err("Provider 请求的 hostedTools 无效。".to_string());
+    }
     Ok(())
+}
+
+fn validate_provider_output_blocks(blocks: &[Value]) -> Result<(), String> {
+    if blocks.is_empty() {
+        return Err("providerOutputBlocks 不能为空。".to_string());
+    }
+    let mut previous_output_index = None;
+    let mut reference_ids = std::collections::HashSet::new();
+    for block in blocks {
+        let output_index = block
+            .get("outputIndex")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "providerOutputBlock 缺少 outputIndex。".to_string())?;
+        if previous_output_index.is_some_and(|previous| output_index <= previous) {
+            return Err("providerOutputBlocks 没有按 outputIndex 递增。".to_string());
+        }
+        previous_output_index = Some(output_index);
+        let kind = block
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "providerOutputBlock 缺少 kind。".to_string())?;
+        let item = block
+            .get("item")
+            .filter(|item| item.is_object())
+            .ok_or_else(|| "providerOutputBlock 缺少原生 item。".to_string())?;
+        let valid = match kind {
+            "reasoning" => item.get("type").and_then(Value::as_str) == Some("reasoning"),
+            "narrative" => {
+                item.get("type").and_then(Value::as_str) == Some("message")
+                    && block
+                        .get("narrativeId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| valid_provider_text(id) && reference_ids.insert(id))
+            }
+            "finalMessage" => {
+                item.get("type").and_then(Value::as_str) == Some("message")
+                    && block
+                        .get("messageId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| valid_provider_text(id) && reference_ids.insert(id))
+            }
+            "toolCall" => {
+                let provider_call_id = block.get("providerCallId").and_then(Value::as_str);
+                item.get("type").and_then(Value::as_str) == Some("function_call")
+                    && block
+                        .get("callId")
+                        .and_then(Value::as_str)
+                        .is_some_and(valid_provider_text)
+                    && block
+                        .get("toolName")
+                        .and_then(Value::as_str)
+                        .is_some_and(valid_provider_text)
+                    && provider_call_id.is_some_and(valid_provider_text)
+                    && item.get("call_id").and_then(Value::as_str) == provider_call_id
+            }
+            "providerHosted" => {
+                let provider_call_id = block.get("providerCallId").and_then(Value::as_str);
+                block.get("providerToolType").and_then(Value::as_str) == Some("web_search")
+                    && provider_call_id.is_some_and(valid_provider_text)
+                    && item.get("id").and_then(Value::as_str) == provider_call_id
+                    && crate::llm_transport::valid_responses_hosted_search_item(item)
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err("providerOutputBlock 合同无效。".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_provider_search_binding(
+    runtime: &RunProviderRuntime,
+    purpose: &str,
+    hosted_tools: &[LocalProviderHostedTool],
+) -> Result<(), (&'static str, &'static str)> {
+    let hosted_search_requested = hosted_tools.len() == 1
+        && hosted_tools[0].tool_type == "webSearch"
+        && hosted_tools[0].provider_tool_type == "web_search";
+    match runtime.web_search_owner.as_str() {
+        "providerHosted" => {
+            let request_matches_purpose = match purpose {
+                "agent" => hosted_search_requested,
+                "contextCompaction" => hosted_tools.is_empty(),
+                _ => false,
+            };
+            if runtime.api_surface != "responses"
+                || runtime.hosted_web_search != "web_search"
+                || !request_matches_purpose
+            {
+                return Err((
+                    "provider_hosted_search_binding_mismatch",
+                    "Provider 请求与 run.started 固定的 hosted search binding 不一致。",
+                ));
+            }
+            Ok(())
+        }
+        "kernelAdapter" | "unavailable" if hosted_tools.is_empty() => Ok(()),
+        "kernelAdapter" | "unavailable" => Err((
+            "provider_hosted_search_binding_mismatch",
+            "当前 run 的搜索执行 owner 不是 Provider。",
+        )),
+        _ => Err((
+            "provider_hosted_search_binding_invalid",
+            "run.started 的搜索执行 owner 无效。",
+        )),
+    }
 }
 
 fn require_session_service(state: &AppState, headers: &HeaderMap) -> Result<(), Json<ApiResponse>> {
@@ -988,4 +1225,87 @@ fn random_service_token() -> Result<String, String> {
         write!(&mut token, "{byte:02x}").expect("writing to String cannot fail");
     }
     Ok(token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn permission_policy(network: &str) -> LocalAgentPermissionPolicy {
+        LocalAgentPermissionPolicy::from_settings(&json!({
+            "agent.permissions.networkRead": network,
+        }))
+        .expect("valid permission policy")
+    }
+
+    fn provider_runtime(
+        api_surface: &'static str,
+        hosted_web_search: &'static str,
+    ) -> ProviderRuntimeSnapshot {
+        ProviderRuntimeSnapshot {
+            provider_runtime_ref: "provider-runtime:test".to_string(),
+            profile_id: "profile:test".to_string(),
+            context_window_tokens: 4_096,
+            max_output_tokens: 512,
+            api_surface,
+            hosted_web_search,
+        }
+    }
+
+    #[test]
+    fn search_owner_is_frozen_from_provider_permission_and_kernel_adapter() {
+        let responses = provider_runtime("responses", "web_search");
+        let chat = provider_runtime("chatCompletions", "none");
+
+        assert_eq!(
+            prepare_web_search_binding(&responses, permission_policy("allow"), true),
+            json!({ "owner": "providerHosted", "providerToolType": "web_search" })
+        );
+        assert_eq!(
+            prepare_web_search_binding(&responses, permission_policy("ask"), true),
+            json!({ "owner": "kernelAdapter", "toolName": "web.search" })
+        );
+        assert_eq!(
+            prepare_web_search_binding(&chat, permission_policy("allow"), true),
+            json!({ "owner": "kernelAdapter", "toolName": "web.search" })
+        );
+        assert_eq!(
+            prepare_web_search_binding(&responses, permission_policy("ask"), false),
+            json!({ "owner": "unavailable" })
+        );
+        assert_eq!(
+            prepare_web_search_binding(&responses, permission_policy("deny"), true),
+            json!({ "owner": "unavailable" })
+        );
+    }
+
+    #[test]
+    fn provider_hosted_search_is_agent_only_and_compaction_remains_tool_free() {
+        let runtime = RunProviderRuntime {
+            provider_runtime_ref: "provider-runtime:test".to_string(),
+            profile_id: "profile:test".to_string(),
+            context_window_tokens: 4_096,
+            max_output_tokens: 512,
+            api_surface: "responses".to_string(),
+            hosted_web_search: "web_search".to_string(),
+            web_search_owner: "providerHosted".to_string(),
+        };
+        let hosted_tool = LocalProviderHostedTool {
+            tool_type: "webSearch".to_string(),
+            provider_tool_type: "web_search".to_string(),
+        };
+
+        assert!(validate_provider_search_binding(
+            &runtime,
+            "agent",
+            std::slice::from_ref(&hosted_tool),
+        )
+        .is_ok());
+        assert!(validate_provider_search_binding(&runtime, "contextCompaction", &[]).is_ok());
+        assert!(validate_provider_search_binding(&runtime, "agent", &[]).is_err());
+        assert!(
+            validate_provider_search_binding(&runtime, "contextCompaction", &[hosted_tool],)
+                .is_err()
+        );
+    }
 }

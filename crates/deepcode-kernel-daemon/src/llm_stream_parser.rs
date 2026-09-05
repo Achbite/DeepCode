@@ -1,10 +1,13 @@
-use crate::llm_transport::{LlmChatOutput, LlmToolCall, LlmToolDefinition};
+use crate::llm_transport::{
+    valid_responses_hosted_search_item, LlmChatOutput, LlmToolCall, LlmToolDefinition,
+};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderStreamKind {
     OpenAiCompatible,
+    Responses,
     Anthropic,
     Ollama,
 }
@@ -13,6 +16,7 @@ impl ProviderStreamKind {
     pub(crate) fn from_profile_kind(value: &str) -> Option<Self> {
         match value {
             "openaiCompatible" => Some(Self::OpenAiCompatible),
+            "responses" => Some(Self::Responses),
             "anthropic" => Some(Self::Anthropic),
             "ollama" => Some(Self::Ollama),
             _ => None,
@@ -22,6 +26,7 @@ impl ProviderStreamKind {
     pub(crate) fn wire_name(self) -> &'static str {
         match self {
             Self::OpenAiCompatible => "openaiCompatible",
+            Self::Responses => "responses",
             Self::Anthropic => "anthropic",
             Self::Ollama => "ollama",
         }
@@ -30,6 +35,7 @@ impl ProviderStreamKind {
     pub(crate) fn terminal_signal(self) -> &'static str {
         match self {
             Self::OpenAiCompatible => "[DONE]",
+            Self::Responses => "response.completed",
             Self::Anthropic => "message_stop",
             Self::Ollama => "done=true",
         }
@@ -92,6 +98,11 @@ pub(crate) struct ProviderStreamAccumulator {
     reasoning: String,
     reasoning_signature: String,
     tool_calls: BTreeMap<i64, ToolBuffer>,
+    hosted_web_search_calls: Vec<Value>,
+    responses_output_items: BTreeMap<i64, Value>,
+    responses_emitted_output_indexes: BTreeSet<i64>,
+    responses_text_by_index: BTreeMap<i64, String>,
+    responses_reasoning_by_index: BTreeMap<i64, String>,
     finish_reason: Option<String>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
@@ -109,6 +120,11 @@ impl ProviderStreamAccumulator {
             reasoning: String::new(),
             reasoning_signature: String::new(),
             tool_calls: BTreeMap::new(),
+            hosted_web_search_calls: Vec::new(),
+            responses_output_items: BTreeMap::new(),
+            responses_emitted_output_indexes: BTreeSet::new(),
+            responses_text_by_index: BTreeMap::new(),
+            responses_reasoning_by_index: BTreeMap::new(),
             finish_reason: None,
             input_tokens: None,
             output_tokens: None,
@@ -141,6 +157,7 @@ impl ProviderStreamAccumulator {
         })?;
         match self.kind {
             ProviderStreamKind::OpenAiCompatible => self.ingest_openai(text),
+            ProviderStreamKind::Responses => self.ingest_responses(text),
             ProviderStreamKind::Anthropic => self.ingest_anthropic(text),
             ProviderStreamKind::Ollama => self.ingest_ollama(text),
         }
@@ -172,6 +189,40 @@ impl ProviderStreamAccumulator {
                 "provider_reasoning_signature_without_content",
                 "Provider reasoning signature 缺少对应 reasoning content。",
             ));
+        }
+        if self.kind == ProviderStreamKind::Responses {
+            for output_index in self.responses_text_by_index.keys() {
+                if self
+                    .responses_output_items
+                    .get(output_index)
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str)
+                    != Some("message")
+                {
+                    return Err(ProviderStreamError::new(
+                        "provider_response_item_terminal_missing",
+                        format!(
+                            "Responses output_index {output_index} 的流式正文缺少对应的原生 message 完成项。"
+                        ),
+                    ));
+                }
+            }
+            for output_index in self.responses_reasoning_by_index.keys() {
+                if self
+                    .responses_output_items
+                    .get(output_index)
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str)
+                    != Some("reasoning")
+                {
+                    return Err(ProviderStreamError::new(
+                        "provider_response_item_terminal_missing",
+                        format!(
+                            "Responses output_index {output_index} 的流式 reasoning 缺少对应的原生 reasoning 完成项。"
+                        ),
+                    ));
+                }
+            }
         }
         let mut tool_calls = Vec::with_capacity(self.tool_calls.len());
         for (index, call) in self.tool_calls {
@@ -215,6 +266,7 @@ impl ProviderStreamAccumulator {
                 reasoning_signature: (!self.reasoning_signature.trim().is_empty())
                     .then_some(self.reasoning_signature),
                 tool_calls,
+                hosted_web_search_calls: self.hosted_web_search_calls,
             },
             completion: ProviderCompletion {
                 provider_kind: self.kind,
@@ -227,7 +279,7 @@ impl ProviderStreamAccumulator {
                             self.cache_read_input_tokens,
                             self.cache_creation_input_tokens,
                         )?,
-                        ProviderStreamKind::OpenAiCompatible => {
+                        ProviderStreamKind::OpenAiCompatible | ProviderStreamKind::Responses => {
                             let cache = cache_usage_from_total(
                                 input_tokens,
                                 self.cache_read_input_tokens,
@@ -340,6 +392,202 @@ impl ProviderStreamAccumulator {
                     buffer.arguments.push_str(arguments);
                 }
             }
+        }
+        Ok(emissions)
+    }
+
+    fn ingest_responses(
+        &mut self,
+        payload: &str,
+    ) -> Result<Vec<ProviderEmission>, ProviderStreamError> {
+        let value = parse_json(payload)?;
+        if let Some(error) = value.get("error") {
+            return Err(ProviderStreamError::new(
+                "provider_error",
+                error.to_string(),
+            ));
+        }
+        let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        let mut emissions = Vec::new();
+        match event_type {
+            "response.output_text.delta" => {
+                if let Some(text) = value.get("delta").and_then(Value::as_str) {
+                    let index = required_output_index(
+                        value.get("output_index"),
+                        "Responses output text delta",
+                    )?;
+                    self.responses_text_by_index
+                        .entry(index)
+                        .or_default()
+                        .push_str(text);
+                    self.push_responses_text(index, text, &mut emissions);
+                }
+            }
+            "response.reasoning_text.delta" => {
+                if let Some(text) = value.get("delta").and_then(Value::as_str) {
+                    let index = required_output_index(
+                        value.get("output_index"),
+                        "Responses reasoning text delta",
+                    )?;
+                    self.responses_reasoning_by_index
+                        .entry(index)
+                        .or_default()
+                        .push_str(text);
+                    self.push_responses_reasoning(index, text, &mut emissions);
+                }
+            }
+            "response.output_item.done" => {
+                let index =
+                    required_output_index(value.get("output_index"), "Responses output item")?;
+                let item = value.get("item").ok_or_else(|| {
+                    ProviderStreamError::new(
+                        "provider_response_item_missing",
+                        "Responses output item 完成事件缺少 item。",
+                    )
+                })?;
+                if self.responses_output_items.contains_key(&index) {
+                    return Err(ProviderStreamError::new(
+                        "provider_response_item_duplicate",
+                        "Responses output_index 重复。",
+                    ));
+                }
+                match item.get("type").and_then(Value::as_str) {
+                    Some("function_call") => {
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .filter(|call_id| !call_id.trim().is_empty())
+                            .ok_or_else(|| {
+                                ProviderStreamError::new(
+                                    "provider_tool_call_invalid",
+                                    "Responses function_call 缺少 call_id。",
+                                )
+                            })?;
+                        let name = item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .filter(|name| !name.trim().is_empty())
+                            .ok_or_else(|| {
+                                ProviderStreamError::new(
+                                    "provider_tool_call_invalid",
+                                    "Responses function_call 缺少工具名称。",
+                                )
+                            })?;
+                        let arguments =
+                            item.get("arguments")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| {
+                                    ProviderStreamError::new(
+                                        "provider_tool_call_invalid",
+                                        "Responses function_call 缺少 arguments。",
+                                    )
+                                })?;
+                        let buffer = self.tool_calls.entry(index).or_default();
+                        set_once(&mut buffer.id, Some(call_id), "工具调用 ID")?;
+                        set_once(&mut buffer.name, Some(name), "工具名称")?;
+                        if !buffer.arguments.is_empty() {
+                            return Err(ProviderStreamError::new(
+                                "provider_tool_call_duplicate",
+                                "Responses function_call output item 重复。",
+                            ));
+                        }
+                        buffer.arguments.push_str(arguments);
+                    }
+                    Some("web_search_call") => {
+                        if !valid_responses_hosted_search_item(item) {
+                            return Err(ProviderStreamError::new(
+                                "provider_hosted_search_item_invalid",
+                                "Responses web_search_call 终态事实无效。",
+                            ));
+                        }
+                        let id = item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .expect("validated hosted search id");
+                        if self.hosted_web_search_calls.iter().any(|candidate| {
+                            candidate.get("id").and_then(Value::as_str) == Some(id)
+                        }) {
+                            return Err(ProviderStreamError::new(
+                                "provider_hosted_search_item_duplicate",
+                                "Responses web_search_call id 重复。",
+                            ));
+                        }
+                        self.hosted_web_search_calls.push(item.clone());
+                    }
+                    Some("message") => {
+                        let text = responses_item_text(item, "output_text")?;
+                        match self.responses_text_by_index.get(&index) {
+                            Some(streamed) if streamed != &text => {
+                                return Err(ProviderStreamError::new(
+                                    "provider_response_item_text_mismatch",
+                                    "Responses message item 与流式正文不一致。",
+                                ));
+                            }
+                            Some(_) => {}
+                            None => self.push_responses_text(index, &text, &mut emissions),
+                        }
+                    }
+                    Some("reasoning") => {
+                        let text = responses_item_text(item, "reasoning_text")?;
+                        match self.responses_reasoning_by_index.get(&index) {
+                            Some(streamed) if streamed != &text => {
+                                return Err(ProviderStreamError::new(
+                                    "provider_response_item_reasoning_mismatch",
+                                    "Responses reasoning item 与流式内容不一致。",
+                                ));
+                            }
+                            Some(_) => {}
+                            None => self.push_responses_reasoning(index, &text, &mut emissions),
+                        }
+                    }
+                    _ => {
+                        return Err(ProviderStreamError::new(
+                            "provider_response_item_type_unsupported",
+                            "Responses 返回了当前合同未支持的 output item 类型。",
+                        ));
+                    }
+                }
+                self.responses_output_items.insert(index, item.clone());
+                self.emit_contiguous_responses_output_items(&mut emissions);
+            }
+            "response.completed" => {
+                let response = value.get("response").unwrap_or(&Value::Null);
+                let usage = response.get("usage").unwrap_or(&Value::Null);
+                set_token_count(
+                    &mut self.input_tokens,
+                    usage.get("input_tokens"),
+                    "输入 token",
+                )?;
+                set_token_count(
+                    &mut self.output_tokens,
+                    usage.get("output_tokens"),
+                    "输出 token",
+                )?;
+                set_token_count(
+                    &mut self.cache_read_input_tokens,
+                    usage.pointer("/input_tokens_details/cached_tokens"),
+                    "缓存读取输入 token",
+                )?;
+                self.finish_reason = Some(if self.tool_calls.is_empty() {
+                    "stop".to_string()
+                } else {
+                    "tool_calls".to_string()
+                });
+                self.emit_remaining_responses_output_items(&mut emissions);
+                self.source_done = true;
+            }
+            "response.failed" | "response.incomplete" => {
+                let detail = value
+                    .pointer("/response/error/message")
+                    .or_else(|| value.pointer("/response/incomplete_details/reason"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(event_type);
+                return Err(ProviderStreamError::new(
+                    "provider_response_failed",
+                    format!("Responses 请求未完成：{detail}"),
+                ));
+            }
+            _ => {}
         }
         Ok(emissions)
     }
@@ -533,6 +781,79 @@ impl ProviderStreamAccumulator {
             event: json!({ "type": "reasoning_delta", "content": text }),
         });
     }
+
+    fn push_responses_text(
+        &mut self,
+        output_index: i64,
+        text: &str,
+        emissions: &mut Vec<ProviderEmission>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        self.content.push_str(text);
+        emissions.push(ProviderEmission {
+            event: json!({
+                "type": "text_delta",
+                "output_index": output_index,
+                "content": text,
+            }),
+        });
+    }
+
+    fn push_responses_reasoning(
+        &mut self,
+        output_index: i64,
+        text: &str,
+        emissions: &mut Vec<ProviderEmission>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        self.reasoning.push_str(text);
+        emissions.push(ProviderEmission {
+            event: json!({
+                "type": "reasoning_delta",
+                "output_index": output_index,
+                "content": text,
+            }),
+        });
+    }
+
+    fn emit_contiguous_responses_output_items(&mut self, emissions: &mut Vec<ProviderEmission>) {
+        let mut output_index = 0;
+        while self
+            .responses_emitted_output_indexes
+            .contains(&output_index)
+        {
+            output_index += 1;
+        }
+        while let Some(item) = self.responses_output_items.get(&output_index) {
+            emissions.push(ProviderEmission {
+                event: json!({
+                    "type": "output_item_completed",
+                    "output_index": output_index,
+                    "item": item,
+                }),
+            });
+            self.responses_emitted_output_indexes.insert(output_index);
+            output_index += 1;
+        }
+    }
+
+    fn emit_remaining_responses_output_items(&mut self, emissions: &mut Vec<ProviderEmission>) {
+        for (&output_index, item) in &self.responses_output_items {
+            if self.responses_emitted_output_indexes.insert(output_index) {
+                emissions.push(ProviderEmission {
+                    event: json!({
+                        "type": "output_item_completed",
+                        "output_index": output_index,
+                        "item": item,
+                    }),
+                });
+            }
+        }
+    }
 }
 
 fn cache_usage_from_total(
@@ -623,6 +944,60 @@ fn required_tool_call_index(
                 format!("{context} 缺少非负整数 index。"),
             )
         })
+}
+
+fn required_output_index(value: Option<&Value>, context: &str) -> Result<i64, ProviderStreamError> {
+    value
+        .and_then(Value::as_i64)
+        .filter(|index| *index >= 0)
+        .ok_or_else(|| {
+            ProviderStreamError::new(
+                "provider_response_output_index_invalid",
+                format!("{context} 缺少非负整数 output_index。"),
+            )
+        })
+}
+
+fn responses_item_text(
+    item: &Value,
+    expected_part_type: &str,
+) -> Result<String, ProviderStreamError> {
+    let Some(parts) = item.get("content") else {
+        return if expected_part_type == "reasoning_text" {
+            Ok(String::new())
+        } else {
+            Err(ProviderStreamError::new(
+                "provider_response_item_content_invalid",
+                "Responses message item 缺少 content。",
+            ))
+        };
+    };
+    let parts = parts.as_array().ok_or_else(|| {
+        ProviderStreamError::new(
+            "provider_response_item_content_invalid",
+            "Responses output item content 不是数组。",
+        )
+    })?;
+    let mut text = String::new();
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) != Some(expected_part_type) {
+            continue;
+        }
+        let value = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+            ProviderStreamError::new(
+                "provider_response_item_content_invalid",
+                "Responses output item 文本 part 缺少 text。",
+            )
+        })?;
+        text.push_str(value);
+    }
+    if expected_part_type == "output_text" && text.is_empty() {
+        return Err(ProviderStreamError::new(
+            "provider_response_item_content_invalid",
+            "Responses message item 没有 output_text。",
+        ));
+    }
+    Ok(text)
 }
 
 fn set_once(
@@ -824,5 +1199,208 @@ mod tests {
         let result = parser.finalize().unwrap();
         assert_eq!(result.output.tool_calls[0].name, "fs.read");
         assert_eq!(result.output.tool_calls[0].arguments["path"], "README.md");
+    }
+
+    #[test]
+    fn responses_hosted_search_is_preserved_with_text_and_cache_usage() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Responses);
+        let text = parser
+            .ingest_payload(br#"{"type":"response.output_text.delta","output_index":0,"delta":"Current result."}"#)
+            .unwrap();
+        let message_item = json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{ "type": "output_text", "text": "Current result.", "annotations": [] }],
+        });
+        let item = json!({
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": { "type": "search", "queries": ["current result"] },
+        });
+        let failed_item = json!({
+            "type": "web_search_call",
+            "id": "ws_2",
+            "status": "failed",
+            "action": { "type": "open_page", "url": "https://example.com/unavailable" },
+        });
+        parser
+            .ingest_payload(
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": message_item.clone(),
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        parser
+            .ingest_payload(
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": item.clone(),
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        parser
+            .ingest_payload(
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 2,
+                    "item": failed_item.clone(),
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        parser
+            .ingest_payload(
+                br#"{"type":"response.completed","response":{"usage":{"input_tokens":30,"output_tokens":6,"input_tokens_details":{"cached_tokens":18}}}}"#,
+            )
+            .unwrap();
+        let result = parser.finalize().unwrap();
+
+        assert_eq!(
+            text[0].event,
+            json!({
+                "type": "text_delta",
+                "output_index": 0,
+                "content": "Current result.",
+            })
+        );
+        assert_eq!(result.output.content, "Current result.");
+        assert_eq!(
+            result.output.hosted_web_search_calls,
+            vec![item.clone(), failed_item.clone()]
+        );
+        assert_eq!(
+            result.completion.usage,
+            Some(ProviderUsage {
+                input_tokens: 30,
+                output_tokens: 6,
+                cache_read_input_tokens: Some(18),
+                cache_miss_input_tokens: Some(12),
+            })
+        );
+    }
+
+    #[test]
+    fn responses_function_call_requires_native_call_id() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Responses);
+        let error = parser
+            .ingest_payload(
+                br#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","name":"fs_read","arguments":"{}"}}"#,
+            )
+            .expect_err("missing call_id must fail");
+
+        assert_eq!(error.code, "provider_tool_call_invalid");
+    }
+
+    #[test]
+    fn responses_streamed_content_requires_matching_native_output_item() {
+        for payload in [
+            br#"{"type":"response.output_text.delta","output_index":0,"delta":"partial"}"#
+                .as_slice(),
+            br#"{"type":"response.reasoning_text.delta","output_index":0,"delta":"partial"}"#
+                .as_slice(),
+        ] {
+            let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Responses);
+            parser.ingest_payload(payload).unwrap();
+            parser
+                .ingest_payload(br#"{"type":"response.completed","response":{}}"#)
+                .unwrap();
+
+            let error = parser
+                .finalize()
+                .expect_err("streamed content without a native completed item must fail");
+            assert_eq!(error.code, "provider_response_item_terminal_missing");
+        }
+    }
+
+    #[test]
+    fn responses_output_items_are_emitted_in_native_output_index_order() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Responses);
+        let items = [
+            json!({
+                "type": "message",
+                "id": "msg_intro",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{ "type": "output_text", "text": "Searching." }],
+            }),
+            json!({
+                "type": "web_search_call",
+                "id": "ws_1",
+                "status": "completed",
+                "action": { "type": "search", "queries": ["current compiler release"] },
+            }),
+            json!({
+                "type": "message",
+                "id": "msg_final",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{ "type": "output_text", "text": "Found it." }],
+            }),
+        ];
+        let mut completed_outputs = Vec::new();
+        for output_index in [2, 0, 1] {
+            let emissions = parser
+                .ingest_payload(
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "item": items[output_index].clone(),
+                    })
+                    .to_string()
+                    .as_bytes(),
+                )
+                .unwrap();
+            completed_outputs.extend(emissions.iter().filter_map(|emission| {
+                (emission.event.get("type").and_then(Value::as_str)
+                    == Some("output_item_completed"))
+                .then(|| {
+                    Some((
+                        emission.event.get("output_index")?.as_i64()?,
+                        emission.event.get("item")?.clone(),
+                    ))
+                })
+                .flatten()
+            }));
+        }
+        let terminal_emissions = parser
+            .ingest_payload(br#"{"type":"response.completed","response":{}}"#)
+            .unwrap();
+        completed_outputs.extend(terminal_emissions.iter().filter_map(|emission| {
+            (emission.event.get("type").and_then(Value::as_str) == Some("output_item_completed"))
+                .then(|| {
+                    Some((
+                        emission.event.get("output_index")?.as_i64()?,
+                        emission.event.get("item")?.clone(),
+                    ))
+                })
+                .flatten()
+        }));
+
+        parser.finalize().unwrap();
+        assert_eq!(
+            completed_outputs
+                .iter()
+                .map(|output| output.0)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            completed_outputs
+                .iter()
+                .map(|output| output.1.clone())
+                .collect::<Vec<_>>(),
+            items
+        );
     }
 }

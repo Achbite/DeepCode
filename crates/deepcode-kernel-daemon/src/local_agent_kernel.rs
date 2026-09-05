@@ -88,7 +88,7 @@ impl WorkspaceResolverPort for HostWorkspaceResolver {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PermissionMode {
+pub(crate) enum PermissionMode {
     Allow,
     Ask,
     Deny,
@@ -141,6 +141,10 @@ impl LocalAgentPermissionPolicy {
             | PreparedEffectScope::WorkspaceMutation
             | PreparedEffectScope::Process => None,
         }
+    }
+
+    pub(crate) fn network_mode(self) -> PermissionMode {
+        self.network
     }
 }
 
@@ -370,6 +374,7 @@ impl LocalAgentKernel {
         secret_provider: Arc<dyn SecretProvider>,
         mcp: McpRuntime,
         permissions: LocalAgentPermissionPolicy,
+        enable_web_search: bool,
     ) -> Result<PreparedKernelGeneration, LocalAgentKernelError> {
         let catalog = ToolCatalogSnapshot::prepare(
             extension_generation_ref,
@@ -377,6 +382,7 @@ impl LocalAgentKernel {
             executor_config.clone(),
             secret_provider,
             mcp,
+            enable_web_search,
         )
         .map_err(catalog_error)?;
         Ok(PreparedKernelGeneration {

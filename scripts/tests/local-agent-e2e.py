@@ -120,6 +120,15 @@ class ProviderState:
             in guidance,
             "bash 与 fs.read 的职责边界 guidance 缺失",
         )
+        require(
+            "- web_fetch: Read bounded text from a known HTTP or HTTPS URL." in guidance,
+            "web.fetch prompt snippet 未进入 Provider 请求",
+        )
+        require(
+            "Do not use this as a substitute for unavailable search by guessing URLs"
+            in guidance,
+            "web.fetch 与搜索的职责边界 guidance 缺失",
+        )
         require("filesystem or Bash tools" not in joined, "附件文本仍在指示 Bash 读取")
         tools_by_description: dict[str, list[str]] = {}
         for item in body["tools"]:
@@ -146,7 +155,7 @@ class ProviderState:
         require(len(reverse_tools) == 1, "Provider 请求没有唯一的 MCP reverse 工具")
         wire_name = reverse_tools[0]
         search_tools = tools_by_description.get(
-            "Search the web through the built-in RSS backend or an explicitly configured JSON endpoint.",
+            "Search the web through the built-in Brave Web Search adapter or an explicitly configured JSON endpoint.",
             [],
         )
         fetch_tools = tools_by_description.get("Fetch bounded HTTP or HTTPS text.", [])
@@ -679,7 +688,7 @@ def projection(daemon: OwnedDaemon, session_id: str) -> dict[str, Any]:
         token=daemon.token,
     )
     require(isinstance(value, dict), "SessionProjection 不是对象")
-    require(value.get("schemaVersion") == "deepcode.session-projection.v4", "投影协议不是当前值")
+    require(value.get("schemaVersion") == "deepcode.session-projection.v5", "投影协议不是当前值")
     require(value.get("sessionId") == session_id, "SessionProjection identity 漂移")
     return value
 
@@ -1036,7 +1045,7 @@ def assert_identity_chain(config_root: Path, session_id: str) -> None:
         require(
             [item.get("canonicalToolName") for item in prompt_contributions]
             == [
-                "fs.read", "bash",
+                "fs.read", "bash", "web.fetch",
                 "arxiv.read", "arxiv.search",
                 "github.read", "github.search",
                 "pdf.read",
@@ -1047,7 +1056,7 @@ def assert_identity_chain(config_root: Path, session_id: str) -> None:
             tool_name = contribution.get("canonicalToolName")
             target = runtime_tools_by_name.get(tool_name)
             require(isinstance(target, dict), "tool prompt 指向不存在的 runtime tool")
-            if tool_name in {"fs.read", "bash"}:
+            if tool_name in {"fs.read", "bash", "web.fetch"}:
                 require(contribution.get("origin") == "coreBuiltin", "core tool prompt origin 漂移")
                 require("pluginUri" not in contribution, "core tool prompt 错误携带 pluginUri")
             else:

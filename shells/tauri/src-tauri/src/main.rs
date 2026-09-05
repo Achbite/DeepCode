@@ -356,7 +356,7 @@ fn create_main_window(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let boot_url = format!("{APP_ASSET_SCHEME}://localhost/index.html");
     let initialization_script = format!(
-        "Object.defineProperty(window,'__DEEPCODE_HOST_BOOT__',{{value:Object.freeze({{schemaVersion:'deepcode.host-ui-bootstrap',host:'{}',port:'{}',uiToken:'{}'}}),writable:false,configurable:true}});",
+        "Object.defineProperty(window,'__DEEPCODE_HOST_BOOT__',{{value:Object.freeze({{schemaVersion:'deepcode.host-ui-bootstrap',host:'{}',port:'{}',uiToken:'{}',windowChrome:'custom'}}),writable:false,configurable:true}});",
         target.host,
         target.port,
         host_tokens.ui_token()

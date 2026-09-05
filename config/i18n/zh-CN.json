@@ -446,6 +446,7 @@
     "settings.runtime.savedImmediate": "已保存并立即生效。",
     "settings.llm.reenterRecoveredApiKey": "当前 schema 的恢复不会自动关联旧密钥；请为已启用的 Profile“{name}”重新输入 API Key。",
     "settings.llm.providerKind.openaiCompatible": "OpenAI 兼容",
+    "settings.llm.providerKind.responses": "Responses API",
     "settings.llm.providerKind.anthropic": "Anthropic",
     "settings.llm.providerKind.ollama": "Ollama",
     "settings.llm.providerFlavor": "Provider 类型",
@@ -453,6 +454,9 @@
     "settings.llm.providerFlavor.deepseek": "DeepSeek",
     "settings.llm.providerFlavor.zhipu": "智谱",
     "settings.llm.providerFlavor.moonshot": "月之暗面 / Kimi",
+    "settings.llm.hostedWebSearch": "Provider 联网搜索",
+    "settings.llm.hostedWebSearch.none": "关闭",
+    "settings.llm.hostedWebSearch.webSearch": "Provider 原生搜索",
     "settings.llm.probeSucceeded": "成功，延迟 {latency}ms",
     "settings.mcp.title": "MCP 服务",
     "settings.mcp.defaultName": "本地 MCP",
@@ -642,6 +646,24 @@
     "agent.tool.summary.usedMany": "使用了 {count} 次工具",
     "agent.tool.summary.editedAndRan": "编辑了文件并运行了命令",
     "agent.tool.summary.editedMany": "已编辑 {count} 项工作区内容",
+    "agent.providerHosted.summary.active": "正在联网检索",
+    "agent.providerHosted.summary.activeTarget": "正在检索 {target}",
+    "agent.providerHosted.summary.activeMany": "正在进行 {count} 次联网检索",
+    "agent.providerHosted.summary.completed": "已完成联网检索",
+    "agent.providerHosted.summary.completedTarget": "已检索 {target}",
+    "agent.providerHosted.summary.completedMany": "已完成 {count} 次联网检索",
+    "agent.providerHosted.summary.didNotComplete": "联网检索未完成",
+    "agent.providerHosted.summary.didNotCompleteTarget": "检索未完成 {target}",
+    "agent.providerHosted.summary.didNotCompleteMany": "{count} 次联网检索未全部完成",
+    "agent.providerHosted.detail.providerTool": "Provider 工具",
+    "agent.providerHosted.detail.providerCallId": "Provider 调用 ID",
+    "agent.providerHosted.detail.action": "动作",
+    "agent.providerHosted.detail.target": "目标",
+    "agent.providerHosted.detail.status": "状态",
+    "agent.providerHosted.detail.queries": "检索词",
+    "agent.providerHosted.detail.url": "网页",
+    "agent.providerHosted.detail.pattern": "查找内容",
+    "agent.providerHosted.detail.sources": "来源",
     "agent.tool.activity.ranCommand": "已运行命令 {command}",
     "agent.tool.activity.runningCommand": "正在运行命令 {command}",
     "agent.tool.activity.createdDirectory": "已创建目录 {path}",
@@ -688,9 +710,13 @@
     "deepcodeGui.tasks.status.inProgress": "进行中",
     "deepcodeGui.tasks.status.completed": "完成",
     "deepcodeGui.cache.summary": "总缓存命中 {value}",
+    "deepcodeGui.cache.pendingSummary": "缓存命中 待统计",
+    "deepcodeGui.cache.pendingTitle": "正在执行，尚未收到可计算的输入缓存用量。统计会在模型请求完成并返回用量后更新。",
+    "deepcodeGui.cache.updatingTitle": "当前仍在执行；以上仅包含已回传的用量，后续统计会在模型请求完成后更新。",
+    "deepcodeGui.cache.emptySummary": "缓存命中 暂无统计",
     "deepcodeGui.cache.unavailableSummary": "缓存命中 不可用",
     "deepcodeGui.cache.calculatedTitle": "已纳入统计的输入为 {input} Token，其中缓存读取 {hit}，缓存未命中 {miss}。总缓存命中率按这些可计算 Token 的累计值计算。",
-    "deepcodeGui.cache.unavailableTitle": "当前会话有 {calls} 次 Provider 调用，但均未报告缓存读取与未命中字段。",
+    "deepcodeGui.cache.unavailableTitle": "当前会话已完成 {calls} 次模型请求，尚无可计算的输入缓存统计。",
     "deepcodeGui.cache.emptyTitle": "当前会话尚无 Provider 用量。",
     "deepcodeGui.titlebar.api": "API",
     "deepcodeGui.titlebar.agent": "Agent"
@@ -868,15 +894,15 @@
     },
     "agent.web.search.endpointTemplate": {
       "label": "Web 搜索覆盖端点模板",
-      "description": "留空使用内建 Bing RSS；也可填写包含 {query} 和可选 {limit} 的 JSON HTTP 端点模板。"
+      "description": "留空使用内建 Brave Web Search adapter；也可填写包含 {query} 和可选 {limit} 的显式 JSON HTTP 端点模板。配置端点绝不作为 fallback。"
     },
     "agent.web.search.authHeaderName": {
       "label": "Web 搜索认证头",
-      "description": "与搜索 SecretRef 一起使用的请求头名称。"
+      "description": "仅供显式配置的搜索端点使用；内建 Brave adapter 固定使用 X-Subscription-Token。"
     },
     "agent.web.search.authSecretRef": {
       "label": "Web 搜索认证 Secret",
-      "description": "配置搜索端点使用的 Secret 引用。"
+      "description": "内建 Brave adapter 必需、显式配置端点可选的 Secret 引用；缺失时内建 web.search 为 blocked。"
     },
     "skills.mounts": {
       "label": "项目 Skill 挂载",

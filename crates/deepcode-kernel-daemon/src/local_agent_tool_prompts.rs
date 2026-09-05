@@ -22,6 +22,15 @@ pub(crate) fn core_tool_prompt_providers() -> Value {
                     "Use this for directory listing, text search, file discovery, builds, tests, and command execution.",
                     "Do not use this as the default way to read a known UTF-8 workspace text file."
                 ]
+            },
+            {
+                "contributionRef": "tool-prompt-contribution:core:web.fetch",
+                "canonicalToolName": "web.fetch",
+                "promptSnippet": "Read bounded text from a known HTTP or HTTPS URL.",
+                "usageGuidelines": [
+                    "Use this to inspect a URL supplied by the user or returned by an earlier tool result.",
+                    "Do not use this as a substitute for unavailable search by guessing URLs or selecting general-purpose websites; report that search is unavailable instead."
+                ]
             }
         ]
     }])
@@ -43,7 +52,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn core_prompt_provider_has_distinct_read_and_bash_guidance() {
+    fn core_prompt_provider_has_distinct_tool_guidance() {
         let providers = core_tool_prompt_providers();
         let providers = providers.as_array().expect("provider array");
         assert_eq!(providers.len(), 1);
@@ -55,7 +64,7 @@ mod tests {
                 .iter()
                 .map(|item| item["canonicalToolName"].as_str().expect("tool name"))
                 .collect::<Vec<_>>(),
-            vec!["fs.read", "bash"]
+            vec!["fs.read", "bash", "web.fetch"]
         );
         assert!(contributions
             .iter()
@@ -65,7 +74,9 @@ mod tests {
                 .iter()
                 .all(|guideline| {
                     let guideline = guideline.as_str().expect("guideline text");
-                    !guideline.contains("fs.read") && !guideline.contains("bash")
+                    ["fs.read", "bash", "web.fetch"]
+                        .iter()
+                        .all(|tool_name| !guideline.contains(tool_name))
                 })));
         assert!(contributions[0]["usageGuidelines"][0]
             .as_str()
@@ -75,5 +86,13 @@ mod tests {
             .as_str()
             .expect("bash guideline")
             .contains("not use this as the default way to read"));
+        assert!(contributions[2]["usageGuidelines"][0]
+            .as_str()
+            .expect("fetch guideline")
+            .contains("supplied by the user or returned by an earlier tool result"));
+        assert!(contributions[2]["usageGuidelines"][1]
+            .as_str()
+            .expect("fetch guideline")
+            .contains("not use this as a substitute for unavailable search"));
     }
 }

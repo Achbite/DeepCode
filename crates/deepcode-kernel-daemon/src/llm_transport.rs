@@ -22,6 +22,7 @@ pub(crate) struct ResolvedLlmProfile {
     pub(crate) temperature: Option<f64>,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) thinking: Option<String>,
+    pub(crate) hosted_web_search: Option<String>,
     pub(crate) api_key: Option<String>,
 }
 
@@ -45,6 +46,7 @@ pub(crate) struct LlmChatOutput {
     pub(crate) reasoning: Option<String>,
     pub(crate) reasoning_signature: Option<String>,
     pub(crate) tool_calls: Vec<LlmToolCall>,
+    pub(crate) hosted_web_search_calls: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +83,7 @@ pub(crate) fn llm_profile_value_is_current(profile: &Value) -> bool {
         "temperature",
         "reasoningEffort",
         "thinking",
+        "hostedWebSearch",
         "secretRef",
         "enabled",
     ];
@@ -108,7 +111,7 @@ pub(crate) fn llm_profile_value_is_current(profile: &Value) -> bool {
         && profile.get("enabled").and_then(Value::as_bool).is_some()
         && matches!(
             profile.get("kind").and_then(Value::as_str),
-            Some("openaiCompatible" | "anthropic" | "ollama")
+            Some("openaiCompatible" | "responses" | "anthropic" | "ollama")
         )
         && profile.get("providerFlavor").is_none_or(|value| {
             matches!(
@@ -128,6 +131,10 @@ pub(crate) fn llm_profile_value_is_current(profile: &Value) -> bool {
         && profile
             .get("thinking")
             .is_none_or(|value| matches!(value.as_str(), Some("enabled" | "disabled")))
+        && profile.get("hostedWebSearch").is_none_or(|value| {
+            value.as_str() == Some("web_search")
+                && profile.get("kind").and_then(Value::as_str) == Some("responses")
+        })
         && profile
             .get("secretRef")
             .is_none_or(|value| value.as_str().and_then(local_secret_ref_key).is_some())
@@ -293,6 +300,10 @@ pub(crate) fn resolve_llm_profile(
             .get("thinking")
             .and_then(Value::as_str)
             .map(str::to_string),
+        hosted_web_search: profile
+            .get("hostedWebSearch")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         api_key,
     })
 }
@@ -355,6 +366,278 @@ pub(crate) fn openai_compatible_request_body(
     body
 }
 
+fn responses_request_body(
+    profile: &ResolvedLlmProfile,
+    messages: Vec<Value>,
+    tools: &[LlmToolDefinition],
+    hosted_tools: &[Value],
+    stream: bool,
+    require_tool_call: bool,
+) -> Result<Value, ProviderTransportError> {
+    let mut provider_tools = tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema,
+            })
+        })
+        .collect::<Vec<_>>();
+    for tool in hosted_tools {
+        let tool = tool.as_object().ok_or_else(|| {
+            ProviderTransportError::message(
+                "provider_hosted_tool_invalid",
+                "Responses hosted tool 不是对象。",
+            )
+        })?;
+        if tool.len() != 2
+            || tool.get("type").and_then(Value::as_str) != Some("webSearch")
+            || tool.get("providerToolType").and_then(Value::as_str) != Some("web_search")
+        {
+            return Err(ProviderTransportError::message(
+                "provider_hosted_tool_invalid",
+                "Responses hosted tool 合同无效。",
+            ));
+        }
+        provider_tools.push(json!({ "type": "web_search" }));
+    }
+    let mut body = json!({
+        "model": profile.model,
+        "input": responses_input(messages)?,
+        "stream": stream,
+        "max_output_tokens": profile
+            .max_output_tokens
+            .expect("resolved Provider runtime has maxOutputTokens"),
+    });
+    if let Some(effort) = profile
+        .reasoning_effort
+        .as_ref()
+        .filter(|_| profile.thinking.as_deref() != Some("disabled"))
+    {
+        body["reasoning"] = json!({ "effort": effort });
+    }
+    if provider_thinking_compatibility(profile) != ProviderThinkingCompatibility::DeepSeek {
+        if let Some(temperature) = profile.temperature {
+            body["temperature"] = json!(temperature);
+        }
+    }
+    if !provider_tools.is_empty() {
+        body["tools"] = Value::Array(provider_tools);
+        if require_tool_call {
+            body["tool_choice"] = json!("required");
+        }
+    }
+    Ok(body)
+}
+
+fn responses_input(messages: Vec<Value>) -> Result<Vec<Value>, ProviderTransportError> {
+    let mut input = Vec::new();
+    for message in messages {
+        let record = message.as_object().ok_or_else(|| {
+            ProviderTransportError::message("provider_envelope_invalid", "Responses 消息不是对象。")
+        })?;
+        if let Some(blocks) = record
+            .get("providerOutputBlocks")
+            .filter(|blocks| !blocks.is_null())
+        {
+            if record.get("role").and_then(Value::as_str) != Some("assistant") {
+                return Err(ProviderTransportError::message(
+                    "provider_envelope_invalid",
+                    "Responses providerOutputBlocks 只能属于 assistant 消息。",
+                ));
+            }
+            let blocks = blocks
+                .as_array()
+                .filter(|blocks| !blocks.is_empty())
+                .ok_or_else(|| {
+                    ProviderTransportError::message(
+                        "provider_envelope_invalid",
+                        "Responses providerOutputBlocks 不是非空数组。",
+                    )
+                })?;
+            for block in blocks {
+                let item = block.get("item").ok_or_else(|| {
+                    ProviderTransportError::message(
+                        "provider_envelope_invalid",
+                        "Responses providerOutputBlock 缺少原生 item。",
+                    )
+                })?;
+                if !valid_responses_replay_item(item) {
+                    return Err(ProviderTransportError::message(
+                        "provider_envelope_invalid",
+                        "Responses providerOutputBlock 原生 item 无效。",
+                    ));
+                }
+                input.push(item.clone());
+            }
+            continue;
+        }
+        if let Some(provider_items) = record
+            .get("providerItems")
+            .filter(|provider_items| !provider_items.is_null())
+        {
+            let provider_items = provider_items.as_array().ok_or_else(|| {
+                ProviderTransportError::message(
+                    "provider_envelope_invalid",
+                    "Responses providerItems 不是数组。",
+                )
+            })?;
+            for item in provider_items {
+                if !valid_responses_hosted_search_item(item) {
+                    return Err(ProviderTransportError::message(
+                        "provider_envelope_invalid",
+                        "Responses providerItems 合同无效。",
+                    ));
+                }
+                input.push(item.clone());
+            }
+        }
+        let role = record
+            .get("role")
+            .and_then(Value::as_str)
+            .filter(|role| matches!(*role, "system" | "user" | "assistant" | "tool"))
+            .ok_or_else(|| {
+                ProviderTransportError::message(
+                    "provider_envelope_invalid",
+                    "Responses 消息角色无效。",
+                )
+            })?;
+        let content = record
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProviderTransportError::message(
+                    "provider_envelope_invalid",
+                    "Responses 消息正文不是字符串。",
+                )
+            })?;
+        if role == "tool" {
+            let call_id = record
+                .get("providerCallId")
+                .and_then(Value::as_str)
+                .filter(|call_id| !call_id.trim().is_empty())
+                .ok_or_else(|| {
+                    ProviderTransportError::message(
+                        "provider_envelope_invalid",
+                        "Responses tool 消息缺少 providerCallId。",
+                    )
+                })?;
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": content,
+            }));
+            continue;
+        }
+        if !content.is_empty() {
+            input.push(json!({
+                "type": "message",
+                "role": role,
+                "content": [{
+                    "type": if role == "assistant" { "output_text" } else { "input_text" },
+                    "text": content,
+                }],
+            }));
+        }
+        let calls = match record.get("toolCalls").filter(|calls| !calls.is_null()) {
+            Some(value) => value.as_array().ok_or_else(|| {
+                ProviderTransportError::message(
+                    "provider_envelope_invalid",
+                    "Responses toolCalls 不是数组。",
+                )
+            })?,
+            None => continue,
+        };
+        for call in calls {
+            let call = call.as_object().ok_or_else(|| {
+                ProviderTransportError::message(
+                    "provider_envelope_invalid",
+                    "Responses toolCalls 成员不是对象。",
+                )
+            })?;
+            let call_id = call
+                .get("providerCallId")
+                .and_then(Value::as_str)
+                .filter(|call_id| !call_id.trim().is_empty())
+                .ok_or_else(|| {
+                    ProviderTransportError::message(
+                        "provider_envelope_invalid",
+                        "Responses function_call 缺少 providerCallId。",
+                    )
+                })?;
+            let name = call
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| {
+                    ProviderTransportError::message(
+                        "provider_envelope_invalid",
+                        "Responses function_call 缺少工具名称。",
+                    )
+                })?;
+            let arguments = call
+                .get("input")
+                .filter(|input| input.is_object())
+                .ok_or_else(|| {
+                    ProviderTransportError::message(
+                        "provider_envelope_invalid",
+                        "Responses function_call 参数不是对象。",
+                    )
+                })?;
+            let arguments = serde_json::to_string(arguments).map_err(|error| {
+                ProviderTransportError::message(
+                    "provider_request_encode_failed",
+                    format!("无法编码 Responses function_call 参数：{error}"),
+                )
+            })?;
+            input.push(json!({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+            }));
+        }
+    }
+    Ok(input)
+}
+
+pub(crate) fn valid_responses_hosted_search_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("web_search_call")
+        && item
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty())
+        && matches!(
+            item.get("status").and_then(Value::as_str),
+            Some("completed" | "failed")
+        )
+        && item.get("action").is_some_and(Value::is_object)
+}
+
+fn valid_responses_replay_item(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => {
+            item.get("role").and_then(Value::as_str) == Some("assistant")
+                && item.get("content").is_some_and(Value::is_array)
+        }
+        Some("reasoning") => item.is_object(),
+        Some("function_call") => {
+            item.get("call_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+                && item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+                && item.get("arguments").and_then(Value::as_str).is_some()
+        }
+        Some("web_search_call") => valid_responses_hosted_search_item(item),
+        _ => false,
+    }
+}
+
 fn openai_compatible_message(
     message: Value,
     compatibility: ProviderThinkingCompatibility,
@@ -413,10 +696,9 @@ fn openai_compatible_message(
         "tool" => json!({
             "role": "tool",
             "tool_call_id": record
-                .get("toolCallId")
-                .or_else(|| record.get("tool_call_id"))
+                .get("providerCallId")
                 .and_then(Value::as_str)
-                .unwrap_or("tool-call"),
+                .expect("validated tool message has providerCallId"),
             "content": message_content_string(record.get("content"))
         }),
         _ => json!({
@@ -441,10 +723,9 @@ fn openai_tool_call(value: &Value) -> Option<Value> {
         .unwrap_or_else(|| json!({}));
     Some(json!({
         "id": record
-            .get("callId")
-            .or_else(|| record.get("id"))
+            .get("providerCallId")
             .and_then(Value::as_str)
-            .unwrap_or("tool-call"),
+            .expect("validated tool call has providerCallId"),
         "type": "function",
         "function": {
             "name": name,
@@ -514,6 +795,8 @@ impl ProviderTransportError {
             "provider_api_key_missing" => "当前 Provider Profile 没有配置 API Key。",
             "provider_request_too_large" => "Provider 请求超过本地传输上限。",
             "provider_envelope_invalid" => "Provider 请求正文不是当前闭合结构。",
+            "provider_hosted_tool_unsupported" => "当前 Provider API surface 不支持 hosted tool。",
+            "provider_hosted_tool_invalid" => "Provider hosted tool 合同无效。",
             "provider_envelope_too_large" => "Provider 单个流事件超过结构上限。",
             "provider_probe_timeout" => "Provider 探测超时。",
             "provider_http_status_failed" => "Provider 返回非成功 HTTP 状态。",
@@ -524,9 +807,11 @@ impl ProviderTransportError {
     }
 }
 
+#[derive(Debug)]
 struct PreparedProviderRequest {
     kind: ProviderStreamKind,
     body: Vec<u8>,
+    hosted_web_search_enabled: bool,
 }
 
 fn prepare_provider_request(
@@ -546,6 +831,16 @@ fn prepare_provider_request(
         .cloned()
         .map(provider_tools_from_values)
         .ok_or_else(|| ProviderTransportError::new("provider_envelope_invalid"))?;
+    let hosted_tools = envelope
+        .get("hostedTools")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| ProviderTransportError::new("provider_envelope_invalid"))?;
+    if !hosted_tools.is_empty() && kind != ProviderStreamKind::Responses {
+        return Err(ProviderTransportError::new(
+            "provider_hosted_tool_unsupported",
+        ));
+    }
     let require_tool_call = envelope
         .get("requireToolCall")
         .and_then(Value::as_bool)
@@ -559,6 +854,14 @@ fn prepare_provider_request(
         ProviderStreamKind::OpenAiCompatible => {
             openai_compatible_request_body(profile, messages, &tools, true, require_tool_call)
         }
+        ProviderStreamKind::Responses => responses_request_body(
+            profile,
+            messages,
+            &tools,
+            &hosted_tools,
+            true,
+            require_tool_call,
+        )?,
         ProviderStreamKind::Anthropic => {
             anthropic_stream_request_body(profile, messages, &tools, require_tool_call)
         }
@@ -575,7 +878,11 @@ fn prepare_provider_request(
     if body.len() > PROVIDER_REQUEST_LIMIT {
         return Err(ProviderTransportError::new("provider_request_too_large"));
     }
-    Ok(PreparedProviderRequest { kind, body })
+    Ok(PreparedProviderRequest {
+        kind,
+        body,
+        hosted_web_search_enabled: !hosted_tools.is_empty(),
+    })
 }
 
 fn build_provider_request(
@@ -584,6 +891,7 @@ fn build_provider_request(
 ) -> Result<reqwest::RequestBuilder, ProviderTransportError> {
     let url = match prepared.kind {
         ProviderStreamKind::OpenAiCompatible => normalize_openai_base_url(profile),
+        ProviderStreamKind::Responses => normalize_responses_base_url(profile),
         ProviderStreamKind::Anthropic => normalize_anthropic_base_url(profile),
         ProviderStreamKind::Ollama => normalize_ollama_base_url(profile),
     };
@@ -592,7 +900,7 @@ fn build_provider_request(
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(prepared.body.clone());
     match prepared.kind {
-        ProviderStreamKind::OpenAiCompatible => {
+        ProviderStreamKind::OpenAiCompatible | ProviderStreamKind::Responses => {
             let key = profile
                 .api_key
                 .as_deref()
@@ -630,7 +938,9 @@ impl ProviderEnvelopeFramer {
         self.buffer.extend_from_slice(chunk);
         let mut payloads = Vec::new();
         match self.kind {
-            ProviderStreamKind::OpenAiCompatible | ProviderStreamKind::Anthropic => {
+            ProviderStreamKind::OpenAiCompatible
+            | ProviderStreamKind::Responses
+            | ProviderStreamKind::Anthropic => {
                 while let Some((end, delimiter)) = sse_boundary(&self.buffer) {
                     let raw = self.buffer.drain(..end + delimiter).collect::<Vec<_>>();
                     ensure_envelope_size(&raw)?;
@@ -737,6 +1047,7 @@ async fn probe_profile(
         &json!({
             "messages": [{ "role": "user", "content": "Reply with OK." }],
             "tools": [],
+            "hostedTools": [],
             "requireToolCall": false
         }),
     )?;
@@ -896,19 +1207,84 @@ pub(crate) fn local_agent_provider_stream_response(
                 };
                 for emission in emissions {
                     let event_type = emission.event.get("type").and_then(Value::as_str);
-                    let Some(text) = emission.event.get("content").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    let provider_type = match event_type {
-                        Some("text_delta") => "text.delta",
-                        Some("reasoning_delta") => "reasoning.delta",
-                        _ => continue,
-                    };
-                    yield Ok(Bytes::from(provider_event(
-                        &request_id,
-                        provider_type,
-                        json!({ "text": text }),
-                    )));
+                    match event_type {
+                        Some("text_delta") | Some("reasoning_delta") => {
+                            let Some(text) = emission.event.get("content").and_then(Value::as_str) else {
+                                continue;
+                            };
+                            let provider_type = if event_type == Some("text_delta") {
+                                "text.delta"
+                            } else {
+                                "reasoning.delta"
+                            };
+                            let data = match emission
+                                .event
+                                .get("output_index")
+                                .and_then(Value::as_i64)
+                            {
+                                Some(output_index) => {
+                                    json!({ "text": text, "outputIndex": output_index })
+                                }
+                                None => json!({ "text": text }),
+                            };
+                            yield Ok(Bytes::from(provider_event(
+                                &request_id,
+                                provider_type,
+                                data,
+                            )));
+                        }
+                        Some("output_item_completed") => {
+                            let Some(output_index) = emission
+                                .event
+                                .get("output_index")
+                                .and_then(Value::as_i64)
+                            else {
+                                yield Ok(Bytes::from(provider_event(
+                                    &request_id,
+                                    "failed",
+                                    json!({
+                                        "code": "provider_stream_emission_invalid",
+                                        "message": "Kernel 流解析器产生了缺少 output_index 的完成项。",
+                                    }),
+                                )));
+                                return;
+                            };
+                            let Some(item) = emission.event.get("item") else {
+                                yield Ok(Bytes::from(provider_event(
+                                    &request_id,
+                                    "failed",
+                                    json!({
+                                        "code": "provider_stream_emission_invalid",
+                                        "message": "Kernel 流解析器产生了缺少 item 的完成项。",
+                                    }),
+                                )));
+                                return;
+                            };
+                            if item.get("type").and_then(Value::as_str)
+                                == Some("web_search_call")
+                                && !prepared.hosted_web_search_enabled
+                            {
+                                yield Ok(Bytes::from(provider_event(
+                                    &request_id,
+                                    "failed",
+                                    json!({
+                                        "code": "provider_hosted_search_unrequested",
+                                        "message": "Provider 返回了当前请求未启用的 hosted search 事实。",
+                                    }),
+                                )));
+                                return;
+                            }
+                            yield Ok(Bytes::from(provider_event(
+                                &request_id,
+                                "output.item.completed",
+                                json!({
+                                    "outputIndex": output_index,
+                                    "item": item,
+                                }),
+                            )));
+                        }
+                        _ => {}
+                    }
                 }
             }
             if accumulator.source_done() || eof {
@@ -926,13 +1302,27 @@ pub(crate) fn local_agent_provider_stream_response(
                 return;
             }
         };
-        if !result.output.content.is_empty()
+        if !prepared.hosted_web_search_enabled
+            && !result.output.hosted_web_search_calls.is_empty()
+        {
+            yield Ok(Bytes::from(provider_event(
+                &request_id,
+                "failed",
+                json!({
+                    "code": "provider_hosted_search_unrequested",
+                    "message": "Provider 返回了当前请求未启用的 hosted search 事实。",
+                }),
+            )));
+            return;
+        }
+        if result.completion.provider_kind != ProviderStreamKind::Responses
+            && (!result.output.content.is_empty()
             || result
                 .output
                 .reasoning
                 .as_deref()
                 .is_some_and(|reasoning| !reasoning.trim().is_empty())
-            || !result.output.tool_calls.is_empty()
+            || !result.output.tool_calls.is_empty())
         {
             let mut message = json!({
                 "messageId": format!("provider-message:{request_id}"),
@@ -978,16 +1368,25 @@ pub(crate) fn local_agent_provider_stream_response(
             }
             _ => json!({}),
         };
-        for call in result.output.tool_calls {
-            yield Ok(Bytes::from(provider_event(
-                &request_id,
-                "tool.call",
-                json!({
-                    "callId": call.id,
-                    "name": call.name,
-                    "input": call.arguments,
-                }),
-            )));
+        if result.completion.provider_kind != ProviderStreamKind::Responses {
+            for call in result.output.tool_calls {
+                yield Ok(Bytes::from(provider_event(
+                    &request_id,
+                    "tool.call",
+                    json!({
+                        "callId": call.id,
+                        "name": call.name,
+                        "input": call.arguments,
+                    }),
+                )));
+            }
+            for item in result.output.hosted_web_search_calls {
+                yield Ok(Bytes::from(provider_event(
+                    &request_id,
+                    "hosted.web-search.completed",
+                    json!({ "item": item }),
+                )));
+            }
         }
         yield Ok(Bytes::from(provider_event(
             &request_id,
@@ -1079,6 +1478,19 @@ fn normalize_openai_base_url(profile: &ResolvedLlmProfile) -> String {
     }
 }
 
+fn normalize_responses_base_url(profile: &ResolvedLlmProfile) -> String {
+    let base = profile
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.openai.com/v1")
+        .trim_end_matches('/');
+    if base.ends_with("/responses") {
+        base.to_string()
+    } else {
+        format!("{base}/responses")
+    }
+}
+
 pub(crate) fn normalize_anthropic_base_url(profile: &ResolvedLlmProfile) -> String {
     let base = profile
         .base_url
@@ -1142,10 +1554,12 @@ mod tests {
                 "description": "Execute one fixture action.",
                 "inputSchema": { "type": "object", "additionalProperties": false }
             }],
+            "hostedTools": [],
             "requireToolCall": true
         });
         for (kind, expected) in [
             ("openaiCompatible", json!("required")),
+            ("responses", json!("required")),
             ("anthropic", json!({ "type": "any" })),
             ("ollama", json!("required")),
         ] {
@@ -1172,6 +1586,7 @@ mod tests {
                     "description": "Fixture action.",
                     "inputSchema": { "type": "object" }
                 }],
+                "hostedTools": [],
                 "requireToolCall": false
             }),
         )
@@ -1195,6 +1610,7 @@ mod tests {
                     "description": "Execute one fixture action.",
                     "inputSchema": { "type": "object", "additionalProperties": false }
                 }],
+                "hostedTools": [],
                 "requireToolCall": true
             }),
         )
@@ -1205,6 +1621,171 @@ mod tests {
         assert_eq!(body["thinking"], json!({ "type": "enabled" }));
         assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
         assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn responses_request_enables_hosted_search_and_replays_provider_item_unchanged() {
+        let mut profile = test_profile("responses");
+        profile.provider_flavor = Some("deepseek".to_string());
+        profile.base_url = Some("https://api.deepseek.com".to_string());
+        profile.hosted_web_search = Some("web_search".to_string());
+        let item = json!({
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": { "type": "search", "queries": ["current compiler release"] },
+        });
+        let failed_item = json!({
+            "type": "web_search_call",
+            "id": "ws_2",
+            "status": "failed",
+            "action": { "type": "open_page", "url": "https://example.com/unavailable" },
+        });
+        let prepared = prepare_provider_request(
+            &profile,
+            &json!({
+                "messages": [
+                    { "role": "user", "content": "Find the current release." },
+                    {
+                        "role": "assistant",
+                        "content": "The current release is available.",
+                        "providerItems": [item.clone(), failed_item.clone()]
+                    }
+                ],
+                "tools": [],
+                "hostedTools": [{
+                    "type": "webSearch",
+                    "providerToolType": "web_search"
+                }],
+                "requireToolCall": false
+            }),
+        )
+        .expect("Responses request must prepare");
+        let body: Value =
+            serde_json::from_slice(&prepared.body).expect("Responses body must decode");
+
+        assert_eq!(prepared.kind, ProviderStreamKind::Responses);
+        assert!(prepared.hosted_web_search_enabled);
+        assert_eq!(body["tools"], json!([{ "type": "web_search" }]));
+        assert_eq!(body["input"][1], item);
+        assert_eq!(body["input"][2], failed_item);
+        assert_eq!(body["input"][3]["role"], "assistant");
+        assert_eq!(
+            normalize_responses_base_url(&profile),
+            "https://api.deepseek.com/responses"
+        );
+    }
+
+    #[test]
+    fn responses_request_replays_ordered_native_items_and_provider_call_identity() {
+        let native_items = vec![
+            json!({
+                "type": "message",
+                "id": "msg_intro",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{ "type": "output_text", "text": "I will inspect it." }],
+            }),
+            json!({
+                "type": "web_search_call",
+                "id": "ws_1",
+                "status": "completed",
+                "action": { "type": "search", "queries": ["current compiler release"] },
+            }),
+            json!({
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "provider-call:read",
+                "name": "fs_read",
+                "arguments": "{\"path\":\"README.md\"}",
+                "status": "completed",
+            }),
+        ];
+        let blocks = native_items
+            .iter()
+            .enumerate()
+            .map(
+                |(output_index, item)| match item["type"].as_str().unwrap() {
+                    "message" => json!({
+                        "outputIndex": output_index,
+                        "kind": "narrative",
+                        "narrativeId": "narrative:intro",
+                        "item": item,
+                    }),
+                    "web_search_call" => json!({
+                        "outputIndex": output_index,
+                        "kind": "providerHosted",
+                        "activityId": "activity:search",
+                        "providerCallId": "ws_1",
+                        "providerToolType": "web_search",
+                        "item": item,
+                    }),
+                    "function_call" => json!({
+                        "outputIndex": output_index,
+                        "kind": "toolCall",
+                        "callId": "logical-call:read",
+                        "providerCallId": "provider-call:read",
+                        "toolName": "fs.read",
+                        "item": item,
+                    }),
+                    _ => unreachable!(),
+                },
+            )
+            .collect::<Vec<_>>();
+        let prepared = prepare_provider_request(
+            &test_profile("responses"),
+            &json!({
+                "messages": [
+                    { "role": "user", "content": "Inspect it." },
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "providerOutputBlocks": blocks,
+                    },
+                    {
+                        "role": "tool",
+                        "content": "{\"ok\":true}",
+                        "toolCallId": "logical-call:read",
+                        "providerCallId": "provider-call:read",
+                    }
+                ],
+                "tools": [],
+                "hostedTools": [],
+                "requireToolCall": false,
+            }),
+        )
+        .expect("ordered Responses replay must prepare");
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        let input = body["input"].as_array().unwrap();
+
+        assert_eq!(&input[1..4], native_items.as_slice());
+        assert_eq!(
+            input[4],
+            json!({
+                "type": "function_call_output",
+                "call_id": "provider-call:read",
+                "output": "{\"ok\":true}",
+            })
+        );
+    }
+
+    #[test]
+    fn responses_request_rejects_invalid_hosted_tool_instead_of_rewriting_it() {
+        let error = prepare_provider_request(
+            &test_profile("responses"),
+            &json!({
+                "messages": [{ "role": "user", "content": "Search." }],
+                "tools": [],
+                "hostedTools": [{
+                    "type": "webSearch",
+                    "providerToolType": "some_other_tool"
+                }],
+                "requireToolCall": false
+            }),
+        )
+        .expect_err("invalid hosted tool must fail");
+
+        assert_eq!(error.code, "provider_hosted_tool_invalid");
     }
 
     fn test_profile(kind: &str) -> ResolvedLlmProfile {
@@ -1218,6 +1799,7 @@ mod tests {
             temperature: None,
             reasoning_effort: None,
             thinking: None,
+            hosted_web_search: None,
             api_key: None,
         }
     }

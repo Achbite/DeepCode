@@ -12,6 +12,8 @@ pub(crate) struct ProviderRuntimeSnapshot {
     pub(crate) profile_id: String,
     pub(crate) context_window_tokens: u64,
     pub(crate) max_output_tokens: u32,
+    pub(crate) api_surface: &'static str,
+    pub(crate) hosted_web_search: &'static str,
 }
 
 #[derive(Clone)]
@@ -165,6 +167,7 @@ fn capture_binding(
         "temperature": profile.temperature,
         "reasoningEffort": profile.reasoning_effort,
         "thinking": profile.thinking,
+        "hostedWebSearch": profile.hosted_web_search,
         "secretRef": selected_profile(gui, &profile_id)?.get("secretRef"),
     });
     let encoded = serde_json::to_vec(&runtime_shape)
@@ -177,6 +180,18 @@ fn capture_binding(
         profile_id,
         context_window_tokens,
         max_output_tokens,
+        api_surface: match profile.kind.as_str() {
+            "openaiCompatible" => "chatCompletions",
+            "responses" => "responses",
+            "anthropic" => "anthropicMessages",
+            "ollama" => "ollamaChat",
+            _ => return Err("LLM Profile kind 无法映射到 Provider API surface。".to_string()),
+        },
+        hosted_web_search: match profile.hosted_web_search.as_deref() {
+            Some("web_search") => "web_search",
+            None => "none",
+            Some(_) => return Err("LLM Profile hostedWebSearch 无法映射。".to_string()),
+        },
     };
     Ok(ProviderRuntimeBinding { snapshot, profile })
 }

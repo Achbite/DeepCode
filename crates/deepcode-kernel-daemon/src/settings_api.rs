@@ -418,7 +418,7 @@ pub(crate) fn default_llm_profiles() -> Value {
             {
                 "id": "deepseek-v4-flash-openai",
                 "name": "DeepSeek V4 Flash",
-                "kind": "openaiCompatible",
+                "kind": "responses",
                 "providerFlavor": "deepseek",
                 "baseUrl": "https://api.deepseek.com",
                 "model": "deepseek-v4-flash",
@@ -427,12 +427,13 @@ pub(crate) fn default_llm_profiles() -> Value {
                 "temperature": 0.2,
                 "reasoningEffort": "high",
                 "thinking": "enabled",
+                "hostedWebSearch": "web_search",
                 "enabled": true
             },
             {
                 "id": "deepseek-v4-pro-openai",
                 "name": "DeepSeek V4 Pro",
-                "kind": "openaiCompatible",
+                "kind": "responses",
                 "providerFlavor": "deepseek",
                 "baseUrl": "https://api.deepseek.com",
                 "model": "deepseek-v4-pro",
@@ -441,6 +442,7 @@ pub(crate) fn default_llm_profiles() -> Value {
                 "temperature": 0.2,
                 "reasoningEffort": "max",
                 "thinking": "enabled",
+                "hostedWebSearch": "web_search",
                 "enabled": true
             }
         ],

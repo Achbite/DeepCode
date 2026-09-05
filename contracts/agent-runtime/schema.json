@@ -123,12 +123,138 @@
     "ModelToolCall": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["callId", "name", "input"],
+      "required": ["callId", "providerCallId", "name", "input"],
       "properties": {
         "callId": { "$ref": "#/$defs/Id" },
+        "providerCallId": { "$ref": "#/$defs/Id" },
         "name": { "$ref": "#/$defs/Id" },
         "input": { "$ref": "#/$defs/JsonObject" }
       }
+    },
+    "ProviderOutputBlock": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["outputIndex", "kind", "item"],
+          "properties": {
+            "outputIndex": { "type": "integer", "minimum": 0 },
+            "kind": { "const": "reasoning" },
+            "item": { "$ref": "#/$defs/JsonObject" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["outputIndex", "kind", "narrativeId", "item"],
+          "properties": {
+            "outputIndex": { "type": "integer", "minimum": 0 },
+            "kind": { "const": "narrative" },
+            "narrativeId": { "$ref": "#/$defs/Id" },
+            "item": { "$ref": "#/$defs/JsonObject" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["outputIndex", "kind", "messageId", "item"],
+          "properties": {
+            "outputIndex": { "type": "integer", "minimum": 0 },
+            "kind": { "const": "finalMessage" },
+            "messageId": { "$ref": "#/$defs/Id" },
+            "item": { "$ref": "#/$defs/JsonObject" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "outputIndex", "kind", "callId", "providerCallId", "toolName", "item"
+          ],
+          "properties": {
+            "outputIndex": { "type": "integer", "minimum": 0 },
+            "kind": { "const": "toolCall" },
+            "callId": { "$ref": "#/$defs/Id" },
+            "providerCallId": { "$ref": "#/$defs/Id" },
+            "toolName": { "$ref": "#/$defs/Id" },
+            "item": { "$ref": "#/$defs/JsonObject" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "outputIndex", "kind", "activityId", "providerCallId", "providerToolType", "item"
+          ],
+          "properties": {
+            "outputIndex": { "type": "integer", "minimum": 0 },
+            "kind": { "const": "providerHosted" },
+            "activityId": { "$ref": "#/$defs/Id" },
+            "providerCallId": { "$ref": "#/$defs/Id" },
+            "providerToolType": { "const": "web_search" },
+            "item": { "$ref": "#/$defs/JsonObject" }
+          }
+        }
+      ]
+    },
+    "AssistantDraftBlockProjection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["outputIndex", "kind", "content"],
+          "properties": {
+            "outputIndex": { "type": "integer", "minimum": 0 },
+            "kind": { "enum": ["narrative", "finalMessage", "message"] },
+            "content": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "outputIndex", "kind", "providerCallId", "providerToolType", "status", "action"
+          ],
+          "properties": {
+            "outputIndex": { "type": "integer", "minimum": 0 },
+            "kind": { "const": "providerHosted" },
+            "providerCallId": { "$ref": "#/$defs/Id" },
+            "providerToolType": { "const": "web_search" },
+            "status": { "enum": ["completed", "failed"] },
+            "action": { "$ref": "#/$defs/JsonObject" }
+          }
+        }
+      ]
+    },
+    "AssistantDraftProjection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["runId", "turnId", "content"],
+          "properties": {
+            "runId": { "$ref": "#/$defs/Id" },
+            "turnId": { "$ref": "#/$defs/Id" },
+            "content": { "type": "string" },
+            "reasoningContent": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["runId", "turnId", "content", "orderedBlocks"],
+          "properties": {
+            "runId": { "$ref": "#/$defs/Id" },
+            "turnId": { "$ref": "#/$defs/Id" },
+            "content": { "const": "" },
+            "orderedBlocks": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/AssistantDraftBlockProjection" }
+            }
+          }
+        }
+      ]
     },
     "ModelMessage": {
       "oneOf": [
@@ -149,26 +275,49 @@
             "role": { "const": "assistant" },
             "content": { "type": "string" },
             "reasoningContent": { "type": "string", "minLength": 1 },
+            "reasoningSignature": { "type": "string", "minLength": 1 },
             "toolCalls": {
               "type": "array",
               "minItems": 1,
               "items": { "$ref": "#/$defs/ModelToolCall" }
+            },
+            "providerItems": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/JsonObject" }
             }
           },
           "anyOf": [
             { "properties": { "content": { "type": "string", "minLength": 1 } } },
             { "required": ["reasoningContent"] },
-            { "required": ["toolCalls"] }
-          ]
+            { "required": ["toolCalls"] },
+            { "required": ["providerItems"] }
+          ],
+          "dependentRequired": { "reasoningSignature": ["reasoningContent"] }
         },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["role", "content", "toolCallId"],
+          "required": ["role", "content", "providerOutputBlocks"],
+          "properties": {
+            "role": { "const": "assistant" },
+            "content": { "const": "" },
+            "providerOutputBlocks": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/ProviderOutputBlock" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["role", "content", "toolCallId", "providerCallId"],
           "properties": {
             "role": { "const": "tool" },
             "content": { "type": "string" },
-            "toolCallId": { "$ref": "#/$defs/Id" }
+            "toolCallId": { "$ref": "#/$defs/Id" },
+            "providerCallId": { "$ref": "#/$defs/Id" }
           }
         }
       ]
@@ -428,7 +577,48 @@
               "type": "object",
               "additionalProperties": false,
               "required": ["text"],
-              "properties": { "text": { "type": "string", "minLength": 1 } }
+              "properties": {
+                "text": { "type": "string", "minLength": 1 },
+                "outputIndex": { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "requestId", "type", "data"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.provider-event" },
+            "requestId": { "$ref": "#/$defs/Id" },
+            "type": { "const": "reasoning.delta" },
+            "data": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["text"],
+              "properties": {
+                "text": { "type": "string", "minLength": 1 },
+                "outputIndex": { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "requestId", "type", "data"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.provider-event" },
+            "requestId": { "$ref": "#/$defs/Id" },
+            "type": { "const": "output.item.completed" },
+            "data": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["outputIndex", "item"],
+              "properties": {
+                "outputIndex": { "type": "integer", "minimum": 0 },
+                "item": { "$ref": "#/$defs/JsonObject" }
+              }
             }
           }
         },
@@ -447,12 +637,14 @@
               "properties": {
                 "messageId": { "$ref": "#/$defs/Id" },
                 "content": { "type": "string" },
-                "reasoningContent": { "type": "string", "minLength": 1 }
+                "reasoningContent": { "type": "string", "minLength": 1 },
+                "reasoningSignature": { "type": "string", "minLength": 1 }
               },
               "anyOf": [
                 { "properties": { "content": { "type": "string", "minLength": 1 } } },
                 { "required": ["reasoningContent"] }
-              ]
+              ],
+              "dependentRequired": { "reasoningSignature": ["reasoningContent"] }
             }
           }
         },
@@ -473,6 +665,22 @@
                 "name": { "$ref": "#/$defs/Id" },
                 "input": { "$ref": "#/$defs/JsonObject" }
               }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "requestId", "type", "data"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.provider-event" },
+            "requestId": { "$ref": "#/$defs/Id" },
+            "type": { "const": "hosted.web-search.completed" },
+            "data": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["item"],
+              "properties": { "item": { "$ref": "#/$defs/JsonObject" } }
             }
           }
         },
@@ -1208,7 +1416,17 @@
               "items": { "$ref": "#/$defs/Id" }
             },
             "reasoningContent": { "type": "string", "minLength": 1 },
-            "reasoningSignature": { "type": "string", "minLength": 1 }
+            "reasoningSignature": { "type": "string", "minLength": 1 },
+            "hostedWebSearchCalls": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/JsonObject" }
+            },
+            "orderedOutputBlocks": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/ProviderOutputBlock" }
+            }
           },
           "dependentRequired": { "reasoningSignature": ["reasoningContent"] }
         },
@@ -1704,7 +1922,8 @@
             "kind": { "const": "message" },
             "timelineId": { "$ref": "#/$defs/Id" },
             "sequence": { "type": "integer", "minimum": 1 },
-            "messageId": { "$ref": "#/$defs/Id" }
+            "messageId": { "$ref": "#/$defs/Id" },
+            "outputIndex": { "type": "integer", "minimum": 0 }
           }
         },
         {
@@ -1718,7 +1937,8 @@
             "timelineId": { "$ref": "#/$defs/Id" },
             "sequence": { "type": "integer", "minimum": 1 },
             "providerRequestId": { "$ref": "#/$defs/Id" },
-            "narrativeId": { "$ref": "#/$defs/Id" }
+            "narrativeId": { "$ref": "#/$defs/Id" },
+            "outputIndex": { "type": "integer", "minimum": 0 }
           }
         },
         {
@@ -1769,7 +1989,7 @@
         "run", "activities", "artifacts", "terminalError"
       ],
       "properties": {
-        "schemaVersion": { "const": "deepcode.session-projection.v4" },
+        "schemaVersion": { "const": "deepcode.session-projection.v5" },
         "sessionId": { "$ref": "#/$defs/Id" },
         "revision": { "type": "integer", "minimum": 0 },
         "display": { "$ref": "#/$defs/SessionDisplayProjection" },
@@ -1778,7 +1998,12 @@
         "messages": { "type": "array", "items": { "$ref": "#/$defs/ProjectionMessage" } },
         "narratives": { "type": "array", "items": { "$ref": "#/$defs/NarrativeProjection" } },
         "timeline": { "type": "array", "items": { "$ref": "#/$defs/SessionTimelineItem" } },
-        "assistantDraft": { "type": ["object", "null"] },
+        "assistantDraft": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/AssistantDraftProjection" }
+          ]
+        },
         "pendingInteraction": {
           "oneOf": [
             { "type": "null" },

@@ -877,12 +877,19 @@ pub(crate) async fn conversation_command_submit(
                     .and_then(Value::as_str)
             })
             .map(automatic_conversation_title);
+        let active_profile_id = command
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|kind| matches!(*kind, "message.submit" | "context.focus"))
+            .and_then(|_| command.get("profileId"))
+            .and_then(Value::as_str);
         let mut gui = state.gui.lock().expect("gui state lock");
         if gui.conversation_catalog_error.is_none() {
             let previous = gui.conversation_catalog.clone();
             if gui.conversation_catalog.touch_session(
                 &session_id,
                 automatic_title.as_deref(),
+                active_profile_id,
                 &crate::now_text(),
             ) {
                 if let Err(error) = persist_catalog_or_rollback(&mut gui, previous) {

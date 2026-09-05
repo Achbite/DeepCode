@@ -616,11 +616,17 @@ fn create_main_window(
     host_tokens: &HostConnectionTokens,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let boot_url = format!("{APP_ASSET_SCHEME}://localhost/index.html");
+    let window_chrome = if cfg!(target_os = "macos") {
+        "nativeOverlay"
+    } else {
+        "custom"
+    };
     let initialization_script = format!(
-        "Object.defineProperty(window,'__DEEPCODE_HOST_BOOT__',{{value:Object.freeze({{schemaVersion:'deepcode.host-ui-bootstrap',host:'{}',port:'{}',uiToken:'{}'}}),writable:false,configurable:true}});",
+        "Object.defineProperty(window,'__DEEPCODE_HOST_BOOT__',{{value:Object.freeze({{schemaVersion:'deepcode.host-ui-bootstrap',host:'{}',port:'{}',uiToken:'{}',windowChrome:'{}'}}),writable:false,configurable:true}});",
         target.host,
         target.port,
-        host_tokens.ui_token()
+        host_tokens.ui_token(),
+        window_chrome
     );
     let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(boot_url.parse()?))
         .initialization_script(initialization_script)
@@ -635,7 +641,7 @@ fn create_main_window(
     let builder = builder
         .decorations(true)
         .title_bar_style(tauri::TitleBarStyle::Overlay)
-        .traffic_light_position(tauri::LogicalPosition::new(-120.0, -120.0))
+        .traffic_light_position(tauri::LogicalPosition::new(14.0, 12.0))
         .hidden_title(true)
         .shadow(true)
         .background_color(tauri::window::Color(245, 246, 247, 255));

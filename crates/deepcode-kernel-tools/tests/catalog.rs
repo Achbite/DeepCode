@@ -25,6 +25,19 @@ fn catalog_exposes_basic_callable_tools() {
         assert_eq!(descriptor.availability, ToolAvailability::Callable);
     }
     let bash = registry.descriptor("bash").expect("bash descriptor");
+    let web_search = registry
+        .descriptor("web.search")
+        .expect("web.search descriptor");
+    assert_eq!(web_search.input_schema["required"], json!(["query"]));
+    assert_eq!(
+        web_search.input_schema["properties"]
+            .as_object()
+            .expect("web.search properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["limit", "query"]
+    );
     assert!(registry.descriptor("process.shell").is_none());
     assert_eq!(
         bash.input_schema["required"],

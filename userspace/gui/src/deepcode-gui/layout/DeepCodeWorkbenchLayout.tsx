@@ -661,6 +661,7 @@ function cacheHitSummary(
 ): { label: string; title: string } {
   const usage = projection?.tokenUsage;
   const cache = inputCacheMetric(usage);
+  const running = projection?.run?.status === 'running';
   if (cache) {
     const percent = `${formatCachePercent(cache.hitPercent)}%`;
     return {
@@ -669,16 +670,26 @@ function cacheHitSummary(
         input: cache.inputTokens.toLocaleString(language),
         hit: cache.hitTokens.toLocaleString(language),
         miss: cache.missTokens.toLocaleString(language),
-      }),
+      }) + (running ? ` ${t(language, 'deepcodeGui.cache.updatingTitle')}` : ''),
+    };
+  }
+  if (running) {
+    return {
+      label: t(language, 'deepcodeGui.cache.pendingSummary'),
+      title: t(language, 'deepcodeGui.cache.pendingTitle'),
+    };
+  }
+  if (!usage?.providerCallCount) {
+    return {
+      label: t(language, 'deepcodeGui.cache.emptySummary'),
+      title: t(language, 'deepcodeGui.cache.emptyTitle'),
     };
   }
   return {
     label: t(language, 'deepcodeGui.cache.unavailableSummary'),
-    title: usage
-      ? t(language, 'deepcodeGui.cache.unavailableTitle', {
-          calls: usage.providerCallCount.toLocaleString(language),
-        })
-      : t(language, 'deepcodeGui.cache.emptyTitle'),
+    title: t(language, 'deepcodeGui.cache.unavailableTitle', {
+      calls: usage.providerCallCount.toLocaleString(language),
+    }),
   };
 }
 

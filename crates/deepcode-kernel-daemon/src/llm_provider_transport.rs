@@ -118,10 +118,9 @@ fn anthropic_assistant_message(record: &serde_json::Map<String, Value>) -> Value
         content.push(json!({
             "type": "tool_use",
             "id": call
-                .get("callId")
-                .or_else(|| call.get("id"))
+                .get("providerCallId")
                 .and_then(Value::as_str)
-                .unwrap_or("tool-call"),
+                .expect("validated tool call has providerCallId"),
             "name": name,
             "input": input
         }));
@@ -136,10 +135,9 @@ fn append_anthropic_tool_result(
     let block = json!({
         "type": "tool_result",
         "tool_use_id": record
-            .get("toolCallId")
-            .or_else(|| record.get("tool_call_id"))
+            .get("providerCallId")
             .and_then(Value::as_str)
-            .unwrap_or("tool-call"),
+            .expect("validated tool message has providerCallId"),
         "content": message_content_string(record.get("content"))
     });
     if let Some(content) = messages

@@ -145,7 +145,7 @@ fn tool_description(tool: KernelToolKind) -> &'static str {
         KernelToolKind::FsWrite => "Create or replace one workspace file and any missing parent directories.",
         KernelToolKind::WebFetch => "Fetch bounded HTTP or HTTPS text.",
         KernelToolKind::WebSearch => {
-            "Search the web through the built-in RSS backend or an explicitly configured JSON endpoint."
+            "Search the web through the built-in Brave Web Search adapter or an explicitly configured JSON endpoint."
         }
         KernelToolKind::ProcessShell => {
             #[cfg(target_os = "macos")]

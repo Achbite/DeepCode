@@ -16,21 +16,11 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct KernelExecutorConfig {
     pub web_search_endpoint_template: String,
     pub web_search_auth_header_name: String,
     pub web_search_auth_secret_ref: String,
-}
-
-impl Default for KernelExecutorConfig {
-    fn default() -> Self {
-        Self {
-            web_search_endpoint_template: String::new(),
-            web_search_auth_header_name: String::new(),
-            web_search_auth_secret_ref: String::new(),
-        }
-    }
 }
 
 pub trait SecretProvider: Send + Sync {
@@ -174,6 +164,10 @@ pub fn builtin_executors(
         .collect::<Vec<_>>();
     assert_executor_bindings_match_tool_registry(registry, &executors);
     executors
+}
+
+pub fn web_search_availability(config: &KernelExecutorConfig) -> ToolAvailability {
+    web::web_search_availability(config)
 }
 
 pub fn resolved_network_target(

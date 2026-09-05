@@ -2,7 +2,7 @@ export const LOCAL_AGENT_PROTOCOL_VERSION = 'deepcode.local-agent' as const;
 export const CONVERSATION_COMMAND_VERSION = 'deepcode.command.v3' as const;
 export const COMMAND_REPLY_VERSION = 'deepcode.command-reply.v3' as const;
 export const SESSION_EVENT_VERSION = 'deepcode.session-event.v4' as const;
-export const SESSION_PROJECTION_VERSION = 'deepcode.session-projection.v4' as const;
+export const SESSION_PROJECTION_VERSION = 'deepcode.session-projection.v5' as const;
 export const PROVIDER_EVENT_VERSION = 'deepcode.provider-event' as const;
 export const KERNEL_REQUEST_VERSION = 'deepcode.kernel-request' as const;
 export const KERNEL_REPLY_VERSION = 'deepcode.kernel-reply' as const;
@@ -266,6 +266,22 @@ export type RunSettlement =
   | { outcome: 'cancelled' }
   | { outcome: 'indeterminate'; error: LocalAgentError };
 
+export type ProviderOutputBlock = {
+  outputIndex: number;
+  item: JsonObject;
+} & (
+  | { kind: 'reasoning' }
+  | { kind: 'narrative'; narrativeId: string }
+  | { kind: 'finalMessage'; messageId: string }
+  | { kind: 'toolCall'; callId: string; providerCallId: string; toolName: string }
+  | {
+      kind: 'providerHosted';
+      activityId: string;
+      providerCallId: string;
+      providerToolType: 'web_search';
+    }
+);
+
 export type ProviderTurnSettlement = {
   providerRequestId: string;
   purpose: 'agent' | 'contextCompaction';
@@ -276,6 +292,8 @@ export type ProviderTurnSettlement = {
       orderedCallIds: string[];
       reasoningContent?: string;
       reasoningSignature?: string;
+      hostedWebSearchCalls?: JsonObject[];
+      orderedOutputBlocks?: ProviderOutputBlock[];
     }
   | {
       outcome: 'failed' | 'indeterminate';
@@ -360,7 +378,7 @@ export interface ContextCompositionItem {
 export interface ContextCompositionTool extends ContextCompositionItem {
   canonicalName: string;
   wireName: string;
-  origin: 'coreBuiltin' | 'extension' | 'sessionControl';
+  origin: 'coreBuiltin' | 'extension' | 'sessionControl' | 'providerHosted';
   availability: 'callable' | 'blocked';
   pluginUri?: PluginUri;
 }
@@ -385,6 +403,11 @@ export type ContextCompositionMessageBlock =
       blockIndex: number;
       kind: 'toolResult';
       resultForCallId: string;
+    }
+  | {
+      blockIndex: number;
+      kind: 'hostedWebSearch';
+      providerCallId: string;
     };
 
 export interface ContextCompositionMessage {
@@ -791,6 +814,7 @@ export type SessionTimelineItem =
       timelineId: string;
       sequence: number;
       messageId: string;
+      outputIndex?: number;
     }
   | {
       kind: 'narrative';
@@ -798,6 +822,7 @@ export type SessionTimelineItem =
       sequence: number;
       providerRequestId: string;
       narrativeId: string;
+      outputIndex?: number;
     }
   | {
       kind: 'plan';
@@ -832,15 +857,30 @@ export interface ApprovalProjection {
   createdAt: string;
 }
 
+export type AssistantDraftBlockProjection =
+  | { outputIndex: number; kind: 'narrative'; content: string }
+  | { outputIndex: number; kind: 'finalMessage'; content: string }
+  | { outputIndex: number; kind: 'message'; content: string }
+  | {
+      outputIndex: number;
+      kind: 'providerHosted';
+      providerCallId: string;
+      providerToolType: 'web_search';
+      status: 'completed' | 'failed';
+      action: JsonObject;
+    };
+
 /**
- * Session-owned, non-durable text for the one Provider turn currently streaming.
- * It is replaced by a canonical narrative or assistant message when the typed turn ends.
+ * Session-owned, non-durable presentation for the one Provider turn currently streaming.
+ * Ordered blocks retain Provider output_index so the GUI can continue the same display buffer
+ * when the typed turn becomes canonical timeline content.
  */
 export interface AssistantDraftProjection {
   runId: string;
   turnId: string;
   content: string;
   reasoningContent?: string;
+  orderedBlocks?: AssistantDraftBlockProjection[];
 }
 
 export type PlanProjectionStatus =
@@ -891,7 +931,7 @@ export interface RunProjection {
 
 export interface ActivityProjection {
   activityId: string;
-  kind: 'run' | 'tool' | 'approval' | 'plan' | 'interaction';
+  kind: 'run' | 'tool' | 'providerHosted' | 'approval' | 'plan' | 'interaction';
   status:
     | 'active'
     | 'requested'
@@ -906,6 +946,13 @@ export interface ActivityProjection {
   callId?: string;
   sequence: number;
   tool?: ToolActivityProjection;
+  providerHosted?: ProviderHostedActivityProjection;
+}
+
+export interface ProviderHostedActivityProjection {
+  providerToolType: 'web_search';
+  providerCallId: string;
+  action: JsonObject;
 }
 
 export interface ActivityResourceProjection {
@@ -1006,11 +1053,15 @@ export interface ModelMessage {
   reasoningContent?: string;
   reasoningSignature?: string;
   toolCallId?: string;
+  providerCallId?: string;
   toolCalls?: readonly ModelToolCall[];
+  providerItems?: readonly JsonObject[];
+  providerOutputBlocks?: readonly ProviderOutputBlock[];
 }
 
 export interface ModelToolCall {
   callId: string;
+  providerCallId: string;
   name: string;
   input: JsonObject;
 }
@@ -1026,6 +1077,18 @@ export interface ProviderRuntimeSnapshot {
   profileId: string;
   contextWindowTokens: number;
   maxOutputTokens: number;
+  apiSurface: 'chatCompletions' | 'responses' | 'anthropicMessages' | 'ollamaChat';
+  hostedWebSearch: 'none' | 'web_search';
+}
+
+export type WebSearchBinding =
+  | { owner: 'providerHosted'; providerToolType: 'web_search' }
+  | { owner: 'kernelAdapter'; toolName: 'web.search' }
+  | { owner: 'unavailable' };
+
+export interface ProviderHostedToolDefinition {
+  type: 'webSearch';
+  providerToolType: 'web_search';
 }
 
 export interface ProviderRequest {
@@ -1041,6 +1104,7 @@ export interface ProviderRequest {
   workspaceBindings: readonly WorkspaceBindingDisplay[];
   messages: readonly ModelMessage[];
   tools: readonly ProviderToolDefinition[];
+  hostedTools: readonly ProviderHostedToolDefinition[];
 }
 
 export type ProviderEvent =
@@ -1048,13 +1112,19 @@ export type ProviderEvent =
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
       requestId: string;
       type: 'text.delta';
-      data: { text: string };
+      data: { text: string; outputIndex?: number };
     }
   | {
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
       requestId: string;
       type: 'reasoning.delta';
-      data: { text: string };
+      data: { text: string; outputIndex?: number };
+    }
+  | {
+      schemaVersion: typeof PROVIDER_EVENT_VERSION;
+      requestId: string;
+      type: 'output.item.completed';
+      data: { outputIndex: number; item: JsonObject };
     }
   | {
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
@@ -1072,6 +1142,12 @@ export type ProviderEvent =
       requestId: string;
       type: 'tool.call';
       data: { callId: string; name: string; input: JsonObject };
+    }
+  | {
+      schemaVersion: typeof PROVIDER_EVENT_VERSION;
+      requestId: string;
+      type: 'hosted.web-search.completed';
+      data: { item: JsonObject };
     }
   | {
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
@@ -1155,6 +1231,7 @@ export interface RunRuntimeSnapshot {
   extensionGenerationRef: string;
   kernelCatalogSnapshotRef: string;
   provider: ProviderRuntimeSnapshot;
+  webSearch: WebSearchBinding;
   instructions: { id: string; text: string }[];
   tools: PreparedToolDescriptor[];
   toolPromptContributions: PreparedToolPromptContribution[];

@@ -446,6 +446,7 @@
     "settings.runtime.savedImmediate": "Saved and active immediately.",
     "settings.llm.reenterRecoveredApiKey": "Current-schema recovery does not automatically reconnect old secrets. Re-enter the API key for enabled profile “{name}”.",
     "settings.llm.providerKind.openaiCompatible": "OpenAI Compatible",
+    "settings.llm.providerKind.responses": "Responses API",
     "settings.llm.providerKind.anthropic": "Anthropic",
     "settings.llm.providerKind.ollama": "Ollama",
     "settings.llm.providerFlavor": "Provider flavor",
@@ -453,6 +454,9 @@
     "settings.llm.providerFlavor.deepseek": "DeepSeek",
     "settings.llm.providerFlavor.zhipu": "Zhipu",
     "settings.llm.providerFlavor.moonshot": "Moonshot / Kimi",
+    "settings.llm.hostedWebSearch": "Hosted web search",
+    "settings.llm.hostedWebSearch.none": "Disabled",
+    "settings.llm.hostedWebSearch.webSearch": "Provider web search",
     "settings.llm.probeSucceeded": "OK, {latency}ms",
     "settings.mcp.title": "MCP Services",
     "settings.mcp.defaultName": "Local MCP",
@@ -642,6 +646,24 @@
     "agent.tool.summary.usedMany": "Used {count} tools",
     "agent.tool.summary.editedAndRan": "Edited files and ran a command",
     "agent.tool.summary.editedMany": "Edited {count} workspace items",
+    "agent.providerHosted.summary.active": "Searching the web",
+    "agent.providerHosted.summary.activeTarget": "Searching for {target}",
+    "agent.providerHosted.summary.activeMany": "Running {count} web searches",
+    "agent.providerHosted.summary.completed": "Completed web search",
+    "agent.providerHosted.summary.completedTarget": "Searched for {target}",
+    "agent.providerHosted.summary.completedMany": "Completed {count} web searches",
+    "agent.providerHosted.summary.didNotComplete": "Web search did not complete",
+    "agent.providerHosted.summary.didNotCompleteTarget": "Search did not complete for {target}",
+    "agent.providerHosted.summary.didNotCompleteMany": "{count} web searches did not all complete",
+    "agent.providerHosted.detail.providerTool": "Provider tool",
+    "agent.providerHosted.detail.providerCallId": "Provider call ID",
+    "agent.providerHosted.detail.action": "Action",
+    "agent.providerHosted.detail.target": "Target",
+    "agent.providerHosted.detail.status": "Status",
+    "agent.providerHosted.detail.queries": "Queries",
+    "agent.providerHosted.detail.url": "Page",
+    "agent.providerHosted.detail.pattern": "Find text",
+    "agent.providerHosted.detail.sources": "Sources",
     "agent.tool.activity.ranCommand": "Ran command {command}",
     "agent.tool.activity.runningCommand": "Running command {command}",
     "agent.tool.activity.createdDirectory": "Created directory {path}",
@@ -688,9 +710,13 @@
     "deepcodeGui.tasks.status.inProgress": "In progress",
     "deepcodeGui.tasks.status.completed": "Done",
     "deepcodeGui.cache.summary": "Total cache hit {value}",
+    "deepcodeGui.cache.pendingSummary": "Cache hit pending",
+    "deepcodeGui.cache.pendingTitle": "Running; measurable input cache usage has not arrived yet. Statistics update when the model request completes and returns usage.",
+    "deepcodeGui.cache.updatingTitle": "Still running; these totals include reported usage only and will update when subsequent model requests complete.",
+    "deepcodeGui.cache.emptySummary": "No cache statistics yet",
     "deepcodeGui.cache.unavailableSummary": "Cache hit unavailable",
     "deepcodeGui.cache.calculatedTitle": "Included input: {input} tokens, with {hit} cache-read and {miss} cache-miss tokens. The total cache hit rate is calculated from these cumulative measurable tokens.",
-    "deepcodeGui.cache.unavailableTitle": "The current session has {calls} Provider calls, but none reported cache-read and cache-miss fields.",
+    "deepcodeGui.cache.unavailableTitle": "The current session has completed {calls} model requests with no measurable input cache statistics.",
     "deepcodeGui.cache.emptyTitle": "No Provider usage for the current session yet.",
     "deepcodeGui.titlebar.api": "API",
     "deepcodeGui.titlebar.agent": "Agent"
@@ -868,15 +894,15 @@
     },
     "agent.web.search.endpointTemplate": {
       "label": "Web Search Endpoint Override",
-      "description": "Leave empty for built-in Bing RSS, or provide a JSON HTTP endpoint template containing {query} and optional {limit}."
+      "description": "Leave empty for the built-in Brave Web Search adapter, or provide an explicit JSON HTTP endpoint template containing {query} and optional {limit}. The configured endpoint is never used as fallback."
     },
     "agent.web.search.authHeaderName": {
       "label": "Web Search Auth Header",
-      "description": "Header name used with the configured search SecretRef."
+      "description": "Header name used only by an explicitly configured search endpoint. The built-in Brave adapter always uses X-Subscription-Token."
     },
     "agent.web.search.authSecretRef": {
       "label": "Web Search Auth Secret",
-      "description": "Secret reference used for the configured search endpoint."
+      "description": "Secret reference required by the built-in Brave adapter and optional for an explicitly configured search endpoint. Without it, built-in web.search is blocked."
     },
     "skills.mounts": {
       "label": "Project Skill Mounts",
