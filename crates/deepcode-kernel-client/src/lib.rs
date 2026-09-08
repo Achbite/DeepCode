@@ -11,21 +11,26 @@ use thiserror::Error;
 mod bootstrap;
 mod conversation;
 
+use conversation::invalid_filesystem_references;
+
 pub use bootstrap::{DaemonStatus, KernelBootstrap, KernelBootstrapGuard, KernelBootstrapOptions};
 pub use conversation::{
     approval_response_command, cancel_command, directory_index_attach_command,
-    directory_index_detach_command, interaction_response_command, is_terminal_run_status,
-    message_command, message_command_with_profile, plan_cancel_command, plan_confirm_command,
-    plan_revision_command, profile_selection_command, ActivityProjection, ApprovalProjection,
-    ArtifactProjection, AssistantDraftProjection, AttachConversationDirectoryIndexRequest,
-    CommandReply, ContextCompositionItem, ContextCompositionMessage,
-    ContextCompositionMessageBlock, ContextCompositionPartitionProjection,
-    ContextCompositionProjection, ContextUsageProjection, ConversationError,
-    ConversationResourceReadRequest, ConversationResourceReadResult,
-    CreateConversationSessionRequest, EffectPreview, ExecutionPlanStep, InteractionOption,
-    InteractionProjection, MessageAttachmentProjection, NarrativeProjection, PendingPlanProjection,
-    PlanOperation, PlanProjection, PlanRef, ProjectionMessage, RunProjection,
-    SessionDisplayProjection, SessionProjection, TodoItem, TodoListProjection,
+    directory_index_detach_command, focus_command, interaction_response_command,
+    is_terminal_run_status, message_command, message_command_with_profile,
+    message_command_with_profile_and_plugins, plan_cancel_command, plan_confirm_command,
+    plan_revision_command, ActivityProjection, ApprovalProjection, ArtifactProjection,
+    AssistantDraftBlockProjection, AssistantDraftProjection,
+    AttachConversationDirectoryIndexRequest, CommandReply, ContextCompositionItem,
+    ContextCompositionMessage, ContextCompositionMessageBlock,
+    ContextCompositionPartitionProjection, ContextCompositionProjection, ContextCompositionTool,
+    ContextUsageProjection, ConversationError, ConversationResourceReadRequest,
+    ConversationResourceReadResult, CreateConversationSessionRequest, EffectPreview,
+    ExecutionPlanStep, FilesystemReference, FilesystemReferencePathInput, InteractionOption,
+    InteractionProjection, NarrativeProjection, PendingPlanProjection, PlanOperation,
+    PlanProjection, PlanRef, PluginCatalogItem, PluginCatalogProjection, PluginSelectionInput,
+    ProjectionMessage, ResolveConversationFilesystemReferencesRequest, RunProjection,
+    SessionDisplayProjection, SessionProjection, SessionTimelineItem, TodoItem, TodoListProjection,
     TokenUsageProjection, TokenUsageRoundProjection, WorkspaceBindingDisplay,
     CONVERSATION_COMMAND_VERSION, SESSION_PROJECTION_VERSION,
 };
@@ -206,6 +211,22 @@ impl HttpKernelClient {
         decode_projection(value)
     }
 
+    pub async fn conversation_plugin_catalog(&self) -> KernelClientResult<PluginCatalogProjection> {
+        let value = self
+            .http
+            .get(self.url("/api/conversation/plugins"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        let catalog: PluginCatalogProjection = decode_api_data(value)?;
+        catalog
+            .validate()
+            .map_err(|message| KernelClientError::Api(message))?;
+        Ok(catalog)
+    }
+
     pub async fn submit_conversation_command(
         &self,
         session_id: &str,
@@ -215,6 +236,24 @@ impl HttpKernelClient {
             .http
             .post(self.url(&format!("/api/conversation/sessions/{session_id}/commands")))
             .json(command)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data(value)
+    }
+
+    /// Read persisted facts without opening or recovering the target Session Actor.
+    pub async fn conversation_read(
+        &self,
+        session_id: &str,
+        query: &Value,
+    ) -> KernelClientResult<Value> {
+        let value = self
+            .http
+            .post(self.url(&format!("/api/conversation/sessions/{session_id}/read")))
+            .json(query)
             .send()
             .await?
             .error_for_status()?
@@ -286,6 +325,31 @@ impl HttpKernelClient {
             .json::<Value>()
             .await?;
         decode_projection(value)
+    }
+
+    pub async fn resolve_conversation_filesystem_references(
+        &self,
+        session_id: &str,
+        references: Vec<FilesystemReferencePathInput>,
+    ) -> KernelClientResult<Vec<FilesystemReference>> {
+        let value = self
+            .http
+            .post(self.url(&format!(
+                "/api/conversation/sessions/{session_id}/filesystem-references/resolve"
+            )))
+            .json(&ResolveConversationFilesystemReferencesRequest { references })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        let references: Vec<FilesystemReference> = decode_api_data(value)?;
+        if invalid_filesystem_references(&references) {
+            return Err(KernelClientError::Api(
+                "conversation filesystem references are invalid".to_string(),
+            ));
+        }
+        Ok(references)
     }
 
     pub async fn detach_conversation_directory_index(

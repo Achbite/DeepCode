@@ -1,11 +1,25 @@
 use crate::prelude::*;
 use crate::*;
 
+fn setting_activates_at_next_run(key: &str) -> bool {
+    key.starts_with("skills.")
+        || key.starts_with("mcp.")
+        || key.starts_with("agent.web.search.")
+        || key == "agent.systemPrompt"
+        || key.starts_with("agent.permissions.")
+}
+
 pub(crate) async fn user_settings_get(State(state): State<AppState>) -> Json<ApiResponse> {
+    let runtime_settings = match state.local_agent.active_runtime_settings() {
+        Ok(settings) => settings,
+        Err(error) => {
+            return ApiResponse::error("active_runtime_settings_unavailable", error);
+        }
+    };
     let gui = state.gui.lock().expect("gui state lock");
     ApiResponse::ok(json!({
         "settings": gui.user_settings,
-        "runtimeSettings": state.runtime_user_settings,
+        "runtimeSettings": runtime_settings,
         "overriddenKeys": [],
         "storePath": gui.paths.settings_path.to_string_lossy()
     }))
@@ -15,6 +29,10 @@ pub(crate) async fn user_settings_patch(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
+    let _runtime_transition = match state.local_agent.runtime_transition() {
+        Ok(transition) => transition,
+        Err(error) => return ApiResponse::error("runtime_transition_lock_failed", error),
+    };
     let patches = body.get("patches").cloned().unwrap_or_else(|| json!({}));
     let Some(patch_object) = patches.as_object() else {
         return ApiResponse::error("invalid_user_settings", "设置补丁必须是 JSON 对象。");
@@ -28,17 +46,31 @@ pub(crate) async fn user_settings_patch(
     if let Err(message) = validate_agent_runtime_settings(&next_settings) {
         return ApiResponse::error("invalid_agent_runtime_settings", message);
     }
+    let changed_keys = patch_object.keys().cloned().collect::<Vec<_>>();
+    let has_next_run_activation = changed_keys
+        .iter()
+        .any(|key| setting_activates_at_next_run(key));
+    let immediate_patch = Value::Object(
+        patch_object
+            .iter()
+            .filter(|(key, _)| !setting_activates_at_next_run(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
     if let Err(error) = atomic_write_json(&settings_path, &next_settings) {
         return ApiResponse::error("write_settings_failed", error);
     }
-    let changed_keys = patch_object.keys().cloned().collect::<Vec<_>>();
-    let restart_required = changed_keys.iter().any(|key| {
-        key.starts_with("skills.")
-            || key.starts_with("mcp.")
-            || key.starts_with("agent.web.search.")
-            || key == "agent.systemPrompt"
-            || key.starts_with("agent.permissions.")
-    });
+    if !immediate_patch
+        .as_object()
+        .is_some_and(serde_json::Map::is_empty)
+    {
+        if let Err(error) = state
+            .local_agent
+            .apply_immediate_runtime_settings(&immediate_patch)
+        {
+            return ApiResponse::error("active_runtime_settings_update_failed", error);
+        }
+    }
     {
         let mut gui = state.gui.lock().expect("gui state lock");
         gui.user_settings = next_settings.clone();
@@ -46,7 +78,7 @@ pub(crate) async fn user_settings_patch(
     ApiResponse::ok(json!({
         "settings": next_settings,
         "changedKeys": changed_keys,
-        "restartRequired": restart_required
+        "activation": if has_next_run_activation { "nextRun" } else { "immediate" }
     }))
 }
 
@@ -72,6 +104,10 @@ pub(crate) async fn llm_profiles_patch(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
+    let _runtime_transition = match state.local_agent.runtime_transition() {
+        Ok(transition) => transition,
+        Err(error) => return ApiResponse::error("runtime_transition_lock_failed", error),
+    };
     let Some(body_object) = body.as_object() else {
         return ApiResponse::error(
             "invalid_llm_profiles_request",
@@ -382,7 +418,7 @@ pub(crate) fn default_llm_profiles() -> Value {
             {
                 "id": "deepseek-v4-flash-openai",
                 "name": "DeepSeek V4 Flash",
-                "kind": "openaiCompatible",
+                "kind": "responses",
                 "providerFlavor": "deepseek",
                 "baseUrl": "https://api.deepseek.com",
                 "model": "deepseek-v4-flash",
@@ -391,12 +427,13 @@ pub(crate) fn default_llm_profiles() -> Value {
                 "temperature": 0.2,
                 "reasoningEffort": "high",
                 "thinking": "enabled",
+                "hostedWebSearch": "web_search",
                 "enabled": true
             },
             {
                 "id": "deepseek-v4-pro-openai",
                 "name": "DeepSeek V4 Pro",
-                "kind": "openaiCompatible",
+                "kind": "responses",
                 "providerFlavor": "deepseek",
                 "baseUrl": "https://api.deepseek.com",
                 "model": "deepseek-v4-pro",
@@ -405,6 +442,7 @@ pub(crate) fn default_llm_profiles() -> Value {
                 "temperature": 0.2,
                 "reasoningEffort": "max",
                 "thinking": "enabled",
+                "hostedWebSearch": "web_search",
                 "enabled": true
             }
         ],

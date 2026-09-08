@@ -1,39 +1,54 @@
 import type {
+  AssistantDraftBlockProjection,
   AssistantDraftProjection,
-  ContextCompositionMessage,
-  ContextCompositionReceipt,
   ExecutionPlan,
+  JsonObject,
   LocalAgentError,
   ModelInteractionRequest,
   ModelMessage,
   NewSessionEvent,
   PlanAuthority,
   ProviderTokenUsage,
+  ProviderActivityProjection,
   ProviderEvent,
+  ProviderOutputBlock,
   ProviderRequest,
-  ProviderToolDefinition,
+  RunSettlement,
+  RunRuntimeSnapshot,
   SessionEvent,
-  TodoProgressUpdate,
-  ToolDescriptor,
+  PreparedToolDescriptor,
+  ToolExecutionReply,
   ToolExecutionRecord,
+  ToolInputRejection,
   ToolExecutionRequest,
+  TodoProgressUpdate,
   WorkspaceBindingDisplay,
 } from '@deepcode/protocol';
 import {
+  KERNEL_REPLY_VERSION,
   KERNEL_REQUEST_VERSION,
-  LOCAL_AGENT_PROTOCOL_VERSION,
-  SESSION_CONTROL_CONTEXT_FOCUS,
   SESSION_CONTROL_INTERACTION_REQUEST,
   SESSION_CONTROL_PLAN_PUBLISH,
-  SESSION_CONTROL_TODO_PROGRESS,
+  SESSION_CONTROL_PLAN_PROGRESS,
 } from '@deepcode/protocol';
-import type { AgentComposition, ContextMessageContribution } from './plugins.js';
+import type { AgentComposition } from './plugins.js';
+import {
+  pendingContextCompaction,
+  prepareContextCompaction,
+  pressureCompactionCutoff,
+  type ContextCompactionRequestEvent,
+} from './compaction.js';
+import { buildAgentProviderRequest } from './contextComposer.js';
+import { LoopFailure, ProviderCompletedFailure, ProviderReportedFailure } from './loopFailure.js';
+import {
+  canonicalJsonValue,
+  decodeProviderToolInput,
+  type ProviderToolCodec,
+} from './providerToolCodec.js';
 import { recoverSession, type SessionState } from './reducer.js';
 import {
   decodeSessionControlCall,
-  SESSION_CONTROL_INSTRUCTIONS,
   SessionControlError,
-  sessionControlToolDefinitions,
   type PlanPublicationDraft,
   type SessionControlCall,
 } from './sessionControls.js';
@@ -45,10 +60,12 @@ export interface LoopSnapshot {
 
 export type LoopCommand =
   | { type: 'start'; runId: string }
-  | { type: 'resume'; runId: string; answerOnly?: boolean }
+  | { type: 'resume'; runId: string }
+  | { type: 'recover'; runId: string }
   | { type: 'cancel'; runId: string };
 
 export type LoopResult =
+  | { status: 'suspended'; runId: string }
   | {
       status: 'waiting';
       runId: string;
@@ -61,45 +78,81 @@ export type LoopResult =
       status: 'settled';
       runId: string;
       outcome: 'completed' | 'failed' | 'cancelled' | 'indeterminate';
+    }
+  | {
+      status: 'finishing';
+      runId: string;
+      settlement: RunSettlement;
     };
 
 export interface AgentLoopDeps {
   composition: AgentComposition;
-  defaultProfileId?: string;
-  providerRunState: ProviderRunTransientState;
   commit(event: NewSessionEvent | readonly NewSessionEvent[]): Promise<LoopSnapshot>;
   updateAssistantDraft(draft: AssistantDraftProjection | null): void;
   nextId(kind: string): string;
 }
 
-export interface ProviderRunTransientState {
-  runId: string;
-  observedCallIds: Set<string>;
-  reasoningByCallId: Map<string, string>;
-  reasoningSignatureByCallId: Map<string, string>;
-}
-
 type ProviderTurnCommon = {
-  contextUsage?: ProviderTokenUsage & { providerRequestId: string };
-  todo?: {
-    callId: string;
-    providerCallId: string;
-    planId: string;
-    revision: number;
-    updates: TodoProgressUpdate[];
+  completion: ProviderTurnCompletion;
+  narratives?: Array<{ narrativeId: string; content: string }>;
+  contextUsage?: ProviderTokenUsage & {
+    providerRequestId: string;
+    providerRuntimeRef: string;
   };
 };
 
-interface PreparedProviderRequest {
-  request: ProviderRequest;
-  receipt: ContextCompositionReceipt;
+interface ProviderTurnCompletion {
+  providerRequestId: string;
+  purpose: 'agent' | 'contextCompaction';
+  providerRuntimeRef: string;
+  orderedCallIds: string[];
+  reasoningContent?: string;
+  reasoningSignature?: string;
+  hostedWebSearchCalls?: JsonObject[];
+  orderedOutputBlocks?: ProviderOutputBlock[];
+}
+
+type DecodedProviderOutputBlock = {
+  outputIndex: number;
+  item: JsonObject;
+} & (
+  | { kind: 'reasoning'; content: string }
+  | { kind: 'message'; content: string }
+  | {
+      kind: 'toolCall';
+      providerCallId: string;
+      name: string;
+      input: Record<string, unknown>;
+    }
+  | {
+      kind: 'toolCallRejected';
+      providerCallId: string;
+      name: string;
+      error: Extract<ProviderOutputBlock, { kind: 'toolCallRejected' }>['error'];
+    }
+  | { kind: 'providerHosted'; providerCallId: string }
+);
+
+interface ExpectedToolRecordIdentity {
+  sessionId: string;
+  runId: string;
+  extensionGenerationRef: string;
+  kernelCatalogSnapshotRef: string;
+  toolBindingRef: string;
+  callId: string;
+  attemptId: string;
+  toolName: string;
+  input: Record<string, unknown>;
 }
 
 type ProviderTurn =
+  | ({ kind: 'planProgress'; callId: string; providerCallId: string;
+       sourceFactRef: string; updates: TodoProgressUpdate[] } & ProviderTurnCommon)
   | ({ kind: 'answer'; content: string; messageId?: string } & ProviderTurnCommon)
   | {
       kind: 'interaction';
       interactionId: string;
+      callId: string;
       providerCallId: string;
       request: ModelInteractionRequest;
       narrative?: string;
@@ -132,21 +185,7 @@ type ProviderTurn =
       };
       narrative?: string;
     } & ProviderTurnCommon)
-  | ({
-      kind: 'focus';
-      callId: string;
-      providerCallId: string;
-      focus: string;
-      narrative?: string;
-    } & ProviderTurnCommon)
   | ({ kind: 'continue'; narrative?: string } & ProviderTurnCommon);
-
-const PRESSURE_COMPACTION_RATIO = 0.9;
-const DEFAULT_COMPACTION_OUTPUT_TOKENS = 4096;
-const MAX_COMPACTION_OUTPUT_TOKENS = 8192;
-const COMPACTION_INSTRUCTIONS = `把给定 Session 历史压缩为后续 Agent 可直接继续工作的事实摘要。
-保留用户目标、已确认决定、边界与约束、未解决问题、精确标识、路径、命令、错误、已完成和待完成工作，以及仍有效的 Plan、Todo 和工具结果。
-区分事实、推断和未知；不得补造事实、回答新任务或执行任何操作。只输出压缩摘要 Markdown。`;
 
 export async function runAgentLoop(
   initial: LoopSnapshot,
@@ -162,30 +201,77 @@ export async function runAgentLoop(
     snapshot = await deps.commit(event);
   };
 
-  for (const requestEvent of pendingToolRequests(snapshot.events, runId)) {
-    const existing = await deps.composition.kernel.readRecord(requestEvent.callId);
-    if (existing) await commitToolRecord(existing, runId, requestEvent.callId, commit);
-  }
   if (hasSettlement(snapshot.events, runId)) return settlementResult(snapshot.events, runId);
-
-  try {
-    if (command.type === 'cancel') return await cancelRun(snapshot, command, deps, commit);
-
-    const recoveredFinalMessageId = latestAssistantMessageId(snapshot.events, runId);
-    if (
-      recoveredFinalMessageId
-      && latestRunEventType(snapshot.events, runId) === 'message.committed'
-    ) {
-      await commit({
-        type: 'run.settled',
+  const interrupted = uncompletedProviderComposition(snapshot, runId);
+  if (interrupted) {
+    const settlement: RunSettlement = {
+      outcome: 'indeterminate',
+      error: {
+        code: 'provider_turn_outcome_unknown',
+        message: `Provider request ${interrupted.providerRequestId} 已组成上下文但没有持久化完成事实。`,
+      },
+    };
+    await commit([
+      providerTurnTerminalEvent(
+        snapshot.state.sessionId,
+        runId,
+        interrupted,
+        runRuntimeSnapshot(snapshot, runId).provider.providerRuntimeRef,
+        settlement,
+      ),
+      {
+        type: 'run.finishing',
         sessionId: snapshot.state.sessionId,
         runId,
-        payload: { outcome: 'completed', finalMessageId: recoveredFinalMessageId },
-      });
-      return { status: 'settled', runId, outcome: 'completed' };
+        payload: settlement,
+      },
+    ]);
+    return finishingResult(runId, settlement);
+  }
+  const runtime = runRuntimeSnapshot(snapshot, runId);
+  try {
+    for (const requestEvent of pendingToolRequests(snapshot.events, runId)) {
+      const existing = await deps.composition.kernel.readRecord(requestEvent.callId);
+      if (existing) {
+        await commitToolRecord(
+          existing,
+          expectedToolRecordIdentity(snapshot, runtime, requestEvent),
+          commit,
+        );
+      }
     }
 
-    const answerOnly = command.type === 'resume' && command.answerOnly === true;
+    if (command.type === 'recover') {
+      const unresolved = pendingToolRequests(snapshot.events, runId)[0];
+      if (unresolved) {
+        const approval = latestApproval(snapshot.events, runId, unresolved.callId);
+        if (approval.requested && !approval.resolved) {
+          return { status: 'waiting', runId, reason: 'approval', callId: unresolved.callId };
+        }
+        await commit({
+          type: 'run.finishing',
+          sessionId: snapshot.state.sessionId,
+          runId,
+          payload: {
+            outcome: 'indeterminate',
+            error: {
+              code: 'tool_effect_outcome_unknown',
+              message: `进程恢复时 Kernel 没有工具调用 ${unresolved.callId} 的确定记录。`,
+            },
+          },
+        });
+        return finishingResult(runId, {
+          outcome: 'indeterminate',
+          error: {
+            code: 'tool_effect_outcome_unknown',
+            message: `进程恢复时 Kernel 没有工具调用 ${unresolved.callId} 的确定记录。`,
+          },
+        });
+      }
+    }
+
+    if (command.type === 'cancel') return await cancelRun(snapshot, command, deps, commit);
+
     while (true) {
       throwIfAborted(signal);
       const pendingCompaction = pendingContextCompaction(snapshot.events, runId);
@@ -201,7 +287,11 @@ export async function runAgentLoop(
         }
         const existing = await deps.composition.kernel.readRecord(requestEvent.callId);
         if (existing) {
-          await commitToolRecord(existing, runId, requestEvent.callId, commit);
+          await commitToolRecord(
+            existing,
+            expectedToolRecordIdentity(snapshot, runtime, requestEvent),
+            commit,
+          );
           continue;
         }
         throwIfAborted(signal);
@@ -211,6 +301,9 @@ export async function runAgentLoop(
           requestId: deps.nextId('kernel-request'),
           sessionId: snapshot.state.sessionId,
           runId,
+          extensionGenerationRef: runtime.extensionGenerationRef,
+          kernelCatalogSnapshotRef: runtime.kernelCatalogSnapshotRef,
+          toolBindingRef: runtimeTool(runtime, requestEvent.payload.toolName).toolBindingRef,
           callId: requestEvent.callId,
           attemptId: requestEvent.payload.attemptId,
           toolName: requestEvent.payload.toolName,
@@ -231,6 +324,17 @@ export async function runAgentLoop(
         const reply = await executeUntilAbort(deps, request, signal);
         if (reply.callId !== requestEvent.callId) {
           throw new LoopFailure('kernel_call_identity_mismatch', 'Kernel 返回了其他工具调用的结果。');
+        }
+        if (reply.status === 'inputRejected') {
+          assertToolRecordIdentity(reply.rejection, expectedToolRecordIdentity(snapshot, runtime, requestEvent));
+          await commit({
+            type: 'tool.input-rejected',
+            sessionId: snapshot.state.sessionId,
+            runId,
+            callId: requestEvent.callId,
+            payload: { rejection: reply.rejection },
+          });
+          continue;
         }
         if (reply.status === 'approvalRequired') {
           if (approval.resolved) {
@@ -254,10 +358,16 @@ export async function runAgentLoop(
           ]);
           return { status: 'waiting', runId, reason: 'approval', callId: requestEvent.callId };
         }
-        await commitToolRecord(reply.record, runId, requestEvent.callId, commit);
+        await commitToolRecord(
+          reply.record,
+          expectedToolRecordIdentity(snapshot, runtime, requestEvent),
+          commit,
+        );
       }
 
       throwIfAborted(signal);
+      const correctionFailure = inputCorrectionFailure(snapshot.events, runId);
+      if (correctionFailure) throw correctionFailure;
       const completedPlan = completedPlanAwaitingLifecycle(snapshot.state);
       if (completedPlan) {
         await commit({
@@ -267,9 +377,26 @@ export async function runAgentLoop(
           payload: completedPlan,
         });
       }
-      const preparedProviderRequest = await buildProviderRequest(snapshot, runId, deps, answerOnly);
-      const pressureCutoff = pressureCompactionCutoff(snapshot, runId, preparedProviderRequest.receipt);
+      const executionPlan = confirmedPlanAwaitingExecution(snapshot.state);
+      const preparedProviderRequest = await buildAgentProviderRequest({
+        sessionId: snapshot.state.sessionId,
+        runId,
+        runtime,
+        events: snapshot.events,
+        responseConstraint: executionPlan ? 'toolRequired' : 'normal',
+        workspaceBindings: runWorkspaceBindings(snapshot, runId),
+        contextProviders: deps.composition.contextProviders,
+        memory: deps.composition.memory,
+        providerRequestId: deps.nextId('provider-request'),
+      });
+      const pressureCutoff = pressureCompactionCutoff(
+        snapshot,
+        runId,
+        preparedProviderRequest.receipt,
+        runtime,
+      );
       if (pressureCutoff !== null) {
+        throwIfAborted(signal);
         await commit({
           type: 'context.compaction.requested',
           sessionId: snapshot.state.sessionId,
@@ -283,60 +410,77 @@ export async function runAgentLoop(
         });
         continue;
       }
+      throwIfAborted(signal);
       await commit({
         type: 'context.composed',
         sessionId: snapshot.state.sessionId,
         runId,
         payload: preparedProviderRequest.receipt,
       });
-      const turn = await consumeProvider(preparedProviderRequest.request, runId, deps, signal);
-      const turnFacts: NewSessionEvent[] = [];
-      if ('narrative' in turn && turn.narrative) {
-        turnFacts.push({
+      const turn = await consumeProvider(
+        preparedProviderRequest.request,
+        preparedProviderRequest.toolCodec,
+        runId,
+        deps,
+        signal,
+      );
+      const providerCallFacts: NewSessionEvent[] = [];
+      const completionDerivedFacts: NewSessionEvent[] = [];
+      const turnNarratives = [
+        ...(turn.narratives ?? []),
+        ...('narrative' in turn && turn.narrative
+          ? [{ narrativeId: deps.nextId('narrative'), content: turn.narrative }]
+          : []),
+      ];
+      for (const narrative of turnNarratives) {
+        completionDerivedFacts.push({
           type: 'narrative.committed',
           sessionId: snapshot.state.sessionId,
           runId,
-          payload: { narrativeId: deps.nextId('narrative'), content: turn.narrative },
+          payload: {
+            narrativeId: narrative.narrativeId,
+            content: narrative.content,
+            providerRequestId: turn.completion.providerRequestId,
+          },
         });
       }
       if (turn.contextUsage) {
-        turnFacts.push({
+        completionDerivedFacts.unshift({
           type: 'context.updated',
           sessionId: snapshot.state.sessionId,
           runId,
           payload: turn.contextUsage,
         });
       }
-      if (turn.todo) {
-        assertTodoProgressSource(snapshot.state, turn.todo);
-        turnFacts.push({
-          type: 'todo.progressed',
-          sessionId: snapshot.state.sessionId,
-          runId,
-          callId: turn.todo.callId,
-          payload: {
-            providerCallId: turn.todo.providerCallId,
-            sourcePlanId: turn.todo.planId,
-            sourcePlanRevision: turn.todo.revision,
-            updates: turn.todo.updates.map((update) => ({ ...update })),
-          },
-        });
-      }
-
       switch (turn.kind) {
-        case 'interaction': {
+        case 'planProgress': {
+          const fact = planProgressFact(snapshot, runId, turn);
           await commit([
-            ...turnFacts,
-            {
-              type: 'interaction.requested',
-              sessionId: snapshot.state.sessionId,
-              runId,
-              payload: {
-                interactionId: turn.interactionId,
-                providerCallId: turn.providerCallId,
-                ...turn.request,
-              },
+            ...orderedProviderCallFacts(turn.completion, [fact]),
+            providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
+            ...completionDerivedFacts,
+          ]);
+          break;
+        }
+        case 'interaction': {
+          const interactionFact: NewSessionEvent = {
+            type: 'interaction.requested',
+            sessionId: snapshot.state.sessionId,
+            runId,
+            callId: turn.callId,
+            payload: {
+              interactionId: turn.interactionId,
+              providerCallId: turn.providerCallId,
+              ...turn.request,
             },
+          };
+          await commit([
+            ...orderedProviderCallFacts(
+              turn.completion,
+              [...providerCallFacts, interactionFact],
+            ),
+            providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
+            ...completionDerivedFacts,
             {
               type: 'run.waiting',
               sessionId: snapshot.state.sessionId,
@@ -378,15 +522,44 @@ export async function runAgentLoop(
             plan,
             runWorkspaceBindings(snapshot, runId).map((binding) => binding.workspaceId),
           );
-          await commit([
-            ...turnFacts,
-            {
-              type: 'plan.published',
+          const comparable = comparablePriorPlan(snapshot.state, plan);
+          if (comparable && planDefinitionKey(comparable) === planDefinitionKey(plan)) {
+            const rejectionEvent: NewSessionEvent = {
+              type: 'session.control.rejected',
               sessionId: snapshot.state.sessionId,
               runId,
               callId: turn.callId,
-              payload: { ...clonePlan(plan), providerCallId: turn.providerCallId },
-            },
+              payload: {
+                providerCallId: turn.providerCallId,
+                toolName: SESSION_CONTROL_PLAN_PUBLISH,
+                input: planDraftInput(turn.draft),
+                error: {
+                  code: 'plan_revision_unchanged',
+                  message: 'The proposed Plan is unchanged. Continue executing the confirmed Plan, or publish a materially revised Plan only when its scope must change.',
+                },
+              },
+            };
+            await commit([
+              ...orderedProviderCallFacts(
+                turn.completion,
+                [...providerCallFacts, rejectionEvent],
+              ),
+              providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
+              ...completionDerivedFacts,
+            ]);
+            break;
+          }
+          const planFact: NewSessionEvent = {
+            type: 'plan.published',
+            sessionId: snapshot.state.sessionId,
+            runId,
+            callId: turn.callId,
+            payload: { ...clonePlan(plan), providerCallId: turn.providerCallId },
+          };
+          await commit([
+            ...orderedProviderCallFacts(turn.completion, [...providerCallFacts, planFact]),
+            providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
+            ...completionDerivedFacts,
             {
               type: 'run.waiting',
               sessionId: snapshot.state.sessionId,
@@ -402,33 +575,66 @@ export async function runAgentLoop(
           };
         }
         case 'answer': {
+          if (executionPlan) {
+            await commit([
+              ...orderedProviderCallFacts(turn.completion, providerCallFacts),
+              providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
+              ...completionDerivedFacts,
+              {
+                type: 'run.finishing',
+                sessionId: snapshot.state.sessionId,
+                runId,
+                payload: {
+                  outcome: 'failed',
+                  error: {
+                    code: 'confirmed_plan_execution_required',
+                    message: `Plan ${executionPlan.planId} revision ${executionPlan.revision} 已确认且 Todo 尚未完成；execution turn 不接受普通终答。`,
+                  },
+                },
+              },
+            ]);
+            return finishingResult(runId, {
+              outcome: 'failed',
+              error: {
+                code: 'confirmed_plan_execution_required',
+                message: `Plan ${executionPlan.planId} revision ${executionPlan.revision} 已确认且 Todo 尚未完成；execution turn 不接受普通终答。`,
+              },
+            });
+          }
           const messageId = turn.messageId ?? deps.nextId('message');
           await commit([
+            ...orderedProviderCallFacts(turn.completion, providerCallFacts),
+            providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
+            ...completionDerivedFacts,
             {
               type: 'message.committed',
               sessionId: snapshot.state.sessionId,
               runId,
-              payload: { messageId, role: 'assistant', content: turn.content },
+              payload: {
+                messageId,
+                role: 'assistant',
+                content: turn.content,
+                providerRequestId: turn.completion.providerRequestId,
+              },
             },
-            ...turnFacts,
             {
-              type: 'run.settled',
+              type: 'run.finishing',
               sessionId: snapshot.state.sessionId,
               runId,
               payload: { outcome: 'completed', finalMessageId: messageId },
             },
           ]);
-          return { status: 'settled', runId, outcome: 'completed' };
+          return finishingResult(runId, { outcome: 'completed', finalMessageId: messageId });
         }
         case 'tools': {
           const seenCalls = new Set<string>();
-          const events: NewSessionEvent[] = [...turnFacts];
+          const callFacts: NewSessionEvent[] = [...providerCallFacts];
           for (const call of turn.calls) {
             if (seenCalls.has(call.callId)) {
               throw new LoopFailure('provider_tool_call_duplicate', 'Provider 重复了工具调用标识。');
             }
             seenCalls.add(call.callId);
-            events.push({
+            callFacts.push({
               type: 'tool.requested',
               sessionId: snapshot.state.sessionId,
               runId,
@@ -441,6 +647,13 @@ export async function runAgentLoop(
               },
             });
           }
+          const events = orderedProviderCallFacts(turn.completion, callFacts);
+          events.push(providerTurnSettledEvent(
+            snapshot.state.sessionId,
+            runId,
+            turn.completion,
+          ));
+          events.push(...completionDerivedFacts);
           await commit(events);
           break;
         }
@@ -457,189 +670,98 @@ export async function runAgentLoop(
               error: { ...turn.rejection.error },
             },
           };
-          const priorRejections = snapshot.events.filter((event) => (
-            event.type === 'session.control.rejected' && event.runId === runId
-          )).length;
-          if (priorRejections === 0) {
-            await commit([...turnFacts, rejectionEvent]);
-            break;
-          }
           await commit([
-            ...turnFacts,
-            rejectionEvent,
-            {
-              type: 'run.settled',
-              sessionId: snapshot.state.sessionId,
-              runId,
-              payload: { outcome: 'failed', error: { ...turn.rejection.error } },
-            },
-          ]);
-          return { status: 'settled', runId, outcome: 'failed' };
-        }
-        case 'focus': {
-          await commit([
-            ...turnFacts,
-            {
-              type: 'context.compaction.requested',
-              sessionId: snapshot.state.sessionId,
-              runId,
-              callId: turn.callId,
-              payload: {
-                compactionId: deps.nextId('compaction'),
-                providerRequestId: deps.nextId('provider-request'),
-                trigger: 'agentFocus',
-                coveredThroughSequence: snapshot.state.revision,
-                focus: turn.focus,
-                providerCallId: turn.providerCallId,
-              },
-            },
+            ...orderedProviderCallFacts(
+              turn.completion,
+              [...providerCallFacts, rejectionEvent],
+            ),
+            providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
+            ...completionDerivedFacts,
           ]);
           break;
         }
         case 'continue':
-          await commit(turnFacts);
+          await commit([
+            ...orderedProviderCallFacts(turn.completion, providerCallFacts),
+            providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
+            ...completionDerivedFacts,
+          ]);
           break;
       }
     }
   } catch (error) {
+    if (error instanceof ProviderReportedFailure || error instanceof ProviderCompletedFailure) {
+      const failure = localAgentError(error);
+      if (!hasSettlement(snapshot.events, runId)) {
+        const pending = uncompletedProviderComposition(snapshot, runId);
+        await commit([
+          ...(pending
+            ? [providerTurnTerminalEvent(
+                snapshot.state.sessionId,
+                runId,
+                pending,
+                runRuntimeSnapshot(snapshot, runId).provider.providerRuntimeRef,
+                { outcome: 'failed', error: failure },
+              )]
+            : []),
+          {
+            type: 'run.finishing',
+            sessionId: snapshot.state.sessionId,
+            runId,
+            payload: { outcome: 'failed', error: failure },
+          },
+        ]);
+      }
+      return finishingResult(runId, { outcome: 'failed', error: failure });
+    }
+    const unknownTurn = uncompletedProviderComposition(snapshot, runId);
+    if (unknownTurn && !hasSettlement(snapshot.events, runId)) {
+      const cause = localAgentError(error);
+      const settlement: RunSettlement = {
+        outcome: 'indeterminate',
+        error: {
+          code: 'provider_turn_outcome_unknown',
+          message: `Provider request ${unknownTurn.providerRequestId} 的完成结果不可判定；原始错误 ${cause.code}：${cause.message}`,
+        },
+      };
+      await commit([
+        providerTurnTerminalEvent(
+          snapshot.state.sessionId,
+          runId,
+          unknownTurn,
+          runRuntimeSnapshot(snapshot, runId).provider.providerRuntimeRef,
+          settlement,
+        ),
+        {
+          type: 'run.finishing',
+          sessionId: snapshot.state.sessionId,
+          runId,
+          payload: settlement,
+        },
+      ]);
+      return finishingResult(runId, settlement);
+    }
+    if (
+      signal.aborted
+      && signal.reason === 'session_service_stopped'
+      && !(error instanceof LoopFailure && error.code === 'tool_cancel_cleanup_failed')
+    ) {
+      return { status: 'suspended', runId };
+    }
     if (signal.aborted) {
       return await cancelRun(snapshot, { type: 'cancel', runId }, deps, commit);
     }
     const failure = localAgentError(error);
     if (!hasSettlement(snapshot.events, runId)) {
       await commit({
-        type: 'run.settled',
+        type: 'run.finishing',
         sessionId: snapshot.state.sessionId,
         runId,
         payload: { outcome: 'failed', error: failure },
       });
     }
-    return { status: 'settled', runId, outcome: 'failed' };
+    return finishingResult(runId, { outcome: 'failed', error: failure });
   }
-}
-
-async function buildProviderRequest(
-  snapshot: LoopSnapshot,
-  runId: string,
-  deps: AgentLoopDeps,
-  answerOnly: boolean,
-): Promise<PreparedProviderRequest> {
-  const profileId = snapshot.state.run?.profileId ?? deps.defaultProfileId;
-  const kernelTools = await deps.composition.kernel.listTools();
-  const composedTools = answerOnly
-    ? []
-    : bindCallableToolSnapshot(kernelTools, deps.composition.toolIds);
-  const controlTools = answerOnly
-    ? []
-    : sessionControlToolDefinitions().map(freezeProviderToolDefinition);
-  const providerTools = Object.freeze([
-    ...controlTools,
-    ...composedTools,
-  ]);
-  assertUniqueProviderTools(providerTools.map((tool) => tool.name));
-  const journalMessages = messagesFromJournal(
-    snapshot.events,
-    runId,
-    deps.providerRunState,
-  );
-  const contextMessages = (
-    await Promise.all(deps.composition.contextProviders.map(async (provider) => (
-      await provider.provide({ sessionId: snapshot.state.sessionId, events: snapshot.events })
-    ).map<ContextMessageContribution>((message, index) => ({
-      contributionId: `context-provider:${provider.id}:${index}`,
-      contributionKind: 'contextProviders',
-      label: provider.id,
-      message: cloneModelMessage(message),
-    }))))
-  ).flat();
-  const instructions = deps.composition.instructions.map<ContextMessageContribution>((instruction) => ({
-    contributionId: `instruction:${instruction.id}`,
-    contributionKind: 'instructions',
-    label: instruction.id,
-    message: { role: 'system', content: instruction.text },
-  }));
-  instructions.push({
-    contributionId: 'session:controls',
-    contributionKind: 'sessionControls',
-    label: 'Session control contract',
-    message: { role: 'system', content: SESSION_CONTROL_INSTRUCTIONS },
-  });
-  instructions.push({
-    contributionId: 'session:workspace-bindings',
-    contributionKind: 'workspaceBindings',
-    label: '当前运行的目录索引',
-    message: {
-      role: 'system',
-      content: `当前 Session workspace binding（仅逻辑身份，不含绝对路径）：${JSON.stringify(
-        snapshot.state.workspaceBindings,
-      )}`,
-    },
-  });
-  if (answerOnly) {
-    instructions.push({
-      contributionId: 'session:answer-only',
-      contributionKind: 'instructions',
-      label: 'Answer-only continuation',
-      message: {
-        role: 'system',
-        content: '当前 run 被明确限制为 answer-only continuation。直接输出最终 Markdown 答复；不要调用任何工具或 Session control。',
-      },
-    });
-  }
-  const selected = await deps.composition.memory.select({
-    events: snapshot.events,
-    messages: [...instructions, ...contextMessages, ...journalMessages],
-  });
-  assertContextContributions(selected);
-  const requestId = deps.nextId('provider-request');
-  const request: ProviderRequest = {
-    protocolVersion: LOCAL_AGENT_PROTOCOL_VERSION,
-    requestId,
-    sessionId: snapshot.state.sessionId,
-    runId,
-    ...(profileId ? { profileId } : {}),
-    purpose: 'agent',
-    responseConstraint: answerOnly ? 'answerOnly' : 'normal',
-    workspaceBindings: runWorkspaceBindings(snapshot, runId),
-    messages: selected.map((item) => cloneModelMessage(item.message)),
-    tools: providerTools,
-  };
-  return {
-    request,
-    receipt: buildContextCompositionReceipt(
-      requestId,
-      'agent',
-      answerOnly ? 'answerOnly' : 'normal',
-      selected,
-      composedTools,
-      controlTools,
-      runWorkspaceBindings(snapshot, runId),
-      snapshot.events,
-    ),
-  };
-}
-
-type ContextCompactionRequestEvent = Extract<
-  SessionEvent,
-  { type: 'context.compaction.requested' }
->;
-
-function pendingContextCompaction(
-  events: readonly SessionEvent[],
-  runId: string,
-): ContextCompactionRequestEvent | null {
-  const completed = new Set(events
-    .filter((event): event is Extract<SessionEvent, { type: 'context.compacted' }> => (
-      event.type === 'context.compacted' && event.runId === runId
-    ))
-    .map((event) => event.payload.compactionId));
-  return [...events]
-    .reverse()
-    .find((event): event is ContextCompactionRequestEvent => (
-      event.type === 'context.compaction.requested'
-      && event.runId === runId
-      && !completed.has(event.payload.compactionId)
-    )) ?? null;
 }
 
 async function performContextCompaction(
@@ -650,72 +772,29 @@ async function performContextCompaction(
   signal: AbortSignal,
   commit: (event: NewSessionEvent | readonly NewSessionEvent[]) => Promise<void>,
 ): Promise<void> {
-  if (snapshot.events.some((event) => (
-    event.type === 'context.composed'
-    && event.payload.providerRequestId === requestEvent.payload.providerRequestId
-  ))) {
-    throw new LoopFailure(
-      'context_compaction_interrupted',
-      '上下文压缩 Provider 调用已开始但没有形成完成事实；Session 不会隐藏重试该调用。',
-    );
-  }
   const cutoff = requestEvent.payload.coveredThroughSequence;
-  const sourceEvents = snapshot.events.filter((event) => event.sequence <= cutoff);
-  const sourceMessages = messagesFromJournal(sourceEvents, runId, deps.providerRunState);
-  const focus = 'focus' in requestEvent.payload ? requestEvent.payload.focus : undefined;
-  const selected: ContextMessageContribution[] = [
-    {
-      contributionId: `context-compaction:${requestEvent.payload.compactionId}:instructions`,
-      contributionKind: 'instructions',
-      label: '上下文压缩指令',
-      message: { role: 'system', content: COMPACTION_INSTRUCTIONS },
-    },
-    ...sourceMessages,
-  ];
-  if (focus) {
-    selected.push({
-      contributionId: `context-compaction:${requestEvent.payload.compactionId}:focus`,
-      contributionKind: 'instructions',
-      label: '后续任务焦点',
-      message: {
-        role: 'system',
-        content: `后续工作焦点如下。压缩时优先保留与此焦点相关的既有事实，但不要回答它：\n${focus}`,
-      },
-    });
-  }
-  assertContextContributions(selected);
-  const profileId = snapshot.state.run?.profileId ?? deps.defaultProfileId;
-  const request: ProviderRequest = {
-    protocolVersion: LOCAL_AGENT_PROTOCOL_VERSION,
-    requestId: requestEvent.payload.providerRequestId,
+  const runtime = runRuntimeSnapshot(snapshot, runId);
+  const prepared = prepareContextCompaction({
     sessionId: snapshot.state.sessionId,
     runId,
-    ...(profileId ? { profileId } : {}),
-    purpose: 'contextCompaction',
-    responseConstraint: 'answerOnly',
-    maxOutputTokens: compactionOutputBudget(snapshot.state.contextUsage?.contextWindowTokens),
+    runtime,
     workspaceBindings: runWorkspaceBindings(snapshot, runId),
-    messages: selected.map((item) => cloneModelMessage(item.message)),
-    tools: [],
-  };
-  const receipt = buildContextCompositionReceipt(
-    request.requestId,
-    'contextCompaction',
-    'answerOnly',
-    selected,
-    [],
-    [],
-    runWorkspaceBindings(snapshot, runId),
-    sourceEvents,
-  );
+    events: snapshot.events,
+    requestEvent,
+  });
+  throwIfAborted(signal);
   await commit({
     type: 'context.composed',
     sessionId: snapshot.state.sessionId,
     runId,
-    payload: receipt,
+    payload: prepared.receipt,
   });
-  const compacted = await consumeCompactionProvider(request, deps, signal);
-  const facts: NewSessionEvent[] = [];
+  const compacted = await consumeCompactionProvider(prepared.request, deps, signal);
+  const facts: NewSessionEvent[] = [providerTurnSettledEvent(
+    snapshot.state.sessionId,
+    runId,
+    compacted.completion,
+  )];
   if (compacted.contextUsage) {
     facts.push({
       type: 'context.updated',
@@ -728,7 +807,6 @@ async function performContextCompaction(
     type: 'context.compacted',
     sessionId: snapshot.state.sessionId,
     runId,
-    ...(requestEvent.callId ? { callId: requestEvent.callId } : {}),
     payload: {
       compactionId: requestEvent.payload.compactionId,
       providerRequestId: requestEvent.payload.providerRequestId,
@@ -740,111 +818,22 @@ async function performContextCompaction(
   await commit(facts);
 }
 
-function compactionOutputBudget(contextWindowTokens?: number): number {
-  if (!contextWindowTokens) return DEFAULT_COMPACTION_OUTPUT_TOKENS;
-  return Math.max(
-    1024,
-    Math.min(MAX_COMPACTION_OUTPUT_TOKENS, Math.floor(contextWindowTokens * 0.08)),
-  );
-}
-
-function pressureCompactionCutoff(
-  snapshot: LoopSnapshot,
-  runId: string,
-  currentReceipt: ContextCompositionReceipt,
-): number | null {
-  const usage = snapshot.state.contextUsage;
-  if (!usage || usage.contextWindowTokens <= 0) return null;
-  const latestCheckpoint = [...snapshot.events]
-    .reverse()
-    .find((event): event is Extract<SessionEvent, { type: 'context.compacted' }> => (
-      event.type === 'context.compacted'
-    ));
-  if (latestCheckpoint && latestCheckpoint.sequence > usage.sequence) return null;
-  const priorReceipt = [...snapshot.state.contextCompositions]
-    .reverse()
-    .find((receipt) => (
-      receipt.purpose === 'agent'
-      && receipt.providerRequestId === usage.providerRequestId
-    ));
-  if (!priorReceipt) return null;
-  const priorUnits = contextShapeUnits(priorReceipt.partitions);
-  const currentUnits = contextShapeUnits(currentReceipt.partitions);
-  if (priorUnits <= 0 || currentUnits <= 0) return null;
-  const estimatedCurrentInput = Math.round(usage.inputTokens * currentUnits / priorUnits);
-  const observedUsed = usage.inputTokens + usage.outputTokens;
-  if (
-    Math.max(observedUsed, estimatedCurrentInput) / usage.contextWindowTokens
-    < PRESSURE_COMPACTION_RATIO
-  ) return null;
-  const input = runInputMessageEvent(snapshot.events, runId);
-  if (!input) return null;
-  const coveredThrough = latestCheckpoint?.payload.coveredThroughSequence ?? 0;
-  const priorRunCutoff = input.sequence - 1;
-  const priorJournalFacts = snapshot.events.some((event) => (
-    event.sequence <= priorRunCutoff
-    && event.sequence > coveredThrough
-    && (event.type === 'message.committed' || event.type === 'narrative.committed')
-  ));
-  if (priorRunCutoff >= 1 && priorJournalFacts) return priorRunCutoff;
-
-  // Once the history before this run has already been checkpointed, pressure can
-  // continue to grow inside the active run. Only advance across facts that close
-  // a model-visible prefix; the current user input is retained verbatim on replay.
-  const sameRunCutoff = snapshot.state.revision;
-  if (sameRunCutoff <= coveredThrough) return null;
-  const sameRunProgress = snapshot.events.some((event) => (
-    event.sequence > Math.max(coveredThrough, input.sequence)
-    && event.sequence <= sameRunCutoff
-    && closesModelContextPrefix(event)
-  ));
-  return sameRunProgress ? sameRunCutoff : null;
-}
-
-function runInputMessageEvent(
-  events: readonly SessionEvent[],
-  runId: string,
-): Extract<SessionEvent, { type: 'message.committed' }> | null {
-  const started = events.find((event): event is Extract<SessionEvent, { type: 'run.started' }> => (
-    event.type === 'run.started' && event.runId === runId
-  ));
-  if (!started) return null;
-  return events.find((event): event is Extract<SessionEvent, { type: 'message.committed' }> => (
-    event.type === 'message.committed'
-    && event.payload.messageId === started.payload.inputMessageId
-  )) ?? null;
-}
-
-function closesModelContextPrefix(event: SessionEvent): boolean {
-  return event.type === 'narrative.committed'
-    || event.type === 'interaction.resolved'
-    || event.type === 'plan.confirmed'
-    || event.type === 'plan.revision.requested'
-    || event.type === 'plan.cancelled'
-    || event.type === 'plan.invalidated'
-    || event.type === 'todo.seeded'
-    || event.type === 'todo.reconciled'
-    || event.type === 'todo.progressed'
-    || event.type === 'session.control.rejected'
-    || event.type === 'tool.completed';
-}
-
-function contextShapeUnits(
-  partitions: readonly { requestShapeUnits: number }[],
-): number {
-  return partitions.reduce((total, partition) => total + partition.requestShapeUnits, 0);
-}
-
 async function consumeCompactionProvider(
   request: ProviderRequest,
   deps: AgentLoopDeps,
   signal: AbortSignal,
 ): Promise<{
   summary: string;
-  contextUsage?: ProviderTokenUsage & { providerRequestId: string };
+  completion: ProviderTurnCompletion;
+  contextUsage?: ProviderTokenUsage & {
+    providerRequestId: string;
+    providerRuntimeRef: string;
+  };
 }> {
+  const activity = trackProviderActivity(request, deps);
   let deltas = '';
-  let completeMessage: string | undefined;
+  let completeMessage: Extract<ProviderEvent, { type: 'assistant.message' }>['data'] | undefined;
+  const orderedOutputItems: Array<{ outputIndex: number; item: JsonObject }> = [];
   let contextUsage: ProviderTokenUsage | undefined;
   let completed = false;
   for await (const event of deps.composition.provider.stream(request, signal)) {
@@ -855,9 +844,39 @@ async function consumeCompactionProvider(
         'Provider 在 completed 之后继续发送压缩事件。',
       );
     }
+    activity.observe(event);
     switch (event.type) {
       case 'text.delta':
         deltas += event.data.text;
+        break;
+      case 'reasoning.delta':
+        break;
+      case 'output.item.completed':
+        if (
+          orderedOutputItems.at(-1)?.outputIndex !== undefined
+          && event.data.outputIndex <= orderedOutputItems.at(-1)!.outputIndex
+        ) {
+          throw new LoopFailure(
+            'provider_output_item_order_invalid',
+            '上下文压缩 output item 没有按原生 output_index 递增返回。',
+          );
+        }
+        if (event.data.item.type === 'function_call') {
+          throw new LoopFailure(
+            'context_compaction_tool_call_invalid',
+            '上下文压缩请求不能调用工具或 Session control。',
+          );
+        }
+        if (event.data.item.type === 'web_search_call') {
+          throw new LoopFailure(
+            'context_compaction_hosted_tool_invalid',
+            '上下文压缩请求不能调用 Provider hosted search。',
+          );
+        }
+        orderedOutputItems.push({
+          outputIndex: event.data.outputIndex,
+          item: structuredClone(event.data.item),
+        });
         break;
       case 'assistant.message':
         if (completeMessage !== undefined) {
@@ -866,98 +885,84 @@ async function consumeCompactionProvider(
             '上下文压缩返回了多个最终消息。',
           );
         }
-        completeMessage = event.data.content;
+        completeMessage = event.data;
         break;
       case 'tool.call':
         throw new LoopFailure(
           'context_compaction_tool_call_invalid',
           '上下文压缩请求不能调用工具或 Session control。',
         );
+      case 'hosted.web-search.completed':
+        throw new LoopFailure(
+          'context_compaction_hosted_tool_invalid',
+          '上下文压缩请求不能调用 Provider hosted search。',
+        );
       case 'completed':
         contextUsage = decodeContextUsage(event.data);
         completed = true;
         break;
       case 'failed':
-        throw new LoopFailure(event.data.code, event.data.message);
+        throw new ProviderReportedFailure(event.data.code, event.data.message);
     }
   }
   if (!completed) {
     throw new LoopFailure('provider_stream_incomplete', '上下文压缩 Provider 流未产生完成事件。');
   }
-  if (completeMessage !== undefined && deltas && completeMessage !== deltas) {
+  if (orderedOutputItems.length > 0 && completeMessage !== undefined) {
+    throw new LoopFailure(
+      'provider_output_contract_mixed',
+      '上下文压缩同一 turn 混用了有序 output item 与聚合完成事件。',
+    );
+  }
+  if (completeMessage !== undefined && deltas && completeMessage.content !== deltas) {
     throw new LoopFailure('provider_message_mismatch', '上下文压缩最终消息与流式文本不一致。');
   }
-  const summary = (completeMessage ?? deltas).trim();
+  const orderedMessages = orderedOutputItems.flatMap((output) => (
+    output.item.type === 'message'
+      ? [providerOutputItemText(output.item, 'output_text', true)]
+      : []
+  ));
+  if (orderedMessages.length > 1) {
+    throw new LoopFailure(
+      'context_compaction_message_count_invalid',
+      '上下文压缩必须只产生一个最终消息。',
+    );
+  }
+  const orderedSummary = orderedMessages[0];
+  if (orderedSummary !== undefined && deltas && orderedSummary !== deltas) {
+    throw new LoopFailure(
+      'provider_output_text_mismatch',
+      '上下文压缩有序 message item 与流式文本不一致。',
+    );
+  }
+  const summary = (orderedSummary ?? completeMessage?.content ?? deltas).trim();
   if (!summary) {
     throw new LoopFailure('context_compaction_empty', '上下文压缩没有产生摘要。');
   }
   return {
     summary,
+    completion: {
+      providerRequestId: request.requestId,
+      purpose: 'contextCompaction',
+      providerRuntimeRef: request.providerRuntimeRef,
+      orderedCallIds: [],
+      ...(completeMessage?.reasoningContent !== undefined
+        ? { reasoningContent: completeMessage.reasoningContent }
+        : {}),
+      ...(completeMessage?.reasoningSignature !== undefined
+        ? { reasoningSignature: completeMessage.reasoningSignature }
+        : {}),
+    },
     ...(contextUsage
-      ? { contextUsage: { ...contextUsage, providerRequestId: request.requestId } }
+      ? {
+          contextUsage: {
+            ...contextUsage,
+            providerRequestId: request.requestId,
+            providerRuntimeRef: request.providerRuntimeRef,
+          },
+        }
       : {}),
   };
-}
-
-function assertUniqueProviderTools(names: readonly string[]): void {
-  const seen = new Set<string>();
-  for (const name of names) {
-    if (!/^[A-Za-z0-9_.-]+$/u.test(name) || name.includes('__')) {
-      throw new LoopFailure(
-        'provider_tool_name_invalid',
-        `Provider 工具名称不在可逆编码域内：${name}`,
-      );
-    }
-    if (seen.has(name)) {
-      throw new LoopFailure('provider_tool_name_conflict', `Provider 工具名称冲突：${name}`);
-    }
-    seen.add(name);
-  }
-}
-
-function bindCallableToolSnapshot(
-  kernelTools: readonly ToolDescriptor[],
-  contributedToolIds: readonly string[],
-): readonly ProviderToolDefinition[] {
-  const kernelByName = new Map(kernelTools.map((tool) => [tool.name, tool]));
-  const snapshot: ProviderToolDefinition[] = [];
-  for (const toolId of contributedToolIds) {
-    const tool = kernelByName.get(toolId);
-    if (!tool) {
-      throw new LoopFailure(
-        'plugin_tool_not_kernel_backed',
-        `插件工具 ${toolId} 没有 Kernel 目录定义。`,
-      );
-    }
-    if (tool.availability === 'blocked') continue;
-    snapshot.push(freezeProviderToolDefinition(tool));
-  }
-  snapshot.sort((left, right) => left.name.localeCompare(right.name, 'en'));
-  return Object.freeze(snapshot);
-}
-
-function freezeProviderToolDefinition(
-  tool: Pick<ProviderToolDefinition, 'name' | 'description' | 'inputSchema'>,
-): ProviderToolDefinition {
-  return Object.freeze({
-    name: tool.name,
-    description: tool.description,
-    inputSchema: canonicalJsonObject(tool.inputSchema),
-  });
-}
-
-function canonicalJsonObject(value: Record<string, unknown>): Record<string, unknown> {
-  return canonicalJsonValue(value) as Record<string, unknown>;
-}
-
-function canonicalJsonValue(value: unknown): unknown {
-  if (Array.isArray(value)) return Object.freeze(value.map(canonicalJsonValue));
-  if (!isRecord(value)) return value;
-  return Object.freeze(Object.fromEntries(
-    Object.keys(value)
-      .sort((left, right) => left.localeCompare(right, 'en'))
-      .map((key) => [key, canonicalJsonValue(value[key])]),
-  ));
 }
 
 function assertPlanWorkspaceBindings(plan: ExecutionPlan, bindings: readonly string[]): void {
@@ -974,11 +979,37 @@ function assertPlanWorkspaceBindings(plan: ExecutionPlan, bindings: readonly str
 
 async function consumeProvider(
   request: ProviderRequest,
+  toolCodec: ProviderToolCodec,
   runId: string,
   deps: AgentLoopDeps,
   signal: AbortSignal,
 ): Promise<ProviderTurn> {
+  let completed = false;
+  try {
+    return await consumeProviderOutput(request, toolCodec, runId, deps, signal, () => {
+      completed = true;
+    });
+  } catch (error) {
+    if (completed && !signal.aborted && !(error instanceof ProviderReportedFailure)) {
+      const failure = localAgentError(error);
+      throw new ProviderCompletedFailure(failure.code, failure.message);
+    }
+    throw error;
+  }
+}
+
+async function consumeProviderOutput(
+  request: ProviderRequest,
+  toolCodec: ProviderToolCodec,
+  runId: string,
+  deps: AgentLoopDeps,
+  signal: AbortSignal,
+  onCompleted: () => void,
+): Promise<ProviderTurn> {
+  const activity = trackProviderActivity(request, deps);
+  deps = { ...deps, updateAssistantDraft: activity.updateDraft };
   let deltas = '';
+  let reasoningDeltas = '';
   let completeMessage: {
     messageId: string;
     content: string;
@@ -990,6 +1021,9 @@ async function consumeProvider(
     name: string;
     input: Record<string, unknown>;
   }> = [];
+  const hostedWebSearchCalls: JsonObject[] = [];
+  const orderedOutputItems: Array<{ outputIndex: number; item: JsonObject }> = [];
+  const streamedTextByOutputIndex = new Map<number, string>();
   let contextUsage: ProviderTokenUsage | undefined;
   let completed = false;
   for await (const event of deps.composition.provider.stream(request, signal)) {
@@ -1000,14 +1034,70 @@ async function consumeProvider(
         'Provider 在 completed 之后继续发送事件。',
       );
     }
+    activity.observe(event);
     switch (event.type) {
+      case 'reasoning.delta': {
+        reasoningDeltas += event.data.text;
+        break;
+      }
       case 'text.delta': {
         deltas += event.data.text;
-        deps.updateAssistantDraft({
-          runId,
-          turnId: request.requestId,
-          content: deltas,
+        if (event.data.outputIndex !== undefined) {
+          if (orderedOutputItems.some((output) => output.outputIndex === event.data.outputIndex)) {
+            throw new LoopFailure(
+              'provider_output_delta_after_completion',
+              'Provider 在 output item 完成后继续发送该 item 的正文增量。',
+            );
+          }
+          streamedTextByOutputIndex.set(
+            event.data.outputIndex,
+            `${streamedTextByOutputIndex.get(event.data.outputIndex) ?? ''}${event.data.text}`,
+          );
+          deps.updateAssistantDraft({
+            runId,
+            turnId: request.requestId,
+            content: '',
+            orderedBlocks: assistantDraftBlocks(
+              orderedOutputItems,
+              toolCodec,
+              streamedTextByOutputIndex,
+            ),
+          });
+        } else if (orderedOutputItems.length === 0) {
+          deps.updateAssistantDraft({
+            runId,
+            turnId: request.requestId,
+            content: deltas,
+          });
+        }
+        break;
+      }
+      case 'output.item.completed': {
+        const previous = orderedOutputItems.at(-1);
+        if (previous && event.data.outputIndex <= previous.outputIndex) {
+          throw new LoopFailure(
+            'provider_output_item_order_invalid',
+            'Provider output item 没有按原生 output_index 递增返回。',
+          );
+        }
+        orderedOutputItems.push({
+          outputIndex: event.data.outputIndex,
+          item: structuredClone(event.data.item),
         });
+        streamedTextByOutputIndex.delete(event.data.outputIndex);
+        const orderedBlocks = assistantDraftBlocks(
+          orderedOutputItems,
+          toolCodec,
+          streamedTextByOutputIndex,
+        );
+        deps.updateAssistantDraft(orderedBlocks.length > 0
+          ? {
+              runId,
+              turnId: request.requestId,
+              content: '',
+              orderedBlocks,
+            }
+          : null);
         break;
       }
       case 'assistant.message':
@@ -1019,22 +1109,43 @@ async function consumeProvider(
         }
         completeMessage = event.data;
         break;
-      case 'tool.call':
+      case 'tool.call': {
+        const canonicalName = toolCodec.canonicalByWire.get(event.data.name);
+        if (!canonicalName) {
+          throw new LoopFailure(
+            'provider_tool_alias_unknown',
+            `Provider 返回了当前 run 未声明的工具别名：${event.data.name}`,
+          );
+        }
         providerCalls.push({
           providerCallId: event.data.callId,
-          name: event.data.name,
-          input: event.data.input,
+          name: canonicalName,
+          input: decodeProviderToolInput(toolCodec, canonicalName, event.data.input),
         });
         break;
+      }
+      case 'hosted.web-search.completed':
+        hostedWebSearchCalls.push(structuredClone(event.data.item));
+        break;
       case 'completed':
-        contextUsage = decodeContextUsage(event.data);
         completed = true;
+        onCompleted();
+        contextUsage = decodeContextUsage(event.data);
         break;
       case 'failed':
-        throw new LoopFailure(event.data.code, event.data.message);
+        throw new ProviderReportedFailure(event.data.code, event.data.message);
     }
   }
   if (!completed) throw new LoopFailure('provider_stream_incomplete', 'Provider 流未产生完成事件。');
+  if (
+    orderedOutputItems.length > 0
+    && (completeMessage !== undefined || providerCalls.length > 0 || hostedWebSearchCalls.length > 0)
+  ) {
+    throw new LoopFailure(
+      'provider_output_contract_mixed',
+      'Provider 同一 turn 混用了有序 output item 与聚合完成事件。',
+    );
+  }
   if (completeMessage) {
     if (
       completeMessage.reasoningContent !== undefined
@@ -1066,6 +1177,15 @@ async function consumeProvider(
     if (deltas && completeMessage.content !== deltas) {
       throw new LoopFailure('provider_message_mismatch', 'Provider 最终消息与流式文本不一致。');
     }
+    if (
+      reasoningDeltas
+      && completeMessage.reasoningContent !== reasoningDeltas
+    ) {
+      throw new LoopFailure(
+        'provider_reasoning_message_mismatch',
+        'Provider 最终 reasoningContent 与流式 reasoning 不一致。',
+      );
+    }
     if (!deltas) {
       deltas = completeMessage.content;
       if (deltas) {
@@ -1078,22 +1198,62 @@ async function consumeProvider(
     }
   }
 
-  if (request.responseConstraint === 'answerOnly') {
-    if (providerCalls.length !== 0) {
+  const decodedOutputBlocks = orderedOutputItems.map((output) => (
+    decodeProviderOutputBlock(output, toolCodec)
+  ));
+  if (decodedOutputBlocks.length > 0) {
+    const outputText = decodedOutputBlocks
+      .filter((block): block is Extract<DecodedProviderOutputBlock, { kind: 'message' }> => (
+        block.kind === 'message'
+      ))
+      .map((block) => block.content)
+      .join('');
+    if (deltas && outputText !== deltas) {
       throw new LoopFailure(
-        'answer_only_contract_violated',
-        'answer-only continuation 不能调用工具或 Session control。',
+        'provider_output_text_mismatch',
+        'Provider 有序 message items 与流式文本不一致。',
       );
+    }
+    if (!deltas && outputText) {
+      deltas = outputText;
+    }
+    for (const block of decodedOutputBlocks) {
+      if (block.kind === 'toolCall') {
+        providerCalls.push({
+          providerCallId: block.providerCallId,
+          name: block.name,
+          input: block.input,
+        });
+      }
     }
   }
 
+  const orderedReasoningContent = decodedOutputBlocks
+    .filter((block): block is Extract<DecodedProviderOutputBlock, { kind: 'reasoning' }> => (
+      block.kind === 'reasoning'
+    ))
+    .map((block) => block.content)
+    .join('');
+  const reasoningContent = completeMessage?.reasoningContent
+    ?? (orderedReasoningContent || reasoningDeltas || undefined);
+
   const usage = contextUsage
-    ? { contextUsage: { ...contextUsage, providerRequestId: request.requestId } }
+    ? {
+        contextUsage: {
+          ...contextUsage,
+          providerRequestId: request.requestId,
+          providerRuntimeRef: request.providerRuntimeRef,
+        },
+      }
     : {};
-  const narrative = deltas.trim() ? deltas : undefined;
+  const narrative = decodedOutputBlocks.length === 0 && deltas.trim() ? deltas : undefined;
+  const rejectedCalls = decodedOutputBlocks.filter(
+    (block): block is Extract<DecodedProviderOutputBlock, { kind: 'toolCallRejected' }> => (
+      block.kind === 'toolCallRejected'
+    ),
+  );
   const seenCalls = new Set<string>();
-  const declaredTools = new Set(request.tools.map((tool) => tool.name));
-  for (const call of providerCalls) {
+  for (const call of [...providerCalls, ...rejectedCalls]) {
     if (!call.providerCallId || seenCalls.has(call.providerCallId)) {
       throw new LoopFailure(
         'provider_tool_call_duplicate',
@@ -1101,12 +1261,27 @@ async function consumeProvider(
       );
     }
     seenCalls.add(call.providerCallId);
-    if (request.responseConstraint !== 'answerOnly' && !declaredTools.has(call.name)) {
+  }
+  const seenHostedSearchCalls = new Set(seenCalls);
+  for (const item of hostedWebSearchCalls) {
+    const callId = typeof item.id === 'string' ? item.id : '';
+    if (!callId || seenHostedSearchCalls.has(callId)) {
       throw new LoopFailure(
-        'provider_tool_not_declared',
-        `Provider 调用了当前 turn 未声明的工具：${call.name}`,
+        'provider_hosted_search_call_duplicate',
+        'Provider hosted search 调用标识为空或重复。',
       );
     }
+    seenHostedSearchCalls.add(callId);
+  }
+  for (const block of decodedOutputBlocks) {
+    if (block.kind !== 'providerHosted') continue;
+    if (seenHostedSearchCalls.has(block.providerCallId)) {
+      throw new LoopFailure(
+        'provider_hosted_search_call_duplicate',
+        'Provider hosted search 调用标识为空或重复。',
+      );
+    }
+    seenHostedSearchCalls.add(block.providerCallId);
   }
   const logicalCallIds = new Set<string>();
   const calls = providerCalls.map((call) => {
@@ -1125,16 +1300,121 @@ async function consumeProvider(
       input: call.input,
     };
   });
-  recordProviderTurnState(
-    deps.providerRunState,
-    runId,
-    calls.map((call) => call.callId),
-    completeMessage?.reasoningContent,
-    completeMessage?.reasoningSignature,
+  const logicalCallByProviderCallId = new Map(calls.map((call) => (
+    [call.providerCallId, call.callId] as const
+  )));
+  for (const call of rejectedCalls) {
+    const callId = deps.nextId('call');
+    if (!callId || callId === call.providerCallId || logicalCallIds.has(callId)) {
+      throw new LoopFailure('logical_call_identity_invalid', 'Session 拒绝调用缺少独立且唯一的 LogicalCallId。');
+    }
+    logicalCallIds.add(callId);
+    logicalCallByProviderCallId.set(call.providerCallId, callId);
+  }
+  const orderedMessageBlocks = decodedOutputBlocks.filter(
+    (block): block is Extract<DecodedProviderOutputBlock, { kind: 'message' }> => (
+      block.kind === 'message'
+    ),
   );
+  const hasCalls = calls.length + rejectedCalls.length > 0;
+  const finalOrderedMessage = !hasCalls ? orderedMessageBlocks.at(-1) : undefined;
+  if (decodedOutputBlocks.length > 0 && !hasCalls && !finalOrderedMessage) {
+    throw new LoopFailure(
+      'provider_answer_empty',
+      'Provider 有序 output items 没有产生最终答复消息。',
+    );
+  }
+  const orderedNarratives: Array<{ narrativeId: string; content: string }> = [];
+  let orderedFinalMessage: { messageId: string; content: string } | undefined;
+  const orderedOutputBlocks = decodedOutputBlocks.map((block): ProviderOutputBlock => {
+    switch (block.kind) {
+      case 'reasoning':
+        return {
+          outputIndex: block.outputIndex,
+          kind: 'reasoning',
+          item: structuredClone(block.item),
+        };
+      case 'message': {
+        if (block.outputIndex === finalOrderedMessage?.outputIndex) {
+          const messageId = deps.nextId('message');
+          orderedFinalMessage = { messageId, content: block.content };
+          return {
+            outputIndex: block.outputIndex,
+            kind: 'finalMessage',
+            messageId,
+            item: structuredClone(block.item),
+          };
+        }
+        const narrativeId = deps.nextId('narrative');
+        orderedNarratives.push({ narrativeId, content: block.content });
+        return {
+          outputIndex: block.outputIndex,
+          kind: 'narrative',
+          narrativeId,
+          item: structuredClone(block.item),
+        };
+      }
+      case 'toolCall':
+      case 'toolCallRejected': {
+        const callId = logicalCallByProviderCallId.get(block.providerCallId);
+        if (!callId) {
+          throw new LoopFailure(
+            'provider_turn_call_fact_mismatch',
+            'Provider output toolCall 缺少对应的 Session LogicalCallId。',
+          );
+        }
+        const callBlock = {
+          outputIndex: block.outputIndex,
+          callId,
+          providerCallId: block.providerCallId,
+          toolName: block.name,
+          item: structuredClone(block.item),
+        };
+        return block.kind === 'toolCallRejected'
+          ? { ...callBlock, kind: 'toolCallRejected', error: structuredClone(block.error) }
+          : { ...callBlock, kind: 'toolCall' };
+      }
+      case 'providerHosted':
+        return {
+          outputIndex: block.outputIndex,
+          kind: 'providerHosted',
+          activityId: deps.nextId('activity'),
+          providerCallId: block.providerCallId,
+          providerToolType: 'web_search',
+          item: structuredClone(block.item),
+        };
+    }
+  });
+  const completion: ProviderTurnCompletion = {
+    providerRequestId: request.requestId,
+    purpose: 'agent',
+    providerRuntimeRef: request.providerRuntimeRef,
+    orderedCallIds: calls.map((call) => call.callId),
+    ...(reasoningContent !== undefined
+      ? { reasoningContent }
+      : {}),
+    ...(completeMessage?.reasoningSignature !== undefined
+      ? { reasoningSignature: completeMessage.reasoningSignature }
+      : {}),
+    ...(hostedWebSearchCalls.length > 0
+      ? { hostedWebSearchCalls }
+      : {}),
+    ...(orderedOutputBlocks.length > 0
+      ? { orderedOutputBlocks }
+      : {}),
+  };
 
   const controlCalls: Array<SessionControlCall & { providerCallId: string }> = [];
   const kernelCalls: typeof calls = [];
+  if ([...calls, ...rejectedCalls].some((call) => (
+    call.name === SESSION_CONTROL_INTERACTION_REQUEST || call.name === SESSION_CONTROL_PLAN_PUBLISH
+    || call.name === SESSION_CONTROL_PLAN_PROGRESS
+  )) && calls.length + rejectedCalls.length > 1) {
+    throw new LoopFailure(
+      'session_control_turn_conflict',
+      'interaction.request 与 plan.publish 必须独占 Provider turn。',
+    );
+  }
   for (const call of calls) {
     try {
       const control = decodeSessionControlCall(call.callId, call.name, call.input);
@@ -1142,6 +1422,12 @@ async function consumeProvider(
       else kernelCalls.push(call);
     } catch (error) {
       if (!(error instanceof SessionControlError)) throw error;
+      if (calls.length !== 1) {
+        throw new LoopFailure(
+          'session_control_rejection_turn_ambiguous',
+          '包含多个调用的 Provider turn 无法只持久化单个 control rejection。',
+        );
+      }
       return {
         kind: 'controlRejected',
         rejection: {
@@ -1152,51 +1438,42 @@ async function consumeProvider(
           error: { code: error.code, message: error.message },
         },
         ...(narrative ? { narrative } : {}),
+        ...(orderedNarratives.length > 0 ? { narratives: orderedNarratives } : {}),
         ...usage,
+        completion,
       };
     }
   }
-  const blockingControls = controlCalls.filter(
-    (control) => control.kind === 'interaction' || control.kind === 'plan',
-  );
-  const todoControls = controlCalls.filter(
-    (control): control is Extract<SessionControlCall, { kind: 'todo' }>
-      & { providerCallId: string } => control.kind === 'todo',
-  );
-  const focusControls = controlCalls.filter(
-    (control): control is Extract<SessionControlCall, { kind: 'focus' }>
-      & { providerCallId: string } => control.kind === 'focus',
-  );
+  const blockingControls = controlCalls;
   if (
     blockingControls.length > 1
-    || todoControls.length > 1
-    || focusControls.length > 1
-    || blockingControls.length > 0 && (todoControls.length > 0 || kernelCalls.length > 0)
-    || focusControls.length > 0 && (controlCalls.length > 1 || kernelCalls.length > 0)
+    || blockingControls.length > 0 && kernelCalls.length > 0
   ) {
     throw new LoopFailure(
       'session_control_turn_conflict',
-      'interaction.request、plan.publish 与 context.focus 必须独占 Provider turn；todo.progress 每个 turn 最多一次，且只能与 Kernel 工具并存。',
+      'interaction.request 与 plan.publish 必须独占 Provider turn。',
     );
   }
 
-  const todo = todoControls[0]
-    ? {
-        todo: {
-          callId: todoControls[0].callId,
-          providerCallId: todoControls[0].providerCallId,
-          planId: todoControls[0].planId,
-          revision: todoControls[0].revision,
-          updates: todoControls[0].updates,
-        },
-      }
-    : {};
-  const common = { ...usage, ...todo };
+  const common = {
+    ...usage,
+    completion,
+    ...(orderedNarratives.length > 0 ? { narratives: orderedNarratives } : {}),
+  };
   const control = blockingControls[0];
+  if (control?.kind === 'planProgress') return { ...control, ...common };
   if (control?.kind === 'interaction') {
+    const interactionId = deps.nextId('interaction');
+    if (interactionId === control.callId || interactionId === control.providerCallId) {
+      throw new LoopFailure(
+        'interaction_identity_invalid',
+        'InteractionId、LogicalCallId 与 ProviderCallId 必须是互不复用的独立身份。',
+      );
+    }
     return {
       kind: 'interaction',
-      interactionId: control.interactionId,
+      interactionId,
+      callId: control.callId,
       providerCallId: control.providerCallId,
       request: control.request,
       ...(narrative ? { narrative } : {}),
@@ -1213,17 +1490,7 @@ async function consumeProvider(
       ...common,
     };
   }
-  if (focusControls[0]) {
-    return {
-      kind: 'focus',
-      callId: focusControls[0].callId,
-      providerCallId: focusControls[0].providerCallId,
-      focus: focusControls[0].focus,
-      ...(narrative ? { narrative } : {}),
-      ...common,
-    };
-  }
-  if (kernelCalls.length > 0) {
+  if (kernelCalls.length > 0 || rejectedCalls.length > 0) {
     return {
       kind: 'tools',
       calls: kernelCalls,
@@ -1231,14 +1498,10 @@ async function consumeProvider(
       ...common,
     };
   }
-  if (todoControls.length > 0) {
-    return {
-      kind: 'continue',
-      ...(narrative ? { narrative } : {}),
-      ...common,
-    };
-  }
-  if (!narrative) {
+  const answer = orderedFinalMessage ?? (narrative
+    ? { content: narrative, messageId: completeMessage?.messageId }
+    : undefined);
+  if (!answer) {
     throw new LoopFailure(
       'provider_answer_empty',
       'Provider turn 正常结束，但没有产生最终答复文本。',
@@ -1246,581 +1509,297 @@ async function consumeProvider(
   }
   return {
     kind: 'answer',
-    content: narrative,
-    ...(completeMessage ? { messageId: completeMessage.messageId } : {}),
+    content: answer.content,
+    ...(answer.messageId ? { messageId: answer.messageId } : {}),
     ...common,
   };
 }
 
-function messagesFromJournal(
-  events: readonly SessionEvent[],
-  runId: string,
-  providerRunState: ProviderRunTransientState,
-): ContextMessageContribution[] {
-  const messages: ContextMessageContribution[] = [];
-  const retainedRunInputId = runInputMessageEvent(events, runId)?.payload.messageId;
-  const checkpoint = [...events]
-    .reverse()
-    .find((event): event is Extract<SessionEvent, { type: 'context.compacted' }> => (
-      event.type === 'context.compacted'
-    ));
-  if (checkpoint) {
-    messages.push({
-      contributionId: `context-checkpoint:${checkpoint.payload.compactionId}`,
-      contributionKind: 'journalMessages',
-      label: '上下文压缩摘要',
-      message: { role: 'system', content: checkpoint.payload.summary },
-    });
-  }
-  for (const event of events) {
-    if (
-      checkpoint
-      && event.sequence <= checkpoint.payload.coveredThroughSequence
-      && !(
-        event.type === 'message.committed'
-        && event.payload.messageId === retainedRunInputId
-      )
-    ) continue;
-    if (event.type === 'message.committed') {
-      messages.push({
-        contributionId: `message:${event.payload.messageId}`,
-        contributionKind: 'journalMessages',
-        label: event.payload.role === 'user' ? '用户消息' : 'Assistant 消息',
-        message: { role: event.payload.role, content: messageContentForModel(event.payload) },
-      });
-    } else if (event.type === 'narrative.committed') {
-      messages.push({
-        contributionId: `narrative:${event.payload.narrativeId}`,
-        contributionKind: 'journalMessages',
-        label: '运行叙述',
-        message: { role: 'assistant', content: event.payload.content },
-      });
-    } else if (event.type === 'interaction.requested') {
-      attachToolCall(messages, {
-        callId: event.payload.interactionId,
-        name: SESSION_CONTROL_INTERACTION_REQUEST,
-        input: {
-          kind: event.payload.kind,
-          prompt: event.payload.prompt,
-          options: event.payload.options,
-          allowFreeform: event.payload.allowFreeform,
-        },
-      });
-    } else if (event.type === 'interaction.resolved') {
-      messages.push({
-        contributionId: `interaction-result:${event.payload.interactionId}`,
-        contributionKind: 'journalMessages',
-        label: '用户交互答复',
-        message: {
-          role: 'tool',
-          toolCallId: event.payload.interactionId,
-          content: JSON.stringify({ response: event.payload.response }),
-        },
-      });
-    } else if (event.type === 'plan.published') {
-      attachToolCall(messages, {
-        callId: event.callId,
-        name: SESSION_CONTROL_PLAN_PUBLISH,
-        input: {
-          title: event.payload.title,
-          summary: event.payload.summary,
-          steps: event.payload.steps,
-          mutationManifest: event.payload.mutationManifest,
-        },
-      });
-    } else if (event.type === 'plan.confirmed') {
-      messages.push({
-        contributionId: `plan-result:${event.payload.planId}:${event.payload.revision}`,
-        contributionKind: 'journalMessages',
-        label: '用户确认 Plan',
-        message: {
-          role: 'tool',
-          toolCallId: event.callId,
-          content: JSON.stringify({
-            response: { kind: 'confirm' },
-            planId: event.payload.planId,
-            revision: event.payload.revision,
-            todoSeeded: true,
-          }),
-        },
-      });
-    } else if (event.type === 'plan.revision.requested') {
-      messages.push({
-        contributionId: `plan-revision-result:${event.payload.planId}:${event.payload.revision}`,
-        contributionKind: 'journalMessages',
-        label: '用户请求修改 Plan',
-        message: {
-          role: 'tool',
-          toolCallId: event.callId,
-          content: JSON.stringify({
-            response: { kind: 'requestRevision', text: event.payload.text },
-            planId: event.payload.planId,
-            revision: event.payload.revision,
-          }),
-        },
-      });
-    } else if (event.type === 'plan.cancelled') {
-      messages.push({
-        contributionId: `plan-cancel-result:${event.payload.planId}:${event.payload.revision}`,
-        contributionKind: 'journalMessages',
-        label: '用户取消 Plan',
-        message: {
-          role: 'tool',
-          toolCallId: event.callId,
-          content: JSON.stringify({
-            response: { kind: 'cancel' },
-            planId: event.payload.planId,
-            revision: event.payload.revision,
-          }),
-        },
-      });
-    } else if (event.type === 'plan.invalidated') {
-      messages.push({
-        contributionId: `plan-invalidated:${event.payload.planId}:${event.payload.revision}:${event.eventId}`,
-        contributionKind: 'journalMessages',
-        label: 'Plan 已失效',
-        message: {
-          role: 'system',
-          content: JSON.stringify({
-            type: 'plan.invalidated',
-            planId: event.payload.planId,
-            revision: event.payload.revision,
-            reason: event.payload.reason,
-            sourceFactRef: event.payload.sourceFactRef,
-          }),
-        },
-      });
-    } else if (event.type === 'todo.seeded' || event.type === 'todo.reconciled') {
-      messages.push({
-        contributionId: `todo-list:${event.payload.sourcePlanId}:${event.payload.sourcePlanRevision}`,
-        contributionKind: 'journalMessages',
-        label: event.type === 'todo.seeded' ? 'Plan Todo 已生成' : 'Plan Todo 已协调',
-        message: {
-          role: 'system',
-          content: JSON.stringify({
-            type: event.type,
-            sourcePlanId: event.payload.sourcePlanId,
-            sourcePlanRevision: event.payload.sourcePlanRevision,
-            items: event.payload.items,
-          }),
-        },
-      });
-    } else if (event.type === 'todo.progressed') {
-      attachToolCall(messages, {
-        callId: event.callId,
-        name: SESSION_CONTROL_TODO_PROGRESS,
-        input: {
-          planId: event.payload.sourcePlanId,
-          revision: event.payload.sourcePlanRevision,
-          updates: event.payload.updates,
-        },
-      });
-      messages.push({
-        contributionId: `todo-result:${event.callId}`,
-        contributionKind: 'journalMessages',
-        label: 'Todo 更新结果',
-        message: {
-          role: 'tool',
-          toolCallId: event.callId,
-          content: JSON.stringify({ accepted: true }),
-        },
-      });
-    } else if (event.type === 'session.control.rejected') {
-      attachToolCall(messages, {
-        callId: event.callId,
-        name: event.payload.toolName,
-        input: event.payload.input,
-      });
-      messages.push({
-        contributionId: `session-control-rejection:${event.callId}`,
-        contributionKind: 'journalMessages',
-        label: 'Session control 拒绝结果',
-        message: {
-          role: 'tool',
-          toolCallId: event.callId,
-          content: JSON.stringify({ accepted: false, error: event.payload.error }),
-        },
-      });
-    } else if (
-      event.type === 'context.compaction.requested'
-      && event.payload.trigger === 'agentFocus'
-      && event.callId
-    ) {
-      attachToolCall(messages, {
-        callId: event.callId,
-        name: SESSION_CONTROL_CONTEXT_FOCUS,
-        input: { focus: event.payload.focus },
-      });
-    } else if (event.type === 'context.compacted' && event.callId) {
-      messages.push({
-        contributionId: `context-focus-result:${event.payload.compactionId}`,
-        contributionKind: 'journalMessages',
-        label: '上下文聚焦结果',
-        message: {
-          role: 'tool',
-          toolCallId: event.callId,
-          content: JSON.stringify({
-            accepted: true,
-            compactionId: event.payload.compactionId,
-          }),
-        },
-      });
-    } else if (event.type === 'tool.requested') {
-      attachToolCall(messages, {
-        callId: event.callId,
-        name: event.payload.toolName,
-        input: event.payload.input,
-      });
-    } else if (event.type === 'tool.completed') {
-      messages.push({
-        contributionId: `tool-result:${event.callId}`,
-        contributionKind: 'journalMessages',
-        label: `${event.payload.record.preparedEffect.operation} 结果`,
-        message: {
-          role: 'tool',
-          toolCallId: event.callId,
-          content: JSON.stringify(toolResultForModel(event.payload.record)),
-        },
-      });
-    }
-  }
-  applyProviderRunState(messages, currentRunCallIds(events, runId), providerRunState);
-  return messages;
+function trackProviderActivity(request: ProviderRequest, deps: AgentLoopDeps): {
+  updateDraft(draft: AssistantDraftProjection | null): void;
+  observe(event: ProviderEvent): void;
+} {
+  let draft: AssistantDraftProjection = { runId: request.runId, turnId: request.requestId, content: '' };
+  const activity: ProviderActivityProjection = {
+    purpose: request.purpose, phase: 'waitingResponse', startedAt: new Date().toISOString(),
+  };
+  const publish = () => deps.updateAssistantDraft({ ...draft, activity: { ...activity } });
+  publish();
+  return {
+    updateDraft(next) {
+      draft = next ?? { runId: request.runId, turnId: request.requestId, content: '' };
+      publish();
+    },
+    observe(event) {
+      if (event.type === 'reasoning.delta' && event.data.text) activity.phase = 'reasoning';
+      else if (event.type === 'text.delta' && event.data.text) activity.phase = 'generatingOutput';
+      else if (event.type === 'assistant.message') activity.phase = 'generatingOutput';
+      else if (event.type === 'output.item.completed') {
+        activity.phase = event.data.item.type === 'message' ? 'generatingOutput' : 'awaitingOutput';
+      } else if (event.type === 'tool.call' || event.type === 'hosted.web-search.completed') {
+        activity.phase = 'awaitingOutput';
+      } else return;
+      activity.lastContentAt = new Date().toISOString();
+      publish();
+    },
+  };
 }
 
-function recordProviderTurnState(
-  state: ProviderRunTransientState,
-  runId: string,
-  callIds: readonly string[],
-  reasoningContent?: string,
-  reasoningSignature?: string,
-): void {
-  if (state.runId !== runId) {
-    throw new LoopFailure(
-      'provider_transient_run_identity_mismatch',
-      'Provider 瞬态 turn 状态不属于当前运行。',
-    );
-  }
-  for (const callId of callIds) {
-    state.observedCallIds.add(callId);
-    if (reasoningContent !== undefined) state.reasoningByCallId.set(callId, reasoningContent);
-    if (reasoningSignature !== undefined) {
-      state.reasoningSignatureByCallId.set(callId, reasoningSignature);
+function decodeProviderOutputBlock(
+  output: { outputIndex: number; item: JsonObject },
+  toolCodec: ProviderToolCodec,
+): DecodedProviderOutputBlock {
+  const item = structuredClone(output.item);
+  switch (item.type) {
+    case 'reasoning':
+      return {
+        outputIndex: output.outputIndex,
+        kind: 'reasoning',
+        content: providerOutputItemText(item, 'reasoning_text', false),
+        item,
+      };
+    case 'message': {
+      if (item.role !== 'assistant') {
+        throw new LoopFailure(
+          'provider_output_message_invalid',
+          'Provider output message 不是 assistant 消息。',
+        );
+      }
+      return {
+        outputIndex: output.outputIndex,
+        kind: 'message',
+        content: providerOutputItemText(item, 'output_text', true),
+        item,
+      };
     }
+    case 'function_call': {
+      const providerCallId = typeof item.call_id === 'string' ? item.call_id : '';
+      const wireName = typeof item.name === 'string' ? item.name : '';
+      const canonicalName = toolCodec.canonicalByWire.get(wireName);
+      if (!providerCallId || !wireName || !canonicalName || typeof item.arguments !== 'string') {
+        throw new LoopFailure(
+          canonicalName ? 'provider_tool_call_invalid' : 'provider_tool_alias_unknown',
+          canonicalName
+            ? 'Provider function_call 终态事实无效。'
+            : `Provider 返回了当前 run 未声明的工具别名：${wireName}`,
+        );
+      }
+      let input: unknown;
+      const rejectInput = (message: string): DecodedProviderOutputBlock => ({
+        outputIndex: output.outputIndex,
+        kind: 'toolCallRejected',
+        providerCallId,
+        name: canonicalName,
+        item,
+        error: {
+          code: 'provider_tool_call_arguments_invalid',
+          message,
+          issues: [{ path: '$', rule: 'json_object', message, expected: 'JSON object' }],
+        },
+      });
+      try {
+        input = JSON.parse(item.arguments);
+      } catch {
+        return rejectInput('Provider function_call arguments 不是有效 JSON。');
+      }
+      if (!isRecord(input)) {
+        return rejectInput('Provider function_call arguments 必须是 JSON 对象。');
+      }
+      let decodedInput: JsonObject;
+      try {
+        decodedInput = decodeProviderToolInput(toolCodec, canonicalName, input);
+      } catch (error) {
+        if (!(error instanceof LoopFailure)) throw error;
+        return {
+          outputIndex: output.outputIndex,
+          kind: 'toolCallRejected',
+          providerCallId,
+          name: canonicalName,
+          item,
+          error: {
+            code: error.code,
+            message: error.message,
+            issues: [{ path: '$.workspace', rule: 'workspace_binding', message: error.message }],
+          },
+        };
+      }
+      return {
+        outputIndex: output.outputIndex,
+        kind: 'toolCall',
+        providerCallId,
+        name: canonicalName,
+        input: decodedInput,
+        item,
+      };
+    }
+    case 'web_search_call': {
+      const providerCallId = typeof item.id === 'string' ? item.id : '';
+      if (
+        !providerCallId
+        || item.status !== 'completed' && item.status !== 'failed'
+        || !isRecord(item.action)
+      ) {
+        throw new LoopFailure(
+          'provider_hosted_search_item_invalid',
+          'Provider hosted search 终态事实无效。',
+        );
+      }
+      return {
+        outputIndex: output.outputIndex,
+        kind: 'providerHosted',
+        providerCallId,
+        item,
+      };
+    }
+    default:
+      throw new LoopFailure(
+        'provider_output_item_type_unsupported',
+        `Provider 返回了当前合同未支持的 output item 类型：${String(item.type)}`,
+      );
   }
 }
 
-function applyProviderRunState(
-  messages: ContextMessageContribution[],
-  currentCallIds: ReadonlySet<string>,
-  state: ProviderRunTransientState,
-): void {
-  for (const contribution of messages) {
-    const message = contribution.message;
-    if (message.role !== 'assistant' || !message.toolCalls?.length) continue;
-    const callIds = message.toolCalls
-      .map((call) => call.callId)
-      .filter((callId) => currentCallIds.has(callId));
-    if (!callIds.length) continue;
-    const missing = callIds.filter((callId) => !state.observedCallIds.has(callId));
-    if (missing.length) {
-      throw new LoopFailure(
-        'provider_transient_turn_state_missing',
-        '当前工具续轮所需的 Provider 瞬态 turn 状态已丢失，不能猜测或重新构造。',
-      );
-    }
-    const reasoning = [...new Set(callIds.flatMap((callId) => {
-      const value = state.reasoningByCallId.get(callId);
-      return value === undefined ? [] : [value];
-    }))];
-    if (reasoning.length > 1) {
-      throw new LoopFailure(
-        'provider_transient_turn_state_conflict',
-        '同一 assistant tool-call turn 关联了冲突的 Provider 瞬态状态。',
-      );
-    }
-    const reasoningSignatures = [...new Set(callIds.flatMap((callId) => {
-      const value = state.reasoningSignatureByCallId.get(callId);
-      return value === undefined ? [] : [value];
-    }))];
-    if (reasoningSignatures.length > 1) {
-      throw new LoopFailure(
-        'provider_transient_turn_signature_conflict',
-        '同一 assistant tool-call turn 关联了冲突的 Provider reasoning signature。',
-      );
-    }
-    if (reasoningSignatures[0] !== undefined && reasoning[0] === undefined) {
-      throw new LoopFailure(
-        'provider_transient_turn_signature_without_content',
-        'Provider reasoning signature 缺少对应 reasoning content。',
-      );
-    }
-    if (reasoning[0] !== undefined) message.reasoningContent = reasoning[0];
-    if (reasoningSignatures[0] !== undefined) {
-      message.reasoningSignature = reasoningSignatures[0];
-    }
-  }
-}
-
-function currentRunCallIds(events: readonly SessionEvent[], runId: string): Set<string> {
-  const callIds = new Set<string>();
+/** One correction turn per run, counted from durable facts rather than process state. */
+function inputCorrectionFailure(events: readonly SessionEvent[], runId: string): LoopFailure | null {
+  const errorsByCall = new Map<string, LocalAgentError>();
   for (const event of events) {
     if (!('runId' in event) || event.runId !== runId) continue;
-    if (event.type === 'interaction.requested') callIds.add(event.payload.interactionId);
-    else if (event.type === 'plan.published') callIds.add(event.callId);
-    else if (
-      event.type === 'todo.progressed'
-      || event.type === 'tool.requested'
-      || event.type === 'session.control.rejected'
-      || event.type === 'context.compaction.requested' && event.payload.trigger === 'agentFocus'
-    ) {
-      if (event.callId) callIds.add(event.callId);
+    if (event.type === 'tool.input-rejected') {
+      errorsByCall.set(event.callId, event.payload.rejection.error);
+    } else if (event.type === 'session.control.rejected' && event.payload.error.code !== 'plan_revision_unchanged') {
+      errorsByCall.set(event.callId, event.payload.error);
     }
   }
-  return callIds;
-}
-
-function attachToolCall(
-  messages: ContextMessageContribution[],
-  call: NonNullable<ModelMessage['toolCalls']>[number],
-): void {
-  const last = messages.at(-1);
-  if (
-    last?.message.role === 'assistant'
-    && !last.message.toolCalls?.some((candidate) => candidate.callId === call.callId)
-  ) {
-    last.message.toolCalls = [...(last.message.toolCalls ?? []), call];
-    return;
-  }
-  messages.push({
-    contributionId: `tool-call:${call.callId}`,
-    contributionKind: 'journalMessages',
-    label: call.name,
-    message: { role: 'assistant', content: '', toolCalls: [call] },
-  });
-}
-
-function buildContextCompositionReceipt(
-  providerRequestId: string,
-  purpose: ContextCompositionReceipt['purpose'],
-  responseConstraint: ContextCompositionReceipt['responseConstraint'],
-  selected: readonly ContextMessageContribution[],
-  kernelTools: readonly ProviderToolDefinition[],
-  controlTools: readonly ProviderToolDefinition[],
-  workspaceBindings: readonly WorkspaceBindingDisplay[],
-  events: readonly SessionEvent[],
-): ContextCompositionReceipt {
-  const attachmentFactsByContributionId = new Map<string, Array<{
-    attachmentId: string;
-    name: string;
-    mediaType: string;
-    content: string;
-  }>>();
+  const rejectedTurns: LocalAgentError[][] = [];
   for (const event of events) {
-    if (event.type !== 'message.committed') continue;
-    const attachments = (event.payload.attachments ?? []).map((attachment) => ({ ...attachment }));
-    if (attachments.length > 0) {
-      attachmentFactsByContributionId.set(`message:${event.payload.messageId}`, attachments);
-    }
+    if (event.type !== 'provider.turn.settled' || event.runId !== runId || event.payload.outcome !== 'completed') continue;
+    const errors = [
+      ...event.payload.orderedCallIds.flatMap((callId) => {
+        const error = errorsByCall.get(callId);
+        return error ? [error] : [];
+      }),
+      ...(event.payload.orderedOutputBlocks ?? []).flatMap((block) => (
+        block.kind === 'toolCallRejected' ? [block.error] : []
+      )),
+    ];
+    if (errors.length > 0) rejectedTurns.push(errors);
   }
-  const workspaceBindingItems = workspaceBindings.map((binding) => ({
-    itemId: binding.workspaceId,
-    label: binding.displayName,
-  }));
-  const toolItems = kernelTools.map((tool) => ({ itemId: tool.name, label: tool.name }));
-  const messages = selected.map((item, messageIndex) => ({
-    messageIndex,
-    contributionId: item.contributionId,
-    contributionKind: item.contributionKind,
-    label: item.label,
-    role: item.message.role,
-    blocks: contextCompositionBlocks(item.message),
-    attachments: (attachmentFactsByContributionId.get(item.contributionId) ?? []).map((attachment) => ({
-      itemId: attachment.attachmentId,
-      label: attachment.name,
-    })),
-  }));
-  return {
-    providerRequestId,
-    purpose,
-    responseConstraint,
-    messages,
-    workspaceBindings: workspaceBindingItems,
-    tools: toolItems,
-    partitions: buildContextCompositionPartitions(
-      selected,
-      kernelTools,
-      controlTools,
-      workspaceBindings,
-      attachmentFactsByContributionId,
-    ),
-  };
+  if (rejectedTurns.length < 2) return null;
+  return new LoopFailure(
+    'tool_input_correction_exhausted',
+    `本次运行的工具参数纠正机会已用尽。原始拒绝：${rejectedTurns.flat().map((error) => `${error.code}: ${error.message}`).join('；')}`,
+  );
 }
 
-const CONTEXT_PARTITION_ORDER = [
-  'instructions',
-  'sessionControls',
-  'tools',
-  'workspaceBindings',
-  'contextProviders',
-  'journalMessages',
-  'messageAttachments',
-] as const;
-
-function buildContextCompositionPartitions(
-  selected: readonly ContextMessageContribution[],
-  kernelTools: readonly ProviderToolDefinition[],
-  controlTools: readonly ProviderToolDefinition[],
-  workspaceBindings: readonly WorkspaceBindingDisplay[],
-  attachmentFactsByContributionId: ReadonlyMap<string, readonly unknown[]>,
-): NonNullable<ContextCompositionReceipt['partitions']> {
-  const metrics = new Map(CONTEXT_PARTITION_ORDER.map((kind) => [kind, {
-    itemCount: 0,
-    requestShapeUnits: 0,
-  }]));
-  const add = (
-    kind: typeof CONTEXT_PARTITION_ORDER[number],
-    itemCount: number,
-    requestShapeUnits: number,
-  ): void => {
-    const metric = metrics.get(kind)!;
-    metric.itemCount += itemCount;
-    metric.requestShapeUnits += requestShapeUnits;
-  };
-  for (const contribution of selected) {
-    const messageUnits = jsonShapeUnits(contribution.message);
-    const attachments = attachmentFactsByContributionId.get(contribution.contributionId) ?? [];
-    const attachmentUnits = Math.min(messageUnits, attachments.length
-      ? jsonShapeUnits(attachments)
-      : 0);
-    if (attachments.length > 0) {
-      add('messageAttachments', attachments.length, attachmentUnits);
-    }
-    if (contribution.contributionKind === 'workspaceBindings') {
-      add('workspaceBindings', workspaceBindings.length, messageUnits - attachmentUnits);
-    } else {
-      add(contribution.contributionKind, 1, messageUnits - attachmentUnits);
-    }
-  }
-  add('sessionControls', controlTools.length, sumShapeUnits(controlTools));
-  add('tools', kernelTools.length, sumShapeUnits(kernelTools));
-  return CONTEXT_PARTITION_ORDER.map((kind) => ({ kind, ...metrics.get(kind)! }));
-}
-
-function sumShapeUnits(values: readonly unknown[]): number {
-  return values.reduce<number>((total, value) => total + jsonShapeUnits(value), 0);
-}
-
-function jsonShapeUnits(value: unknown): number {
-  const encoded = JSON.stringify(value);
-  return encoded ? new TextEncoder().encode(encoded).byteLength : 0;
-}
-
-function contextCompositionBlocks(message: ModelMessage): ContextCompositionMessage['blocks'] {
-  const blocks: ContextCompositionMessage['blocks'] = [];
-  const append = (
-    block:
-      | { kind: 'text' | 'reasoning' }
-      | { kind: 'toolCall'; callId: string; toolName: string }
-      | { kind: 'toolResult'; resultForCallId: string },
-  ): void => {
-    blocks.push({
-      ...block,
-      blockIndex: blocks.length,
-    } as ContextCompositionMessage['blocks'][number]);
-  };
-  if (message.role === 'tool' && message.toolCallId) {
-    append({ kind: 'toolResult', resultForCallId: message.toolCallId });
-    return blocks;
-  }
-  if (message.reasoningContent) append({ kind: 'reasoning' });
-  if (message.content) append({ kind: 'text' });
-  for (const call of message.toolCalls ?? []) {
-    append({ kind: 'toolCall', callId: call.callId, toolName: call.name });
-  }
-  return blocks;
-}
-
-const CONTEXT_MESSAGE_KINDS: readonly ContextCompositionMessage['contributionKind'][] = [
-  'instructions',
-  'workspaceBindings',
-  'sessionControls',
-  'journalMessages',
-  'contextProviders',
-];
-
-function assertContextContributions(
-  contributions: readonly ContextMessageContribution[],
-): void {
-  const seen = new Set<string>();
-  for (const contribution of contributions) {
-    if (!contribution.contributionId || seen.has(contribution.contributionId)) {
-      throw new LoopFailure(
-        'context_contribution_identity_invalid',
-        'Memory provider 返回了空或重复的上下文贡献标识。',
-      );
-    }
-    if (!CONTEXT_MESSAGE_KINDS.includes(contribution.contributionKind)) {
-      throw new LoopFailure(
-        'context_contribution_kind_invalid',
-        `Memory provider 返回了未知的上下文贡献类型：${contribution.contributionKind}`,
-      );
-    }
-    if (!contribution.label || !contribution.message) {
-      throw new LoopFailure(
-        'context_contribution_shape_invalid',
-        'Memory provider 返回的上下文贡献缺少标签或消息。',
-      );
-    }
-    seen.add(contribution.contributionId);
-  }
-}
-
-function cloneModelMessage(message: ModelMessage): ModelMessage {
-  return {
-    ...message,
-    ...(message.toolCalls
-      ? {
-          toolCalls: message.toolCalls.map((call) => ({
-            ...call,
-            input: { ...call.input },
-          })),
+function assistantDraftBlocks(
+  outputs: readonly { outputIndex: number; item: JsonObject }[],
+  toolCodec: ProviderToolCodec,
+  streamedTextByOutputIndex: ReadonlyMap<number, string> = new Map(),
+): AssistantDraftBlockProjection[] {
+  const blocks = outputs.flatMap((output): AssistantDraftBlockProjection[] => {
+    // Draft presentation must not admit tool inputs or interrupt their native stream.
+    if (output.item.type === 'function_call' || output.item.type === 'reasoning') return [];
+    const block = decodeProviderOutputBlock(output, toolCodec);
+    switch (block.kind) {
+      case 'reasoning':
+      case 'toolCall':
+      case 'toolCallRejected':
+        return [];
+      case 'message': {
+        const phase = block.item.phase;
+        if (phase !== undefined && phase !== null && typeof phase !== 'string') {
+          throw new LoopFailure(
+            'provider_output_message_phase_invalid',
+            'Provider output message 的 phase 不是字符串。',
+          );
         }
-      : {}),
-  };
+        const kind = phase === 'commentary'
+          ? 'narrative'
+          : phase === 'final_answer'
+            ? 'finalMessage'
+            : phase === undefined || phase === null
+              ? 'message'
+              : undefined;
+        if (!kind) {
+          throw new LoopFailure(
+            'provider_output_message_phase_unsupported',
+            `Provider output message 返回了当前合同未支持的 phase：${phase}`,
+          );
+        }
+        return [{
+          outputIndex: block.outputIndex,
+          kind,
+          content: block.content,
+        }];
+      }
+      case 'providerHosted': {
+        const status = block.item.status;
+        const action = block.item.action;
+        if (
+          status !== 'completed'
+          && status !== 'failed'
+          || !isRecord(action)
+        ) {
+          throw new LoopFailure(
+            'provider_hosted_search_item_invalid',
+            'Provider hosted search 终态事实无效。',
+          );
+        }
+        return [{
+          outputIndex: block.outputIndex,
+          kind: 'providerHosted',
+          providerCallId: block.providerCallId,
+          providerToolType: 'web_search',
+          status,
+          action: structuredClone(action),
+        }];
+      }
+    }
+  });
+  const completedOutputIndexes = new Set(outputs.map((output) => output.outputIndex));
+  for (const [outputIndex, content] of streamedTextByOutputIndex) {
+    if (completedOutputIndexes.has(outputIndex)) {
+      throw new LoopFailure(
+        'provider_output_delta_after_completion',
+        'Provider 在 output item 完成后继续发送该 item 的正文增量。',
+      );
+    }
+    blocks.push({ outputIndex, kind: 'message', content });
+  }
+  return blocks.sort((left, right) => left.outputIndex - right.outputIndex);
 }
 
-function messageContentForModel(
-  payload: Extract<SessionEvent, { type: 'message.committed' }>['payload'],
+function providerOutputItemText(
+  item: JsonObject,
+  partType: 'output_text' | 'reasoning_text',
+  required: boolean,
 ): string {
-  const sections = [payload.content];
-  if (payload.directoryAttachments?.length) {
-    sections.push(`用户为本条消息附加的目录引用（仅逻辑身份，不含绝对路径）：\n${JSON.stringify(
-      payload.directoryAttachments.map((attachment) => ({ ...attachment })),
-    )}`);
+  const parts = item.content;
+  if (!Array.isArray(parts)) {
+    if (!required && parts === undefined) return '';
+    throw new LoopFailure(
+      'provider_output_item_content_invalid',
+      'Provider output item content 不是数组。',
+    );
   }
-  if (payload.attachments?.length) {
-    sections.push(`用户明确附加的文件（内容按 JSON 精确编码）：\n${JSON.stringify(
-      payload.attachments.map((attachment) => ({
-        attachmentId: attachment.attachmentId,
-        name: attachment.name,
-        mediaType: attachment.mediaType,
-        content: attachment.content,
-      })),
-    )}`);
+  let text = '';
+  for (const part of parts) {
+    if (!isRecord(part) || part.type !== partType) continue;
+    if (typeof part.text !== 'string') {
+      throw new LoopFailure(
+        'provider_output_item_content_invalid',
+        'Provider output item 文本 part 缺少 text。',
+      );
+    }
+    text += part.text;
   }
-  return sections.join('\n\n');
-}
-
-function toolResultForModel(record: ToolExecutionRecord): Record<string, unknown> {
-  if (record.outcome === 'completed') return { outcome: record.outcome, output: record.output };
-  if (record.outcome === 'failed' || record.outcome === 'indeterminate') {
-    return { outcome: record.outcome, error: record.error };
+  if (required && !text.trim()) {
+    throw new LoopFailure(
+      'provider_output_item_content_invalid',
+      'Provider output message 没有可显示正文。',
+    );
   }
-  return {
-    outcome: record.outcome,
-    ...('error' in record && record.error ? { error: record.error } : {}),
-  };
+  return text;
 }
 
 function selectedPlanAuthorities(events: readonly SessionEvent[]): PlanAuthority[] {
@@ -1866,7 +1845,15 @@ async function cancelRun(
   if (current) {
     const reply = await deps.composition.kernel.cancel(current.callId, current.payload.attemptId);
     if (reply.status !== 'notFound') {
-      await commitToolRecord(reply.record, command.runId, current.callId, commit);
+      await commitToolRecord(
+        reply.record,
+        expectedToolRecordIdentity(
+          snapshot,
+          runRuntimeSnapshot(snapshot, command.runId),
+          current,
+        ),
+        commit,
+      );
       if (reply.record.outcome === 'indeterminate') indeterminate = reply.record.error;
     } else if (!latestApproval(snapshot.events, command.runId, current.callId).requested) {
       indeterminate = {
@@ -1877,58 +1864,129 @@ async function cancelRun(
   }
   if (indeterminate) {
     await commit({
-      type: 'run.settled',
+      type: 'run.finishing',
       sessionId: snapshot.state.sessionId,
       runId: command.runId,
       payload: { outcome: 'indeterminate', error: indeterminate },
     });
-    return { status: 'settled', runId: command.runId, outcome: 'indeterminate' };
+    return finishingResult(command.runId, { outcome: 'indeterminate', error: indeterminate });
   }
   await commit({
-    type: 'run.settled',
+    type: 'run.finishing',
     sessionId: snapshot.state.sessionId,
     runId: command.runId,
     payload: { outcome: 'cancelled' },
   });
-  return { status: 'settled', runId: command.runId, outcome: 'cancelled' };
+  return finishingResult(command.runId, { outcome: 'cancelled' });
 }
 
 async function executeUntilAbort(
   deps: AgentLoopDeps,
   request: ToolExecutionRequest,
   signal: AbortSignal,
-) {
+): Promise<ToolExecutionReply> {
+  if (signal.aborted) {
+    await cancelExecutingAttempt(deps, request);
+    throw signal.reason ?? new Error('run_cancelled');
+  }
   const execution = deps.composition.kernel.execute(request);
   void execution.catch(() => undefined);
-  if (signal.aborted) throw signal.reason ?? new Error('run_cancelled');
   let onAbort: (() => void) | undefined;
-  const aborted = new Promise<never>((_resolve, reject) => {
-    onAbort = () => reject(signal.reason ?? new Error('run_cancelled'));
+  const aborted = new Promise<void>((resolve) => {
+    onAbort = () => {
+      resolve();
+    };
     signal.addEventListener('abort', onAbort, { once: true });
   });
   try {
-    return await Promise.race([execution, aborted]);
+    const winner = await Promise.race([
+      execution.then((reply) => ({ type: 'execution' as const, reply })),
+      aborted.then(() => ({ type: 'abort' as const })),
+    ]);
+    if (winner.type === 'execution') return winner.reply;
+    const cancelled = await cancelExecutingAttempt(deps, request);
+    if (cancelled.status === 'notFound') return await execution;
+    return {
+      schemaVersion: KERNEL_REPLY_VERSION,
+      type: 'tool.execution',
+      requestId: request.requestId,
+      callId: request.callId,
+      status: cancelled.status,
+      record: cancelled.record,
+    };
   } finally {
     if (onAbort) signal.removeEventListener('abort', onAbort);
   }
 }
 
+async function cancelExecutingAttempt(
+  deps: AgentLoopDeps,
+  request: ToolExecutionRequest,
+) {
+  try {
+    return await deps.composition.kernel.cancel(request.callId, request.attemptId);
+  } catch (error) {
+    throw new LoopFailure(
+      'tool_cancel_cleanup_failed',
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
+
 async function commitToolRecord(
   record: ToolExecutionRecord,
-  runId: string,
-  callId: string,
+  expected: ExpectedToolRecordIdentity,
   commit: (event: NewSessionEvent | readonly NewSessionEvent[]) => Promise<void>,
 ): Promise<void> {
-  if (record.runId !== runId || record.callId !== callId) {
-    throw new LoopFailure('kernel_record_identity_mismatch', 'Kernel 记录不属于当前运行或调用。');
-  }
+  assertToolRecordIdentity(record, expected);
   await commit({
     type: 'tool.completed',
     sessionId: record.sessionId,
-    runId,
-    callId,
+    runId: expected.runId,
+    callId: expected.callId,
     payload: { record },
   });
+}
+
+function expectedToolRecordIdentity(
+  snapshot: LoopSnapshot,
+  runtime: RunRuntimeSnapshot,
+  requestEvent: Extract<SessionEvent, { type: 'tool.requested' }>,
+): ExpectedToolRecordIdentity {
+  return {
+    sessionId: snapshot.state.sessionId,
+    runId: requestEvent.runId,
+    extensionGenerationRef: runtime.extensionGenerationRef,
+    kernelCatalogSnapshotRef: runtime.kernelCatalogSnapshotRef,
+    toolBindingRef: runtimeTool(runtime, requestEvent.payload.toolName).toolBindingRef,
+    callId: requestEvent.callId,
+    attemptId: requestEvent.payload.attemptId,
+    toolName: requestEvent.payload.toolName,
+    input: requestEvent.payload.input,
+  };
+}
+
+function assertToolRecordIdentity(
+  record: ToolExecutionRecord | ToolInputRejection,
+  expected: ExpectedToolRecordIdentity,
+): void {
+  if (
+    record.sessionId !== expected.sessionId
+    || record.runId !== expected.runId
+    || record.extensionGenerationRef !== expected.extensionGenerationRef
+    || record.kernelCatalogSnapshotRef !== expected.kernelCatalogSnapshotRef
+    || record.toolBindingRef !== expected.toolBindingRef
+    || record.callId !== expected.callId
+    || record.attemptId !== expected.attemptId
+    || record.toolName !== expected.toolName
+    || JSON.stringify(canonicalJsonValue(record.input))
+      !== JSON.stringify(canonicalJsonValue(expected.input))
+  ) {
+    throw new LoopFailure(
+      'kernel_record_identity_mismatch',
+      'Kernel 记录不属于当前 run 固定的工具 binding 或调用事实。',
+    );
+  }
 }
 
 function pendingToolRequests(
@@ -1936,7 +1994,8 @@ function pendingToolRequests(
   runId: string,
 ): Array<Extract<SessionEvent, { type: 'tool.requested' }>> {
   const completed = new Set(events.flatMap((event) => (
-    event.type === 'tool.completed' && event.runId === runId ? [event.callId] : []
+    (event.type === 'tool.completed' || event.type === 'tool.input-rejected')
+      && event.runId === runId ? [event.callId] : []
   )));
   return events.filter(
     (event): event is Extract<SessionEvent, { type: 'tool.requested' }> => (
@@ -1995,7 +2054,7 @@ function decodeContextUsage(data: Record<string, unknown>): ProviderTokenUsage |
     || cacheReadPresent !== cacheMissPresent
     || cacheReadPresent && (cacheReadInputTokens === undefined || cacheMissInputTokens === undefined)
     || cacheReadInputTokens !== undefined && cacheMissInputTokens !== undefined
-      && cacheReadInputTokens + cacheMissInputTokens > inputTokens
+      && cacheReadInputTokens + cacheMissInputTokens !== inputTokens
   ) {
     throw new LoopFailure('provider_usage_invalid', 'Provider 完成事件中的上下文计数无效。');
   }
@@ -2073,37 +2132,84 @@ function nextPlanIdentity(
   return { planId, revision: 1 };
 }
 
-function assertTodoProgressSource(
+function comparablePriorPlan(
   state: SessionState,
-  progress: NonNullable<ProviderTurnCommon['todo']>,
-): void {
-  const todo = state.todoList;
-  if (
-    !todo
-    || todo.sourcePlanId !== progress.planId
-    || todo.sourcePlanRevision !== progress.revision
-    || !state.activePlanRef
-    || state.activePlanRef.planId !== progress.planId
-    || state.activePlanRef.revision !== progress.revision
-    || !state.plans.some((plan) => (
-      plan.planId === progress.planId
-      && plan.revision === progress.revision
-      && plan.status === 'confirmed'
-    ))
-  ) {
-    throw new LoopFailure(
-      'todo_source_plan_mismatch',
-      'todo.progress 必须引用当前会话已确认 Plan revision 生成的 Todo。',
-    );
+  proposed: ExecutionPlan,
+): ExecutionPlan | null {
+  if (proposed.revision > 1) {
+    return state.plans.find((candidate) => (
+      candidate.planId === proposed.planId
+      && candidate.revision === proposed.revision - 1
+    )) ?? null;
   }
-  const todoIds = new Set(todo.items.map((item) => item.todoId));
-  const missing = progress.updates.find((update) => !todoIds.has(update.todoId));
-  if (missing) {
-    throw new LoopFailure(
-      'todo_item_missing',
-      `todo.progress 引用了不存在的 todoId：${missing.todoId}`,
-    );
-  }
+  const active = state.activePlanRef;
+  if (!active) return null;
+  return state.plans.find((candidate) => (
+    candidate.planId === active.planId
+    && candidate.revision === active.revision
+    && candidate.status === 'confirmed'
+  )) ?? null;
+}
+
+function planDefinitionKey(
+  plan: Pick<ExecutionPlan, 'title' | 'summary' | 'steps' | 'mutationManifest'>,
+): string {
+  return JSON.stringify(canonicalJsonValue({
+    title: plan.title,
+    summary: plan.summary,
+    steps: plan.steps,
+    mutationManifest: plan.mutationManifest,
+  }));
+}
+
+function planDraftInput(draft: PlanPublicationDraft): Record<string, unknown> {
+  return {
+    title: draft.title,
+    summary: draft.summary,
+    steps: draft.steps.map((step) => ({
+      ...step,
+      ...(step.verification ? { verification: [...step.verification] } : {}),
+    })),
+    mutationManifest: draft.mutationManifest.map((operation) => ({ ...operation })),
+  };
+}
+
+function planProgressFact(
+  snapshot: LoopSnapshot,
+  runId: string,
+  turn: Extract<ProviderTurn, { kind: 'planProgress' }>,
+): NewSessionEvent {
+  const active = snapshot.state.activePlanRef;
+  const todo = snapshot.state.todoList;
+  const confirmation = snapshot.events.findLast((event) => (
+    event.type === 'plan.confirmed' && event.payload.planId === active?.planId
+    && event.payload.revision === active?.revision
+  ));
+  const evidence = snapshot.events.find((event) => (
+    event.type === 'tool.completed' && event.runId === runId
+    && event.payload.record.recordId === turn.sourceFactRef
+  ));
+  const valid = active && todo && confirmation
+    && todo.sourcePlanId === active.planId && todo.sourcePlanRevision === active.revision
+    && evidence?.type === 'tool.completed'
+    && turn.updates.every((update) => todo.items.some((item) => item.todoId === update.todoId))
+    && (!turn.updates.some((update) => update.status === 'completed') || evidence.payload.record.outcome === 'completed');
+  if (!valid) return {
+    type: 'session.control.rejected', sessionId: snapshot.state.sessionId, runId, callId: turn.callId,
+    payload: {
+      providerCallId: turn.providerCallId, toolName: SESSION_CONTROL_PLAN_PROGRESS,
+      input: { sourceFactRef: turn.sourceFactRef, updates: turn.updates },
+      error: { code: 'plan_progress_evidence_invalid', message: 'Use current Todo IDs and a tool result recordId from this run. Earlier investigation results remain valid evidence; Completion requires a successful result.' },
+    },
+  };
+  return {
+    type: 'todo.progressed', sessionId: snapshot.state.sessionId, runId, callId: turn.callId,
+    payload: {
+      providerCallId: turn.providerCallId,
+      sourcePlanId: active.planId, sourcePlanRevision: active.revision,
+      sourceFactRef: turn.sourceFactRef, updates: turn.updates,
+    },
+  };
 }
 
 function completedPlanAwaitingLifecycle(
@@ -2122,25 +2228,138 @@ function completedPlanAwaitingLifecycle(
     : null;
 }
 
+function confirmedPlanAwaitingExecution(
+  state: SessionState,
+): { planId: string; revision: number } | null {
+  const active = state.activePlanRef;
+  const todo = state.todoList;
+  if (
+    !active
+    || !todo
+    || todo.sourcePlanId !== active.planId
+    || todo.sourcePlanRevision !== active.revision
+    || todo.items.length === 0
+    || todo.items.every((item) => item.status === 'completed')
+  ) return null;
+  const plan = state.plans.find((candidate) => (
+    candidate.planId === active.planId
+    && candidate.revision === active.revision
+  ));
+  return plan?.status === 'confirmed' ? { ...active } : null;
+}
+
 function hasSettlement(events: readonly SessionEvent[], runId: string): boolean {
   return events.some((event) => event.type === 'run.settled' && event.runId === runId);
 }
 
-function latestRunEventType(
-  events: readonly SessionEvent[],
+function uncompletedProviderComposition(
+  snapshot: LoopSnapshot,
   runId: string,
-): SessionEvent['type'] | undefined {
-  return events.findLast((event) => 'runId' in event && event.runId === runId)?.type;
+): SessionState['contextCompositions'][number] | null {
+  return snapshot.state.contextCompositions.find((receipt) => (
+    receipt.runId === runId
+    && snapshot.state.providerTurns[receipt.providerRequestId] === undefined
+  )) ?? null;
 }
 
-function latestAssistantMessageId(events: readonly SessionEvent[], runId: string): string | undefined {
-  return events.findLast(
-    (event): event is Extract<SessionEvent, { type: 'message.committed' }> => (
-      event.type === 'message.committed'
-      && event.runId === runId
-      && event.payload.role === 'assistant'
-    ),
-  )?.payload.messageId;
+function runRuntimeSnapshot(snapshot: LoopSnapshot, runId: string): RunRuntimeSnapshot {
+  const runtime = snapshot.state.runRuntimeSnapshots[runId];
+  if (!runtime) throw new LoopFailure('run_runtime_snapshot_missing', '当前 run 缺少运行时快照。');
+  return runtime;
+}
+
+function runtimeTool(runtime: RunRuntimeSnapshot, name: string): PreparedToolDescriptor {
+  const tool = runtime.tools.find((candidate) => candidate.name === name);
+  if (!tool || tool.availability !== 'callable') {
+    throw new LoopFailure('run_tool_binding_missing', `当前 run 缺少可调用工具 binding：${name}`);
+  }
+  return tool;
+}
+
+function providerTurnSettledEvent(
+  sessionId: string,
+  runId: string,
+  completion: ProviderTurnCompletion,
+): NewSessionEvent {
+  return {
+    type: 'provider.turn.settled',
+    sessionId,
+    runId,
+    payload: {
+      providerRequestId: completion.providerRequestId,
+      purpose: completion.purpose,
+      providerRuntimeRef: completion.providerRuntimeRef,
+      outcome: 'completed',
+      orderedCallIds: [...completion.orderedCallIds],
+      ...(completion.reasoningContent !== undefined
+        ? { reasoningContent: completion.reasoningContent }
+        : {}),
+      ...(completion.reasoningSignature !== undefined
+        ? { reasoningSignature: completion.reasoningSignature }
+        : {}),
+      ...(completion.hostedWebSearchCalls !== undefined
+        ? {
+            hostedWebSearchCalls: completion.hostedWebSearchCalls
+              .map((item) => structuredClone(item)),
+          }
+        : {}),
+      ...(completion.orderedOutputBlocks !== undefined
+        ? {
+            orderedOutputBlocks: completion.orderedOutputBlocks.map((block) => ({
+              ...block,
+              item: structuredClone(block.item),
+            })),
+          }
+        : {}),
+    },
+  };
+}
+
+function providerTurnTerminalEvent(
+  sessionId: string,
+  runId: string,
+  composition: SessionState['contextCompositions'][number],
+  providerRuntimeRef: string,
+  settlement: Extract<RunSettlement, { outcome: 'failed' | 'indeterminate' }>,
+): NewSessionEvent {
+  return {
+    type: 'provider.turn.settled',
+    sessionId,
+    runId,
+    payload: {
+      providerRequestId: composition.providerRequestId,
+      purpose: composition.purpose,
+      providerRuntimeRef,
+      outcome: settlement.outcome,
+      error: { ...settlement.error },
+    },
+  };
+}
+
+function orderedProviderCallFacts(
+  completion: ProviderTurnCompletion,
+  facts: readonly NewSessionEvent[],
+): NewSessionEvent[] {
+  const byCallId = new Map<string, NewSessionEvent>();
+  for (const fact of facts) {
+    if (!('callId' in fact) || !fact.callId || byCallId.has(fact.callId)) {
+      throw new LoopFailure(
+        'provider_turn_call_fact_invalid',
+        'Provider turn 的调用事实缺少或重复 LogicalCallId。',
+      );
+    }
+    byCallId.set(fact.callId, fact);
+  }
+  if (
+    byCallId.size !== completion.orderedCallIds.length
+    || completion.orderedCallIds.some((callId) => !byCallId.has(callId))
+  ) {
+    throw new LoopFailure(
+      'provider_turn_call_fact_mismatch',
+      'Provider turn 完成事实与本 turn 的调用事实集合不一致。',
+    );
+  }
+  return completion.orderedCallIds.map((callId) => byCallId.get(callId)!);
 }
 
 function settlementResult(events: readonly SessionEvent[], runId: string): LoopResult {
@@ -2151,6 +2370,18 @@ function settlementResult(events: readonly SessionEvent[], runId: string): LoopR
   );
   if (!event) throw new Error('run_settlement_missing');
   return { status: 'settled', runId, outcome: event.payload.outcome };
+}
+
+function finishingResult(runId: string, settlement: RunSettlement): LoopResult {
+  return {
+    status: 'finishing',
+    runId,
+    settlement: settlement.outcome === 'completed'
+      ? { ...settlement }
+      : settlement.outcome === 'failed' || settlement.outcome === 'indeterminate'
+        ? { outcome: settlement.outcome, error: { ...settlement.error } }
+        : { outcome: 'cancelled' },
+  };
 }
 
 export function loopSnapshot(sessionId: string, events: readonly SessionEvent[]): LoopSnapshot {
@@ -2195,11 +2426,4 @@ function localAgentError(error: unknown): LocalAgentError {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-}
-
-class LoopFailure extends Error {
-  constructor(readonly code: string, message: string) {
-    super(message);
-    this.name = 'LoopFailure';
-  }
 }

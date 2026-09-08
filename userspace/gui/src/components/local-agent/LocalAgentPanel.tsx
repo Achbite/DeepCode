@@ -1,30 +1,59 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import type {
   ActivityProjection,
+  AssistantDraftBlockProjection,
   MessageFeedback,
   PlanResponse,
+  PluginSelectionInput,
+  ProviderHostedActivityProjection,
   RunProjection,
   SessionProjection,
-  UserMessageAttachment,
 } from '@deepcode/protocol';
 import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../../deepcode-gui/layout/DeepCodeShellIcon';
 import ProjectFolderDialog from '../../deepcode-gui/layout/ProjectFolderDialog';
 import SessionModelSelector from '../../deepcode-gui/panel/SessionModelSelector';
+import ProviderStageStatus from './ProviderStageStatus';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import { useSettingsStore } from '../../state/settingsStore';
-import { BufferedMarkdown, MarkdownContent } from './BufferedMarkdown';
+import { usePresentedCommittedContent } from '../../presentation/PresentationRuntime';
+import { BufferedMarkdown } from './BufferedMarkdown';
 import PlanCard from './PlanCard';
 import { shouldOfferFocusCommand, shouldSubmitComposerKey } from './composerKeyboard';
 import {
   readConversationResource,
   type ConversationResourceReadResult,
 } from '../../services/localAgentApi';
-import { readMessageAttachmentFile } from '../../services/runtimeAdapter';
 import './localAgentPanel.css';
 
 interface LocalAgentPanelProps {
   mode?: 'panel' | 'workbench';
+}
+
+interface PendingFilesystemPath {
+  path: string;
+  kind: 'file' | 'directory';
+}
+
+interface SessionViewport {
+  mode: 'following' | 'detached';
+  scrollTop: number;
+}
+
+interface ComposerState {
+  draft: string;
+  filesystemPaths: PendingFilesystemPath[];
+  pluginSelections: PluginSelectionInput[];
+  selectionStart: number;
+  selectionEnd: number;
+  focused: boolean;
 }
 
 async function copyTextToClipboard(text: string): Promise<void> {
@@ -46,30 +75,57 @@ async function copyTextToClipboard(text: string): Promise<void> {
 const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => {
   const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
   const runtimeEffectiveSettings = useSettingsStore((state) => state.runtimeEffectiveSettings);
-  const settingsRestartRequired = useSettingsStore((state) => state.restartRequired);
+  const settingsPendingNextRunActivation = useSettingsStore(
+    (state) => state.pendingNextRunActivation,
+  );
   const patchUserSetting = useSettingsStore((state) => state.patchUserSetting);
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
   const sessionId = useLocalAgentStore((state) => state.sessionId);
   const draftProjectId = useLocalAgentStore((state) => state.draftProjectId);
   const catalog = useLocalAgentStore((state) => state.catalog);
+  const pluginCatalog = useLocalAgentStore((state) => state.pluginCatalog);
   const profiles = useLocalAgentStore((state) => state.profiles);
   const selectedProfileId = useLocalAgentStore((state) => state.selectedProfileId);
   const projection = useLocalAgentStore((state) => state.projection);
+  const pendingInteraction = projection?.pendingInteraction ?? null;
+  const pendingApproval = projection?.pendingApproval ?? null;
+  const pendingPlan = projection?.pendingPlan ?? null;
+  const composerViewKey = sessionId ?? `new:${draftProjectId ?? 'independent'}`;
+  const composerModeKey = pendingPlan
+    ? `plan:${pendingPlan.planId}:${pendingPlan.revision}`
+    : pendingInteraction
+      ? `interaction:${pendingInteraction.interactionId}`
+      : pendingApproval
+        ? `approval:${pendingApproval.approvalId}`
+        : 'normal';
+  const composerStateKey = `${composerViewKey}\u0000${composerModeKey}`;
+  const presentation = usePresentedCommittedContent(projection, language);
   const loading = useLocalAgentStore((state) => state.loading);
   const submitting = useLocalAgentStore((state) => state.submitting);
   const catalogBusy = useLocalAgentStore((state) => state.catalogBusy);
   const error = useLocalAgentStore((state) => state.error);
+  const refreshProfiles = useLocalAgentStore((state) => state.refreshProfiles);
   const refresh = useLocalAgentStore((state) => state.refresh);
   const sendMessage = useLocalAgentStore((state) => state.sendMessage);
+  const focusContext = useLocalAgentStore((state) => state.focusContext);
   const setMessageFeedback = useLocalAgentStore((state) => state.setMessageFeedback);
   const respondInteraction = useLocalAgentStore((state) => state.respondInteraction);
   const respondApproval = useLocalAgentStore((state) => state.respondApproval);
   const respondPlan = useLocalAgentStore((state) => state.respondPlan);
   const cancelRun = useLocalAgentStore((state) => state.cancelRun);
   const selectProfile = useLocalAgentStore((state) => state.selectProfile);
+  const selectReasoningEffort = useLocalAgentStore((state) => state.selectReasoningEffort);
+  const reasoningEffortOverride = useLocalAgentStore((state) => state.reasoningEffortOverride);
+  const modelSettingsBusy = useLocalAgentStore((state) => state.modelSettingsBusy);
   const [draft, setDraft] = useState('');
-  const [attachments, setAttachments] = useState<UserMessageAttachment[]>([]);
-  const [pendingDirectoryPaths, setPendingDirectoryPaths] = useState<string[]>([]);
+  const [pendingFilesystemPaths, setPendingFilesystemPaths] = useState<
+    PendingFilesystemPath[]
+  >([]);
+  const [pluginSelections, setPluginSelections] = useState<PluginSelectionInput[]>([]);
+  const [pluginPickerOpen, setPluginPickerOpen] = useState(false);
+  const [pluginQuery, setPluginQuery] = useState('');
+  const [pluginTriggerStart, setPluginTriggerStart] = useState<number | null>(null);
+  const [pluginActiveIndex, setPluginActiveIndex] = useState(0);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [attachmentMenuOpen, setAttachmentMenuOpen] = useState(false);
   const [attachmentDialogOpen, setAttachmentDialogOpen] = useState(false);
@@ -78,67 +134,190 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const [resourcePreview, setResourcePreview] = useState<ResourcePreviewState | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [uiActionError, setUiActionError] = useState<string | null>(null);
+  const [, setProviderStreamCompletionRevision] = useState(0);
+
+  useEffect(() => {
+    const handleProfilesUpdated = () => {
+      void refreshProfiles();
+    };
+    window.addEventListener('deepcode:llm-profiles-updated', handleProfilesUpdated);
+    return () => window.removeEventListener('deepcode:llm-profiles-updated', handleProfilesUpdated);
+  }, [refreshProfiles]);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const attachmentControlRef = useRef<HTMLDivElement | null>(null);
+  const pluginPickerRef = useRef<HTMLDivElement | null>(null);
   const permissionControlRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const composerStatesRef = useRef(new Map<string, ComposerState>());
+  const activeComposerStateKeyRef = useRef(composerStateKey);
+  const pendingComposerRestoreRef = useRef<{
+    key: string;
+    state: ComposerState;
+  } | null>(null);
   const compositionActiveRef = useRef(false);
   const compositionCommitPendingRef = useRef(false);
   const compositionGuardFrameRef = useRef<number | null>(null);
   const activeViewRef = useRef<string | null>(sessionId);
+  const sessionViewportsRef = useRef(new Map<string, SessionViewport>());
+  const pendingViewportRestoreRef = useRef<string | null>(null);
+  const providerStreamProgressRef = useRef(new Map<string, number>());
+  const transitioningProviderStreamsRef = useRef(new Set<string>());
   const followingLatestRef = useRef(true);
-  const userDetachedFromLatestRef = useRef(false);
   const lastScrollTopRef = useRef(0);
   const lastTouchYRef = useRef<number | null>(null);
-  const suppressScrollEventsUntilRef = useRef(0);
+  const touchScrollActiveRef = useRef(false);
+  const pointerScrollActiveRef = useRef(false);
+  const transientUserScrollRef = useRef(false);
+  const transientUserScrollFrameRef = useRef<number | null>(null);
   const scrollFrameRef = useRef<number | null>(null);
-  const scrollTimeoutRef = useRef<number | null>(null);
+  const viewportRestoreFrameRef = useRef<number | null>(null);
+  const detachedViewportFrameRef = useRef<number | null>(null);
   const activeSummary = catalog.sessions.find((session) => session.id === sessionId);
   const activeProject = catalog.projects.find((project) => (
     project.id === (activeSummary?.projectId ?? draftProjectId)
   ));
   const title = activeSummary?.title.trim()
-    || conversationTitle(projection?.messages, language);
+    || projection?.display.creationTitle.trim()
+    || t(language, 'agent.session.newTitle');
   const conversationItems = useMemo(() => projectionItems(projection), [projection]);
+  const assistantDraft = projection?.assistantDraft ?? null;
+  const legacyAssistantDraftStreamIdentity = projection && assistantDraft?.content
+    ? providerStreamIdentity(projection.sessionId, assistantDraft.runId, assistantDraft.turnId)
+    : null;
+  const orderedAssistantDraftItems = useMemo(
+    () => assistantDraftItems(assistantDraft),
+    [assistantDraft],
+  );
+  const assistantDraftLayoutKey = assistantDraft
+    ? `${assistantDraft.content.length}:${assistantDraft.orderedBlocks?.map((block) => (
+        `${block.outputIndex}:${block.kind}:${block.kind === 'providerHosted'
+          ? block.status
+          : block.content.length}`
+      )).join('|') ?? ''}`
+    : '';
+  const projectionPollingActive = Boolean(
+    projection?.run && ['running', 'waiting', 'releasing'].includes(projection.run.status),
+  );
+  const timelineExtentKey = projection?.timeline.map((item) => (
+    item.kind === 'toolGroup'
+      ? `${item.timelineId}:${item.activityIds.length}`
+      : item.timelineId
+  )).join('|') ?? '';
   const hasConversationContent = conversationItems.length > 0
-    || Boolean(projection?.assistantDraft)
+    || Boolean(assistantDraft)
     || Boolean(projection?.pendingInteraction)
     || Boolean(projection?.pendingApproval)
     || Boolean(projection?.pendingPlan)
     || Boolean(projection?.terminalError);
-  const pendingInteraction = projection?.pendingInteraction ?? null;
-  const pendingApproval = projection?.pendingApproval ?? null;
-  const pendingPlan = projection?.pendingPlan ?? null;
+  const recordProviderStreamProgress = useCallback((identity: string, length: number) => {
+    providerStreamProgressRef.current.set(identity, length);
+  }, []);
 
-  const setLatestFollowMode = useCallback((following: boolean) => {
+  const finishProviderStream = useCallback((identity: string) => {
+    providerStreamProgressRef.current.delete(identity);
+    if (transitioningProviderStreamsRef.current.delete(identity)) {
+      setProviderStreamCompletionRevision((revision) => revision + 1);
+    }
+  }, []);
+
+  const committedProviderContent = (
+    runId: string,
+    providerRequestId: string,
+    outputIndex: number | undefined,
+    content: string,
+    committed: React.ReactNode,
+  ): React.ReactNode => {
+    if (!projection) throw new Error('conversation_projection_missing_for_committed_content');
+    const identity = providerStreamIdentity(
+      projection.sessionId,
+      runId,
+      providerRequestId,
+      outputIndex,
+    );
+    if (!transitioningProviderStreamsRef.current.has(identity)) return committed;
+    return (
+      <BufferedMarkdown
+        key={`committed:${identity}`}
+        text={content}
+        streamIdentity={identity}
+        initialVisibleLength={providerStreamProgressRef.current.get(identity) ?? 0}
+        onVisibleLengthChange={recordProviderStreamProgress}
+        onCaughtUp={finishProviderStream}
+      />
+    );
+  };
+
+  const recordComposerElementState = (
+    element: HTMLTextAreaElement,
+    focused: boolean,
+  ) => {
+    composerStatesRef.current.set(activeComposerStateKeyRef.current, {
+      draft: element.value,
+      filesystemPaths: pendingFilesystemPaths.map((item) => ({ ...item })),
+      pluginSelections: pluginSelections.map((item) => ({ ...item })),
+      selectionStart: element.selectionStart ?? element.value.length,
+      selectionEnd: element.selectionEnd ?? element.value.length,
+      focused,
+    });
+  };
+
+  const setComposerStateForKey = (key: string, state: ComposerState) => {
+    const copy = cloneComposerState(state);
+    composerStatesRef.current.set(key, copy);
+    if (activeComposerStateKeyRef.current !== key) return;
+    setDraft(copy.draft);
+    setPendingFilesystemPaths(copy.filesystemPaths);
+    setPluginSelections(copy.pluginSelections);
+    pendingComposerRestoreRef.current = { key, state: copy };
+  };
+
+  const applyLatestFollowMode = useCallback((following: boolean) => {
     followingLatestRef.current = following;
-    userDetachedFromLatestRef.current = !following;
     setFollowingLatest(following);
   }, []);
+
+  const setLatestFollowMode = useCallback((following: boolean) => {
+    applyLatestFollowMode(following);
+    const activeSessionId = activeViewRef.current;
+    if (activeSessionId && pendingViewportRestoreRef.current !== activeSessionId) {
+      sessionViewportsRef.current.set(activeSessionId, {
+        mode: following ? 'following' : 'detached',
+        scrollTop: bodyRef.current?.scrollTop ?? lastScrollTopRef.current,
+      });
+    }
+  }, [applyLatestFollowMode]);
 
   const scrollToLatestNow = useCallback((behavior: ScrollBehavior = 'auto') => {
     const body = bodyRef.current;
     if (!body) return;
-    suppressScrollEventsUntilRef.current = window.performance.now() + 220;
     body.scrollTo({ top: body.scrollHeight, behavior });
   }, []);
 
   const scheduleScrollToLatest = useCallback((behavior: ScrollBehavior = 'auto') => {
-    if (!followingLatestRef.current) return;
-    scrollToLatestNow(behavior);
+    if (!followingLatestRef.current || pendingViewportRestoreRef.current !== null) return;
     if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current);
     scrollFrameRef.current = window.requestAnimationFrame(() => {
       scrollFrameRef.current = null;
-      if (followingLatestRef.current) scrollToLatestNow(behavior);
+      if (followingLatestRef.current && pendingViewportRestoreRef.current === null) {
+        scrollToLatestNow(behavior);
+      }
     });
-    if (scrollTimeoutRef.current !== null) window.clearTimeout(scrollTimeoutRef.current);
-    scrollTimeoutRef.current = window.setTimeout(() => {
-      scrollTimeoutRef.current = null;
-      if (followingLatestRef.current) scrollToLatestNow('auto');
-    }, 80);
   }, [scrollToLatestNow]);
+
+  const markTransientUserScroll = useCallback(() => {
+    transientUserScrollRef.current = true;
+    if (transientUserScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(transientUserScrollFrameRef.current);
+    }
+    transientUserScrollFrameRef.current = window.requestAnimationFrame(() => {
+      transientUserScrollFrameRef.current = window.requestAnimationFrame(() => {
+        transientUserScrollRef.current = false;
+        transientUserScrollFrameRef.current = null;
+      });
+    });
+  }, []);
 
   useEffect(() => {
     if (!sessionId) return undefined;
@@ -146,14 +325,10 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     let timeout: number | null = null;
 
     const schedule = () => {
-      if (cancelled) return;
-      const current = useLocalAgentStore.getState().projection;
-      const active = Boolean(
-        current?.run && ['running', 'waiting'].includes(current.run.status),
-      );
+      if (cancelled || timeout !== null) return;
       const delay = document.visibilityState === 'hidden'
         ? 10_000
-        : active
+        : projectionPollingActive
           ? 750
           : 4_000;
       timeout = window.setTimeout(() => {
@@ -175,44 +350,208 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
       document.removeEventListener('visibilitychange', refreshWhenVisible);
       if (timeout !== null) window.clearTimeout(timeout);
     };
-  }, [refresh, sessionId]);
+  }, [projectionPollingActive, refresh, sessionId]);
 
-  useEffect(() => {
-    if (activeViewRef.current !== sessionId) {
-      if (!submitting) {
-        setPendingDirectoryPaths([]);
-        setAttachments([]);
-        setAttachmentMenuOpen(false);
-        setAttachmentDialogOpen(false);
-      }
-      setLatestFollowMode(true);
-      activeViewRef.current = sessionId;
+  useLayoutEffect(() => {
+    if (legacyAssistantDraftStreamIdentity) {
+      transitioningProviderStreamsRef.current.add(legacyAssistantDraftStreamIdentity);
     }
-  }, [sessionId, setLatestFollowMode, submitting]);
+    if (!projection || !assistantDraft?.orderedBlocks) return;
+    for (const block of assistantDraft.orderedBlocks) {
+      if (block.kind === 'providerHosted') continue;
+      transitioningProviderStreamsRef.current.add(providerStreamIdentity(
+        projection.sessionId,
+        assistantDraft.runId,
+        assistantDraft.turnId,
+        block.outputIndex,
+      ));
+    }
+  }, [assistantDraft, legacyAssistantDraftStreamIdentity, projection]);
+
+  useLayoutEffect(() => {
+    const previousKey = activeComposerStateKeyRef.current;
+    if (previousKey === composerStateKey) return;
+    const textarea = textareaRef.current;
+    const previous = composerStatesRef.current.get(previousKey);
+    const outgoing: ComposerState = {
+      draft: textarea?.value ?? draft,
+      filesystemPaths: pendingFilesystemPaths.map((item) => ({ ...item })),
+      pluginSelections: pluginSelections.map((item) => ({ ...item })),
+      selectionStart: textarea?.selectionStart ?? previous?.selectionStart ?? draft.length,
+      selectionEnd: textarea?.selectionEnd ?? previous?.selectionEnd ?? draft.length,
+      focused: document.activeElement === textarea || previous?.focused === true,
+    };
+    composerStatesRef.current.set(previousKey, outgoing);
+
+    const cachedIncoming = composerStatesRef.current.get(composerStateKey);
+    const incoming = cloneComposerState(
+      cachedIncoming ?? { ...emptyComposerState(), focused: outgoing.focused },
+    );
+    activeComposerStateKeyRef.current = composerStateKey;
+    pendingComposerRestoreRef.current = { key: composerStateKey, state: incoming };
+    setDraft(incoming.draft);
+    setPendingFilesystemPaths(incoming.filesystemPaths);
+    setPluginSelections(incoming.pluginSelections);
+    setPluginPickerOpen(false);
+    setAttachmentMenuOpen(false);
+    setAttachmentDialogOpen(false);
+    setPermissionMenuOpen(false);
+    setAttachmentError(null);
+  }, [composerStateKey]);
+
+  useLayoutEffect(() => {
+    const pending = pendingComposerRestoreRef.current;
+    if (!pending || pending.key !== activeComposerStateKeyRef.current) return;
+    const textarea = textareaRef.current;
+    if (!textarea || textarea.value !== pending.state.draft) return;
+    const selectionStart = Math.min(pending.state.selectionStart, textarea.value.length);
+    const selectionEnd = Math.min(
+      Math.max(selectionStart, pending.state.selectionEnd),
+      textarea.value.length,
+    );
+    textarea.setSelectionRange(selectionStart, selectionEnd);
+    if (pending.state.focused && !textarea.disabled) textarea.focus({ preventScroll: true });
+    pendingComposerRestoreRef.current = null;
+  });
+
+  useLayoutEffect(() => {
+    if (activeViewRef.current !== sessionId) {
+      if (scrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(scrollFrameRef.current);
+        scrollFrameRef.current = null;
+      }
+      pendingViewportRestoreRef.current = sessionId;
+      setPluginPickerOpen(false);
+      setAttachmentMenuOpen(false);
+      setAttachmentDialogOpen(false);
+      activeViewRef.current = sessionId;
+      const saved = sessionId ? sessionViewportsRef.current.get(sessionId) : undefined;
+      applyLatestFollowMode(saved?.mode !== 'detached');
+    }
+  }, [applyLatestFollowMode, sessionId]);
+
+  useLayoutEffect(() => {
+    if (!sessionId || !loading || projection !== null) return;
+    if (pendingViewportRestoreRef.current === sessionId) return;
+    if (scrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(scrollFrameRef.current);
+      scrollFrameRef.current = null;
+    }
+    pendingViewportRestoreRef.current = sessionId;
+  }, [loading, projection, sessionId]);
+
+  useLayoutEffect(() => {
+    if (
+      !sessionId
+      || pendingViewportRestoreRef.current !== sessionId
+      || loading
+      || projection?.sessionId !== sessionId
+    ) return;
+    if (viewportRestoreFrameRef.current !== null) {
+      window.cancelAnimationFrame(viewportRestoreFrameRef.current);
+    }
+    const targetSessionId = sessionId;
+    viewportRestoreFrameRef.current = window.requestAnimationFrame(() => {
+      viewportRestoreFrameRef.current = null;
+      if (
+        activeViewRef.current !== targetSessionId
+        || pendingViewportRestoreRef.current !== targetSessionId
+      ) return;
+      const body = bodyRef.current;
+      if (!body) return;
+      const saved = sessionViewportsRef.current.get(targetSessionId);
+      const following = saved?.mode !== 'detached';
+      applyLatestFollowMode(following);
+      body.scrollTop = following ? body.scrollHeight : (saved?.scrollTop ?? 0);
+      lastScrollTopRef.current = body.scrollTop;
+      pendingViewportRestoreRef.current = null;
+    });
+  }, [
+    applyLatestFollowMode,
+    loading,
+    presentation.layoutKey,
+    projection?.sessionId,
+    sessionId,
+    timelineExtentKey,
+  ]);
 
   useEffect(() => {
     if (followingLatest) scheduleScrollToLatest();
-  }, [followingLatest, projection?.assistantDraft?.content, projection?.revision, scheduleScrollToLatest]);
+  }, [
+    assistantDraftLayoutKey,
+    followingLatest,
+    scheduleScrollToLatest,
+    timelineExtentKey,
+  ]);
 
   useEffect(() => {
-    if (typeof ResizeObserver === 'undefined' || !transcriptRef.current) return undefined;
+    const body = bodyRef.current;
+    const transcript = transcriptRef.current;
+    if (typeof ResizeObserver === 'undefined' || !body || !transcript) return undefined;
     const observer = new ResizeObserver(() => {
-      if (followingLatestRef.current) scheduleScrollToLatest();
+      if (pendingViewportRestoreRef.current !== null) return;
+      if (followingLatestRef.current) {
+        scheduleScrollToLatest();
+        return;
+      }
+      const activeSessionId = activeViewRef.current;
+      const saved = activeSessionId
+        ? sessionViewportsRef.current.get(activeSessionId)
+        : undefined;
+      const userScrolling = transientUserScrollRef.current
+        || touchScrollActiveRef.current
+        || pointerScrollActiveRef.current;
+      if (!activeSessionId || saved?.mode !== 'detached' || userScrolling) return;
+      if (detachedViewportFrameRef.current !== null) {
+        window.cancelAnimationFrame(detachedViewportFrameRef.current);
+      }
+      detachedViewportFrameRef.current = window.requestAnimationFrame(() => {
+        detachedViewportFrameRef.current = null;
+        const currentBody = bodyRef.current;
+        const currentSaved = sessionViewportsRef.current.get(activeSessionId);
+        if (
+          !currentBody
+          || activeViewRef.current !== activeSessionId
+          || followingLatestRef.current
+          || pendingViewportRestoreRef.current !== null
+          || currentSaved?.mode !== 'detached'
+          || transientUserScrollRef.current
+          || touchScrollActiveRef.current
+          || pointerScrollActiveRef.current
+        ) return;
+        currentBody.scrollTop = currentSaved.scrollTop;
+        lastScrollTopRef.current = currentBody.scrollTop;
+      });
     });
-    observer.observe(transcriptRef.current);
-    return () => observer.disconnect();
-  }, [scheduleScrollToLatest]);
+    observer.observe(transcript);
+    observer.observe(body);
+    return () => {
+      observer.disconnect();
+      if (detachedViewportFrameRef.current !== null) {
+        window.cancelAnimationFrame(detachedViewportFrameRef.current);
+        detachedViewportFrameRef.current = null;
+      }
+    };
+  }, [scheduleScrollToLatest, sessionId]);
 
   useEffect(() => () => {
     if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current);
-    if (scrollTimeoutRef.current !== null) window.clearTimeout(scrollTimeoutRef.current);
+    if (viewportRestoreFrameRef.current !== null) {
+      window.cancelAnimationFrame(viewportRestoreFrameRef.current);
+    }
+    if (detachedViewportFrameRef.current !== null) {
+      window.cancelAnimationFrame(detachedViewportFrameRef.current);
+    }
+    if (transientUserScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(transientUserScrollFrameRef.current);
+    }
     if (compositionGuardFrameRef.current !== null) {
       window.cancelAnimationFrame(compositionGuardFrameRef.current);
     }
   }, []);
 
   useEffect(() => {
-    if (!permissionMenuOpen && !attachmentMenuOpen) return undefined;
+    if (!permissionMenuOpen && !attachmentMenuOpen && !pluginPickerOpen) return undefined;
     const closeOnOutsidePointer = (event: PointerEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
@@ -222,15 +561,37 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
       if (attachmentMenuOpen && !attachmentControlRef.current?.contains(target)) {
         setAttachmentMenuOpen(false);
       }
+      if (
+        pluginPickerOpen
+        && !pluginPickerRef.current?.contains(target)
+        && target !== textareaRef.current
+      ) {
+        setPluginPickerOpen(false);
+      }
     };
     document.addEventListener('pointerdown', closeOnOutsidePointer);
     return () => document.removeEventListener('pointerdown', closeOnOutsidePointer);
-  }, [attachmentMenuOpen, permissionMenuOpen]);
+  }, [attachmentMenuOpen, permissionMenuOpen, pluginPickerOpen]);
+
+  useEffect(() => {
+    const finishPointerScroll = () => {
+      if (!pointerScrollActiveRef.current) return;
+      pointerScrollActiveRef.current = false;
+      markTransientUserScroll();
+    };
+    window.addEventListener('pointerup', finishPointerScroll);
+    window.addEventListener('pointercancel', finishPointerScroll);
+    return () => {
+      window.removeEventListener('pointerup', finishPointerScroll);
+      window.removeEventListener('pointercancel', finishPointerScroll);
+    };
+  }, [markTransientUserScroll]);
 
   useEffect(() => {
     if (pendingPlan || pendingInteraction || pendingApproval) {
-      setAttachments([]);
-      setPendingDirectoryPaths([]);
+      setPendingFilesystemPaths([]);
+      setPluginSelections([]);
+      setPluginPickerOpen(false);
       setAttachmentMenuOpen(false);
       setAttachmentDialogOpen(false);
     }
@@ -248,17 +609,49 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
       || compositionActiveRef.current
       || compositionCommitPendingRef.current
     ) return;
-    const submittedAttachments = attachments;
-    const submittedDirectoryPaths = pendingDirectoryPaths;
+    const submittedComposerKey = activeComposerStateKeyRef.current;
+    const submittedFilesystemPaths = pendingFilesystemPaths;
+    const submittedPluginSelections = pluginSelections;
+    const submittedTextarea = textareaRef.current;
+    const submittedComposerState: ComposerState = {
+      draft: submittedText,
+      filesystemPaths: submittedFilesystemPaths.map((item) => ({ ...item })),
+      pluginSelections: submittedPluginSelections.map((item) => ({ ...item })),
+      selectionStart: submittedTextarea?.selectionStart ?? submittedText.length,
+      selectionEnd: submittedTextarea?.selectionEnd ?? submittedText.length,
+      focused: document.activeElement === submittedTextarea,
+    };
     setDraft('');
+    setPluginPickerOpen(false);
     setLatestFollowMode(true);
     try {
-      await sendMessage(submittedText, submittedAttachments, submittedDirectoryPaths);
-      setAttachments([]);
-      setPendingDirectoryPaths([]);
-      setAttachmentError(null);
+      const focusMatch = submittedText.match(/^\/focus(?:\s+)([\s\S]+)$/u);
+      if (focusMatch) {
+        await focusContext(
+          focusMatch[1]!.trim(),
+          submittedFilesystemPaths,
+          submittedPluginSelections,
+        );
+      } else {
+        await sendMessage(
+          submittedText,
+          submittedFilesystemPaths,
+          submittedPluginSelections,
+        );
+      }
+      setComposerStateForKey(submittedComposerKey, {
+        ...submittedComposerState,
+        draft: '',
+        filesystemPaths: [],
+        pluginSelections: [],
+        selectionStart: 0,
+        selectionEnd: 0,
+      });
+      if (activeComposerStateKeyRef.current === submittedComposerKey) {
+        setAttachmentError(null);
+      }
     } catch {
-      setDraft(submittedText);
+      setComposerStateForKey(submittedComposerKey, submittedComposerState);
     }
   };
 
@@ -305,9 +698,118 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     });
   };
 
+  const filteredPlugins = useMemo(() => {
+    const query = pluginQuery.trim().toLocaleLowerCase();
+    return pluginCatalog.plugins.filter((plugin) => {
+      if (!query) return true;
+      return [plugin.displayName, plugin.shortDescription, plugin.uri]
+        .some((value) => value.toLocaleLowerCase().includes(query));
+    });
+  }, [pluginCatalog.plugins, pluginQuery]);
+
+  useEffect(() => {
+    setPluginActiveIndex((current) => Math.min(
+      current,
+      Math.max(0, filteredPlugins.length - 1),
+    ));
+  }, [filteredPlugins.length]);
+
+  const openPluginPicker = () => {
+    setAttachmentMenuOpen(false);
+    setPluginTriggerStart(null);
+    setPluginQuery('');
+    setPluginActiveIndex(0);
+    setPluginPickerOpen(true);
+    window.requestAnimationFrame(() => textareaRef.current?.focus());
+  };
+
+  const updateDraft = (value: string, cursor: number) => {
+    setDraft(value);
+    setPluginSelections((current) => current.filter((selection) => (
+      value.includes(`@${selection.label}`)
+    )));
+    const prefix = value.slice(0, cursor);
+    const match = prefix.match(/(^|\s)@([^\s@/]*)$/u);
+    if (!match) {
+      setPluginPickerOpen(false);
+      setPluginTriggerStart(null);
+      setPluginQuery('');
+      setPluginActiveIndex(0);
+      return;
+    }
+    setPluginTriggerStart(cursor - match[2]!.length - 1);
+    setPluginQuery(match[2]!);
+    setPluginActiveIndex(0);
+    setPluginPickerOpen(true);
+  };
+
+  const selectPlugin = (plugin: (typeof pluginCatalog.plugins)[number]) => {
+    const cursor = textareaRef.current?.selectionStart ?? draft.length;
+    const mention = `@${plugin.displayName}`;
+    const alreadySelected = pluginSelections.some((selection) => selection.uri === plugin.uri);
+    const insertionStart = pluginTriggerStart ?? (
+      draft.length + (draft && !/\s$/u.test(draft) ? 1 : 0)
+    );
+    const nextDraft = alreadySelected
+      ? (pluginTriggerStart === null
+          ? draft
+          : `${draft.slice(0, pluginTriggerStart)}${draft.slice(cursor)}`)
+      : pluginTriggerStart === null
+        ? `${draft}${draft && !/\s$/u.test(draft) ? ' ' : ''}${mention} `
+        : `${draft.slice(0, pluginTriggerStart)}${mention} ${draft.slice(cursor)}`;
+    const nextCursor = alreadySelected
+      ? insertionStart
+      : insertionStart + mention.length + 1;
+    setDraft(nextDraft);
+    setPluginSelections((current) => (
+      current.some((selection) => selection.uri === plugin.uri)
+        ? current
+        : [...current, {
+            selectionId: nextPanelId('plugin-selection'),
+            uri: plugin.uri,
+            label: plugin.displayName,
+          }]
+    ));
+    setPluginPickerOpen(false);
+    setPluginTriggerStart(null);
+    setPluginQuery('');
+    setPluginActiveIndex(0);
+    window.requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+      textareaRef.current?.setSelectionRange(nextCursor, nextCursor);
+    });
+  };
+
   const focusCommandSuggestionVisible = shouldOfferFocusCommand(draft);
 
   const submitOnComposerEnter = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (
+      pluginPickerOpen
+      && !event.nativeEvent.isComposing
+      && !compositionActiveRef.current
+      && !compositionCommitPendingRef.current
+    ) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setPluginPickerOpen(false);
+        return;
+      }
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        setPluginActiveIndex((current) => {
+          if (filteredPlugins.length === 0) return 0;
+          const delta = event.key === 'ArrowDown' ? 1 : -1;
+          return (current + delta + filteredPlugins.length) % filteredPlugins.length;
+        });
+        return;
+      }
+      if ((event.key === 'Enter' && !event.shiftKey) || event.key === 'Tab') {
+        event.preventDefault();
+        const plugin = filteredPlugins[pluginActiveIndex];
+        if (plugin) selectPlugin(plugin);
+        return;
+      }
+    }
     if (!shouldSubmitComposerKey({
       key: event.key,
       shiftKey: event.shiftKey,
@@ -330,9 +832,16 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     response: Extract<PlanResponse, { kind: 'confirm' | 'cancel' }>,
   ) => {
     if (!pendingPlan || submitting) return;
+    const submittedComposerKey = activeComposerStateKeyRef.current;
     try {
       await respondPlan(response);
-      setDraft('');
+      const cached = composerStatesRef.current.get(submittedComposerKey) ?? emptyComposerState();
+      setComposerStateForKey(submittedComposerKey, {
+        ...cached,
+        draft: '',
+        selectionStart: 0,
+        selectionEnd: 0,
+      });
     } catch {
       // The store preserves the authoritative command error for the shared error panel.
     }
@@ -362,42 +871,41 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   ) => {
     setAttachmentDialogOpen(false);
     if (pendingPlan || pendingInteraction || pendingApproval) return;
-    if (type === 'directory') {
-      setAttachmentError(null);
-      setPendingDirectoryPaths((current) => (
-        current.includes(absolutePath) ? current : [...current, absolutePath]
-      ));
-      return;
-    }
     try {
-      if (attachments.length >= 8) {
+      if (pendingFilesystemPaths.length >= 8) {
         throw new Error(t(language, 'agent.attachment.error.maxFiles'));
       }
-      const result = await readMessageAttachmentFile(absolutePath);
-      if (!result.ok || !result.data) {
-        throw new Error(t(language, 'agent.attachment.error.readFile', {
-          message: result.message ?? result.error ?? 'unknown',
-        }));
+      if (type === 'file' && mediaTypeForPath(absolutePath) === 'application/pdf') {
+        const matches = pluginCatalog.plugins.filter((plugin) => (
+          plugin.activationMediaTypes.includes('application/pdf')
+        ));
+        if (matches.length !== 1) {
+          throw new Error('plugin_selection_unavailable:application/pdf');
+        }
+        const plugin = matches[0]!;
+        setPluginSelections((current) => (
+          current.some((selection) => selection.uri === plugin.uri)
+            ? current
+            : [...current, {
+                selectionId: nextPanelId('plugin-selection'),
+                uri: plugin.uri,
+                label: plugin.displayName,
+              }]
+        ));
+        setDraft((current) => {
+          const mention = `@${plugin.displayName}`;
+          return current.includes(mention)
+            ? current
+            : `${current}${current && !/\s$/u.test(current) ? ' ' : ''}${mention} `;
+        });
       }
-      if (result.data.content.includes('\0')) {
-        throw new Error(t(language, 'agent.attachment.error.notText', {
-          name: result.data.name,
-        }));
-      }
-      const next = {
-        attachmentId: nextAttachmentId(),
-        name: result.data.name,
-        mediaType: result.data.mediaType || 'text/plain',
-        content: result.data.content,
-      } satisfies UserMessageAttachment;
-      const totalBytes = [...attachments, next].reduce(
-        (total, attachment) => total + new TextEncoder().encode(attachment.content).byteLength,
-        0,
-      );
-      if (totalBytes > 512 * 1024) {
-        throw new Error(t(language, 'agent.attachment.error.totalSize'));
-      }
-      setAttachments((current) => [...current, next]);
+      setPendingFilesystemPaths((current) => (
+        current.some((candidate) => (
+          candidate.path === absolutePath && candidate.kind === type
+        ))
+          ? current
+          : [...current, { path: absolutePath, kind: type }]
+      ));
       setAttachmentError(null);
     } catch (selectionError) {
       setAttachmentError(selectionError instanceof Error
@@ -442,6 +950,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     projection?.run && ['running', 'waiting'].includes(projection.run.status),
   );
   const canSend = Boolean(draft.trim())
+    && !modelSettingsBusy
     && !loading
     && !submitting
     && !catalogBusy
@@ -499,9 +1008,22 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
         className="local-agent__body"
         aria-live="polite"
         onWheel={(event) => {
+          if (pendingViewportRestoreRef.current === sessionId) return;
+          markTransientUserScroll();
           if (event.deltaY < 0) setLatestFollowMode(false);
         }}
+        onPointerDown={(event) => {
+          if (event.target === event.currentTarget) pointerScrollActiveRef.current = true;
+        }}
+        onKeyDown={(event) => {
+          const scrollsAway = ['ArrowUp', 'PageUp', 'Home'].includes(event.key);
+          const scrollsTowardLatest = ['ArrowDown', 'PageDown', 'End'].includes(event.key);
+          if (!scrollsAway && !scrollsTowardLatest) return;
+          markTransientUserScroll();
+          if (scrollsAway) setLatestFollowMode(false);
+        }}
         onTouchStart={(event) => {
+          touchScrollActiveRef.current = true;
           lastTouchYRef.current = event.touches[0]?.clientY ?? null;
         }}
         onTouchMove={(event) => {
@@ -513,20 +1035,37 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           }
         }}
         onTouchEnd={() => {
+          touchScrollActiveRef.current = false;
+          lastTouchYRef.current = null;
+          markTransientUserScroll();
+        }}
+        onTouchCancel={() => {
+          touchScrollActiveRef.current = false;
           lastTouchYRef.current = null;
         }}
         onScroll={(event) => {
           const body = event.currentTarget;
+          if (
+            pendingViewportRestoreRef.current === sessionId
+            || (loading && projection === null)
+          ) return;
           const scrolledUp = body.scrollTop < lastScrollTopRef.current - 2;
           lastScrollTopRef.current = body.scrollTop;
+          const userDriven = transientUserScrollRef.current
+            || touchScrollActiveRef.current
+            || pointerScrollActiveRef.current;
+          if (!userDriven) return;
           const distanceFromLatest = body.scrollHeight - body.scrollTop - body.clientHeight;
-          if (window.performance.now() < suppressScrollEventsUntilRef.current) return;
-          if (scrolledUp) {
-            setLatestFollowMode(false);
+          if (scrolledUp && followingLatestRef.current) setLatestFollowMode(false);
+          if (!followingLatestRef.current && distanceFromLatest <= 2) {
+            setLatestFollowMode(true);
             return;
           }
-          if (userDetachedFromLatestRef.current && distanceFromLatest <= 2) {
-            setLatestFollowMode(true);
+          if (sessionId) {
+            sessionViewportsRef.current.set(sessionId, {
+              mode: followingLatestRef.current ? 'following' : 'detached',
+              scrollTop: body.scrollTop,
+            });
           }
         }}
       >
@@ -549,21 +1088,31 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
               className={`local-agent__message local-agent__message--${item.value.role}`}
             >
               <div className="local-agent__message-content">
-                <MarkdownContent>{item.value.content}</MarkdownContent>
-                {(item.value.attachments.length > 0
-                  || item.value.directoryAttachments.length > 0) && (
+                {item.value.role === 'assistant'
+                  ? committedProviderContent(
+                      item.value.runId,
+                      item.value.providerRequestId,
+                      item.outputIndex,
+                      item.value.content,
+                      presentation.content(`message:${item.value.messageId}:content`),
+                    )
+                  : presentation.content(`message:${item.value.messageId}:content`)}
+                {item.value.filesystemReferences.length > 0 && (
                   <div className="local-agent__message-attachments">
-                    {item.value.attachments.map((attachment) => (
-                      <span key={attachment.attachmentId}>
-                        <DeepCodeShellIcon name="artifact" />
-                        {attachment.name}
-                        <small>{formatBytes(attachment.byteLength, language)}</small>
-                      </span>
-                    ))}
-                    {item.value.directoryAttachments.map((attachment) => (
-                      <span className="local-agent__message-directory" key={attachment.workspaceId}>
-                        <DeepCodeShellIcon name="folder" />
-                        {attachment.displayName}
+                    {item.value.filesystemReferences.map((reference) => (
+                      <span
+                        className={reference.kind === 'directory'
+                          ? 'local-agent__message-directory'
+                          : undefined}
+                        key={reference.referenceId}
+                      >
+                        <DeepCodeShellIcon name={reference.kind === 'directory'
+                          ? 'folder'
+                          : 'artifact'} />
+                        {reference.displayName}
+                        {reference.kind === 'file' && (
+                          <small>{formatBytes(reference.byteLength, language)}</small>
+                        )}
                       </span>
                     ))}
                   </div>
@@ -617,7 +1166,15 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             </article>
           ) : item.type === 'narrative' ? (
             <article className="local-agent__narrative" key={`narrative:${item.value.narrativeId}`}>
-              <div><MarkdownContent>{item.value.content}</MarkdownContent></div>
+              <div>
+                {committedProviderContent(
+                  item.value.runId,
+                  item.value.providerRequestId,
+                  item.outputIndex,
+                  item.value.content,
+                  presentation.content(`narrative:${item.value.narrativeId}`),
+                )}
+              </div>
             </article>
           ) : item.type === 'plan' ? (
             <PlanCard
@@ -631,24 +1188,70 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
               activities={item.values}
               key={item.groupId}
               language={language}
+              onExpand={() => setLatestFollowMode(false)}
               onOpenWorkspaceResource={openWorkspaceResource}
             />
           ))}
-          {projection?.assistantDraft && (
+          {orderedAssistantDraftItems.map((item) => item.type === 'text' ? (
+            <article
+              className={item.block.kind === 'narrative'
+                ? 'local-agent__narrative local-agent__narrative--draft'
+                : 'local-agent__message local-agent__message--assistant local-agent__message--draft'}
+              key={`draft:${item.block.outputIndex}`}
+            >
+              <div className={item.block.kind === 'narrative'
+                ? undefined
+                : 'local-agent__message-content'}
+              >
+                <BufferedMarkdown
+                  text={item.block.content}
+                  streamIdentity={providerStreamIdentity(
+                    projection!.sessionId,
+                    assistantDraft!.runId,
+                    assistantDraft!.turnId,
+                    item.block.outputIndex,
+                  )}
+                  initialVisibleLength={providerStreamProgressRef.current.get(
+                    providerStreamIdentity(
+                      projection!.sessionId,
+                      assistantDraft!.runId,
+                      assistantDraft!.turnId,
+                      item.block.outputIndex,
+                    ),
+                  ) ?? 0}
+                  onVisibleLengthChange={recordProviderStreamProgress}
+                />
+              </div>
+            </article>
+          ) : (
+            <ProviderHostedDraftGroup
+              blocks={item.blocks}
+              key={item.groupId}
+              language={language}
+              onExpand={() => setLatestFollowMode(false)}
+            />
+          ))}
+          {assistantDraft?.content && legacyAssistantDraftStreamIdentity && (
             <article className="local-agent__message local-agent__message--assistant local-agent__message--draft">
               <div className="local-agent__message-content">
                 <BufferedMarkdown
-                  text={projection.assistantDraft.content}
-                  streamIdentity={projection.assistantDraft.turnId}
+                  key={legacyAssistantDraftStreamIdentity}
+                  text={assistantDraft.content}
+                  streamIdentity={legacyAssistantDraftStreamIdentity}
+                  initialVisibleLength={providerStreamProgressRef.current.get(
+                    legacyAssistantDraftStreamIdentity,
+                  ) ?? 0}
+                  onVisibleLengthChange={recordProviderStreamProgress}
                 />
               </div>
             </article>
           )}
-          {projection?.run?.status === 'running' && (
-            <div className="local-agent__run-thinking" role="status" aria-live="polite">
-              <span className="local-agent__run-spinner" aria-hidden="true" />
-              <span>{t(language, 'agent.run.thinking')}</span>
-            </div>
+          {projection?.run && projection.run.status !== 'completed' && (
+            <ProviderStageStatus run={projection.run} language={language}
+              key={`${projection.run.runId}:${assistantDraft?.turnId ?? 'idle'}`}
+              activity={assistantDraft?.runId === projection.run.runId ? assistantDraft.activity : undefined}
+              toolPending={projection.activities.some((activity) => activity.runId === projection.run?.runId
+                && activity.kind === 'tool' && ['requested', 'active', 'waiting'].includes(activity.status))} />
           )}
           {projection?.terminalError && (
             <article className="local-agent__terminal-error">
@@ -671,12 +1274,17 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
         )}
       </div>
 
-      <footer className={`local-agent__composer-shell${pendingPlan || pendingInteraction
+      <footer className={`local-agent__composer-shell${pendingPlan || pendingInteraction || pendingApproval
         ? ' local-agent__composer-shell--decision'
         : ''}`}>
         {error && <div className="local-agent__error">{error}</div>}
         {attachmentError && <div className="local-agent__error">{attachmentError}</div>}
         {uiActionError && <div className="local-agent__error">{uiActionError}</div>}
+        {presentation.snapshot.status.state === 'unavailable' && (
+          <div className="local-agent__error">
+            {presentation.snapshot.status.error.message}
+          </div>
+        )}
         {(pendingPlan || pendingInteraction) && (
           <section className="local-agent__interaction-panel">
             <header className="local-agent__interaction-panel-heading">
@@ -749,6 +1357,12 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                     ? t(language, 'agent.composer.placeholder.plan')
                     : t(language, 'agent.composer.placeholder.interaction')}
                   onChange={(event) => setDraft(event.target.value)}
+                  onFocus={(event) => recordComposerElementState(event.currentTarget, true)}
+                  onBlur={(event) => recordComposerElementState(event.currentTarget, false)}
+                  onSelect={(event) => recordComposerElementState(
+                    event.currentTarget,
+                    document.activeElement === event.currentTarget,
+                  )}
                   onCompositionStart={beginComposition}
                   onCompositionEnd={endComposition}
                   onKeyDown={submitOnComposerEnter}
@@ -778,7 +1392,68 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             )}
           </section>
         )}
-        {!pendingPlan && !pendingInteraction && <div
+        {pendingApproval && (
+          <section
+            className="local-agent__decision"
+            aria-labelledby={`approval-${pendingApproval.approvalId}`}
+          >
+            <header className="local-agent__decision-heading">
+              <span className="local-agent__decision-mark" aria-hidden="true">
+                <DeepCodeShellIcon name="tool" />
+              </span>
+              <span className="local-agent__decision-title">
+                <strong id={`approval-${pendingApproval.approvalId}`}>
+                  {t(language, 'agent.approval.question')}
+                </strong>
+                <small>{t(language, 'agent.approval.required')}</small>
+              </span>
+            </header>
+            <pre className="local-agent__decision-command">
+              <code>{pendingApproval.preview.summary}</code>
+            </pre>
+            {(pendingApproval.preview.effects.length > 0
+              || pendingApproval.preview.logicalTargets.length > 0) && (
+              <details className="local-agent__decision-scope">
+                <summary>
+                  <span>{t(language, 'agent.approval.scope')}</span>
+                  <DeepCodeShellIcon name="chevronDown" />
+                </summary>
+                <dl>
+                  {pendingApproval.preview.effects.length > 0 && (
+                    <div>
+                      <dt>{t(language, 'agent.approval.effects')}</dt>
+                      <dd>{pendingApproval.preview.effects.map((effect) => (
+                        <code key={effect}>{effect}</code>
+                      ))}</dd>
+                    </div>
+                  )}
+                  {pendingApproval.preview.logicalTargets.length > 0 && (
+                    <div>
+                      <dt>{t(language, 'agent.approval.targets')}</dt>
+                      <dd>{pendingApproval.preview.logicalTargets.map((target) => (
+                        <code key={target}>{target}</code>
+                      ))}</dd>
+                    </div>
+                  )}
+                </dl>
+              </details>
+            )}
+            <div className="local-agent__decision-actions">
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={() => void respondApproval('deny')}
+              >{t(language, 'agent.approval.deny')}</button>
+              <button
+                type="button"
+                className="local-agent__button--primary"
+                disabled={submitting}
+                onClick={() => void respondApproval('allow')}
+              >{t(language, 'agent.approval.allow')}</button>
+            </div>
+          </section>
+        )}
+        {!pendingPlan && !pendingInteraction && !pendingApproval && <div
           className="local-agent__composer"
           onMouseDown={(event) => {
             const target = event.target as HTMLElement;
@@ -787,6 +1462,39 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             textareaRef.current?.focus();
           }}
         >
+          {pluginPickerOpen && (
+            <div
+              ref={pluginPickerRef}
+              className="local-agent__plugin-picker"
+              role="listbox"
+              aria-label={t(language, 'agent.plugin.picker')}
+            >
+              <div className="local-agent__plugin-picker-heading">
+                {t(language, 'agent.plugin.picker')}
+              </div>
+              {filteredPlugins.length ? filteredPlugins.map((plugin, index) => (
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={index === pluginActiveIndex}
+                  key={plugin.uri}
+                  onClick={() => selectPlugin(plugin)}
+                  onMouseEnter={() => setPluginActiveIndex(index)}
+                >
+                  <DeepCodeShellIcon name="extension" />
+                  <span>
+                    <b>{plugin.displayName}</b>
+                    <small>{plugin.shortDescription}</small>
+                  </span>
+                  <code>{plugin.uri}</code>
+                </button>
+              )) : (
+                <div className="local-agent__plugin-picker-empty">
+                  {t(language, 'agent.plugin.empty')}
+                </div>
+              )}
+            </div>
+          )}
           {focusCommandSuggestionVisible && (
             <div
               className="local-agent__command-suggestions"
@@ -808,74 +1516,65 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
               </button>
             </div>
           )}
-          {pendingApproval && (
-            <div className="local-agent__decision">
-              <div className="local-agent__decision-heading">
-                <strong>{pendingApproval.preview.summary}</strong>
-                <span>{t(language, 'agent.approval.required')}</span>
-              </div>
-              {pendingApproval.preview.logicalTargets.length > 0 && (
-                <ul className="local-agent__decision-targets">
-                  {pendingApproval.preview.logicalTargets.map((target) => (
-                    <li key={target}>{target}</li>
-                  ))}
-                </ul>
-              )}
-              <div className="local-agent__decision-actions">
-                <button
-                  type="button"
-                  disabled={submitting}
-                  onClick={() => void respondApproval('deny')}
-                >{t(language, 'agent.approval.deny')}</button>
-                <button
-                  type="button"
-                  className="local-agent__button--primary"
-                  disabled={submitting}
-                  onClick={() => void respondApproval('allow')}
-                >{t(language, 'agent.approval.allow')}</button>
-              </div>
-            </div>
-          )}
           <textarea
             ref={textareaRef}
             value={draft}
-            disabled={Boolean(pendingApproval)}
-            rows={pendingApproval ? 2 : 3}
-            placeholder={pendingApproval
-              ? t(language, 'agent.composer.placeholder.approval')
-              : t(language, 'agent.composer.placeholder.task')}
-            onChange={(event) => setDraft(event.target.value)}
+            rows={3}
+            placeholder={t(language, 'agent.composer.placeholder.task')}
+            onChange={(event) => updateDraft(
+              event.target.value,
+              event.target.selectionStart ?? event.target.value.length,
+            )}
+            onFocus={(event) => recordComposerElementState(event.currentTarget, true)}
+            onBlur={(event) => recordComposerElementState(event.currentTarget, false)}
+            onSelect={(event) => recordComposerElementState(
+              event.currentTarget,
+              document.activeElement === event.currentTarget,
+            )}
             onCompositionStart={beginComposition}
             onCompositionEnd={endComposition}
             onKeyDown={submitOnComposerEnter}
           />
-          {(attachments.length > 0 || pendingDirectoryPaths.length > 0) && (
+          {(pendingFilesystemPaths.length > 0 || pluginSelections.length > 0) && (
             <div className="local-agent__draft-attachments">
-              {attachments.map((attachment) => (
-                <span key={attachment.attachmentId}>
-                  <DeepCodeShellIcon name="artifact" />
-                  {attachment.name}
+              {pluginSelections.map((selection) => (
+                <span className="local-agent__draft-plugin" key={selection.selectionId}>
+                  <DeepCodeShellIcon name="extension" />
+                  @{selection.label}
                   <button
                     type="button"
-                    aria-label={t(language, 'agent.attachment.remove', {
-                      name: attachment.name,
-                    })}
-                    onClick={() => setAttachments((current) => current.filter((item) => (
-                      item.attachmentId !== attachment.attachmentId
-                    )))}
+                    aria-label={t(language, 'agent.plugin.remove', { name: selection.label })}
+                    onClick={() => {
+                      setPluginSelections((current) => current.filter((item) => (
+                        item.selectionId !== selection.selectionId
+                      )));
+                      setDraft((current) => current.replace(`@${selection.label}`, '').trimStart());
+                    }}
                   >×</button>
                 </span>
               ))}
-              {pendingDirectoryPaths.map((path) => (
-                <span className="local-agent__draft-directory" key={path}>
-                  <DeepCodeShellIcon name="folder" />
-                  {t(language, 'agent.attachment.folder')} · {directoryDisplayName(path)}
+              {pendingFilesystemPaths.map((reference) => (
+                <span
+                  className={reference.kind === 'directory'
+                    ? 'local-agent__draft-directory'
+                    : undefined}
+                  key={`${reference.kind}:${reference.path}`}
+                >
+                  <DeepCodeShellIcon name={reference.kind === 'directory'
+                    ? 'folder'
+                    : 'artifact'} />
+                  {reference.kind === 'directory'
+                    ? `${t(language, 'agent.attachment.folder')} · `
+                    : ''}
+                  {filesystemPathDisplayName(reference.path)}
                   <button
                     type="button"
-                    aria-label={t(language, 'agent.attachment.removePendingDirectory')}
-                    onClick={() => setPendingDirectoryPaths((current) => (
-                      current.filter((candidate) => candidate !== path)
-                    ))}
+                    aria-label={t(language, 'agent.attachment.remove', {
+                      name: filesystemPathDisplayName(reference.path),
+                    })}
+                    onClick={() => setPendingFilesystemPaths((current) => current.filter((item) => (
+                      item.path !== reference.path || item.kind !== reference.kind
+                    )))}
                   >×</button>
                 </span>
               ))}
@@ -891,7 +1590,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                   title={t(language, 'agent.attachment.menu')}
                   aria-expanded={attachmentMenuOpen}
                   aria-haspopup="menu"
-                  disabled={Boolean(pendingApproval || catalogBusy)}
+                  disabled={catalogBusy}
                   onClick={() => {
                     setAttachmentMenuOpen((open) => !open);
                     setPermissionMenuOpen(false);
@@ -913,6 +1612,17 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                       <span>
                         <b>{t(language, 'agent.attachment.filesAndFolders')}</b>
                         <small>{t(language, 'agent.attachment.pickerDescription')}</small>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={openPluginPicker}
+                    >
+                      <DeepCodeShellIcon name="extension" />
+                      <span>
+                        <b>{t(language, 'agent.plugin.menu')}</b>
+                        <small>{t(language, 'agent.plugin.menuDescription')}</small>
                       </span>
                     </button>
                     <button
@@ -944,13 +1654,23 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                     runtimeEffectiveSettings['agent.permissions.workspaceMutation'] === 'allow'
                       ? 'agent.permission.summary.allow'
                       : 'agent.permission.summary.plan',
+                    {
+                      external: t(
+                        language,
+                        runtimeEffectiveSettings['agent.permissions.external'] === 'allow'
+                          ? 'agent.permission.allow'
+                          : runtimeEffectiveSettings['agent.permissions.external'] === 'deny'
+                            ? 'agent.permission.deny'
+                            : 'agent.permission.ask',
+                      ),
+                    },
                   )}
                 </button>
                 {permissionMenuOpen && (
                   <div className="local-agent__permission-menu">
-                    {settingsRestartRequired && (
-                      <div className="local-agent__permission-restart-notice">
-                        {t(language, 'agent.permission.restartRequired')}
+                    {settingsPendingNextRunActivation && (
+                      <div className="local-agent__permission-activation-notice">
+                        {t(language, 'agent.permission.nextRunActivationPending')}
                       </div>
                     )}
                     <div className="local-agent__permission-invariant">
@@ -1024,10 +1744,12 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                 language={language}
                 profiles={profiles}
                 selectedProfileId={selectedProfileId}
+                reasoningEffortOverride={reasoningEffortOverride}
                 contextUsage={projection?.contextUsage ?? null}
                 contextCompositions={projection?.contextCompositions ?? []}
-                busy={loading}
+                busy={loading || submitting || modelSettingsBusy}
                 onProfileChange={selectProfile}
+                onReasoningEffortChange={selectReasoningEffort}
               />
               <button
                 type="button"
@@ -1054,7 +1776,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             </div>
           </div>
         </div>}
-        {!pendingPlan && !pendingInteraction && (
+        {!pendingPlan && !pendingInteraction && !pendingApproval && (
           <div className="local-agent__composer-hint">
             {t(language, 'agent.composer.hint')}
           </div>
@@ -1125,39 +1847,102 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
 interface ToolActivityGroupProps {
   activities: ActivityProjection[];
   language: UiLanguage;
+  onExpand(): void;
   onOpenWorkspaceResource(workspaceId: string, logicalPath: string): void;
 }
 
-const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
-  activities,
+interface ProviderHostedDraftGroupProps {
+  blocks: Array<Extract<AssistantDraftBlockProjection, { kind: 'providerHosted' }>>;
+  language: UiLanguage;
+  onExpand(): void;
+}
+
+const ProviderHostedDraftGroup: React.FC<ProviderHostedDraftGroupProps> = ({
+  blocks,
   language,
-  onOpenWorkspaceResource,
+  onExpand,
 }) => {
-  const terminal = activities.every((activity) => isTerminalActivity(activity.status));
-  const userControlled = useRef(false);
-  const [expanded, setExpanded] = useState(() => !terminal);
-  const hasFailure = activities.some((activity) => (
-    ['failed', 'denied', 'indeterminate'].includes(activity.status)
-  ));
-  const groupStatus = toolGroupStatus(activities);
-
-  useEffect(() => {
-    if (!userControlled.current) setExpanded(!terminal);
-  }, [terminal]);
-
+  const [expanded, setExpanded] = useState(false);
+  const failed = blocks.some((block) => block.status === 'failed');
+  const firstTarget = blocks.length === 1
+    ? providerHostedActionTarget(blocks[0]?.action)
+    : '';
+  const summary = blocks.length === 1
+    ? failed
+      ? firstTarget
+        ? t(language, 'agent.providerHosted.summary.didNotCompleteTarget', { target: firstTarget })
+        : t(language, 'agent.providerHosted.summary.didNotComplete')
+      : firstTarget
+        ? t(language, 'agent.providerHosted.summary.completedTarget', { target: firstTarget })
+        : t(language, 'agent.providerHosted.summary.completed')
+    : failed
+      ? t(language, 'agent.providerHosted.summary.didNotCompleteMany', { count: blocks.length })
+      : t(language, 'agent.providerHosted.summary.completedMany', { count: blocks.length });
   return (
-    <article className={`local-agent__tool-group${hasFailure ? ' local-agent__tool-group--failed' : ''}`}>
+    <article className={`local-agent__tool-group${expanded ? ' local-agent__tool-group--expanded' : ''}${failed ? ' local-agent__tool-group--failed' : ''}`}>
       <button
         type="button"
         className="local-agent__tool-group-summary"
         aria-expanded={expanded}
         onClick={() => {
-          userControlled.current = true;
+          if (!expanded) onExpand();
           setExpanded((current) => !current);
         }}
       >
         <span className="local-agent__tool-group-icon">
-          <DeepCodeShellIcon name="tool" />
+          <DeepCodeShellIcon name="search" />
+        </span>
+        <strong>{summary}</strong>
+        <span className="local-agent__tool-group-chevron" aria-hidden="true">
+          <DeepCodeShellIcon name="chevronRight" />
+        </span>
+      </button>
+      {expanded && (
+        <div className="local-agent__tool-group-items">
+          {blocks.map((block) => (
+            <ProviderHostedEntry
+              key={block.providerCallId}
+              hosted={block}
+              status={block.status}
+              language={language}
+            />
+          ))}
+        </div>
+      )}
+    </article>
+  );
+};
+
+const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
+  activities,
+  language,
+  onExpand,
+  onOpenWorkspaceResource,
+}) => {
+  const terminal = activities.every((activity) => isTerminalActivity(activity.status));
+  const [expanded, setExpanded] = useState(() => !terminal);
+  const hasFailure = activities.some((activity) => (
+    ['failed', 'denied', 'rejected', 'indeterminate'].includes(activity.status)
+  ));
+  const groupStatus = toolGroupStatus(activities);
+
+  return (
+    <article className={`local-agent__tool-group${expanded ? ' local-agent__tool-group--expanded' : ''}${hasFailure ? ' local-agent__tool-group--failed' : ''}`}>
+      <button
+        type="button"
+        className="local-agent__tool-group-summary"
+        aria-expanded={expanded}
+        onClick={() => {
+          if (!expanded) onExpand();
+          setExpanded((current) => !current);
+        }}
+      >
+        <span className="local-agent__tool-group-icon">
+          <DeepCodeShellIcon
+            name={activities.every((activity) => activity.kind === 'providerHosted')
+              ? 'search'
+              : 'tool'}
+          />
         </span>
         <strong>{toolGroupSummary(activities, language)}</strong>
         {groupStatus !== 'completed' && (
@@ -1183,6 +1968,59 @@ const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
   );
 };
 
+interface ProviderHostedEntryProps {
+  hosted: ProviderHostedActivityProjection;
+  status: ActivityProjection['status'];
+  language: UiLanguage;
+}
+
+const ProviderHostedEntry: React.FC<ProviderHostedEntryProps> = ({ hosted, status, language }) => {
+  const actionType = providerHostedActionType(hosted.action);
+  const fieldLabels: Record<string, string> = {
+    queries: 'agent.providerHosted.detail.queries',
+    query: 'agent.providerHosted.detail.queries',
+    url: 'agent.providerHosted.detail.url',
+    pattern: 'agent.providerHosted.detail.pattern',
+    sources: 'agent.providerHosted.detail.sources',
+  };
+  return (
+    <div className={`local-agent__tool-entry local-agent__tool-entry--${status}`}>
+      <div className="local-agent__tool-entry-details">
+        <dl>
+          <div>
+            <dt>{t(language, 'agent.providerHosted.detail.status')}</dt>
+            <dd>{toolActivityStatus(status, language)}</dd>
+          </div>
+          {actionType && (
+            <div>
+              <dt>{t(language, 'agent.providerHosted.detail.action')}</dt>
+              <dd><code>{actionType}</code></dd>
+            </div>
+          )}
+          {Object.entries(hosted.action).filter(([field]) => field !== 'type').map(([field, value]) => (
+            <div key={field}>
+              <dt>{fieldLabels[field] ? t(language, fieldLabels[field]) : field}</dt>
+              <dd><code>{typeof value === 'string'
+                ? value
+                : Array.isArray(value) && value.every((item) => typeof item === 'string')
+                  ? value.join('\n')
+                  : JSON.stringify(value, null, 2)}</code></dd>
+            </div>
+          ))}
+          <div>
+            <dt>{t(language, 'agent.providerHosted.detail.providerTool')}</dt>
+            <dd><code>{hosted.providerToolType}</code></dd>
+          </div>
+          <div>
+            <dt>{t(language, 'agent.providerHosted.detail.providerCallId')}</dt>
+            <dd><code>{hosted.providerCallId}</code></dd>
+          </div>
+        </dl>
+      </div>
+    </div>
+  );
+};
+
 interface ToolActivityEntryProps {
   activity: ActivityProjection;
   language: UiLanguage;
@@ -1198,6 +2036,15 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
   const tool = activity.tool;
   const shell = tool?.shell;
   const result = shell?.result;
+  if (activity.providerHosted) {
+    return (
+      <ProviderHostedEntry
+        hosted={activity.providerHosted}
+        status={activity.status}
+        language={language}
+      />
+    );
+  }
   return (
     <div className={`local-agent__tool-entry local-agent__tool-entry--${activity.status}`}>
       <button
@@ -1231,7 +2078,7 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
                   <dt>{t(language, 'agent.tool.shell.cwd')}</dt>
                   <dd><code>{shell.cwd}</code></dd>
                 </div>
-                {result?.environment && (
+                {result && (
                   <>
                     <div>
                       <dt>{t(language, 'agent.tool.shell.environment')}</dt>
@@ -1241,13 +2088,27 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
                     </div>
                     <div>
                       <dt>{t(language, 'agent.tool.shell.writeScope')}</dt>
-                      <dd>{t(language, 'agent.tool.shell.writeScopeValue')}</dd>
+                      <dd>{t(
+                        language,
+                        `agent.tool.shell.writeScope.${result.environment.writeScope}`,
+                      )}</dd>
                     </div>
                   </>
                 )}
               </>
             )}
           </dl>
+          {activity.inputRejection && (
+            <div className="local-agent__input-rejection">
+              <p>{activity.inputRejection.message}</p>
+              {activity.inputRejection.issues.map((issue, index) => (
+                <div key={`${issue.path}:${issue.rule}:${index}`}>
+                  <code>{issue.path}</code><span>{issue.message}</span>
+                  {issue.expected !== undefined && <code>{JSON.stringify(issue.expected)}</code>}
+                </div>
+              ))}
+            </div>
+          )}
           {tool?.resources.length ? (
             <div className="local-agent__tool-resources">
               {tool.resources.map((resource, index) => {
@@ -1338,16 +2199,6 @@ function permissionSetting(
   );
 }
 
-function conversationTitle(
-  messages: { role: string; content: string }[] | undefined,
-  language: UiLanguage,
-): string {
-  const first = messages?.find((message) => message.role === 'user')?.content.trim();
-  if (!first) return t(language, 'agent.session.newTitle');
-  const line = first.split(/\r?\n/u, 1)[0].trim();
-  return line.length > 34 ? `${line.slice(0, 34)}…` : line;
-}
-
 function runLabel(run: RunProjection | null, language: UiLanguage): string {
   if (!run) return t(language, 'agent.run.status.idle');
   if (run.status === 'waiting' && run.waitingReason === 'userInput') {
@@ -1366,14 +2217,20 @@ function samePlanReference(
   return reference?.planId === plan.planId && reference.revision === plan.revision;
 }
 
-type RawProjectionItem =
-  | { type: 'message'; sequence: number; value: SessionProjection['messages'][number] }
-  | { type: 'narrative'; sequence: number; value: SessionProjection['narratives'][number] }
-  | { type: 'plan'; sequence: number; value: SessionProjection['plans'][number] }
-  | { type: 'tool'; sequence: number; value: ActivityProjection };
-
 type ProjectionItem =
-  | Exclude<RawProjectionItem, { type: 'tool' }>
+  | {
+      type: 'message';
+      sequence: number;
+      outputIndex?: number;
+      value: SessionProjection['messages'][number];
+    }
+  | {
+      type: 'narrative';
+      sequence: number;
+      outputIndex?: number;
+      value: SessionProjection['narratives'][number];
+    }
+  | { type: 'plan'; sequence: number; value: SessionProjection['plans'][number] }
   | {
       type: 'toolGroup';
       sequence: number;
@@ -1381,40 +2238,103 @@ type ProjectionItem =
       values: ActivityProjection[];
     };
 
+type AssistantDraftItem =
+  | {
+      type: 'text';
+      block: Exclude<AssistantDraftBlockProjection, { kind: 'providerHosted' }>;
+    }
+  | {
+      type: 'providerHostedGroup';
+      groupId: string;
+      blocks: Array<Extract<AssistantDraftBlockProjection, { kind: 'providerHosted' }>>;
+    };
+
+function assistantDraftItems(
+  draft: SessionProjection['assistantDraft'],
+): AssistantDraftItem[] {
+  if (!draft?.orderedBlocks) return [];
+  const items: AssistantDraftItem[] = [];
+  let hostedBlocks: Array<Extract<AssistantDraftBlockProjection, { kind: 'providerHosted' }>> = [];
+  const flushHostedBlocks = (): void => {
+    if (hostedBlocks.length === 0) return;
+    items.push({
+      type: 'providerHostedGroup',
+      groupId: `draft-hosted:${draft.turnId}:${hostedBlocks[0]!.outputIndex}`,
+      blocks: hostedBlocks,
+    });
+    hostedBlocks = [];
+  };
+  for (const block of draft.orderedBlocks) {
+    if (block.kind !== 'providerHosted') {
+      flushHostedBlocks();
+      items.push({ type: 'text', block });
+      continue;
+    }
+    hostedBlocks.push(block);
+  }
+  flushHostedBlocks();
+  return items;
+}
+
 function projectionItems(projection: SessionProjection | null): ProjectionItem[] {
   if (!projection) return [];
-  const ordered: RawProjectionItem[] = [
-    ...projection.messages
-      .filter((message) => message.role === 'user' || message.role === 'assistant')
-      .map((value): RawProjectionItem => ({ type: 'message', sequence: value.sequence, value })),
-    ...projection.narratives.map((value): RawProjectionItem => ({
-      type: 'narrative', sequence: value.sequence, value,
-    })),
-    ...projection.plans.map((value): RawProjectionItem => ({
-      type: 'plan', sequence: value.sequence, value,
-    })),
-    ...projection.activities
-      .filter((activity) => activity.kind === 'tool')
-      .map((value): RawProjectionItem => ({ type: 'tool', sequence: value.sequence, value })),
-  ].sort((left, right) => left.sequence - right.sequence);
-  return ordered.reduce<ProjectionItem[]>((items, item) => {
-    if (item.type !== 'tool') {
-      items.push(item);
-      return items;
+  return projection.timeline.map((item): ProjectionItem => {
+    switch (item.kind) {
+      case 'message':
+        return {
+          type: 'message',
+          sequence: item.sequence,
+          ...(item.outputIndex !== undefined ? { outputIndex: item.outputIndex } : {}),
+          value: requiredProjectionValue(
+            projection.messages,
+            (message) => message.messageId === item.messageId,
+            'conversation_timeline_message_missing',
+          ),
+        };
+      case 'narrative':
+        return {
+          type: 'narrative',
+          sequence: item.sequence,
+          ...(item.outputIndex !== undefined ? { outputIndex: item.outputIndex } : {}),
+          value: requiredProjectionValue(
+            projection.narratives,
+            (narrative) => narrative.narrativeId === item.narrativeId,
+            'conversation_timeline_narrative_missing',
+          ),
+        };
+      case 'plan':
+        return {
+          type: 'plan',
+          sequence: item.sequence,
+          value: requiredProjectionValue(
+            projection.plans,
+            (plan) => plan.planId === item.planId && plan.revision === item.revision,
+            'conversation_timeline_plan_missing',
+          ),
+        };
+      case 'toolGroup':
+        return {
+          type: 'toolGroup',
+          sequence: item.sequence,
+          groupId: item.timelineId,
+          values: item.activityIds.map((activityId) => requiredProjectionValue(
+            projection.activities,
+            (activity) => activity.activityId === activityId,
+            'conversation_timeline_activity_missing',
+          )),
+        };
     }
-    const previous = items.at(-1);
-    if (previous?.type === 'toolGroup') {
-      previous.values.push(item.value);
-      return items;
-    }
-    items.push({
-      type: 'toolGroup',
-      sequence: item.sequence,
-      groupId: `tool-group:${item.value.activityId}`,
-      values: [item.value],
-    });
-    return items;
-  }, []);
+  });
+}
+
+function requiredProjectionValue<Value>(
+  values: readonly Value[],
+  predicate: (value: Value) => boolean,
+  error: string,
+): Value {
+  const value = values.find(predicate);
+  if (!value) throw new Error(error);
+  return value;
 }
 
 function toolGroupSummary(
@@ -1422,6 +2342,22 @@ function toolGroupSummary(
   language: UiLanguage,
 ): string {
   const status = toolGroupStatus(activities);
+  if (activities.every((activity) => activity.kind === 'providerHosted')) {
+    if (activities.length === 1) return toolActivitySummary(activities[0], language);
+    if (status === 'completed') {
+      return t(language, 'agent.providerHosted.summary.completedMany', {
+        count: activities.length,
+      });
+    }
+    if (['failed', 'cancelled', 'indeterminate', 'denied'].includes(status)) {
+      return t(language, 'agent.providerHosted.summary.didNotCompleteMany', {
+        count: activities.length,
+      });
+    }
+    return t(language, 'agent.providerHosted.summary.activeMany', {
+      count: activities.length,
+    });
+  }
   const operation = activities.length === 1
     ? (activities[0].tool?.operation ?? activities[0].label)
     : null;
@@ -1442,7 +2378,7 @@ function toolGroupSummary(
   }
   if (status === 'completed') {
     const hasShell = activities.some((activity) => (
-      activity.tool?.operation === 'process.shell'
+      activity.tool?.operation === 'bash'
     ));
     const editCount = activities.filter((activity) => (
       isFileMutationOperation(activity.tool?.operation)
@@ -1458,15 +2394,29 @@ function toolGroupSummary(
 }
 
 function toolActivitySummary(activity: ActivityProjection, language: UiLanguage): string {
+  if (activity.kind === 'providerHosted' && activity.providerHosted) {
+    const target = providerHostedActionTarget(activity.providerHosted.action);
+    const failed = ['failed', 'denied', 'indeterminate', 'cancelled'].includes(activity.status);
+    if (activity.status === 'completed') {
+      return target
+        ? t(language, 'agent.providerHosted.summary.completedTarget', { target })
+        : t(language, 'agent.providerHosted.summary.completed');
+    }
+    if (failed) {
+      return target
+        ? t(language, 'agent.providerHosted.summary.didNotCompleteTarget', { target })
+        : t(language, 'agent.providerHosted.summary.didNotComplete');
+    }
+    return target
+      ? t(language, 'agent.providerHosted.summary.activeTarget', { target })
+      : t(language, 'agent.providerHosted.summary.active');
+  }
   const operation = activity.tool?.operation ?? activity.label;
   const target = activity.tool?.resources[0]?.label;
   const command = activity.tool?.shell?.command;
   if (activity.status === 'completed') {
-    if (operation === 'process.shell' && command) {
+    if (operation === 'bash' && command) {
       return t(language, 'agent.tool.activity.ranCommand', { command });
-    }
-    if (operation === 'fs.ensure_directory' && target) {
-      return t(language, 'agent.tool.activity.createdDirectory', { path: target });
     }
     if (operation === 'fs.delete' && target) {
       return t(language, 'agent.tool.activity.deletedPath', { path: target });
@@ -1477,16 +2427,10 @@ function toolActivitySummary(activity: ActivityProjection, language: UiLanguage)
     if (operation === 'fs.read' && target) {
       return t(language, 'agent.tool.activity.readPath', { path: target });
     }
-    if (operation === 'fs.list' && target) {
-      return t(language, 'agent.tool.activity.readDirectory', { path: target });
-    }
-    if (operation === 'fs.stat' && target) {
-      return t(language, 'agent.tool.activity.inspectedPath', { path: target });
-    }
     return t(language, 'agent.tool.summary.usedOne', { operation });
   }
   if (['failed', 'denied', 'indeterminate', 'cancelled'].includes(activity.status)) {
-    if (operation === 'process.shell' && command) {
+    if (operation === 'bash' && command) {
       return t(language, 'agent.tool.activity.commandDidNotComplete', { command });
     }
     return t(language, 'agent.tool.activity.didNotComplete', {
@@ -1494,7 +2438,7 @@ function toolActivitySummary(activity: ActivityProjection, language: UiLanguage)
       target: target ? ` · ${target}` : '',
     });
   }
-  if (operation === 'process.shell' && command) {
+  if (operation === 'bash' && command) {
     return t(language, 'agent.tool.activity.runningCommand', { command });
   }
   return t(language, 'agent.tool.activity.runningOperation', {
@@ -1503,18 +2447,35 @@ function toolActivitySummary(activity: ActivityProjection, language: UiLanguage)
   });
 }
 
+function providerHostedActionType(action: Record<string, unknown> | undefined): string {
+  return typeof action?.type === 'string' ? action.type : '';
+}
+
+function providerHostedActionTarget(action: Record<string, unknown> | undefined): string {
+  if (!action) return '';
+  if (Array.isArray(action.queries)) {
+    const queries = action.queries.filter((query): query is string => (
+      typeof query === 'string' && query.length > 0
+    ));
+    if (queries.length > 0) return queries.join(' · ');
+  }
+  for (const field of ['query', 'url', 'pattern']) {
+    const value = action[field];
+    if (typeof value === 'string' && value) return value;
+  }
+  return '';
+}
+
 function isFileMutationOperation(operation: string | undefined): boolean {
   return operation !== undefined && [
-    'fs.create',
     'fs.write',
     'fs.edit',
-    'fs.ensure_directory',
     'fs.delete',
   ].includes(operation);
 }
 
 function isTerminalActivity(status: ActivityProjection['status']): boolean {
-  return ['completed', 'denied', 'failed', 'cancelled', 'indeterminate'].includes(status);
+  return ['completed', 'denied', 'rejected', 'failed', 'cancelled', 'indeterminate'].includes(status);
 }
 
 function toolActivityStatus(
@@ -1533,6 +2494,7 @@ function toolGroupStatus(
     'requested',
     'failed',
     'denied',
+    'rejected',
     'indeterminate',
     'cancelled',
     'completed',
@@ -1541,15 +2503,51 @@ function toolGroupStatus(
     ?? 'indeterminate';
 }
 
-function nextAttachmentId(): string {
-  const random = globalThis.crypto?.randomUUID?.()
-    ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-  return `attachment:${random}`;
+function emptyComposerState(): ComposerState {
+  return {
+    draft: '',
+    filesystemPaths: [],
+    pluginSelections: [],
+    selectionStart: 0,
+    selectionEnd: 0,
+    focused: false,
+  };
 }
 
-function directoryDisplayName(absolutePath: string): string {
+function cloneComposerState(state: ComposerState): ComposerState {
+  return {
+    ...state,
+    filesystemPaths: state.filesystemPaths.map((item) => ({ ...item })),
+    pluginSelections: state.pluginSelections.map((item) => ({ ...item })),
+  };
+}
+
+function providerStreamIdentity(
+  sessionId: string,
+  runId: string,
+  providerRequestId: string,
+  outputIndex?: number,
+): string {
+  return outputIndex === undefined
+    ? `${sessionId}\u0000${runId}\u0000${providerRequestId}`
+    : `${sessionId}\u0000${runId}\u0000${providerRequestId}\u0000${outputIndex}`;
+}
+
+function nextPanelId(kind: string): string {
+  const random = globalThis.crypto?.randomUUID?.()
+    ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return `${kind}:${random}`;
+}
+
+function filesystemPathDisplayName(absolutePath: string): string {
   const normalized = absolutePath.replace(/[\\/]+$/u, '');
   return normalized.split(/[\\/]/u).at(-1) || absolutePath;
+}
+
+function mediaTypeForPath(absolutePath: string): string {
+  return absolutePath.toLocaleLowerCase().endsWith('.pdf')
+    ? 'application/pdf'
+    : 'application/octet-stream';
 }
 
 function formatBytes(value: number, language: UiLanguage): string {

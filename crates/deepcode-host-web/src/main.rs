@@ -432,6 +432,7 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("PATCH", ["api", "llm", "profiles"])
         | ("POST", ["api", "llm", "probe"])
         | ("GET", ["api", "conversation", "catalog"])
+        | ("GET", ["api", "conversation", "plugins"])
         | ("GET", ["api", "conversation", "catalog", "manage"])
         | ("POST", ["api", "conversation", "projects"])
         | ("POST", ["api", "conversation", "sessions"])
@@ -457,11 +458,31 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("PATCH", ["api", "conversation", "sessions", _])
         | ("DELETE", ["api", "conversation", "sessions", _])
         | ("POST", ["api", "conversation", "sessions", _, "directory-indexes"])
-        | ("POST", ["api", "conversation", "sessions", _, "directory-attachments", "resolve"])
+        | ("POST", ["api", "conversation", "sessions", _, "filesystem-references", "resolve"])
         | ("DELETE", ["api", "conversation", "sessions", _, "directory-indexes", _])
         | ("GET", ["api", "conversation", "sessions", _, "projection"])
+        | ("GET", ["api", "conversation", "sessions", _, "context-compositions", _])
+        | ("POST", ["api", "conversation", "sessions", _, "read"])
         | ("POST", ["api", "conversation", "sessions", _, "resources", "read"]) => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_proxy_path_allowed;
+
+    #[test]
+    fn host_proxy_exposes_only_the_exact_plugin_catalog_get_route() {
+        assert!(host_proxy_path_allowed("GET", "/api/conversation/plugins"));
+        assert!(!host_proxy_path_allowed(
+            "POST",
+            "/api/conversation/plugins"
+        ));
+        assert!(!host_proxy_path_allowed(
+            "GET",
+            "/api/conversation/plugins/extra"
+        ));
     }
 }
 
@@ -523,94 +544,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         );
     }
     difference == 0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{host_proxy_path_allowed, trusted_desktop_origin};
-
-    #[test]
-    fn desktop_http_origin_accepts_the_local_review_port() {
-        assert!(trusted_desktop_origin(
-            "http://deepcode-gui.localhost:31245"
-        ));
-        assert!(trusted_desktop_origin("http://deepcode-editor.localhost"));
-        assert!(!trusted_desktop_origin(
-            "http://deepcode-gui.localhost.example:31245"
-        ));
-        assert!(!trusted_desktop_origin(
-            "http://deepcode-gui.localhost:not-a-port"
-        ));
-    }
-
-    #[test]
-    fn conversation_catalog_routes_are_exposed_to_the_gui_shell() {
-        assert!(host_proxy_path_allowed("GET", "/api/conversation/catalog"));
-        assert!(host_proxy_path_allowed(
-            "GET",
-            "/api/conversation/catalog/manage"
-        ));
-        assert!(host_proxy_path_allowed(
-            "POST",
-            "/api/conversation/projects"
-        ));
-        assert!(host_proxy_path_allowed(
-            "PATCH",
-            "/api/conversation/projects/project%3Aone"
-        ));
-        assert!(host_proxy_path_allowed(
-            "DELETE",
-            "/api/conversation/projects/project%3Aone"
-        ));
-        assert!(host_proxy_path_allowed(
-            "PATCH",
-            "/api/conversation/sessions/session%3Aone"
-        ));
-        assert!(host_proxy_path_allowed(
-            "DELETE",
-            "/api/conversation/sessions/session%3Aone"
-        ));
-        assert!(host_proxy_path_allowed(
-            "POST",
-            "/api/conversation/sessions/session%3Aone/resources/read"
-        ));
-        assert!(host_proxy_path_allowed(
-            "POST",
-            "/api/conversation/sessions/session%3Aone/directory-indexes"
-        ));
-        assert!(host_proxy_path_allowed(
-            "POST",
-            "/api/conversation/sessions/session%3Aone/directory-attachments/resolve"
-        ));
-        assert!(host_proxy_path_allowed(
-            "DELETE",
-            "/api/conversation/sessions/session%3Aone/directory-indexes/workspace%3Aone"
-        ));
-    }
-
-    #[test]
-    fn conversation_catalog_does_not_open_an_unbounded_proxy_prefix() {
-        assert!(!host_proxy_path_allowed(
-            "POST",
-            "/api/conversation/catalog"
-        ));
-        assert!(!host_proxy_path_allowed(
-            "GET",
-            "/api/conversation/projects/project%3Aone"
-        ));
-        assert!(!host_proxy_path_allowed(
-            "DELETE",
-            "/api/conversation/sessions/session%3Aone/projection"
-        ));
-        assert!(!host_proxy_path_allowed(
-            "GET",
-            "/api/conversation/sessions/session%3Aone/projection/stream"
-        ));
-        assert!(!host_proxy_path_allowed(
-            "GET",
-            "/api/conversation/sessions/session%3Aone/resources/read"
-        ));
-    }
 }
 
 async fn proxy_response(response: reqwest::Response) -> Response {

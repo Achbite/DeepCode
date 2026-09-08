@@ -1,12 +1,13 @@
-# Skill / MCP 冒烟资产
+# Skill / MCP 链路输入
 
-该目录只提供小型本地测试输入，用于验证当前插件组合路径：
+该目录只保留两项可由测试临时装配的原始输入：
 
-- `skills/text-echo-declarative` 和 `skills/text-transform-brokered` 的 `SKILL.md`
-  会作为 Session instruction contribution 加载；Skill 文本本身不授予工具权限。
-- `mcp/mcp-text-tools/server.py` 是行分隔 JSON-RPC 的本地 stdio MCP Server，
-  提供 `text.reverse` 工具；MCP 进程由 Kernel 插件适配器持有并在退出时回收。
-- MCP 工具与内置工具使用同一个 Kernel 请求、授权、执行记录和恢复读取路径。
-- `plugin/text-tools.plugin.json` 等旧描述文件仅作为历史 fixture 输入，不参与当前运行时组合。
+- `skills/text-echo-declarative/SKILL.md` 是纯 instruction contribution；它不授予
+  Kernel 工具、工作区、Shell、网络或 secret 权限。
+- `mcp/mcp-text-tools/server.py` 是行分隔 JSON-RPC 的本地 stdio MCP Server，提供
+  `text.reverse` 工具。测试通过临时设置注册它，Kernel 持有并回收对应进程。
 
-这些资产不形成第二套合同，也不作为发布清单或自审计包。
+测试应通过结构化 Provider fixture 驱动工具识别和执行，不依赖固定自然语言问句或
+关键词。运行中的 generation 保持其启动快照；输入变更只应在下一次 run 被发现。
+
+这些文件不是插件 descriptor、运行时合同、发布清单或第二套事实源。

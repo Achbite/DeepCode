@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "deepcode-gui-tauri-shell"
-version = "0.5.45"
+version = "0.5.50"
 dependencies = [
  "deepcode-kernel-abi",
  "getrandom 0.3.4",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "deepcode-kernel-abi"
-version = "0.5.45"
+version = "0.5.50"
 dependencies = [
  "serde",
  "serde_json",

@@ -7,9 +7,6 @@ pub(crate) struct AppState {
     pub(crate) session_service: crate::session_service::SessionServiceProcess,
     pub(crate) host_connection: crate::host_connection::HostConnection,
     pub(crate) gui: Arc<Mutex<GuiState>>,
-    /// Immutable settings snapshot used to assemble the current Kernel and
-    /// Session runtimes. Saved settings may diverge until the daemon restarts.
-    pub(crate) runtime_user_settings: Value,
     pub(crate) host_services: HostServices,
     pub(crate) terminal_runtime: Arc<Mutex<crate::terminal_api::TerminalRuntime>>,
 }
@@ -23,6 +20,7 @@ pub(crate) struct HostPaths {
     pub(crate) catalog_store_path: PathBuf,
     pub(crate) session_store_path: PathBuf,
     pub(crate) tool_record_store_path: PathBuf,
+    pub(crate) attachment_store_root: PathBuf,
 }
 
 #[derive(Debug)]
@@ -94,6 +92,7 @@ impl HostPaths {
             catalog_store_path: runtime_root.join("catalog.sqlite3"),
             session_store_path: runtime_root.join("session.sqlite3"),
             tool_record_store_path: runtime_root.join("tool-record.sqlite3"),
+            attachment_store_root: runtime_root.join("attachments"),
         }
     }
 }

@@ -1,22 +1,25 @@
 import type {
   CommandJournalPort,
   CommandReply,
+  ContextCompositionProjection,
   ConversationCommand,
   ConversationPort,
+  ConversationReadQuery,
+  ConversationReadResult,
   SessionProjection,
   WorkspaceBindingDisplay,
 } from '@deepcode/protocol';
 import { SessionActor } from './actor.js';
 import type { AgentComposition } from './plugins.js';
+import { readConversation, readSessionEvents } from './conversationRead.js';
+import { recoverSession } from './reducer.js';
 
 export interface SessionCompositionFactory {
   create(input: {
     sessionId: string;
     workspaceBindings: readonly WorkspaceBindingDisplay[];
-    profileId?: string;
   }): Promise<{
     composition: AgentComposition;
-    profileId?: string;
   }>;
 }
 
@@ -47,13 +50,23 @@ export class SessionService implements ConversationPort {
   async deleteSession(sessionId: string): Promise<void> {
     const actorPromise = this.#actors.get(sessionId);
     if (actorPromise) {
-      const actor = await actorPromise;
-      const projection = await actor.snapshot();
-      if (projection.run && ['running', 'waiting'].includes(projection.run.status)) {
-        throw new Error('session_delete_active_run');
+      let actor: SessionActor | undefined;
+      try {
+        actor = await actorPromise;
+      } catch (error) {
+        if (this.#actors.get(sessionId) === actorPromise) this.#actors.delete(sessionId);
+        if (isActorOpenRollbackFailure(error)) throw error;
       }
-      await actor.dispose();
-      this.#actors.delete(sessionId);
+      if (actor) {
+        if (!actor.hasLoopFailure()) {
+          const projection = await actor.snapshot();
+          if (projection.run && ['running', 'waiting'].includes(projection.run.status)) {
+            throw new Error('session_delete_active_run');
+          }
+        }
+        await actor.dispose();
+        if (this.#actors.get(sessionId) === actorPromise) this.#actors.delete(sessionId);
+      }
     }
     await this.journal.deleteSession(sessionId);
   }
@@ -66,10 +79,33 @@ export class SessionService implements ConversationPort {
     return await (await this.actor(sessionId)).snapshot();
   }
 
+  async contextComposition(sessionId: string, providerRequestId: string): Promise<ContextCompositionProjection> {
+    const state = recoverSession(sessionId, await readSessionEvents(this.journal, sessionId));
+    const receipt = state.contextCompositions.find((item) => item.providerRequestId === providerRequestId);
+    if (!receipt) throw new Error('context_composition_not_found');
+    return structuredClone(receipt);
+  }
+
+  async read(query: ConversationReadQuery): Promise<ConversationReadResult> {
+    return await readConversation(this.journal, query);
+  }
+
   async dispose(): Promise<void> {
-    const actors = await Promise.all(this.#actors.values());
-    await Promise.all(actors.map((actor) => actor.dispose()));
+    const actorPromises = [...this.#actors.values()];
     this.#actors.clear();
+    const actorResults = await Promise.allSettled(actorPromises);
+    const errors: unknown[] = actorResults.flatMap((result) => (
+      result.status === 'rejected' ? [result.reason] : []
+    ));
+    const disposeResults = await Promise.allSettled(
+      actorResults.flatMap((result) => (
+        result.status === 'fulfilled' ? [result.value.dispose()] : []
+      )),
+    );
+    errors.push(...disposeResults.flatMap((result) => (
+      result.status === 'rejected' ? [result.reason] : []
+    )));
+    if (errors.length > 0) throw new AggregateError(errors, 'session_service_dispose_failed');
   }
 
   private async actor(sessionId: string): Promise<SessionActor> {
@@ -91,16 +127,29 @@ export class SessionService implements ConversationPort {
     const installed = await this.compositions.create({
       sessionId,
       workspaceBindings: first.payload.workspaceBindings.map((binding) => ({ ...binding })),
-      ...(profileId ? { profileId } : {}),
     });
     const actor = new SessionActor(sessionId, this.journal, installed.composition, {
-      ...(profileId ?? installed.profileId
-        ? { profileId: profileId ?? installed.profileId }
-        : {}),
+      ...(profileId ? { profileId } : {}),
     });
-    await actor.recover();
-    return actor;
+    try {
+      await actor.recover();
+      return actor;
+    } catch (error) {
+      try {
+        await actor.dispose();
+      } catch (disposeError) {
+        throw new AggregateError(
+          [error, disposeError],
+          'session_actor_open_rollback_failed',
+        );
+      }
+      throw error;
+    }
   }
+}
+
+function isActorOpenRollbackFailure(error: unknown): boolean {
+  return error instanceof AggregateError && error.message === 'session_actor_open_rollback_failed';
 }
 
 async function firstEvent(journal: CommandJournalPort, sessionId: string) {

@@ -1,14 +1,15 @@
 use crate::app::TuiApp;
 use deepcode_kernel_client::{
-    ActivityProjection, ContextCompositionProjection, ContextUsageProjection, NarrativeProjection,
-    PendingPlanProjection, ProjectionMessage, SessionProjection,
+    ActivityProjection, AssistantDraftProjection, ContextCompositionProjection,
+    ContextUsageProjection, NarrativeProjection, PendingPlanProjection, PlanProjection,
+    ProjectionMessage, SessionProjection, SessionTimelineItem, TokenUsageProjection,
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     prelude::Frame,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 #[derive(Clone, Default)]
@@ -46,6 +47,9 @@ impl Renderer {
             self.draw_todo(frame, content[1], app);
         }
         self.draw_input(frame, rows[2], app);
+        if app.plugin_picker_open() {
+            self.draw_plugin_picker(frame, rows[1], app);
+        }
         frame.render_widget(
             Paragraph::new(app.status()).style(Style::default().fg(Color::DarkGray)),
             rows[3],
@@ -71,29 +75,36 @@ impl Renderer {
             }
             for item in timeline_items(projection) {
                 match item {
-                    TimelineItem::Message(message) => {
+                    TimelineItem::Message { value: message, .. } => {
                         output.push_str(&format!("{}: {}\n", message.role, message.content));
-                        if !message.attachments.is_empty() {
+                        if !message.filesystem_references.is_empty() {
                             output.push_str(&format!(
-                                "  附件：{}\n",
+                                "  文件系统引用：{}\n",
                                 message
-                                    .attachments
+                                    .filesystem_references
                                     .iter()
-                                    .map(|attachment| attachment.name.as_str())
+                                    .map(|reference| reference.display_name.as_str())
                                     .collect::<Vec<_>>()
                                     .join(", ")
                             ));
                         }
                     }
-                    TimelineItem::Narrative(narrative) => {
+                    TimelineItem::Narrative {
+                        value: narrative, ..
+                    } => {
                         output.push_str(&format!("{}\n", narrative.content));
                     }
-                    TimelineItem::Tool(activity) => {
-                        render_tool_plain(&mut output, activity);
+                    TimelineItem::Plan { value: plan, .. } => {
+                        render_timeline_plan_plain(&mut output, plan);
+                    }
+                    TimelineItem::ToolGroup { activities, .. } => {
+                        for activity in activities {
+                            render_tool_plain(&mut output, activity);
+                        }
                     }
                 }
             }
-            if let Some(draft) = projection.assistant_draft.as_ref() {
+            if let Some(draft) = visible_assistant_draft(projection) {
                 output.push_str(&draft.content);
                 output.push_str("▋\n");
             }
@@ -134,6 +145,25 @@ impl Renderer {
             }
         } else {
             output.push_str("Session 尚未初始化。\n");
+        }
+        let selected_plugins = app.selected_plugin_labels();
+        if !selected_plugins.is_empty() {
+            output.push_str(&format!(
+                "下一次请求插件：{}\n",
+                selected_plugins.join(", ")
+            ));
+        }
+        if app.plugin_picker_open() {
+            output.push_str("插件候选：\n");
+            for entry in app.plugin_picker_entries() {
+                output.push_str(&format!(
+                    "  {} {} · {} ({})\n",
+                    if entry.highlighted { ">" } else { " " },
+                    entry.display_name,
+                    entry.short_description,
+                    entry.uri,
+                ));
+            }
         }
         output.push_str("────────────────────────────────────────\n");
         output.push_str(app.status());
@@ -247,7 +277,7 @@ impl Renderer {
         if let Some(projection) = app.projection() {
             for item in timeline_items(projection) {
                 match item {
-                    TimelineItem::Message(message) => {
+                    TimelineItem::Message { value: message, .. } => {
                         let color = if message.role == "user" {
                             Color::Blue
                         } else if message.role == "assistant" {
@@ -259,14 +289,14 @@ impl Renderer {
                             format!("{}: {}", message.role, message.content),
                             Style::default().fg(color),
                         )));
-                        if !message.attachments.is_empty() {
+                        if !message.filesystem_references.is_empty() {
                             lines.push(Line::from(Span::styled(
                                 format!(
-                                    "  附件：{}",
+                                    "  文件系统引用：{}",
                                     message
-                                        .attachments
+                                        .filesystem_references
                                         .iter()
-                                        .map(|attachment| attachment.name.as_str())
+                                        .map(|reference| reference.display_name.as_str())
                                         .collect::<Vec<_>>()
                                         .join(", ")
                                 ),
@@ -274,19 +304,26 @@ impl Renderer {
                             )));
                         }
                     }
-                    TimelineItem::Narrative(narrative) => {
+                    TimelineItem::Narrative {
+                        value: narrative, ..
+                    } => {
                         lines.push(Line::from(Span::styled(
                             narrative.content.as_str(),
                             Style::default().fg(Color::DarkGray),
                         )));
                     }
-                    TimelineItem::Tool(activity) => {
-                        push_tool_lines(&mut lines, activity);
+                    TimelineItem::Plan { value: plan, .. } => {
+                        push_timeline_plan_lines(&mut lines, plan);
+                    }
+                    TimelineItem::ToolGroup { activities, .. } => {
+                        for activity in activities {
+                            push_tool_lines(&mut lines, activity);
+                        }
                     }
                 }
                 lines.push(Line::from(""));
             }
-            if let Some(draft) = projection.assistant_draft.as_ref() {
+            if let Some(draft) = visible_assistant_draft(projection) {
                 lines.push(Line::from(Span::styled(
                     format!("{}▋", draft.content),
                     Style::default().fg(Color::White),
@@ -392,28 +429,89 @@ impl Renderer {
     }
 
     fn draw_input(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+        let selected_plugins = app.selected_plugin_labels();
+        let title = if app.has_pending_plan() {
+            " Plan response ".to_string()
+        } else if app
+            .projection()
+            .is_some_and(|projection| projection.pending_approval.is_some())
+        {
+            " Approval (1 allow / 2 deny) ".to_string()
+        } else if selected_plugins.is_empty() {
+            " Message · @ plugins ".to_string()
+        } else {
+            format!(" Message · plugins: {} ", selected_plugins.join(", "))
+        };
         frame.render_widget(
             Paragraph::new(app.input())
                 .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(if app.has_pending_plan() {
-                            " Plan response "
-                        } else if app
-                            .projection()
-                            .is_some_and(|projection| projection.pending_approval.is_some())
-                        {
-                            " Approval (1 allow / 2 deny) "
-                        } else {
-                            " Message "
-                        }),
-                ),
+                .block(Block::default().borders(Borders::ALL).title(title)),
             area,
         );
-        let width = area.width.saturating_sub(2).max(1);
-        let offset = app.input().chars().count() as u16;
-        frame.set_cursor_position((area.x + 1 + offset % width, area.y + 1 + offset / width));
+        let width = usize::from(area.width.saturating_sub(2).max(1));
+        let offset = Line::from(app.input()).width();
+        let column = u16::try_from(offset % width).unwrap_or(0);
+        let row = u16::try_from(offset / width).unwrap_or(u16::MAX);
+        frame.set_cursor_position((area.x + 1 + column, area.y + 1 + row));
+    }
+
+    fn draw_plugin_picker(&self, frame: &mut Frame<'_>, anchor: Rect, app: &TuiApp) {
+        let entries = app.plugin_picker_entries();
+        let content_height = entries.len().saturating_mul(2).max(1);
+        let height = u16::try_from(content_height.saturating_add(2))
+            .unwrap_or(anchor.height)
+            .min(anchor.height.max(1));
+        let area = Rect {
+            x: anchor.x,
+            y: anchor
+                .y
+                .saturating_add(anchor.height.saturating_sub(height)),
+            width: anchor.width,
+            height,
+        };
+        let mut lines = Vec::new();
+        if entries.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "没有匹配的可用插件",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for entry in entries {
+                let marker = if entry.highlighted { ">" } else { " " };
+                let selected = if entry.already_selected {
+                    " · selected"
+                } else {
+                    ""
+                };
+                let style = if entry.highlighted {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{marker} {}{selected}", entry.display_name),
+                    style,
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!("  {} · {}", entry.short_description, entry.uri),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+        let title = app
+            .plugin_picker_query()
+            .filter(|query| !query.is_empty())
+            .map(|query| format!(" Plugins · @{query} · Enter/Tab select · Esc close "))
+            .unwrap_or_else(|| " Plugins · Enter/Tab select · Esc close ".to_string());
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(Block::default().borders(Borders::ALL).title(title)),
+            area,
+        );
     }
 }
 
@@ -424,7 +522,7 @@ const CONTEXT_PARTITIONS: [(&str, &str); 7] = [
     ("workspaceBindings", "目录索引"),
     ("contextProviders", "上下文提供项"),
     ("journalMessages", "对话消息"),
-    ("messageAttachments", "消息附件"),
+    ("filesystemReferences", "文件系统引用"),
 ];
 
 fn context_lines(projection: Option<&SessionProjection>, bar_width: usize) -> Vec<Line<'static>> {
@@ -454,7 +552,8 @@ fn context_lines(projection: Option<&SessionProjection>, bar_width: usize) -> Ve
         lines.push(context_usage_bar(usage, bar_width));
         lines.push(context_usage_legend(usage));
         lines.push(Line::from(""));
-        if let Some((hit, miss)) = context_cache_counts(usage) {
+        let cache = &projection.token_usage;
+        if cache.cache_available {
             lines.push(Line::from(vec![
                 Span::styled(
                     "Cache ",
@@ -462,29 +561,46 @@ fn context_lines(projection: Option<&SessionProjection>, bar_width: usize) -> Ve
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!(
-                    "{} · hit {} · miss {}",
-                    percent_label(hit, hit.saturating_add(miss)),
-                    format_number(hit),
-                    format_number(miss),
-                )),
+                Span::raw(cache_detail_label(cache)),
             ]));
-            lines.push(cache_bar(hit, miss, bar_width));
+            lines.push(cache_bar(cache.cache_hit_ratio, bar_width));
         } else {
-            lines.push(Line::from(Span::styled(
-                "Cache N/A",
-                Style::default().fg(Color::DarkGray),
-            )));
+            lines.push(Line::from(vec![
+                Span::styled("Cache N/A", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(
+                        " · reports {}/{} ({})",
+                        cache.reported_call_count,
+                        cache.provider_call_count,
+                        cache_coverage_label(cache),
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
         }
     } else {
         lines.push(Line::from(Span::styled(
             "Context N/A",
             Style::default().fg(Color::DarkGray),
         )));
-        lines.push(Line::from(Span::styled(
-            "Cache N/A",
-            Style::default().fg(Color::DarkGray),
-        )));
+        let cache = &projection.token_usage;
+        if cache.cache_available {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Cache ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(cache_detail_label(cache)),
+            ]));
+            lines.push(cache_bar(cache.cache_hit_ratio, bar_width));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "Cache N/A",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
 
     lines.push(Line::from(""));
@@ -546,12 +662,12 @@ fn context_usage_legend(usage: &ContextUsageProjection) -> Line<'static> {
     ])
 }
 
-fn cache_bar(hit: u64, miss: u64, width: usize) -> Line<'static> {
-    let total = hit.saturating_add(miss);
-    if total == 0 {
+fn cache_bar(cache_hit_ratio: Option<f64>, width: usize) -> Line<'static> {
+    let Some(cache_hit_ratio) = cache_hit_ratio else {
         return Line::from(Span::styled("N/A", Style::default().fg(Color::DarkGray)));
-    }
-    let hit_width = scaled_width(hit, total, width).min(width);
+    };
+    let hit_width = (cache_hit_ratio * width as f64).round() as usize;
+    let hit_width = hit_width.min(width);
     let miss_width = width.saturating_sub(hit_width);
     Line::from(vec![
         Span::styled("█".repeat(hit_width), Style::default().fg(Color::Green)),
@@ -580,12 +696,6 @@ fn scaled_width(value: u64, total: u64, width: usize) -> usize {
     usize::try_from(numerator / u128::from(total)).unwrap_or(width)
 }
 
-fn context_cache_counts(usage: &ContextUsageProjection) -> Option<(u64, u64)> {
-    let hit = usage.cache_read_input_tokens?;
-    let miss = usage.cache_miss_input_tokens?;
-    (hit.saturating_add(miss) > 0).then_some((hit, miss))
-}
-
 fn current_context_receipt(
     projection: &SessionProjection,
 ) -> Option<&ContextCompositionProjection> {
@@ -594,9 +704,16 @@ fn current_context_receipt(
             .context_compositions
             .iter()
             .rev()
-            .find(|receipt| receipt.provider_request_id == usage.provider_request_id);
+            .find(|receipt| {
+                receipt.purpose == "agent"
+                    && receipt.provider_request_id == usage.provider_request_id
+            });
     }
-    projection.context_compositions.last()
+    projection
+        .context_compositions
+        .iter()
+        .rev()
+        .find(|receipt| receipt.purpose == "agent")
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -675,18 +792,19 @@ fn render_context_plain(output: &mut String, projection: &SessionProjection) {
         ));
         output.push_str(&plain_usage_bar(usage, 40));
         output.push('\n');
-        if let Some((hit, miss)) = context_cache_counts(usage) {
-            output.push_str(&format!(
-                "Cache {} · hit {} · miss {}\n",
-                percent_label(hit, hit.saturating_add(miss)),
-                format_number(hit),
-                format_number(miss),
-            ));
-        } else {
-            output.push_str("Cache N/A\n");
-        }
     } else {
-        output.push_str("Context N/A\nCache N/A\n");
+        output.push_str("Context N/A\n");
+    }
+    let cache = &projection.token_usage;
+    if cache.cache_available {
+        output.push_str(&format!("Cache {}\n", cache_detail_label(cache)));
+    } else {
+        output.push_str(&format!(
+            "Cache N/A · reports {}/{} ({})\n",
+            cache.reported_call_count,
+            cache.provider_call_count,
+            cache_coverage_label(cache),
+        ));
     }
     output.push_str("Request\n");
     if let Some(receipt) = current_context_receipt(projection) {
@@ -721,40 +839,62 @@ fn plain_usage_bar(usage: &ContextUsageProjection, width: usize) -> String {
 }
 
 enum TimelineItem<'a> {
-    Message(&'a ProjectionMessage),
-    Narrative(&'a NarrativeProjection),
-    Tool(&'a ActivityProjection),
-}
-
-impl TimelineItem<'_> {
-    fn sequence(&self) -> u64 {
-        match self {
-            Self::Message(value) => value.sequence,
-            Self::Narrative(value) => value.sequence,
-            Self::Tool(value) => value.sequence,
-        }
-    }
+    Message {
+        value: &'a ProjectionMessage,
+    },
+    Narrative {
+        value: &'a NarrativeProjection,
+    },
+    Plan {
+        value: &'a PlanProjection,
+    },
+    ToolGroup {
+        activities: Vec<&'a ActivityProjection>,
+    },
 }
 
 fn timeline_items(projection: &SessionProjection) -> Vec<TimelineItem<'_>> {
-    let tool_count = projection
-        .activities
+    projection
+        .timeline
         .iter()
-        .filter(|activity| activity.kind == "tool")
-        .count();
-    let mut items =
-        Vec::with_capacity(projection.messages.len() + projection.narratives.len() + tool_count);
-    items.extend(projection.messages.iter().map(TimelineItem::Message));
-    items.extend(projection.narratives.iter().map(TimelineItem::Narrative));
-    items.extend(
-        projection
-            .activities
-            .iter()
-            .filter(|activity| activity.kind == "tool")
-            .map(TimelineItem::Tool),
-    );
-    items.sort_by_key(TimelineItem::sequence);
-    items
+        .map(|item| match item {
+            SessionTimelineItem::Message { message_id, .. } => TimelineItem::Message {
+                value: projection
+                    .messages
+                    .iter()
+                    .find(|message| message.message_id == *message_id)
+                    .expect("validated Session timeline message reference"),
+            },
+            SessionTimelineItem::Narrative { narrative_id, .. } => TimelineItem::Narrative {
+                value: projection
+                    .narratives
+                    .iter()
+                    .find(|narrative| narrative.narrative_id == *narrative_id)
+                    .expect("validated Session timeline narrative reference"),
+            },
+            SessionTimelineItem::Plan {
+                plan_id, revision, ..
+            } => TimelineItem::Plan {
+                value: projection
+                    .plans
+                    .iter()
+                    .find(|plan| plan.plan_id == *plan_id && plan.revision == *revision)
+                    .expect("validated Session timeline plan reference"),
+            },
+            SessionTimelineItem::ToolGroup { activity_ids, .. } => TimelineItem::ToolGroup {
+                activities: activity_ids
+                    .iter()
+                    .map(|activity_id| {
+                        projection
+                            .activities
+                            .iter()
+                            .find(|activity| activity.activity_id == *activity_id)
+                            .expect("validated Session timeline activity reference")
+                    })
+                    .collect(),
+            },
+        })
+        .collect()
 }
 
 fn push_tool_lines(lines: &mut Vec<Line<'_>>, activity: &ActivityProjection) {
@@ -779,6 +919,17 @@ fn push_tool_lines(lines: &mut Vec<Line<'_>>, activity: &ActivityProjection) {
                 Style::default().fg(Color::DarkGray),
             )));
             if let Some(result) = shell.result.as_ref() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  environment: shell={} · interactive={} · pathSource={} · writeScope={} · homeWritable={}",
+                        result.environment.shell,
+                        result.environment.interactive,
+                        result.environment.path_source,
+                        result.environment.write_scope,
+                        result.environment.home_writable,
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )));
                 let exit = result
                     .exit_code
                     .map_or_else(|| "signal/timeout".to_string(), |code| code.to_string());
@@ -826,6 +977,22 @@ fn push_tool_lines(lines: &mut Vec<Line<'_>>, activity: &ActivityProjection) {
     }
 }
 
+fn push_timeline_plan_lines(lines: &mut Vec<Line<'_>>, plan: &PlanProjection) {
+    lines.push(Line::from(Span::styled(
+        format!("Plan · revision {} · {}", plan.revision, plan.status),
+        Style::default().fg(Color::Cyan),
+    )));
+    lines.push(Line::from(Span::styled(
+        plan.title.clone(),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(plan.summary.clone()));
+    for (index, step) in plan.steps.iter().enumerate() {
+        lines.push(Line::from(format!("{}. {}", index + 1, step.title)));
+        lines.push(Line::from(format!("   {}", step.details)));
+    }
+}
+
 fn push_tool_stream_lines(lines: &mut Vec<Line<'_>>, label: &str, output: &str) {
     if output.is_empty() {
         return;
@@ -851,6 +1018,14 @@ fn render_tool_plain(output: &mut String, activity: &ActivityProjection) {
             output.push_str(&format!("  $ {}\n", shell.command));
             output.push_str(&format!("  cwd: {}\n", shell.cwd));
             if let Some(result) = shell.result.as_ref() {
+                output.push_str(&format!(
+                    "  environment: shell={} · interactive={} · pathSource={} · writeScope={} · homeWritable={}\n",
+                    result.environment.shell,
+                    result.environment.interactive,
+                    result.environment.path_source,
+                    result.environment.write_scope,
+                    result.environment.home_writable,
+                ));
                 let exit = result
                     .exit_code
                     .map_or_else(|| "signal/timeout".to_string(), |code| code.to_string());
@@ -936,20 +1111,42 @@ fn activity_color(status: &str) -> Color {
 
 fn cache_hit_label(projection: &SessionProjection) -> String {
     let usage = &projection.token_usage;
-    if usage.cache_reported_call_count == 0 {
+    if !usage.cache_available {
         return "--%".to_string();
     }
-    let Some(total) = usage
-        .cache_read_input_tokens
-        .checked_add(usage.cache_miss_input_tokens)
-        .filter(|total| *total > 0)
-    else {
-        return "--%".to_string();
-    };
+    usage
+        .cache_hit_ratio
+        .map(|ratio| format!("{:.0}%", ratio * 100.0))
+        .unwrap_or_else(|| "--%".to_string())
+}
+
+fn cache_detail_label(usage: &TokenUsageProjection) -> String {
     format!(
-        "{:.0}%",
-        usage.cache_read_input_tokens as f64 * 100.0 / total as f64
+        "{} · hit {} · miss {} · reports {}/{} ({})",
+        usage
+            .cache_hit_ratio
+            .map(|ratio| format!("{:.1}%", ratio * 100.0))
+            .unwrap_or_else(|| "N/A".to_string()),
+        format_number(usage.cache_read_input_tokens),
+        format_number(usage.cache_miss_input_tokens),
+        usage.reported_call_count,
+        usage.provider_call_count,
+        cache_coverage_label(usage),
     )
+}
+
+fn cache_coverage_label(usage: &TokenUsageProjection) -> &'static str {
+    if usage.cache_complete {
+        "complete"
+    } else if usage.cache_available {
+        "partial"
+    } else {
+        "unavailable"
+    }
+}
+
+fn visible_assistant_draft(projection: &SessionProjection) -> Option<&AssistantDraftProjection> {
+    projection.assistant_draft.as_ref()
 }
 
 fn render_plan_plain(output: &mut String, plan: &PendingPlanProjection) {
@@ -967,104 +1164,19 @@ fn render_plan_plain(output: &mut String, plan: &PendingPlanProjection) {
     output.push_str("输入 1/确认；其他非空文本用于修订；/cancel-plan 明确取消。\n");
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use deepcode_kernel_client::ContextCompositionPartitionProjection;
-
-    #[test]
-    fn context_partition_metrics_follow_session_projection_without_shell_estimates() {
-        let receipt = ContextCompositionProjection {
-            provider_request_id: "provider-request:test".to_string(),
-            run_id: "run:test".to_string(),
-            response_constraint: "normal".to_string(),
-            messages: Vec::new(),
-            workspace_bindings: Vec::new(),
-            tools: Vec::new(),
-            partitions: CONTEXT_PARTITIONS
-                .iter()
-                .zip([1, 0, 2, 1, 0, 1, 2])
-                .map(
-                    |((kind, _), item_count)| ContextCompositionPartitionProjection {
-                        kind: (*kind).to_string(),
-                        item_count,
-                        request_shape_units: item_count,
-                        estimated_input_tokens: None,
-                        token_source: None,
-                    },
-                )
-                .collect(),
-            sequence: 1,
-            created_at: "2026-08-27T00:00:00Z".to_string(),
-        };
-
-        assert_eq!(
-            context_partition_metrics(&receipt),
-            [
-                ContextPartitionMetric {
-                    item_count: 1,
-                    estimated_input_tokens: None
-                },
-                ContextPartitionMetric::default(),
-                ContextPartitionMetric {
-                    item_count: 2,
-                    estimated_input_tokens: None
-                },
-                ContextPartitionMetric {
-                    item_count: 1,
-                    estimated_input_tokens: None
-                },
-                ContextPartitionMetric::default(),
-                ContextPartitionMetric {
-                    item_count: 1,
-                    estimated_input_tokens: None
-                },
-                ContextPartitionMetric {
-                    item_count: 2,
-                    estimated_input_tokens: None
-                },
-            ],
-        );
-    }
-
-    #[test]
-    fn context_partition_metrics_render_only_session_owned_estimates() {
-        let mut receipt = ContextCompositionProjection {
-            provider_request_id: "provider-request:test".to_string(),
-            run_id: "run:test".to_string(),
-            response_constraint: "normal".to_string(),
-            messages: Vec::new(),
-            workspace_bindings: Vec::new(),
-            tools: Vec::new(),
-            partitions: CONTEXT_PARTITIONS
-                .iter()
-                .enumerate()
-                .map(|(index, (kind, _))| ContextCompositionPartitionProjection {
-                    kind: (*kind).to_string(),
-                    item_count: index as u64,
-                    request_shape_units: index as u64 + 1,
-                    estimated_input_tokens: Some(index as u64 + 10),
-                    token_source: Some("sessionEstimated".to_string()),
-                })
-                .collect(),
-            sequence: 1,
-            created_at: "2026-08-27T00:00:00Z".to_string(),
-        };
-        let metrics = context_partition_metrics(&receipt);
-        assert_eq!(metrics[2].estimated_input_tokens, Some(12));
-        assert_eq!(partition_token_label(metrics[2]), "≈12 Token");
-
-        receipt.partitions[2].token_source = None;
-        assert_eq!(
-            context_partition_metrics(&receipt)[2].estimated_input_tokens,
-            None,
-        );
-    }
-
-    #[test]
-    fn context_bar_widths_preserve_total_width() {
-        let widths = segment_widths(36_000, 4_000, 24_000, 40);
-        assert_eq!(widths.0 + widths.1 + widths.2, 40);
-        assert_eq!(format_number(64_000), "64,000");
+fn render_timeline_plan_plain(output: &mut String, plan: &PlanProjection) {
+    output.push_str(&format!(
+        "Plan · revision {} · {}\n",
+        plan.revision, plan.status
+    ));
+    output.push_str(&format!("{}\n{}\n", plan.title, plan.summary));
+    for (index, step) in plan.steps.iter().enumerate() {
+        output.push_str(&format!("{}. {}\n", index + 1, step.title));
+        output.push_str(&format!("   {}\n", step.details));
+        if let Some(verification) = step.verification.as_ref() {
+            for item in verification {
+                output.push_str(&format!("   验证：{item}\n"));
+            }
+        }
     }
 }

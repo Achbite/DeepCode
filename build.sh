@@ -737,13 +737,13 @@ stage_hash() {
       kernel)
         tracked_files Cargo.toml Cargo.lock contracts/agent-runtime crates/deepcode-kernel-abi \
           crates/deepcode-kernel-runtime crates/deepcode-kernel-tools crates/deepcode-kernel-config \
-          crates/deepcode-kernel-client crates/deepcode-kernel-daemon crates/deepcode-host-web \
-          shells/cli shells/tui
+          crates/deepcode-kernel-client crates/deepcode-kernel-daemon crates/deepcode-first-party-tools crates/deepcode-host-web \
+          shells/cli shells/tui skills
         ;;
       daemon)
         tracked_files Cargo.toml Cargo.lock contracts/agent-runtime crates/deepcode-kernel-abi \
           crates/deepcode-kernel-runtime crates/deepcode-kernel-tools crates/deepcode-kernel-config \
-          crates/deepcode-kernel-daemon crates/deepcode-host-web
+          crates/deepcode-kernel-daemon crates/deepcode-first-party-tools crates/deepcode-host-web skills
         ;;
       cli)
         tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi crates/deepcode-kernel-client shells/cli
@@ -931,17 +931,19 @@ build_deepcode_gui() {
 build_daemon() {
   if stage_should_skip daemon \
     "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" \
+    "$CARGO_TARGET_ROOT/release/deepcode-first-party-provider" \
     "$CARGO_TARGET_ROOT/release/deepcode-host-web" \
     "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" \
+    "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-first-party-provider.exe" \
     "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-host-web.exe"; then
     return
   fi
   configure_sccache
   echo "==[build][daemon]== build Rust Kernel daemon and private Host proxy for Linux"
-  cargo_with_fallback build --release -p deepcode-kernel-daemon -p deepcode-host-web
+  cargo_with_fallback build --release -p deepcode-first-party-tools -p deepcode-kernel-daemon -p deepcode-host-web
   echo "==[build][daemon]== build Rust Kernel daemon and private Host proxy for Windows GNU"
   cargo_with_fallback build --release --target "$WINDOWS_TARGET" \
-    -p deepcode-kernel-daemon -p deepcode-host-web
+    -p deepcode-first-party-tools -p deepcode-kernel-daemon -p deepcode-host-web
   mark_stage_built daemon
   show_sccache_stats
 }
@@ -1248,10 +1250,12 @@ validate_package_inputs() {
   require_package_file "$windows_node_source" \
     "Windows node.exe runtime is required for the Session service" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "run ./build.sh --stage kernel first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/release/deepcode-first-party-provider" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/release/deepcode-host-web" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/release/deepcode-tui" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" "run ./build.sh --stage kernel first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-first-party-provider.exe" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-host-web.exe" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-cli.exe" "run ./build.sh --stage kernel first" || missing=1
   require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-tui.exe" "run ./build.sh --stage kernel first" || missing=1
@@ -1307,7 +1311,7 @@ verify_protocol_runtime() {
     verify_runtime_file "$dist_dir/$required" "$label $required" || failed=1
   done
   if [ -d "$dist_dir" ] && find "$dist_dir" -maxdepth 1 -type f \
-    \( -name 'agent.*' -o -name 'kernelAbiV1.*' -o -name 'kernelAbiV2.*' \) -print -quit | grep -q .; then
+    -name 'agent.*' -print -quit | grep -q .; then
     echo "==[build][verify-package-runtime][error]== $label contains a retired Agent protocol module" >&2
     failed=1
   fi
@@ -1571,6 +1575,7 @@ verify_linux_package_runtime() {
   [ -d "$LINUX_DIR" ] || return 2
   echo "==[build][verify-package-runtime]== check linux-x64 package"
   verify_runtime_executable "$LINUX_DIR/deepcode-kernel" "linux kernel" || missing=1
+  verify_runtime_executable "$LINUX_DIR/deepcode-first-party-provider" "linux first-party provider" || missing=1
   verify_runtime_executable "$LINUX_DIR/deepcode-host-web" "linux private Host proxy" || missing=1
   verify_runtime_executable "$LINUX_DIR/deepcode-cli" "linux cli" || missing=1
   verify_runtime_executable "$LINUX_DIR/deepcode-tui" "linux tui" || missing=1
@@ -1596,6 +1601,7 @@ verify_windows_package_runtime() {
   [ -d "$WIN_DIR" ] || return 2
   echo "==[build][verify-package-runtime]== check win64 package"
   verify_runtime_file "$WIN_DIR/deepcode-kernel.exe" "windows kernel" || missing=1
+  verify_runtime_file "$WIN_DIR/deepcode-first-party-provider.exe" "windows first-party provider" || missing=1
   verify_runtime_file "$WIN_DIR/deepcode-host-web.exe" "windows private Host proxy" || missing=1
   verify_runtime_file "$WIN_DIR/deepcode-cli.exe" "windows cli" || missing=1
   verify_runtime_file "$WIN_DIR/deepcode-tui.exe" "windows tui" || missing=1
@@ -1631,6 +1637,7 @@ verify_macos_package_runtime() {
   [ -d "$macos_dir" ] || return 2
   echo "==[build][verify-package-runtime]== check macos-arm64 package"
   verify_runtime_executable "$macos_dir/deepcode-kernel" "macOS shared kernel" || missing=1
+  verify_runtime_executable "$macos_dir/deepcode-first-party-provider" "macOS shared first-party provider" || missing=1
   verify_runtime_executable "$macos_dir/DeepCode-CLI.command" "macOS CLI launcher" || missing=1
   verify_runtime_executable "$macos_dir/DeepCode-TUI.command" "macOS TUI launcher" || missing=1
   verify_runtime_executable "$macos_dir/libexec/DeepCode-CLI" "macOS CLI host" || missing=1
@@ -1660,6 +1667,7 @@ verify_macos_package_runtime() {
     checked_app=1
     verify_runtime_executable "$macos_dir/DeepCode.app/Contents/MacOS/DeepCode" "macOS DeepCode app shell" || missing=1
     verify_runtime_executable "$macos_dir/DeepCode.app/Contents/MacOS/deepcode-kernel" "macOS DeepCode bundled kernel" || missing=1
+    verify_runtime_executable "$macos_dir/DeepCode.app/Contents/MacOS/deepcode-first-party-provider" "macOS DeepCode bundled first-party provider" || missing=1
     verify_runtime_executable "$macos_dir/DeepCode.app/Contents/MacOS/deepcode-host-web" "macOS DeepCode private Host proxy" || missing=1
     verify_frontend_package_assets "$macos_dir/DeepCode.app/Contents/MacOS/web" "macOS DeepCode bundled web" || missing=1
     verify_macos_app_identity "$macos_dir/DeepCode.app" "DeepCode" || missing=1
@@ -1668,6 +1676,7 @@ verify_macos_package_runtime() {
     checked_app=1
     verify_runtime_executable "$macos_dir/DeepCode-GUI.app/Contents/MacOS/DeepCode-GUI" "macOS DeepCode-GUI app shell" || missing=1
     verify_runtime_executable "$macos_dir/DeepCode-GUI.app/Contents/MacOS/deepcode-kernel" "macOS DeepCode-GUI bundled kernel" || missing=1
+    verify_runtime_executable "$macos_dir/DeepCode-GUI.app/Contents/MacOS/deepcode-first-party-provider" "macOS DeepCode-GUI bundled first-party provider" || missing=1
     verify_runtime_executable "$macos_dir/DeepCode-GUI.app/Contents/MacOS/deepcode-host-web" "macOS DeepCode-GUI private Host proxy" || missing=1
     verify_frontend_package_assets "$macos_dir/DeepCode-GUI.app/Contents/MacOS/web-deepcode-gui" "macOS DeepCode-GUI bundled web" || missing=1
     verify_macos_app_identity "$macos_dir/DeepCode-GUI.app" "DeepCode-GUI" || missing=1
@@ -1746,6 +1755,7 @@ Direct CLI/daemon runs use the OS config root unless DEEPCODE_CONFIG_DIR is set.
 
 Entries:
   deepcode-kernel       Rust Kernel Daemon + localhost API
+  deepcode-first-party-provider  Out-of-process GitHub, arXiv, and PDF tools
   deepcode-host-web     Private desktop Host proxy
 $gui_entries
   deepcode              CLI Host Shell MVP over KernelClient (Linux)
@@ -1795,6 +1805,7 @@ clean_package_generated_outputs() {
     "$dist_dir/deepcode-cli"
     "$dist_dir/deepcode-gui"
     "$dist_dir/deepcode-host-web"
+    "$dist_dir/deepcode-first-party-provider"
     "$dist_dir/deepcode-kernel"
     "$dist_dir/deepcode-tui"
     "$dist_dir/DeepCode"
@@ -1803,6 +1814,7 @@ clean_package_generated_outputs() {
     "$dist_dir/deepcode.cmd"
     "$dist_dir/deepcode-cli.exe"
     "$dist_dir/deepcode-host-web.exe"
+    "$dist_dir/deepcode-first-party-provider.exe"
     "$dist_dir/deepcode-kernel.exe"
     "$dist_dir/deepcode-tui.exe"
     "$dist_dir/DeepCode.exe"
@@ -1824,9 +1836,11 @@ package_distribution() {
 
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$LINUX_DIR/deepcode-kernel" \
     "run ./build.sh --stage kernel first"
+  copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-first-party-provider" "$LINUX_DIR/deepcode-first-party-provider" \
+    "run ./build.sh --stage kernel first"
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-host-web" "$LINUX_DIR/deepcode-host-web" \
     "run ./build.sh --stage kernel first"
-  chmod +x "$LINUX_DIR/deepcode-kernel" "$LINUX_DIR/deepcode-host-web"
+  chmod +x "$LINUX_DIR/deepcode-kernel" "$LINUX_DIR/deepcode-first-party-provider" "$LINUX_DIR/deepcode-host-web"
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "$LINUX_DIR/deepcode-cli" \
     "run ./build.sh --stage kernel first"
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "$LINUX_DIR/deepcode" \
@@ -1836,6 +1850,8 @@ package_distribution() {
   chmod +x "$LINUX_DIR/deepcode-cli" "$LINUX_DIR/deepcode" "$LINUX_DIR/deepcode-tui"
 
   copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" "$WIN_DIR/deepcode-kernel.exe" \
+    "run ./build.sh --stage kernel first"
+  copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-first-party-provider.exe" "$WIN_DIR/deepcode-first-party-provider.exe" \
     "run ./build.sh --stage kernel first"
   copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-host-web.exe" "$WIN_DIR/deepcode-host-web.exe" \
     "run ./build.sh --stage kernel first"

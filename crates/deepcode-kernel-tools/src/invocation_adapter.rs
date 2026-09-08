@@ -31,41 +31,13 @@ pub fn canonicalize_invocation(
         fields.entry(name.to_owned()).or_insert(value);
     };
     match tool_id {
-        Tool::FsList => {
-            materialize("depth", json!(2));
-            materialize("includeHidden", json!(false));
-        }
-        Tool::FsGlob => {
-            materialize("maxResults", json!(500));
-        }
-        Tool::CodeGrep => {
-            materialize("include", json!([]));
-            materialize("exclude", json!([]));
-            materialize("strategy", json!("literal"));
-            materialize("contextLines", json!(0));
-            materialize("maxResults", json!(200));
-        }
-        Tool::FsCreate => materialize("executable", json!(false)),
-        Tool::GithubSearch => {
-            materialize("kind", json!("repositories"));
-            materialize("page", json!(1));
-            materialize("limit", json!(10));
-        }
-        Tool::GithubRead => {
-            materialize("path", json!("."));
+        Tool::FsRead => {
+            materialize("startLine", json!(1));
+            materialize("maxLines", json!(2_000));
             materialize("maxBytes", json!(262_144));
         }
-        Tool::ArxivSearch => {
-            materialize("field", json!("all"));
-            materialize("start", json!(0));
-            materialize("limit", json!(10));
-            materialize("sortBy", json!("relevance"));
-            materialize("sortOrder", json!("descending"));
-        }
         Tool::ProcessShell => {
-            materialize("cwd", json!("."));
-            materialize("timeoutMs", json!(120_000));
-            materialize("maxOutputBytes", json!(262_144));
+            materialize("timeout", json!(120));
         }
         Tool::WebSearch => materialize("limit", json!(5)),
         Tool::WebFetch => materialize("maxBytes", json!(98_304)),
@@ -85,36 +57,9 @@ fn normalize_invocation(
 ) -> Result<(), InvocationNormalizationError> {
     match invocation {
         KernelCanonicalInvocation::FsRead { path, .. }
-        | KernelCanonicalInvocation::FsDiff { path, .. }
-        | KernelCanonicalInvocation::FsCreate { path, .. }
         | KernelCanonicalInvocation::FsWrite { path, .. }
-        | KernelCanonicalInvocation::FsEdit { path, .. }
-        | KernelCanonicalInvocation::FsEnsureDirectory { path }
-        | KernelCanonicalInvocation::DocumentRead { path, .. } => {
+        | KernelCanonicalInvocation::FsEdit { path, .. } => {
             *path = normalize_workspace_path(path, false)?;
-        }
-        KernelCanonicalInvocation::FsStat { path }
-        | KernelCanonicalInvocation::FsList { path, .. } => {
-            *path = normalize_workspace_path(path, true)?;
-        }
-        KernelCanonicalInvocation::GithubRead { path, .. } => {
-            *path = normalize_workspace_path(path, true)?;
-        }
-        KernelCanonicalInvocation::FsGlob { root, .. } => {
-            *root = normalize_workspace_path(root, true)?;
-        }
-        KernelCanonicalInvocation::CodeGrep {
-            root,
-            include,
-            exclude,
-            ..
-        } => {
-            *root = normalize_workspace_path(root, true)?;
-            *include = normalize_string_set(std::mem::take(include))?;
-            *exclude = normalize_string_set(std::mem::take(exclude))?;
-        }
-        KernelCanonicalInvocation::ProcessShell { cwd, .. } => {
-            *cwd = normalize_workspace_path(cwd, true)?;
         }
         KernelCanonicalInvocation::FsDelete(target) => {
             let path = match target {
@@ -156,91 +101,38 @@ fn adapt_public_arguments(
         .ok_or_else(|| invalid_arguments(tool_id.as_str()))?;
     match tool_id {
         Tool::FsRead => {
-            ensure_allowed_fields(fields, &["path", "startLine", "endLine"], tool_id)?;
-            let start_line = fields.remove("startLine");
-            let end_line = fields.remove("endLine");
-            let range = match (start_line, end_line) {
-                (None, None) => json!({"kind":"whole","data":{}}),
-                (Some(start_line), Some(end_line)) => json!({
-                    "kind":"lines",
-                    "data":{"startLine":start_line,"endLine":end_line}
-                }),
-                _ => return Err(invalid_arguments(tool_id.as_str())),
-            };
-            fields.insert("range".to_owned(), range);
-        }
-        Tool::FsStat => {
-            ensure_allowed_fields(fields, &["path"], tool_id)?;
-        }
-        Tool::FsList => {
-            ensure_allowed_fields(fields, &["path", "depth", "includeHidden"], tool_id)?;
-            fields
-                .entry("path".to_owned())
-                .or_insert_with(|| json!("."));
-        }
-        Tool::FsGlob => {
-            ensure_allowed_fields(fields, &["pattern", "path", "maxResults"], tool_id)?;
-            let root = fields.remove("path").unwrap_or_else(|| json!("."));
-            fields.insert("root".to_owned(), root);
-        }
-        Tool::CodeGrep => {
             ensure_allowed_fields(
                 fields,
-                &[
-                    "query",
-                    "include",
-                    "exclude",
-                    "path",
-                    "strategy",
-                    "contextLines",
-                    "maxResults",
-                ],
-                tool_id,
-            )?;
-            let root = fields.remove("path").unwrap_or_else(|| json!("."));
-            fields.insert("root".to_owned(), root);
-        }
-        Tool::DocumentRead => {
-            ensure_allowed_fields(fields, &["path", "startPage", "endPage"], tool_id)?;
-            let start_page = fields.remove("startPage");
-            let end_page = fields.remove("endPage");
-            let pages = match (start_page, end_page) {
-                (None, None) => json!({"kind":"all","data":{}}),
-                (Some(start_page), Some(end_page)) => json!({
-                    "kind":"range",
-                    "data":{"startPage":start_page,"endPage":end_page}
-                }),
-                _ => return Err(invalid_arguments(tool_id.as_str())),
-            };
-            fields.insert("pages".to_owned(), pages);
-        }
-        Tool::GithubSearch => {
-            ensure_allowed_fields(fields, &["query", "kind", "page", "limit"], tool_id)?;
-        }
-        Tool::GithubRead => {
-            ensure_allowed_fields(fields, &["repository", "path", "ref", "maxBytes"], tool_id)?;
-            if let Some(reference) = fields.remove("ref") {
-                fields.insert("reference".to_owned(), reference);
-            }
-        }
-        Tool::ArxivSearch => {
-            ensure_allowed_fields(
-                fields,
-                &["query", "field", "start", "limit", "sortBy", "sortOrder"],
+                &["path", "startLine", "maxLines", "maxBytes"],
                 tool_id,
             )?;
         }
-        Tool::ArxivRead => {
-            ensure_allowed_fields(fields, &["id"], tool_id)?;
+        Tool::FsWrite => {
+            ensure_allowed_fields(fields, &["path", "content", "executable"], tool_id)?;
+        }
+        Tool::FsEdit => {
+            ensure_allowed_fields(fields, &["path", "edits"], tool_id)?;
         }
         Tool::ProcessShell => {
             ensure_allowed_fields(
                 fields,
-                &["command", "cwd", "timeoutMs", "maxOutputBytes"],
+                &[
+                    "command",
+                    "workspaceMode",
+                    "executionScope",
+                    "timeout",
+                    "terminal",
+                ],
                 tool_id,
             )?;
         }
-        _ => {}
+        Tool::WebSearch => {
+            ensure_allowed_fields(fields, &["query", "limit"], tool_id)?;
+        }
+        Tool::WebFetch => {
+            ensure_allowed_fields(fields, &["url", "maxBytes"], tool_id)?;
+        }
+        Tool::FsDelete => unreachable!("fs.delete is canonicalized before field adaptation"),
     }
     Ok(arguments)
 }
@@ -362,19 +254,4 @@ pub fn normalize_canonical_platform_path(
         format!("{prefix}/{}", components.join("/"))
     };
     Ok(normalized)
-}
-
-fn normalize_string_set(
-    mut values: Vec<String>,
-) -> Result<Vec<String>, InvocationNormalizationError> {
-    if values.len() > 256
-        || values
-            .iter()
-            .any(|value| value.trim().is_empty() || value.contains('\0'))
-    {
-        return Err(invalid_arguments("string-list"));
-    }
-    values.sort();
-    values.dedup();
-    Ok(values)
 }

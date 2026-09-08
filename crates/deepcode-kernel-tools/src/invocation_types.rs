@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const MAX_CANONICAL_INVOCATION_BYTES: usize = 1024 * 1024;
-const MAX_LIST_ITEMS: usize = 256;
 const MAX_ORDINARY_STRING_BYTES: usize = 16 * 1024;
+pub const MAX_TERMINAL_STDIN_BYTES: usize = 64 * 1024;
 
 fn empty_field(field: &'static str) -> ToolValidationError {
     ToolValidationError::EmptyField { field }
@@ -23,40 +23,16 @@ fn invalid_value(field: &'static str, reason: &'static str) -> ToolValidationErr
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum KernelToolKind {
-    #[serde(rename = "code.grep")]
-    CodeGrep,
-    #[serde(rename = "document.read")]
-    DocumentRead,
-    #[serde(rename = "fs.create")]
-    FsCreate,
     #[serde(rename = "fs.delete")]
     FsDelete,
-    #[serde(rename = "fs.diff")]
-    FsDiff,
     #[serde(rename = "fs.edit")]
     FsEdit,
-    #[serde(rename = "fs.ensure_directory")]
-    FsEnsureDirectory,
-    #[serde(rename = "fs.glob")]
-    FsGlob,
-    #[serde(rename = "fs.list")]
-    FsList,
     #[serde(rename = "fs.read")]
     FsRead,
-    #[serde(rename = "fs.stat")]
-    FsStat,
     #[serde(rename = "fs.write")]
     FsWrite,
-    #[serde(rename = "process.shell")]
+    #[serde(rename = "bash")]
     ProcessShell,
-    #[serde(rename = "github.read")]
-    GithubRead,
-    #[serde(rename = "github.search")]
-    GithubSearch,
-    #[serde(rename = "arxiv.read")]
-    ArxivRead,
-    #[serde(rename = "arxiv.search")]
-    ArxivSearch,
     #[serde(rename = "web.fetch")]
     WebFetch,
     #[serde(rename = "web.search")]
@@ -66,131 +42,42 @@ pub enum KernelToolKind {
 impl KernelToolKind {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::CodeGrep => "code.grep",
-            Self::DocumentRead => "document.read",
-            Self::FsCreate => "fs.create",
             Self::FsDelete => "fs.delete",
-            Self::FsDiff => "fs.diff",
             Self::FsEdit => "fs.edit",
-            Self::FsEnsureDirectory => "fs.ensure_directory",
-            Self::FsGlob => "fs.glob",
-            Self::FsList => "fs.list",
             Self::FsRead => "fs.read",
-            Self::FsStat => "fs.stat",
             Self::FsWrite => "fs.write",
-            Self::ProcessShell => "process.shell",
-            Self::GithubRead => "github.read",
-            Self::GithubSearch => "github.search",
-            Self::ArxivRead => "arxiv.read",
-            Self::ArxivSearch => "arxiv.search",
+            Self::ProcessShell => "bash",
             Self::WebFetch => "web.fetch",
             Self::WebSearch => "web.search",
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "data",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum KernelLineRange {
-    Whole {},
-    Lines { start_line: u32, end_line: u32 },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "data",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum KernelDocumentPages {
-    All {},
-    Range { start_page: u32, end_page: u32 },
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KernelWorkspaceMode {
+    Read,
+    Write,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum KernelSearchStrategy {
-    Literal,
-    Regex,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum KernelGithubSearchKind {
-    Repositories,
-    Code,
-    Issues,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum KernelArxivSearchField {
-    All,
-    Title,
-    Author,
-    Abstract,
-    Category,
-    Id,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum KernelArxivSortBy {
-    Relevance,
-    LastUpdatedDate,
-    SubmittedDate,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum KernelSortOrder {
-    Ascending,
-    Descending,
+pub enum KernelExecutionScope {
+    Workspace,
+    Host,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "data",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum KernelFileDigestPrecondition {
-    ExpectedFileDigest { digest: String },
-    ExpectedBeforeBlock { text: String },
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KernelTerminalInput {
+    pub stdin: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "data",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum KernelEditMatcher {
-    ExactBlock {
-        text: String,
-    },
-    ContextBlock {
-        before: String,
-        target: String,
-        after: String,
-    },
-    LineRange {
-        start_line: u32,
-        end_line: u32,
-        precondition: KernelFileDigestPrecondition,
-    },
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KernelTextEdit {
+    pub old_text: String,
+    pub new_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,92 +104,31 @@ pub enum KernelCanonicalInvocation {
     #[serde(rename = "fs.read")]
     FsRead {
         path: String,
-        range: KernelLineRange,
-    },
-    #[serde(rename = "fs.stat")]
-    FsStat { path: String },
-    #[serde(rename = "fs.list")]
-    FsList {
-        path: String,
-        depth: u32,
-        include_hidden: bool,
-    },
-    #[serde(rename = "fs.glob")]
-    FsGlob {
-        root: String,
-        pattern: String,
-        max_results: u32,
-    },
-    #[serde(rename = "fs.diff")]
-    FsDiff {
-        path: String,
-        proposed_content: String,
-    },
-    #[serde(rename = "code.grep")]
-    CodeGrep {
-        root: String,
-        query: String,
-        include: Vec<String>,
-        exclude: Vec<String>,
-        strategy: KernelSearchStrategy,
-        context_lines: u32,
-        max_results: u32,
-    },
-    #[serde(rename = "fs.create")]
-    FsCreate {
-        path: String,
-        content: String,
-        executable: bool,
+        start_line: u32,
+        max_lines: u32,
+        max_bytes: u32,
     },
     #[serde(rename = "fs.write")]
-    FsWrite { path: String, content: String },
+    FsWrite {
+        path: String,
+        content: String,
+        executable: Option<bool>,
+    },
     #[serde(rename = "fs.edit")]
     FsEdit {
         path: String,
-        matcher: KernelEditMatcher,
-        replacement: String,
+        edits: Vec<KernelTextEdit>,
     },
     #[serde(rename = "fs.delete")]
     FsDelete(KernelDeleteTarget),
-    #[serde(rename = "fs.ensure_directory")]
-    FsEnsureDirectory { path: String },
-    #[serde(rename = "document.read")]
-    DocumentRead {
-        path: String,
-        pages: KernelDocumentPages,
-    },
-    #[serde(rename = "process.shell")]
+    #[serde(rename = "bash")]
     ProcessShell {
         command: String,
-        cwd: String,
-        timeout_ms: u32,
-        max_output_bytes: u32,
+        workspace_mode: KernelWorkspaceMode,
+        execution_scope: KernelExecutionScope,
+        timeout: u32,
+        terminal: Option<KernelTerminalInput>,
     },
-    #[serde(rename = "github.search")]
-    GithubSearch {
-        query: String,
-        kind: KernelGithubSearchKind,
-        page: u32,
-        limit: u32,
-    },
-    #[serde(rename = "github.read")]
-    GithubRead {
-        repository: String,
-        path: String,
-        reference: Option<String>,
-        max_bytes: u32,
-    },
-    #[serde(rename = "arxiv.search")]
-    ArxivSearch {
-        query: String,
-        field: KernelArxivSearchField,
-        start: u32,
-        limit: u32,
-        sort_by: KernelArxivSortBy,
-        sort_order: KernelSortOrder,
-    },
-    #[serde(rename = "arxiv.read")]
-    ArxivRead { id: String },
     #[serde(rename = "web.search")]
     WebSearch { query: String, limit: u32 },
     #[serde(rename = "web.fetch")]
@@ -313,22 +139,10 @@ impl KernelCanonicalInvocation {
     pub fn tool_id(&self) -> KernelToolKind {
         match self {
             Self::FsRead { .. } => KernelToolKind::FsRead,
-            Self::FsStat { .. } => KernelToolKind::FsStat,
-            Self::FsList { .. } => KernelToolKind::FsList,
-            Self::FsGlob { .. } => KernelToolKind::FsGlob,
-            Self::FsDiff { .. } => KernelToolKind::FsDiff,
-            Self::CodeGrep { .. } => KernelToolKind::CodeGrep,
-            Self::FsCreate { .. } => KernelToolKind::FsCreate,
             Self::FsWrite { .. } => KernelToolKind::FsWrite,
             Self::FsEdit { .. } => KernelToolKind::FsEdit,
             Self::FsDelete(_) => KernelToolKind::FsDelete,
-            Self::FsEnsureDirectory { .. } => KernelToolKind::FsEnsureDirectory,
-            Self::DocumentRead { .. } => KernelToolKind::DocumentRead,
             Self::ProcessShell { .. } => KernelToolKind::ProcessShell,
-            Self::GithubSearch { .. } => KernelToolKind::GithubSearch,
-            Self::GithubRead { .. } => KernelToolKind::GithubRead,
-            Self::ArxivSearch { .. } => KernelToolKind::ArxivSearch,
-            Self::ArxivRead { .. } => KernelToolKind::ArxivRead,
             Self::WebSearch { .. } => KernelToolKind::WebSearch,
             Self::WebFetch { .. } => KernelToolKind::WebFetch,
         }
@@ -344,117 +158,58 @@ impl KernelCanonicalInvocation {
             ));
         }
         match self {
-            Self::FsRead { path, range } => {
+            Self::FsRead {
+                path,
+                start_line,
+                max_lines,
+                max_bytes,
+            } => {
                 validate_path(path, false)?;
-                if let KernelLineRange::Lines {
-                    start_line,
-                    end_line,
-                } = range
-                {
-                    validate_range("range", *start_line, *end_line)?;
+                validate_u32("startLine", *start_line, 1, u32::MAX)?;
+                validate_u32("maxLines", *max_lines, 1, 5_000)?;
+                validate_u32("maxBytes", *max_bytes, 1_024, 1_048_576)?;
+            }
+            Self::FsWrite { path, .. } => validate_path(path, false)?,
+            Self::FsEdit { path, edits } => {
+                validate_path(path, false)?;
+                if edits.is_empty() || edits.len() > 128 {
+                    return Err(invalid_value(
+                        "edits",
+                        "must contain between 1 and 128 items",
+                    ));
                 }
-            }
-            Self::FsStat { path } => validate_path(path, true)?,
-            Self::FsList { path, depth, .. } => {
-                validate_path(path, true)?;
-                validate_u32("depth", *depth, 1, 16)?;
-            }
-            Self::FsGlob {
-                root,
-                pattern,
-                max_results,
-            } => {
-                validate_path(root, true)?;
-                validate_text("pattern", pattern, false)?;
-                validate_u32("maxResults", *max_results, 1, 5_000)?;
-            }
-            Self::FsDiff { path, .. } => validate_path(path, false)?,
-            Self::CodeGrep {
-                root,
-                query,
-                include,
-                exclude,
-                context_lines,
-                max_results,
-                ..
-            } => {
-                validate_path(root, true)?;
-                validate_text("query", query, false)?;
-                validate_string_list("include", include)?;
-                validate_string_list("exclude", exclude)?;
-                validate_u32("contextLines", *context_lines, 0, 5)?;
-                validate_u32("maxResults", *max_results, 1, 500)?;
-            }
-            Self::FsCreate { path, .. }
-            | Self::FsWrite { path, .. }
-            | Self::FsEnsureDirectory { path } => validate_path(path, false)?,
-            Self::FsEdit { path, matcher, .. } => {
-                validate_path(path, false)?;
-                validate_matcher(matcher)?;
+                let mut old_texts = std::collections::HashSet::with_capacity(edits.len());
+                for edit in edits {
+                    validate_text("edits.oldText", &edit.old_text, false)?;
+                    validate_text("edits.newText", &edit.new_text, true)?;
+                    if !old_texts.insert(edit.old_text.as_str()) {
+                        return Err(invalid_value("edits.oldText", "must be unique"));
+                    }
+                }
             }
             Self::FsDelete(target) => match target {
                 KernelDeleteTarget::File { path } | KernelDeleteTarget::DirectoryTree { path } => {
                     validate_path(path, false)?
                 }
             },
-            Self::DocumentRead { path, pages } => {
-                validate_path(path, false)?;
-                if let KernelDocumentPages::Range {
-                    start_page,
-                    end_page,
-                } = pages
-                {
-                    validate_range("pages", *start_page, *end_page)?;
-                    if end_page - start_page + 1 > 50 {
-                        return Err(invalid_value("pages", "cannot request more than 50 pages"));
-                    }
-                }
-            }
             Self::ProcessShell {
                 command,
-                cwd,
-                timeout_ms,
-                max_output_bytes,
+                workspace_mode: _,
+                execution_scope: _,
+                timeout,
+                terminal,
             } => {
                 validate_text("command", command, false)?;
-                validate_path(cwd, true)?;
-                validate_u32("timeoutMs", *timeout_ms, 100, 600_000)?;
-                validate_u32("maxOutputBytes", *max_output_bytes, 1_024, 1_048_576)?;
+                validate_u32("timeout", *timeout, 1, 600)?;
+                if let Some(terminal) = terminal {
+                    if terminal.stdin.len() > MAX_TERMINAL_STDIN_BYTES {
+                        return Err(field_too_large("terminal.stdin", MAX_TERMINAL_STDIN_BYTES));
+                    }
+                }
                 if let Some(reason) = process_shell_hard_deny_reason(command) {
                     return Err(invalid_value("command", reason));
                 }
             }
-            Self::GithubSearch {
-                query, page, limit, ..
-            } => {
-                validate_text("query", query, false)?;
-                validate_u32("page", *page, 1, 100)?;
-                validate_u32("limit", *limit, 1, 30)?;
-            }
-            Self::GithubRead {
-                repository,
-                path,
-                reference,
-                max_bytes,
-            } => {
-                validate_repository(repository)?;
-                validate_path(path, true)?;
-                if let Some(reference) = reference {
-                    validate_text("ref", reference, false)?;
-                }
-                validate_u32("maxBytes", *max_bytes, 1_024, 262_144)?;
-            }
-            Self::ArxivSearch {
-                query,
-                start,
-                limit,
-                ..
-            } => {
-                validate_text("query", query, false)?;
-                validate_u32("start", *start, 0, 10_000)?;
-                validate_u32("limit", *limit, 1, 30)?;
-            }
-            Self::ArxivRead { id } => validate_arxiv_id(id)?,
             Self::WebSearch { query, limit } => {
                 validate_text("query", query, false)?;
                 validate_u32("limit", *limit, 1, 10)?;
@@ -475,78 +230,31 @@ impl KernelCanonicalInvocation {
 
     pub fn executor_arguments(&self) -> Value {
         match self {
-            Self::FsRead { path, range } => match range {
-                KernelLineRange::Whole {} => json!({ "path": path }),
-                KernelLineRange::Lines {
-                    start_line,
-                    end_line,
-                } => json!({
-                    "path": path,
-                    "startLine": start_line,
-                    "endLine": end_line,
-                }),
-            },
-            Self::FsStat { path } => json!({ "path": path }),
-            Self::FsList {
+            Self::FsRead {
                 path,
-                depth,
-                include_hidden,
+                start_line,
+                max_lines,
+                max_bytes,
             } => json!({
                 "path": path,
-                "depth": depth,
-                "includeHidden": include_hidden,
+                "startLine": start_line,
+                "maxLines": max_lines,
+                "maxBytes": max_bytes,
             }),
-            Self::FsGlob {
-                root,
-                pattern,
-                max_results,
-            } => json!({
-                "path": root,
-                "pattern": pattern,
-                "maxResults": max_results,
-            }),
-            Self::FsDiff {
-                path,
-                proposed_content,
-            } => json!({
-                "path": path,
-                "proposedContent": proposed_content,
-            }),
-            Self::CodeGrep {
-                root,
-                query,
-                include,
-                exclude,
-                strategy,
-                context_lines,
-                max_results,
-            } => json!({
-                "path": root,
-                "query": query,
-                "include": include,
-                "exclude": exclude,
-                "strategy": strategy,
-                "contextLines": context_lines,
-                "maxResults": max_results,
-            }),
-            Self::FsCreate {
+            Self::FsWrite {
                 path,
                 content,
                 executable,
-            } => json!({
+            } => {
+                let mut value = json!({ "path": path, "content": content });
+                if let Some(executable) = executable {
+                    value["executable"] = json!(executable);
+                }
+                value
+            }
+            Self::FsEdit { path, edits } => json!({
                 "path": path,
-                "content": content,
-                "executable": executable,
-            }),
-            Self::FsWrite { path, content } => json!({ "path": path, "content": content }),
-            Self::FsEdit {
-                path,
-                matcher,
-                replacement,
-            } => json!({
-                "path": path,
-                "patchSpec": { "match": matcher_for_executor(matcher) },
-                "replacement": replacement,
+                "edits": edits,
             }),
             Self::FsDelete(KernelDeleteTarget::File { path }) => json!({
                 "path": path,
@@ -556,72 +264,24 @@ impl KernelCanonicalInvocation {
                 "path": path,
                 "targetKind": "directoryTree",
             }),
-            Self::FsEnsureDirectory { path } => json!({ "path": path }),
-            Self::DocumentRead { path, pages } => match pages {
-                KernelDocumentPages::All {} => json!({ "path": path }),
-                KernelDocumentPages::Range {
-                    start_page,
-                    end_page,
-                } => json!({
-                    "path": path,
-                    "startPage": start_page,
-                    "endPage": end_page,
-                }),
-            },
             Self::ProcessShell {
                 command,
-                cwd,
-                timeout_ms,
-                max_output_bytes,
-            } => json!({
-                "command": command,
-                "cwd": cwd,
-                "timeoutMs": timeout_ms,
-                "maxOutputBytes": max_output_bytes,
-            }),
-            Self::GithubSearch {
-                query,
-                kind,
-                page,
-                limit,
-            } => json!({
-                "query": query,
-                "kind": kind,
-                "page": page,
-                "limit": limit,
-            }),
-            Self::GithubRead {
-                repository,
-                path,
-                reference,
-                max_bytes,
+                workspace_mode,
+                execution_scope,
+                timeout,
+                terminal,
             } => {
                 let mut value = json!({
-                    "repository": repository,
-                    "path": path,
-                    "maxBytes": max_bytes,
+                    "command": command,
+                    "workspaceMode": workspace_mode,
+                    "executionScope": execution_scope,
+                    "timeout": timeout,
                 });
-                if let Some(reference) = reference {
-                    value["ref"] = json!(reference);
+                if let Some(terminal) = terminal {
+                    value["terminal"] = json!(terminal);
                 }
                 value
             }
-            Self::ArxivSearch {
-                query,
-                field,
-                start,
-                limit,
-                sort_by,
-                sort_order,
-            } => json!({
-                "query": query,
-                "field": field,
-                "start": start,
-                "limit": limit,
-                "sortBy": sort_by,
-                "sortOrder": sort_order,
-            }),
-            Self::ArxivRead { id } => json!({ "id": id }),
             Self::WebSearch { query, limit } => json!({ "query": query, "limit": limit }),
             Self::WebFetch { url, max_bytes } => json!({ "url": url, "maxBytes": max_bytes }),
         }
@@ -852,45 +512,6 @@ fn is_system_root_target(target: &str) -> bool {
     )
 }
 
-fn matcher_for_executor(matcher: &KernelEditMatcher) -> Value {
-    match matcher {
-        KernelEditMatcher::ExactBlock { text } => json!({
-            "kind": "exactBlock",
-            "text": text,
-        }),
-        KernelEditMatcher::ContextBlock {
-            before,
-            target,
-            after,
-        } => json!({
-            "kind": "contextBlock",
-            "before": before,
-            "target": target,
-            "after": after,
-        }),
-        KernelEditMatcher::LineRange {
-            start_line,
-            end_line,
-            precondition,
-        } => {
-            let mut value = json!({
-                "kind": "lineRange",
-                "startLine": start_line,
-                "endLine": end_line,
-            });
-            match precondition {
-                KernelFileDigestPrecondition::ExpectedFileDigest { digest } => {
-                    value["expectedFileHash"] = Value::String(digest.clone());
-                }
-                KernelFileDigestPrecondition::ExpectedBeforeBlock { text } => {
-                    value["expectedBeforeBlock"] = Value::String(text.clone());
-                }
-            }
-            value
-        }
-    }
-}
-
 fn validate_path(value: &str, allow_dot: bool) -> Result<(), ToolValidationError> {
     validate_text("path", value, false)?;
     if value.contains('\\')
@@ -905,50 +526,6 @@ fn validate_path(value: &str, allow_dot: bool) -> Result<(), ToolValidationError
             "path",
             "must be a normalized workspace-relative path",
         ));
-    }
-    Ok(())
-}
-
-fn validate_repository(repository: &str) -> Result<(), ToolValidationError> {
-    validate_text("repository", repository, false)?;
-    let mut parts = repository.split('/');
-    let owner = parts.next().unwrap_or_default();
-    let name = parts.next().unwrap_or_default();
-    if owner.is_empty()
-        || name.is_empty()
-        || parts.next().is_some()
-        || !owner.chars().all(is_github_name_character)
-        || !name.chars().all(is_github_name_character)
-    {
-        return Err(invalid_value("repository", "must use owner/name"));
-    }
-    Ok(())
-}
-
-fn is_github_name_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
-}
-
-fn validate_arxiv_id(id: &str) -> Result<(), ToolValidationError> {
-    validate_text("id", id, false)?;
-    if id
-        .chars()
-        .any(|character| character.is_whitespace() || character.is_control())
-    {
-        return Err(invalid_value("id", "must be an arXiv identifier"));
-    }
-    Ok(())
-}
-
-fn validate_string_list(field: &'static str, values: &[String]) -> Result<(), ToolValidationError> {
-    if values.len() > MAX_LIST_ITEMS {
-        return Err(invalid_value(field, "has too many items"));
-    }
-    for value in values {
-        validate_text(field, value, false)?;
-    }
-    if !values.windows(2).all(|pair| pair[0] < pair[1]) {
-        return Err(invalid_value(field, "must be sorted and unique"));
     }
     Ok(())
 }
@@ -975,60 +552,6 @@ fn validate_u32(
 ) -> Result<(), ToolValidationError> {
     if !(minimum..=maximum).contains(&value) {
         return Err(invalid_value(field, "is outside the supported range"));
-    }
-    Ok(())
-}
-
-fn validate_range(field: &'static str, start: u32, end: u32) -> Result<(), ToolValidationError> {
-    if start == 0 || end == 0 || start > end {
-        return Err(invalid_value(field, "requires one-based start <= end"));
-    }
-    Ok(())
-}
-
-fn validate_matcher(value: &KernelEditMatcher) -> Result<(), ToolValidationError> {
-    match value {
-        KernelEditMatcher::ExactBlock { text } => validate_text("matcher.text", text, false),
-        KernelEditMatcher::ContextBlock {
-            before,
-            target,
-            after,
-        } => {
-            validate_text("matcher.before", before, true)?;
-            validate_text("matcher.target", target, false)?;
-            validate_text("matcher.after", after, true)
-        }
-        KernelEditMatcher::LineRange {
-            start_line,
-            end_line,
-            precondition,
-        } => {
-            validate_range("matcher.lineRange", *start_line, *end_line)?;
-            match precondition {
-                KernelFileDigestPrecondition::ExpectedFileDigest { digest } => {
-                    validate_file_digest("expectedFileDigest", digest)
-                }
-                KernelFileDigestPrecondition::ExpectedBeforeBlock { text } => {
-                    validate_text("expectedBeforeBlock", text, false)
-                }
-            }
-        }
-    }
-}
-
-fn validate_file_digest(field: &'static str, value: &str) -> Result<(), ToolValidationError> {
-    let Some(hex) = value.strip_prefix("sha256:") else {
-        return Err(invalid_value(field, "must include the sha256: prefix"));
-    };
-    if hex.len() != 64
-        || !hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(invalid_value(
-            field,
-            "must be sha256: followed by 64 lowercase hexadecimal characters",
-        ));
     }
     Ok(())
 }

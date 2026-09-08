@@ -12,13 +12,16 @@ const SHELL_ACTIVITY_RESULT_FIELDS = [
 const SHELL_ENVIRONMENT_FIELDS = [
   'shell',
   'interactive',
+  'executionScope',
+  'terminal',
   'pathSource',
   'writeScope',
   'homeWritable',
+  'networkAccess',
 ] as const;
 
 export function isShellActivityResult(value: unknown): boolean {
-  return isExactRecord(value, SHELL_ACTIVITY_RESULT_FIELDS, ['environment'])
+  return isExactRecord(value, [...SHELL_ACTIVITY_RESULT_FIELDS, 'environment'])
     && typeof value.stdout === 'string'
     && typeof value.stderr === 'string'
     && (value.exitCode === null
@@ -28,17 +31,27 @@ export function isShellActivityResult(value: unknown): boolean {
     && typeof value.truncated === 'boolean'
     && isNaturalNumber(value.capturedBytes)
     && isNaturalNumber(value.durationMs)
-    && (value.environment === undefined || isShellExecutionEnvironment(value.environment));
+    && isShellExecutionEnvironment(value.environment);
 }
 
 export function isShellExecutionEnvironment(value: unknown): boolean {
   return isExactRecord(value, SHELL_ENVIRONMENT_FIELDS)
     && typeof value.shell === 'string'
     && value.shell.trim().length > 0
-    && value.interactive === false
+    && typeof value.terminal === 'boolean'
+    && value.interactive === value.terminal
+    && (value.executionScope === 'workspace' || value.executionScope === 'host')
     && value.pathSource === 'hostPlusStandardDeveloperPaths'
-    && value.writeScope === 'workspaceAndKernelTemporary'
-    && value.homeWritable === false;
+    && (value.executionScope === 'host'
+      ? value.writeScope === 'hostUser'
+        && value.homeWritable === true
+        && value.networkAccess === true
+      : (
+          value.writeScope === 'kernelTemporaryOnly'
+          || value.writeScope === 'workspaceAndKernelTemporary'
+        )
+        && value.homeWritable === false
+        && value.networkAccess === false);
 }
 
 function isNaturalNumber(value: unknown): value is number {

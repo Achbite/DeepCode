@@ -12,6 +12,10 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::Path as StdPath;
 
+const MAX_MESSAGE_FILESYSTEM_REFERENCES: usize = 8;
+const MAX_REFERENCE_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_REFERENCE_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CreateConversationSessionRequest {
@@ -59,8 +63,33 @@ pub(crate) struct AttachConversationDirectoryIndexRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ResolveConversationDirectoryAttachmentsRequest {
-    paths: Vec<String>,
+pub(crate) struct ResolveConversationFilesystemReferencesRequest {
+    references: Vec<FilesystemReferencePathInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FilesystemReferencePathInput {
+    path: String,
+    kind: String,
+}
+
+pub(crate) async fn conversation_read(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(mut body): Json<Value>,
+) -> Json<ApiResponse> {
+    let Some(query) = body.as_object_mut() else {
+        return ApiResponse::error("conversation_read_invalid", "读取选项必须是对象。");
+    };
+    if query.contains_key("sessionId") {
+        return ApiResponse::error("conversation_read_invalid", "sessionId 使用请求路径。");
+    }
+    query.insert("sessionId".into(), Value::String(session_id));
+    match request_service(state.session_service.clone(), "read", body).await {
+        Ok(value) => ApiResponse::ok(value),
+        Err(error) => session_service_error(error),
+    }
 }
 
 pub(crate) async fn conversation_catalog_get(State(state): State<AppState>) -> Json<ApiResponse> {
@@ -69,6 +98,16 @@ pub(crate) async fn conversation_catalog_get(State(state): State<AppState>) -> J
         return ApiResponse::error("conversation_catalog_unavailable", error);
     }
     ApiResponse::ok(gui.conversation_catalog.public_value())
+}
+
+pub(crate) async fn conversation_plugin_catalog_get(
+    State(state): State<AppState>,
+) -> Json<ApiResponse> {
+    let gui = state.gui.lock().expect("gui state lock");
+    match crate::local_agent_plugins::plugin_catalog_projection(&gui.user_settings) {
+        Ok(catalog) => ApiResponse::ok(catalog),
+        Err(error) => ApiResponse::error("plugin_catalog_unavailable", error),
+    }
 }
 
 pub(crate) async fn conversation_resource_read(
@@ -132,33 +171,21 @@ pub(crate) async fn conversation_resource_read(
     }
 }
 
-pub(crate) async fn conversation_directory_attachments_resolve(
+pub(crate) async fn conversation_filesystem_references_resolve(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
-    Json(body): Json<ResolveConversationDirectoryAttachmentsRequest>,
+    Json(body): Json<ResolveConversationFilesystemReferencesRequest>,
 ) -> Json<ApiResponse> {
     if !valid_id(&session_id) {
         return ApiResponse::error("conversation_session_identity_invalid", "对话身份无效。");
     }
-    if body.paths.is_empty() || body.paths.len() > 8 {
+    if body.references.is_empty() || body.references.len() > MAX_MESSAGE_FILESYSTEM_REFERENCES {
         return ApiResponse::error(
-            "conversation_directory_attachments_invalid",
-            "单次消息必须附加一至八个目录。",
+            "conversation_filesystem_references_invalid",
+            "单次消息必须附加一至八个文件系统引用。",
         );
     }
-    let roots = match canonical_roots(&body.paths) {
-        Ok(value) if !value.is_empty() => value,
-        Ok(_) => {
-            return ApiResponse::error(
-                "conversation_directory_attachments_invalid",
-                "目录附件不能为空。",
-            )
-        }
-        Err(error) => {
-            return ApiResponse::error("conversation_directory_attachments_invalid", error)
-        }
-    };
-    let bindings = {
+    let references = {
         let mut gui = state.gui.lock().expect("gui state lock");
         if let Some(error) = gui.conversation_catalog_error.as_deref() {
             return ApiResponse::error("conversation_catalog_unavailable", error);
@@ -167,18 +194,30 @@ pub(crate) async fn conversation_directory_attachments_resolve(
             return ApiResponse::error("conversation_session_not_found", "对话不存在。");
         }
         let previous = gui.conversation_catalog.clone();
-        let workspace_ids =
-            match register_roots(&mut gui.conversation_catalog, roots, &crate::now_text()) {
-                Ok(value) => value,
-                Err(error) => return session_service_error(error),
-            };
-        let bindings = binding_snapshot(&gui.conversation_catalog, &workspace_ids);
+        let attachment_store_root = gui.paths.attachment_store_root.clone();
+        let mut created_snapshot_roots = Vec::new();
+        let references = match resolve_filesystem_references(
+            &mut gui.conversation_catalog,
+            &attachment_store_root,
+            &session_id,
+            &body.references,
+            &crate::now_text(),
+            &mut created_snapshot_roots,
+        ) {
+            Ok(value) => value,
+            Err((code, message)) => {
+                gui.conversation_catalog = previous;
+                cleanup_created_snapshot_roots(&created_snapshot_roots);
+                return ApiResponse::error(code, message);
+            }
+        };
         if let Err(error) = persist_catalog_or_rollback(&mut gui, previous) {
+            cleanup_created_snapshot_roots(&created_snapshot_roots);
             return ApiResponse::error("conversation_catalog_write_failed", error);
         }
-        bindings
+        references
     };
-    ApiResponse::ok(json!(bindings))
+    ApiResponse::ok(json!(references))
 }
 
 pub(crate) async fn conversation_directory_index_attach(
@@ -250,7 +289,7 @@ pub(crate) async fn conversation_directory_index_attach(
         "submit",
         json!({
             "command": {
-                "schemaVersion": "deepcode.command",
+                "schemaVersion": "deepcode.command.v3",
                 "type": "session.directory-index.attach",
                 "commandId": command_id,
                 "sessionId": session_id,
@@ -333,7 +372,7 @@ pub(crate) async fn conversation_directory_index_detach(
         "submit",
         json!({
             "command": {
-                "schemaVersion": "deepcode.command",
+                "schemaVersion": "deepcode.command.v3",
                 "type": "session.directory-index.detach",
                 "commandId": command_id,
                 "sessionId": session_id,
@@ -700,31 +739,7 @@ pub(crate) async fn conversation_session_delete(
             return ApiResponse::error("conversation_session_not_found", "对话不存在。");
         };
     }
-    let snapshot = match request_service(
-        state.session_service.clone(),
-        "snapshot",
-        json!({ "sessionId": session_id }),
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(error) if error.code == "session_not_found" => {
-            return ApiResponse::error("conversation_session_not_found", "对话不存在.")
-        }
-        Err(error) => return session_service_error(error),
-    };
-    let active = snapshot
-        .pointer("/run/status")
-        .and_then(Value::as_str)
-        .is_some_and(|status| matches!(status, "running" | "waiting"));
-    if active {
-        return ApiResponse::error(
-            "conversation_session_active",
-            "请先停止当前运行，再删除对话。",
-        );
-    }
-
-    let deleted = {
+    let (deleted, deleted_workspaces) = {
         let mut gui = state.gui.lock().expect("gui state lock");
         if let Some(error) = gui.conversation_catalog_error.as_deref() {
             return ApiResponse::error("conversation_catalog_unavailable", error);
@@ -732,6 +747,13 @@ pub(crate) async fn conversation_session_delete(
         let Some(deleted) = gui.conversation_catalog.session(&session_id).cloned() else {
             return ApiResponse::error("conversation_session_not_found", "对话不存在。");
         };
+        let deleted_workspaces = gui
+            .conversation_catalog
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.owner_session_id.as_deref() == Some(session_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
         if !gui.conversation_catalog.delete_session(&session_id) {
             return ApiResponse::error("conversation_session_not_found", "对话不存在。");
         }
@@ -742,7 +764,7 @@ pub(crate) async fn conversation_session_delete(
             gui.conversation_catalog.insert_session(deleted);
             return ApiResponse::error("conversation_catalog_write_failed", error);
         }
-        deleted
+        (deleted, deleted_workspaces)
     };
 
     if let Err(error) = request_service(
@@ -763,6 +785,9 @@ pub(crate) async fn conversation_session_delete(
             );
         }
         gui.conversation_catalog.insert_session(deleted);
+        for workspace in deleted_workspaces {
+            gui.conversation_catalog.register_workspace(workspace);
+        }
         if let Err(rollback_error) = gui
             .conversation_catalog
             .persist(&gui.paths.catalog_store_path)
@@ -775,7 +800,34 @@ pub(crate) async fn conversation_session_delete(
                 ),
             );
         }
+        if error.code == "session_delete_active_run" {
+            return ApiResponse::error(
+                "conversation_session_active",
+                "请先停止当前运行，再删除对话。",
+            );
+        }
+        if error.code == "session_not_found" {
+            return ApiResponse::error("conversation_session_not_found", "对话不存在。");
+        }
         return session_service_error(error);
+    }
+    if let Err(error) = state.local_agent.kernel.delete_session_outputs(&session_id) {
+        return ApiResponse::error(error.code, error.message);
+    }
+    let attachment_root = {
+        let gui = state.gui.lock().expect("gui state lock");
+        session_attachment_root(&gui.paths.attachment_store_root, &session_id)
+    };
+    if let Err(error) = fs::remove_dir_all(&attachment_root) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return ApiResponse::error(
+                "conversation_attachment_cleanup_failed",
+                format!(
+                    "对话已删除，但 Host 文件引用目录清理失败（{}）：{error}",
+                    attachment_root.display()
+                ),
+            );
+        }
     }
     let gui = state.gui.lock().expect("gui state lock");
     ApiResponse::ok(gui.conversation_catalog.public_value())
@@ -802,13 +854,21 @@ pub(crate) async fn conversation_command_submit(
             return ApiResponse::error(code, message);
         }
     }
-    if command.get("type").and_then(Value::as_str) == Some("message.submit") {
+    if matches!(
+        command.get("type").and_then(Value::as_str),
+        Some("message.submit" | "context.focus")
+    ) {
         let gui = state.gui.lock().expect("gui state lock");
         if let Some(error) = gui.conversation_catalog_error.as_deref() {
             return ApiResponse::error("conversation_catalog_unavailable", error);
         }
         if let Err((code, message)) =
-            validate_message_directory_attachments(&gui.conversation_catalog, &session_id, &command)
+            validate_message_filesystem_references(&gui.conversation_catalog, &session_id, &command)
+        {
+            return ApiResponse::error(code, message);
+        }
+        if let Err((code, message)) =
+            validate_required_filesystem_plugins(&gui.user_settings, &command)
         {
             return ApiResponse::error(code, message);
         }
@@ -827,15 +887,30 @@ pub(crate) async fn conversation_command_submit(
         let automatic_title = command
             .get("type")
             .and_then(Value::as_str)
-            .filter(|kind| *kind == "message.submit")
-            .and_then(|_| command.get("text").and_then(Value::as_str))
+            .filter(|kind| matches!(*kind, "message.submit" | "context.focus"))
+            .and_then(|kind| {
+                command
+                    .get(if kind == "message.submit" {
+                        "text"
+                    } else {
+                        "task"
+                    })
+                    .and_then(Value::as_str)
+            })
             .map(automatic_conversation_title);
+        let active_profile_id = command
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|kind| matches!(*kind, "message.submit" | "context.focus"))
+            .and_then(|_| command.get("profileId"))
+            .and_then(Value::as_str);
         let mut gui = state.gui.lock().expect("gui state lock");
         if gui.conversation_catalog_error.is_none() {
             let previous = gui.conversation_catalog.clone();
             if gui.conversation_catalog.touch_session(
                 &session_id,
                 automatic_title.as_deref(),
+                active_profile_id,
                 &crate::now_text(),
             ) {
                 if let Err(error) = persist_catalog_or_rollback(&mut gui, previous) {
@@ -855,6 +930,22 @@ pub(crate) async fn conversation_projection_get(
         state.session_service,
         "snapshot",
         json!({ "sessionId": session_id }),
+    )
+    .await
+    {
+        Ok(value) => ApiResponse::ok(value),
+        Err(error) => session_service_error(error),
+    }
+}
+
+pub(crate) async fn conversation_context_composition_get(
+    State(state): State<AppState>,
+    Path((session_id, provider_request_id)): Path<(String, String)>,
+) -> Json<ApiResponse> {
+    match request_service(
+        state.session_service,
+        "contextComposition",
+        json!({ "sessionId": session_id, "providerRequestId": provider_request_id }),
     )
     .await
     {
@@ -911,6 +1002,236 @@ fn canonical_roots(paths: &[String]) -> Result<Vec<String>, String> {
     Ok(roots)
 }
 
+fn resolve_filesystem_references(
+    catalog: &mut ConversationCatalog,
+    attachment_store_root: &FsPath,
+    session_id: &str,
+    inputs: &[FilesystemReferencePathInput],
+    now: &str,
+    created_snapshot_roots: &mut Vec<PathBuf>,
+) -> Result<Vec<Value>, (&'static str, String)> {
+    let mut references = Vec::with_capacity(inputs.len());
+    let mut seen_sources = HashSet::new();
+    let mut total_file_bytes = 0u64;
+    for input in inputs {
+        match input.kind.as_str() {
+            "directory" => {
+                let canonical_root = canonical_folder_path(&input.path)
+                    .map_err(|message| ("conversation_filesystem_reference_invalid", message))?;
+                if !seen_sources.insert(format!("directory\0{canonical_root}")) {
+                    return Err((
+                        "conversation_filesystem_reference_duplicate",
+                        "同一目录不能在一条消息中重复附加。".to_string(),
+                    ));
+                }
+                let workspace_ids =
+                    register_roots(catalog, vec![canonical_root], now).map_err(|error| {
+                        (
+                            "conversation_filesystem_reference_identity_failed",
+                            format!("{}: {}", error.code, error.message),
+                        )
+                    })?;
+                let binding = binding_snapshot(catalog, &workspace_ids)
+                    .into_iter()
+                    .next()
+                    .ok_or((
+                        "conversation_workspace_not_found",
+                        "Host 未能登记目录引用。".to_string(),
+                    ))?;
+                let reference_id = random_id("filesystem-reference").map_err(|error| {
+                    (
+                        "conversation_filesystem_reference_identity_failed",
+                        format!("{}: {}", error.code, error.message),
+                    )
+                })?;
+                references.push(json!({
+                    "referenceId": reference_id,
+                    "workspaceId": binding.workspace_id,
+                    "logicalPath": ".",
+                    "displayName": binding.display_name,
+                    "kind": "directory",
+                }));
+            }
+            "file" => {
+                let source = fs::canonicalize(&input.path).map_err(|error| {
+                    (
+                        "conversation_filesystem_reference_invalid",
+                        format!("本地文件不可用：{error}"),
+                    )
+                })?;
+                let metadata = source.metadata().map_err(|error| {
+                    (
+                        "conversation_filesystem_reference_invalid",
+                        format!("读取本地文件元数据失败：{error}"),
+                    )
+                })?;
+                if !metadata.is_file() {
+                    return Err((
+                        "conversation_filesystem_reference_invalid",
+                        "文件引用必须指向普通文件。".to_string(),
+                    ));
+                }
+                if metadata.len() > MAX_REFERENCE_FILE_BYTES {
+                    return Err((
+                        "conversation_filesystem_reference_too_large",
+                        format!("单个文件引用不能超过 {} 字节。", MAX_REFERENCE_FILE_BYTES),
+                    ));
+                }
+                total_file_bytes = total_file_bytes.checked_add(metadata.len()).ok_or((
+                    "conversation_filesystem_reference_too_large",
+                    "文件引用总大小溢出。".to_string(),
+                ))?;
+                if total_file_bytes > MAX_REFERENCE_TOTAL_BYTES {
+                    return Err((
+                        "conversation_filesystem_reference_too_large",
+                        format!(
+                            "单条消息的文件引用总计不能超过 {} 字节。",
+                            MAX_REFERENCE_TOTAL_BYTES
+                        ),
+                    ));
+                }
+                let canonical_source = source.to_string_lossy().to_string();
+                if !seen_sources.insert(format!("file\0{canonical_source}")) {
+                    return Err((
+                        "conversation_filesystem_reference_duplicate",
+                        "同一文件不能在一条消息中重复附加。".to_string(),
+                    ));
+                }
+                let file_name = source
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.trim().is_empty())
+                    .ok_or((
+                        "conversation_filesystem_reference_invalid",
+                        "文件名不是有效 UTF-8。".to_string(),
+                    ))?
+                    .to_string();
+                let reference_id = random_id("filesystem-reference").map_err(|error| {
+                    (
+                        "conversation_filesystem_reference_identity_failed",
+                        format!("{}: {}", error.code, error.message),
+                    )
+                })?;
+                let workspace_id = random_id("workspace").map_err(|error| {
+                    (
+                        "conversation_filesystem_reference_identity_failed",
+                        format!("{}: {}", error.code, error.message),
+                    )
+                })?;
+                let snapshot_root = session_attachment_root(attachment_store_root, session_id)
+                    .join(reference_storage_segment(&reference_id));
+                if snapshot_root.exists() {
+                    return Err((
+                        "conversation_filesystem_reference_identity_conflict",
+                        "文件引用的 Host 存储身份冲突。".to_string(),
+                    ));
+                }
+                fs::create_dir_all(&snapshot_root).map_err(|error| {
+                    (
+                        "conversation_filesystem_reference_import_failed",
+                        format!("创建文件引用存储目录失败：{error}"),
+                    )
+                })?;
+                created_snapshot_roots.push(snapshot_root.clone());
+                let destination = snapshot_root.join(&file_name);
+                let copied = fs::copy(&source, &destination).map_err(|error| {
+                    (
+                        "conversation_filesystem_reference_import_failed",
+                        format!("导入文件引用失败：{error}"),
+                    )
+                })?;
+                if copied != metadata.len() {
+                    return Err((
+                        "conversation_filesystem_reference_import_failed",
+                        "导入文件引用时复制字节数不一致。".to_string(),
+                    ));
+                }
+                let canonical_snapshot_root = fs::canonicalize(&snapshot_root)
+                    .map_err(|error| {
+                        (
+                            "conversation_filesystem_reference_import_failed",
+                            format!("解析文件引用存储目录失败：{error}"),
+                        )
+                    })?
+                    .to_string_lossy()
+                    .to_string();
+                let display_name = bounded_display_name(&file_name);
+                let media_type = filesystem_reference_media_type(&source);
+                catalog.register_workspace(ConversationWorkspaceRecord {
+                    workspace_id: workspace_id.clone(),
+                    display_name: display_name.clone(),
+                    canonical_root: canonical_snapshot_root,
+                    owner_session_id: Some(session_id.to_string()),
+                    created_at: now.to_string(),
+                });
+                references.push(json!({
+                    "referenceId": reference_id,
+                    "workspaceId": workspace_id,
+                    "logicalPath": file_name,
+                    "displayName": display_name,
+                    "kind": "file",
+                    "mediaType": media_type,
+                    "byteLength": metadata.len(),
+                }));
+            }
+            _ => {
+                return Err((
+                    "conversation_filesystem_reference_kind_invalid",
+                    "文件系统引用 kind 必须是 file 或 directory。".to_string(),
+                ))
+            }
+        }
+    }
+    Ok(references)
+}
+
+fn cleanup_created_snapshot_roots(roots: &[PathBuf]) {
+    for root in roots.iter().rev() {
+        if let Err(error) = fs::remove_dir_all(root) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("[conversation-filesystem-reference-cleanup] {error}");
+            }
+        }
+    }
+}
+
+fn session_attachment_root(root: &FsPath, session_id: &str) -> PathBuf {
+    root.join(reference_storage_segment(session_id))
+}
+
+fn reference_storage_segment(value: &str) -> String {
+    deepcode_kernel_tools::hash_bytes(value.as_bytes())
+}
+
+fn bounded_display_name(value: &str) -> String {
+    value.chars().take(120).collect()
+}
+
+fn filesystem_reference_media_type(path: &FsPath) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "pdf" => "application/pdf",
+        "md" | "mdx" => "text/markdown",
+        "json" => "application/json",
+        "toml" => "application/toml",
+        "yaml" | "yml" => "application/yaml",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "mjs" | "cjs" => "text/javascript",
+        "ts" | "tsx" => "text/typescript",
+        "xml" | "svg" => "application/xml",
+        "txt" | "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx" | "rs" | "py" | "java"
+        | "go" | "sh" | "zsh" | "bash" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
 fn register_roots(
     catalog: &mut ConversationCatalog,
     roots: Vec<String>,
@@ -927,6 +1248,7 @@ fn register_roots(
             workspace_id: workspace_id.clone(),
             display_name: workspace_display_name(&root),
             canonical_root: root,
+            owner_session_id: None,
             created_at: now.to_string(),
         });
         workspace_ids.push(workspace_id);
@@ -963,11 +1285,11 @@ fn projection_references_workspace(projection: &Value, workspace_id: &str) -> bo
             .is_some_and(|messages| {
                 messages
                     .iter()
-                    .any(|message| bindings_contain(message.get("directoryAttachments")))
+                    .any(|message| bindings_contain(message.get("filesystemReferences")))
             })
 }
 
-fn validate_message_directory_attachments(
+fn validate_message_filesystem_references(
     catalog: &ConversationCatalog,
     session_id: &str,
     command: &Value,
@@ -975,38 +1297,214 @@ fn validate_message_directory_attachments(
     catalog
         .session(session_id)
         .ok_or(("conversation_session_not_found", "对话不存在。".to_string()))?;
-    let Some(value) = command.get("directoryAttachments") else {
+    let Some(value) = command.get("filesystemReferences") else {
         return Ok(());
     };
-    let bindings = value.as_array().ok_or((
-        "conversation_directory_attachments_invalid",
-        "directoryAttachments 必须是数组。".to_string(),
+    let references = value.as_array().ok_or((
+        "conversation_filesystem_references_invalid",
+        "filesystemReferences 必须是数组。".to_string(),
     ))?;
-    if bindings.len() > 8 {
+    if references.len() > MAX_MESSAGE_FILESYSTEM_REFERENCES {
         return Err((
-            "conversation_directory_attachments_invalid",
-            "单次消息最多附加八个目录。".to_string(),
+            "conversation_filesystem_references_invalid",
+            "单次消息最多附加八个文件系统引用。".to_string(),
         ));
     }
-    let mut seen = HashSet::new();
-    for binding in bindings {
-        let workspace_id = binding.get("workspaceId").and_then(Value::as_str).ok_or((
-            "conversation_directory_attachment_invalid",
-            "目录附件缺少 workspaceId。".to_string(),
+    let mut reference_ids = HashSet::new();
+    let mut targets = HashSet::new();
+    for reference in references {
+        let object = reference.as_object().ok_or((
+            "conversation_filesystem_reference_invalid",
+            "文件系统引用必须是对象。".to_string(),
         ))?;
-        let display_name = binding.get("displayName").and_then(Value::as_str).ok_or((
-            "conversation_directory_attachment_invalid",
-            "目录附件缺少 displayName。".to_string(),
+        let reference_id = reference
+            .get("referenceId")
+            .and_then(Value::as_str)
+            .filter(|value| valid_id(value))
+            .ok_or((
+                "conversation_filesystem_reference_invalid",
+                "文件系统引用缺少有效 referenceId。".to_string(),
+            ))?;
+        let workspace_id = reference
+            .get("workspaceId")
+            .and_then(Value::as_str)
+            .filter(|value| valid_id(value))
+            .ok_or((
+                "conversation_filesystem_reference_invalid",
+                "文件系统引用缺少有效 workspaceId。".to_string(),
+            ))?;
+        let logical_path = reference
+            .get("logicalPath")
+            .and_then(Value::as_str)
+            .filter(|value| valid_reference_logical_path(value))
+            .ok_or((
+                "conversation_filesystem_reference_invalid",
+                "文件系统引用缺少有效 logicalPath。".to_string(),
+            ))?;
+        let display_name = reference
+            .get("displayName")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or((
+                "conversation_filesystem_reference_invalid",
+                "文件系统引用缺少 displayName。".to_string(),
+            ))?;
+        let kind = reference.get("kind").and_then(Value::as_str).ok_or((
+            "conversation_filesystem_reference_invalid",
+            "文件系统引用缺少 kind。".to_string(),
         ))?;
         let workspace = catalog.workspace(workspace_id).ok_or((
-            "conversation_directory_attachment_not_found",
-            "目录附件不在 Host workspace catalog 中。".to_string(),
+            "conversation_filesystem_reference_not_found",
+            "文件系统引用不在 Host workspace catalog 中。".to_string(),
         ))?;
-        if workspace.display_name != display_name || !seen.insert(workspace_id) {
+        if workspace.display_name != display_name
+            || !reference_ids.insert(reference_id)
+            || !targets.insert(format!("{workspace_id}\0{logical_path}"))
+        {
             return Err((
-                "conversation_directory_attachment_mismatch",
-                "目录附件与 Host workspace catalog 不一致或重复。".to_string(),
+                "conversation_filesystem_reference_mismatch",
+                "文件系统引用与 Host workspace catalog 不一致或重复。".to_string(),
             ));
+        }
+        let target = resolve_catalog_reference_path(workspace, logical_path)?;
+        match kind {
+            "directory" => {
+                if object.len() != 5
+                    || logical_path != "."
+                    || workspace.owner_session_id.is_some()
+                    || !target.is_dir()
+                {
+                    return Err((
+                        "conversation_filesystem_reference_mismatch",
+                        "目录引用与 Host 登记事实不一致。".to_string(),
+                    ));
+                }
+            }
+            "file" => {
+                let media_type = reference
+                    .get("mediaType")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or((
+                        "conversation_filesystem_reference_invalid",
+                        "文件引用缺少 mediaType。".to_string(),
+                    ))?;
+                let byte_length = reference.get("byteLength").and_then(Value::as_u64).ok_or((
+                    "conversation_filesystem_reference_invalid",
+                    "文件引用缺少 byteLength。".to_string(),
+                ))?;
+                let metadata = target.metadata().map_err(|error| {
+                    (
+                        "conversation_filesystem_reference_unavailable",
+                        format!("读取 Host 文件快照失败：{error}"),
+                    )
+                })?;
+                if object.len() != 7
+                    || logical_path == "."
+                    || workspace.owner_session_id.as_deref() != Some(session_id)
+                    || !metadata.is_file()
+                    || metadata.len() != byte_length
+                    || filesystem_reference_media_type(&target) != media_type
+                {
+                    return Err((
+                        "conversation_filesystem_reference_mismatch",
+                        "文件引用与 Host 导入快照不一致。".to_string(),
+                    ));
+                }
+            }
+            _ => {
+                return Err((
+                    "conversation_filesystem_reference_kind_invalid",
+                    "文件系统引用 kind 必须是 file 或 directory。".to_string(),
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_reference_logical_path(value: &str) -> bool {
+    if value.is_empty() || value.len() > 4_096 || value.contains('\0') || value.contains('\\') {
+        return false;
+    }
+    if value == "." {
+        return true;
+    }
+    !value.starts_with('/')
+        && !value.ends_with('/')
+        && value
+            .split('/')
+            .all(|segment| !segment.is_empty() && !matches!(segment, "." | ".."))
+}
+
+fn resolve_catalog_reference_path(
+    workspace: &ConversationWorkspaceRecord,
+    logical_path: &str,
+) -> Result<PathBuf, (&'static str, String)> {
+    let canonical_root = fs::canonicalize(&workspace.canonical_root).map_err(|error| {
+        (
+            "conversation_filesystem_reference_unavailable",
+            format!("Host workspace 根不可用：{error}"),
+        )
+    })?;
+    let requested = if logical_path == "." {
+        canonical_root.clone()
+    } else {
+        canonical_root.join(logical_path)
+    };
+    let canonical = fs::canonicalize(requested).map_err(|error| {
+        (
+            "conversation_filesystem_reference_unavailable",
+            format!("Host 文件系统引用不可用：{error}"),
+        )
+    })?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err((
+            "conversation_filesystem_reference_escape",
+            "文件系统引用逃逸 Host workspace 根。".to_string(),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn validate_required_filesystem_plugins(
+    settings: &Value,
+    command: &Value,
+) -> Result<(), (&'static str, String)> {
+    let selected_uris = command
+        .get("pluginSelections")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|selection| selection.get("uri").and_then(Value::as_str))
+        .collect::<HashSet<_>>();
+    let Some(references) = command
+        .get("filesystemReferences")
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    for media_type in references.iter().filter_map(|reference| {
+        (reference.get("kind").and_then(Value::as_str) == Some("file"))
+            .then(|| reference.get("mediaType").and_then(Value::as_str))
+            .flatten()
+    }) {
+        let required_uri =
+            crate::local_agent_plugins::plugin_uri_for_activation_media_type(settings, media_type)
+                .map_err(|message| ("plugin_catalog_unavailable", message))?;
+        if media_type == "application/pdf" && required_uri.is_none() {
+            return Err((
+                "plugin_selection_unavailable",
+                "PDF 文件引用需要一个声明 application/pdf 激活类型的可用插件。".to_string(),
+            ));
+        }
+        if let Some(uri) = required_uri {
+            if !selected_uris.contains(uri.as_str()) {
+                return Err((
+                    "plugin_selection_required",
+                    format!("文件类型 {media_type} 需要显式选择插件 {uri}。"),
+                ));
+            }
         }
     }
     Ok(())
@@ -1125,12 +1623,33 @@ fn random_id(prefix: &str) -> Result<String, SessionServiceError> {
 mod tests {
     use super::*;
 
+    struct TemporaryTree(PathBuf);
+
+    impl TemporaryTree {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(
+                random_id(label)
+                    .expect("temporary tree identity")
+                    .replace(':', "-"),
+            );
+            std::fs::create_dir_all(&path).expect("create temporary tree");
+            Self(path)
+        }
+    }
+
+    impl Drop for TemporaryTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn catalog_fixture() -> ConversationCatalog {
         ConversationCatalog {
             workspaces: vec![ConversationWorkspaceRecord {
                 workspace_id: "workspace:test".to_string(),
                 display_name: "Test".to_string(),
                 canonical_root: "/private/host/Test".to_string(),
+                owner_session_id: None,
                 created_at: "1".to_string(),
             }],
             projects: Vec::new(),
@@ -1185,37 +1704,51 @@ mod tests {
     }
 
     #[test]
-    fn message_directory_attachments_must_match_host_catalog_without_becoming_session_bindings() {
-        let catalog = catalog_fixture();
+    fn message_filesystem_references_must_match_host_catalog() {
+        let root = std::env::temp_dir().join(
+            random_id("deepcode-filesystem-reference-test")
+                .expect("temporary reference identity")
+                .replace(':', "-"),
+        );
+        std::fs::create_dir_all(&root).expect("create temporary reference directory");
+        let mut catalog = catalog_fixture();
+        catalog.workspaces[0].canonical_root = root.to_string_lossy().to_string();
         let command = json!({
-            "directoryAttachments": [{
+            "filesystemReferences": [{
+                "referenceId": "reference:test",
                 "workspaceId": "workspace:test",
+                "logicalPath": ".",
                 "displayName": "Test",
+                "kind": "directory",
             }]
         });
-        assert!(
-            validate_message_directory_attachments(&catalog, "session:test", &command,).is_ok()
-        );
+        assert!(validate_message_filesystem_references(&catalog, "session:test", &command).is_ok());
 
         let forged = json!({
-            "directoryAttachments": [{
+            "filesystemReferences": [{
+                "referenceId": "reference:test",
                 "workspaceId": "workspace:test",
+                "logicalPath": ".",
                 "displayName": "Forged",
+                "kind": "directory",
             }]
         });
         assert_eq!(
-            validate_message_directory_attachments(&catalog, "session:test", &forged)
-                .expect_err("forged attachment rejected")
+            validate_message_filesystem_references(&catalog, "session:test", &forged)
+                .expect_err("forged reference rejected")
                 .0,
-            "conversation_directory_attachment_mismatch"
+            "conversation_filesystem_reference_mismatch"
         );
 
         let projection = json!({
             "workspaceBindings": [],
             "messages": [{
-                "directoryAttachments": [{
+                "filesystemReferences": [{
+                    "referenceId": "reference:test",
                     "workspaceId": "workspace:test",
+                    "logicalPath": ".",
                     "displayName": "Test",
+                    "kind": "directory",
                 }]
             }]
         });
@@ -1227,5 +1760,96 @@ mod tests {
             &projection,
             "workspace:other"
         ));
+        std::fs::remove_dir_all(root).expect("remove temporary reference directory");
+    }
+
+    #[test]
+    fn file_reference_is_imported_as_session_owned_snapshot() {
+        let source_tree = TemporaryTree::new("deepcode-reference-source");
+        let attachment_tree = TemporaryTree::new("deepcode-reference-store");
+        let source = source_tree.0.join("fixture.pdf");
+        std::fs::write(&source, b"%PDF fixture bytes").expect("write source fixture");
+        let mut catalog = catalog_fixture();
+        let inputs = vec![FilesystemReferencePathInput {
+            path: source.to_string_lossy().to_string(),
+            kind: "file".to_string(),
+        }];
+        let mut created_snapshot_roots = Vec::new();
+
+        let references = resolve_filesystem_references(
+            &mut catalog,
+            &attachment_tree.0,
+            "session:test",
+            &inputs,
+            "now",
+            &mut created_snapshot_roots,
+        )
+        .expect("import file reference");
+        assert_eq!(references.len(), 1);
+        let reference = &references[0];
+        assert_eq!(reference["kind"], "file");
+        assert_eq!(reference["logicalPath"], "fixture.pdf");
+        assert_eq!(reference["mediaType"], "application/pdf");
+        assert_eq!(reference["byteLength"], 18);
+        let workspace_id = reference["workspaceId"]
+            .as_str()
+            .expect("workspace identity");
+        let workspace = catalog.workspace(workspace_id).expect("snapshot workspace");
+        assert_eq!(workspace.owner_session_id.as_deref(), Some("session:test"));
+        let imported = PathBuf::from(&workspace.canonical_root).join("fixture.pdf");
+        assert_eq!(
+            std::fs::read(&imported).expect("read imported snapshot"),
+            b"%PDF fixture bytes"
+        );
+
+        std::fs::write(&source, b"changed source").expect("mutate source fixture");
+        assert_eq!(
+            std::fs::read(&imported).expect("read stable snapshot"),
+            b"%PDF fixture bytes"
+        );
+        assert!(validate_message_filesystem_references(
+            &catalog,
+            "session:test",
+            &json!({ "filesystemReferences": references }),
+        )
+        .is_ok());
+        assert_eq!(created_snapshot_roots.len(), 1);
+        assert!(created_snapshot_roots[0].starts_with(&attachment_tree.0));
+    }
+
+    #[test]
+    fn pdf_reference_requires_the_declared_media_type_plugin_selection() {
+        let settings = json!({});
+        let required_uri = crate::local_agent_plugins::plugin_uri_for_activation_media_type(
+            &settings,
+            "application/pdf",
+        )
+        .expect("resolve activation owner")
+        .expect("PDF activation owner");
+        assert_eq!(required_uri, "plugin://pdf@first-party");
+        let mut command = json!({
+            "filesystemReferences": [{
+                "referenceId": "reference:pdf",
+                "workspaceId": "workspace:pdf",
+                "logicalPath": "fixture.pdf",
+                "displayName": "fixture.pdf",
+                "kind": "file",
+                "mediaType": "application/pdf",
+                "byteLength": 18,
+            }],
+        });
+
+        assert_eq!(
+            validate_required_filesystem_plugins(&settings, &command)
+                .expect_err("missing PDF plugin selection")
+                .0,
+            "plugin_selection_required"
+        );
+        command["pluginSelections"] = json!([{
+            "selectionId": "selection:pdf",
+            "uri": required_uri,
+            "label": "PDF reader",
+        }]);
+        assert!(validate_required_filesystem_plugins(&settings, &command).is_ok());
     }
 }

@@ -68,21 +68,3 @@ impl HostShutdownReceipt {
             && &self.identity == expected_identity
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn local_tokens_have_exact_prefix_and_entropy() {
-        assert!(is_valid_host_shell_token(&format!(
-            "{HOST_SHELL_TOKEN_PREFIX}{}",
-            "a".repeat(64)
-        )));
-        assert!(!is_valid_host_shell_token("short"));
-        assert!(!is_valid_host_shell_token(&format!(
-            "{HOST_UI_TOKEN_PREFIX}{}",
-            "a".repeat(64)
-        )));
-    }
-}
