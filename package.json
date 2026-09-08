@@ -12,14 +12,15 @@
     "dev:kernel:build-only": "cargo build -p deepcode-first-party-tools -p deepcode-kernel-daemon -p deepcode-host-web",
     "dev:tauri": "pnpm tauri:dev:deepcode-gui",
     "tauri:dev:deepcode-gui": "pnpm build:deepcode-gui && cargo build -p deepcode-first-party-tools -p deepcode-kernel-daemon -p deepcode-host-web && pnpm --filter @deepcode/deepcode-gui-shell prepare:dist && DEEPCODE_KERNEL_DAEMON_BIN=\"$PWD/target/debug/deepcode-kernel-daemon\" DEEPCODE_HOST_WEB_BIN=\"$PWD/target/debug/deepcode-host-web\" DEEPCODE_CLIENT_DIST=\"$PWD/shells/deepcode-gui/dist\" pnpm --filter @deepcode/deepcode-gui-shell tauri:dev",
-    "build": "pnpm --filter @deepcode/protocol build && pnpm --filter @deepcode/presentation-core build && pnpm --filter @deepcode/session-core build && pnpm --filter @deepcode/client build && cargo build --workspace",
-    "build:client": "pnpm --filter @deepcode/client build",
-    "build:deepcode-gui": "pnpm --filter @deepcode/protocol build && pnpm --filter @deepcode/presentation-core build && pnpm --filter @deepcode/session-core build && pnpm --filter @deepcode/client build:deepcode-gui",
-    "build:kernel": "cargo build -p deepcode-host-web",
-    "build:tauri": "pnpm --filter @deepcode/tauri-shell tauri:build",
-    "build:tauri:deepcode-gui": "pnpm build:deepcode-gui && pnpm --filter @deepcode/deepcode-gui-shell prepare:dist && pnpm --filter @deepcode/deepcode-gui-shell tauri:build",
+    "build": "bash ./build.sh",
+    "build:client": "bash ./build.sh --stage gui",
+    "build:deepcode-gui": "bash ./build.sh --stage deepcode-gui",
+    "build:kernel": "bash ./build.sh --stage daemon",
+    "build:tauri": "bash ./build.sh --stage tauri",
+    "build:tauri:deepcode-gui": "bash ./build.sh --stage deepcode-gui-tauri",
     "start": "pnpm tauri:dev:deepcode-gui",
-    "typecheck": "pnpm --filter @deepcode/protocol typecheck && pnpm --filter @deepcode/presentation-core typecheck && pnpm --filter @deepcode/session-core typecheck && pnpm --filter @deepcode/client typecheck"
+    "typecheck": "pnpm --filter @deepcode/protocol typecheck && pnpm --filter @deepcode/presentation-core typecheck && pnpm --filter @deepcode/session-core typecheck && pnpm --filter @deepcode/client typecheck",
+    "build:userspace-shared": "pnpm --filter @deepcode/protocol build && pnpm --filter @deepcode/presentation-core build && pnpm --filter @deepcode/session-core build"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",

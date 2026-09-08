@@ -613,11 +613,16 @@
   font-weight: var(--dc-weight-medium);
 }
 
-.deepcode-gui-session-row > button:first-child span {
+.deepcode-gui-session-row__title {
+  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.deepcode-gui-session-row .local-agent__run-label {
+  flex: 0 0 auto;
 }
 
 .deepcode-gui-session-row kbd {

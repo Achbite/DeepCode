@@ -33,7 +33,7 @@ impl ProductTools {
 
     pub(crate) fn definitions() -> Vec<(&'static str, String, Value)> {
         vec![
-            ("session.read", "Read persisted DeepCode conversation facts without resuming the session. Start with summary; use messages, tools, plans or context for details. before is an exclusive event-sequence cursor; nextBefore continues older items. Excerpts report truncation. A session ID is required.".into(), json!({
+            ("session.read", "Read persisted DeepCode conversation facts without resuming the session. Query directly; no prior Skill read is required. Start with summary; use messages, tools, plans or context for details. before is an exclusive event-sequence cursor; nextBefore continues older items. Excerpts report truncation. A session ID is required.".into(), json!({
                 "type":"object", "additionalProperties":false, "required":["sessionId"],
                 "properties": {
                     "sessionId":{"type":"string","description":"Exact complete ID from the user or DeepCode. Preserve it verbatim, including prefixes such as session:."},
@@ -44,7 +44,7 @@ impl ProductTools {
                     "providerRequestId":{"type":"string","description":"Exact Provider request ID; requires view=context."}
                 }
             })),
-            ("skill.read", format!("Read a DeepCode product Skill or its reference on demand. Available: {}. Omit path to read SKILL.md.",
+            ("skill.read", format!("Read a DeepCode product Skill or its reference when guidance is needed. Read only content relevant to the current question. Available: {}. Omit path to read SKILL.md.",
                 SKILLS.iter().map(|skill| format!("{} — {}", skill.id, skill.description())).collect::<Vec<_>>().join("; ")), json!({
                 "type":"object", "additionalProperties":false, "required":["name"],
                 "properties": {

@@ -6,13 +6,14 @@ import type {
   ConversationPort,
   ConversationReadQuery,
   ConversationReadResult,
+  ConversationSessionStatus,
   SessionProjection,
   WorkspaceBindingDisplay,
 } from '@deepcode/protocol';
 import { SessionActor } from './actor.js';
 import type { AgentComposition } from './plugins.js';
 import { readConversation, readSessionEvents } from './conversationRead.js';
-import { recoverSession } from './reducer.js';
+import { emptySessionState, recoverSession, reduceSession, type SessionState } from './reducer.js';
 
 export interface SessionCompositionFactory {
   create(input: {
@@ -25,6 +26,7 @@ export interface SessionCompositionFactory {
 
 export class SessionService implements ConversationPort {
   readonly #actors = new Map<string, Promise<SessionActor>>();
+  readonly #statusStates = new Map<string, SessionState>();
 
   constructor(
     readonly journal: CommandJournalPort,
@@ -69,6 +71,7 @@ export class SessionService implements ConversationPort {
       }
     }
     await this.journal.deleteSession(sessionId);
+    this.#statusStates.delete(sessionId);
   }
 
   async submit(command: ConversationCommand): Promise<CommandReply> {
@@ -77,6 +80,29 @@ export class SessionService implements ConversationPort {
 
   async snapshot(sessionId: string): Promise<SessionProjection> {
     return await (await this.actor(sessionId)).snapshot();
+  }
+
+  async statuses(sessionIds: readonly string[]): Promise<ConversationSessionStatus[]> {
+    return await Promise.all(sessionIds.map(async (sessionId) => {
+      // Reuse the canonical reducer and read only new events after the first read.
+      // Sidebar reads must not open Actors or resume waiting/running conversations.
+      let state = this.#statusStates.get(sessionId) ?? emptySessionState(sessionId);
+      for await (const event of this.journal.read(sessionId, state.revision)) {
+        state = reduceSession(state, event);
+      }
+      if (state.revision === 0) throw new Error('session_not_found');
+      if (state.revision >= (this.#statusStates.get(sessionId)?.revision ?? 0)) {
+        this.#statusStates.set(sessionId, state);
+      }
+      return {
+        sessionId, revision: state.revision,
+        run: state.run ? {
+          runId: state.run.runId,
+          status: state.run.status,
+          ...(state.run.waitingReason ? { waitingReason: state.run.waitingReason } : {}),
+        } : null,
+      };
+    }));
   }
 
   async contextComposition(sessionId: string, providerRequestId: string): Promise<ContextCompositionProjection> {
@@ -93,6 +119,7 @@ export class SessionService implements ConversationPort {
   async dispose(): Promise<void> {
     const actorPromises = [...this.#actors.values()];
     this.#actors.clear();
+    this.#statusStates.clear();
     const actorResults = await Promise.allSettled(actorPromises);
     const errors: unknown[] = actorResults.flatMap((result) => (
       result.status === 'rejected' ? [result.reason] : []

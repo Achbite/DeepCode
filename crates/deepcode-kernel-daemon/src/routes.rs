@@ -86,6 +86,7 @@ pub(crate) fn build_app(state: AppState) -> Router {
             post(conversation_session_create),
         )
         .route("/api/conversation/catalog", get(conversation_catalog_get))
+        .route("/api/conversation/statuses", get(conversation_statuses_get))
         .route(
             "/api/conversation/plugins",
             get(conversation_plugin_catalog_get),

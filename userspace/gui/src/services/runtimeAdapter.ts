@@ -14,13 +14,6 @@ declare global {
 
 export const APP_CLOSE_REQUEST_EVENT = 'deepcode:app-close-request';
 
-export interface RuntimeStatus {
-  runtime: 'web';
-  version: string;
-  platform: string;
-  arch?: string;
-}
-
 export interface KernelStartResult {
   started: boolean;
   blocked: boolean;
@@ -84,6 +77,15 @@ export async function closeAppWindow(): Promise<void> {
   await windowCommand('close', () => window.close());
 }
 
+export async function openExternalUrl(url: string): Promise<void> {
+  const invoke = tauriInvoke();
+  if (invoke) {
+    await invoke('deepcode_open_external_url', { url });
+    return;
+  }
+  window.open(url, '_blank', 'noopener,noreferrer');
+}
+
 export function healthVersion(health?: HealthStatus): string {
   return health?.version || health?.buildCommit || 'unknown';
 }
@@ -96,15 +98,6 @@ export function isRuntimeReady(
     && response.data.status === 'ok'
     && response.data.kernel === 'ready'
     && response.data.session === 'ready';
-}
-
-export async function getRuntimeStatus(): Promise<RuntimeStatus> {
-  const health = await api.getHealth();
-  return {
-    runtime: 'web',
-    version: health.ok ? healthVersion(health.data) : 'unknown',
-    platform: navigator.platform,
-  };
 }
 
 export async function startKernelAfterPermission(): Promise<ApiResponse<KernelStartResult>> {

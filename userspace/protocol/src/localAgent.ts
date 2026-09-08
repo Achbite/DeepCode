@@ -49,6 +49,13 @@ export interface ConversationSessionSummary {
   updatedAt: string;
 }
 
+/** Compact Session facts for navigation; reading these does not start a run. */
+export interface ConversationSessionStatus {
+  sessionId: string;
+  revision: number;
+  run: Pick<RunProjection, 'runId' | 'status' | 'waitingReason'> | null;
+}
+
 export interface ConversationCatalog {
   projects: ConversationProject[];
   sessions: ConversationSessionSummary[];
@@ -848,6 +855,8 @@ export type SessionTimelineItem =
       timelineId: string;
       sequence: number;
       messageId: string;
+      /** Required for assistant text; absent for user messages. */
+      streamId?: string;
       outputIndex?: number;
     }
   | {
@@ -856,6 +865,7 @@ export type SessionTimelineItem =
       sequence: number;
       providerRequestId: string;
       narrativeId: string;
+      streamId: string;
       outputIndex?: number;
     }
   | {
@@ -892,9 +902,14 @@ export interface ApprovalProjection {
 }
 
 export type AssistantDraftBlockProjection =
-  | { outputIndex: number; kind: 'narrative'; content: string }
-  | { outputIndex: number; kind: 'finalMessage'; content: string }
-  | { outputIndex: number; kind: 'message'; content: string }
+  | {
+      kind: 'narrative' | 'finalMessage' | 'message';
+      content: string;
+      /** Opaque Session-owned identity shared with the committed timeline text. */
+      streamId: string;
+      /** Present only when the Provider supplied a native output index. */
+      outputIndex?: number;
+    }
   | {
       outputIndex: number;
       kind: 'providerHosted';
@@ -904,17 +919,12 @@ export type AssistantDraftBlockProjection =
       action: JsonObject;
     };
 
-/**
- * Session-owned, non-durable presentation for the one Provider turn currently streaming.
- * Ordered blocks retain Provider output_index so the GUI can continue the same display buffer
- * when the typed turn becomes canonical timeline content.
- */
+/** Session-owned, non-durable presentation for the one Provider turn currently streaming. */
 export interface AssistantDraftProjection {
   runId: string;
   turnId: string;
-  content: string;
-  reasoningContent?: string;
-  orderedBlocks?: AssistantDraftBlockProjection[];
+  /** Session orders these blocks. An empty list can still carry Provider activity. */
+  blocks: AssistantDraftBlockProjection[];
   activity?: ProviderActivityProjection;
 }
 
@@ -1098,6 +1108,7 @@ export interface SessionProjection {
 export interface ConversationPort {
   submit(command: ConversationCommand): Promise<CommandReply>;
   snapshot(sessionId: string): Promise<SessionProjection>;
+  statuses(sessionIds: readonly string[]): Promise<ConversationSessionStatus[]>;
   contextComposition(sessionId: string, providerRequestId: string): Promise<ContextCompositionProjection>;
   read(query: ConversationReadQuery): Promise<ConversationReadResult>;
 }

@@ -8,16 +8,16 @@
     "dev": "vite",
     "dev:deepcode-gui": "vite --config vite.deepcode-gui.config.ts",
     "build": "pnpm run build:types && pnpm run build:web",
-    "build:types": "tsc",
+    "build:types": "tsc --noEmit",
     "build:web": "vite build",
     "build:deepcode-gui": "pnpm run build:types && pnpm run build:deepcode-gui:web",
     "build:deepcode-gui:web": "vite build --config vite.deepcode-gui.config.ts && if [ -f dist-deepcode-gui/deepcode-gui.html ]; then cp dist-deepcode-gui/deepcode-gui.html dist-deepcode-gui/index.html; fi",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/session-contract.test.mjs"
   },
   "dependencies": {
     "@deepcode/presentation-core": "workspace:*",
     "@deepcode/protocol": "workspace:*",
-    "@deepcode/session-core": "workspace:*",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "katex": "^0.17.0",

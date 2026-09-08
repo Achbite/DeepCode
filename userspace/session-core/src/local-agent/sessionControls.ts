@@ -30,7 +30,7 @@ export function sessionControlInstructions(
   if (!hasWorkspaceBindings) {
     return `Text with calls is progress; text without calls is the final answer. ${names.interactionRequest} must be the only call in its turn. No workspace is bound to this run; do not invent a workspace handle or request workspace operations.`;
   }
-  return `Text with calls is progress; text without calls is the final answer. Session controls must be the only call in their turn. Use ${names.planProgress} to report progress for the confirmed Todo list using tool result recordId evidence; command counts do not determine step completion. Session Todo messages are chronological state updates; the latest update is current. Use a logical workspace handle from the Session binding list and workspace-relative paths; never invent or expose a workspaceId.`;
+  return `Text with calls is progress; text without calls is the final answer. ${names.interactionRequest} and ${names.planPublish} must each be the only call in their turn. One ${names.planProgress} may accompany ordinary tool calls, reporting confirmed Todo progress from a tool result recordId already received before this turn; never anticipate results of calls in the same turn. Command counts do not determine step completion. Session Todo messages are chronological state updates; the latest update is current. Use a logical workspace handle from the Session binding list and workspace-relative paths; never invent or expose a workspaceId.`;
 }
 
 const INTERACTION_SCHEMA: JsonObject = {
@@ -181,7 +181,7 @@ export function sessionControlToolDefinitions(): readonly ProviderToolDefinition
     },
     {
       name: SESSION_CONTROL_PLAN_PROGRESS,
-      description: 'Update confirmed Todo steps after examining a tool result. sourceFactRef is its recordId from this run, including investigation before Plan confirmation. Mark completed only when the step and its verification are done. Batch related updates; this does not request user confirmation.',
+      description: 'Update confirmed Todo steps after examining a tool result. sourceFactRef is its recordId from this run, received before this turn, including investigation before Plan confirmation. Mark completed only when the step and its verification are done. Batch related updates into one call, optionally alongside ordinary tool calls; their future results cannot be evidence. This does not request user confirmation.',
       inputSchema: {
         type: 'object', additionalProperties: false, required: ['sourceFactRef', 'updates'],
         properties: {
@@ -499,16 +499,6 @@ function requiredDisplayText(value: unknown, field: string, maxLength: number): 
     );
   }
   return text;
-}
-
-function requiredPositiveInteger(value: unknown, field: string): number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
-    throw new SessionControlError(
-      'session_control_integer_invalid',
-      `Session control 字段 ${field} 必须是正整数。`,
-    );
-  }
-  return value;
 }
 
 function assertExactKeys(

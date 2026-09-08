@@ -8,7 +8,7 @@ use deepcode_kernel_client::{
     PluginSelectionInput, ProjectionMessage, SessionProjection, SessionTimelineItem,
 };
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -758,8 +758,8 @@ async fn wait_for_projection(
     let mut last_revision = start_revision;
     let mut rendered_sequence = start_timeline_sequence;
     let mut rendered_todo_sequence = start_todo_sequence;
-    let mut live_turn: Option<(String, String)> = None;
-    let mut live_text = String::new();
+    let mut live_text = HashMap::<String, String>::new();
+    let mut live_stream: Option<String> = None;
     let mut live_open = false;
     loop {
         if Instant::now() >= deadline {
@@ -771,33 +771,25 @@ async fn wait_for_projection(
             .map_err(|error| error.to_string())?;
         if projection.revision > last_revision {
             if !plain {
-                let current_turn = projection
-                    .assistant_draft
-                    .as_ref()
-                    .map(|draft| (draft.run_id.as_str(), draft.turn_id.as_str()));
-                let previous_turn = live_turn
-                    .as_ref()
-                    .map(|(run_id, turn_id)| (run_id.as_str(), turn_id.as_str()));
-                let previous_turn_closed = previous_turn != current_turn;
-                if previous_turn_closed && live_open {
+                let live_stream_visible =
+                    projection.assistant_draft.as_ref().is_some_and(|draft| {
+                        draft.blocks.iter().any(|block| {
+                            block.text().is_some_and(|(stream_id, _)| {
+                                live_stream.as_deref() == Some(stream_id)
+                            })
+                        })
+                    });
+                if !live_stream_visible && live_open {
                     eprintln!();
                     live_open = false;
                 }
-                render_increment_except(
-                    &projection,
-                    rendered_sequence,
-                    previous_turn_closed.then_some(previous_turn).flatten(),
-                );
+                render_increment_except(&projection, rendered_sequence, Some(&mut live_text));
                 if projection
                     .todo_list
                     .as_ref()
                     .is_some_and(|todo| todo.sequence > rendered_todo_sequence)
                 {
                     render_todo(&projection);
-                }
-                if previous_turn_closed {
-                    live_turn = None;
-                    live_text.clear();
                 }
             }
             rendered_sequence = last_timeline_sequence(&projection);
@@ -806,34 +798,31 @@ async fn wait_for_projection(
         }
         if !plain {
             if let Some(draft) = projection.assistant_draft.as_ref() {
-                let draft_identity = (draft.run_id.as_str(), draft.turn_id.as_str());
-                let live_identity = live_turn
-                    .as_ref()
-                    .map(|(run_id, turn_id)| (run_id.as_str(), turn_id.as_str()));
-                if live_identity != Some(draft_identity) {
-                    if live_open {
-                        eprintln!();
+                for block in &draft.blocks {
+                    let Some((stream_id, content)) = block.text() else {
+                        continue;
+                    };
+                    let previous = live_text.get(stream_id).map(String::as_str).unwrap_or("");
+                    if content == previous {
+                        continue;
                     }
-                    live_turn = Some((draft.run_id.clone(), draft.turn_id.clone()));
-                    live_text.clear();
-                    live_open = false;
-                }
-                if draft.content.starts_with(&live_text) {
-                    let delta = &draft.content[live_text.len()..];
-                    if !delta.is_empty() {
+                    if live_stream.as_deref() != Some(stream_id) && live_open {
+                        eprintln!();
+                        live_open = false;
+                    }
+                    if let Some(delta) = content.strip_prefix(previous) {
                         eprint!("{delta}");
-                        io::stderr().flush().map_err(|error| error.to_string())?;
-                        live_open = true;
+                    } else {
+                        if live_open {
+                            eprintln!();
+                        }
+                        eprint!("{content}");
                     }
-                } else {
-                    if live_open {
-                        eprintln!();
-                    }
-                    eprint!("{}", draft.content);
                     io::stderr().flush().map_err(|error| error.to_string())?;
                     live_open = true;
+                    live_stream = Some(stream_id.to_string());
+                    live_text.insert(stream_id.to_string(), content.to_string());
                 }
-                live_text = draft.content.clone();
             }
         }
         if let Some(run) = projection.run.as_ref() {
@@ -1140,24 +1129,38 @@ fn render_increment(projection: &SessionProjection, after_sequence: u64) {
 fn render_increment_except(
     projection: &SessionProjection,
     after_sequence: u64,
-    suppress_turn: Option<(&str, &str)>,
+    mut streamed_text: Option<&mut HashMap<String, String>>,
 ) {
     for item in timeline_items(projection)
         .into_iter()
         .filter(|item| item.sequence() > after_sequence)
     {
         match item {
-            TimelineItem::Message { value: message, .. } => {
-                if message.role == "assistant" && message_identity(message) == suppress_turn {
+            TimelineItem::Message {
+                value: message,
+                stream_id,
+                ..
+            } => {
+                if render_stream_remainder(
+                    &message.content,
+                    stream_id,
+                    streamed_text.as_deref_mut(),
+                ) {
                     continue;
                 }
                 println!("{}: {}", message.role, message.content);
                 render_attachments(message);
             }
             TimelineItem::Narrative {
-                value: narrative, ..
+                value: narrative,
+                stream_id,
+                ..
             } => {
-                if narrative_identity(narrative) == suppress_turn {
+                if render_stream_remainder(
+                    &narrative.content,
+                    Some(stream_id),
+                    streamed_text.as_deref_mut(),
+                ) {
                     continue;
                 }
                 println!("{}", narrative.content);
@@ -1172,18 +1175,24 @@ fn render_increment_except(
     }
 }
 
-fn message_identity(message: &ProjectionMessage) -> Option<(&str, &str)> {
-    Some((
-        message.run_id.as_deref()?,
-        message.provider_request_id.as_deref()?,
-    ))
-}
-
-fn narrative_identity(narrative: &NarrativeProjection) -> Option<(&str, &str)> {
-    Some((
-        narrative.run_id.as_str(),
-        narrative.provider_request_id.as_str(),
-    ))
+fn render_stream_remainder(
+    content: &str,
+    stream_id: Option<&str>,
+    streamed_text: Option<&mut HashMap<String, String>>,
+) -> bool {
+    let (Some(stream_id), Some(streamed_text)) = (stream_id, streamed_text) else {
+        return false;
+    };
+    let Some(previous) = streamed_text.insert(stream_id.to_string(), content.to_string()) else {
+        return false;
+    };
+    let Some(remaining) = content.strip_prefix(previous.as_str()) else {
+        return false;
+    };
+    if !remaining.is_empty() {
+        eprintln!("{remaining}");
+    }
+    true
 }
 
 fn render_tool_activity(projection: &SessionProjection, activity: &ActivityProjection) {
@@ -1406,10 +1415,12 @@ enum TimelineItem<'a> {
     Message {
         sequence: u64,
         value: &'a ProjectionMessage,
+        stream_id: Option<&'a str>,
     },
     Narrative {
         sequence: u64,
         value: &'a NarrativeProjection,
+        stream_id: &'a str,
     },
     Plan {
         sequence: u64,
@@ -1440,9 +1451,11 @@ fn timeline_items(projection: &SessionProjection) -> Vec<TimelineItem<'_>> {
             SessionTimelineItem::Message {
                 sequence,
                 message_id,
+                stream_id,
                 ..
             } => TimelineItem::Message {
                 sequence: *sequence,
+                stream_id: stream_id.as_deref(),
                 value: projection
                     .messages
                     .iter()
@@ -1452,9 +1465,11 @@ fn timeline_items(projection: &SessionProjection) -> Vec<TimelineItem<'_>> {
             SessionTimelineItem::Narrative {
                 sequence,
                 narrative_id,
+                stream_id,
                 ..
             } => TimelineItem::Narrative {
                 sequence: *sequence,
+                stream_id,
                 value: projection
                     .narratives
                     .iter()
