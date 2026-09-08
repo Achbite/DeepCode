@@ -33,7 +33,7 @@ const MAX_REQUEST_BYTES = 1024 * 1024;
 type BridgeRequest = {
   protocolVersion: typeof LOCAL_AGENT_PROTOCOL_VERSION;
   requestId: string;
-  operation: 'health' | 'createSession' | 'deleteSession' | 'submit' | 'snapshot' | 'contextComposition' | 'read' | 'shutdown';
+  operation: 'health' | 'createSession' | 'deleteSession' | 'submit' | 'snapshot' | 'statuses' | 'contextComposition' | 'read' | 'shutdown';
   data: Record<string, unknown>;
 };
 
@@ -152,6 +152,13 @@ async function dispatch(
     }
     case 'snapshot':
       return await service.snapshot(requiredString(request.data, 'sessionId'));
+    case 'statuses': {
+      const { sessionIds } = request.data;
+      if (!Array.isArray(sessionIds) || !sessionIds.every(validId)) {
+        throw new Error('conversation_status_query_invalid');
+      }
+      return await service.statuses(sessionIds);
+    }
     case 'read':
       return await service.read(decodeConversationReadQuery(request.data));
     case 'contextComposition':
@@ -412,7 +419,7 @@ function decodeRequest(encoded: string): BridgeRequest {
     || value.protocolVersion !== LOCAL_AGENT_PROTOCOL_VERSION
     || typeof value.requestId !== 'string'
     || !value.requestId
-    || !['health', 'createSession', 'deleteSession', 'submit', 'snapshot', 'contextComposition', 'read', 'shutdown'].includes(String(value.operation))
+    || !['health', 'createSession', 'deleteSession', 'submit', 'snapshot', 'statuses', 'contextComposition', 'read', 'shutdown'].includes(String(value.operation))
     || !isRecord(value.data)
   ) {
     throw new Error('session_service_request_invalid');

@@ -1,8 +1,10 @@
 import type {
+  AssistantDraftBlockProjection,
   CommandReply,
   ConversationCatalog,
   ConversationCatalogManagement,
   ConversationCommand,
+  ConversationSessionStatus,
   ContextCompositionMessageBlock,
   ContextCompositionTool,
   FilesystemReference,
@@ -78,6 +80,23 @@ export async function getConversationCatalog(
     `${API_BASE}/conversation/catalog`,
     { signal },
   ));
+}
+
+export async function getConversationStatuses(signal?: AbortSignal): Promise<ConversationSessionStatus[]> {
+  const value = await request<unknown>(`${API_BASE}/conversation/statuses`, { signal });
+  if (!Array.isArray(value) || !value.every((item) => (
+    isExactRecord(item, ['sessionId', 'revision', 'run'])
+    && isIdentifier(item.sessionId)
+    && Number.isSafeInteger(item.revision) && Number(item.revision) >= 1
+    && (item.run === null || (
+      isExactRecord(item.run, ['runId', 'status'], ['waitingReason'])
+      && isIdentifier(item.run.runId)
+      && RUN_PROJECTION_STATUSES.includes(item.run.status as never)
+      && (item.run.waitingReason === undefined
+        || ['approval', 'userInput', 'plan'].includes(String(item.run.waitingReason)))
+    ))
+  ))) throw new Error('conversation_statuses_invalid');
+  return value as ConversationSessionStatus[];
 }
 
 export async function getPluginCatalog(
@@ -364,18 +383,20 @@ function isTimelineItem(value: unknown): boolean {
       return isExactRecord(
         value,
         ['kind', 'timelineId', 'sequence', 'messageId'],
-        ['outputIndex'],
+        ['outputIndex', 'streamId'],
       )
         && isIdentifier(value.messageId)
+        && (value.streamId === undefined || isStreamId(value.streamId))
         && (value.outputIndex === undefined || isNaturalNumber(value.outputIndex));
     case 'narrative':
       return isExactRecord(
         value,
-        ['kind', 'timelineId', 'sequence', 'providerRequestId', 'narrativeId'],
+        ['kind', 'timelineId', 'sequence', 'providerRequestId', 'narrativeId', 'streamId'],
         ['outputIndex'],
       )
         && isIdentifier(value.providerRequestId)
         && isIdentifier(value.narrativeId)
+        && isStreamId(value.streamId)
         && (value.outputIndex === undefined || isNaturalNumber(value.outputIndex));
     case 'plan':
       return isExactRecord(value, [
@@ -424,6 +445,9 @@ function timelineReferencesAreValid(
           && messages.some((message) => (
             message.messageId === messageId
             && ['user', 'assistant'].includes(String(message.role))
+            && (message.role === 'assistant'
+              ? isStreamId(item.streamId)
+              : item.streamId === undefined)
           ));
       }
       case 'narrative': {
@@ -642,27 +666,28 @@ function isNarrative(value: unknown): boolean {
 function isAssistantDraft(value: unknown): boolean {
   if (!isExactRecord(
     value,
-    ['runId', 'turnId', 'content'],
-    ['reasoningContent', 'orderedBlocks', 'activity'],
+    ['runId', 'turnId', 'blocks'],
+    ['activity'],
   )
     || !isIdentifier(value.runId)
     || !isIdentifier(value.turnId)
-    || typeof value.content !== 'string'
-    || value.reasoningContent !== undefined && typeof value.reasoningContent !== 'string'
+    || !isArrayOf(value.blocks, isAssistantDraftBlock)
     || value.activity !== undefined && !isProviderActivity(value.activity)
   ) return false;
-  if (value.orderedBlocks === undefined) return true;
-  const orderedBlocks = value.orderedBlocks;
-  if (
-    value.content !== ''
-    || value.reasoningContent !== undefined
-    || !Array.isArray(orderedBlocks)
-    || orderedBlocks.length === 0
-    || !orderedBlocks.every(isAssistantDraftBlock)
-  ) return false;
-  return orderedBlocks.every((block, index) => (
-    index === 0 || block.outputIndex > orderedBlocks[index - 1].outputIndex
-  ));
+  const streams = new Set<string>();
+  const blockCount = value.blocks.length;
+  let previousOutputIndex = -1;
+  return value.blocks.every((block) => {
+    if (block.outputIndex === undefined && blockCount !== 1) return false;
+    if (block.outputIndex !== undefined) {
+      if (block.outputIndex <= previousOutputIndex) return false;
+      previousOutputIndex = block.outputIndex;
+    }
+    if (block.kind === 'providerHosted') return true;
+    if (streams.has(block.streamId)) return false;
+    streams.add(block.streamId);
+    return true;
+  });
 }
 
 function isProviderActivity(value: unknown): boolean {
@@ -673,19 +698,20 @@ function isProviderActivity(value: unknown): boolean {
     && (value.lastContentAt === undefined || isNonEmptyText(value.lastContentAt) && Number.isFinite(Date.parse(value.lastContentAt)));
 }
 
-function isAssistantDraftBlock(value: unknown): value is Record<string, unknown> & {
-  outputIndex: number;
-} {
-  if (!isRecord(value) || !isNaturalNumber(value.outputIndex)) return false;
+function isAssistantDraftBlock(value: unknown): value is AssistantDraftBlockProjection {
+  if (!isRecord(value)) return false;
   if (value.kind === 'narrative' || value.kind === 'finalMessage' || value.kind === 'message') {
-    return isExactRecord(value, ['outputIndex', 'kind', 'content'])
-      && isNonEmptyText(value.content);
+    return isExactRecord(value, ['kind', 'content', 'streamId'], ['outputIndex'])
+      && typeof value.content === 'string' && value.content.length > 0
+      && isStreamId(value.streamId)
+      && (value.outputIndex === undefined || isNaturalNumber(value.outputIndex));
   }
   return value.kind === 'providerHosted'
     && isExactRecord(value, [
       'outputIndex', 'kind', 'providerCallId', 'providerToolType', 'status', 'action',
     ])
     && isIdentifier(value.providerCallId)
+    && isNaturalNumber(value.outputIndex)
     && value.providerToolType === 'web_search'
     && (value.status === 'completed' || value.status === 'failed')
     && isRecord(value.action);
@@ -1299,6 +1325,10 @@ function isIdentifier(value: unknown): value is string {
 
 function isNonEmptyText(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isStreamId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
 }
 
 function isNaturalNumber(value: unknown): value is number {

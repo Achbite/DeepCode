@@ -2,7 +2,7 @@
 # DeepCode 开发容器入口 (Makefile)
 # 主要目标：
 #   make shell          -> 进入唯一开发容器（镜像与容器状态自动收敛）
-#   make build          -> 在唯一开发容器内执行完整跨平台构建
+#   make build          -> 等同 bash ./build.sh，按宿主平台生成 macOS 或 Linux/Windows 产物
 #   make build-deepcode-gui -> 在 Docker 内构建 DeepCode-GUI dist
 #   make build-deepcode-gui-tauri -> 在 Docker 内构建 Windows DeepCode-GUI.exe
 #   make dev-deepcode-gui   -> 在 Docker 内启动当前配置端口的 DeepCode-GUI 调试服务
@@ -24,6 +24,8 @@ IMAGE            := $(IMAGE_NAME):$(IMAGE_TAG)
 DOCKERFILE       ?= Dockerfile.dev
 WORKDIR_IN_CTNR  ?= /workspace
 DEEPCODE_PROJECT_ROOT := $(realpath $(CURDIR))
+DEEPCODE_BUILD_HOST_OS := $(shell uname -s)
+DEEPCODE_BUILD_STAGES ?= all
 CONTAINER_NAME ?= deepcode-dev
 CONTAINER_HOSTNAME ?= deepcode-dev
 DEEPCODE_HOST_PORT ?= 31246
@@ -111,17 +113,18 @@ RUN_ARGS := \
 	-e CARGO_TARGET_DIR=$(DEEPCODE_CONTAINER_CARGO_TARGET_DIR) \
 	-e DEEPCODE_TMPDIR=$(DEEPCODE_CONTAINER_TMPDIR) \
 	-e SCCACHE_DIR=$(DEEPCODE_CONTAINER_SCCACHE_DIR) \
+	-e DEEPCODE_BUILD_HOST_OS=$(DEEPCODE_BUILD_HOST_OS) \
 	-e PATH=/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
 	$(NETWORK_ENV_ARGS)
 
-.PHONY: help docker-info branch-audit branch-hooks shell build build-deepcode-gui build-deepcode-gui-tauri dev-deepcode-gui reset-dev clean macos-package-service macos-package-service-status macos-package-service-stop package-macos package-macos-clean package-macos-deepcode-gui _validate_config _ensure_macos_package_service _ensure_image _ensure_container
+.PHONY: help docker-info branch-audit branch-hooks shell build build-deepcode-gui build-deepcode-gui-tauri dev-deepcode-gui reset-dev clean macos-package-service macos-package-service-status macos-package-service-stop package-macos package-macos-clean package-macos-deepcode-gui _validate_config _print_image _ensure_image _ensure_container _build_in_container
 
 # ---- help：默认目标，列出可用入口 ----
 help:
 	@echo "DeepCode 开发容器入口"
 	@echo ""
 	@echo "  make shell          进入唯一开发容器（自动更新镜像并收敛容器）"
-	@echo "  make build          在 Docker 内执行完整跨平台构建并请求 macOS 本机包"
+	@echo "  make build          按宿主平台构建：Mac 生成 macOS 包，WSL/Linux 生成 Linux 和 Windows 包"
 	@echo "  make build-deepcode-gui  在 Docker 内构建 DeepCode-GUI dist"
 	@echo "  make build-deepcode-gui-tauri  在 Docker 内构建 Windows DeepCode-GUI.exe"
 	@echo "  make docker-info    显示当前项目的容器、挂载、端口、工具链和 volume 配置"
@@ -136,8 +139,8 @@ help:
 	@echo "  make package-macos-deepcode-gui  刷新 DeepCode-GUI.app，并同步刷新共享同一运行时的现有 App"
 	@echo ""
 	@echo "进入容器后可手动执行："
-	@echo "  bash ./build.sh   编译并输出统一分发目录到 bin/"
-	@echo "  bash ./test.sh --list  查看测试 profile 与 suite 注册"
+	@echo "  bash ./build.sh   按宿主平台编译并输出分发目录到 bin/"
+	@echo "  bash ./test.sh --help  查看测试 profile"
 	@echo "  bash ./test.sh    运行默认 required 验证（宿主机不会降级为静态成功）"
 	@echo "  bash ./test.sh --profile static  显式运行宿主机安全静态检查"
 
@@ -193,17 +196,10 @@ package-macos-clean:
 package-macos-deepcode-gui:
 	@bash ./build.sh --stage package-macos-deepcode-gui
 
-_ensure_macos_package_service:
-	@if [ "$$(uname -s 2>/dev/null)" = "Darwin" ] && [ "$${DEEPCODE_MACOS_PACKAGE_AUTOSTART:-1}" = "1" ]; then \
-		if bash ./scripts/macos-package-service.sh status --quiet >/dev/null 2>&1; then \
-			echo "[make] macOS package service 已运行"; \
-		else \
-			echo "[make] macOS package service 未运行，自动启动..."; \
-			bash ./build.sh --stage macos-package-service; \
-		fi; \
-	fi
-
 # ---- _ensure_image：每次求值 Dockerfile，未变化时直接命中 Docker 缓存 ----
+_print_image:
+	@printf '%s\n' '$(IMAGE)'
+
 _ensure_image: _validate_config
 	@echo "[make] 更新开发镜像 $(IMAGE)（未变化层使用 Docker 缓存）..."
 	@docker build --provenance=false $(BUILD_ARGS) -f $(DOCKERFILE) -t $(IMAGE) .
@@ -260,13 +256,16 @@ _ensure_container: _ensure_image
 	fi
 
 # ---- shell：唯一交互入口 ----
-shell: _ensure_macos_package_service _ensure_container
+shell: _ensure_container
+	@if [ "$(DEEPCODE_BUILD_HOST_OS)" = "Darwin" ]; then bash ./scripts/macos-package-service.sh start; fi
 	@echo "[make] exec 进入容器 $(CONTAINER_NAME) ..."
-	@docker exec -it $(NETWORK_ENV_ARGS) $(CONTAINER_NAME) bash
+	@docker exec -it $(NETWORK_ENV_ARGS) -e DEEPCODE_BUILD_HOST_OS=$(DEEPCODE_BUILD_HOST_OS) $(CONTAINER_NAME) bash
 
-build: _ensure_macos_package_service _ensure_container
-	@echo "[make] Docker 内执行完整跨平台构建 ..."
-	@docker exec $(NETWORK_ENV_ARGS) $(CONTAINER_NAME) bash -c 'DEEPCODE_MACOS_PACKAGE_MODE=require bash ./build.sh'
+build:
+	@bash ./build.sh
+
+_build_in_container: _ensure_container
+	@docker exec $(NETWORK_ENV_ARGS) -e DEEPCODE_BUILD_HOST_OS=$(DEEPCODE_BUILD_HOST_OS) $(CONTAINER_NAME) bash ./build.sh --stage "$(DEEPCODE_BUILD_STAGES)"
 
 build-deepcode-gui: _ensure_container
 	@echo "[make] Docker 内构建 DeepCode-GUI dist ..."

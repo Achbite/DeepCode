@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""验证两轮本地 Agent 基础链路；不承担效果、稳定性或发布验收。"""
+"""验证本地 fixture Provider、两轮工具调用和共享投影；不承担真实 Provider 或发布验收。"""
 
 from __future__ import annotations
 
@@ -30,11 +30,18 @@ GENERATION_ONE = "SKILL_GENERATION_ONE"
 GENERATION_TWO = "SKILL_GENERATION_TWO"
 ATTACHMENT_CONTENT = "LOCAL_ATTACHMENT_CONTENT_MUST_NOT_REACH_PROVIDER"
 PDF_CONTENT = "DEEPCODE_FIRST_PARTY_PDF_BINDING_OK"
-FIRST_PARTY_PLUGIN_URIS = {
-    "plugin://github@first-party",
-    "plugin://arxiv@first-party",
-    "plugin://pdf@first-party",
+CORE_TOOL_NAMES = [
+    "fs.read", "fs.write", "fs.edit", "fs.delete",
+    "bash", "web.search", "web.fetch", "session.read", "skill.read",
+]
+FIRST_PARTY_TOOL_OWNERS = {
+    "github.search": "plugin://github@first-party",
+    "github.read": "plugin://github@first-party",
+    "arxiv.search": "plugin://arxiv@first-party",
+    "arxiv.read": "plugin://arxiv@first-party",
+    "pdf.read": "plugin://pdf@first-party",
 }
+FIRST_PARTY_PLUGIN_URIS = set(FIRST_PARTY_TOOL_OWNERS.values())
 URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -76,8 +83,17 @@ class ProviderState:
         self._failures: list[str] = []
         self._old_wire_name: str | None = None
         self._new_wire_name: str | None = None
+        self._daemon: OwnedDaemon | None = None
+        self._session_id: str | None = None
+        self._consumed_receipts: set[str] = set()
+        self._last_receipt_sequence = 0
         self.first_request_started = threading.Event()
         self.release_first_request = threading.Event()
+
+    def bind_session(self, daemon: OwnedDaemon, session_id: str) -> None:
+        require(self._daemon is None, "Provider fixture 已绑定 Session")
+        self._daemon = daemon
+        self._session_id = session_id
 
     def register(self, body: dict[str, Any]) -> int:
         require(body.get("stream") is True, "Provider 请求未使用流式链路")
@@ -88,6 +104,7 @@ class ProviderState:
             return len(self._requests)
 
     def inspect(self, ordinal: int, body: dict[str, Any]) -> dict[str, str]:
+        tools_by_name = self.current_receipt_tools(ordinal, body)
         messages = body["messages"]
         joined = "\n".join(
             message_text(message.get("content"))
@@ -104,7 +121,8 @@ class ProviderState:
         require(len(guidance_messages) == 1, "Provider 请求没有唯一的基础工具 guidance")
         guidance = guidance_messages[0]
         require(
-            "- fs_read: Read UTF-8 workspace text directly or in bounded segments." in guidance,
+            f"- {tools_by_name['fs.read']['wireName']}: Read UTF-8 workspace text directly or in bounded segments."
+            in guidance,
             "fs.read prompt snippet 未进入 Provider 请求",
         )
         require(
@@ -112,7 +130,8 @@ class ProviderState:
             "fs.read 优先于 shell 文本读取的 guidance 缺失",
         )
         require(
-            "- bash: List, search, discover, build, test, and run commands." in guidance,
+            f"- {tools_by_name['bash']['wireName']}: List, search, discover, build, test, and run commands."
+            in guidance,
             "bash prompt snippet 未进入 Provider 请求",
         )
         require(
@@ -121,7 +140,8 @@ class ProviderState:
             "bash 与 fs.read 的职责边界 guidance 缺失",
         )
         require(
-            "- web_fetch: Read bounded text from a known HTTP or HTTPS URL." in guidance,
+            f"- {tools_by_name['web.fetch']['wireName']}: Read bounded text from a known HTTP or HTTPS URL."
+            in guidance,
             "web.fetch prompt snippet 未进入 Provider 请求",
         )
         require(
@@ -130,52 +150,23 @@ class ProviderState:
             "web.fetch 与搜索的职责边界 guidance 缺失",
         )
         require("filesystem or Bash tools" not in joined, "附件文本仍在指示 Bash 读取")
-        tools_by_description: dict[str, list[str]] = {}
-        for item in body["tools"]:
-            function = item.get("function") if isinstance(item, dict) else None
-            if not isinstance(function, dict):
-                continue
-            name = function.get("name")
-            description = function.get("description")
-            if isinstance(name, str) and name and isinstance(description, str):
-                tools_by_description.setdefault(description, []).append(name)
-        provider_tool_names = [
-            item.get("function", {}).get("name")
-            for item in body["tools"]
-            if isinstance(item, dict) and isinstance(item.get("function"), dict)
-        ]
+        mcp_server_id = "fixture-old" if ordinal <= 2 else "fixture-new"
+        reverse_tool = tools_by_name.get(f"mcp.{mcp_server_id}.text.reverse")
+        require(isinstance(reverse_tool, dict), "Provider 请求缺少当前代次的 MCP reverse 工具")
         require(
-            provider_tool_names[:7] == [
-                "fs_read", "fs_write", "fs_edit", "fs_delete",
-                "bash", "web_search", "web_fetch",
-            ],
-            "Provider 基础七工具没有保持锁定顺序",
+            reverse_tool.get("origin") == "extension"
+            and reverse_tool.get("pluginUri") == f"plugin://{mcp_server_id}@mcp",
+            "MCP reverse 工具没有绑定当前代次的 plugin owner",
         )
-        reverse_tools = tools_by_description.get("Reverse text", [])
-        require(len(reverse_tools) == 1, "Provider 请求没有唯一的 MCP reverse 工具")
-        wire_name = reverse_tools[0]
-        search_tools = tools_by_description.get(
-            "Search the web through the built-in Brave Web Search adapter or an explicitly configured JSON endpoint.",
-            [],
-        )
-        fetch_tools = tools_by_description.get("Fetch bounded HTTP or HTTPS text.", [])
-        require(len(search_tools) == 1, "Provider 请求没有唯一的 web.search 工具")
-        require(len(fetch_tools) == 1, "Provider 请求没有唯一的 web.fetch 工具")
-        expected_first_party_descriptions = {
-            "Search GitHub repositories, code, or issues with GitHub's native Search API.",
-            "Read a GitHub repository directory listing or UTF-8 file through the Contents API.",
-            "Search arXiv paper metadata through the arXiv Atom API.",
-            "Read one canonical arXiv paper metadata record by arXiv identifier.",
-            "Extract text from a bounded page range of a PDF in the current workspace binding.",
-        }
-        require(
-            all(len(tools_by_description.get(description, [])) == 1
-                for description in expected_first_party_descriptions),
-            "Provider 请求没有精确暴露 GitHub/arXiv/PDF first-party 工具",
-        )
-        pdf_tools = tools_by_description[
-            "Extract text from a bounded page range of a PDF in the current workspace binding."
-        ]
+        wire_name = reverse_tool["wireName"]
+        for name, plugin_uri in FIRST_PARTY_TOOL_OWNERS.items():
+            tool = tools_by_name.get(name)
+            require(
+                isinstance(tool, dict)
+                and tool.get("origin") == "extension"
+                and tool.get("pluginUri") == plugin_uri,
+                f"Provider 请求缺少精确 first-party 工具与 owner：{name}",
+            )
         require(
             "Search GitHub repositories, code, and issues through GitHub's native API." in guidance
             and "Search arXiv paper metadata through its native Atom API." in guidance
@@ -250,12 +241,74 @@ class ProviderState:
         else:
             raise AssertionError(f"Provider 收到未登记的第 {ordinal} 个请求")
         return {
-            "read": provider_tool_names[0],
+            "read": tools_by_name["fs.read"]["wireName"],
             "reverse": wire_name,
-            "pdf": pdf_tools[0],
-            "search": search_tools[0],
-            "fetch": fetch_tools[0],
+            "pdf": tools_by_name["pdf.read"]["wireName"],
+            "search": tools_by_name["web.search"]["wireName"],
+            "fetch": tools_by_name["web.fetch"]["wireName"],
         }
+
+    def current_receipt_tools(
+        self,
+        ordinal: int,
+        body: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        require(self._daemon is not None and self._session_id is not None, "Provider fixture 尚未绑定 Session")
+        current = projection(self._daemon, self._session_id)
+        run = current.get("run")
+        require(isinstance(run, dict) and run.get("status") == "running", "Provider 请求没有当前 running run")
+        receipts = current.get("contextCompositions")
+        require(isinstance(receipts, list), "当前投影缺少 context receipt")
+        with self._lock:
+            require(len(self._consumed_receipts) == ordinal - 1, "Provider 请求与 context receipt 消费次序不一致")
+            pending = [
+                receipt for receipt in receipts
+                if isinstance(receipt, dict)
+                and receipt.get("runId") == run.get("runId")
+                and receipt.get("providerRequestId") not in self._consumed_receipts
+            ]
+            require(len(pending) == 1, "当前 run 没有唯一未消费的 context receipt")
+            receipt = pending[0]
+            request_id = receipt.get("providerRequestId")
+            sequence = receipt.get("sequence")
+            require(isinstance(request_id, str) and bool(request_id), "context receipt 缺少 Provider requestId")
+            require(
+                isinstance(sequence, int) and sequence > self._last_receipt_sequence,
+                "context receipt sequence 没有前进",
+            )
+            require(receipt.get("purpose") == "agent", "fixture Provider 请求关联到错误的 context purpose")
+            self._consumed_receipts.add(request_id)
+            self._last_receipt_sequence = sequence
+
+        receipt_tools = receipt.get("tools")
+        require(isinstance(receipt_tools, list) and bool(receipt_tools), "context receipt 工具目录为空")
+        tools_by_name: dict[str, dict[str, Any]] = {}
+        wire_names: list[str] = []
+        for tool in receipt_tools:
+            require(isinstance(tool, dict), "context receipt 工具不是对象")
+            canonical_name = tool.get("canonicalName")
+            wire_name = tool.get("wireName")
+            require(
+                isinstance(canonical_name, str) and bool(canonical_name)
+                and isinstance(wire_name, str) and bool(wire_name)
+                and canonical_name not in tools_by_name and wire_name not in wire_names
+                and tool.get("availability") == "callable",
+                "context receipt 的 canonical/wire 映射缺失、重复或不可调用",
+            )
+            tools_by_name[canonical_name] = tool
+            wire_names.append(wire_name)
+        provider_wire_names = [
+            item.get("function", {}).get("name")
+            if isinstance(item, dict) and isinstance(item.get("function"), dict) else None
+            for item in body["tools"]
+        ]
+        require(provider_wire_names == wire_names, "Provider 请求的工具目录与当前 context receipt 不一致")
+        require(
+            [tool["canonicalName"] for tool in receipt_tools if tool.get("origin") == "coreBuiltin"]
+            == CORE_TOOL_NAMES,
+            "Provider 基础九工具没有保持精确集合与顺序",
+        )
+        return tools_by_name
 
     def first_started(self) -> bool:
         self.assert_healthy()
@@ -729,7 +782,7 @@ def create_session(daemon: OwnedDaemon, workspace_path: Path) -> dict[str, Any]:
     return value
 
 
-def assert_legacy_attachment_command_rejected(
+def assert_unknown_attachment_fields_rejected(
     daemon: OwnedDaemon,
     session_id: str,
 ) -> None:
@@ -742,15 +795,15 @@ def assert_legacy_attachment_command_rejected(
         body={
             "schemaVersion": COMMAND_VERSION,
             "type": "message.submit",
-            "commandId": "command-legacy-attachments",
+            "commandId": "command-unknown-attachment-fields",
             "sessionId": session_id,
-            "text": "legacy attachment shape",
+            "text": "unsupported attachment fields",
             "attachments": [],
             "directoryAttachments": [],
         },
         timeout=12,
     )
-    require(envelope.get("ok") is False, "旧附件字段被当前 Session wire 合同接受")
+    require(envelope.get("ok") is False, "未声明的附件字段被当前 Session wire 合同接受")
 
 
 def selected_plugin_catalog(daemon: OwnedDaemon, label: str) -> tuple[str, list[dict[str, Any]]]:
@@ -976,7 +1029,7 @@ def sqlite_read_only(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
 
 
-def assert_identity_chain(config_root: Path, session_id: str) -> None:
+def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: str) -> None:
     runtime_root = config_root / "runtime" / "agent-runtime"
     with sqlite_read_only(runtime_root / "session.sqlite3") as connection:
         started_rows = connection.execute(
@@ -1030,12 +1083,8 @@ def assert_identity_chain(config_root: Path, session_id: str) -> None:
         ]
         require(
             [tool.get("name") for tool in runtime_core_tools]
-            == [
-                "bash",
-                "fs.delete", "fs.edit", "fs.read", "fs.write",
-                "web.fetch", "web.search",
-            ],
-            "Kernel runtime snapshot 未包含精确七项基础工具",
+            == sorted(CORE_TOOL_NAMES),
+            "Kernel runtime snapshot 未包含精确九项基础工具",
         )
         runtime_tools_by_name = {
             tool.get("name"): tool for tool in runtime_tools if isinstance(tool, dict)
@@ -1069,16 +1118,17 @@ def assert_identity_chain(config_root: Path, session_id: str) -> None:
                 contribution.get("preparedToolBindingRef") == target.get("toolBindingRef"),
                 "tool prompt 没有绑定当前 run 的 prepared tool",
             )
+        mcp_server_id = "fixture-old" if run_index == 0 else "fixture-new"
         reverse_tools = [
             tool
             for tool in runtime_tools
-            if isinstance(tool, dict) and tool.get("description") == "Reverse text"
+            if isinstance(tool, dict) and tool.get("name") == f"mcp.{mcp_server_id}.text.reverse"
         ]
         require(len(reverse_tools) == 1, "run snapshot 缺少唯一 MCP 工具 binding")
         tool = reverse_tools[0]
         require(tool.get("origin") == "extension", "MCP prepared tool 缺少 extension origin")
         require(
-            isinstance(tool.get("pluginUri"), str) and tool["pluginUri"].endswith("@mcp"),
+            tool.get("pluginUri") == f"plugin://{mcp_server_id}@mcp",
             "MCP prepared tool 缺少精确 pluginUri",
         )
         run_records = records_by_run.get(run_id, [])
@@ -1356,13 +1406,14 @@ def main() -> None:
             daemon_one.start()
             created = create_session(daemon_one, workspace_root)
             session_id = created["sessionId"]
+            provider.bind_session(daemon_one, session_id)
             creation_bindings = created.get("workspaceBindings")
             require(
                 isinstance(creation_bindings, list) and len(creation_bindings) == 1,
                 "新项目 Session 没有原子绑定唯一 workspace creation snapshot",
             )
-            assert_legacy_attachment_command_rejected(daemon_one, session_id)
-            require(provider.count() == 0, "旧附件命令在拒绝前错误启动了 Provider")
+            assert_unknown_attachment_fields_rejected(daemon_one, session_id)
+            require(provider.count() == 0, "未声明附件字段的命令在拒绝前错误启动了 Provider")
             cli_ask = start_cli_ask_with_file(
                 daemon_one,
                 session_id,
@@ -1427,7 +1478,7 @@ def main() -> None:
             final_revision = int(final["revision"])
 
             daemon_one.shutdown()
-            assert_identity_chain(config_root, session_id)
+            assert_persisted_tool_bindings_and_release(config_root, session_id)
 
             daemon_two = OwnedDaemon(config_root)
             daemon_two.start()

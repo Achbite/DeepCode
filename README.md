@@ -62,8 +62,10 @@ cd bin/macos-arm64
 Build the local package from source:
 
 ```bash
-make package-macos
+bash ./build.sh
 ```
+
+On Mac, the script selects macOS artifacts by default; `make build` uses the same entrypoint. Frontend and Session assets are built from source in Docker, while native Rust/Tauri packaging runs on the Darwin host.
 
 Output is written to `bin/macos-arm64/` and includes both apps, the CLI/TUI launchers, Kernel, Session runtime, web assets, and a package-local writable data root. If a package still shows stale resources, quit every DeepCode app and run:
 
@@ -77,11 +79,15 @@ The macOS package service uses the request directory inside this repository and 
 
 ## Linux and Windows packages
 
-Portable builds use the single `deepcode-dev` container. The recommended host entrypoint for a complete build is:
+On WSL/Linux, run the same command to automatically build Linux and Windows artifacts in the single `deepcode-dev` container:
 
 ```bash
-make build
+bash ./build.sh
 ```
+
+No stage argument is needed. `make build`, `--full`, `--stage all`, and `--stage package` use the same platform selection.
+
+Each build invokes the source build for every selected product and its dependencies. Cargo, sccache, Docker layers and dependency stores accelerate these steps; existing `dist` files or stage stamps never replace them. Packaging also builds its inputs before assembling the distribution.
 
 For an interactive development shell (enter WSL first on Windows):
 
@@ -89,6 +95,8 @@ For an interactive development shell (enter WSL first on Windows):
 make shell
 bash ./build.sh
 ```
+
+`make shell` passes the host platform into the container and prepares the native packaging service on Mac. Running `build.sh` inside that Mac development container therefore requests only macOS artifacts, even though its container kernel is Linux.
 
 Every entrypoint reevaluates `Dockerfile.dev` through Docker's build cache. If the source mount, image, or port changed, the tooling recreates only the fixed `deepcode-dev` container and preserves dependency/build caches. Branch-specific containers and `DEEPCODE_WORKTREE_ID` are no longer part of the development model. To recreate only the container, run:
 
@@ -102,8 +110,11 @@ Artifacts are written to:
 
 ```text
 bin/linux-x64/
+bin/linux-arm64/
 bin/win64/
 ```
+
+For WSL/Linux builds, the Linux directory matches the development container architecture: `linux-x64` for amd64, or `linux-arm64` for arm64. A build emits one Linux architecture plus `win64`; Mac builds default to `macos-arm64` only.
 
 On Linux:
 
@@ -111,6 +122,8 @@ On Linux:
 cd bin/linux-x64
 ./deepcode-gui
 ```
+
+Use `bin/linux-arm64` instead for an ARM64 Linux build.
 
 Then open [http://127.0.0.1:31245/](http://127.0.0.1:31245/). On Windows, use `DeepCode.exe` or `DeepCode-GUI.exe`; Microsoft Edge WebView2 Evergreen Runtime is required.
 
@@ -249,7 +262,9 @@ bash ./test.sh required
 bash ./test.sh full
 ```
 
-`static` checks layering and repository structure. `required` runs Rust/TypeScript builds and unit tests. `full` additionally exercises a local Provider, tool decisions, cancellation, command replay, and restart recovery end to end.
+Run `required` and `full` inside `make shell`. They prepare the current TypeScript dependencies before running checks; host execution is rejected. `static` can run on the host and checks shell syntax, Git whitespace changes and the existing layer-dependency rules. `required` runs Rust workspace tests, TypeScript checks and the registered Session/GUI contract tests. `full` additionally builds CLI/TUI and GUI web resources and runs the existing local Provider fixture, tool execution and session lifecycle checks. It does not certify live Provider behavior, native GUI interaction or release packages.
+
+The four existing native GUI lifecycle tests belong to a separate Cargo workspace. Their explicit entrypoint in a supported native build environment is `cargo test --manifest-path shells/deepcode-gui/src-tauri/Cargo.toml`; they are not part of the default `required` or `full` profiles.
 
 ## Notices and license
 

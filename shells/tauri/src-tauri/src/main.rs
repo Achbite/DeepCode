@@ -120,7 +120,8 @@ fn main() {
             deepcode_start_kernel_after_permission,
             deepcode_window_minimize,
             deepcode_window_toggle_maximize,
-            deepcode_window_close
+            deepcode_window_close,
+            deepcode_open_external_url
         ])
         .setup(|app| {
             let target = resolve_launch_target();
@@ -321,6 +322,41 @@ fn deepcode_window_toggle_maximize(window: Window) -> Result<(), String> {
 #[tauri::command]
 fn deepcode_window_close(window: Window) -> Result<(), String> {
     window.close().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn deepcode_open_external_url(url: String) -> Result<(), String> {
+    let url = tauri::Url::parse(&url).map_err(|error| error.to_string())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("Only HTTP and HTTPS links can open in the system browser.".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(target_os = "macos")]
+        let mut command = Command::new("/usr/bin/open");
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let mut command = Command::new("rundll32.exe");
+            command.arg("url.dll,FileProtocolHandler");
+            command
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let mut command = Command::new("xdg-open");
+        let output = command
+            .arg(url.as_str())
+            .output()
+            .map_err(|error| format!("Failed to open the system browser: {error}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Failed to open the system browser ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn resolve_launch_target() -> LaunchTarget {

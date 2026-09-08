@@ -6,7 +6,7 @@
 #   2. 校准 PATH 与可写权限（首次启动时确保 named volume 子目录存在）
 #   3. 前台保活，等待 docker exec 进入交互式 bash
 # 注意：本脚本 *不* 自动执行 pnpm install / cargo build，
-#       依赖安装由用户在容器内手动执行 ./build.sh 触发，避免 make shell 卡顿。
+#       依赖安装由用户在容器内执行 bash ./build.sh 触发，避免 make shell 卡顿。
 # ====================================================================
 set -euo pipefail
 
@@ -45,8 +45,8 @@ done
 cat <<'TIP'
 [entrypoint] ----------------------------------------------
 [entrypoint]  容器已就绪。常用命令（项目根目录直接调用）：
-[entrypoint]    ./build.sh   编译并输出统一分发目录到 ./bin/deepcode/
-[entrypoint]    ./test.sh    Kernel / userspace / Host smoke
+[entrypoint]    bash ./build.sh   按宿主平台构建：Mac 输出 macOS 包，WSL/Linux 输出 Linux 和 Windows 包
+[entrypoint]    bash ./test.sh    运行 required 登记检查
 [entrypoint]    pnpm install （首次或 lockfile 变更时）
 [entrypoint] ----------------------------------------------
 TIP

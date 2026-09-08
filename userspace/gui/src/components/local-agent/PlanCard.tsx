@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import type { PlanOperation, PlanProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
-import DeepCodeShellIcon from '../../deepcode-gui/layout/DeepCodeShellIcon';
+import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import { MarkdownContent } from './BufferedMarkdown';
 
 interface PlanCardProps {
@@ -47,6 +47,7 @@ const PlanCard: React.FC<PlanCardProps> = ({
               {t(language, 'agent.plan.revision', { revision: plan.revision })}
               {active ? ` · ${t(language, 'agent.plan.active')}` : ''}
             </span>
+            <span className="local-agent__plan-card-status">{status}</span>
             <DeepCodeShellIcon name="chevronDown" />
           </button>
           <h2>{plan.title}</h2>

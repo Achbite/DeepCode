@@ -35,9 +35,6 @@ importers:
       '@deepcode/protocol':
         specifier: workspace:*
         version: link:../protocol
-      '@deepcode/session-core':
-        specifier: workspace:*
-        version: link:../session-core
       '@xterm/addon-fit':
         specifier: ^0.11.0
         version: 0.11.0

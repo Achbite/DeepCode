@@ -121,10 +121,7 @@ fi
 RUST_TOOLCHAIN="${DEEPCODE_MACOS_RUST_TOOLCHAIN:-$CANONICAL_RUST_TOOLCHAIN}"
 NODE_MAJOR="${DEEPCODE_MACOS_NODE_MAJOR:-22}"
 NODE_HOME="${DEEPCODE_MACOS_NODE_HOME:-$HOME/.local/deepcode-node}"
-PNPM_VERSION="${DEEPCODE_MACOS_PNPM_VERSION:-9.15.9}"
 BOOTSTRAP="${DEEPCODE_MACOS_BOOTSTRAP:-1}"
-BUILD_GUI_ON_HOST="${DEEPCODE_MACOS_BUILD_GUI_ON_HOST:-0}"
-REFRESH_GUI_DIST="${DEEPCODE_MACOS_REFRESH_GUI_DIST:-1}"
 KILL_RUNNING="${DEEPCODE_MACOS_KILL_RUNNING:-1}"
 SEED_CARGO_REGISTRY="${DEEPCODE_MACOS_SEED_CARGO_REGISTRY:-1}"
 CARGO_OFFLINE="${DEEPCODE_MACOS_CARGO_OFFLINE:-1}"
@@ -147,8 +144,7 @@ Environment:
   DEEPCODE_MACOS_PRODUCTS=DeepCode-GUI,DeepCode
                                 Build one ordered product-set transaction.
   DEEPCODE_MACOS_CLEAN=1        Clean macOS package build artifacts before rebuilding.
-  DEEPCODE_MACOS_REFRESH_GUI_DIST=1
-                                Ensure GUI dist through one incremental Docker build. Defaults to 1 for package builds.
+  Frontend packages are rebuilt from current source in Docker for every package transaction.
   DEEPCODE_MACOS_NODE_MODULES_VOLUME=<name>
                                 Override the checkout-scoped frontend dependency volume.
   DEEPCODE_MACOS_KILL_RUNNING=1 Automatically stop processes occupying the target .app bundle. Defaults to 1.
@@ -185,9 +181,6 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ "$CLEAN_PACKAGE_CACHE" = "1" ]; then
-  REFRESH_GUI_DIST=1
-fi
 case "$KILL_RUNNING" in
   0|1) ;;
   *)
@@ -414,42 +407,6 @@ install_user_node() {
   [ "$installed_major" -ge 20 ] || fail "installed node is too old: $(node --version)"
 }
 
-ensure_pnpm() {
-  if command -v pnpm >/dev/null 2>&1; then
-    return
-  fi
-
-  if command -v corepack >/dev/null 2>&1; then
-    log "pnpm not found; enabling pnpm through corepack"
-    corepack enable
-    corepack prepare pnpm@9 --activate
-  elif command -v npm >/dev/null 2>&1; then
-    log "pnpm not found; installing pnpm@9 into user npm prefix"
-    export npm_config_prefix="${npm_config_prefix:-$HOME/.local}"
-    mkdir -p "$npm_config_prefix/bin"
-    prepend_path_dir "$npm_config_prefix/bin"
-    npm install -g pnpm@9
-  elif [ "$BOOTSTRAP" = "1" ]; then
-    log "pnpm not found; installing pnpm $PNPM_VERSION through the official user-level installer"
-    export PNPM_HOME="${PNPM_HOME:-$HOME/Library/pnpm}"
-    mkdir -p "$PNPM_HOME"
-
-    local curl_wrapper_dir
-    curl_wrapper_dir="$(mktemp -d)"
-    cat > "$curl_wrapper_dir/curl" <<'CURL_WRAPPER'
-#!/usr/bin/env sh
-exec /usr/bin/curl --connect-timeout 20 --max-time 300 --retry 4 --retry-all-errors "$@"
-CURL_WRAPPER
-    chmod +x "$curl_wrapper_dir/curl"
-    PATH="$curl_wrapper_dir:$PATH" /usr/bin/curl --connect-timeout 20 --max-time 60 --retry 4 --retry-all-errors -fsSL https://get.pnpm.io/install.sh \
-      | env PATH="$curl_wrapper_dir:$PATH" SHELL="${SHELL:-/bin/zsh}" PNPM_HOME="$PNPM_HOME" PNPM_VERSION="$PNPM_VERSION" sh -
-    rm -rf "$curl_wrapper_dir"
-    prepend_path_dir "$PNPM_HOME"
-  fi
-
-  command -v pnpm >/dev/null 2>&1 || fail "pnpm not found and could not be bootstrapped from node/corepack/npm."
-}
-
 rustup_has_toolchain() {
   local installed
   while read -r installed _; do
@@ -548,11 +505,6 @@ configure_cargo_network_mode() {
   fi
 }
 
-install_dependencies() {
-  log "install workspace JS dependencies"
-  pnpm install --frozen-lockfile
-}
-
 prepare_tauri_dist() {
   [ -f "$CLIENT_DIST_DIR/index.html" ] || fail "GUI dist missing at $CLIENT_DIST_DIR"
   validate_frontend_dist "$CLIENT_DIST_DIR" "$PRODUCT"
@@ -568,7 +520,7 @@ validate_frontend_dist() {
   local index_file="$dist_dir/index.html"
   [ -f "$index_file" ] || fail "$label frontend dist missing index.html at $index_file"
   if ! grep -q '<script[^>]*type="module"[^>]*assets/' "$index_file"; then
-    fail "$label frontend dist index.html has no production module entry; rebuild the GUI dist with DEEPCODE_FORCE_BUILD=1."
+    fail "$label frontend dist index.html has no production module entry; rebuild the GUI dist through its Docker build stage."
   fi
 }
 
@@ -598,29 +550,34 @@ requested_gui_stages() {
 }
 
 refresh_gui_dists_with_docker() {
-  command -v docker >/dev/null 2>&1 || return 1
-  docker image inspect deepcode-dev:latest >/dev/null 2>&1 || return 1
-  local workspace_source="" stages force_build checkout_id node_modules_volume
+  command -v docker >/dev/null 2>&1 || fail "Docker is required to build the frontend product set."
+  local image
+  image="$(make --no-print-directory -s -C "$ROOT_DIR" _print_image)"
+  make -C "$ROOT_DIR" _ensure_image
+  local workspace_source="" container_status container_image current_image stages checkout_id node_modules_volume
   stages="$(requested_gui_stages)"
-  force_build="${DEEPCODE_FORCE_BUILD:-0}"
+  current_image="$(docker image inspect --format '{{.Id}}' "$image")"
+  container_status="$(docker container inspect --format '{{.State.Status}}' deepcode-dev 2>/dev/null || true)"
+  container_image="$(docker container inspect --format '{{.Image}}' deepcode-dev 2>/dev/null || true)"
   workspace_source="$(
     docker container inspect \
       --format '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' \
       deepcode-dev 2>/dev/null || true
   )"
-  if [ -n "$workspace_source" ] \
-    && [ "$(cd "$workspace_source" 2>/dev/null && pwd -P)" = "$(cd "$ROOT_DIR" && pwd -P)" ]; then
+  if [ "$container_status" = "running" ] \
+    && [ "$container_image" = "$current_image" ] \
+    && [ -n "$workspace_source" ] \
+    && [ "$(cd "$workspace_source" 2>/dev/null && pwd -P)" = "$ROOT_DIR" ]; then
     log "ensure frontend product set in deepcode-dev: $stages"
     docker exec \
       -e PNPM_STORE_DIR=/root/.local/share/pnpm/store \
-      -e DEEPCODE_FORCE_BUILD="$force_build" \
       deepcode-dev \
       bash -c "bash ./build.sh --stage '$stages'"
     return
   fi
 
   if [ -n "$workspace_source" ]; then
-    log "deepcode-dev uses $workspace_source; ensure active-checkout frontends in one isolated container"
+    log "deepcode-dev is not reusable (status=$container_status, source=$workspace_source); build in one isolated container"
   else
     log "ensure active-checkout frontends in one isolated container"
   fi
@@ -634,23 +591,9 @@ refresh_gui_dists_with_docker() {
     --mount "type=volume,src=$node_modules_volume,dst=/workspace/node_modules" \
     --mount "type=volume,src=deepcode-pnpm-store,dst=/root/.local/share/pnpm/store" \
     -e PNPM_STORE_DIR=/root/.local/share/pnpm/store \
-    -e DEEPCODE_FORCE_BUILD="$force_build" \
     --workdir /workspace \
-    deepcode-dev:latest \
+    "$image" \
     bash -c "bash ./build.sh --stage '$stages'"
-}
-
-all_frontend_dists_exist() {
-  local original_product="$PRODUCT"
-  local product
-  for product in "${REQUESTED_PRODUCTS[@]}"; do
-    configure_product "$product"
-    if [ ! -f "$CLIENT_DIST_DIR/index.html" ]; then
-      configure_product "$original_product"
-      return 1
-    fi
-  done
-  configure_product "$original_product"
 }
 
 prepare_all_tauri_dists() {
@@ -665,37 +608,8 @@ prepare_all_tauri_dists() {
 }
 
 ensure_gui_dists() {
-  if [ "$REFRESH_GUI_DIST" = "1" ] || ! all_frontend_dists_exist; then
-    if ! refresh_gui_dists_with_docker; then
-      if [ "$BUILD_GUI_ON_HOST" != "1" ] || [ "${#REQUESTED_PRODUCTS[@]}" -ne 1 ] || [ "${REQUESTED_PRODUCTS[0]}" != "DeepCode" ]; then
-        fail "Docker frontend transaction failed; host fallback is supported only for a single DeepCode product"
-      fi
-      configure_product "DeepCode"
-      ensure_node
-      ensure_pnpm
-      install_dependencies
-      build_gui_dist
-    fi
-  else
-    log "reuse current frontend product set"
-  fi
-
-  all_frontend_dists_exist || fail "one or more requested frontend distributions are missing"
+  refresh_gui_dists_with_docker
   prepare_all_tauri_dists
-}
-
-build_gui_dist() {
-  log "build TS protocol/session-core/React GUI"
-  pnpm --filter @deepcode/protocol clean
-  rm -f "$ROOT_DIR/userspace/protocol/tsconfig.tsbuildinfo"
-  pnpm --filter @deepcode/protocol build
-  pnpm --filter @deepcode/session-core build
-  if [ "$PRODUCT" = "DeepCode-GUI" ]; then
-    fail "DeepCode-GUI host-side frontend build is disabled; use Docker build stage deepcode-gui."
-  fi
-  pnpm --filter @deepcode/client build
-
-  prepare_tauri_dist
 }
 
 build_rust_bins() {
@@ -1304,7 +1218,6 @@ main() {
   cd "$ROOT_DIR"
   prepend_path_dir "$HOME/.cargo/bin"
   prepend_path_dir "$HOME/.local/bin"
-  prepend_path_dir "${PNPM_HOME:-$HOME/Library/pnpm}"
   prepend_path_dir "$HOME/bin"
 
   ensure_macos_arm64

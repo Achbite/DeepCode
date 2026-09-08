@@ -196,16 +196,18 @@ impl SessionProjection {
                     .run
                     .as_ref()
                     .is_none_or(|run| run.run_id != draft.run_id)
-                || draft.ordered_blocks.as_ref().is_some_and(|blocks| {
-                    draft.content != ""
-                        || draft.reasoning_content.is_some()
-                        || blocks.is_empty()
-                        || blocks.iter().enumerate().any(|(index, block)| {
-                            block.invalid()
-                                || index > 0
-                                    && block.output_index() <= blocks[index - 1].output_index()
-                        })
-                })
+                || {
+                    let mut stream_ids = HashSet::new();
+                    draft.blocks.iter().enumerate().any(|(index, block)| {
+                        block.invalid()
+                            || block
+                                .text()
+                                .is_some_and(|(stream_id, _)| !stream_ids.insert(stream_id))
+                            || block.output_index().is_none() && draft.blocks.len() != 1
+                            || index > 0
+                                && block.output_index() <= draft.blocks[index - 1].output_index()
+                    })
+                }
         }) {
             return Err("shared Session projection has an invalid assistant draft".to_string());
         }
@@ -544,19 +546,30 @@ impl SessionProjection {
                 return true;
             }
             match item {
-                SessionTimelineItem::Message { message_id, .. } => {
+                SessionTimelineItem::Message {
+                    message_id,
+                    stream_id,
+                    ..
+                } => {
                     !timeline_message_ids.insert(message_id.as_str())
                         || self.messages.iter().all(|message| {
                             message.message_id != *message_id
                                 || !matches!(message.role.as_str(), "user" | "assistant")
+                                || if message.role == "assistant" {
+                                    stream_id.as_deref().is_none_or(str::is_empty)
+                                } else {
+                                    stream_id.is_some()
+                                }
                         })
                 }
                 SessionTimelineItem::Narrative {
                     provider_request_id,
                     narrative_id,
+                    stream_id,
                     ..
                 } => {
                     provider_request_id.is_empty()
+                        || stream_id.is_empty()
                         || !timeline_narrative_ids.insert(narrative_id.as_str())
                         || self.narratives.iter().all(|narrative| {
                             narrative.narrative_id != *narrative_id
@@ -638,6 +651,8 @@ pub enum SessionTimelineItem {
         sequence: u64,
         #[serde(rename = "messageId")]
         message_id: String,
+        #[serde(rename = "streamId")]
+        stream_id: Option<String>,
         #[serde(rename = "outputIndex")]
         output_index: Option<u64>,
     },
@@ -650,6 +665,8 @@ pub enum SessionTimelineItem {
         provider_request_id: String,
         #[serde(rename = "narrativeId")]
         narrative_id: String,
+        #[serde(rename = "streamId")]
+        stream_id: String,
         #[serde(rename = "outputIndex")]
         output_index: Option<u64>,
     },
@@ -1022,13 +1039,11 @@ pub struct NarrativeProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AssistantDraftProjection {
     pub run_id: String,
     pub turn_id: String,
-    pub content: String,
-    pub reasoning_content: Option<String>,
-    pub ordered_blocks: Option<Vec<AssistantDraftBlockProjection>>,
+    pub blocks: Vec<AssistantDraftBlockProjection>,
     pub activity: Option<ProviderActivityProjection>,
 }
 
@@ -1058,19 +1073,25 @@ pub enum AssistantDraftBlockProjection {
     #[serde(rename = "narrative")]
     Narrative {
         #[serde(rename = "outputIndex")]
-        output_index: u64,
+        output_index: Option<u64>,
+        #[serde(rename = "streamId")]
+        stream_id: String,
         content: String,
     },
     #[serde(rename = "finalMessage")]
     FinalMessage {
         #[serde(rename = "outputIndex")]
-        output_index: u64,
+        output_index: Option<u64>,
+        #[serde(rename = "streamId")]
+        stream_id: String,
         content: String,
     },
     #[serde(rename = "message")]
     Message {
         #[serde(rename = "outputIndex")]
-        output_index: u64,
+        output_index: Option<u64>,
+        #[serde(rename = "streamId")]
+        stream_id: String,
         content: String,
     },
     #[serde(rename = "providerHosted")]
@@ -1087,20 +1108,41 @@ pub enum AssistantDraftBlockProjection {
 }
 
 impl AssistantDraftBlockProjection {
-    fn output_index(&self) -> u64 {
+    fn output_index(&self) -> Option<u64> {
         match self {
             Self::Narrative { output_index, .. }
             | Self::FinalMessage { output_index, .. }
-            | Self::Message { output_index, .. }
-            | Self::ProviderHosted { output_index, .. } => *output_index,
+            | Self::Message { output_index, .. } => *output_index,
+            Self::ProviderHosted { output_index, .. } => Some(*output_index),
+        }
+    }
+
+    pub fn text(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Narrative {
+                stream_id, content, ..
+            }
+            | Self::FinalMessage {
+                stream_id, content, ..
+            }
+            | Self::Message {
+                stream_id, content, ..
+            } => Some((stream_id, content)),
+            Self::ProviderHosted { .. } => None,
         }
     }
 
     fn invalid(&self) -> bool {
         match self {
-            Self::Narrative { content, .. }
-            | Self::FinalMessage { content, .. }
-            | Self::Message { content, .. } => content.trim().is_empty(),
+            Self::Narrative {
+                stream_id, content, ..
+            }
+            | Self::FinalMessage {
+                stream_id, content, ..
+            }
+            | Self::Message {
+                stream_id, content, ..
+            } => stream_id.is_empty() || content.is_empty(),
             Self::ProviderHosted {
                 provider_call_id,
                 provider_tool_type,
@@ -2175,7 +2217,8 @@ mod tests {
                 "kind": "message",
                 "timelineId": "message:message:answer",
                 "sequence": 8,
-                "messageId": "message:answer"
+                "messageId": "message:answer",
+                "streamId": "stream:answer"
             }
         ]);
         value

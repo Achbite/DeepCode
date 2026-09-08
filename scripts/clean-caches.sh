@@ -61,6 +61,8 @@ Options:
 Preserved by default:
   bin/linux-x64/config
   bin/linux-x64/sessions
+  bin/linux-arm64/config
+  bin/linux-arm64/sessions
   bin/win64/config
   bin/win64/sessions
   bin/macos-arm64/config
@@ -262,6 +264,7 @@ clean_repo_local() {
   done
 
   clean_portable_package_outputs "$ROOT_DIR/bin/linux-x64" "linux-x64"
+  clean_portable_package_outputs "$ROOT_DIR/bin/linux-arm64" "linux-arm64"
   clean_portable_package_outputs "$ROOT_DIR/bin/win64" "win64"
 }
 

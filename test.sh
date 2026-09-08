@@ -27,6 +27,10 @@ case "$profile" in
 esac
 
 if [ "$profile" != 'static' ]; then
+  if [ ! -f /.dockerenv ] && ! grep -qaE '(docker|containerd|kubepods)' /proc/1/cgroup 2>/dev/null; then
+    printf 'required/full 验证必须在开发容器内执行；请先运行 make shell。\n' >&2
+    exit 3
+  fi
   for tool in cargo node pnpm; do
     command -v "$tool" >/dev/null 2>&1 || { printf '缺少命令：%s\n' "$tool" >&2; exit 1; }
   done
@@ -37,7 +41,11 @@ fi
 
 run_static() {
   printf '[test] 源码身份与脚本语法\n'
-  bash -n ./test.sh ./build.sh ./scripts/source-identity.sh ./scripts/branch-flow.sh ./scripts/package-macos.sh ./scripts/macos-package-service.sh
+  local script
+  for script in ./test.sh ./build.sh ./entrypoint.sh ./scripts/source-identity.sh ./scripts/branch-flow.sh ./scripts/package-macos.sh ./scripts/macos-package-service.sh ./scripts/check-architecture.sh; do
+    bash -n "$script"
+  done
+  bash ./scripts/check-architecture.sh
   if deepcode_source_git_available "$ROOT_DIR"; then
     git -C "$ROOT_DIR" diff --check
   else
@@ -50,8 +58,14 @@ run_required() {
   printf '[test] Rust workspace\n'
   cargo fmt --all -- --check
   cargo test --workspace
-  printf '[test] Session 数据流与跨包类型接线\n'
+  printf '[test] Userspace 共享依赖\n'
+  bash ./build.sh --stage deps
+  pnpm build:userspace-shared
+  printf '[test] Session 数据流\n'
   pnpm --filter @deepcode/session-core test
+  printf '[test] GUI 投影合同与状态交互\n'
+  pnpm --filter @deepcode/client test
+  printf '[test] 跨包类型接线\n'
   pnpm typecheck
 }
 

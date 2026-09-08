@@ -314,15 +314,31 @@ export function projectSessionPresentation(projection: SessionProjection): Prese
 
   if (projection.assistantDraft) {
     const draft = projection.assistantDraft;
-    blocks.push({
-      kind: 'text',
-      blockId: `draft:${draft.runId}:${draft.turnId}`,
-      source: source('assistantDraft', `${draft.runId}:${draft.turnId}`),
-      region: 'transient',
-      text: draft.content,
-      format: 'markdown',
-      role: 'draft',
-    });
+    for (const block of draft.blocks) {
+      if (block.kind === 'providerHosted') {
+        const identity = `${draft.turnId}:${block.providerCallId}`;
+        blocks.push({
+          kind: 'keyValue',
+          blockId: `draft-hosted:${identity}`,
+          source: source('assistantDraft', identity),
+          region: 'transient',
+          entries: [
+            { key: block.providerToolType, value: block.status },
+            { key: 'action', value: JSON.stringify(block.action) },
+          ],
+        });
+      } else {
+        blocks.push({
+          kind: 'text',
+          blockId: `draft:${block.streamId}`,
+          source: source('assistantDraft', block.streamId),
+          region: 'transient',
+          text: block.content,
+          format: 'markdown',
+          role: 'draft',
+        });
+      }
+    }
   }
 
   if (projection.pendingInteraction) {

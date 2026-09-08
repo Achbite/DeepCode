@@ -202,11 +202,12 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["outputIndex", "kind", "content"],
+          "required": ["kind", "content", "streamId"],
           "properties": {
-            "outputIndex": { "type": "integer", "minimum": 0 },
             "kind": { "enum": ["narrative", "finalMessage", "message"] },
-            "content": { "type": "string", "minLength": 1 }
+            "content": { "type": "string", "minLength": 1 },
+            "streamId": { "type": "string", "minLength": 1 },
+            "outputIndex": { "type": "integer", "minimum": 0 }
           }
         },
         {
@@ -227,34 +228,28 @@
       ]
     },
     "AssistantDraftProjection": {
-      "oneOf": [
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["runId", "turnId", "content"],
-          "properties": {
-            "runId": { "$ref": "#/$defs/Id" },
-            "turnId": { "$ref": "#/$defs/Id" },
-            "content": { "type": "string" },
-            "reasoningContent": { "type": "string" }
-          }
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "turnId", "blocks"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/Id" },
+        "turnId": { "$ref": "#/$defs/Id" },
+        "blocks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/AssistantDraftBlockProjection" }
         },
-        {
+        "activity": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["runId", "turnId", "content", "orderedBlocks"],
+          "required": ["purpose", "phase", "startedAt"],
           "properties": {
-            "runId": { "$ref": "#/$defs/Id" },
-            "turnId": { "$ref": "#/$defs/Id" },
-            "content": { "const": "" },
-            "orderedBlocks": {
-              "type": "array",
-              "minItems": 1,
-              "items": { "$ref": "#/$defs/AssistantDraftBlockProjection" }
-            }
+            "purpose": { "enum": ["agent", "contextCompaction"] },
+            "phase": { "enum": ["waitingResponse", "reasoning", "awaitingOutput", "generatingOutput"] },
+            "startedAt": { "$ref": "#/$defs/Timestamp" },
+            "lastContentAt": { "$ref": "#/$defs/Timestamp" }
           }
         }
-      ]
+      }
     },
     "ModelMessage": {
       "oneOf": [
@@ -1923,6 +1918,7 @@
             "timelineId": { "$ref": "#/$defs/Id" },
             "sequence": { "type": "integer", "minimum": 1 },
             "messageId": { "$ref": "#/$defs/Id" },
+            "streamId": { "type": "string", "minLength": 1 },
             "outputIndex": { "type": "integer", "minimum": 0 }
           }
         },
@@ -1930,7 +1926,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "kind", "timelineId", "sequence", "providerRequestId", "narrativeId"
+            "kind", "timelineId", "sequence", "providerRequestId", "narrativeId", "streamId"
           ],
           "properties": {
             "kind": { "const": "narrative" },
@@ -1938,6 +1934,7 @@
             "sequence": { "type": "integer", "minimum": 1 },
             "providerRequestId": { "$ref": "#/$defs/Id" },
             "narrativeId": { "$ref": "#/$defs/Id" },
+            "streamId": { "type": "string", "minLength": 1 },
             "outputIndex": { "type": "integer", "minimum": 0 }
           }
         },

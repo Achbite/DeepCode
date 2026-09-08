@@ -5,8 +5,9 @@
 #
 # 默认行为：
 #   bash ./build.sh
-#     macOS 宿主机：按输入指纹增量构建，并以同一事务打包 DeepCode.app / DeepCode-GUI.app。
-#     Docker/Linux：完整构建并输出 bin/linux-x64/ 与 bin/win64/，可自动请求 macOS 打包服务。
+#     macOS：生成 bin/macos-arm64/；前端在 Docker 内编译，原生包在 Mac 上生成。
+#     WSL/Linux：在 Docker 内构建当前 Linux 架构目录与 bin/win64/。
+#     make shell 会向容器传入宿主平台，容器内使用相同的默认选择。
 #
 # 分阶段入口：
 #   bash ./build.sh --stage gui      # pnpm + React GUI + Tauri embedded dist
@@ -19,7 +20,7 @@
 #   bash ./build.sh --stage tui      # Linux/Windows TUI Host shell
 #   bash ./build.sh --stage tauri    # Windows DeepCode.exe Tauri thin shell
 #   bash ./build.sh --stage deepcode-gui-tauri # Windows DeepCode-GUI.exe Tauri shell
-#   bash ./build.sh --stage package  # 复制已有构建产物到 bin/
+#   bash ./build.sh --stage package  # 从源码构建当前宿主平台的分发产物
 #   bash ./build.sh --stage verify-package-runtime # 只读检查已打包 runtime 是否齐全
 #   bash ./build.sh --stage all      # 等价默认完整构建
 #
@@ -33,8 +34,6 @@
 #                                  Override cwd used for official crates.io fallback; default /tmp/deepcode-cargo-official-cwd.
 #   DEEPCODE_CARGO_AUTO_PRIMARY_RETRY
 #                                  Cargo retry count for the auto-mode primary source probe; default 0.
-#   DEEPCODE_FORCE_BUILD=1      忽略 stage hash，强制执行构建阶段。
-#   DEEPCODE_ALLOW_HOST_BUILD=1 显式允许宿主机直接构建（默认 Docker-only）。
 #   --clean-cache               清理 macOS 打包缓存后重新打包；保留用户配置和会话数据。
 #   --no-kill-running           macOS 打包时不自动结束旧 .app 占用进程。
 # ====================================================================
@@ -45,8 +44,28 @@ export CI="${CI:-true}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$ROOT_DIR/scripts/source-identity.sh"
+
+is_docker_environment() {
+  [ -f /.dockerenv ] && return 0
+  grep -qaE '(docker|containerd|kubepods)' /proc/1/cgroup 2>/dev/null
+}
+
+BUILD_HOST_OS="$(uname -s)"
+if is_docker_environment; then
+  BUILD_HOST_OS="${DEEPCODE_BUILD_HOST_OS:-Linux}"
+fi
+case "$BUILD_HOST_OS" in
+  Darwin|Linux) ;;
+  *) echo "==[build][error]== unsupported build host: $BUILD_HOST_OS" >&2; exit 3 ;;
+esac
+
 BIN_ROOT="$ROOT_DIR/bin"
-LINUX_DIR="$BIN_ROOT/linux-x64"
+case "$(uname -m)" in
+  x86_64|amd64) LINUX_PLATFORM="linux-x64" ;;
+  aarch64|arm64) LINUX_PLATFORM="linux-arm64" ;;
+  *) echo "==[build][error]== unsupported build architecture: $(uname -m)" >&2; exit 3 ;;
+esac
+LINUX_DIR="$BIN_ROOT/$LINUX_PLATFORM"
 WIN_DIR="$BIN_ROOT/win64"
 CLIENT_DIR="$ROOT_DIR/userspace/gui"
 WINDOWS_TARGET="x86_64-pc-windows-gnu"
@@ -113,28 +132,30 @@ PNPM_FETCH_RETRY_MINTIMEOUT_MS="${DEEPCODE_PNPM_FETCH_RETRY_MINTIMEOUT_MS:-5000}
 PNPM_FETCH_RETRY_MAXTIMEOUT_MS="${DEEPCODE_PNPM_FETCH_RETRY_MAXTIMEOUT_MS:-15000}"
 PNPM_FETCH_TIMEOUT_MS="${DEEPCODE_PNPM_FETCH_TIMEOUT_MS:-30000}"
 BUILD_LINUX_TAURI_SHELL="${DEEPCODE_BUILD_LINUX_TAURI_SHELL:-0}"
-STAGE_STAMP_DIR="$ROOT_DIR/.build-cache/build-stamps"
 CARGO_WITH_FALLBACK="$ROOT_DIR/scripts/cargo-with-fallback.sh"
 
 export CARGO_TARGET_DIR="$CARGO_TARGET_ROOT"
 export TMPDIR="$BUILD_TMPDIR"
 
 cd "$ROOT_DIR"
-mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
 
 usage() {
   cat <<'USAGE'
 Usage:
-  ./build.sh [--stage all|gui|deepcode-gui|deepcode-gui-tauri|macos-package-service|package-macos|package-macos-deepcode-gui|daemon|cli|tui|tauri|package|verify-package-runtime]...
-  ./build.sh --stage macos-package-service
-  ./build.sh --full
-  ./build.sh --stage package-macos --clean-cache
+  bash ./build.sh [--stage all|gui|deepcode-gui|deepcode-gui-tauri|macos-package-service|package-macos|package-macos-deepcode-gui|daemon|cli|tui|tauri|package|verify-package-runtime]...
+  bash ./build.sh --stage macos-package-service
+  bash ./build.sh --full
+  bash ./build.sh --stage package-macos --clean-cache
 
 Default:
-  macOS host: package latest DeepCode.app and DeepCode-GUI.app.
-  Docker/Linux: build regular Linux/Windows distribution artifacts.
+  macOS: build current-source macOS apps and shared runtime in bin/macos-arm64/.
+  WSL/Linux: build Linux and Windows distribution artifacts in Docker.
+  make shell passes the host platform into Docker for the same default selection.
+  --full, --stage all and --stage package use this platform selection too.
 
 Environment:
+  DEEPCODE_BUILD_HOST_OS            Host OS passed into Docker by make shell.
+                                    Darwin selects macOS; Linux selects Linux/Windows.
   CARGO_TARGET_DIR                  Override shared Cargo target directory.
                                     Docker default prefers /workspace/target
                                     when it is a native Docker volume, otherwise
@@ -145,7 +166,6 @@ Environment:
   DEEPCODE_PNPM_REGISTRY            Override pnpm registry used by dependency install.
   DEEPCODE_PNPM_NETWORK_CONCURRENCY Override pnpm network concurrency.
   DEEPCODE_PNPM_FETCH_TIMEOUT_MS    Override pnpm fetch timeout in milliseconds.
-  DEEPCODE_FORCE_BUILD=1            Ignore stage hash stamps and rebuild.
   DEEPCODE_DISABLE_SCCACHE=1        Disable sccache even when available.
   DEEPCODE_CARGO_SOURCE=auto|repo|official
                                     Cargo registry source mode. Default auto keeps
@@ -162,7 +182,6 @@ Environment:
   DEEPCODE_CARGO_AUTO_PRIMARY_RETRY
                                     Cargo retry count for auto-mode primary source
                                     probe. Default 0 to fail fast into fallback.
-  DEEPCODE_ALLOW_HOST_BUILD=1       Allow non-Docker host builds explicitly.
   SCCACHE_DIR                       Override local sccache cache directory.
                                     Docker default prefers CARGO_TARGET_DIR/.sccache
                                     on native Docker volumes, otherwise
@@ -170,10 +189,6 @@ Environment:
   DEEPCODE_RESET_SCCACHE_SERVER=0   Do not stop an existing Docker sccache
                                     server before first use.
   DEEPCODE_BUILD_LINUX_TAURI_SHELL=1 Build optional Linux Tauri shell.
-  DEEPCODE_MACOS_PACKAGE_MODE=auto|off|require
-                                      From Docker, submit a macOS package request after full package stage.
-  DEEPCODE_MACOS_PACKAGE_AUTOSTART=1  Start the host package service automatically when build.sh is running on macOS.
-  DEEPCODE_MACOS_PACKAGE_WAIT=1       Wait for the host package service request to finish.
   DEEPCODE_MACOS_PACKAGE_TIMEOUT_SECONDS
                                       Timeout for macOS package service requests.
   DEEPCODE_MACOS_PRODUCTS=DeepCode-GUI,DeepCode
@@ -236,11 +251,7 @@ case "$kill_running" in
 esac
 
 if [ "${#requested_stages[@]}" -eq 0 ]; then
-  if [ "$(uname -s)" = "Darwin" ] && [ ! -f /.dockerenv ]; then
-    requested_stages=("package-macos")
-  else
-    requested_stages=("all")
-  fi
+  requested_stages=("all")
 fi
 
 run_deps=0
@@ -262,15 +273,19 @@ SCCACHE_CONFIGURED=0
 enable_stage() {
   case "$1" in
     all)
-      run_deps=1
-      run_gui=1
-      run_deepcode_gui=1
-      run_daemon=1
-      run_cli=1
-      run_tui=1
-      run_tauri=1
-      run_deepcode_gui_tauri=1
-      run_package=1
+      if [ "$BUILD_HOST_OS" = "Darwin" ]; then
+        run_package_macos=1
+      else
+        run_deps=1
+        run_gui=1
+        run_deepcode_gui=1
+        run_daemon=1
+        run_cli=1
+        run_tui=1
+        run_tauri=1
+        run_deepcode_gui_tauri=1
+        run_package=1
+      fi
       ;;
     macos-package-service)
       run_macos_package_service=1
@@ -303,6 +318,7 @@ enable_stage() {
       ;;
     tauri)
       run_deps=1
+      run_gui=1
       run_tauri=1
       ;;
     deepcode-gui-tauri)
@@ -311,7 +327,7 @@ enable_stage() {
       run_deepcode_gui_tauri=1
       ;;
     package)
-      run_package=1
+      enable_stage all
       ;;
     verify-package-runtime)
       run_verify_package_runtime=1
@@ -338,6 +354,7 @@ build_started_at() {
 
 echo "==[build]== DeepCode cross-platform build started at $(build_started_at)"
 echo "==[build]== ROOT_DIR=$ROOT_DIR"
+echo "==[build]== host platform: $BUILD_HOST_OS"
 echo "==[build]== CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
 echo "==[build]== TMPDIR=$TMPDIR"
 echo "==[build]== PNPM_STORE_DIR=$PNPM_STORE_DIR"
@@ -345,21 +362,6 @@ echo "==[build]== PNPM_REGISTRY=$PNPM_REGISTRY"
 echo "==[build]== DEEPCODE_BUILD_LINUX_TAURI_SHELL=$BUILD_LINUX_TAURI_SHELL"
 echo "==[build]== clean-cache=$clean_cache"
 echo "==[build]== stages: deps=$run_deps gui=$run_gui deepcode-gui=$run_deepcode_gui deepcode-gui-tauri=$run_deepcode_gui_tauri package-macos=$run_package_macos package-macos-deepcode-gui=$run_package_macos_deepcode_gui macos-package-service=$run_macos_package_service daemon=$run_daemon cli=$run_cli tui=$run_tui tauri=$run_tauri package=$run_package verify-package-runtime=$run_verify_package_runtime"
-mkdir -p "$STAGE_STAMP_DIR"
-
-is_docker_environment() {
-  [ -f /.dockerenv ] && return 0
-  grep -qaE '(docker|containerd|kubepods)' /proc/1/cgroup 2>/dev/null
-}
-
-require_docker_build_environment() {
-  if is_docker_environment || [ "${DEEPCODE_ALLOW_HOST_BUILD:-0}" = "1" ]; then
-    return
-  fi
-  echo "==[build][error]== build.sh is Docker-only for build/package stages." >&2
-  echo "==[build][error]== Run inside the deepcode-dev container, or set DEEPCODE_ALLOW_HOST_BUILD=1 for a one-off local diagnostic build." >&2
-  exit 3
-}
 
 run_macos_package_products_from_host() {
   local products_csv
@@ -376,9 +378,9 @@ run_macos_package_products_from_host() {
   products_csv="$(IFS=,; printf '%s' "$*")"
   echo "==[build][package-macos]== package product set on macOS host: $products_csv"
   if [ "$clean_cache" = "1" ]; then
-    env DEEPCODE_MACOS_CLEAN=1 DEEPCODE_MACOS_REFRESH_GUI_DIST=1 DEEPCODE_MACOS_KILL_RUNNING="$kill_running" DEEPCODE_MACOS_PRODUCTS="$products_csv" bash ./scripts/package-macos.sh
+    env DEEPCODE_MACOS_CLEAN=1 DEEPCODE_MACOS_KILL_RUNNING="$kill_running" DEEPCODE_MACOS_PRODUCTS="$products_csv" bash ./scripts/package-macos.sh
   else
-    env DEEPCODE_MACOS_REFRESH_GUI_DIST=1 DEEPCODE_MACOS_KILL_RUNNING="$kill_running" DEEPCODE_MACOS_PRODUCTS="$products_csv" bash ./scripts/package-macos.sh
+    env DEEPCODE_MACOS_KILL_RUNNING="$kill_running" DEEPCODE_MACOS_PRODUCTS="$products_csv" bash ./scripts/package-macos.sh
   fi
   echo ""
   echo "==[build]== DONE"
@@ -449,77 +451,25 @@ macos_package_service_is_running() {
   bash ./scripts/macos-package-service.sh status --quiet >/dev/null 2>&1
 }
 
-ensure_macos_package_service_running() {
-  macos_package_service_is_running && return 0
-  if [ "${DEEPCODE_MACOS_PACKAGE_AUTOSTART:-1}" != "1" ]; then
-    return 1
-  fi
-  if is_docker_environment; then
-    echo "==[build][package-macos]== macOS package service is not running; Docker cannot start host-side service automatically"
-    return 1
-  fi
-  if [ "$(uname -s)" != "Darwin" ]; then
-    return 1
-  fi
-
-  echo "==[build][package-macos]== macOS package service is not running; starting host service"
-  start_macos_package_service_from_host
-  macos_package_service_is_running
-}
-
 submit_macos_package_request() {
-  local required="$1"
-  shift
   local products_csv
-  local wait="${DEEPCODE_MACOS_PACKAGE_WAIT:-1}"
   local timeout="${DEEPCODE_MACOS_PACKAGE_TIMEOUT_SECONDS:-3600}"
   products_csv="$(IFS=,; printf '%s' "$*")"
-  local args=(submit --products "$products_csv" --timeout-seconds "$timeout")
-
-  args+=(--refresh-gui-dist)
+  local args=(submit --products "$products_csv" --timeout-seconds "$timeout" --wait)
   if [ "$clean_cache" = "1" ]; then
     args+=(--clean)
   fi
   if [ "$kill_running" = "0" ]; then
     args+=(--no-kill-running)
   fi
-  if [ "$wait" = "1" ]; then
-    args+=(--wait)
-  fi
-
-  if ! ensure_macos_package_service_running; then
-    if [ "$required" = "1" ]; then
-      echo "==[build][error]== macOS package service is not running." >&2
-      echo "==[build][error]== Run on the macOS host first: bash ./build.sh --stage macos-package-service" >&2
-      exit 3
-    fi
-    echo "==[build][package-macos]== macOS package service not running; skip auto package request"
-    echo "==[build][package-macos]== Start it on host with: bash ./build.sh --stage macos-package-service"
-    return 0
+  if ! macos_package_service_is_running; then
+    echo "==[build][error]== macOS package service is not running." >&2
+    echo "==[build][error]== Run on the macOS host first: bash ./build.sh --stage macos-package-service" >&2
+    exit 3
   fi
 
   echo "==[build][package-macos]== submit product set to macOS package service: $products_csv"
   bash ./scripts/macos-package-service.sh "${args[@]}"
-}
-
-submit_macos_package_requests() {
-  local required="$1"
-  shift
-  submit_macos_package_request "$required" "$@"
-}
-
-auto_submit_macos_package_request() {
-  if [ "${DEEPCODE_MACOS_PACKAGE_MODE:-auto}" = "off" ]; then
-    return 0
-  fi
-  is_docker_environment || return 0
-
-  local required=0
-  if [ "${DEEPCODE_MACOS_PACKAGE_MODE:-auto}" = "require" ]; then
-    required=1
-  fi
-  resolve_macos_products
-  submit_macos_package_requests "$required" "${resolved_macos_products[@]}"
 }
 
 host_macos_stage_count=$((run_package_macos + run_package_macos_deepcode_gui))
@@ -550,14 +500,14 @@ if [ "$host_macos_stage_count" -gt 0 ]; then
   if [ "$run_package_macos" = "1" ]; then
     resolve_macos_products
     if is_docker_environment; then
-      submit_macos_package_requests 1 "${resolved_macos_products[@]}"
+      submit_macos_package_request "${resolved_macos_products[@]}"
     else
       run_macos_package_products_from_host "${resolved_macos_products[@]}"
     fi
   else
     resolve_deepcode_gui_products
     if is_docker_environment; then
-      submit_macos_package_request 1 "${resolved_macos_products[@]}"
+      submit_macos_package_request "${resolved_macos_products[@]}"
     else
       run_macos_package_products_from_host "${resolved_macos_products[@]}"
     fi
@@ -572,7 +522,12 @@ fi
 
 docker_build_stage_count=$((run_deps + run_gui + run_deepcode_gui + run_daemon + run_cli + run_tui + run_tauri + run_deepcode_gui_tauri + run_package))
 if [ "$docker_build_stage_count" -gt 0 ]; then
-  require_docker_build_environment
+  if ! is_docker_environment; then
+    docker_stages="$(IFS=,; printf '%s' "${requested_stages[*]}")"
+    echo "==[build]== run selected stages in the development container: $docker_stages"
+    exec make --no-print-directory -C "$ROOT_DIR" _build_in_container "DEEPCODE_BUILD_STAGES=$docker_stages"
+  fi
+  mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
 fi
 
 configure_sccache() {
@@ -696,127 +651,6 @@ validate_tauri_locked_graph() {
   return 1
 }
 
-tracked_files() {
-  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    git ls-files --cached --others --exclude-standard -- "$@"
-  else
-    find "$@" \
-      \( -type d \( -name .git -o -name node_modules -o -name target -o -name dist -o -name 'dist-*' -o -name .build-cache \) -prune \) -o \
-      \( -type f ! -name .DS_Store ! -name '*.tsbuildinfo' -print \) \
-      2>/dev/null || true
-  fi
-}
-
-find_existing_files() {
-  local path
-  for path in "$@"; do
-    if [ -f "$path" ]; then
-      printf '%s\n' "$path"
-    elif [ -d "$path" ]; then
-      find "$path" -type f 2>/dev/null || true
-    fi
-  done
-}
-
-stage_hash() {
-  local stage="$1"
-  local files_hash
-  files_hash="$({
-    tracked_files build.sh scripts/cargo-with-fallback.sh
-    case "$stage" in
-      gui)
-        tracked_files package.json pnpm-lock.yaml contracts/agent-runtime \
-          userspace/protocol userspace/session-core userspace/gui \
-          | grep -Ev '(^|/)(dist|node_modules)/' || true
-        ;;
-      deepcode-gui)
-        tracked_files package.json pnpm-lock.yaml contracts/agent-runtime \
-          userspace/protocol userspace/session-core userspace/gui shells/deepcode-gui \
-          | grep -Ev '(^|/)(dist|dist-deepcode-gui|node_modules)/' || true
-        ;;
-      kernel)
-        tracked_files Cargo.toml Cargo.lock contracts/agent-runtime crates/deepcode-kernel-abi \
-          crates/deepcode-kernel-runtime crates/deepcode-kernel-tools crates/deepcode-kernel-config \
-          crates/deepcode-kernel-client crates/deepcode-kernel-daemon crates/deepcode-first-party-tools crates/deepcode-host-web \
-          shells/cli shells/tui skills
-        ;;
-      daemon)
-        tracked_files Cargo.toml Cargo.lock contracts/agent-runtime crates/deepcode-kernel-abi \
-          crates/deepcode-kernel-runtime crates/deepcode-kernel-tools crates/deepcode-kernel-config \
-          crates/deepcode-kernel-daemon crates/deepcode-first-party-tools crates/deepcode-host-web skills
-        ;;
-      cli)
-        tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi crates/deepcode-kernel-client shells/cli
-        ;;
-      tui)
-        tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi crates/deepcode-kernel-client shells/tui
-        ;;
-      tauri)
-        tracked_files package.json pnpm-lock.yaml shells/tauri
-        find_existing_files "$CLIENT_DIR/dist" "$ROOT_DIR/shells/tauri/dist"
-        ;;
-      deepcode-gui-tauri)
-        tracked_files package.json pnpm-lock.yaml shells/deepcode-gui
-        find_existing_files "$CLIENT_DIR/dist-deepcode-gui" "$ROOT_DIR/shells/deepcode-gui/dist"
-        ;;
-      *)
-        return 1
-        ;;
-    esac
-  } \
-    | while IFS= read -r path; do
-        [ -f "$path" ] && printf '%s\n' "$path"
-      done \
-    | LC_ALL=C sort -u \
-    | xargs -r sha256sum \
-    | sha256sum \
-    | awk '{print $1}')"
-
-  {
-    printf 'stage=%s\n' "$stage"
-    printf 'files=%s\n' "$files_hash"
-    case "$stage" in
-      gui|deepcode-gui)
-        printf 'node=%s\n' "$(node --version 2>/dev/null || printf unavailable)"
-        printf 'pnpm=%s\n' "$(pnpm --version 2>/dev/null || printf unavailable)"
-        ;;
-      *)
-        printf 'rustc=%s\n' "$(rustc --version 2>/dev/null || printf unavailable)"
-        printf 'cargo=%s\n' "$(cargo --version 2>/dev/null || printf unavailable)"
-        printf 'target=%s\n' "$CARGO_TARGET_ROOT"
-        ;;
-    esac
-  } | sha256sum | awk '{print $1}'
-}
-
-stage_should_skip() {
-  local stage="$1"
-  shift
-
-  if [ "${DEEPCODE_FORCE_BUILD:-0}" = "1" ]; then
-    return 1
-  fi
-
-  local artifact
-  for artifact in "$@"; do
-    [ -e "$artifact" ] || return 1
-  done
-
-  local stamp_file="$STAGE_STAMP_DIR/${stage}.sha256"
-  local current_hash
-  current_hash="$(stage_hash "$stage")"
-  if [ -f "$stamp_file" ] && [ "$(cat "$stamp_file")" = "$current_hash" ]; then
-    echo "==[build][$stage]== unchanged; skipping stage (set DEEPCODE_FORCE_BUILD=1 to rebuild)"
-    return 0
-  fi
-  return 1
-}
-
-mark_stage_built() {
-  local stage="$1"
-  stage_hash "$stage" >"$STAGE_STAMP_DIR/${stage}.sha256"
-}
-
 run_pnpm_install() {
   echo "==[build][deps]== pnpm install"
   pnpm install --frozen-lockfile \
@@ -832,7 +666,7 @@ run_pnpm_install() {
 prepare_tauri_dist() {
   local tauri_gui_dist="$ROOT_DIR/shells/tauri/dist"
   test -d "$CLIENT_DIR/dist" || {
-    echo "==[build][error]== userspace/gui/dist missing; run ./build.sh --stage gui first" >&2
+    echo "==[build][error]== userspace/gui/dist missing; run bash ./build.sh --stage gui first" >&2
     exit 1
   }
   validate_frontend_dist "$CLIENT_DIR/dist" "DeepCode" "gui"
@@ -846,7 +680,7 @@ prepare_deepcode_gui_tauri_dist() {
   local tauri_gui_dist="$ROOT_DIR/shells/deepcode-gui/dist"
   normalize_deepcode_gui_dist
   test -d "$deepcode_gui_dist" || {
-    echo "==[build][error]== userspace/gui/dist-deepcode-gui missing; run ./build.sh --stage deepcode-gui first" >&2
+    echo "==[build][error]== userspace/gui/dist-deepcode-gui missing; run bash ./build.sh --stage deepcode-gui first" >&2
     exit 1
   }
   validate_frontend_dist "$deepcode_gui_dist" "DeepCode-GUI" "deepcode-gui"
@@ -876,7 +710,7 @@ validate_frontend_dist() {
   fi
   if ! grep -q '<script[^>]*type="module"[^>]*assets/' "$index_file"; then
     echo "==[build][error]== $label frontend dist index.html has no production module entry." >&2
-    echo "==[build][error]== Rebuild the dist with DEEPCODE_FORCE_BUILD=1 bash ./build.sh --stage $stage" >&2
+    echo "==[build][error]== Rebuild the dist with bash ./build.sh --stage $stage" >&2
     exit 1
   fi
 }
@@ -894,132 +728,72 @@ build_frontend_shared() {
   if [ "$FRONTEND_SHARED_READY" = "1" ]; then
     return
   fi
-  echo "==[build][frontend-shared]== build protocol/session-core and check client types"
-  pnpm --filter @deepcode/protocol clean
-  rm -f "$ROOT_DIR/userspace/protocol/tsconfig.tsbuildinfo"
-  pnpm --filter @deepcode/protocol build
-  pnpm --filter @deepcode/session-core build
-  pnpm --filter @deepcode/client build:types
+  echo "==[build][frontend-shared]== build shared userspace packages and check client types"
+  pnpm build:userspace-shared
+  pnpm --filter @deepcode/client typecheck
   FRONTEND_SHARED_READY=1
 }
 
 build_gui() {
-  if stage_should_skip gui "$CLIENT_DIR/dist/index.html" "$ROOT_DIR/shells/tauri/dist/index.html"; then
-    return
-  fi
   build_frontend_shared
   echo "==[build][gui]== build DeepCode web assets"
   pnpm --filter @deepcode/client build:web
   echo "==[build][gui]== prepare Tauri embedded GUI dist"
   prepare_tauri_dist
-  mark_stage_built gui
 }
 
 build_deepcode_gui() {
-  if stage_should_skip deepcode-gui "$CLIENT_DIR/dist-deepcode-gui/index.html" "$ROOT_DIR/shells/deepcode-gui/dist/index.html"; then
-    return
-  fi
   build_frontend_shared
   echo "==[build][deepcode-gui]== build DeepCode-GUI web assets"
   pnpm --filter @deepcode/client build:deepcode-gui:web
   normalize_deepcode_gui_dist
   echo "==[build][deepcode-gui]== prepare DeepCode-GUI Tauri embedded dist"
   prepare_deepcode_gui_tauri_dist
-  mark_stage_built deepcode-gui
 }
 
 build_daemon() {
-  if stage_should_skip daemon \
-    "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" \
-    "$CARGO_TARGET_ROOT/release/deepcode-first-party-provider" \
-    "$CARGO_TARGET_ROOT/release/deepcode-host-web" \
-    "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" \
-    "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-first-party-provider.exe" \
-    "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-host-web.exe"; then
-    return
-  fi
   configure_sccache
   echo "==[build][daemon]== build Rust Kernel daemon and private Host proxy for Linux"
   cargo_with_fallback build --release -p deepcode-first-party-tools -p deepcode-kernel-daemon -p deepcode-host-web
   echo "==[build][daemon]== build Rust Kernel daemon and private Host proxy for Windows GNU"
   cargo_with_fallback build --release --target "$WINDOWS_TARGET" \
     -p deepcode-first-party-tools -p deepcode-kernel-daemon -p deepcode-host-web
-  mark_stage_built daemon
   show_sccache_stats
 }
 
 build_cli() {
-  if stage_should_skip cli \
-    "$CARGO_TARGET_ROOT/release/deepcode-cli" \
-    "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-cli.exe" \
-    ; then
-    return
-  fi
   configure_sccache
   echo "==[build][cli]== build Rust CLI Host shell for Linux"
   cargo_with_fallback build --release -p deepcode-cli
   echo "==[build][cli]== build Rust CLI Host shell for Windows GNU"
   cargo_with_fallback build --release --target "$WINDOWS_TARGET" -p deepcode-cli
-  mark_stage_built cli
   show_sccache_stats
 }
 
 build_tui() {
-  if stage_should_skip tui \
-    "$CARGO_TARGET_ROOT/release/deepcode-tui" \
-    "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-tui.exe"; then
-    return
-  fi
   configure_sccache
   echo "==[build][tui]== build Rust TUI Host shell for Linux"
   cargo_with_fallback build --release -p deepcode-tui
   echo "==[build][tui]== build Rust TUI Host shell for Windows GNU"
   cargo_with_fallback build --release --target "$WINDOWS_TARGET" -p deepcode-tui
-  mark_stage_built tui
   show_sccache_stats
 }
 
-build_kernel() {
-  build_daemon
-  build_cli
-  build_tui
-}
-
 build_tauri() {
-  if [ ! -d "$CLIENT_DIR/dist" ]; then
-    echo "==[build][tauri]== GUI dist missing; building GUI first"
-    build_gui
-  else
-    prepare_tauri_dist
-  fi
-  if stage_should_skip tauri "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode.exe"; then
-    return
-  fi
   configure_sccache
   echo "==[build][tauri]== build Windows DeepCode.exe GUI shell"
   run_with_cargo_fallback_shim "$ROOT_DIR/shells/tauri/src-tauri/Cargo.toml" \
     pnpm --filter @deepcode/tauri-shell tauri:build -- --target "$WINDOWS_TARGET"
-  mark_stage_built tauri
   show_sccache_stats
 }
 
 build_deepcode_gui_tauri() {
-  if [ ! -d "$CLIENT_DIR/dist-deepcode-gui" ]; then
-    echo "==[build][deepcode-gui-tauri]== DeepCode-GUI dist missing; building DeepCode-GUI first"
-    build_deepcode_gui
-  else
-    prepare_deepcode_gui_tauri_dist
-  fi
   local runtime_dist="$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/web-deepcode-gui"
   sync_deepcode_gui_runtime_assets "$runtime_dist"
-  if stage_should_skip deepcode-gui-tauri "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode-GUI.exe"; then
-    return
-  fi
   configure_sccache
   echo "==[build][deepcode-gui-tauri]== build Windows DeepCode-GUI.exe Tauri shell"
   run_with_cargo_fallback_shim "$ROOT_DIR/shells/deepcode-gui/src-tauri/Cargo.toml" \
     pnpm --filter @deepcode/deepcode-gui-shell tauri:build -- --target "$WINDOWS_TARGET"
-  mark_stage_built deepcode-gui-tauri
   show_sccache_stats
 }
 
@@ -1228,8 +1002,8 @@ find_webview2_loader_dll() {
 
 validate_package_inputs() {
   local missing=0
-  require_package_dir "$CLIENT_DIR/dist" "run ./build.sh --stage gui first" || missing=1
-  require_package_dir "$CLIENT_DIR/dist-deepcode-gui" "run ./build.sh --stage deepcode-gui first" || missing=1
+  require_package_dir "$CLIENT_DIR/dist" "run bash ./build.sh --stage gui first" || missing=1
+  require_package_dir "$CLIENT_DIR/dist-deepcode-gui" "run bash ./build.sh --stage deepcode-gui first" || missing=1
   require_package_file "$ROOT_DIR/userspace/session-core/dist/$SESSION_BRIDGE_NAME" \
     "run pnpm --filter @deepcode/session-core build first" || missing=1
   require_package_file "$ROOT_DIR/userspace/session-core/package.json" \
@@ -1243,24 +1017,24 @@ validate_package_inputs() {
   require_package_file "$ROOT_DIR/config/defaults/llm-profiles.json" \
     "portable LLM Profile default is missing" || missing=1
   local linux_node_source windows_node_source
-  linux_node_source="$(distribution_node_source linux-x64)"
+  linux_node_source="$(distribution_node_source "$LINUX_PLATFORM")"
   windows_node_source="$(distribution_node_source win64)"
   require_package_file "$linux_node_source" \
     "Linux Node 20+ runtime is required for the Session service" || missing=1
   require_package_file "$windows_node_source" \
     "Windows node.exe runtime is required for the Session service" || missing=1
-  require_package_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "run ./build.sh --stage kernel first" || missing=1
-  require_package_file "$CARGO_TARGET_ROOT/release/deepcode-first-party-provider" "run ./build.sh --stage kernel first" || missing=1
-  require_package_file "$CARGO_TARGET_ROOT/release/deepcode-host-web" "run ./build.sh --stage kernel first" || missing=1
-  require_package_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "run ./build.sh --stage kernel first" || missing=1
-  require_package_file "$CARGO_TARGET_ROOT/release/deepcode-tui" "run ./build.sh --stage kernel first" || missing=1
-  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" "run ./build.sh --stage kernel first" || missing=1
-  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-first-party-provider.exe" "run ./build.sh --stage kernel first" || missing=1
-  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-host-web.exe" "run ./build.sh --stage kernel first" || missing=1
-  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-cli.exe" "run ./build.sh --stage kernel first" || missing=1
-  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-tui.exe" "run ./build.sh --stage kernel first" || missing=1
-  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode.exe" "run ./build.sh --stage tauri first" || missing=1
-  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode-GUI.exe" "run ./build.sh --stage deepcode-gui-tauri first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "run bash ./build.sh --stage daemon --stage cli --stage tui first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/release/deepcode-first-party-provider" "run bash ./build.sh --stage daemon --stage cli --stage tui first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/release/deepcode-host-web" "run bash ./build.sh --stage daemon --stage cli --stage tui first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "run bash ./build.sh --stage daemon --stage cli --stage tui first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/release/deepcode-tui" "run bash ./build.sh --stage daemon --stage cli --stage tui first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" "run bash ./build.sh --stage daemon --stage cli --stage tui first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-first-party-provider.exe" "run bash ./build.sh --stage daemon --stage cli --stage tui first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-host-web.exe" "run bash ./build.sh --stage daemon --stage cli --stage tui first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-cli.exe" "run bash ./build.sh --stage daemon --stage cli --stage tui first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-tui.exe" "run bash ./build.sh --stage daemon --stage cli --stage tui first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode.exe" "run bash ./build.sh --stage tauri first" || missing=1
+  require_package_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode-GUI.exe" "run bash ./build.sh --stage deepcode-gui-tauri first" || missing=1
   local webview2_loader_dll
   webview2_loader_dll="$(find_webview2_loader_dll)"
   if [ ! -f "$webview2_loader_dll" ]; then
@@ -1347,6 +1121,7 @@ const profileFields = new Set([
   'temperature',
   'reasoningEffort',
   'thinking',
+  'hostedWebSearch',
   'secretRef',
   'enabled',
 ]);
@@ -1408,12 +1183,12 @@ try {
     if (typeof profile.enabled !== 'boolean') {
       reject(`profiles[${index}].enabled must be a boolean`);
     }
-    if (!['openaiCompatible', 'anthropic', 'ollama'].includes(profile.kind)) {
+    if (!['openaiCompatible', 'responses', 'anthropic', 'ollama'].includes(profile.kind)) {
       reject(`profiles[${index}].kind is unsupported`);
     }
     if (
       'providerFlavor' in profile
-      && !['openai', 'deepseek', 'zhipu'].includes(profile.providerFlavor)
+      && !['openai', 'deepseek', 'zhipu', 'moonshot'].includes(profile.providerFlavor)
     ) {
       reject(`profiles[${index}].providerFlavor is unsupported`);
     }
@@ -1452,6 +1227,12 @@ try {
       && !['enabled', 'disabled'].includes(profile.thinking)
     ) {
       reject(`profiles[${index}].thinking is unsupported`);
+    }
+    if (
+      'hostedWebSearch' in profile
+      && (profile.hostedWebSearch !== 'web_search' || profile.kind !== 'responses')
+    ) {
+      reject(`profiles[${index}].hostedWebSearch requires responses and web_search`);
     }
   }
 
@@ -1573,7 +1354,7 @@ verify_macos_app_identity() {
 verify_linux_package_runtime() {
   local missing=0
   [ -d "$LINUX_DIR" ] || return 2
-  echo "==[build][verify-package-runtime]== check linux-x64 package"
+  echo "==[build][verify-package-runtime]== check $LINUX_PLATFORM package"
   verify_runtime_executable "$LINUX_DIR/deepcode-kernel" "linux kernel" || missing=1
   verify_runtime_executable "$LINUX_DIR/deepcode-first-party-provider" "linux first-party provider" || missing=1
   verify_runtime_executable "$LINUX_DIR/deepcode-host-web" "linux private Host proxy" || missing=1
@@ -1589,7 +1370,7 @@ verify_linux_package_runtime() {
     "$LINUX_DIR/config/user/local/settings/llm-profiles.json" \
     "$LINUX_DIR/node/bin/node" \
     "linux LLM Profile store" || missing=1
-  verify_distribution_build_identity "$LINUX_DIR" "linux-x64" || missing=1
+  verify_distribution_build_identity "$LINUX_DIR" "$LINUX_PLATFORM" || missing=1
   verify_frontend_package_assets "$LINUX_DIR/web" "linux editor web" || missing=1
   verify_frontend_package_assets "$LINUX_DIR/web-deepcode-gui" "linux DeepCode-GUI web" || missing=1
   return "$missing"
@@ -1635,7 +1416,7 @@ verify_macos_package_runtime() {
   local checked_app=0
   local validation_node=""
   [ -d "$macos_dir" ] || return 2
-  echo "==[build][verify-package-runtime]== check macos-arm64 package"
+  echo "==[build][verify-package-runtime]== check existing macos-arm64 package structure (does not rebuild the package)"
   verify_runtime_executable "$macos_dir/deepcode-kernel" "macOS shared kernel" || missing=1
   verify_runtime_executable "$macos_dir/deepcode-first-party-provider" "macOS shared first-party provider" || missing=1
   verify_runtime_executable "$macos_dir/DeepCode-CLI.command" "macOS CLI launcher" || missing=1
@@ -1718,7 +1499,7 @@ verify_package_runtime() {
 
   if [ "$checked" = "0" ]; then
     echo "==[build][verify-package-runtime][error]== no package directory found under $BIN_ROOT" >&2
-    echo "==[build][verify-package-runtime][error]== run ./build.sh --stage package or ./build.sh --stage package-macos first" >&2
+    echo "==[build][verify-package-runtime][error]== run bash ./build.sh --stage package or ./build.sh --stage package-macos first" >&2
     exit 1
   fi
   if [ "$missing" = "1" ]; then
@@ -1825,44 +1606,44 @@ clean_package_generated_outputs() {
 }
 
 package_distribution() {
-  echo "==[build][package]== prepare bin/linux-x64 and bin/win64 directories"
+  echo "==[build][package]== prepare bin/$LINUX_PLATFORM and bin/win64 directories"
   validate_package_inputs
   mkdir -p "$LINUX_DIR" "$WIN_DIR"
-  clean_package_generated_outputs "$LINUX_DIR" "linux-x64"
+  clean_package_generated_outputs "$LINUX_DIR" "$LINUX_PLATFORM"
   clean_package_generated_outputs "$WIN_DIR" "win64"
 
-  prepare_distribution_tree "$LINUX_DIR" "linux-x64"
+  prepare_distribution_tree "$LINUX_DIR" "$LINUX_PLATFORM"
   prepare_distribution_tree "$WIN_DIR" "win64"
 
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$LINUX_DIR/deepcode-kernel" \
-    "run ./build.sh --stage kernel first"
+    "run bash ./build.sh --stage daemon --stage cli --stage tui first"
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-first-party-provider" "$LINUX_DIR/deepcode-first-party-provider" \
-    "run ./build.sh --stage kernel first"
+    "run bash ./build.sh --stage daemon --stage cli --stage tui first"
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-host-web" "$LINUX_DIR/deepcode-host-web" \
-    "run ./build.sh --stage kernel first"
+    "run bash ./build.sh --stage daemon --stage cli --stage tui first"
   chmod +x "$LINUX_DIR/deepcode-kernel" "$LINUX_DIR/deepcode-first-party-provider" "$LINUX_DIR/deepcode-host-web"
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "$LINUX_DIR/deepcode-cli" \
-    "run ./build.sh --stage kernel first"
+    "run bash ./build.sh --stage daemon --stage cli --stage tui first"
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "$LINUX_DIR/deepcode" \
-    "run ./build.sh --stage kernel first"
+    "run bash ./build.sh --stage daemon --stage cli --stage tui first"
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-tui" "$LINUX_DIR/deepcode-tui" \
-    "run ./build.sh --stage kernel first"
+    "run bash ./build.sh --stage daemon --stage cli --stage tui first"
   chmod +x "$LINUX_DIR/deepcode-cli" "$LINUX_DIR/deepcode" "$LINUX_DIR/deepcode-tui"
 
   copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-kernel-daemon.exe" "$WIN_DIR/deepcode-kernel.exe" \
-    "run ./build.sh --stage kernel first"
+    "run bash ./build.sh --stage daemon --stage cli --stage tui first"
   copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-first-party-provider.exe" "$WIN_DIR/deepcode-first-party-provider.exe" \
-    "run ./build.sh --stage kernel first"
+    "run bash ./build.sh --stage daemon --stage cli --stage tui first"
   copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-host-web.exe" "$WIN_DIR/deepcode-host-web.exe" \
-    "run ./build.sh --stage kernel first"
+    "run bash ./build.sh --stage daemon --stage cli --stage tui first"
   copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-cli.exe" "$WIN_DIR/deepcode-cli.exe" \
-    "run ./build.sh --stage kernel first"
+    "run bash ./build.sh --stage daemon --stage cli --stage tui first"
   copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/deepcode-tui.exe" "$WIN_DIR/deepcode-tui.exe" \
-    "run ./build.sh --stage kernel first"
+    "run bash ./build.sh --stage daemon --stage cli --stage tui first"
   copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode.exe" "$WIN_DIR/DeepCode.exe" \
-    "run ./build.sh --stage tauri first"
+    "run bash ./build.sh --stage tauri first"
   copy_required_file "$CARGO_TARGET_ROOT/$WINDOWS_TARGET/release/DeepCode-GUI.exe" "$WIN_DIR/DeepCode-GUI.exe" \
-    "run ./build.sh --stage deepcode-gui-tauri first"
+    "run bash ./build.sh --stage deepcode-gui-tauri first"
   validate_frontend_dist "$WIN_DIR/web-deepcode-gui" "DeepCode-GUI packaged assets" "deepcode-gui"
 
   local webview2_loader_dll
@@ -1901,7 +1682,7 @@ if not defined DEEPCODE_PORT set "DEEPCODE_PORT=31245"
 "%SCRIPT_DIR%deepcode-cli.exe" %*
 LAUNCHER
 
-  write_readme "$LINUX_DIR" "linux-x64"
+  write_readme "$LINUX_DIR" "$LINUX_PLATFORM"
   write_readme "$WIN_DIR" "win64"
 
   if [ "$BUILD_LINUX_TAURI_SHELL" = "1" ]; then
@@ -1910,12 +1691,9 @@ LAUNCHER
     run_with_cargo_fallback_shim "$ROOT_DIR/shells/tauri/src-tauri/Cargo.toml" \
       pnpm --filter @deepcode/tauri-shell tauri:build
     local tauri_release="$CARGO_TARGET_ROOT/release/DeepCode"
-    if [ -x "$tauri_release" ]; then
-      cp -v "$tauri_release" "$LINUX_DIR/DeepCode"
-      chmod +x "$LINUX_DIR/DeepCode"
-    else
-      echo "==[build][opt]== Tauri shell build completed, but no Linux release binary was found at $tauri_release"
-    fi
+    copy_required_file "$tauri_release" "$LINUX_DIR/DeepCode" \
+      "Linux Tauri shell build did not produce its release binary"
+    chmod +x "$LINUX_DIR/DeepCode"
   else
     echo "==[build][opt]== Linux Tauri shell build skipped; set DEEPCODE_BUILD_LINUX_TAURI_SHELL=1 to enable"
   fi
@@ -1967,7 +1745,6 @@ fi
 
 if [ "$run_package" = "1" ]; then
   package_distribution
-  auto_submit_macos_package_request
 fi
 
 if [ "$run_verify_package_runtime" = "1" ]; then
@@ -1976,6 +1753,10 @@ fi
 
 echo ""
 echo "==[build]== DONE"
-if [ -d "$LINUX_DIR" ] || [ -d "$WIN_DIR" ]; then
+if [ "$run_package" = "1" ]; then
+  echo "==[build]== updated distributions: $LINUX_DIR, $WIN_DIR"
   find "$LINUX_DIR" "$WIN_DIR" -maxdepth 2 -type f 2>/dev/null | sort || true
+else
+  [ "$run_gui" != "1" ] || printf '%s\n' "$CLIENT_DIR/dist"
+  [ "$run_deepcode_gui" != "1" ] || printf '%s\n' "$CLIENT_DIR/dist-deepcode-gui"
 fi

@@ -4,7 +4,6 @@ import {
   DEEPSEEK_ANTHROPIC_BASE_URL,
   DEEPSEEK_LLM_MODEL_OPTIONS,
   DEEPSEEK_OPENAI_BASE_URL,
-  DEPRECATED_DEEPSEEK_LLM_MODELS,
   GLM_LLM_MODEL_OPTIONS,
   GLM_OPENAI_BASE_URL,
   KIMI_LLM_MODEL_OPTIONS,
@@ -508,11 +507,7 @@ const LlmSection: React.FC = () => {
                       <option
                         key={model}
                         value={model}
-                        label={
-                          (DEPRECATED_DEEPSEEK_LLM_MODELS as readonly string[]).includes(model)
-                            ? t(language, 'settings.llm.deprecatedModel', { model })
-                            : model
-                        }
+                        label={model}
                       />
                     ))}
                   </datalist>

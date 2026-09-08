@@ -432,6 +432,7 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("PATCH", ["api", "llm", "profiles"])
         | ("POST", ["api", "llm", "probe"])
         | ("GET", ["api", "conversation", "catalog"])
+        | ("GET", ["api", "conversation", "statuses"])
         | ("GET", ["api", "conversation", "plugins"])
         | ("GET", ["api", "conversation", "catalog", "manage"])
         | ("POST", ["api", "conversation", "projects"])

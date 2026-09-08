@@ -100,6 +100,30 @@ pub(crate) async fn conversation_catalog_get(State(state): State<AppState>) -> J
     ApiResponse::ok(gui.conversation_catalog.public_value())
 }
 
+pub(crate) async fn conversation_statuses_get(State(state): State<AppState>) -> Json<ApiResponse> {
+    let session_ids: Vec<String> = {
+        let gui = state.gui.lock().expect("gui state lock");
+        if let Some(error) = gui.conversation_catalog_error.as_deref() {
+            return ApiResponse::error("conversation_catalog_unavailable", error);
+        }
+        gui.conversation_catalog
+            .sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect()
+    };
+    match request_service(
+        state.session_service.clone(),
+        "statuses",
+        json!({ "sessionIds": session_ids }),
+    )
+    .await
+    {
+        Ok(value) => ApiResponse::ok(value),
+        Err(error) => session_service_error(error),
+    }
+}
+
 pub(crate) async fn conversation_plugin_catalog_get(
     State(state): State<AppState>,
 ) -> Json<ApiResponse> {
