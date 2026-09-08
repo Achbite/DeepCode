@@ -10,10 +10,11 @@ import { useLocalAgentStore } from '../../state/localAgentStore';
 import { inputCacheMetric } from '../../utils/providerUsage';
 import DeepCodeConversationShell from './DeepCodeConversationShell';
 import DeepCodeSidebar from './DeepCodeSidebar';
+import { useReadRunMarkers } from './useReadRunMarkers';
 import DeepCodeTaskPanel from './DeepCodeTaskPanel';
 import DeepCodeTitlebar from './DeepCodeTitlebar';
-import DeepCodeShellIcon from './DeepCodeShellIcon';
-import ProjectFolderDialog from './ProjectFolderDialog';
+import DeepCodeShellIcon from '../../components/shared/DeepCodeShellIcon';
+import ProjectFolderDialog from '../../components/workspace-open-dialog/ProjectFolderDialog';
 import '../styles/deepcodeShell.css';
 
 interface DeepCodeWorkbenchLayoutProps {
@@ -64,6 +65,18 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const activeSessionId = useLocalAgentStore((state) => state.sessionId);
   const draftProjectId = useLocalAgentStore((state) => state.draftProjectId);
   const catalog = useLocalAgentStore((state) => state.catalog);
+  const sessionStatuses = useLocalAgentStore((state) => state.sessionStatuses);
+  const sidebarStatuses = useMemo(() => {
+    if (!projection || (sessionStatuses[projection.sessionId]?.revision ?? -1) > projection.revision) {
+      return sessionStatuses;
+    }
+    return {
+      ...sessionStatuses,
+      [projection.sessionId]: {
+        sessionId: projection.sessionId, revision: projection.revision, run: projection.run,
+      },
+    };
+  }, [projection, sessionStatuses]);
   const loading = useLocalAgentStore((state) => state.loading);
   const submitting = useLocalAgentStore((state) => state.submitting);
   const catalogBusy = useLocalAgentStore((state) => state.catalogBusy);
@@ -79,6 +92,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const deleteSession = useLocalAgentStore((state) => state.deleteSession);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const readRunMarkers = useReadRunMarkers(projection, !loading && !settingsOpen);
   const [collapsedProjectIds, setCollapsedProjectIds] = useState<string[]>([]);
   const [projectCreateMenu, setProjectCreateMenu] = useState<{ x: number; y: number } | null>(null);
   const [projectMenu, setProjectMenu] = useState<PositionedMenu<ConversationProject> | null>(null);
@@ -261,6 +275,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
           language={language}
           projects={catalog.projects}
           sessions={catalog.sessions}
+          sessionStatuses={sidebarStatuses}
+          readRunMarkers={readRunMarkers}
           collapsedProjectIds={collapsedSet}
           activeSessionId={activeSessionId}
           draftProjectId={draftProjectId}

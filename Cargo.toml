@@ -1,7 +1,6 @@
 [workspace]
 members = [
   "crates/deepcode-kernel-abi",
-  "crates/deepcode-kernel-config",
   "crates/deepcode-kernel-tools",
   "crates/deepcode-kernel-runtime",
   "crates/deepcode-kernel-client",
@@ -31,7 +30,6 @@ incremental = true
 
 [workspace.dependencies]
 deepcode-kernel-abi = { path = "crates/deepcode-kernel-abi" }
-deepcode-kernel-config = { path = "crates/deepcode-kernel-config" }
 deepcode-kernel-tools = { path = "crates/deepcode-kernel-tools" }
 deepcode-kernel-runtime = { path = "crates/deepcode-kernel-runtime" }
 deepcode-kernel-daemon = { path = "crates/deepcode-kernel-daemon" }

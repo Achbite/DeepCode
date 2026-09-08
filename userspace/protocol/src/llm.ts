@@ -36,13 +36,6 @@ export const KIMI_OPENAI_BASE_URL = 'https://api.moonshot.ai/v1';
 export const DEEPSEEK_LLM_MODEL_OPTIONS = [
   'deepseek-v4-flash',
   'deepseek-v4-pro',
-  'deepseek-chat',
-  'deepseek-reasoner',
-] as const;
-
-export const DEPRECATED_DEEPSEEK_LLM_MODELS = [
-  'deepseek-chat',
-  'deepseek-reasoner',
 ] as const;
 
 export const GLM_LLM_MODEL_OPTIONS = ['glm-5.2', 'glm-5.1', 'glm-5'] as const;

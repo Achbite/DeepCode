@@ -89,32 +89,53 @@
   border-radius: 999px;
   color: var(--dc-muted);
   font-size: var(--dc-font-caption);
+  white-space: nowrap;
 }
 
-.local-agent__run-label::before {
-  content: '';
-  width: 7px;
-  height: 7px;
-  border-radius: 999px;
-  background: var(--dc-faint);
+.local-agent__run-status-icon,
+.local-agent__run-status-spinner {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
 }
 
-.local-agent__run-label--running::before {
-  background: var(--dc-accent);
-  box-shadow: 0 0 0 3px var(--dc-accent-soft);
+.local-agent__run-status-spinner {
+  box-sizing: border-box;
+  border: 1.5px solid color-mix(in srgb, currentColor 22%, transparent);
+  border-top-color: currentColor;
+  border-right-color: currentColor;
+  border-radius: 50%;
+  animation: local-agent-run-spinner 800ms linear infinite;
 }
 
-.local-agent__run-label--waiting::before {
-  background: var(--dc-warning);
+.local-agent__run-label--running,
+.local-agent__run-label--releasing {
+  color: var(--dc-foreground);
 }
 
-.local-agent__run-label--completed::before {
-  background: var(--dc-success);
+.local-agent__run-label--waiting {
+  color: var(--dc-warning);
 }
 
-.local-agent__run-label--failed::before,
-.local-agent__run-label--indeterminate::before {
-  background: var(--dc-danger);
+.local-agent__run-label--completed > svg {
+  color: var(--dc-success);
+}
+
+.local-agent__run-label--failed,
+.local-agent__run-label--releaseFailed,
+.local-agent__run-label--indeterminate {
+  color: var(--dc-danger);
+}
+
+.local-agent__run-label--compact {
+  min-height: 16px;
+  padding: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .local-agent__run-status-spinner {
+    animation: none;
+  }
 }
 
 .local-agent__body {
@@ -948,6 +969,9 @@
 .local-agent__plan-document-meta svg:last-child {
   width: 13px;
   height: 13px;
+}
+
+.local-agent__plan-document-meta .local-agent__plan-card-status {
   margin-left: auto;
 }
 
@@ -1217,11 +1241,10 @@
 
 .local-agent__interaction-panel {
   overflow: hidden;
-  border: 1px solid var(--dc-border-strong);
+  border: 1px solid var(--dc-border);
   border-radius: 16px;
   background: var(--dc-surface-raised);
-  box-shadow: 0 1px 2px color-mix(in srgb, var(--dc-foreground-strong) 7%, transparent),
-    0 18px 42px -30px color-mix(in srgb, var(--dc-foreground-strong) 38%, transparent);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--dc-foreground-strong) 4%, transparent);
 }
 
 .local-agent__interaction-panel-heading {
@@ -1342,8 +1365,10 @@
   grid-template-columns: 28px minmax(0, 1fr) auto;
   align-items: end;
   gap: 7px;
-  padding: 8px 12px;
-  border-top: 1px solid var(--dc-border);
+  margin: 0 9px 9px;
+  padding: 7px 9px;
+  border-radius: 24px;
+  background: var(--dc-surface-subtle);
 }
 
 .local-agent__interaction-compose-mark {
@@ -1381,6 +1406,23 @@
   color: var(--dc-faint);
 }
 
+:root[data-product='deepcode-gui'] .local-agent
+  :is(.local-agent__plan-card, .local-agent__interaction-panel, .local-agent__decision)
+  :is(button, summary, textarea):focus-visible {
+  outline: none;
+}
+
+:root[data-product='deepcode-gui'] .local-agent
+  :is(.local-agent__plan-card, .local-agent__interaction-panel, .local-agent__decision)
+  :is(button, summary):focus-visible {
+  background: var(--dc-surface-hover);
+  box-shadow: inset 0 0 0 1px var(--dc-border-strong);
+}
+
+:root[data-product='deepcode-gui'] .local-agent__interaction-composer textarea:focus-visible {
+  box-shadow: inset 0 -1px 0 var(--dc-border-strong);
+}
+
 .local-agent .local-agent__interaction-secondary {
   display: inline-flex;
   min-height: 28px;
@@ -1415,7 +1457,6 @@
   gap: 8px;
   margin-top: 7px;
   padding: 10px 15px 12px;
-  border-top: 1px solid var(--dc-border);
 }
 
 .local-agent button,

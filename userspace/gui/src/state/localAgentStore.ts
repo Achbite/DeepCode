@@ -3,6 +3,7 @@ import type {
   CommandReply,
   ConversationCatalog,
   ConversationCommand,
+  ConversationSessionStatus,
   LlmProviderProfile,
   LlmReasoningEffort,
   SessionModelSettings,
@@ -22,6 +23,7 @@ import {
   deleteConversationProject as deleteProjectRequest,
   deleteConversationSession as deleteSessionRequest,
   getConversationCatalog,
+  getConversationStatuses,
   getConversationCatalogManagement,
   getPluginCatalog,
   getLocalAgentProjection,
@@ -43,6 +45,7 @@ interface PendingFilesystemPath {
 type StoreErrorSource =
   | 'initialization'
   | 'projection'
+  | 'statuses'
   | 'catalog'
   | 'pluginCatalog'
   | 'profiles'
@@ -58,6 +61,7 @@ interface LocalAgentState {
   profiles: LlmProviderProfile[];
   defaultProfileId: string | null;
   catalog: ConversationCatalog;
+  sessionStatuses: Record<string, ConversationSessionStatus>;
   pluginCatalog: PluginCatalogProjection;
   projection: SessionProjection | null;
   loading: boolean;
@@ -116,7 +120,7 @@ let generation = 0;
 let activeSubmissionCount = 0;
 const decisionSubmissions = new Map<string, Promise<CommandReply>>();
 let projectionRefreshFlight: {
-  sessionId: string;
+  sessionId: string | null;
   generation: number;
   promise: Promise<void>;
 } | null = null;
@@ -130,6 +134,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
   profiles: [],
   defaultProfileId: null,
   catalog: EMPTY_CATALOG,
+  sessionStatuses: {},
   pluginCatalog: EMPTY_PLUGIN_CATALOG,
   projection: null,
   loading: false,
@@ -159,6 +164,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
         // Catalog readiness is independent of navigation. Starting a new draft
         // while boot data loads cancels view restoration, not the shared data.
         set({ catalog, pluginCatalog, profiles, defaultProfileId });
+        void get().refresh();
         if (currentGeneration !== generation) {
           set({
             selectedProfileId: resolveEnabledProfileId(profiles, get().selectedProfileId, defaultProfileId),
@@ -347,7 +353,6 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
 
   refresh: async () => {
     const { sessionId } = get();
-    if (!sessionId) return;
     const refreshGeneration = generation;
     if (
       projectionRefreshFlight?.sessionId === sessionId
@@ -357,7 +362,22 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
     }
 
     const promise = (async () => {
+      const statuses = (async () => {
+        try {
+          const items = await getConversationStatuses();
+          set((state) => ({
+            sessionStatuses: Object.fromEntries(items.map((item) => {
+              const current = state.sessionStatuses[item.sessionId];
+              return [item.sessionId, current && current.revision > item.revision ? current : item];
+            })),
+            ...(state.errorSource === 'statuses' ? { error: null, errorSource: null } : {}),
+          }));
+        } catch (error) {
+          set({ sessionStatuses: {}, error: errorMessage(error), errorSource: 'statuses' });
+        }
+      })();
       try {
+        if (!sessionId) return;
         const projection = await getLocalAgentProjection(sessionId);
         if (generation !== refreshGeneration || get().sessionId !== sessionId) return;
         set((state) => {
@@ -380,6 +400,8 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
         if (generation === refreshGeneration && get().sessionId === sessionId) {
           set({ error: errorMessage(error), errorSource: 'projection' });
         }
+      } finally {
+        await statuses;
       }
     })();
     projectionRefreshFlight = { sessionId, generation: refreshGeneration, promise };
@@ -905,10 +927,8 @@ function sameAssistantDraft(
   if (left === null || right === null) return left === right;
   return left.runId === right.runId
     && left.turnId === right.turnId
-    && left.content === right.content
-    && left.reasoningContent === right.reasoningContent
     && JSON.stringify(left.activity) === JSON.stringify(right.activity)
-    && JSON.stringify(left.orderedBlocks) === JSON.stringify(right.orderedBlocks);
+    && JSON.stringify(left.blocks) === JSON.stringify(right.blocks);
 }
 
 function requiredFilesystemPluginSelections(

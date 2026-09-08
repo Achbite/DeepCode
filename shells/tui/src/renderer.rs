@@ -105,8 +105,12 @@ impl Renderer {
                 }
             }
             if let Some(draft) = visible_assistant_draft(projection) {
-                output.push_str(&draft.content);
-                output.push_str("▋\n");
+                for block in &draft.blocks {
+                    if let Some((_, content)) = block.text() {
+                        output.push_str(content);
+                        output.push_str("▋\n");
+                    }
+                }
             }
             if let Some(plan) = projection.pending_plan.as_ref() {
                 render_plan_plain(&mut output, plan);
@@ -324,11 +328,15 @@ impl Renderer {
                 lines.push(Line::from(""));
             }
             if let Some(draft) = visible_assistant_draft(projection) {
-                lines.push(Line::from(Span::styled(
-                    format!("{}▋", draft.content),
-                    Style::default().fg(Color::White),
-                )));
-                lines.push(Line::from(""));
+                for block in &draft.blocks {
+                    if let Some((_, content)) = block.text() {
+                        lines.push(Line::from(Span::styled(
+                            format!("{content}▋"),
+                            Style::default().fg(Color::White),
+                        )));
+                        lines.push(Line::from(""));
+                    }
+                }
             }
             if let Some(plan) = projection.pending_plan.as_ref() {
                 lines.push(Line::from(Span::styled(

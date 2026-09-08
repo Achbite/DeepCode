@@ -64,8 +64,10 @@ cd bin/macos-arm64
 从源码生成本地包：
 
 ```bash
-make package-macos
+bash ./build.sh
 ```
+
+脚本在 Mac 上默认选择 macOS 产物；`make build` 使用同一入口。前端和 Session 资源在 Docker 内从源码构建，Darwin 原生 Rust／Tauri 打包在宿主执行。
 
 输出位于 `bin/macos-arm64/`，包含两个 App、CLI/TUI launcher、Kernel、Session runtime、Web assets 和包内可写数据根。若包仍显示旧资源，请先退出全部 DeepCode App，再执行：
 
@@ -79,11 +81,15 @@ macOS package service 固定使用当前仓库内的请求目录，并只发布�
 
 ## Linux 与 Windows 包
 
-开发和便携打包通过唯一的 `deepcode-dev` 容器完成。推荐直接在宿主机运行完整构建：
+在 WSL/Linux 上直接执行相同命令，脚本会自动通过唯一的 `deepcode-dev` 容器构建 Linux 和 Windows 产物：
 
 ```bash
-make build
+bash ./build.sh
 ```
+
+无需指定阶段。`make build`、`--full`、`--stage all` 和 `--stage package` 使用相同的平台选择。
+
+每次构建都会调用所选产品及其依赖的源码构建步骤。Cargo、sccache、Docker 层和依赖存储只用于加速；已有 `dist` 或阶段标记不能替代编译。打包入口也会先构建输入，再组装分发目录。
 
 需要交互调试时（Windows 请先进入 WSL）：
 
@@ -91,6 +97,8 @@ make build
 make shell
 bash ./build.sh
 ```
+
+`make shell` 会向容器传入宿主平台，并在 Mac 上准备原生打包服务。因此，Mac 的开发容器内执行 `build.sh` 也只请求 macOS 产物，不会因为容器内核是 Linux 而改为构建 Linux／Windows 包。
 
 每次入口都会通过 Docker 缓存重新求值 `Dockerfile.dev`。若源码挂载、开发镜像或端口发生变化，工具只重建固定名称的 `deepcode-dev` 容器并保留依赖/编译缓存；不再存在分支专用容器或 `DEEPCODE_WORKTREE_ID`。只想重建容器时执行：
 
@@ -104,8 +112,11 @@ Rust 开发版本由 `rust-toolchain.toml` 统一指定为 1.88.0；workspace �
 
 ```text
 bin/linux-x64/
+bin/linux-arm64/
 bin/win64/
 ```
+
+WSL/Linux 构建的 Linux 目录与开发容器的真实架构一致：amd64 使用 `linux-x64`，arm64 使用 `linux-arm64`。每次生成其中一种 Linux 架构，以及 `win64`；Mac 默认只生成 `macos-arm64`。
 
 Linux 启动方式：
 
@@ -113,6 +124,8 @@ Linux 启动方式：
 cd bin/linux-x64
 ./deepcode-gui
 ```
+
+ARM64 Linux 产物改用 `bin/linux-arm64`。
 
 然后打开 [http://127.0.0.1:31245/](http://127.0.0.1:31245/)。Windows 可打开 `DeepCode.exe` 或 `DeepCode-GUI.exe`；目标系统需要 Microsoft Edge WebView2 Evergreen Runtime。
 
@@ -251,7 +264,9 @@ bash ./test.sh required
 bash ./test.sh full
 ```
 
-`static` 检查分层与仓库结构，`required` 执行 Rust/TypeScript 构建和单元测试，`full` 额外运行本地 Provider、工具决定、取消、命令回放和重启恢复的端到端路径。
+`required` 和 `full` 在 `make shell` 容器中运行，并先准备当前 TypeScript 依赖产物；宿主执行会被拒绝。`static` 可在宿主运行，检查脚本语法、Git 空白错误和既有分层依赖规则。`required` 执行 Rust workspace 测试、TypeScript 检查及已登记的 Session／GUI 合同测试。`full` 额外构建 CLI／TUI、GUI Web 资源，并运行已有的本地 Provider fixture、工具执行和会话生命周期检查；它不认证真实 Provider、原生 GUI 交互或发布包。
+
+现有四项原生 GUI 生命周期测试属于独立 Cargo workspace。在受支持的原生构建环境中，显式入口为 `cargo test --manifest-path shells/deepcode-gui/src-tauri/Cargo.toml`；不属于默认 `required` 或 `full` profile。
 
 ## 第三方说明与许可证
 
