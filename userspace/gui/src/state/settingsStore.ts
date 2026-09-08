@@ -7,6 +7,8 @@ import {
   workspaceOverridableSettingsIndex,
   type SettingCatalogEntry,
   type SettingsSurface,
+  type GetUserSettingsResult,
+  type UserSettingsActivation,
   type UserSettingValue,
   type UserSettings,
 } from '@deepcode/protocol';
@@ -72,16 +74,22 @@ interface SettingsStateData {
   overriddenKeys: string[];
   storePath: string | null;
   loading: boolean;
-  restartRequired: boolean;
+  pendingNextRunActivation: boolean;
   errorMessage: string | null;
 }
 
 interface SettingsActions {
   loadUserSettings: () => Promise<void>;
   syncWorkspaceSettings: (settings: Record<string, unknown>) => void;
-  patchUserSetting: (key: string, value: UserSettingValue) => Promise<void>;
+  patchUserSetting: (
+    key: string,
+    value: UserSettingValue,
+  ) => Promise<UserSettingsActivation | null>;
+  patchUserSettingsBatch: (
+    patches: Record<string, UserSettingValue>,
+  ) => Promise<UserSettingsActivation | null>;
   patchWorkspaceSetting: (key: string, value: UserSettingValue) => Promise<void>;
-  resetUserSetting: (key: string) => Promise<void>;
+  resetUserSetting: (key: string) => Promise<UserSettingsActivation | null>;
   getSettingSource: (key: string) => SettingSource;
 }
 
@@ -344,13 +352,6 @@ function definitionsForCatalog(entries: readonly SettingCatalogEntry[]): Setting
 }
 
 const KNOWN_SETTING_KEYS = new Set(Object.keys(DEFAULT_USER_SETTINGS));
-const RUNTIME_RESTART_SETTING_KEYS = Object.keys(DEFAULT_USER_SETTINGS).filter((key) => (
-  key.startsWith('skills.')
-  || key.startsWith('mcp.')
-  || key.startsWith('agent.web.search.')
-  || key === 'agent.systemPrompt'
-  || key.startsWith('agent.permissions.')
-));
 const WORKSPACE_OVERRIDABLE_SETTING_KEYS = new Set(
   workspaceOverridableSettingsIndex().map((entry) => entry.key)
 );
@@ -429,15 +430,95 @@ function buildEffectiveSettings(
   return { effectiveSettings, sources };
 }
 
-function runtimeSettingsDiverge(
+function hasPendingNextRunActivation(
   saved: UserSettings,
   runtime: UserSettings,
 ): boolean {
-  return RUNTIME_RESTART_SETTING_KEYS.some((key) => saved[key] !== runtime[key]);
+  const keys = new Set([...Object.keys(saved), ...Object.keys(runtime)]);
+  for (const key of keys) {
+    if (!Object.is(saved[key], runtime[key])) return true;
+  }
+  return false;
 }
 
 export const useSettingsStore = create<SettingsStore>((set, get) => {
   const initialEffective = buildEffectiveSettings(DEFAULT_USER_SETTINGS, {}, []);
+
+  const applyCanonicalSettings = (
+    snapshot: GetUserSettingsResult,
+    overriddenKeys = snapshot.overriddenKeys,
+  ) => {
+    const next = buildEffectiveSettings(
+      snapshot.settings,
+      get().workspaceSettings,
+      overriddenKeys,
+    );
+    const runtime = buildEffectiveSettings(
+      snapshot.runtimeSettings,
+      get().workspaceSettings,
+      overriddenKeys,
+    );
+    set({
+      userSettings: snapshot.settings,
+      runtimeUserSettings: snapshot.runtimeSettings,
+      overriddenKeys,
+      storePath: snapshot.storePath,
+      effectiveSettings: next.effectiveSettings,
+      runtimeEffectiveSettings: runtime.effectiveSettings,
+      sources: next.sources,
+      loading: false,
+      pendingNextRunActivation: hasPendingNextRunActivation(
+        snapshot.settings,
+        snapshot.runtimeSettings,
+      ),
+      errorMessage: null,
+    });
+  };
+
+  const applyUserSettingsPatch = async (
+    patches: Record<string, UserSettingValue>,
+    fallbackError: string,
+  ): Promise<UserSettingsActivation | null> => {
+    const result = await patchUserSettings(patches);
+    if (!result.ok || !result.data) {
+      set({
+        errorMessage: result.message ?? fallbackError,
+      });
+      return null;
+    }
+    if (result.data.activation !== 'immediate' && result.data.activation !== 'nextRun') {
+      set({ errorMessage: fallbackError });
+      return null;
+    }
+
+    const overridden = new Set(get().overriddenKeys);
+    for (const key of result.data.changedKeys) {
+      if (patches[key] === null) {
+        overridden.delete(key);
+      } else {
+        overridden.add(key);
+      }
+    }
+    const overriddenKeys = Array.from(overridden);
+    const refreshed = await getUserSettings();
+    if (refreshed.ok && refreshed.data) {
+      applyCanonicalSettings(refreshed.data, overriddenKeys);
+    } else {
+      const next = buildEffectiveSettings(
+        result.data.settings,
+        get().workspaceSettings,
+        overriddenKeys,
+      );
+      set({
+        userSettings: result.data.settings,
+        overriddenKeys,
+        effectiveSettings: next.effectiveSettings,
+        sources: next.sources,
+        errorMessage: refreshed.message ?? activeT('settings.error.loadUser'),
+      });
+    }
+    return result.data.activation;
+  };
 
   return {
     userSettings: DEFAULT_USER_SETTINGS,
@@ -449,7 +530,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
     overriddenKeys: [],
     storePath: null,
     loading: false,
-    restartRequired: false,
+    pendingNextRunActivation: false,
     errorMessage: null,
 
     loadUserSettings: async () => {
@@ -463,31 +544,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
         });
         return;
       }
-      const next = buildEffectiveSettings(
-        result.data.settings,
-        get().workspaceSettings,
-        result.data.overriddenKeys
-      );
-      const runtime = buildEffectiveSettings(
-        result.data.runtimeSettings,
-        get().workspaceSettings,
-        result.data.overriddenKeys
-      );
-      set({
-        userSettings: result.data.settings,
-        runtimeUserSettings: result.data.runtimeSettings,
-        overriddenKeys: result.data.overriddenKeys,
-        storePath: result.data.storePath,
-        effectiveSettings: next.effectiveSettings,
-        runtimeEffectiveSettings: runtime.effectiveSettings,
-        sources: next.sources,
-        loading: false,
-        restartRequired: runtimeSettingsDiverge(
-          next.effectiveSettings,
-          runtime.effectiveSettings,
-        ),
-        errorMessage: null,
-      });
+      applyCanonicalSettings(result.data);
     },
 
     syncWorkspaceSettings: (settings) => {
@@ -511,32 +568,24 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
 
     patchUserSetting: async (key, value) => {
       const normalized = normalizeSettingValue(key, value);
-      const result = await patchUserSettings({ [key]: normalized });
-      if (!result.ok || !result.data) {
-        set({
-          errorMessage: result.message ?? activeT('settings.error.saveUser', { key }),
-        });
-        return;
-      }
-      const overriddenKeys = Array.from(
-        new Set([...get().overriddenKeys, key, ...result.data.changedKeys])
+      return applyUserSettingsPatch(
+        { [key]: normalized },
+        activeT('settings.error.saveUser', { key }),
       );
-      const next = buildEffectiveSettings(
-        result.data.settings,
-        get().workspaceSettings,
-        overriddenKeys
+    },
+
+    patchUserSettingsBatch: async (patches) => {
+      const normalized = Object.fromEntries(
+        Object.entries(patches).map(([key, value]) => [
+          key,
+          value === null ? null : normalizeSettingValue(key, value),
+        ]),
+      ) as Record<string, UserSettingValue>;
+      const keys = Object.keys(normalized).join(', ');
+      return applyUserSettingsPatch(
+        normalized,
+        activeT('settings.error.saveUser', { key: keys }),
       );
-      set({
-        userSettings: result.data.settings,
-        overriddenKeys,
-        effectiveSettings: next.effectiveSettings,
-        sources: next.sources,
-        restartRequired: runtimeSettingsDiverge(
-          next.effectiveSettings,
-          get().runtimeEffectiveSettings,
-        ),
-        errorMessage: null,
-      });
     },
 
     patchWorkspaceSetting: async (key, value) => {
@@ -568,30 +617,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
     },
 
     resetUserSetting: async (key) => {
-      const result = await patchUserSettings({ [key]: null });
-      if (!result.ok || !result.data) {
-        set({
-          errorMessage: result.message ?? activeT('settings.error.resetUser', { key }),
-        });
-        return;
-      }
-      const overriddenKeys = get().overriddenKeys.filter((k) => k !== key);
-      const next = buildEffectiveSettings(
-        result.data.settings,
-        get().workspaceSettings,
-        overriddenKeys
+      return applyUserSettingsPatch(
+        { [key]: null },
+        activeT('settings.error.resetUser', { key }),
       );
-      set({
-        userSettings: result.data.settings,
-        overriddenKeys,
-        effectiveSettings: next.effectiveSettings,
-        sources: next.sources,
-        restartRequired: runtimeSettingsDiverge(
-          next.effectiveSettings,
-          get().runtimeEffectiveSettings,
-        ),
-        errorMessage: null,
-      });
     },
 
     getSettingSource: (key) => get().sources[key] ?? 'default',

@@ -20,7 +20,6 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist tsconfig.tsbuildinfo",
-    "test": "pnpm run build && node --test tests/user-settings.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

@@ -1,14 +1,10 @@
 use deepcode_kernel_abi::{KernelError, KernelResult};
-use deepcode_kernel_tools::file_content::{
-    lightweight_file_classification, read_text_file_for_llm,
-};
+use deepcode_kernel_tools::file_content::read_text_file_for_llm;
 use deepcode_kernel_tools::kernel_internal::KernelExecutorBinding;
 use deepcode_kernel_tools::KernelToolRegistry;
 use deepcode_kernel_tools::ToolAvailability;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
@@ -16,30 +12,15 @@ use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct KernelExecutorConfig {
     pub web_search_endpoint_template: String,
     pub web_search_auth_header_name: String,
     pub web_search_auth_secret_ref: String,
-    pub github_api_base_url: String,
-    pub github_auth_secret_ref: String,
-    pub arxiv_api_base_url: String,
-}
-
-impl Default for KernelExecutorConfig {
-    fn default() -> Self {
-        Self {
-            web_search_endpoint_template: String::new(),
-            web_search_auth_header_name: String::new(),
-            web_search_auth_secret_ref: String::new(),
-            github_api_base_url: "https://api.github.com".to_string(),
-            github_auth_secret_ref: String::new(),
-            arxiv_api_base_url: "https://export.arxiv.org/api".to_string(),
-        }
-    }
 }
 
 pub trait SecretProvider: Send + Sync {
@@ -63,18 +44,52 @@ pub struct KernelToolInvocation {
     pub input: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
+pub struct KernelCancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl KernelCancellationToken {
+    pub fn cancel(&self) {
+        self.cancelled.store(true, AtomicOrdering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(AtomicOrdering::Acquire)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct KernelToolExecutionContext {
+    /// Kernel-owned per-attempt archive. Retained output belongs to the Session.
+    pub output_directory: Option<PathBuf>,
     pub workspace_root: Option<String>,
     pub workspace_id: Option<String>,
     pub private_resolved_targets: Vec<String>,
+    pub cancellation: KernelCancellationToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KernelToolExecutionOutcome {
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelToolExecutionFailure {
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KernelToolExecutionResult {
     pub invocation_id: String,
+    pub outcome: KernelToolExecutionOutcome,
     pub output: Value,
+    pub error: Option<KernelToolExecutionFailure>,
 }
 
 pub trait KernelToolExecutor: Send + Sync {
@@ -119,6 +134,14 @@ impl KernelExecutorRegistry {
                 "Kernel tool {tool_id} has no executable binding"
             ))
         })?;
+        if context.cancellation.is_cancelled() {
+            return Err(KernelError::Structured {
+                code: "tool_execution_cancelled",
+                stage: "execution",
+                message: format!("Kernel tool {tool_id} was cancelled before execution"),
+                details: serde_json::json!({ "toolId": tool_id }),
+            });
+        }
         executor.invoke(invocation, context)
     }
 
@@ -145,6 +168,10 @@ pub fn builtin_executors(
     executors
 }
 
+pub fn web_search_availability(config: &KernelExecutorConfig) -> ToolAvailability {
+    web::web_search_availability(config)
+}
+
 pub fn resolved_network_target(
     tool_id: &str,
     input: &Value,
@@ -167,10 +194,6 @@ pub fn resolved_network_target(
             web::validate_http_url(&target)?;
             Ok(Some(target))
         }
-        "github.search" => Ok(Some(web::github_search_target_url(config, input)?)),
-        "github.read" => Ok(Some(web::github_read_target_url(config, input)?)),
-        "arxiv.search" => Ok(Some(web::arxiv_search_target_url(config, input)?)),
-        "arxiv.read" => Ok(Some(web::arxiv_read_target_url(config, input)?)),
         _ => Ok(None),
     }
 }
@@ -182,32 +205,14 @@ fn executor_for_binding(
 ) -> Box<dyn KernelToolExecutor> {
     match binding {
         KernelExecutorBinding::FsRead => Box::new(FsReadExecutor),
-        KernelExecutorBinding::FsStat => Box::new(FsStatExecutor),
-        KernelExecutorBinding::FsList => Box::new(FsListExecutor),
-        KernelExecutorBinding::FsGlob => Box::new(FsGlobExecutor),
-        KernelExecutorBinding::FsDiff => Box::new(FsDiffExecutor),
-        KernelExecutorBinding::FsCreate => Box::new(FsCreateExecutor),
         KernelExecutorBinding::FsWrite => Box::new(FsWriteExecutor),
         KernelExecutorBinding::FsEdit => Box::new(FsEditExecutor),
         KernelExecutorBinding::FsDelete => Box::new(FsDeleteExecutor),
-        KernelExecutorBinding::FsEnsureDirectory => Box::new(FsEnsureDirectoryExecutor),
-        KernelExecutorBinding::CodeGrep => Box::new(CodeGrepExecutor),
-        KernelExecutorBinding::DocumentRead => Box::new(DocumentReadExecutor),
         KernelExecutorBinding::WebSearch => Box::new(WebSearchExecutor {
             config,
             secret_provider,
         }),
         KernelExecutorBinding::WebFetch => Box::new(WebFetchExecutor),
-        KernelExecutorBinding::GithubSearch => Box::new(GithubSearchExecutor {
-            config,
-            secret_provider,
-        }),
-        KernelExecutorBinding::GithubRead => Box::new(GithubReadExecutor {
-            config,
-            secret_provider,
-        }),
-        KernelExecutorBinding::ArxivSearch => Box::new(ArxivSearchExecutor { config }),
-        KernelExecutorBinding::ArxivRead => Box::new(ArxivReadExecutor { config }),
         KernelExecutorBinding::ProcessShell => Box::new(ProcessShellExecutor),
     }
 }
@@ -246,17 +251,13 @@ fn assert_executor_bindings_match_tool_registry(
     }
 }
 
-mod document;
 #[path = "executors/fs.rs"]
 mod filesystem;
 mod process;
-mod search;
 pub(crate) mod web;
 
-use document::DocumentReadExecutor;
 use filesystem::*;
 use process::*;
-use search::{skip_directory, CodeGrepExecutor, FsGlobExecutor};
 use web::*;
 
 fn ok(invocation_id: String, output: Value) -> KernelToolExecutionResult {
@@ -274,114 +275,88 @@ fn ok(invocation_id: String, output: Value) -> KernelToolExecutionResult {
     let _ = affected_resources;
     KernelToolExecutionResult {
         invocation_id,
+        outcome: KernelToolExecutionOutcome::Completed,
         output,
+        error: None,
+    }
+}
+
+fn known_failure(
+    invocation_id: String,
+    output: Value,
+    code: &str,
+    message: impl Into<String>,
+) -> KernelToolExecutionResult {
+    KernelToolExecutionResult {
+        invocation_id,
+        outcome: KernelToolExecutionOutcome::Failed,
+        output,
+        error: Some(KernelToolExecutionFailure {
+            code: code.to_string(),
+            message: message.into(),
+        }),
     }
 }
 
 #[derive(Debug)]
-struct TextPatchResult {
+struct TextEditRange {
+    start: usize,
+    end: usize,
+    new_text: String,
+}
+
+#[derive(Debug)]
+struct AppliedTextEdits {
     updated: String,
-    match_kind: String,
     changed_ranges: Value,
 }
 
-fn apply_text_patch(
-    original: &str,
-    replacement: &str,
-    patch_spec: &Value,
-) -> KernelResult<TextPatchResult> {
-    let matcher = patch_spec
-        .get("match")
-        .ok_or_else(|| KernelError::InvalidCommand("patchSpec.match is required".to_string()))?;
-    let kind = matcher
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("exactBlock");
-    match kind {
-        "exactBlock" => {
-            let needle = required_string(matcher, "text")?;
-            let (start, end) = unique_match_range(original, &needle)?;
-            Ok(TextPatchResult {
-                updated: replace_range(original, start, end, replacement),
-                match_kind: kind.to_string(),
-                changed_ranges: serde_json::json!([byte_range_json(start, end, replacement.len())]),
-            })
-        }
-        "contextBlock" => {
-            let before = get_string(matcher, "before").unwrap_or_default();
-            let target = required_string(matcher, "target")?;
-            let after = get_string(matcher, "after").unwrap_or_default();
-            let combined = format!("{before}{target}{after}");
-            let (combined_start, _) = unique_match_range(original, &combined)?;
-            let start = combined_start + before.len();
-            let end = start + target.len();
-            Ok(TextPatchResult {
-                updated: replace_range(original, start, end, replacement),
-                match_kind: kind.to_string(),
-                changed_ranges: serde_json::json!([byte_range_json(start, end, replacement.len())]),
-            })
-        }
-        "lineRange" => apply_line_range_patch(original, replacement, matcher),
-        other => Err(KernelError::InvalidCommand(format!(
-            "unsupported patchSpec.match.kind: {other}"
-        ))),
+fn apply_exact_text_edits(original: &str, edits: &Value) -> KernelResult<AppliedTextEdits> {
+    let edits = edits.as_array().ok_or_else(|| {
+        KernelError::InvalidCommand("fs.edit requires a non-empty edits array".to_string())
+    })?;
+    if edits.is_empty() || edits.len() > 128 {
+        return Err(KernelError::InvalidCommand(
+            "fs.edit requires between 1 and 128 edits".to_string(),
+        ));
     }
-}
 
-fn apply_line_range_patch(
-    original: &str,
-    replacement: &str,
-    matcher: &Value,
-) -> KernelResult<TextPatchResult> {
-    let expected_hash = get_string(matcher, "expectedFileHash");
-    let expected_before = get_string(matcher, "expectedBeforeBlock");
-    if expected_hash.is_none() && expected_before.is_none() {
-        return Err(KernelError::InvalidCommand(
-            "lineRange patch requires expectedFileHash or expectedBeforeBlock".to_string(),
-        ));
+    let mut ranges = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let old_text = required_string(edit, "oldText")?;
+        let new_text = get_string_allow_empty(edit, "newText").ok_or_else(|| {
+            KernelError::InvalidCommand("fs.edit edit.newText is required".to_string())
+        })?;
+        let (start, end) = unique_match_range(original, &old_text)?;
+        ranges.push(TextEditRange {
+            start,
+            end,
+            new_text,
+        });
     }
-    if let Some(expected_hash) = expected_hash {
-        let actual_hash = deepcode_kernel_tools::hash_bytes(original.as_bytes());
-        if expected_hash != actual_hash {
-            return Err(KernelError::InvalidCommand(format!(
-                "lineRange patch expectedFileHash mismatch: expected {expected_hash}, actual {actual_hash}"
-            )));
-        }
+    ranges.sort_by_key(|range| range.start);
+    if ranges.windows(2).any(|pair| pair[0].end > pair[1].start) {
+        return Err(KernelError::Structured {
+            code: "edit_ranges_overlap",
+            stage: "execution",
+            message: "fs.edit replacement ranges must not overlap".to_string(),
+            details: serde_json::json!({ "classification": "overlapping_edits" }),
+        });
     }
-    let start_line = matcher
-        .get("startLine")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| KernelError::InvalidCommand("lineRange.startLine is required".to_string()))?
-        as usize;
-    let end_line = matcher
-        .get("endLine")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| KernelError::InvalidCommand("lineRange.endLine is required".to_string()))?
-        as usize;
-    if start_line == 0 || end_line < start_line {
-        return Err(KernelError::InvalidCommand(
-            "lineRange requires 1-based startLine <= endLine".to_string(),
-        ));
+
+    let changed_ranges = Value::Array(
+        ranges
+            .iter()
+            .map(|range| byte_range_json(range.start, range.end, range.new_text.len()))
+            .collect(),
+    );
+    let mut updated = original.to_string();
+    for range in ranges.iter().rev() {
+        updated.replace_range(range.start..range.end, &range.new_text);
     }
-    let (start, end) = line_range_to_byte_range(original, start_line, end_line)?;
-    let before_block = &original[start..end];
-    if let Some(expected_before) = expected_before {
-        if before_block != expected_before {
-            return Err(KernelError::InvalidCommand(
-                "lineRange expectedBeforeBlock does not match current file content".to_string(),
-            ));
-        }
-    }
-    Ok(TextPatchResult {
-        updated: replace_range(original, start, end, replacement),
-        match_kind: "lineRange".to_string(),
-        changed_ranges: serde_json::json!([{
-            "startLine": start_line,
-            "endLine": end_line,
-            "startByte": start,
-            "endByte": end,
-            "replacementBytes": replacement.len()
-        }]),
+    Ok(AppliedTextEdits {
+        updated,
+        changed_ranges,
     })
 }
 
@@ -414,56 +389,12 @@ fn unique_match_range(haystack: &str, needle: &str) -> KernelResult<(usize, usiz
     Ok((start, start + needle.len()))
 }
 
-fn replace_range(original: &str, start: usize, end: usize, replacement: &str) -> String {
-    let mut updated = String::with_capacity(original.len() - (end - start) + replacement.len());
-    updated.push_str(&original[..start]);
-    updated.push_str(replacement);
-    updated.push_str(&original[end..]);
-    updated
-}
-
 fn byte_range_json(start: usize, end: usize, replacement_bytes: usize) -> Value {
     serde_json::json!({
         "startByte": start,
         "endByte": end,
         "replacementBytes": replacement_bytes
     })
-}
-
-fn line_range_to_byte_range(
-    content: &str,
-    start_line: usize,
-    end_line: usize,
-) -> KernelResult<(usize, usize)> {
-    let mut line_start = 0usize;
-    let mut current_line = 1usize;
-    let mut start_byte = None;
-    let mut end_byte = None;
-    for segment in content.split_inclusive('\n') {
-        let next = line_start + segment.len();
-        if current_line == start_line {
-            start_byte = Some(line_start);
-        }
-        if current_line == end_line {
-            end_byte = Some(next);
-            break;
-        }
-        current_line += 1;
-        line_start = next;
-    }
-    if start_byte.is_none() && start_line == current_line && line_start == content.len() {
-        start_byte = Some(line_start);
-    }
-    if end_byte.is_none() && end_line == current_line && line_start == content.len() {
-        end_byte = Some(content.len());
-    }
-    let start = start_byte.ok_or_else(|| {
-        KernelError::InvalidCommand(format!("lineRange.startLine {start_line} is outside file"))
-    })?;
-    let end = end_byte.ok_or_else(|| {
-        KernelError::InvalidCommand(format!("lineRange.endLine {end_line} is outside file"))
-    })?;
-    Ok((start, end))
 }
 
 fn atomic_write_text(target: &Path, content: &str) -> KernelResult<()> {
@@ -498,16 +429,16 @@ fn atomic_create_text(target: &Path, content: &str, executable: bool) -> KernelR
         return Err(KernelError::Structured {
             code: "unsupported_file_attribute",
             stage: "tool.execute",
-            message: "fs.create executable=true is not supported on native Windows".to_string(),
+            message: "fs.write executable=true is not supported on native Windows".to_string(),
             details: serde_json::json!({
-                "toolId": "fs.create",
+                "toolId": "fs.write",
                 "attribute": "executable",
                 "platform": std::env::consts::OS,
             }),
         });
     }
     let parent = target.parent().ok_or_else(|| {
-        KernelError::InvalidCommand("create target has no parent directory".to_string())
+        KernelError::InvalidCommand("fs.write target has no parent directory".to_string())
     })?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -516,20 +447,21 @@ fn atomic_create_text(target: &Path, content: &str, executable: bool) -> KernelR
     let file_name = target
         .file_name()
         .and_then(OsStr::to_str)
-        .unwrap_or("create-target");
-    let temp_path = parent.join(format!(".{file_name}.deepcode-create-{stamp}.tmp"));
+        .unwrap_or("write-target");
+    let temp_path = parent.join(format!(".{file_name}.deepcode-write-{stamp}.tmp"));
     let mut cleanup = TemporaryPathGuard::new(temp_path.clone());
     fs::write(&temp_path, content)
-        .map_err(|error| KernelError::Other(format!("write create temp: {error}")))?;
+        .map_err(|error| KernelError::Other(format!("write fs.write temp: {error}")))?;
     #[cfg(unix)]
     if executable {
-        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o755))
-            .map_err(|error| KernelError::Other(format!("set executable permissions: {error}")))?;
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o755)).map_err(|error| {
+            KernelError::Other(format!("set fs.write executable mode: {error}"))
+        })?;
     }
     fs::hard_link(&temp_path, target)
-        .map_err(|error| KernelError::Other(format!("commit create: {error}")))?;
+        .map_err(|error| KernelError::Other(format!("commit fs.write create: {error}")))?;
     fs::remove_file(&temp_path)
-        .map_err(|error| KernelError::Other(format!("remove create temp: {error}")))?;
+        .map_err(|error| KernelError::Other(format!("remove fs.write temp: {error}")))?;
     cleanup.disarm();
     Ok(())
 }
@@ -610,152 +542,10 @@ fn get_string_allow_empty(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
-fn string_array(value: &Value, key: &str) -> Vec<String> {
-    value
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .filter(|item| !item.trim().is_empty())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-}
-
 fn required_string(value: &Value, key: &str) -> KernelResult<String> {
     get_string(value, key)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| KernelError::InvalidCommand(format!("{key} is required")))
-}
-
-fn glob_regex(pattern: &str) -> KernelResult<Regex> {
-    let mut expression = String::from("^");
-    let chars = pattern.chars().collect::<Vec<_>>();
-    let mut index = 0usize;
-    while index < chars.len() {
-        match chars[index] {
-            '*' if chars.get(index + 1) == Some(&'*') => {
-                expression.push_str(".*");
-                index += 2;
-            }
-            '*' => {
-                expression.push_str("[^/]*");
-                index += 1;
-            }
-            '?' => {
-                expression.push_str("[^/]");
-                index += 1;
-            }
-            character => {
-                expression.push_str(&regex::escape(&character.to_string()));
-                index += 1;
-            }
-        }
-    }
-    expression.push('$');
-    Regex::new(&expression)
-        .map_err(|error| KernelError::InvalidCommand(format!("invalid glob pattern: {error}")))
-}
-
-fn compile_glob_patterns(patterns: &[String]) -> KernelResult<Vec<Regex>> {
-    patterns.iter().map(|pattern| glob_regex(pattern)).collect()
-}
-
-fn collect_glob_matches(
-    root: &Path,
-    directory: &Path,
-    matcher: &Regex,
-    max_results: usize,
-    matches: &mut Vec<String>,
-    skipped: &mut usize,
-) -> KernelResult<()> {
-    if matches.len() >= max_results {
-        return Ok(());
-    }
-    let entries = fs::read_dir(directory)
-        .map_err(|error| KernelError::Other(format!("fs.glob {}: {error}", directory.display())))?;
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                *skipped += 1;
-                continue;
-            }
-        };
-        let path = entry.path();
-        if path.is_dir() {
-            if !skip_directory(&path) {
-                collect_glob_matches(root, &path, matcher, max_results, matches, skipped)?;
-            }
-            if matches.len() >= max_results {
-                break;
-            }
-            continue;
-        }
-        if !path.is_file() {
-            *skipped += 1;
-            continue;
-        }
-        let relative = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if matcher.is_match(&relative) {
-            matches.push(relative);
-            if matches.len() >= max_results {
-                break;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn changed_line_ranges(old: &str, new: &str) -> Value {
-    let old_lines = old.lines().collect::<Vec<_>>();
-    let new_lines = new.lines().collect::<Vec<_>>();
-    let prefix = old_lines
-        .iter()
-        .zip(new_lines.iter())
-        .take_while(|(left, right)| left == right)
-        .count();
-    let suffix = old_lines[prefix..]
-        .iter()
-        .rev()
-        .zip(new_lines[prefix..].iter().rev())
-        .take_while(|(left, right)| left == right)
-        .count();
-    serde_json::json!([{
-        "oldStartLine": prefix + 1,
-        "oldEndLine": old_lines.len().saturating_sub(suffix),
-        "newStartLine": prefix + 1,
-        "newEndLine": new_lines.len().saturating_sub(suffix)
-    }])
-}
-
-fn unified_diff(path: &str, old: &str, new: &str) -> String {
-    let mut output = format!("--- a/{path}\n+++ b/{path}\n");
-    let old_lines = old.lines().collect::<Vec<_>>();
-    let new_lines = new.lines().collect::<Vec<_>>();
-    output.push_str(&format!(
-        "@@ -1,{} +1,{} @@\n",
-        old_lines.len(),
-        new_lines.len()
-    ));
-    for line in old_lines {
-        output.push('-');
-        output.push_str(line);
-        output.push('\n');
-    }
-    for line in new_lines {
-        output.push('+');
-        output.push_str(line);
-        output.push('\n');
-    }
-    output
 }
 
 fn normalize_relative_path(path: &str) -> String {
@@ -769,91 +559,6 @@ fn normalize_relative_path(path: &str) -> String {
     } else {
         normalized
     }
-}
-
-fn list_nodes(
-    path: &Path,
-    root: &Path,
-    depth: u32,
-    include_hidden: bool,
-) -> KernelResult<Vec<Value>> {
-    if depth == 0 {
-        return Ok(Vec::new());
-    }
-    let mut entries = fs::read_dir(path)
-        .map_err(|error| KernelError::Other(format!("list {}: {error}", path.display())))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| KernelError::Other(format!("read dir entry: {error}")))?;
-    entries.sort_by(compare_dir_entries);
-
-    let mut nodes = Vec::new();
-    for entry in entries {
-        if !include_hidden && entry.file_name().to_string_lossy().starts_with('.') {
-            continue;
-        }
-        let entry_path = entry.path();
-        let metadata = entry
-            .metadata()
-            .map_err(|error| KernelError::Other(format!("metadata: {error}")))?;
-        let kind = if metadata.is_dir() {
-            "directory"
-        } else {
-            "file"
-        };
-        let relative = entry_path
-            .strip_prefix(root)
-            .unwrap_or(&entry_path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let mut node = serde_json::json!({
-            "id": relative,
-            "name": entry.file_name().to_string_lossy(),
-            "path": relative,
-            "type": kind,
-            "sizeBytes": metadata.len()
-        });
-        if metadata.is_file() {
-            node["fileClassification"] =
-                serde_json::to_value(lightweight_file_classification(&entry_path, &metadata))
-                    .unwrap_or(Value::Null);
-        }
-        if metadata.is_dir() && depth > 1 {
-            node["children"] =
-                Value::Array(list_nodes(&entry_path, root, depth - 1, include_hidden)?);
-        }
-        nodes.push(node);
-    }
-    Ok(nodes)
-}
-
-fn compare_dir_entries(left: &fs::DirEntry, right: &fs::DirEntry) -> Ordering {
-    let left_is_dir = left.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
-    let right_is_dir = right.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
-    match (left_is_dir, right_is_dir) {
-        (true, false) => Ordering::Less,
-        (false, true) => Ordering::Greater,
-        _ => left
-            .file_name()
-            .to_string_lossy()
-            .to_ascii_lowercase()
-            .cmp(&right.file_name().to_string_lossy().to_ascii_lowercase()),
-    }
-}
-
-pub(crate) const CODE_SEARCH_DEFAULT_MAX_RESULTS: usize = 200;
-const CODE_SEARCH_MAX_RESULTS: usize = 500;
-const CODE_SEARCH_MAX_CONTEXT_LINES: usize = 5;
-const CODE_SEARCH_MAX_VISITED_FILES: usize = 500;
-
-fn limit_text(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_string();
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…[truncated]", &value[..end])
 }
 
 #[cfg(test)]

@@ -2,228 +2,145 @@ use deepcode_kernel_tools::{KernelToolRegistry, ToolAvailability};
 use serde_json::json;
 
 #[test]
-fn catalog_contains_the_canonical_callable_tools() {
+fn rejected_arguments_explain_required_unknown_enum_type_and_nested_bounds() {
+    use deepcode_kernel_tools::KernelToolCatalogError;
     let registry = KernelToolRegistry::new();
-    let names = registry
-        .descriptors()
-        .map(|tool| tool.name.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(names.len(), 19);
-    assert!(names.contains(&"fs.read"));
-    assert!(names.contains(&"fs.stat"));
-    assert!(names.contains(&"fs.edit"));
-    assert!(names.contains(&"web.fetch"));
-    assert!(names.contains(&"github.search"));
-    assert!(names.contains(&"github.read"));
-    assert!(names.contains(&"arxiv.search"));
-    assert!(names.contains(&"arxiv.read"));
-    assert!(names.contains(&"process.shell"));
-    assert_eq!(
-        registry.descriptor("fs.read").unwrap().availability,
-        ToolAvailability::Callable,
-    );
-    assert_eq!(
-        registry.descriptor("fs.stat").unwrap().availability,
-        ToolAvailability::Callable,
-    );
-    for callable in [
-        "web.search",
-        "web.fetch",
-        "github.search",
-        "github.read",
-        "arxiv.search",
-        "arxiv.read",
-    ] {
-        assert_eq!(
-            registry.descriptor(callable).unwrap().availability,
-            ToolAvailability::Callable,
-        );
-    }
-    assert_eq!(
-        registry.descriptor("process.shell").unwrap().availability,
-        if cfg!(target_os = "macos") {
-            ToolAvailability::Callable
-        } else {
-            ToolAvailability::Blocked
-        },
-    );
-    for removed in [
-        "fs.rename",
-        "git.commit",
-        "git.diff",
-        "git.stage",
-        "git.status",
-        "git.unstage",
-    ] {
-        assert!(registry.descriptor(removed).is_none());
-    }
+    let error = registry.canonicalize("bash", json!({"command":"pwd", "executionMode":"read", "executionScope":"outside", "timeout":"slow"})).unwrap_err();
+    let KernelToolCatalogError::InvalidArguments { issues, .. } = error else {
+        panic!("expected typed input rejection")
+    };
+    assert!(issues
+        .iter()
+        .any(|issue| issue.path == "$.workspaceMode" && issue.rule == "required"));
+    assert!(issues
+        .iter()
+        .any(|issue| issue.path == "$.executionMode" && issue.rule == "additionalProperties"));
+    assert!(issues.iter().any(|issue| issue.path == "$.executionScope"
+        && issue.rule == "enum"
+        && issue.expected == Some(json!(["workspace", "host"]))));
+    assert!(issues
+        .iter()
+        .any(|issue| issue.path == "$.timeout" && issue.rule == "type"));
+    let error = registry
+        .canonicalize(
+            "fs.edit",
+            json!({"path":"README.md", "edits":[{"oldText":"", "newText":"updated"}]}),
+        )
+        .unwrap_err();
+    let KernelToolCatalogError::InvalidArguments { issues, .. } = error else {
+        panic!("expected typed input rejection")
+    };
+    assert!(issues
+        .iter()
+        .any(|issue| issue.path == "$.edits[0].oldText" && issue.rule == "minLength"));
+    assert!(matches!(
+        registry.canonicalize("missing.tool", json!({})),
+        Err(KernelToolCatalogError::ToolNotRegistered(_))
+    ));
 }
 
 #[test]
-fn canonical_arguments_match_the_executor_boundary() {
+fn catalog_exposes_basic_callable_tools() {
+    let registry = KernelToolRegistry::new();
+    let names = registry
+        .descriptors()
+        .map(|descriptor| descriptor.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "bash",
+            "fs.delete",
+            "fs.edit",
+            "fs.read",
+            "fs.write",
+            "web.fetch",
+            "web.search",
+        ]
+    );
+    for name in names {
+        let descriptor = registry.descriptor(name).unwrap();
+        assert_eq!(descriptor.availability, ToolAvailability::Callable);
+    }
+    let bash = registry.descriptor("bash").expect("bash descriptor");
+    let web_search = registry
+        .descriptor("web.search")
+        .expect("web.search descriptor");
+    assert_eq!(web_search.input_schema["required"], json!(["query"]));
+    assert_eq!(
+        web_search.input_schema["properties"]
+            .as_object()
+            .expect("web.search properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["limit", "query"]
+    );
+    assert!(registry.descriptor("process.shell").is_none());
+    assert_eq!(
+        bash.input_schema["required"],
+        json!(["command", "workspaceMode", "executionScope"])
+    );
+    assert_eq!(
+        bash.input_schema["properties"]
+            .as_object()
+            .expect("bash properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![
+            "command",
+            "executionScope",
+            "terminal",
+            "timeout",
+            "workspaceMode"
+        ]
+    );
+}
+
+#[test]
+fn canonical_arguments_reach_the_executor_boundary() {
     let registry = KernelToolRegistry::new();
     let read = registry
         .canonicalize(
             "fs.read",
-            json!({"path":"src/lib.rs","startLine":2,"endLine":4}),
+            json!({"path":"src/lib.rs","startLine":2,"maxLines":3}),
         )
         .unwrap();
     assert_eq!(
         read.arguments,
-        json!({"path":"src/lib.rs","startLine":2,"endLine":4})
-    );
-
-    let stat = registry
-        .canonicalize("fs.stat", json!({"path":"."}))
-        .unwrap();
-    assert_eq!(stat.arguments, json!({"path":"."}));
-
-    let delete = registry
-        .canonicalize(
-            "fs.delete",
-            json!({"path":"build/cache","targetKind":"directoryTree"}),
-        )
-        .unwrap();
-    assert_eq!(
-        delete.arguments,
-        json!({"path":"build/cache","targetKind":"directoryTree"})
-    );
-
-    assert!(registry
-        .canonicalize(
-            "fs.delete",
-            json!({"path":"build/cache","targetKind":"directory","recursive":true}),
-        )
-        .is_err());
-    assert!(registry
-        .canonicalize("fs.delete", json!({"path":"build/cache"}))
-        .is_err());
-
-    let edit = registry
-        .canonicalize(
-            "fs.edit",
-            json!({
-                "path":"src/lib.rs",
-                "matcher":{"kind":"exactBlock","data":{"text":"old"}},
-                "replacement":"new"
-            }),
-        )
-        .unwrap();
-    assert_eq!(
-        edit.arguments,
         json!({
             "path":"src/lib.rs",
-            "patchSpec":{"match":{"kind":"exactBlock","text":"old"}},
-            "replacement":"new"
+            "startLine":2,
+            "maxLines":3,
+            "maxBytes":262144
         })
     );
 
-    let digest_edit = registry
+    let write = registry
         .canonicalize(
-            "fs.edit",
+            "fs.write",
+            json!({"path":"src/generated/main.rs","content":"fn main() {}\n"}),
+        )
+        .unwrap();
+    assert_eq!(write.arguments["path"], "src/generated/main.rs");
+    assert!(write.arguments.get("executable").is_none());
+
+    let shell = registry
+        .canonicalize(
+            "bash",
             json!({
-                "path":"src/lib.rs",
-                "matcher":{
-                    "kind":"lineRange",
-                    "data":{
-                        "startLine":1,
-                        "endLine":1,
-                        "precondition":{
-                            "kind":"expectedFileDigest",
-                            "data":{"digest":format!("sha256:{}", "a".repeat(64))}
-                        }
-                    }
-                },
-                "replacement":"new\n"
+                "command":"printf ready",
+                "workspaceMode":"read",
+                "executionScope":"workspace"
             }),
         )
         .unwrap();
-    assert_eq!(
-        digest_edit.arguments["patchSpec"]["match"]["expectedFileHash"],
-        format!("sha256:{}", "a".repeat(64)),
-    );
-    assert!(registry
-        .canonicalize(
-            "fs.edit",
-            json!({
-                "path":"src/lib.rs",
-                "matcher":{
-                    "kind":"lineRange",
-                    "data":{
-                        "startLine":1,
-                        "endLine":1,
-                        "precondition":{
-                            "kind":"expectedFileDigest",
-                            "data":{"digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
-                        }
-                    }
-                },
-                "replacement":"new"
-            }),
-        )
-        .is_err());
-
-    #[cfg(target_os = "macos")]
-    {
-        let shell = registry
-            .canonicalize("process.shell", json!({"command":"printf ready"}))
-            .unwrap();
-        assert_eq!(
-            shell.arguments,
-            json!({
-                "command":"printf ready",
-                "cwd":".",
-                "timeoutMs":120000,
-                "maxOutputBytes":262144
-            })
-        );
-    }
-}
-
-#[test]
-fn catalog_rejects_unknown_fields_and_workspace_escape() {
-    let registry = KernelToolRegistry::new();
-    assert!(registry
-        .canonicalize("fs.read", json!({"path":"src/lib.rs","extra":true}))
-        .is_err());
-    assert!(registry
-        .canonicalize("fs.read", json!({"path":"../outside"}))
-        .is_err());
-    assert!(registry
-        .canonicalize("fs.glob", json!({"pattern":"**/*","path":""}))
-        .is_err());
-    assert!(registry
-        .canonicalize(
-            "process.shell",
-            json!({"command":"printf ok","cwd":"../outside"}),
-        )
-        .is_err());
-    for command in [
-        "mkfs.ext4 /dev/disk1",
-        "diskutil eraseDisk APFS Temporary /dev/disk1",
-        "rm -rf /",
-        "sudo /sbin/newfs_apfs /dev/disk1",
-        "sh -c 'rm -rf /'",
-    ] {
-        assert!(
-            registry
-                .canonicalize("process.shell", json!({"command":command}))
-                .is_err(),
-            "hard-denied command unexpectedly canonicalized: {command}"
-        );
-    }
-    #[cfg(target_os = "macos")]
-    assert!(registry
-        .canonicalize(
-            "process.shell",
-            json!({"command":"rm -rf target && printf done","cwd":"."}),
-        )
-        .is_ok());
-    assert_eq!(
-        registry
-            .descriptor("fs.glob")
-            .unwrap()
-            .input_schema["properties"]["path"]["description"],
-        "Optional normalized workspace-relative directory. Omit it for the workspace root; if explicitly provided for the root, use '.' and never an empty string."
-    );
+    assert_eq!(shell.arguments["command"], "printf ready");
+    assert_eq!(shell.arguments["workspaceMode"], "read");
+    assert_eq!(shell.arguments["executionScope"], "workspace");
+    assert_eq!(shell.arguments["timeout"], 120);
+    assert!(shell.arguments.get("terminal").is_none());
+    assert!(shell.arguments.get("cwd").is_none());
+    assert!(shell.arguments.get("maxOutputBytes").is_none());
 }

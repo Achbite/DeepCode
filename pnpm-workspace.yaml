@@ -1,6 +1,7 @@
 packages:
   - "userspace/gui"
   - "userspace/protocol"
+  - "userspace/presentation-core"
   - "userspace/session-core"
   - "shells/tauri"
   - "shells/deepcode-gui"

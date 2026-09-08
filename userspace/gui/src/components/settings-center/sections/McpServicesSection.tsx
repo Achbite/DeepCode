@@ -48,7 +48,7 @@ function newServer(language: UiLanguage): McpServer {
 const McpServicesSection: React.FC = () => {
   const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
   const loading = useSettingsStore((state) => state.loading);
-  const patchUserSetting = useSettingsStore((state) => state.patchUserSetting);
+  const patchUserSettingsBatch = useSettingsStore((state) => state.patchUserSettingsBatch);
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
   const stored = useMemo(
     () => parseServers(effectiveSettings['mcp.servers']),
@@ -70,9 +70,17 @@ const McpServicesSection: React.FC = () => {
 
   const save = async () => {
     setMessage(null);
-    await patchUserSetting('mcp.autoLoad', autoLoad);
-    await patchUserSetting('mcp.servers', JSON.stringify(servers, null, 2));
-    setMessage(t(language, 'settings.runtime.restartDaemonAfterSave'));
+    const activation = await patchUserSettingsBatch({
+      'mcp.autoLoad': autoLoad,
+      'mcp.servers': JSON.stringify(servers, null, 2),
+    });
+    if (!activation) return;
+    setMessage(t(
+      language,
+      activation === 'nextRun'
+        ? 'settings.runtime.nextRunActivationAfterSave'
+        : 'settings.runtime.savedImmediate',
+    ));
   };
 
   return (

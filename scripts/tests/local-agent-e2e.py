@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""验证当前 Catalog、Session、Plan、Kernel 与三个 UI 壳的真实本地链路。"""
+"""验证两轮本地 Agent 基础链路；不承担效果、稳定性或发布验收。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import signal
 import socket
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -23,6 +24,18 @@ from typing import Any, Callable
 
 
 ROOT = Path(__file__).resolve().parents[2]
+HOST_TOKEN_HEADER = "x-deepcode-host-shell-token"
+COMMAND_VERSION = "deepcode.command.v3"
+GENERATION_ONE = "SKILL_GENERATION_ONE"
+GENERATION_TWO = "SKILL_GENERATION_TWO"
+ATTACHMENT_CONTENT = "LOCAL_ATTACHMENT_CONTENT_MUST_NOT_REACH_PROVIDER"
+PDF_CONTENT = "DEEPCODE_FIRST_PARTY_PDF_BINDING_OK"
+FIRST_PARTY_PLUGIN_URIS = {
+    "plugin://github@first-party",
+    "plugin://arxiv@first-party",
+    "plugin://pdf@first-party",
+}
+URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def runtime_path(environment_name: str, default: Path) -> Path:
@@ -46,143 +59,233 @@ SESSION_BRIDGE = runtime_path(
     "DEEPCODE_E2E_SESSION_BRIDGE",
     ROOT / "userspace" / "session-core" / "dist" / "sessionServiceBridge.js",
 )
-HOST_TOKEN_HEADER = "x-deepcode-host-shell-token"
-COMMAND_VERSION = "deepcode.command"
-EXPECTED_CONTENT = "created once\n"
-URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-MARKERS = (
-    "EXECUTE", "FEEDBACK", "PLAN_CANCEL", "CANCEL", "FAIL", "TODO", "AUTONOMY",
-)
-CLI_CANCELLED_EXIT = 8
+MCP_SERVER = ROOT / "fixtures" / "skill-mcp-smoke" / "mcp" / "mcp-text-tools" / "server.py"
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise AssertionError(message)
 
 
 class ProviderState:
+    """Routes deterministic fixture responses by request order, never by prompt text."""
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._requests: list[dict[str, Any]] = []
-        self._counts = {marker: 0 for marker in MARKERS}
-        self._forbidden_roots: list[str] = []
-        self.cancel_started = threading.Event()
-        self.release_cancel = threading.Event()
-        self.todo_continuation_started = threading.Event()
-        self.release_todo_continuation = threading.Event()
+        self._failures: list[str] = []
+        self._old_wire_name: str | None = None
+        self._new_wire_name: str | None = None
+        self.first_request_started = threading.Event()
+        self.release_first_request = threading.Event()
 
-    def forbid_roots(self, roots: list[Path]) -> None:
-        self._forbidden_roots = [str(root.resolve()) for root in roots]
+    def register(self, body: dict[str, Any]) -> int:
+        require(body.get("stream") is True, "Provider 请求未使用流式链路")
+        require(isinstance(body.get("messages"), list), "Provider 请求缺少 messages")
+        require(isinstance(body.get("tools"), list), "Provider 请求缺少 tools")
+        with self._lock:
+            self._requests.append(body)
+            return len(self._requests)
 
-    def register(
-        self,
-        body: dict[str, Any],
-    ) -> tuple[str, int, str | None, set[str], dict[str, Any] | None]:
-        messages = body.get("messages")
-        if not isinstance(messages, list):
-            raise AssertionError("Provider 请求缺少 messages")
+    def inspect(self, ordinal: int, body: dict[str, Any]) -> dict[str, str]:
+        messages = body["messages"]
         joined = "\n".join(
-            str(message.get("content", ""))
+            message_text(message.get("content"))
             for message in messages
             if isinstance(message, dict)
         )
-        marker = next((item for item in MARKERS if item in joined), "")
-        if not marker:
-            raise AssertionError(f"Provider 请求缺少 E2E 标记：{joined!r}")
-        encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
-        leaked = next((root for root in self._forbidden_roots if root in encoded), None)
-        if leaked is not None:
-            raise AssertionError(f"普通 Provider 请求泄露了 Host 私有 canonicalRoot：{leaked}")
-        workspace_id: str | None = None
-        binding_prefix = "当前 Session workspace binding（仅逻辑身份，不含绝对路径）："
-        for message in messages:
-            if not isinstance(message, dict) or message.get("role") != "system":
+        guidance_messages = [
+            message_text(message.get("content"))
+            for message in messages
+            if isinstance(message, dict)
+            and message.get("role") == "system"
+            and message_text(message.get("content")).startswith("Active tool guidance:")
+        ]
+        require(len(guidance_messages) == 1, "Provider 请求没有唯一的基础工具 guidance")
+        guidance = guidance_messages[0]
+        require(
+            "- fs_read: Read UTF-8 workspace text directly or in bounded segments." in guidance,
+            "fs.read prompt snippet 未进入 Provider 请求",
+        )
+        require(
+            "instead of shell commands such as cat or sed" in guidance,
+            "fs.read 优先于 shell 文本读取的 guidance 缺失",
+        )
+        require(
+            "- bash: List, search, discover, build, test, and run commands." in guidance,
+            "bash prompt snippet 未进入 Provider 请求",
+        )
+        require(
+            "Do not use this as the default way to read a known UTF-8 workspace text file."
+            in guidance,
+            "bash 与 fs.read 的职责边界 guidance 缺失",
+        )
+        require(
+            "- web_fetch: Read bounded text from a known HTTP or HTTPS URL." in guidance,
+            "web.fetch prompt snippet 未进入 Provider 请求",
+        )
+        require(
+            "Do not use this as a substitute for unavailable search by guessing URLs"
+            in guidance,
+            "web.fetch 与搜索的职责边界 guidance 缺失",
+        )
+        require("filesystem or Bash tools" not in joined, "附件文本仍在指示 Bash 读取")
+        tools_by_description: dict[str, list[str]] = {}
+        for item in body["tools"]:
+            function = item.get("function") if isinstance(item, dict) else None
+            if not isinstance(function, dict):
                 continue
-            content = message.get("content")
-            if not isinstance(content, str) or not content.startswith(binding_prefix):
-                continue
-            bindings = json.loads(content.removeprefix(binding_prefix))
-            if isinstance(bindings, list) and bindings and isinstance(bindings[0], dict):
-                candidate = bindings[0].get("workspaceId")
-                if isinstance(candidate, str):
-                    workspace_id = candidate
-            break
-        tool_result_ids = {
-            str(message.get("tool_call_id"))
+            name = function.get("name")
+            description = function.get("description")
+            if isinstance(name, str) and name and isinstance(description, str):
+                tools_by_description.setdefault(description, []).append(name)
+        provider_tool_names = [
+            item.get("function", {}).get("name")
+            for item in body["tools"]
+            if isinstance(item, dict) and isinstance(item.get("function"), dict)
+        ]
+        require(
+            provider_tool_names[:7] == [
+                "fs_read", "fs_write", "fs_edit", "fs_delete",
+                "bash", "web_search", "web_fetch",
+            ],
+            "Provider 基础七工具没有保持锁定顺序",
+        )
+        reverse_tools = tools_by_description.get("Reverse text", [])
+        require(len(reverse_tools) == 1, "Provider 请求没有唯一的 MCP reverse 工具")
+        wire_name = reverse_tools[0]
+        search_tools = tools_by_description.get(
+            "Search the web through the built-in Brave Web Search adapter or an explicitly configured JSON endpoint.",
+            [],
+        )
+        fetch_tools = tools_by_description.get("Fetch bounded HTTP or HTTPS text.", [])
+        require(len(search_tools) == 1, "Provider 请求没有唯一的 web.search 工具")
+        require(len(fetch_tools) == 1, "Provider 请求没有唯一的 web.fetch 工具")
+        expected_first_party_descriptions = {
+            "Search GitHub repositories, code, or issues with GitHub's native Search API.",
+            "Read a GitHub repository directory listing or UTF-8 file through the Contents API.",
+            "Search arXiv paper metadata through the arXiv Atom API.",
+            "Read one canonical arXiv paper metadata record by arXiv identifier.",
+            "Extract text from a bounded page range of a PDF in the current workspace binding.",
+        }
+        require(
+            all(len(tools_by_description.get(description, [])) == 1
+                for description in expected_first_party_descriptions),
+            "Provider 请求没有精确暴露 GitHub/arXiv/PDF first-party 工具",
+        )
+        pdf_tools = tools_by_description[
+            "Extract text from a bounded page range of a PDF in the current workspace binding."
+        ]
+        require(
+            "Search GitHub repositories, code, and issues through GitHub's native API." in guidance
+            and "Search arXiv paper metadata through its native Atom API." in guidance
+            and "Read bounded page ranges from a PDF attached to the current workspace binding."
+            in guidance,
+            "first-party tool prompt contribution 未进入 Provider 请求",
+        )
+        results = {
+            str(message.get("tool_call_id")): message_text(message.get("content"))
             for message in messages
             if isinstance(message, dict)
             and message.get("role") == "tool"
             and isinstance(message.get("tool_call_id"), str)
         }
-        tool_call_names: dict[str, str] = {}
-        for message in messages:
-            if not isinstance(message, dict) or message.get("role") != "assistant":
-                continue
-            calls = message.get("tool_calls")
-            if not isinstance(calls, list):
-                continue
-            for call in calls:
-                if not isinstance(call, dict) or not isinstance(call.get("id"), str):
-                    continue
-                function = call.get("function")
-                if isinstance(function, dict) and isinstance(function.get("name"), str):
-                    tool_call_names[call["id"]] = function["name"].replace("__", ".")
-        completed_tool_names = {
-            tool_call_names[call_id]
-            for call_id in tool_result_ids
-            if call_id in tool_call_names
+
+        if ordinal == 1:
+            require(GENERATION_ONE in joined, "第一轮首个请求未加载旧 Skill generation")
+            require(GENERATION_TWO not in joined, "第一轮首个请求提前加载新 Skill generation")
+            require('"workspace":"workspace2"' in joined, "文件引用未使用逻辑 workspace handle")
+            require('"path":"e2e-note.txt"' in joined, "文件引用逻辑路径未进入首轮请求")
+            require('"mediaType":"text/plain"' in joined, "文件引用 mediaType 未进入首轮请求")
+            require(ATTACHMENT_CONTENT not in joined, "文件内容被错误嵌入首轮 Provider 请求")
+            with self._lock:
+                self._old_wire_name = wire_name
+            self.first_request_started.set()
+        elif ordinal == 2:
+            require(GENERATION_ONE in joined, "同一 run 的 continuation 丢失旧 Skill snapshot")
+            require(GENERATION_TWO not in joined, "同一 run 的 continuation 被新 Skill 改写")
+            require(wire_name == self.old_wire_name(), "同一 run 的 MCP 工具目录发生变化")
+            require(
+                any("ahpla" in content for content in results.values()),
+                "第一轮 MCP ToolRecord 未进入 Provider continuation",
+            )
+            require(
+                any("Fixture search result" in content for content in results.values()),
+                "第一轮 web.search ToolRecord 未进入 Provider continuation",
+            )
+            require(
+                any("web-fetch-ok" in content for content in results.values()),
+                "第一轮 web.fetch ToolRecord 未进入 Provider continuation",
+            )
+            require(
+                any(ATTACHMENT_CONTENT in content for content in results.values()),
+                "第一轮 fs.read 未按逻辑引用惰性读取文件快照",
+            )
+            require(
+                any(PDF_CONTENT in content for content in results.values()),
+                "第一轮 pdf.read 未从 Kernel prepared workspace binding 提取正文",
+            )
+        elif ordinal == 3:
+            require(GENERATION_TWO in joined, "下一 run 未加载新 Skill generation")
+            require(GENERATION_ONE not in joined, "下一 run 仍暴露旧 Skill generation")
+            require(wire_name != self.old_wire_name(), "下一 run 未取得新的 MCP wire tool")
+            with self._lock:
+                self._new_wire_name = wire_name
+        elif ordinal == 4:
+            require(GENERATION_TWO in joined, "第二轮 continuation 丢失新 Skill snapshot")
+            require(GENERATION_ONE not in joined, "第二轮 continuation 混入旧 Skill snapshot")
+            require(wire_name == self.new_wire_name(), "第二轮 continuation 的 MCP 目录漂移")
+            require(
+                any("ateb" in content for content in results.values()),
+                "第二轮 MCP ToolRecord 未进入 Provider continuation",
+            )
+            require(
+                any("Fixture search result" in content for content in results.values()),
+                "第二轮 web.search ToolRecord 未进入 Provider continuation",
+            )
+            require(
+                any("web-fetch-ok" in content for content in results.values()),
+                "第二轮 web.fetch ToolRecord 未进入 Provider continuation",
+            )
+        else:
+            raise AssertionError(f"Provider 收到未登记的第 {ordinal} 个请求")
+        return {
+            "read": provider_tool_names[0],
+            "reverse": wire_name,
+            "pdf": pdf_tools[0],
+            "search": search_tools[0],
+            "fetch": fetch_tools[0],
         }
-        todo_fact: dict[str, Any] | None = None
-        for message in messages:
-            if not isinstance(message, dict) or message.get("role") != "system":
-                continue
-            content = message.get("content")
-            if not isinstance(content, str):
-                continue
-            try:
-                candidate = json.loads(content)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(candidate, dict) and candidate.get("type") in {
-                "todo.seeded", "todo.reconciled",
-            }:
-                todo_fact = candidate
-        tools = body.get("tools")
-        tool_names = {
-            item.get("function", {}).get("name")
-            for item in tools
-            if isinstance(item, dict)
-        } if isinstance(tools, list) else set()
-        if not {
-            "fs__create", "fs__list", "plan__publish", "interaction__request", "todo__progress",
-        }.issubset(tool_names):
-            raise AssertionError("普通 Provider 请求没有同时暴露 Kernel 工具与 Session control")
-        if marker == "AUTONOMY":
-            if "工作区内 fs.* 修改可直接执行" not in joined:
-                raise AssertionError("完全访问工作区模式没有进入 Session 指令")
-            if "process.shell 可直接用于工作区调试" not in joined:
-                raise AssertionError("项目调试 Shell 的独立授权没有进入 Session 指令")
-            if "有充分工作区事实时自行选择最小一致工程路线" not in joined:
-                raise AssertionError("工程路线委托模式没有进入 Session 指令")
-        with self._lock:
-            self._requests.append(body)
-            self._counts[marker] += 1
-            ordinal = self._counts[marker]
-        return marker, ordinal, workspace_id, completed_tool_names, todo_fact
 
-    def count(self, marker: str | None = None) -> int:
-        with self._lock:
-            return len(self._requests) if marker is None else self._counts[marker]
+    def first_started(self) -> bool:
+        self.assert_healthy()
+        return self.first_request_started.is_set()
 
-    def models(self, marker: str) -> list[str]:
+    def record_failure(self, error: BaseException) -> None:
         with self._lock:
-            result: list[str] = []
-            for body in self._requests:
-                messages = body.get("messages", [])
-                joined = "\n".join(
-                    str(message.get("content", ""))
-                    for message in messages
-                    if isinstance(message, dict)
-                )
-                if marker in joined and isinstance(body.get("model"), str):
-                    result.append(body["model"])
-            return result
+            self._failures.append(f"{type(error).__name__}: {error}")
+
+    def assert_healthy(self) -> None:
+        with self._lock:
+            failure = self._failures[0] if self._failures else None
+        if failure is not None:
+            raise AssertionError(f"Mock Provider 失败：{failure}")
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._requests)
+
+    def old_wire_name(self) -> str:
+        with self._lock:
+            value = self._old_wire_name
+        require(value is not None, "旧 MCP wire name 尚未捕获")
+        return value
+
+    def new_wire_name(self) -> str:
+        with self._lock:
+            value = self._new_wire_name
+        require(value is not None, "新 MCP wire name 尚未捕获")
+        return value
 
 
 class MockProviderHandler(http.server.BaseHTTPRequestHandler):
@@ -193,335 +296,131 @@ class MockProviderHandler(http.server.BaseHTTPRequestHandler):
         return self.server.provider_state  # type: ignore[attr-defined]
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+        headers_sent = False
         try:
-            if not self.path.endswith("/chat/completions"):
-                self.send_error(404)
-                return
-            if self.headers.get("authorization") != "Bearer e2e-key":
-                self.send_error(401)
-                return
+            require(self.path.endswith("/chat/completions"), "Provider endpoint 不匹配")
+            require(self.headers.get("authorization") == "Bearer e2e-key", "Provider 凭据不匹配")
             length = int(self.headers.get("content-length", "0"))
-            if length <= 0 or length > 8 * 1024 * 1024:
-                self.send_error(400)
-                return
+            require(0 < length <= 8 * 1024 * 1024, "Provider 请求长度无效")
             body = json.loads(self.rfile.read(length))
-            if not isinstance(body, dict):
-                raise AssertionError("Provider body 不是对象")
-            marker, ordinal, workspace_id, completed_tool_names, todo_fact = (
-                self.provider_state.register(body)
-            )
+            require(isinstance(body, dict), "Provider body 不是对象")
+            ordinal = self.provider_state.register(body)
+            wire_names = self.provider_state.inspect(ordinal, body)
+
             self.send_response(200)
             self.send_header("content-type", "text/event-stream; charset=utf-8")
             self.send_header("cache-control", "no-cache")
             self.send_header("connection", "close")
             self.end_headers()
-            self._respond(marker, ordinal, workspace_id, completed_tool_names, todo_fact)
+            headers_sent = True
+
+            if ordinal == 1:
+                require(
+                    self.provider_state.release_first_request.wait(timeout=20),
+                    "等待第一轮运行时更新超时",
+                )
+                self._send_tool_calls([
+                    ("provider-call-read-one", wire_names["read"], {
+                        "workspace": "workspace2",
+                        "path": "e2e-note.txt",
+                    }),
+                    ("provider-call-one", wire_names["reverse"], {"text": "alpha"}),
+                    ("provider-call-pdf-one", wire_names["pdf"], {
+                        "workspace": "primary",
+                        "path": "fixture.pdf",
+                        "startPage": 1,
+                        "endPage": 1,
+                    }),
+                    ("provider-call-search-one", wire_names["search"], {
+                        "query": "fixture",
+                        "limit": 1,
+                    }),
+                    ("provider-call-fetch-one", wire_names["fetch"], {
+                        "url": f"http://127.0.0.1:{self.server.server_port}/fixture-resource",
+                    }),
+                ])
+            elif ordinal == 2:
+                self._send_text("round-one-complete")
+            elif ordinal == 3:
+                self._send_tool_calls([
+                    ("provider-call-two", wire_names["reverse"], {"text": "beta"}),
+                    ("provider-call-search-two", wire_names["search"], {
+                        "query": "fixture",
+                        "limit": 1,
+                    }),
+                    ("provider-call-fetch-two", wire_names["fetch"], {
+                        "url": f"http://127.0.0.1:{self.server.server_port}/fixture-resource",
+                    }),
+                ])
+            elif ordinal == 4:
+                self._send_text("round-two-complete")
         except (BrokenPipeError, ConnectionResetError):
             return
-        except Exception as error:  # Make mock failures visible to the caller.
-            try:
-                payload = json.dumps({"error": str(error)}).encode("utf-8")
-                self.send_response(500)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(payload)))
-                self.send_header("connection", "close")
-                self.end_headers()
-                self.wfile.write(payload)
-            except Exception:
-                pass
+        except BaseException as error:
+            self.provider_state.record_failure(error)
+            if not headers_sent:
+                self.send_error(500)
+            self.close_connection = True
 
-    def _respond(
-        self,
-        marker: str,
-        ordinal: int,
-        workspace_id: str | None,
-        completed_tool_names: set[str],
-        todo_fact: dict[str, Any] | None,
-    ) -> None:
-        if marker == "CANCEL":
-            self._send_text("正在等待可取消的 Provider 响应。")
-            self.provider_state.cancel_started.set()
-            self.provider_state.release_cancel.wait(20)
-            self._send_done()
-            return
-        if marker == "FAIL":
-            self._send_tool_call(
-                "正在提交一个字段非法的 Plan 以验证失败边界。",
-                f"plan:invalid:{ordinal}",
-                "plan__publish",
-                {
-                    "title": "无效 Plan",
-                    "summary": "这个 Plan 缺少步骤。",
-                    "steps": [],
-                    "mutationManifest": [],
-                },
-            )
-            self._send_done()
-            return
-        if workspace_id is None:
-            raise AssertionError(f"{marker} Provider 请求缺少逻辑 workspaceId")
-        if marker == "EXECUTE":
-            if ordinal == 1:
-                self._send_tool_call(
-                    "正在核对目标并准备一个精确的写入计划。",
-                    "plan:execute",
-                    "plan__publish",
-                    {
-                        "title": "创建验收文件",
-                        "summary": "只创建一个精确目标。",
-                        "steps": [{
-                            "stepId": "step:create",
-                            "title": "创建验收文件",
-                            "details": "创建 executed.txt 并核对工具回执。",
-                            "verification": ["executed.txt 内容与预期一致。"],
-                        }],
-                        "mutationManifest": [{
-                            "workspaceId": workspace_id,
-                            "operation": "fs.create",
-                            "target": "executed.txt",
-                        }],
-                    },
-                )
-            elif ordinal == 2 and "fs.create" not in completed_tool_names:
-                self._send_tool_call(
-                    "计划已确认，正在创建唯一目标文件。",
-                    "e2e-call-execute",
-                    "fs__create",
-                    {
-                        "workspaceId": workspace_id,
-                        "path": "executed.txt",
-                        "content": EXPECTED_CONTENT,
-                    },
-                )
-            elif ordinal == 3 and "fs.create" in completed_tool_names:
-                self._send_text("已完成 **Plan 授权** 的文件创建。", finish_reason="stop")
-            else:
-                raise AssertionError(
-                    f"EXECUTE Provider 轮次异常：ordinal={ordinal}, results={completed_tool_names}"
-                )
-        elif marker == "FEEDBACK":
-            if ordinal == 1:
-                self._send_tool_call(
-                    "正在形成可调整的计划。",
-                    "plan:feedback",
-                    "plan__publish",
-                    {
-                        "title": "创建反馈文件",
-                        "summary": "创建初始目标。",
-                        "steps": [{
-                            "stepId": "step:feedback",
-                            "title": "创建反馈文件",
-                            "details": "创建 feedback.txt。",
-                        }],
-                        "mutationManifest": [{
-                                "workspaceId": workspace_id,
-                                "operation": "fs.create",
-                                "target": "feedback.txt",
-                        }],
-                    },
-                )
-            elif ordinal == 2:
-                self._send_tool_call(
-                    "已按修订说明形成新的最终计划。",
-                    "plan:feedback:revised",
-                    "plan__publish",
-                    {
-                        "title": "说明修订目标",
-                        "summary": "只说明 docs/notes.md，不执行写入。",
-                        "steps": [{
-                            "stepId": "step:feedback",
-                            "title": "说明修订目标",
-                            "details": "说明 docs/notes.md 的处理方案。",
-                        }],
-                        "mutationManifest": [],
-                    },
-                )
-            elif ordinal == 3:
-                self._send_text(
-                    "修订 Plan 已确认，本轮未执行 workspace mutation。",
-                    finish_reason="stop",
-                )
-            else:
-                raise AssertionError("FEEDBACK Provider 轮次异常")
-        elif marker == "PLAN_CANCEL":
-            if ordinal == 1:
-                self._send_tool_call(
-                    "正在准备一个可取消的计划。",
-                    "plan:ignore",
-                    "plan__publish",
-                    {
-                        "title": "创建不应执行的文件",
-                        "summary": "该 Plan 将由用户取消。",
-                        "steps": [{
-                            "stepId": "step:cancelled",
-                            "title": "创建不应执行的文件",
-                            "details": "创建 ignored.txt。",
-                        }],
-                        "mutationManifest": [{
-                                "workspaceId": workspace_id,
-                                "operation": "fs.create",
-                                "target": "ignored.txt",
-                        }],
-                    },
-                )
-            elif ordinal == 2:
-                self._send_text("已取消计划；没有执行任何修改。", finish_reason="stop")
-            else:
-                raise AssertionError("PLAN_CANCEL Provider 轮次异常")
-        elif marker == "TODO":
-            if ordinal == 1:
-                self._send_tool_call(
-                    "这是复杂任务；我先发布完整计划。",
-                    "plan:todo",
-                    "plan__publish",
-                    {
-                        "title": "读取目录并整理结论",
-                        "summary": "读取项目结构、分析关键链路并形成回答。",
-                        "steps": [
-                            {
-                                "stepId": "step:inspect",
-                                "title": "读取项目结构",
-                                "details": "读取工作区目录。",
-                            },
-                            {
-                                "stepId": "step:analyze",
-                                "title": "分析关键链路",
-                                "details": "分析目录与代码事实。",
-                            },
-                            {
-                                "stepId": "step:answer",
-                                "title": "整理最终结论",
-                                "details": "输出最终答复。",
-                            },
-                        ],
-                        "mutationManifest": [],
-                    },
-                )
-            elif ordinal == 2:
-                if todo_fact is None:
-                    raise AssertionError("TODO 确认后 Provider 没有收到 todo.seeded 事实")
-                items = todo_fact.get("items")
-                if not isinstance(items, list) or len(items) != 3:
-                    raise AssertionError("TODO seeded items 无效")
-                self._send_tool_calls(
-                    "Plan 已确认并生成待办；我先读取目录结构。",
-                    [
-                        (
-                            "todo:complex:start",
-                            "todo__progress",
-                            {
-                                "planId": todo_fact["sourcePlanId"],
-                                "revision": todo_fact["sourcePlanRevision"],
-                                "updates": [
-                                    {"todoId": items[0]["todoId"], "status": "inProgress"},
-                                    {"todoId": items[1]["todoId"], "status": "pending"},
-                                    {"todoId": items[2]["todoId"], "status": "pending"},
-                                ],
-                            },
-                        ),
-                        (
-                            "e2e-call-todo-list",
-                            "fs__list",
-                            {"workspaceId": workspace_id, "path": ".", "depth": 2},
-                        ),
-                    ],
-                )
-            elif ordinal == 3 and "fs.list" in completed_tool_names:
-                if todo_fact is None:
-                    raise AssertionError("TODO continuation 缺少 durable Todo fact")
-                items = todo_fact.get("items")
-                if not isinstance(items, list) or len(items) != 3:
-                    raise AssertionError("TODO continuation items 无效")
-                self.provider_state.todo_continuation_started.set()
-                self.provider_state.release_todo_continuation.wait(20)
-                self._send_tool_call(
-                    "目录读取完成；我正在收敛分析并更新待办。",
-                    "todo:complex:done",
-                    "todo__progress",
-                    {
-                        "planId": todo_fact["sourcePlanId"],
-                        "revision": todo_fact["sourcePlanRevision"],
-                        "updates": [
-                            {"todoId": item["todoId"], "status": "completed"}
-                            for item in items
-                        ],
-                    },
-                )
-            elif ordinal == 4:
-                self._send_text("复杂任务的目录读取、链路分析与结论整理均已完成。", finish_reason="stop")
-            else:
-                raise AssertionError(
-                    f"TODO Provider 轮次异常：ordinal={ordinal}, results={completed_tool_names}"
-                )
-        elif marker == "AUTONOMY":
-            if ordinal == 1 and "fs.create" not in completed_tool_names:
-                self._send_tool_call(
-                    "当前工作区允许直接修改；无需发布权限门禁 Plan。",
-                    "e2e-call-autonomy",
-                    "fs__create",
-                    {
-                        "workspaceId": workspace_id,
-                        "path": "autonomy.txt",
-                        "content": "workspace autonomy\n",
-                    },
-                )
-            elif ordinal == 2 and "fs.create" in completed_tool_names:
-                self._send_text("已在绑定工作区内直接完成修改。", finish_reason="stop")
-            else:
-                raise AssertionError(
-                    f"AUTONOMY Provider 轮次异常：ordinal={ordinal}, "
-                    f"results={completed_tool_names}"
-                )
+    def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/fixture-resource":
+            encoded = b"web-fetch-ok"
+            self.send_response(200)
+            self.send_header("content-type", "text/plain; charset=utf-8")
+        elif parsed.path == "/search":
+            encoded = json.dumps({
+                "results": [{
+                    "title": "Fixture search result",
+                    "url": f"http://127.0.0.1:{self.server.server_port}/fixture-resource",
+                    "snippet": "Local deterministic search evidence.",
+                }],
+            }, separators=(",", ":")).encode("utf-8")
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
         else:
-            raise AssertionError(f"未知 E2E marker：{marker}")
-        self._send_done()
-
-    def _send_text(self, content: str, finish_reason: str | None = None) -> None:
-        self._send_payload({
-            "choices": [{
-                "index": 0,
-                "delta": {"content": content},
-                "finish_reason": finish_reason,
-            }],
-            "usage": {"prompt_tokens": 120, "completion_tokens": 24},
-        })
-
-    def _send_tool_call(
-        self,
-        content: str,
-        call_id: str,
-        name: str,
-        arguments: dict[str, Any],
-    ) -> None:
-        self._send_tool_calls(content, [(call_id, name, arguments)])
+            self.send_error(404)
+            return
+        self.send_header("content-length", str(len(encoded)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(encoded)
+        self.close_connection = True
 
     def _send_tool_calls(
         self,
-        content: str,
         calls: list[tuple[str, str, dict[str, Any]]],
     ) -> None:
         self._send_payload({
             "choices": [{
                 "index": 0,
                 "delta": {
-                    "content": content,
-                    "tool_calls": [
-                        {
-                            "index": index,
-                            "id": call_id,
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": json.dumps(arguments, separators=(",", ":")),
-                            },
-                        }
-                        for index, (call_id, name, arguments) in enumerate(calls)
-                    ],
+                    "tool_calls": [{
+                        "index": index,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(arguments, separators=(",", ":")),
+                        },
+                    } for index, (call_id, name, arguments) in enumerate(calls)],
                 },
                 "finish_reason": "tool_calls",
             }],
-            "usage": {"prompt_tokens": 140, "completion_tokens": 30},
+            "usage": provider_usage(),
         })
+        self._send_done()
+
+    def _send_text(self, content: str) -> None:
+        self._send_payload({
+            "choices": [{
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": "stop",
+            }],
+            "usage": provider_usage(),
+        })
+        self._send_done()
 
     def _send_payload(self, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -544,6 +443,57 @@ class MockProviderServer(http.server.ThreadingHTTPServer):
     def __init__(self, state: ProviderState) -> None:
         super().__init__(("127.0.0.1", 0), MockProviderHandler)
         self.provider_state = state
+
+
+def provider_usage() -> dict[str, Any]:
+    return {
+        "prompt_tokens": 100,
+        "completion_tokens": 10,
+        "prompt_tokens_details": {"cached_tokens": 40},
+    }
+
+
+def message_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def write_pdf_fixture(path: Path, text: str) -> None:
+    escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    stream = f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET\n".encode("ascii")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+        ),
+        b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n"
+        + stream + b"endstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    encoded = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for index, value in enumerate(objects, start=1):
+        offsets.append(len(encoded))
+        encoded.extend(f"{index} 0 obj\n".encode("ascii"))
+        encoded.extend(value)
+        encoded.extend(b"\nendobj\n")
+    xref_offset = len(encoded)
+    encoded.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    encoded.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        encoded.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    encoded.extend(
+        (
+            f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref_offset}\n%%EOF\n"
+        ).encode("ascii")
+    )
+    path.write_bytes(encoded)
 
 
 class OwnedDaemon:
@@ -597,7 +547,7 @@ class OwnedDaemon:
             try:
                 value = api_json(self.base_url, "/api/host/identity")
                 return value if isinstance(value, dict) else None
-            except Exception:
+            except (OSError, ValueError, urllib.error.URLError):
                 return None
 
         self.identity = wait_until(ready, 12, "Daemon 未进入 ready")
@@ -652,11 +602,6 @@ class OwnedDaemon:
         return content[-12000:]
 
 
-def require(condition: bool, message: str) -> None:
-    if not condition:
-        raise AssertionError(message)
-
-
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as handle:
         handle.bind(("127.0.0.1", 0))
@@ -671,6 +616,8 @@ def wait_until(operation: Callable[[], Any], timeout: float, message: str) -> An
             value = operation()
             if value:
                 return value
+        except AssertionError:
+            raise
         except Exception as error:
             last_error = error
         time.sleep(0.05)
@@ -733,25 +680,6 @@ def api_json(
     return envelope.get("data")
 
 
-def expect_api_error(
-    daemon: OwnedDaemon,
-    path: str,
-    code: str,
-    *,
-    method: str = "GET",
-    body: dict[str, Any] | None = None,
-) -> None:
-    envelope = api_envelope(
-        daemon.base_url,
-        path,
-        token=daemon.token,
-        method=method,
-        body=body,
-    )
-    require(envelope.get("ok") is False, f"{path} 意外成功")
-    require(envelope.get("error") == code, f"{path} 错误码漂移：{envelope}")
-
-
 def projection(daemon: OwnedDaemon, session_id: str) -> dict[str, Any]:
     path_id = urllib.parse.quote(session_id, safe="")
     value = api_json(
@@ -760,30 +688,552 @@ def projection(daemon: OwnedDaemon, session_id: str) -> dict[str, Any]:
         token=daemon.token,
     )
     require(isinstance(value, dict), "SessionProjection 不是对象")
-    require(value.get("schemaVersion") == "deepcode.session-projection", "投影协议不是当前值")
+    require(value.get("schemaVersion") == "deepcode.session-projection.v5", "投影协议不是当前值")
     require(value.get("sessionId") == session_id, "SessionProjection identity 漂移")
     return value
 
 
-def wait_projection(
+def wait_completed(
     daemon: OwnedDaemon,
+    provider: ProviderState,
     session_id: str,
-    predicate: Callable[[dict[str, Any]], bool],
     label: str,
 ) -> dict[str, Any]:
     def current_if_ready() -> dict[str, Any] | None:
+        provider.assert_healthy()
         current = projection(daemon, session_id)
-        if predicate(current):
-            return current
         run = current.get("run") or {}
-        if run.get("status") in {"completed", "failed", "cancelled", "indeterminate"}:
+        if run.get("status") == "completed":
+            return current
+        if run.get("status") in {"failed", "cancelled", "indeterminate"}:
             raise AssertionError(
-                f"Session 在到达 {label} 前已终止："
-                f"status={run.get('status')} error={current.get('terminalError')}"
+                f"Session 在到达 {label} 前终止：{run.get('status')} {current.get('terminalError')}"
+                f"\ndaemon:\n{daemon.log_tail()}"
             )
         return None
 
-    return wait_until(current_if_ready, 15, f"Session 未到达 {label}")
+    return wait_until(current_if_ready, 20, f"Session 未到达 {label}")
+
+
+def create_session(daemon: OwnedDaemon, workspace_path: Path) -> dict[str, Any]:
+    value = api_json(
+        daemon.base_url,
+        "/api/conversation/sessions",
+        token=daemon.token,
+        method="POST",
+        body={"workspacePaths": [str(workspace_path)]},
+        timeout=12,
+    )
+    require(isinstance(value, dict), "create Session 未返回 projection")
+    require(isinstance(value.get("sessionId"), str), "Session id 无效")
+    return value
+
+
+def assert_legacy_attachment_command_rejected(
+    daemon: OwnedDaemon,
+    session_id: str,
+) -> None:
+    path_id = urllib.parse.quote(session_id, safe="")
+    envelope = api_envelope(
+        daemon.base_url,
+        f"/api/conversation/sessions/{path_id}/commands",
+        token=daemon.token,
+        method="POST",
+        body={
+            "schemaVersion": COMMAND_VERSION,
+            "type": "message.submit",
+            "commandId": "command-legacy-attachments",
+            "sessionId": session_id,
+            "text": "legacy attachment shape",
+            "attachments": [],
+            "directoryAttachments": [],
+        },
+        timeout=12,
+    )
+    require(envelope.get("ok") is False, "旧附件字段被当前 Session wire 合同接受")
+
+
+def selected_plugin_catalog(daemon: OwnedDaemon, label: str) -> tuple[str, list[dict[str, Any]]]:
+    catalog = api_json(
+        daemon.base_url,
+        "/api/conversation/plugins",
+        token=daemon.token,
+    )
+    require(isinstance(catalog, dict), f"{label} PluginCatalogProjection 不是对象")
+    revision = catalog.get("revision")
+    plugins = catalog.get("plugins")
+    require(isinstance(revision, str) and revision, f"{label} 插件目录 revision 无效")
+    require(isinstance(plugins, list), f"{label} 插件目录不是数组")
+    typed_plugins = [plugin for plugin in plugins if isinstance(plugin, dict)]
+    require(len(typed_plugins) == len(plugins), f"{label} 插件目录项不是对象")
+    uris = {plugin.get("uri") for plugin in typed_plugins}
+    require(FIRST_PARTY_PLUGIN_URIS.issubset(uris), f"{label} 缺少 first-party 插件")
+    require(
+        len(typed_plugins) == 5
+        and len([uri for uri in uris if isinstance(uri, str) and uri.endswith("@skill")]) == 1
+        and len([uri for uri in uris if isinstance(uri, str) and uri.endswith("@mcp")]) == 1,
+        f"{label} 必须精确暴露三项 first-party 插件及当前 Skill/MCP fixture",
+    )
+    return revision, typed_plugins
+
+
+def submit_message(
+    daemon: OwnedDaemon,
+    session_id: str,
+    command_id: str,
+    text: str,
+    filesystem_references: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    revision, plugins = selected_plugin_catalog(daemon, "message.submit")
+    selections = []
+    for index, plugin in enumerate(plugins):
+        require(isinstance(plugin, dict), "插件目录项不是对象")
+        uri = plugin.get("uri")
+        label = plugin.get("displayName")
+        require(isinstance(uri, str) and uri.startswith("plugin://"), "插件 URI 无效")
+        require(isinstance(label, str) and label, "插件 label 无效")
+        selections.append({
+            "selectionId": f"{command_id}:plugin:{index + 1}",
+            "uri": uri,
+            "label": label,
+        })
+    path_id = urllib.parse.quote(session_id, safe="")
+    value = api_json(
+        daemon.base_url,
+        f"/api/conversation/sessions/{path_id}/commands",
+        token=daemon.token,
+        method="POST",
+        body={
+            "schemaVersion": COMMAND_VERSION,
+            "type": "message.submit",
+            "commandId": command_id,
+            "sessionId": session_id,
+            "text": text,
+            **({"filesystemReferences": filesystem_references} if filesystem_references else {}),
+            "pluginCatalogRevision": revision,
+            "pluginSelections": selections,
+        },
+        timeout=15,
+    )
+    require(isinstance(value, dict), "command reply 不是对象")
+    require(value.get("status") == "accepted", "Session 未接纳 message.submit")
+    return value
+
+
+def start_cli_ask_with_file(
+    daemon: OwnedDaemon,
+    session_id: str,
+    file_path: Path,
+    text: str,
+) -> subprocess.Popen[str]:
+    _, plugins = selected_plugin_catalog(daemon, "CLI ask")
+    command = [
+        str(CLI_BINARY),
+        "--api", daemon.base_url,
+        "--no-auto-start-kernel",
+        "--session", session_id,
+        "--file", str(file_path),
+        "--plain",
+    ]
+    for plugin in plugins:
+        uri = plugin.get("uri") if isinstance(plugin, dict) else None
+        require(isinstance(uri, str) and uri.startswith("plugin://"), "CLI ask 插件 URI 无效")
+        command.extend(["--plugin", uri])
+    command.extend(["ask", text])
+    return subprocess.Popen(
+        command,
+        cwd=ROOT,
+        env=shell_environment(daemon),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def plugin_settings(
+    skill_root: Path,
+    mount_id: str,
+    server_id: str,
+    server_name: str,
+) -> dict[str, Any]:
+    return {
+        "skills.autoLoad": True,
+        "skills.mounts": json.dumps([{
+            "id": mount_id,
+            "path": str(skill_root),
+            "enabled": True,
+        }], separators=(",", ":")),
+        "mcp.autoLoad": True,
+        "mcp.servers": json.dumps([{
+            "id": server_id,
+            "name": server_name,
+            "transport": "stdio",
+            "command": sys.executable,
+            "args": str(MCP_SERVER),
+            "enabled": True,
+        }], separators=(",", ":")),
+    }
+
+
+def write_configuration(
+    config_root: Path,
+    provider_url: str,
+    settings: dict[str, Any],
+) -> None:
+    settings_root = config_root / "config" / "user" / "local" / "settings"
+    settings_root.mkdir(parents=True)
+    profile = {
+        "profiles": [{
+            "id": "e2e-main",
+            "name": "Local E2E",
+            "kind": "openaiCompatible",
+            "providerFlavor": "openai",
+            "baseUrl": provider_url,
+            "model": "mock-main",
+            "contextWindowTokens": 8192,
+            "maxOutputTokens": 512,
+            "enabled": True,
+        }],
+        "defaultProfileId": "e2e-main",
+    }
+    (settings_root / "llm-profiles.json").write_text(
+        json.dumps(profile, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (settings_root / "user-settings.json").write_text(
+        json.dumps(settings, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def patch_plugins(
+    daemon: OwnedDaemon,
+    old_settings: dict[str, Any],
+    new_settings: dict[str, Any],
+) -> None:
+    changed = {key: new_settings[key] for key in new_settings if new_settings[key] != old_settings[key]}
+    result = api_json(
+        daemon.base_url,
+        "/api/user-settings",
+        token=daemon.token,
+        method="PATCH",
+        body={"patches": changed},
+    )
+    require(result.get("activation") == "nextRun", "插件设置未声明 nextRun 激活")
+    require(set(result.get("changedKeys", [])) == set(changed), "插件设置变更键不完整")
+
+    snapshot = api_json(daemon.base_url, "/api/user-settings", token=daemon.token)
+    for key in changed:
+        require(snapshot["settings"].get(key) == new_settings[key], f"{key} 未写入保存设置")
+        require(
+            snapshot["runtimeSettings"].get(key) == old_settings[key],
+            f"{key} 在当前 run 内提前激活",
+        )
+
+
+def assert_runtime_activated(daemon: OwnedDaemon, new_settings: dict[str, Any]) -> None:
+    snapshot = api_json(daemon.base_url, "/api/user-settings", token=daemon.token)
+    for key in ("skills.mounts", "mcp.servers"):
+        require(
+            snapshot["runtimeSettings"].get(key) == new_settings[key],
+            f"{key} 未在下一 run 激活",
+        )
+
+
+def assert_projection_flow(value: dict[str, Any]) -> None:
+    run = value.get("run") or {}
+    require(run.get("status") == "completed", "最终 run 未完成")
+    assistant_messages = [
+        message for message in value.get("messages", []) if message.get("role") == "assistant"
+    ]
+    require(len(assistant_messages) == 2, "两轮基础链路没有形成两个 assistant 事实")
+    require(assistant_messages[-1].get("content") == "round-two-complete", "最终消息数据流错误")
+    completed_tools = [
+        activity
+        for activity in value.get("activities", [])
+        if activity.get("kind") == "tool" and activity.get("status") == "completed"
+    ]
+    require(
+        len(completed_tools) == 8,
+        "两轮惰性文件读取/MCP/PDF/web 调用未形成八个 completed activity",
+    )
+
+    usage = value.get("tokenUsage") or {}
+    require(usage.get("providerCallCount") == 4, "Provider 调用聚合错误")
+    require(usage.get("reportedCallCount") == 4, "缓存报告调用聚合错误")
+    require(usage.get("inputTokens") == 400, "输入 token 聚合错误")
+    require(usage.get("outputTokens") == 40, "输出 token 聚合错误")
+    require(usage.get("cacheReadInputTokens") == 160, "缓存读取 token 聚合错误")
+    require(usage.get("cacheMissInputTokens") == 240, "缓存未命中 token 聚合错误")
+    require(usage.get("cacheAvailable") is True, "缓存事实未标记 available")
+    require(usage.get("cacheComplete") is True, "缓存事实未标记 complete")
+    ratio = usage.get("cacheHitRatio")
+    require(isinstance(ratio, (int, float)) and abs(ratio - 0.4) < 1e-12, "缓存命中率分母错误")
+
+
+def sqlite_read_only(path: Path) -> sqlite3.Connection:
+    require(path.is_file(), f"运行事实未落盘：{path.name}")
+    return sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+
+
+def assert_identity_chain(config_root: Path, session_id: str) -> None:
+    runtime_root = config_root / "runtime" / "agent-runtime"
+    with sqlite_read_only(runtime_root / "session.sqlite3") as connection:
+        started_rows = connection.execute(
+            "SELECT run_id, payload_json FROM session_events "
+            "WHERE session_id=? AND event_type='run.started' ORDER BY sequence",
+            (session_id,),
+        ).fetchall()
+        lifecycle_rows = connection.execute(
+            "SELECT run_id, event_type, sequence, payload_json FROM session_events "
+            "WHERE session_id=? AND event_type IN "
+            "('tool.completed','context.composed','run.finishing','run.runtime.released',"
+            "'run.runtime.release_failed','run.settled') ORDER BY sequence",
+            (session_id,),
+        ).fetchall()
+    require(len(started_rows) == 2, "两轮链路没有两个 run.started runtime snapshot")
+
+    with sqlite_read_only(runtime_root / "tool-record.sqlite3") as connection:
+        record_rows = connection.execute(
+            "SELECT run_id, call_id, record_json FROM tool_records "
+            "WHERE session_id=? ORDER BY completed_at, call_id",
+            (session_id,),
+        ).fetchall()
+    require(len(record_rows) == 8, "两轮链路没有八个文件读取/MCP/PDF/web ToolRecord")
+    records_by_run: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for run_id, call_id, encoded in record_rows:
+        records_by_run.setdefault(run_id, []).append((call_id, json.loads(encoded)))
+
+    lifecycle_by_run: dict[str, list[tuple[str, int, dict[str, Any]]]] = {}
+    for run_id, event_type, sequence, encoded in lifecycle_rows:
+        lifecycle_by_run.setdefault(run_id, []).append((event_type, sequence, json.loads(encoded)))
+
+    snapshots: list[dict[str, Any]] = []
+    plugin_instances: list[str] = []
+    first_receipts: list[dict[str, Any]] = []
+    expected_io = [("alpha", "ahpla"), ("beta", "ateb")]
+    for run_index, ((run_id, encoded), (expected_input, expected_output)) in enumerate(
+        zip(started_rows, expected_io)
+    ):
+        payload = json.loads(encoded)
+        runtime = payload.get("runtimeSnapshot")
+        require(isinstance(runtime, dict), "run.started 缺少 runtimeSnapshot")
+        workspace_bindings = payload.get("workspaceBindings")
+        require(isinstance(workspace_bindings, list) and workspace_bindings, "run.started 缺少 workspace bindings")
+        primary_workspace_id = workspace_bindings[0].get("workspaceId")
+        require(isinstance(primary_workspace_id, str) and primary_workspace_id, "primary workspaceId 无效")
+        runtime_tools = runtime.get("tools", [])
+        require(isinstance(runtime_tools, list), "run runtime tools 不是数组")
+        runtime_core_tools = [
+            tool for tool in runtime_tools
+            if isinstance(tool, dict) and tool.get("origin") == "coreBuiltin"
+        ]
+        require(
+            [tool.get("name") for tool in runtime_core_tools]
+            == [
+                "bash",
+                "fs.delete", "fs.edit", "fs.read", "fs.write",
+                "web.fetch", "web.search",
+            ],
+            "Kernel runtime snapshot 未包含精确七项基础工具",
+        )
+        runtime_tools_by_name = {
+            tool.get("name"): tool for tool in runtime_tools if isinstance(tool, dict)
+        }
+        prompt_contributions = runtime.get("toolPromptContributions")
+        require(isinstance(prompt_contributions, list), "run runtime 缺少 tool prompt snapshot")
+        require(
+            [item.get("canonicalToolName") for item in prompt_contributions]
+            == [
+                "fs.read", "bash", "web.fetch",
+                "arxiv.read", "arxiv.search",
+                "github.read", "github.search",
+                "pdf.read",
+            ],
+            "run runtime 未按稳定顺序冻结 core/first-party tool guidance",
+        )
+        for contribution in prompt_contributions:
+            tool_name = contribution.get("canonicalToolName")
+            target = runtime_tools_by_name.get(tool_name)
+            require(isinstance(target, dict), "tool prompt 指向不存在的 runtime tool")
+            if tool_name in {"fs.read", "bash", "web.fetch"}:
+                require(contribution.get("origin") == "coreBuiltin", "core tool prompt origin 漂移")
+                require("pluginUri" not in contribution, "core tool prompt 错误携带 pluginUri")
+            else:
+                require(contribution.get("origin") == "extension", "first-party prompt origin 漂移")
+                require(
+                    contribution.get("pluginUri") in FIRST_PARTY_PLUGIN_URIS,
+                    "first-party prompt 缺少精确 pluginUri",
+                )
+            require(
+                contribution.get("preparedToolBindingRef") == target.get("toolBindingRef"),
+                "tool prompt 没有绑定当前 run 的 prepared tool",
+            )
+        reverse_tools = [
+            tool
+            for tool in runtime_tools
+            if isinstance(tool, dict) and tool.get("description") == "Reverse text"
+        ]
+        require(len(reverse_tools) == 1, "run snapshot 缺少唯一 MCP 工具 binding")
+        tool = reverse_tools[0]
+        require(tool.get("origin") == "extension", "MCP prepared tool 缺少 extension origin")
+        require(
+            isinstance(tool.get("pluginUri"), str) and tool["pluginUri"].endswith("@mcp"),
+            "MCP prepared tool 缺少精确 pluginUri",
+        )
+        run_records = records_by_run.get(run_id, [])
+        expected_record_count = 5 if run_index == 0 else 3
+        require(
+            len(run_records) == expected_record_count,
+            f"当前 run 没有精确 {expected_record_count} 个 ToolRecord",
+        )
+        mcp_records = [entry for entry in run_records if entry[1].get("toolName") == tool.get("name")]
+        require(len(mcp_records) == 1, "MCP ToolRecord 未唯一关联到 runtime tool")
+        call_id, record = mcp_records[0]
+        require(record.get("callId") == call_id, "ToolRecord callId 列与事实不一致")
+        require(record.get("outcome") == "completed", "MCP ToolRecord 未完成")
+        require(record.get("input", {}).get("text") == expected_input, "MCP 输入事实错误")
+        require(expected_output in json.dumps(record.get("output"), ensure_ascii=False), "MCP 输出事实错误")
+        require(
+            record.get("extensionGenerationRef") == runtime.get("extensionGenerationRef"),
+            "ToolRecord 与 run 的 ExtensionGenerationRef 不一致",
+        )
+        require(
+            record.get("kernelCatalogSnapshotRef") == runtime.get("kernelCatalogSnapshotRef"),
+            "ToolRecord 与 run 的 KernelCatalogSnapshotRef 不一致",
+        )
+        require(record.get("toolBindingRef") == tool.get("toolBindingRef"), "ToolBindingRef 未贯通")
+        require(record.get("toolName") == tool.get("name"), "ToolRecord 工具名未贯通")
+        prepared = record.get("preparedEffect") or {}
+        require(prepared.get("origin") == "extension", "MCP 工具未标记为 extension contribution")
+        require(prepared.get("toolBindingRef") == tool.get("toolBindingRef"), "PreparedEffect binding 漂移")
+        plugin_instance = prepared.get("pluginInstanceRef")
+        require(isinstance(plugin_instance, str) and plugin_instance, "MCP 缺少 PluginInstanceRef")
+        plugin_instances.append(plugin_instance)
+        web_records = {candidate.get("toolName"): candidate for _, candidate in run_records}
+        if run_index == 0:
+            pdf_tool = runtime_tools_by_name.get("pdf.read")
+            require(isinstance(pdf_tool, dict), "run snapshot 缺少 pdf.read")
+            require(pdf_tool.get("possibleEffects") == ["workspaceRead"], "pdf.read effect scope 错误")
+            require(pdf_tool.get("pluginUri") == "plugin://pdf@first-party", "pdf.read plugin owner 错误")
+            pdf_record = web_records.get("pdf.read")
+            require(isinstance(pdf_record, dict), "第一轮缺少 pdf.read ToolRecord")
+            require(pdf_record.get("outcome") == "completed", "pdf.read ToolRecord 未完成")
+            require(pdf_record.get("input", {}).get("path") == "fixture.pdf", "pdf.read 输入路径漂移")
+            require(
+                PDF_CONTENT in json.dumps(pdf_record.get("output"), ensure_ascii=False),
+                "pdf.read ToolRecord 未包含真实提取正文",
+            )
+            pdf_effect = pdf_record.get("preparedEffect") or {}
+            require(pdf_effect.get("workspaceId") == primary_workspace_id, "pdf.read workspace binding 错误")
+            require(pdf_effect.get("logicalTargets") == ["fixture.pdf"], "pdf.read logical target 漂移")
+        require("Fixture search result" in json.dumps(
+            web_records["web.search"].get("output"), ensure_ascii=False,
+        ), "web.search 没有真实返回结构化结果")
+        require("web-fetch-ok" in json.dumps(
+            web_records["web.fetch"].get("output"), ensure_ascii=False,
+        ), "web.fetch 没有真实获取 HTTP 内容")
+        if run_index == 0:
+            require(
+                ATTACHMENT_CONTENT in json.dumps(
+                    web_records["fs.read"].get("output"), ensure_ascii=False,
+                ),
+                "fs.read 没有从 Host 文件快照返回真实内容",
+            )
+
+        lifecycle = lifecycle_by_run.get(run_id, [])
+        event_types = [event_type for event_type, _, _ in lifecycle]
+        require("run.runtime.release_failed" not in event_types, "run runtime release 失败")
+        for event_type in ("run.finishing", "run.runtime.released", "run.settled"):
+            require(event_types.count(event_type) == 1, f"{event_type} 回执数量错误")
+        positions = {event_type: sequence for event_type, sequence, _ in lifecycle}
+        require(
+            positions["run.finishing"] < positions["run.runtime.released"] < positions["run.settled"],
+            "run release receipt 没有位于 finishing 与 settled 之间",
+        )
+        released_payload = next(
+            event_payload for event_type, _, event_payload in lifecycle
+            if event_type == "run.runtime.released"
+        )
+        require(released_payload.get("alreadyReleased") is False, "首次 release 被错误标为重放")
+        require(
+            len(released_payload.get("pluginInstanceRefs", [])) == 5,
+            "release receipt 未列出当前 run 的三项 first-party/Skill/MCP plugin lease",
+        )
+        completed_order = [
+            event_payload.get("record", {}).get("toolName")
+            for event_type, _, event_payload in lifecycle
+            if event_type == "tool.completed"
+        ]
+        expected_completed_order = (
+            ["fs.read", tool.get("name"), "pdf.read", "web.search", "web.fetch"]
+            if run_index == 0
+            else [tool.get("name"), "web.search", "web.fetch"]
+        )
+        require(completed_order == expected_completed_order, "同一 Provider turn 的工具没有严格按请求顺序完成")
+        receipts = [
+            event_payload for event_type, _, event_payload in lifecycle
+            if event_type == "context.composed"
+        ]
+        require(len(receipts) == 2, "每个 run 必须有 tool turn 与 continuation 两个 context receipt")
+        for receipt in receipts:
+            for field in (
+                "stableCoreHash", "baseToolSchemaHash", "selectedPluginSnapshotHash",
+            ):
+                require(
+                    isinstance(receipt.get(field), str)
+                    and receipt[field].startswith("context-hash-v1:"),
+                    f"context.composed 缺少 {field}",
+                )
+            require(
+                isinstance(receipt.get("dynamicInstructionBytes"), int)
+                and receipt["dynamicInstructionBytes"] > 0,
+                "context.composed dynamicInstructionBytes 无效",
+            )
+            provider_tools = receipt.get("tools")
+            require(isinstance(provider_tools, list) and provider_tools, "context receipt 工具目录为空")
+            require(all(
+                isinstance(item, dict)
+                and isinstance(item.get("canonicalName"), str)
+                and isinstance(item.get("wireName"), str)
+                and item.get("origin") in {"coreBuiltin", "extension", "sessionControl"}
+                and item.get("availability") == "callable"
+                for item in provider_tools
+            ), "context receipt 工具来源字段不完整")
+        first_receipts.append(receipts[0])
+        snapshots.append(runtime)
+
+    for key in (
+        "runRuntimeSnapshotRef",
+        "extensionGenerationRef",
+        "kernelCatalogSnapshotRef",
+    ):
+        require(snapshots[0].get(key) != snapshots[1].get(key), f"下一 run 未更新 {key}")
+    require(snapshots[0]["tools"] != snapshots[1]["tools"], "下一 run 的工具 snapshot 未更新")
+    prompt_bindings = [
+        [item.get("preparedToolBindingRef") for item in snapshot["toolPromptContributions"]]
+        for snapshot in snapshots
+    ]
+    require(prompt_bindings[0] != prompt_bindings[1], "下一 run 未重新绑定 tool prompt snapshot")
+    prompt_content = [[
+        {key: value for key, value in item.items() if key != "preparedToolBindingRef"}
+        for item in snapshot["toolPromptContributions"]
+    ] for snapshot in snapshots]
+    require(prompt_content[0] == prompt_content[1], "稳定 core tool guidance 文本发生漂移")
+    require(plugin_instances[0] != plugin_instances[1], "两代 MCP 复用了 PluginInstanceRef")
+    require(
+        first_receipts[0]["stableCoreHash"] == first_receipts[1]["stableCoreHash"],
+        "两个 run 的稳定 System Prompt hash 漂移",
+    )
+    require(
+        first_receipts[0]["baseToolSchemaHash"] == first_receipts[1]["baseToolSchemaHash"],
+        "两个 run 的基础工具 schema hash 漂移",
+    )
+    require(
+        first_receipts[0]["selectedPluginSnapshotHash"]
+        != first_receipts[1]["selectedPluginSnapshotHash"],
+        "插件代次更新后 selected plugin snapshot hash 未变化",
+    )
 
 
 def shell_environment(daemon: OwnedDaemon) -> dict[str, str]:
@@ -793,1213 +1243,233 @@ def shell_environment(daemon: OwnedDaemon) -> dict[str, str]:
     return environment
 
 
-def run_cli(
+def assert_shells_read_projection(
     daemon: OwnedDaemon,
-    *arguments: str,
-    timeout: float = 18,
-) -> subprocess.CompletedProcess[str]:
+    session_id: str,
+    revision: int,
+) -> None:
     require(CLI_BINARY.is_file(), f"缺少 CLI：{CLI_BINARY}")
-    return subprocess.run(
+    cli = subprocess.run(
         [
             str(CLI_BINARY),
             "--api", daemon.base_url,
             "--no-auto-start-kernel",
-            *arguments,
+            "--session", session_id,
+            "show",
         ],
         cwd=ROOT,
         env=shell_environment(daemon),
         check=False,
         capture_output=True,
         text=True,
-        timeout=timeout,
+        timeout=18,
+    )
+    require(cli.returncode == 0, f"CLI 读取共享投影失败：{cli.stderr}")
+    require(
+        f"session={session_id} revision={revision}" in f"{cli.stdout}\n{cli.stderr}",
+        "CLI 没有读取精确 SessionProjection identity",
     )
 
-
-def run_tui(
-    daemon: OwnedDaemon,
-    session_id: str,
-    *,
-    input_text: str | None = None,
-    smoke: bool = False,
-    timeout: float = 18,
-) -> subprocess.CompletedProcess[str]:
     require(TUI_BINARY.is_file(), f"缺少 TUI：{TUI_BINARY}")
-    arguments = [
-        str(TUI_BINARY),
-        "--api", daemon.base_url,
-        "--no-auto-start-kernel",
-        "--session", session_id,
-    ]
-    if smoke:
-        arguments.append("--smoke")
-    return subprocess.run(
-        arguments,
+    tui = subprocess.run(
+        [
+            str(TUI_BINARY),
+            "--api", daemon.base_url,
+            "--no-auto-start-kernel",
+            "--session", session_id,
+            "--smoke",
+        ],
         cwd=ROOT,
         env=shell_environment(daemon),
-        input=input_text,
         check=False,
         capture_output=True,
         text=True,
-        timeout=timeout,
+        timeout=18,
     )
-
-
-def create_session(
-    daemon: OwnedDaemon,
-    *,
-    workspace_paths: list[Path] | None = None,
-    project_id: str | None = None,
-) -> dict[str, Any]:
-    body: dict[str, Any] = {}
-    if workspace_paths is not None:
-        body["workspacePaths"] = [str(path) for path in workspace_paths]
-    if project_id is not None:
-        body["projectId"] = project_id
-    value = api_json(
-        daemon.base_url,
-        "/api/conversation/sessions",
-        token=daemon.token,
-        method="POST",
-        body=body,
-        timeout=12,
-    )
-    require(isinstance(value, dict), "create Session 未返回 projection")
-    require(isinstance(value.get("sessionId"), str), "Session id 无效")
-    return value
-
-
-def command(daemon: OwnedDaemon, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    path_id = urllib.parse.quote(session_id, safe="")
-    value = api_json(
-        daemon.base_url,
-        f"/api/conversation/sessions/{path_id}/commands",
-        token=daemon.token,
-        method="POST",
-        body=payload,
-        timeout=15,
-    )
-    require(isinstance(value, dict), "command reply 不是对象")
-    return value
-
-
-def message_command(session_id: str, command_id: str, text: str) -> dict[str, Any]:
-    return {
-        "schemaVersion": COMMAND_VERSION,
-        "type": "message.submit",
-        "commandId": command_id,
-        "sessionId": session_id,
-        "text": text,
-    }
-
-
-def plan_command(
-    session_id: str,
-    command_id: str,
-    run_id: str,
-    plan: dict[str, Any],
-    response: dict[str, Any],
-) -> dict[str, Any]:
-    return {
-        "schemaVersion": COMMAND_VERSION,
-        "type": "plan.respond",
-        "commandId": command_id,
-        "sessionId": session_id,
-        "runId": run_id,
-        "planId": plan["planId"],
-        "revision": plan["revision"],
-        "response": response,
-    }
-
-
-def run_execute(
-    daemon: OwnedDaemon,
-    workspace: Path,
-    provider: ProviderState,
-) -> tuple[str, str, int, str]:
-    created = create_session(daemon, workspace_paths=[workspace])
-    session_id = created["sessionId"]
-    workspace_id = created["workspaceBindings"][0]["workspaceId"]
-    original = message_command(
-        session_id,
-        "command:execute:start",
-        "E2E EXECUTE：先给出结构化计划，再创建文件。",
-    )
-    reply = command(daemon, session_id, original)
-    require(reply.get("status") == "accepted", "EXECUTE 消息未接纳")
-    waiting = wait_projection(
-        daemon,
-        session_id,
-        lambda item: (item.get("run") or {}).get("status") == "waiting"
-        and item.get("pendingPlan") is not None,
-        "EXECUTE Plan waiting",
-    )
-    run_id = waiting["run"]["runId"]
-    plan = waiting["pendingPlan"]
-    require(plan.get("responseMode") == "confirmReviseOrCancel", "Plan responseMode 错误")
-    require(plan.get("revision") == 1, "首个 Plan revision 错误")
-    require(plan.get("title") == "创建验收文件", "Plan 标题错误")
-    require(
-        plan.get("mutationManifest") == [{
-            "workspaceId": workspace_id,
-            "operation": "fs.create",
-            "target": "executed.txt",
-        }],
-        "Plan mutationManifest 没有精确 target",
-    )
-    require(
-        any(
-            "准备一个精确的写入计划" in item.get("content", "")
-            for item in waiting.get("narratives", [])
-        ),
-        "Plan 前没有 LLM narrative",
-    )
-    require(not (workspace / "executed.txt").exists(), "Plan 选择前已经写入文件")
-
-    switched = run_cli(
-        daemon,
-        "--session", session_id,
-        "model", "e2e-secondary",
-    )
-    require(switched.returncode == 0, f"CLI 中途切换模型失败：{switched.stderr}")
-    require("e2e-secondary" in switched.stdout, "CLI 没有确认中途模型切换")
-    switched_projection = projection(daemon, session_id)
-    require(
-        (switched_projection.get("run") or {}).get("profileId") == "e2e-secondary",
-        "中途模型选择没有进入共享投影",
-    )
-
-    resolved = run_tui(daemon, session_id, input_text="1\n/quit\n", timeout=25)
-    require(resolved.returncode == 0, f"TUI 确认 Plan 失败：{resolved.stderr}")
-    output = f"{resolved.stdout}\n{resolved.stderr}"
-    require("Plan · revision 1" in output and "1. 创建验收文件" in output, "TUI 没有渲染完整 Plan")
-    require("工具 fs.create [completed]" in output, "TUI 没有渲染完成的工具事实")
-    require(
-        "assistant: 已完成 **Plan 授权** 的文件创建。" in output,
-        f"TUI 缺少最终回答：{output}",
-    )
-    final = wait_projection(
-        daemon,
-        session_id,
-        lambda item: (item.get("run") or {}).get("status") == "completed",
-        "EXECUTE completed",
-    )
-    require(final.get("pendingPlan") is None, "选择后 Plan 未从投影消失")
-    require((workspace / "executed.txt").read_text() == EXPECTED_CONTENT, "执行文件内容错误")
-    activities = [
-        item for item in final.get("activities", [])
-        if item.get("kind") == "tool"
-        and (item.get("tool") or {}).get("operation") == "fs.create"
-    ]
-    require(
-        len(activities) == 1 and activities[0].get("status") == "completed",
-        "工具 activity 错误",
-    )
-    require(
-        any(
-            "计划已确认" in item.get("content", "")
-            for item in final.get("narratives", [])
-        ),
-        "工具调用前没有 LLM 过渡性 narrative",
-    )
-    require(final.get("contextUsage", {}).get("inputTokens") == 120, "context usage 未进入投影")
-
-    count_before = provider.count()
-    replay = command(daemon, session_id, original)
-    require(replay.get("status") == "replayed", "相同 commandId 未精确回放")
-    require(replay.get("revision") == reply.get("revision"), "回放 revision 不是原始值")
-    assert_count_stable(provider, count_before, 0.35, "命令回放重复调用 Provider")
-    require((workspace / "executed.txt").read_text() == EXPECTED_CONTENT, "回放改变了工具结果")
-    return session_id, run_id, int(final["revision"]), workspace_id
-
-
-def run_feedback(daemon: OwnedDaemon, workspace: Path) -> tuple[str, str]:
-    created = create_session(daemon, workspace_paths=[workspace])
-    session_id = created["sessionId"]
-    original = message_command(
-        session_id,
-        "command:feedback:start",
-        "E2E FEEDBACK：给出计划并等待我调整。",
-    )
-    require(command(daemon, session_id, original).get("status") == "accepted", "FEEDBACK 未接纳")
-    waiting = wait_projection(
-        daemon,
-        session_id,
-        lambda item: item.get("pendingPlan") is not None,
-        "FEEDBACK Plan waiting",
-    )
-    run_id = waiting["run"]["runId"]
-    original_plan = waiting["pendingPlan"]
-    feedback = "改为只说明 docs/notes.md，不执行写入"
-    revised_reply = run_cli(daemon, "--session", session_id, "ask", feedback, timeout=25)
-    require(revised_reply.returncode == 5, f"CLI Plan 修订没有停在新 Plan Gate：{revised_reply.stderr}")
-    revised = wait_projection(
-        daemon,
-        session_id,
-        lambda item: (item.get("pendingPlan") or {}).get("revision") == 2,
-        "FEEDBACK revised Plan waiting",
-    )
-    require(revised["pendingPlan"]["planId"] == original_plan["planId"], "修订 PlanId 漂移")
-    require(revised["pendingPlan"]["mutationManifest"] == [], "修订 Plan 意外保留 mutation")
-    completed = run_cli(daemon, "--session", session_id, "ask", "确认", timeout=25)
-    require(completed.returncode == 0, f"CLI 确认修订 Plan 失败：{completed.stderr}")
-    output = f"{completed.stdout}\n{completed.stderr}"
-    require("本轮未执行 workspace mutation" in output, "修订确认后没有 LLM 最终答复")
-    final = wait_projection(
-        daemon,
-        session_id,
-        lambda item: (item.get("run") or {}).get("status") == "completed",
-        "FEEDBACK completed",
-    )
-    require(final.get("pendingPlan") is None, "修订确认后 Plan 未关闭")
-    require(
-        [(plan.get("revision"), plan.get("status")) for plan in final.get("plans", [])]
-        == [(1, "superseded"), (2, "confirmed")],
-        "Plan revision lifecycle 错误",
-    )
-    require(not (workspace / "feedback.txt").exists(), "反馈路线意外获得写入 authority")
-    require(not (workspace / "docs" / "notes.md").exists(), "自然语言反馈被误当作 Plan")
-    require(
-        not any(item.get("kind") == "tool" for item in final.get("activities", [])),
-        "反馈路线执行了工具",
-    )
-    return session_id, run_id
-
-
-def run_plan_cancel(daemon: OwnedDaemon, workspace: Path) -> tuple[str, str]:
-    created = create_session(daemon, workspace_paths=[workspace])
-    session_id = created["sessionId"]
-    original = message_command(
-        session_id,
-        "command:plan-cancel:start",
-        "E2E PLAN_CANCEL：给出计划，我将明确取消。",
-    )
-    require(command(daemon, session_id, original).get("status") == "accepted", "PLAN_CANCEL 未接纳")
-    waiting = wait_projection(
-        daemon,
-        session_id,
-        lambda item: item.get("pendingPlan") is not None,
-        "PLAN_CANCEL Plan waiting",
-    )
-    run_id = waiting["run"]["runId"]
-    completed = run_cli(daemon, "--session", session_id, "cancel-plan", timeout=25)
-    require(completed.returncode == 0, f"CLI 取消 Plan 失败：{completed.stderr}")
-    output = f"{completed.stdout}\n{completed.stderr}"
-    require("已取消计划" in output, "取消后没有 LLM 最终回答")
-    final = wait_projection(
-        daemon,
-        session_id,
-        lambda item: (item.get("run") or {}).get("status") == "completed",
-        "PLAN_CANCEL completed",
-    )
-    require(final.get("pendingPlan") is None, "取消后 Plan 未关闭")
-    require(final.get("plans", [])[0].get("status") == "cancelled", "Plan 未进入 cancelled")
-    require(not (workspace / "ignored.txt").exists(), "取消后仍执行了 mutation")
-    require(
-        not any(item.get("kind") == "tool" for item in final.get("activities", [])),
-        "取消路线执行了工具",
-    )
-    return session_id, run_id
-
-
-def run_cancel(
-    daemon: OwnedDaemon,
-    workspace: Path,
-    provider: ProviderState,
-) -> tuple[str, str]:
-    created = create_session(daemon, workspace_paths=[workspace])
-    session_id = created["sessionId"]
-    original = message_command(
-        session_id,
-        "command:cancel:start",
-        "E2E CANCEL：输出进度后等待取消。",
-    )
-    require(command(daemon, session_id, original).get("status") == "accepted", "CANCEL 未接纳")
-    wait_until(provider.cancel_started.is_set, 10, "Provider CANCEL 流未开始")
-    running = wait_projection(
-        daemon,
-        session_id,
-        lambda item: (item.get("run") or {}).get("status") == "running"
-        and "可取消" in (item.get("assistantDraft") or {}).get("content", ""),
-        "CANCEL running with transient assistant draft",
-    )
-    run_id = running["run"]["runId"]
-    completed = run_cli(daemon, "--session", session_id, "cancel", run_id)
-    require(
-        completed.returncode == CLI_CANCELLED_EXIT,
-        f"CLI cancel 未返回 cancelled 专用非零退出码：{completed.returncode}\n{completed.stderr}",
-    )
-    final = wait_projection(
-        daemon,
-        session_id,
-        lambda item: (item.get("run") or {}).get("status") == "cancelled",
-        "CANCEL cancelled",
-    )
-    require(final.get("pendingPlan") is None, "取消后仍有 Plan")
-    require(final.get("pendingInteraction") is None, "取消后仍有 interaction")
-    require(final.get("assistantDraft") is None, "取消后仍有 assistant draft")
-    provider.release_cancel.set()
-    return session_id, run_id
-
-
-def run_failure(daemon: OwnedDaemon, workspace: Path) -> tuple[str, str]:
-    created = create_session(daemon, workspace_paths=[workspace])
-    session_id = created["sessionId"]
-    original = message_command(
-        session_id,
-        "command:fail:start",
-        "E2E FAIL：返回字段非法的 Session control call。",
-    )
-    require(command(daemon, session_id, original).get("status") == "accepted", "FAIL 未接纳")
-    failed = wait_projection(
-        daemon,
-        session_id,
-        lambda item: (item.get("run") or {}).get("status") == "failed",
-        "FAIL failed",
-    )
-    run_id = failed["run"]["runId"]
-    require(
-        failed.get("terminalError", {}).get("code") == "session_control_plan_steps_invalid",
-        f"FAIL 原始结构错误未保留：{failed.get('terminalError')}",
-    )
-    shown = run_cli(daemon, "--session", session_id, "show")
-    require(shown.returncode == 6, f"CLI failed 状态必须非零 6，实际 {shown.returncode}")
-    require(
-        "session_control_plan_steps_invalid" in f"{shown.stdout}\n{shown.stderr}",
-        "CLI 未显示失败根因",
-    )
-    return session_id, run_id
-
-
-def run_todo(
-    daemon: OwnedDaemon,
-    workspace: Path,
-    provider: ProviderState,
-) -> tuple[str, str, int, str]:
-    created = create_session(daemon, workspace_paths=[workspace])
-    session_id = created["sessionId"]
-    bindings = created.get("workspaceBindings", [])
-    require(len(bindings) == 1, "TODO Session 没有固定单一 workspace binding")
-    workspace_id = bindings[0].get("workspaceId")
-    require(isinstance(workspace_id, str), "TODO Session workspaceId 缺失")
-    original = message_command(
-        session_id,
-        "command:todo:start",
-        "E2E TODO：这是复杂任务，请先形成 Todo，再读取目录并整理结论。",
-    )
-    require(command(daemon, session_id, original).get("status") == "accepted", "TODO 未接纳")
-    plan_waiting = wait_projection(
-        daemon,
-        session_id,
-        lambda item: item.get("pendingPlan") is not None,
-        "TODO Plan waiting",
-    )
-    run_id = plan_waiting["run"]["runId"]
-    confirm = command(
-        daemon,
-        session_id,
-        plan_command(
-            session_id,
-            "command:todo:confirm",
-            run_id,
-            plan_waiting["pendingPlan"],
-            {"kind": "confirm"},
-        ),
-    )
-    require(confirm.get("status") == "accepted", "TODO Plan 确认未接纳")
-    wait_until(
-        provider.todo_continuation_started.is_set,
-        12,
-        "TODO 第二个 Provider turn 未开始",
-    )
-    active = wait_projection(
-        daemon,
-        session_id,
-        lambda item: (item.get("run") or {}).get("status") == "running"
-        and item.get("todoList") is not None
-        and any(
-            todo.get("status") == "inProgress"
-            for todo in item["todoList"].get("items", [])
-        ),
-        "TODO active projection",
-    )
-    require(
-        [todo.get("sourceStepId") for todo in active["todoList"]["items"]]
-        == ["step:inspect", "step:analyze", "step:answer"],
-        "复杂任务 Todo 与 Plan step 顺序映射错误",
-    )
-    list_activities = [
-        item for item in active.get("activities", [])
-        if item.get("kind") == "tool"
-        and (item.get("tool") or {}).get("operation") == "fs.list"
-    ]
-    require(
-        len(list_activities) == 1 and list_activities[0].get("status") == "completed",
-        "复杂任务的 fs.list activity 未进入共享投影",
-    )
-    require(
-        any(
-            "生成待办" in item.get("content", "")
-            for item in active.get("narratives", [])
-        ),
-        "复杂任务调用工具前缺少 LLM narrative",
-    )
-
-    provider.release_todo_continuation.set()
-    final = wait_projection(
-        daemon,
-        session_id,
-        lambda item: (item.get("run") or {}).get("status") == "completed",
-        "TODO completed",
-    )
-    require(
-        all(todo.get("status") == "completed" for todo in final["todoList"]["items"]),
-        "复杂任务结束时 Todo 没有由 LLM 更新为 completed",
-    )
-    require(
-        final.get("messages", [])[-1].get("content")
-        == "复杂任务的目录读取、链路分析与结论整理均已完成。",
-        "复杂任务最终回答错误",
-    )
-    cli = run_cli(daemon, "--session", session_id, "show")
-    require(cli.returncode == 0, f"CLI 读取 Todo 共享投影失败：{cli.stderr}")
-    require(
-        "Todo" in cli.stdout and "[x] 读取项目结构" in cli.stdout,
-        "CLI 没有渲染 Session Todo 投影",
-    )
-    tui = run_tui(daemon, session_id, smoke=True)
-    require(tui.returncode == 0, f"TUI 读取 Todo 共享投影失败：{tui.stderr}")
-    require(
-        "Todo" in tui.stdout and "[x] 读取项目结构" in tui.stdout,
-        "TUI 没有渲染 Session Todo 投影",
-    )
-    return session_id, run_id, int(final["revision"]), workspace_id
-
-
-def assert_shells_read_shared_projection(
-    daemon: OwnedDaemon,
-    session_id: str,
-    expected_revision: int,
-    forbidden_root: Path,
-) -> None:
-    cli = run_cli(daemon, "--session", session_id, "show")
-    require(cli.returncode == 0, f"CLI 读取共享投影失败：{cli.stderr}")
-    cli_output = f"{cli.stdout}\n{cli.stderr}"
-    require(
-        f"session={session_id} revision={expected_revision}" in cli_output,
-        "CLI 没有读取预期 SessionProjection revision",
-    )
-    require(
-        "assistant: 已完成 **Plan 授权** 的文件创建。" in cli_output,
-        "CLI 缺少共享 answer",
-    )
-    require("工具 fs.create [completed]" in cli_output, "CLI 缺少共享工具 activity")
-    require(str(forbidden_root) not in cli_output, "CLI 普通投影泄露绝对路径")
-
-    tui = run_tui(daemon, session_id, smoke=True)
     require(tui.returncode == 0, f"TUI 读取共享投影失败：{tui.stderr}")
     require(
-        tui.stdout.startswith("DeepCode TUI\n")
-        and f"session={session_id} revision={expected_revision}" in tui.stdout,
-        "TUI 未从当前共享投影渲染精确 Session 身份",
-    )
-    require(
-        f"session={session_id} revision={expected_revision}" in tui.stdout,
-        "TUI 没有读取预期 SessionProjection revision",
-    )
-    require(
-        "assistant: 已完成 **Plan 授权** 的文件创建。" in tui.stdout,
-        "TUI 缺少共享 answer",
-    )
-    require("工具 fs.create [completed]" in tui.stdout, "TUI 缺少共享工具 activity")
-    require(str(forbidden_root) not in tui.stdout, "TUI 普通投影泄露绝对路径")
-
-
-def exercise_catalog(
-    daemon: OwnedDaemon,
-    primary: Path,
-    secondary: Path,
-) -> None:
-    catalog = api_json(
-        daemon.base_url,
-        "/api/conversation/projects",
-        token=daemon.token,
-        method="POST",
-        body={"title": "多目录项目", "workspacePaths": [str(primary), str(secondary)]},
-    )
-    require(isinstance(catalog, dict), "创建项目未返回 Catalog")
-    project = next(item for item in catalog["projects"] if item["title"] == "多目录项目")
-    project_id = project["id"]
-    require(len(project["workspaceBindings"]) == 2, "项目没有保存多个 binding 模板")
-    public_text = json.dumps(catalog, ensure_ascii=False)
-    require("canonicalRoot" not in public_text, "普通 Catalog 暴露 canonicalRoot 字段")
-    require(
-        str(primary) not in public_text and str(secondary) not in public_text,
-        "普通 Catalog 暴露路径",
-    )
-
-    management = api_json(
-        daemon.base_url,
-        "/api/conversation/catalog/manage",
-        token=daemon.token,
-    )
-    roots = {item["canonicalRoot"] for item in management["workspaces"]}
-    require(
-        str(primary.resolve()) in roots and str(secondary.resolve()) in roots,
-        "管理面板看不到真实路径",
-    )
-
-    existing = create_session(daemon, project_id=project_id)
-    require(len(existing["workspaceBindings"]) == 2, "项目 Session 未取得创建快照")
-    existing_id = existing["sessionId"]
-    api_json(
-        daemon.base_url,
-        f"/api/conversation/projects/{urllib.parse.quote(project_id, safe='')}",
-        token=daemon.token,
-        method="PATCH",
-        body={"workspacePaths": [str(primary)]},
-    )
-    require(
-        len(projection(daemon, existing_id)["workspaceBindings"]) == 2,
-        "已有 Session snapshot 被项目更新改写",
-    )
-    newer = create_session(daemon, project_id=project_id)
-    require(len(newer["workspaceBindings"]) == 1, "新 Session 没有使用更新后的项目模板")
-    newer_id = newer["sessionId"]
-
-    independent = create_session(daemon)
-    independent_id = independent["sessionId"]
-    require(independent["workspaceBindings"] == [], "独立 Session 不应隐式获得 binding")
-    moved_catalog = api_json(
-        daemon.base_url,
-        f"/api/conversation/sessions/{urllib.parse.quote(independent_id, safe='')}",
-        token=daemon.token,
-        method="PATCH",
-        body={"projectId": project_id},
-    )
-    moved = next(item for item in moved_catalog["sessions"] if item["id"] == independent_id)
-    require(moved["projectId"] == project_id, "Session 归类没有变化")
-    require(moved["workspaceBindings"] == [], "移入项目静默新增了 workspace grant")
-    require(
-        projection(daemon, independent_id)["workspaceBindings"] == [],
-        "Session 投影 snapshot 被归类改写",
-    )
-
-    for session_id in (existing_id, newer_id, independent_id):
-        path_id = urllib.parse.quote(session_id, safe="")
-        api_json(
-            daemon.base_url,
-            f"/api/conversation/sessions/{path_id}",
-            token=daemon.token,
-            method="DELETE",
-        )
-        expect_api_error(
-            daemon,
-            f"/api/conversation/sessions/{path_id}/projection",
-            "session_not_found",
-        )
-    api_json(
-        daemon.base_url,
-        f"/api/conversation/projects/{urllib.parse.quote(project_id, safe='')}",
-        token=daemon.token,
-        method="DELETE",
-    )
-    final_catalog = api_json(
-        daemon.base_url,
-        "/api/conversation/catalog",
-        token=daemon.token,
-    )
-    require(final_catalog["projects"] == [], "项目删除后仍在 Catalog")
-    require(
-        all(
-            item["id"] not in {existing_id, newer_id, independent_id}
-            for item in final_catalog["sessions"]
-        ),
-        "删除的对话仍在 Catalog",
+        f"session={session_id} revision={revision}" in tui.stdout,
+        "TUI 没有读取精确 SessionProjection identity",
     )
 
 
-def assert_count_stable(
-    provider: ProviderState,
-    expected: int,
-    duration: float,
-    message: str,
-) -> None:
-    deadline = time.monotonic() + duration
+def assert_provider_count_stable(provider: ProviderState, expected: int) -> None:
+    deadline = time.monotonic() + 0.35
     while time.monotonic() < deadline:
-        require(provider.count() == expected, message)
+        provider.assert_healthy()
+        require(provider.count() == expected, "恢复 settled Session 时重复调用 Provider")
         time.sleep(0.05)
 
 
-def inspect_sqlite(
-    config_root: Path,
-    expected_runs: dict[str, tuple[str, str]],
-    execute_session: str,
-    execute_workspace_id: str,
-    expected_todo_workspace_id: str,
-) -> None:
-    runtime_root = config_root / "runtime" / "agent-runtime"
-    catalog_path = runtime_root / "catalog.sqlite3"
-    session_path = runtime_root / "session.sqlite3"
-    record_path = runtime_root / "tool-record.sqlite3"
-    expected_versions = {
-        catalog_path: 1,
-        session_path: 2,
-        record_path: 1,
-    }
-    for path, expected_version in expected_versions.items():
-        require(path.is_file(), f"当前 Store 未落盘：{path.name}")
-        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
-            version = connection.execute("PRAGMA user_version").fetchone()[0]
-            require(
-                version == expected_version,
-                f"{path.name} user_version 不是 {expected_version}",
-            )
-
-    with sqlite3.connect(f"file:{session_path}?mode=ro", uri=True) as connection:
-        rows = connection.execute(
-            "SELECT session_id, sequence, event_type, run_id, call_id, payload_json "
-            "FROM session_events ORDER BY session_id, sequence"
-        ).fetchall()
-        by_session: dict[str, list[dict[str, Any]]] = {}
-        for session_id, sequence, event_type, run_id, call_id, encoded in rows:
-            event = {
-                "sequence": sequence,
-                "type": event_type,
-                "runId": run_id,
-                "callId": call_id,
-                "payload": json.loads(encoded),
-            }
-            by_session.setdefault(session_id, []).append(event)
-        require(set(by_session) == set(expected_runs), "Session Store 出现意外 Session")
-        for session_id, events in by_session.items():
-            require(
-                [event["sequence"] for event in events] == list(range(1, len(events) + 1)),
-                f"{session_id} sequence 不连续",
-            )
-            require(
-                not any(
-                    event["type"] in {"executor.started", "run.settling", "assistant.chunk"}
-                    for event in events
-                ),
-                "A1-min/A1-transient 不应新增 executor.started、run.settling 或 assistant.chunk",
-            )
-            run_id, expected_outcome = expected_runs[session_id]
-            settlements = [
-                event for event in events
-                if event["type"] == "run.settled" and event["runId"] == run_id
-            ]
-            require(len(settlements) == 1, f"{session_id} settlement 数量不是 1")
-            payload = settlements[0]["payload"]
-            require(payload.get("outcome") == expected_outcome, f"{session_id} outcome 错误")
-            if expected_outcome == "completed":
-                require(
-                    set(payload) == {"outcome", "finalMessageId"},
-                    "completed settlement 字段错误",
-                )
-                require(
-                    any(
-                        event["type"] == "message.committed"
-                        and event["runId"] == run_id
-                        and event["payload"].get("role") == "assistant"
-                        and event["payload"].get("messageId") == payload["finalMessageId"]
-                        for event in events
-                    ),
-                    "completed settlement 未绑定 LLM answer",
-                )
-            elif expected_outcome == "cancelled":
-                require(payload == {"outcome": "cancelled"}, "cancelled settlement 字段错误")
-            else:
-                require(
-                    payload.get("error", {}).get("code")
-                    == "session_control_plan_steps_invalid",
-                    "失败根因漂移",
-                )
-
-        execute_confirmations = [
-            event for event in by_session[execute_session]
-            if event["type"] == "plan.confirmed"
-        ]
-        require(len(execute_confirmations) == 1, "EXECUTE Plan confirmation 数量错误")
-        confirmed = execute_confirmations[0]["payload"]
-        require(confirmed.get("revision") == 1, "Plan confirmation revision 错误")
-        authorities = confirmed.get("authorities", [])
-        require(len(authorities) == 1, "Plan 确认没有产生单一 authority")
-        authority = authorities[0]
-        require(authority["sessionId"] == execute_session, "PlanAuthority sessionId 错误")
-        require("runId" not in authority, "PlanAuthority 不应绑定单一 runId")
-        require(authority["revision"] == 1, "PlanAuthority revision 错误")
-        require(authority["decisionId"] == confirmed["decisionId"], "PlanAuthority decisionId 错误")
-        require(authority["workspaceId"] == execute_workspace_id, "PlanAuthority workspaceId 错误")
-        require(
-            authority["coveredOperations"] == [{
-                "workspaceId": execute_workspace_id,
-                "operation": "fs.create",
-                "target": "executed.txt",
-            }],
-            "PlanAuthority coverage 错误",
-        )
-
-        feedback_session = next(
-            sid for sid, (_, outcome) in expected_runs.items()
-            if outcome == "completed"
-            and sid != execute_session
-            and any(
-                event["payload"].get("providerCallId") == "plan:feedback"
-                for event in by_session[sid]
-                if event["type"] == "plan.published"
-            )
-        )
-        feedback_events = by_session[feedback_session]
-        require(
-            len([event for event in feedback_events if event["type"] == "plan.revision.requested"]) == 1,
-            "Plan revision request 事实错误",
-        )
-        require(
-            len([event for event in feedback_events if event["type"] == "plan.superseded"]) == 1,
-            "旧 Plan revision 未 supersede",
-        )
-        revised_confirmation = next(
-            event["payload"] for event in feedback_events
-            if event["type"] == "plan.confirmed"
-        )
-        require(revised_confirmation["revision"] == 2, "修订 Plan revision 错误")
-        require(revised_confirmation["authorities"] == [], "无 mutation 修订 Plan 意外产生 authority")
-
-        plan_cancel_session = next(
-            sid for sid, (_, outcome) in expected_runs.items()
-            if outcome == "completed"
-            and sid != execute_session
-            and any(
-                event["payload"].get("providerCallId") == "plan:ignore"
-                for event in by_session[sid]
-                if event["type"] == "plan.published"
-            )
-        )
-        require(
-            len([
-                event for event in by_session[plan_cancel_session]
-                if event["type"] == "plan.cancelled"
-            ]) == 1,
-            "Plan cancel 事实错误",
-        )
-        require(
-            not any(
-                event["type"] == "plan.confirmed"
-                for event in by_session[plan_cancel_session]
-            ),
-            "Plan cancel 意外产生 confirmation",
-        )
-
-        todo_sessions = [
-            sid for sid, events in by_session.items()
-            if any(event["type"] == "todo.progressed" for event in events)
-        ]
-        require(len(todo_sessions) == 1, f"复杂任务 Todo Session 数量错误：{todo_sessions}")
-        todo_seed = next(
-            event for event in by_session[todo_sessions[0]]
-            if event["type"] == "todo.seeded"
-        )
-        require(
-            [item["sourceStepId"] for item in todo_seed["payload"]["items"]]
-            == ["step:inspect", "step:analyze", "step:answer"],
-            "Todo seed 没有绑定 Plan steps",
-        )
-        todo_events = [
-            event for event in by_session[todo_sessions[0]]
-            if event["type"] == "todo.progressed"
-        ]
-        require(
-            [event["payload"]["providerCallId"] for event in todo_events]
-            == ["todo:complex:start", "todo:complex:done"],
-            "Todo durable Provider 调用顺序错误",
-        )
-        require(
-            [item["status"] for item in todo_events[0]["payload"]["updates"]]
-            == ["inProgress", "pending", "pending"],
-            "Todo 初始状态错误",
-        )
-        require(
-            all(item["status"] == "completed" for item in todo_events[1]["payload"]["updates"]),
-            "Todo 完成状态错误",
-        )
-        require(
-            any(
-                event["type"] == "plan.completed"
-                for event in by_session[todo_sessions[0]]
-            ),
-            "Todo 全部完成后 Plan 未进入 completed",
-        )
-
-        command_counts = dict(connection.execute(
-            "SELECT session_id, COUNT(*) FROM session_commands GROUP BY session_id"
-        ).fetchall())
-        expected_command_counts = {
-            execute_session: 3,
-            feedback_session: 3,
-            plan_cancel_session: 2,
-            todo_sessions[0]: 2,
-        }
-        for session_id, (_, outcome) in expected_runs.items():
-            if session_id not in expected_command_counts:
-                expected_command_counts[session_id] = 2 if outcome == "cancelled" else 1
-        require(
-            command_counts == expected_command_counts,
-            f"命令 durable 数量错误：{command_counts}",
-        )
-        execute_tool_call_id = next(
-            event["callId"] for event in by_session[execute_session]
-            if event["type"] == "tool.requested"
-            and event["payload"].get("providerCallId") == "e2e-call-execute"
-        )
-        todo_tool_call_id = next(
-            event["callId"] for event in by_session[todo_sessions[0]]
-            if event["type"] == "tool.requested"
-            and event["payload"].get("providerCallId") == "e2e-call-todo-list"
-        )
-
-    with sqlite3.connect(f"file:{record_path}?mode=ro", uri=True) as connection:
-        rows = connection.execute(
-            "SELECT call_id, workspace_id, operation, logical_targets_json, record_json "
-            "FROM tool_records ORDER BY call_id"
-        ).fetchall()
-        require(len(rows) == 2, "ToolRecord 数量错误")
-        rows_by_call = {row[0]: row for row in rows}
-        require(
-            set(rows_by_call) == {execute_tool_call_id, todo_tool_call_id},
-            "ToolRecord 没有绑定 Session LogicalCallId",
-        )
-        call_id, workspace_id, operation, logical_targets, encoded = rows_by_call[
-            execute_tool_call_id
-        ]
-        record = json.loads(encoded)
-        require(call_id == execute_tool_call_id, "ToolRecord callId 错误")
-        require(workspace_id == execute_workspace_id, "ToolRecord workspaceId 错误")
-        require(operation == "fs.create", "ToolRecord operation 错误")
-        require(json.loads(logical_targets) == ["executed.txt"], "ToolRecord logical targets 错误")
-        require(record.get("outcome") == "completed", "ToolRecord outcome 错误")
-        require(
-            record.get("input") == {
-                "workspaceId": execute_workspace_id,
-                "path": "executed.txt",
-                "content": EXPECTED_CONTENT,
-            },
-            "ToolRecord 原始 input 漂移",
-        )
-        require(
-            record.get("authority", {}).get("source") == "plan",
-            "mutation 未使用 PlanAuthority",
-        )
-        prepared = record.get("preparedEffect", {})
-        require(prepared.get("workspaceId") == execute_workspace_id, "PreparedEffect workspaceId 错误")
-        require(prepared.get("operation") == "fs.create", "PreparedEffect operation 错误")
-        require(prepared.get("logicalTargets") == ["executed.txt"], "PreparedEffect target 错误")
-        require(
-            prepared.get("canonicalInvocation", {}).get("arguments", {}).get("path")
-            == "executed.txt",
-            "PreparedEffect canonical invocation 错误",
-        )
-        todo_call_id, todo_workspace_id, todo_operation, todo_targets, todo_encoded = rows_by_call[
-            todo_tool_call_id
-        ]
-        todo_record = json.loads(todo_encoded)
-        require(todo_call_id == todo_tool_call_id, "Todo ToolRecord callId 错误")
-        require(
-            todo_workspace_id == expected_todo_workspace_id,
-            "Todo ToolRecord workspaceId 错误",
-        )
-        require(todo_operation == "fs.list", "Todo ToolRecord operation 错误")
-        require(json.loads(todo_targets) == ["."], "Todo ToolRecord logical targets 错误")
-        require(todo_record.get("outcome") == "completed", "Todo ToolRecord outcome 错误")
-        require(
-            todo_record.get("authority") == {
-                "decision": "allow",
-                "source": "workspaceBinding",
-                "workspaceId": expected_todo_workspace_id,
-            },
-            "复杂任务目录读取没有使用当前 Session 的精确 workspace binding authority",
-        )
-
-    with sqlite3.connect(f"file:{catalog_path}?mode=ro", uri=True) as connection:
-        require(
-            connection.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0,
-            "删除项目后仍有项目",
-        )
-        session_ids = {
-            row[0] for row in connection.execute("SELECT session_id FROM session_catalog")
-        }
-        require(session_ids == set(expected_runs), "Catalog 和 Session Store 的 Session 不一致")
-        columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(session_catalog)")
-        }
-        require(
-            columns == {
-                "session_id",
-                "title",
-                "project_id",
-                "workspace_bindings_json",
-                "profile_id",
-                "created_at",
-                "updated_at",
-            },
-            f"Catalog Session 列不符合当前合同：{sorted(columns)}",
-        )
-
-
-def write_configuration(
-    config_root: Path,
-    provider_url: str,
-    *,
-    workspace_mutation: str = "plan",
-    engineering_decisions: str = "ask",
-) -> None:
-    settings = config_root / "config" / "user" / "local" / "settings"
-    settings.mkdir(parents=True)
-    profile = {
-        "profiles": [
-            {
-                "id": "e2e-primary",
-                "name": "Local E2E Primary",
-                "kind": "openaiCompatible",
-                "providerFlavor": "openai",
-                "baseUrl": provider_url,
-                "model": "mock-primary",
-                "contextWindowTokens": 4096,
-                "maxOutputTokens": 1024,
-                "enabled": True,
-            },
-            {
-                "id": "e2e-secondary",
-                "name": "Local E2E Secondary",
-                "kind": "openaiCompatible",
-                "providerFlavor": "openai",
-                "baseUrl": provider_url,
-                "model": "mock-secondary",
-                "contextWindowTokens": 4096,
-                "maxOutputTokens": 1024,
-                "enabled": True,
-            },
-        ],
-        "defaultProfileId": "e2e-primary",
-    }
-    (settings / "llm-profiles.json").write_text(
-        json.dumps(profile, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    user_settings = {
-        "gui.colorTheme": "light",
-        "agent.permissions.workspaceMutation": workspace_mutation,
-        "agent.permissions.engineeringDecisions": engineering_decisions,
-    }
-    (settings / "user-settings.json").write_text(
-        json.dumps(user_settings, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-
-def run_workspace_autonomy(daemon: OwnedDaemon, workspace: Path) -> None:
-    created = create_session(daemon, workspace_paths=[workspace])
-    session_id = created["sessionId"]
-    workspace_id = created["workspaceBindings"][0]["workspaceId"]
-    reply = command(
-        daemon,
-        session_id,
-        message_command(
-            session_id,
-            "command:autonomy:start",
-            "E2E AUTONOMY：直接完成绑定工作区修改，不发布 Plan。",
-        ),
-    )
-    require(reply.get("status") == "accepted", "AUTONOMY 消息未接纳")
-    completed = wait_projection(
-        daemon,
-        session_id,
-        lambda item: (item.get("run") or {}).get("status") == "completed",
-        "AUTONOMY completed",
-    )
-    require(completed.get("plans") == [], "关闭 Plan 门禁后仍发布了 Plan")
-    require(completed.get("todoList") is None, "无 Plan 的直接修改意外生成 Todo")
-    require(
-        (workspace / "autonomy.txt").read_text(encoding="utf-8")
-        == "workspace autonomy\n",
-        "完全访问工作区模式没有创建目标文件",
-    )
-
-    record_path = (
-        daemon.config_root / "runtime" / "agent-runtime" / "tool-record.sqlite3"
-    )
-    with sqlite3.connect(f"file:{record_path}?mode=ro", uri=True) as connection:
-        rows = connection.execute(
-            "SELECT workspace_id, operation, record_json FROM tool_records"
-        ).fetchall()
-    require(len(rows) == 1, "AUTONOMY ToolRecord 数量错误")
-    record_workspace_id, operation, encoded = rows[0]
-    record = json.loads(encoded)
-    require(record_workspace_id == workspace_id, "AUTONOMY workspaceId 错误")
-    require(operation == "fs.create", "AUTONOMY operation 错误")
-    require(
-        record.get("authority") == {
-            "decision": "allow",
-            "source": "userSetting",
-            "authorityId": "user-setting:agent.permissions.workspaceMutation",
-            "workspaceId": workspace_id,
-        },
-        "AUTONOMY 写入没有使用显式工作区权限设置",
-    )
-
-
 def main() -> None:
-    provider_state = ProviderState()
-    provider_server = MockProviderServer(provider_state)
+    require(MCP_SERVER.is_file(), f"缺少 MCP fixture：{MCP_SERVER}")
+    provider = ProviderState()
+    provider_server = MockProviderServer(provider)
     provider_thread = threading.Thread(target=provider_server.serve_forever, daemon=True)
     provider_thread.start()
     daemon_one: OwnedDaemon | None = None
     daemon_two: OwnedDaemon | None = None
-    daemon_three: OwnedDaemon | None = None
+    cli_ask: subprocess.Popen[str] | None = None
     try:
-        with tempfile.TemporaryDirectory(prefix="deepcode-agent-runtime-e2e-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="deepcode-basic-loop-e2e-") as temporary:
             root = Path(temporary)
             config_root = root / "config-root"
-            primary = root / "primary-workspace"
-            secondary = root / "secondary-workspace"
+            workspace_root = root / "workspace"
+            skill_root = root / "runtime-skill"
             config_root.mkdir()
-            primary.mkdir()
-            secondary.mkdir()
-            provider_state.forbid_roots([primary, secondary])
+            workspace_root.mkdir()
+            skill_root.mkdir()
+            write_pdf_fixture(workspace_root / "fixture.pdf", PDF_CONTENT)
+            attachment_file = root / "e2e-note.txt"
+            attachment_file.write_text(ATTACHMENT_CONTENT, encoding="utf-8")
+            skill_file = skill_root / "SKILL.md"
+            skill_file.write_text(f"# Runtime fixture\n\n{GENERATION_ONE}\n", encoding="utf-8")
+
+            old_plugins = plugin_settings(
+                skill_root,
+                "fixture-skill-old",
+                "fixture-old",
+                "Fixture Old",
+            )
+            new_plugins = plugin_settings(
+                skill_root,
+                "fixture-skill-new",
+                "fixture-new",
+                "Fixture New",
+            )
             provider_url = f"http://127.0.0.1:{provider_server.server_port}/v1"
-            write_configuration(config_root, provider_url)
+            user_settings = {
+                "agent.systemPrompt": "",
+                "agent.permissions.workspaceMutation": "plan",
+                "agent.permissions.engineeringDecisions": "ask",
+                "agent.permissions.networkRead": "allow",
+                "agent.permissions.external": "allow",
+                "agent.web.search.endpointTemplate": (
+                    f"http://127.0.0.1:{provider_server.server_port}/search"
+                    "?q={query}&limit={limit}"
+                ),
+                **old_plugins,
+            }
+            write_configuration(config_root, provider_url, user_settings)
 
             daemon_one = OwnedDaemon(config_root)
             daemon_one.start()
-            settings = api_json(
-                daemon_one.base_url,
-                "/api/user-settings",
-                token=daemon_one.token,
-            )
+            created = create_session(daemon_one, workspace_root)
+            session_id = created["sessionId"]
+            creation_bindings = created.get("workspaceBindings")
             require(
-                settings.get("settings", {}).get("gui.colorTheme") == "light",
-                "当前用户设置没有进入 Host 投影",
+                isinstance(creation_bindings, list) and len(creation_bindings) == 1,
+                "新项目 Session 没有原子绑定唯一 workspace creation snapshot",
             )
-            exercise_catalog(daemon_one, primary, secondary)
+            assert_legacy_attachment_command_rejected(daemon_one, session_id)
+            require(provider.count() == 0, "旧附件命令在拒绝前错误启动了 Provider")
+            cli_ask = start_cli_ask_with_file(
+                daemon_one,
+                session_id,
+                attachment_file,
+                "第一轮链路输入。",
+            )
 
-            execute_session, execute_run, execute_revision, workspace_id = run_execute(
-                daemon_one,
-                primary,
-                provider_state,
+            def first_provider_request_started() -> bool:
+                provider.assert_healthy()
+                if cli_ask is not None and cli_ask.poll() is not None:
+                    cli_stdout, cli_stderr = cli_ask.communicate()
+                    raise AssertionError(
+                        "CLI 在首个 Provider 请求前退出"
+                        f" code={cli_ask.returncode}"
+                        f"\nstdout:\n{cli_stdout}"
+                        f"\nstderr:\n{cli_stderr}"
+                        f"\ndaemon:\n{daemon_one.log_tail()}"
+                    )
+                if daemon_one.process is not None and daemon_one.process.poll() is not None:
+                    raise AssertionError(
+                        "Daemon 在首个 Provider 请求前退出"
+                        f" code={daemon_one.process.returncode}"
+                        f"\n{daemon_one.log_tail()}"
+                    )
+                return provider.first_started()
+
+            wait_until(
+                first_provider_request_started,
+                12,
+                "第一轮 Provider 请求未开始",
             )
-            feedback_session, feedback_run = run_feedback(daemon_one, primary)
-            plan_cancel_session, plan_cancel_run = run_plan_cancel(daemon_one, primary)
-            cancel_session, cancel_run = run_cancel(daemon_one, primary, provider_state)
-            failure_session, failure_run = run_failure(daemon_one, primary)
-            todo_session, todo_run, todo_revision, todo_workspace_id = run_todo(
-                daemon_one,
-                primary,
-                provider_state,
-            )
-            require(provider_state.count("EXECUTE") == 3, "EXECUTE Provider 调用数错误")
-            require(provider_state.count("FEEDBACK") == 3, "FEEDBACK Provider 调用数错误")
-            require(provider_state.count("PLAN_CANCEL") == 2, "PLAN_CANCEL Provider 调用数错误")
-            require(provider_state.count("CANCEL") == 1, "CANCEL Provider 调用数错误")
-            require(provider_state.count("FAIL") == 2, "FAIL Provider 调用数错误")
-            require(provider_state.count("TODO") == 4, "TODO Provider 调用数错误")
+
+            skill_file.write_text(f"# Runtime fixture\n\n{GENERATION_TWO}\n", encoding="utf-8")
+            patch_plugins(daemon_one, old_plugins, new_plugins)
+            provider.release_first_request.set()
+            first = wait_completed(daemon_one, provider, session_id, "first run completed")
+            cli_stdout, cli_stderr = cli_ask.communicate(timeout=18)
+            require(cli_ask.returncode == 0, f"CLI ask --file 失败：{cli_stderr}")
+            require("round-one-complete" in cli_stdout, "CLI ask 未显示第一轮回答")
+            cli_ask = None
+            require(first.get("messages", [])[-1].get("content") == "round-one-complete", "第一轮回答未贯通")
+            first_input = first.get("messages", [])[0]
+            filesystem_references = first_input.get("filesystemReferences")
+            require(isinstance(filesystem_references, list) and len(filesystem_references) == 1, "Host 未返回唯一文件引用")
+            require(filesystem_references[0].get("logicalPath") == "e2e-note.txt", "逻辑文件名漂移")
+            require(filesystem_references[0].get("mediaType") == "text/plain", "文本媒体类型漂移")
             require(
-                provider_state.models("EXECUTE") == [
-                    "mock-primary", "mock-secondary", "mock-secondary",
-                ],
-                f"中途模型切换未作用于后续 Provider 调用："
-                f"{provider_state.models('EXECUTE')}",
+                set(filesystem_references[0]) == {
+                    "referenceId", "workspaceId", "logicalPath", "displayName", "kind",
+                    "mediaType", "byteLength",
+                },
+                "共享 SessionProjection 的文件引用字段不精确",
             )
-            assert_shells_read_shared_projection(
-                daemon_one,
-                execute_session,
-                execute_revision,
-                primary,
-            )
-            expected_runs = {
-                execute_session: (execute_run, "completed"),
-                feedback_session: (feedback_run, "completed"),
-                plan_cancel_session: (plan_cancel_run, "completed"),
-                cancel_session: (cancel_run, "cancelled"),
-                failure_session: (failure_run, "failed"),
-                todo_session: (todo_run, "completed"),
-            }
-            calls_before_restart = provider_state.count()
+
+            submit_message(daemon_one, session_id, "command-round-two", "第二轮链路输入。")
+            final = wait_completed(daemon_one, provider, session_id, "second run completed")
+            provider.assert_healthy()
+            require(provider.count() == 4, "两轮 tool/continuation Provider 调用数不是四次")
+            require(provider.old_wire_name() != provider.new_wire_name(), "MCP wire tool 未热更新")
+            assert_runtime_activated(daemon_one, new_plugins)
+            assert_projection_flow(final)
+            final_revision = int(final["revision"])
+
             daemon_one.shutdown()
-            inspect_sqlite(
-                config_root,
-                expected_runs,
-                execute_session,
-                workspace_id,
-                todo_workspace_id,
-            )
+            assert_identity_chain(config_root, session_id)
+
             daemon_two = OwnedDaemon(config_root)
             daemon_two.start()
-            recovered = projection(daemon_two, execute_session)
-            require(
-                (recovered.get("run") or {}).get("status") == "completed",
-                "重启后 completed 丢失",
-            )
-            require(int(recovered["revision"]) == execute_revision, "重启后 projection revision 漂移")
-            require(
-                (primary / "executed.txt").read_text() == EXPECTED_CONTENT,
-                "重启后文件事实改变",
-            )
-            recovered_todo = projection(daemon_two, todo_session)
-            require(
-                (recovered_todo.get("run") or {}).get("status") == "completed",
-                "重启后复杂任务 completed 丢失",
-            )
-            require(
-                int(recovered_todo["revision"]) == todo_revision,
-                "重启后 Todo projection revision 漂移",
+            recovered = projection(daemon_two, session_id)
+            require((recovered.get("run") or {}).get("status") == "completed", "重启后完成态丢失")
+            require(int(recovered["revision"]) == final_revision, "重启后 projection revision 漂移")
+            assert_projection_flow(recovered)
+            assert_provider_count_stable(provider, 4)
+            assert_shells_read_projection(daemon_two, session_id, final_revision)
+            attachment_root = config_root / "runtime" / "agent-runtime" / "attachments"
+            require(any(attachment_root.rglob("e2e-note.txt")), "Host 文件快照未持有到 Session 生命周期")
+            path_id = urllib.parse.quote(session_id, safe="")
+            api_json(
+                daemon_two.base_url,
+                f"/api/conversation/sessions/{path_id}",
+                token=daemon_two.token,
+                method="DELETE",
+                timeout=12,
             )
             require(
-                all(
-                    item.get("status") == "completed"
-                    for item in (recovered_todo.get("todoList") or {}).get("items", [])
-                ),
-                "重启后 durable Todo 投影丢失",
-            )
-            assert_count_stable(
-                provider_state,
-                calls_before_restart,
-                0.35,
-                "恢复 settled Session 时重复调用 Provider",
+                not attachment_root.exists() or not any(attachment_root.iterdir()),
+                "Session 删除后 Host 文件快照仍然存在",
             )
             daemon_two.shutdown()
-            inspect_sqlite(
-                config_root,
-                expected_runs,
-                execute_session,
-                workspace_id,
-                todo_workspace_id,
-            )
-            autonomy_config_root = root / "autonomy-config-root"
-            autonomy_workspace = root / "autonomy-workspace"
-            autonomy_config_root.mkdir()
-            autonomy_workspace.mkdir()
-            provider_state.forbid_roots([primary, secondary, autonomy_workspace])
-            write_configuration(
-                autonomy_config_root,
-                provider_url,
-                workspace_mutation="allow",
-                engineering_decisions="delegate",
-            )
-            daemon_three = OwnedDaemon(autonomy_config_root)
-            daemon_three.start()
-            run_workspace_autonomy(daemon_three, autonomy_workspace)
-            require(provider_state.count("AUTONOMY") == 2, "AUTONOMY Provider 调用数错误")
-            daemon_three.shutdown()
+
             print(
                 "[local-agent-e2e] PASS "
-                "plan/todo/autonomy/catalog/snapshot/replay/restart/cli/tui/failure"
+                "basic-loop/sequential-tools/web/first-party-plugin/pdf-binding/cache/release/restart/"
+                "filesystem-reference/shared-projection "
+                "(CLI chain verification only; not GUI, package, or release acceptance)"
             )
     finally:
-        provider_state.release_cancel.set()
-        provider_state.release_todo_continuation.set()
+        provider.release_first_request.set()
+        if cli_ask is not None:
+            cli_ask.terminate()
+            try:
+                cli_ask.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                cli_ask.kill()
+                cli_ask.wait(timeout=3)
         if daemon_two is not None:
             daemon_two.close()
-        if daemon_three is not None:
-            daemon_three.close()
         if daemon_one is not None:
             daemon_one.close()
         provider_server.shutdown()

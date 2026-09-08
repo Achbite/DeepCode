@@ -20,13 +20,15 @@ import type { WorkspaceSummary } from './workspace.js';
  */
 export interface HealthStatus {
   service: 'deepcode-host-web' | 'deepcode-kernel-daemon' | string;
-  status: 'ok';
+  ok: boolean;
+  status: 'ok' | 'degraded';
   version?: string;
   timestamp?: string;
   buildCommit?: string;
   kernelAbiVersion?: string;
   protocolVersion?: string;
-  kernel?: string;
+  kernel: 'ready';
+  session: 'ready' | 'unavailable';
   /** 当前活动工作区摘要；无工作区时 available=false */
   workspace: WorkspaceSummary;
 }

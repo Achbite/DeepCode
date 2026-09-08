@@ -4,15 +4,23 @@ import type {
   ArtifactProjection,
   PendingPlanProjection,
   PlanProjection,
+  ProviderOutputBlock,
+  RunSettlement,
+  RunRuntimeSnapshot,
   SessionEvent,
   SessionProjection,
   ShellExecutionEnvironmentProjection,
   ToolExecutionRecord,
   WorkspaceBindingDisplay,
 } from '@deepcode/protocol';
-import { SESSION_PROJECTION_VERSION } from '@deepcode/protocol';
+import {
+  SESSION_CONTROL_INTERACTION_REQUEST,
+  SESSION_CONTROL_PLAN_PUBLISH,
+  SESSION_PROJECTION_VERSION,
+} from '@deepcode/protocol';
 
 export interface SessionState {
+  modelSettings: SessionProjection['modelSettings'];
   sessionId: string;
   revision: number;
   display: SessionProjection['display'];
@@ -31,14 +39,46 @@ export interface SessionState {
   contextCompositions: SessionProjection['contextCompositions'];
   tokenUsage: SessionProjection['tokenUsage'];
   tokenUsageHistory: Record<string, SessionProjection['tokenUsageHistory'][number]>;
+  runRuntimeSnapshots: Record<string, RunRuntimeSnapshot>;
+  pendingRunSettlements: Record<string, RunSettlement>;
+  runRuntimeReleases: Record<
+    string,
+    Extract<SessionEvent, { type: 'run.runtime.released' }>['payload']
+  >;
+  providerTurns: Record<string, ProviderTurnState>;
+  providerUsageRequestIds: Record<string, true>;
+  providerCallFacts: Record<string, ProviderCallFactState>;
   run: SessionProjection['run'];
   activities: Record<string, ActivityProjection>;
   artifacts: Record<string, ArtifactProjection>;
   terminalError: SessionProjection['terminalError'];
 }
 
+export interface ProviderTurnState {
+  runId: string;
+  providerRequestId: string;
+  purpose: 'agent' | 'contextCompaction';
+  providerRuntimeRef: string;
+  outcome: 'completed' | 'failed' | 'indeterminate';
+  orderedCallIds?: string[];
+  reasoningContent?: string;
+  reasoningSignature?: string;
+  hostedWebSearchCalls?: Record<string, unknown>[];
+  orderedOutputBlocks?: ProviderOutputBlock[];
+  error?: { code: string; message: string };
+  sequence: number;
+}
+
+export interface ProviderCallFactState {
+  runId: string;
+  providerCallId: string;
+  toolName: string;
+  sequence: number;
+}
+
 export function emptySessionState(sessionId: string): SessionState {
   return {
+    modelSettings: null,
     sessionId,
     revision: 0,
     display: { creationTitle: '新对话' },
@@ -57,13 +97,22 @@ export function emptySessionState(sessionId: string): SessionState {
     contextCompositions: [],
     tokenUsage: {
       providerCallCount: 0,
+      reportedCallCount: 0,
       inputTokens: 0,
       outputTokens: 0,
       cacheReadInputTokens: 0,
       cacheMissInputTokens: 0,
-      cacheReportedCallCount: 0,
+      cacheAvailable: false,
+      cacheComplete: false,
+      cacheHitRatio: null,
     },
     tokenUsageHistory: {},
+    runRuntimeSnapshots: {},
+    pendingRunSettlements: {},
+    runRuntimeReleases: {},
+    providerTurns: {},
+    providerUsageRequestIds: {},
+    providerCallFacts: {},
     run: null,
     activities: {},
     artifacts: {},
@@ -79,13 +128,14 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
     ...previous,
     revision: event.sequence,
     display: { ...previous.display },
+    modelSettings: previous.modelSettings ? { ...previous.modelSettings } : null,
     creationWorkspaceBindings: previous.creationWorkspaceBindings.map((binding) => ({ ...binding })),
     sessionDirectoryIndexes: previous.sessionDirectoryIndexes.map((binding) => ({ ...binding })),
     workspaceBindings: previous.workspaceBindings.map((binding) => ({ ...binding })),
     messages: previous.messages.map((message) => ({
       ...message,
-      attachments: message.attachments.map((attachment) => ({ ...attachment })),
-      directoryAttachments: message.directoryAttachments.map((attachment) => ({ ...attachment })),
+      filesystemReferences: message.filesystemReferences.map((reference) => ({ ...reference })),
+      pluginSelections: message.pluginSelections.map((selection) => ({ ...selection })),
     })),
     narratives: previous.narratives.map((narrative) => ({ ...narrative })),
     pendingInteraction: cloneInteraction(previous.pendingInteraction),
@@ -100,6 +150,31 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
     tokenUsageHistory: Object.fromEntries(
       Object.entries(previous.tokenUsageHistory).map(([runId, usage]) => [runId, { ...usage }]),
     ),
+    runRuntimeSnapshots: Object.fromEntries(
+      Object.entries(previous.runRuntimeSnapshots).map(([runId, snapshot]) => (
+        [runId, cloneRunRuntimeSnapshot(snapshot)]
+      )),
+    ),
+    pendingRunSettlements: Object.fromEntries(
+      Object.entries(previous.pendingRunSettlements).map(([runId, settlement]) => [
+        runId,
+        cloneRunSettlement(settlement),
+      ]),
+    ),
+    runRuntimeReleases: Object.fromEntries(
+      Object.entries(previous.runRuntimeReleases).map(([runId, receipt]) => [
+        runId,
+        { ...receipt, pluginInstanceRefs: [...receipt.pluginInstanceRefs] },
+      ]),
+    ),
+    providerTurns: Object.fromEntries(
+      Object.entries(previous.providerTurns).map(([requestId, turn]) => (
+        [requestId, cloneProviderTurn(turn)]
+      )),
+    ),
+    providerUsageRequestIds: { ...previous.providerUsageRequestIds },
+    providerCallFacts: Object.fromEntries(Object.entries(previous.providerCallFacts)
+      .map(([callId, fact]) => [callId, { ...fact }])),
     run: previous.run ? cloneRun(previous.run) : null,
     activities: Object.fromEntries(
       Object.entries(previous.activities).map(([id, activity]) => [id, cloneActivity(activity)]),
@@ -111,7 +186,12 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
   };
 
   switch (event.type) {
+    case 'session.model-settings.updated':
+      next.modelSettings = { ...event.payload.settings };
+      break;
     case 'session.created':
+      next.modelSettings = event.payload.profileId
+        ? { profileId: event.payload.profileId, reasoningEffortOverride: null } : null;
       next.display = { creationTitle: event.payload.displayTitle };
       next.creationWorkspaceBindings = event.payload.workspaceBindings.map((binding) => ({ ...binding }));
       next.sessionDirectoryIndexes = [];
@@ -150,18 +230,27 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
           sequence: event.sequence,
           startedAt: event.occurredAt,
           providerCallCount: 0,
+          reportedCallCount: 0,
           inputTokens: 0,
           outputTokens: 0,
           cacheReadInputTokens: 0,
           cacheMissInputTokens: 0,
-          cacheReportedCallCount: 0,
+          cacheAvailable: false,
+          cacheComplete: false,
+          cacheHitRatio: null,
         };
+        if (next.runRuntimeSnapshots[event.runId]) {
+          throw new Error('run_runtime_snapshot_duplicate');
+        }
+        next.runRuntimeSnapshots[event.runId] = cloneRunRuntimeSnapshot(
+          event.payload.runtimeSnapshot,
+        );
       }
       next.run = {
         runId: event.runId,
         status: 'running',
         workspaceBindings: event.payload.workspaceBindings.map((binding) => ({ ...binding })),
-        ...(event.payload.profileId ? { profileId: event.payload.profileId } : {}),
+        profileId: event.payload.runtimeSnapshot.provider.profileId,
       };
       next.terminalError = null;
       next.activities[runActivityId(event.runId)] = {
@@ -173,28 +262,49 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         sequence: event.sequence,
       };
       break;
-    case 'run.profile.selected':
-      assertCurrentRun(next, event.runId, 'run_profile_selection_identity_mismatch');
-      next.run = { ...next.run!, profileId: event.payload.profileId };
-      break;
     case 'message.committed':
-      next.messages.push({
-        messageId: event.payload.messageId,
-        role: event.payload.role,
-        content: event.payload.content,
-        attachments: (event.payload.attachments ?? []).map((attachment) => ({
-          attachmentId: attachment.attachmentId,
-          name: attachment.name,
-          mediaType: attachment.mediaType,
-          byteLength: new TextEncoder().encode(attachment.content).byteLength,
-        })),
-        directoryAttachments: (event.payload.directoryAttachments ?? []).map((attachment) => ({
-          ...attachment,
-        })),
-        feedback: null,
-        sequence: event.sequence,
-        createdAt: event.occurredAt,
-      });
+      {
+        const common = {
+          messageId: event.payload.messageId,
+          content: event.payload.content,
+          filesystemReferences: (event.payload.filesystemReferences ?? []).map((reference) => ({
+            ...reference,
+          })),
+          pluginSelections: (event.payload.pluginSelections ?? []).map((selection) => ({
+            ...selection,
+          })),
+          feedback: null,
+          sequence: event.sequence,
+          createdAt: event.occurredAt,
+        };
+        if (event.payload.role === 'assistant') {
+          if (!event.runId) throw new Error('assistant_message_run_identity_missing');
+          const turn = requiredProviderTurn(
+            next,
+            event.runId,
+            event.payload.providerRequestId,
+            'agent',
+          );
+          assertProviderMessageReference(
+            turn,
+            'finalMessage',
+            event.payload.messageId,
+            event.payload.content,
+          );
+          next.messages.push({
+            ...common,
+            role: 'assistant',
+            runId: event.runId,
+            providerRequestId: event.payload.providerRequestId,
+          });
+        } else {
+          next.messages.push({
+            ...common,
+            role: event.payload.role,
+            ...(event.runId ? { runId: event.runId } : {}),
+          });
+        }
+      }
       break;
     case 'message.feedback.updated': {
       const index = next.messages.findIndex((message) => message.messageId === event.payload.messageId);
@@ -205,18 +315,34 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     }
     case 'narrative.committed':
+      assertProviderMessageReference(
+        requiredProviderTurn(next, event.runId, event.payload.providerRequestId, 'agent'),
+        'narrative',
+        event.payload.narrativeId,
+        event.payload.content,
+      );
       next.narratives.push({
         narrativeId: event.payload.narrativeId,
         runId: event.runId,
+        providerRequestId: event.payload.providerRequestId,
         content: event.payload.content,
         sequence: event.sequence,
         createdAt: event.occurredAt,
       });
       break;
     case 'interaction.requested':
+      recordProviderCallFact(
+        next,
+        event.callId,
+        event.runId,
+        event.payload.providerCallId,
+        SESSION_CONTROL_INTERACTION_REQUEST,
+        event.sequence,
+      );
       next.pendingInteraction = {
         interactionId: event.payload.interactionId,
         runId: event.runId,
+        callId: event.callId,
         kind: event.payload.kind,
         prompt: event.payload.prompt,
         allowFreeform: event.payload.allowFreeform,
@@ -232,6 +358,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         status: 'waiting',
         label: event.payload.prompt,
         runId: event.runId,
+        callId: event.callId,
         sequence: event.sequence,
       };
       break;
@@ -250,6 +377,14 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         throw new Error('plan_revision_duplicate');
       }
       const plan = projectPlan(event);
+      recordProviderCallFact(
+        next,
+        event.callId,
+        event.runId,
+        event.payload.providerCallId,
+        SESSION_CONTROL_PLAN_PUBLISH,
+        event.sequence,
+      );
       next.plans.push(plan);
       next.pendingPlan = { ...clonePlanProjection(plan), responseMode: 'confirmReviseOrCancel' };
       next.activities[planActivityId(event.payload.planId, event.payload.revision)] = {
@@ -423,6 +558,9 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
     }
     case 'todo.progressed': {
       assertRunningRun(next, event.runId, 'todo_run_not_active');
+      if (event.callId && event.payload.providerCallId) {
+        recordProviderCallFact(next, event.callId, event.runId, event.payload.providerCallId, 'plan.progress', event.sequence);
+      }
       if (
         !next.todoList
         || next.todoList.sourcePlanId !== event.payload.sourcePlanId
@@ -457,6 +595,14 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     }
     case 'tool.requested':
+      recordProviderCallFact(
+        next,
+        event.callId,
+        event.runId,
+        event.payload.providerCallId,
+        event.payload.toolName,
+        event.sequence,
+      );
       next.activities[toolActivityId(event.callId)] = {
         activityId: toolActivityId(event.callId),
         kind: 'tool',
@@ -501,6 +647,13 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       settleActivity(next, approvalActivityId(event.payload.approvalId), 'completed', event.sequence);
       resumeRun(next, event.runId);
       break;
+    case 'tool.input-rejected':
+      settleActivity(next, toolActivityId(event.callId), 'rejected', event.sequence);
+      next.activities[toolActivityId(event.callId)] = {
+        ...next.activities[toolActivityId(event.callId)],
+        inputRejection: structuredClone(event.payload.rejection.error),
+      };
+      break;
     case 'tool.completed':
       settleActivity(
         next,
@@ -518,10 +671,41 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     case 'session.control.rejected':
       assertRunningRun(next, event.runId, 'session_control_rejection_run_not_active');
+      recordProviderCallFact(
+        next,
+        event.callId,
+        event.runId,
+        event.payload.providerCallId,
+        event.payload.toolName,
+        event.sequence,
+      );
+      if (event.payload.error.code !== 'plan_revision_unchanged') {
+        next.activities[toolActivityId(event.callId)] = {
+          activityId: toolActivityId(event.callId),
+          kind: 'tool',
+          status: 'rejected',
+          label: event.payload.toolName,
+          runId: event.runId,
+          callId: event.callId,
+          sequence: event.sequence,
+          inputRejection: {
+            ...event.payload.error,
+            issues: [{ path: '$', rule: 'session_control_schema', message: event.payload.error.message }],
+          },
+        };
+      }
       break;
     case 'context.compaction.requested':
+      assertRunningRun(next, event.runId, 'context_compaction_run_not_active');
+      break;
     case 'context.compacted':
       assertRunningRun(next, event.runId, 'context_compaction_run_not_active');
+      requiredProviderTurn(
+        next,
+        event.runId,
+        event.payload.providerRequestId,
+        'contextCompaction',
+      );
       break;
     case 'context.composed':
       assertRunningRun(next, event.runId, 'provider_request_run_not_active');
@@ -534,10 +718,16 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         providerRequestId: event.payload.providerRequestId,
         purpose: event.payload.purpose,
         responseConstraint: event.payload.responseConstraint,
+        stableCoreHash: event.payload.stableCoreHash,
+        baseToolSchemaHash: event.payload.baseToolSchemaHash,
+        selectedPluginSnapshotHash: event.payload.selectedPluginSnapshotHash,
+        dynamicInstructionBytes: event.payload.dynamicInstructionBytes,
         messages: event.payload.messages.map((message) => ({
           ...message,
           blocks: message.blocks.map((block) => ({ ...block })),
-          attachments: message.attachments.map((attachment) => ({ ...attachment })),
+          filesystemReferences: message.filesystemReferences.map((reference) => ({
+            ...reference,
+          })),
         })),
         workspaceBindings: event.payload.workspaceBindings.map((binding) => ({ ...binding })),
         tools: event.payload.tools.map((tool) => ({ ...tool })),
@@ -546,65 +736,201 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         createdAt: event.occurredAt,
       });
       break;
+    case 'provider.turn.settled': {
+      assertRunningRun(next, event.runId, 'provider_turn_run_not_active');
+      const runtime = requiredRunRuntimeSnapshot(next, event.runId);
+      if (event.payload.providerRuntimeRef !== runtime.provider.providerRuntimeRef) {
+        throw new Error('provider_turn_runtime_identity_mismatch');
+      }
+      const receipt = next.contextCompositions.find((candidate) => (
+        candidate.runId === event.runId
+        && candidate.providerRequestId === event.payload.providerRequestId
+      ));
+      if (!receipt || receipt.purpose !== event.payload.purpose) {
+        throw new Error('provider_turn_composition_missing');
+      }
+      if (next.providerTurns[event.payload.providerRequestId]) {
+        throw new Error('provider_turn_completion_duplicate');
+      }
+      const currentTurnCallFacts = Object.entries(next.providerCallFacts)
+        .filter(([, fact]) => (
+          fact.runId === event.runId
+          && fact.sequence > receipt.sequence
+          && fact.sequence < event.sequence
+        ))
+        .sort((left, right) => left[1].sequence - right[1].sequence);
+      const currentTurnCallIds = currentTurnCallFacts.map(([callId]) => callId);
+      const settlement = event.payload;
+      if (settlement.outcome === 'completed') {
+        if (new Set(settlement.orderedCallIds).size !== settlement.orderedCallIds.length) {
+          throw new Error('provider_turn_call_order_invalid');
+        }
+        if (
+          currentTurnCallIds.length !== settlement.orderedCallIds.length
+          || currentTurnCallIds.some((callId, index) => (
+            callId !== settlement.orderedCallIds[index]
+          ))
+        ) {
+          throw new Error('provider_turn_call_order_mismatch');
+        }
+        if (settlement.orderedOutputBlocks !== undefined) {
+          validateOrderedProviderOutputBlocks(
+            settlement.orderedOutputBlocks,
+            settlement.orderedCallIds,
+          );
+          const orderedToolCalls = settlement.orderedOutputBlocks.filter((block) => (
+            block.kind === 'toolCall'
+          ));
+          if (orderedToolCalls.some((block, index) => {
+            const fact = currentTurnCallFacts[index];
+            return !fact
+              || fact[0] !== block.callId
+              || fact[1].providerCallId !== block.providerCallId
+              || fact[1].toolName !== block.toolName;
+          })) {
+            throw new Error('provider_turn_call_identity_mismatch');
+          }
+          if (settlement.purpose !== 'agent') {
+            throw new Error('provider_output_blocks_purpose_invalid');
+          }
+          if (
+            settlement.orderedOutputBlocks.some((block) => block.kind === 'providerHosted')
+            && runtime.webSearch.owner !== 'providerHosted'
+          ) {
+            throw new Error('provider_hosted_search_owner_mismatch');
+          }
+        }
+      } else if (currentTurnCallIds.length > 0) {
+        throw new Error('provider_turn_terminal_call_facts_invalid');
+      }
+      next.providerTurns[event.payload.providerRequestId] = {
+        runId: event.runId,
+        providerRequestId: event.payload.providerRequestId,
+        purpose: event.payload.purpose,
+        providerRuntimeRef: event.payload.providerRuntimeRef,
+        outcome: event.payload.outcome,
+        ...(event.payload.outcome === 'completed'
+          ? {
+              orderedCallIds: [...event.payload.orderedCallIds],
+              ...(event.payload.reasoningContent !== undefined
+                ? { reasoningContent: event.payload.reasoningContent }
+                : {}),
+              ...(event.payload.reasoningSignature !== undefined
+                ? { reasoningSignature: event.payload.reasoningSignature }
+                : {}),
+              ...(event.payload.hostedWebSearchCalls !== undefined
+                ? {
+                    hostedWebSearchCalls: event.payload.hostedWebSearchCalls
+                      .map((item) => structuredClone(item)),
+                  }
+                : {}),
+              ...(event.payload.orderedOutputBlocks !== undefined
+                ? {
+                    orderedOutputBlocks: event.payload.orderedOutputBlocks.map((block) => ({
+                      ...block,
+                      item: structuredClone(block.item),
+                    })),
+                  }
+                : {}),
+            }
+          : { error: { ...event.payload.error } }),
+        sequence: event.sequence,
+      };
+      if (settlement.outcome === 'completed') {
+        for (const block of settlement.orderedOutputBlocks ?? []) {
+          if (block.kind === 'toolCallRejected') {
+            if (next.providerCallFacts[block.callId] || next.activities[toolActivityId(block.callId)]) {
+              throw new Error('provider_turn_rejected_call_identity_duplicate');
+            }
+            next.activities[toolActivityId(block.callId)] = {
+              activityId: toolActivityId(block.callId),
+              kind: 'tool',
+              status: 'rejected',
+              label: block.toolName,
+              runId: event.runId,
+              callId: block.callId,
+              sequence: event.sequence,
+              inputRejection: structuredClone(block.error),
+            };
+          }
+          if (block.kind !== 'providerHosted') continue;
+          const status = block.item.status;
+          const action = block.item.action;
+          if (
+            status !== 'completed' && status !== 'failed'
+            || !isRecord(action)
+          ) throw new Error('provider_hosted_search_item_invalid');
+          next.activities[block.activityId] = {
+            activityId: block.activityId,
+            kind: 'providerHosted',
+            status,
+            label: 'web.search',
+            runId: event.runId,
+            sequence: event.sequence,
+            providerHosted: {
+              providerToolType: block.providerToolType,
+              providerCallId: block.providerCallId,
+              action: structuredClone(action),
+            },
+          };
+        }
+      }
+      next.tokenUsage = withProviderCompletion(next.tokenUsage);
+      const runUsage = next.tokenUsageHistory[event.runId];
+      if (!runUsage) throw new Error('token_usage_run_missing');
+      next.tokenUsageHistory[event.runId] = withProviderCompletion(runUsage);
+      // The last settled call owns this slot, even when it reports no usage.
+      next.contextUsage = null;
+      break;
+    }
     case 'context.updated': {
       assertRunningRun(next, event.runId, 'provider_usage_run_not_active');
       const providerRequestId = event.payload.providerRequestId;
+      requiredProviderTurn(next, event.runId, providerRequestId);
+      const runtime = requiredRunRuntimeSnapshot(next, event.runId);
+      if (
+        event.payload.providerRuntimeRef !== runtime.provider.providerRuntimeRef
+        || event.payload.contextWindowTokens !== runtime.provider.contextWindowTokens
+      ) {
+        throw new Error('provider_usage_runtime_identity_mismatch');
+      }
+      const cacheReadPresent = event.payload.cacheReadInputTokens !== undefined;
+      const cacheMissPresent = event.payload.cacheMissInputTokens !== undefined;
+      if (
+        cacheReadPresent !== cacheMissPresent
+        || cacheReadPresent
+          && addTokenCount(
+            event.payload.cacheReadInputTokens!,
+            event.payload.cacheMissInputTokens!,
+          ) !== event.payload.inputTokens
+      ) {
+        throw new Error('provider_usage_cache_invalid');
+      }
+      if (next.providerUsageRequestIds[providerRequestId]) {
+        throw new Error('provider_usage_duplicate');
+      }
       const receiptIndex = next.contextCompositions.findIndex((receipt) => (
         receipt.runId === event.runId
         && receipt.providerRequestId === providerRequestId
       ));
       if (receiptIndex < 0) throw new Error('provider_request_receipt_missing');
+      next.providerUsageRequestIds[providerRequestId] = true;
       const receipt = next.contextCompositions[receiptIndex];
       next.contextCompositions[receiptIndex] = {
         ...receipt,
         partitions: estimatePartitionTokens(receipt.partitions, event.payload.inputTokens),
       };
-      if (receipt.purpose === 'agent') {
-        next.contextUsage = {
-          ...event.payload,
-          providerRequestId,
-          runId: event.runId,
-          sequence: event.sequence,
-          updatedAt: event.occurredAt,
-        };
-      }
-      next.tokenUsage = {
-        providerCallCount: addTokenCount(next.tokenUsage.providerCallCount, 1),
-        inputTokens: addTokenCount(next.tokenUsage.inputTokens, event.payload.inputTokens),
-        outputTokens: addTokenCount(next.tokenUsage.outputTokens, event.payload.outputTokens),
-        cacheReadInputTokens: addTokenCount(
-          next.tokenUsage.cacheReadInputTokens,
-          event.payload.cacheReadInputTokens ?? 0,
-        ),
-        cacheMissInputTokens: addTokenCount(
-          next.tokenUsage.cacheMissInputTokens,
-          event.payload.cacheMissInputTokens ?? 0,
-        ),
-        cacheReportedCallCount: addTokenCount(
-          next.tokenUsage.cacheReportedCallCount,
-          event.payload.cacheReadInputTokens === undefined ? 0 : 1,
-        ),
+      next.contextUsage = {
+        ...event.payload,
+        providerRequestId,
+        runId: event.runId,
+        sequence: event.sequence,
+        updatedAt: event.occurredAt,
       };
+      next.tokenUsage = withProviderUsage(next.tokenUsage, event.payload);
       const runUsage = next.tokenUsageHistory[event.runId];
       if (!runUsage) throw new Error('token_usage_run_missing');
-      next.tokenUsageHistory[event.runId] = {
-        ...runUsage,
-        providerCallCount: addTokenCount(runUsage.providerCallCount, 1),
-        inputTokens: addTokenCount(runUsage.inputTokens, event.payload.inputTokens),
-        outputTokens: addTokenCount(runUsage.outputTokens, event.payload.outputTokens),
-        cacheReadInputTokens: addTokenCount(
-          runUsage.cacheReadInputTokens,
-          event.payload.cacheReadInputTokens ?? 0,
-        ),
-        cacheMissInputTokens: addTokenCount(
-          runUsage.cacheMissInputTokens,
-          event.payload.cacheMissInputTokens ?? 0,
-        ),
-        cacheReportedCallCount: addTokenCount(
-          runUsage.cacheReportedCallCount,
-          event.payload.cacheReadInputTokens === undefined ? 0 : 1,
-        ),
-      };
+      next.tokenUsageHistory[event.runId] = withProviderUsage(runUsage, event.payload);
       break;
     }
     case 'run.waiting':
@@ -613,10 +939,84 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         status: 'waiting',
         waitingReason: event.payload.reason,
         workspaceBindings: currentRunBindings(next, event.runId),
-        ...(next.run?.profileId ? { profileId: next.run.profileId } : {}),
+        profileId: requiredRunRuntimeSnapshot(next, event.runId).provider.profileId,
       };
       break;
+    case 'run.finishing':
+      assertCurrentRun(next, event.runId, 'run_finishing_identity_mismatch');
+      if (
+        next.pendingRunSettlements[event.runId]
+        || next.runRuntimeReleases[event.runId]
+        || !['running', 'waiting'].includes(next.run!.status)
+      ) throw new Error('run_finishing_state_invalid');
+      next.pendingRunSettlements[event.runId] = cloneRunSettlement(event.payload);
+      next.run = {
+        runId: event.runId,
+        status: 'releasing',
+        workspaceBindings: currentRunBindings(next, event.runId),
+        profileId: requiredRunRuntimeSnapshot(next, event.runId).provider.profileId,
+      };
+      next.pendingInteraction = null;
+      next.pendingApproval = null;
+      break;
+    case 'run.runtime.release_failed': {
+      assertCurrentRun(next, event.runId, 'run_runtime_release_failure_identity_mismatch');
+      const runtime = requiredRunRuntimeSnapshot(next, event.runId);
+      if (
+        !next.pendingRunSettlements[event.runId]
+        || next.runRuntimeReleases[event.runId]
+        || !['releasing', 'releaseFailed'].includes(next.run!.status)
+        || event.payload.runRuntimeSnapshotRef !== runtime.runRuntimeSnapshotRef
+        || event.payload.extensionGenerationRef !== runtime.extensionGenerationRef
+        || event.payload.kernelCatalogSnapshotRef !== runtime.kernelCatalogSnapshotRef
+        || event.payload.providerRuntimeRef !== runtime.provider.providerRuntimeRef
+      ) throw new Error('run_runtime_release_failure_state_invalid');
+      next.run = {
+        runId: event.runId,
+        status: 'releaseFailed',
+        workspaceBindings: currentRunBindings(next, event.runId),
+        profileId: runtime.provider.profileId,
+      };
+      next.terminalError = { ...event.payload.error };
+      break;
+    }
+    case 'run.runtime.released': {
+      assertCurrentRun(next, event.runId, 'run_runtime_release_identity_mismatch');
+      const runtime = requiredRunRuntimeSnapshot(next, event.runId);
+      if (
+        !next.pendingRunSettlements[event.runId]
+        || next.runRuntimeReleases[event.runId]
+        || !['releasing', 'releaseFailed'].includes(next.run!.status)
+        || event.payload.runRuntimeSnapshotRef !== runtime.runRuntimeSnapshotRef
+        || event.payload.extensionGenerationRef !== runtime.extensionGenerationRef
+        || event.payload.kernelCatalogSnapshotRef !== runtime.kernelCatalogSnapshotRef
+        || event.payload.providerRuntimeRef !== runtime.provider.providerRuntimeRef
+        || new Set(event.payload.pluginInstanceRefs).size !== event.payload.pluginInstanceRefs.length
+        || event.payload.pluginInstanceRefs.some((pluginInstanceRef) => (
+          !runtime.selectedPlugins.plugins.some((plugin) => (
+            plugin.pluginInstanceRef === pluginInstanceRef
+          ))
+        ))
+      ) throw new Error('run_runtime_release_receipt_invalid');
+      next.runRuntimeReleases[event.runId] = {
+        ...event.payload,
+        pluginInstanceRefs: [...event.payload.pluginInstanceRefs],
+      };
+      next.run = {
+        runId: event.runId,
+        status: 'releasing',
+        workspaceBindings: currentRunBindings(next, event.runId),
+        profileId: runtime.provider.profileId,
+      };
+      next.terminalError = null;
+      break;
+    }
     case 'run.settled':
+      if (
+        !next.pendingRunSettlements[event.runId]
+        || !next.runRuntimeReleases[event.runId]
+        || !sameRunSettlement(next.pendingRunSettlements[event.runId], event.payload)
+      ) throw new Error('run_settlement_release_receipt_missing');
       if (!next.tokenUsageHistory[event.runId]) throw new Error('token_usage_run_missing');
       next.tokenUsageHistory[event.runId] = {
         ...next.tokenUsageHistory[event.runId],
@@ -627,7 +1027,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         runId: event.runId,
         status: event.payload.outcome,
         workspaceBindings: currentRunBindings(next, event.runId),
-        ...(next.run?.profileId ? { profileId: next.run.profileId } : {}),
+        profileId: requiredRunRuntimeSnapshot(next, event.runId).provider.profileId,
       };
       next.pendingInteraction = null;
       next.pendingApproval = null;
@@ -636,7 +1036,16 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         || event.payload.outcome === 'indeterminate'
         ? { ...event.payload.error }
         : null;
+      delete next.pendingRunSettlements[event.runId];
       break;
+  }
+  if (next.run) {
+    const provider = requiredRunRuntimeSnapshot(next, next.run.runId).provider;
+    next.run = {
+      ...next.run,
+      ...(provider.reasoningEffort ? { reasoningEffort: provider.reasoningEffort } : {}),
+      ...(provider.thinking ? { thinking: provider.thinking } : {}),
+    };
   }
   return next;
 }
@@ -654,15 +1063,17 @@ export function projectSession(
     sessionId: state.sessionId,
     revision: state.revision,
     display: { ...state.display },
+    modelSettings: state.modelSettings ? { ...state.modelSettings } : null,
     workspaceBindings: state.workspaceBindings.map((binding) => ({ ...binding })),
     sessionDirectoryIndexes: state.sessionDirectoryIndexes.map((binding) => ({ ...binding })),
     messages: state.messages.map((message) => ({
       ...message,
-      attachments: message.attachments.map((attachment) => ({ ...attachment })),
-      directoryAttachments: message.directoryAttachments.map((attachment) => ({ ...attachment })),
+      filesystemReferences: message.filesystemReferences.map((reference) => ({ ...reference })),
+      pluginSelections: message.pluginSelections.map((selection) => ({ ...selection })),
     })),
     narratives: state.narratives.map((narrative) => ({ ...narrative })),
-    assistantDraft: assistantDraft ? { ...assistantDraft } : null,
+    timeline: projectTimeline(state),
+    assistantDraft: assistantDraft ? structuredClone(assistantDraft) : null,
     pendingInteraction: cloneInteraction(state.pendingInteraction),
     pendingApproval: cloneApproval(state.pendingApproval),
     plans: state.plans.map((plan) => clonePlanProjection(plan)),
@@ -670,7 +1081,12 @@ export function projectSession(
     pendingPlan: state.pendingPlan ? clonePlanProjection(state.pendingPlan) : null,
     todoList: cloneTodoList(state.todoList),
     contextUsage: state.contextUsage ? { ...state.contextUsage } : null,
-    contextCompositions: state.contextCompositions.map(cloneContextComposition),
+    // The ball displays the last settled call; also expose a pending call's
+    // composition before usage arrives. Historical receipts remain in the journal.
+    contextCompositions: state.contextCompositions.filter((receipt, index) => (
+      receipt.providerRequestId === state.contextUsage?.providerRequestId
+      || index === state.contextCompositions.length - 1
+    )).map(cloneContextComposition),
     tokenUsage: { ...state.tokenUsage },
     tokenUsageHistory: Object.values(state.tokenUsageHistory)
       .sort((left, right) => right.sequence - left.sequence)
@@ -706,6 +1122,385 @@ function cloneRun(run: NonNullable<SessionProjection['run']>): NonNullable<Sessi
   };
 }
 
+function cloneRunRuntimeSnapshot(snapshot: RunRuntimeSnapshot): RunRuntimeSnapshot {
+  const storedAliases = (snapshot as unknown as { providerToolAliases?: unknown })
+    .providerToolAliases;
+  const storedToolPromptContributions = (
+    snapshot as unknown as { toolPromptContributions?: unknown }
+  ).toolPromptContributions;
+  if (!Array.isArray(storedAliases)) {
+    throw new Error('run_runtime_provider_tool_aliases_missing');
+  }
+  if (!Array.isArray(storedToolPromptContributions)) {
+    throw new Error('run_runtime_tool_prompt_contributions_missing');
+  }
+  const providerToolAliases = (storedAliases as RunRuntimeSnapshot['providerToolAliases'])
+    .map((alias) => ({ ...alias }));
+  const toolPromptContributions = (
+    storedToolPromptContributions as RunRuntimeSnapshot['toolPromptContributions']
+  ).map((contribution) => ({
+    ...contribution,
+    usageGuidelines: [...contribution.usageGuidelines],
+  }));
+  return {
+    ...snapshot,
+    provider: { ...snapshot.provider },
+    webSearch: { ...snapshot.webSearch },
+    instructions: snapshot.instructions.map((instruction) => ({ ...instruction })),
+    tools: snapshot.tools.map((tool) => ({
+      ...tool,
+      inputSchema: structuredClone(tool.inputSchema),
+      possibleEffects: [...tool.possibleEffects],
+    })),
+    toolPromptContributions,
+    providerToolAliases,
+    selectedPlugins: {
+      catalogRevision: snapshot.selectedPlugins.catalogRevision,
+      plugins: snapshot.selectedPlugins.plugins.map((plugin) => ({
+        ...plugin,
+        capabilityRefs: [...plugin.capabilityRefs],
+      })),
+    },
+  };
+}
+
+function cloneProviderTurn(turn: ProviderTurnState): ProviderTurnState {
+  return {
+    ...turn,
+    ...(turn.orderedCallIds ? { orderedCallIds: [...turn.orderedCallIds] } : {}),
+    ...(turn.hostedWebSearchCalls
+      ? { hostedWebSearchCalls: turn.hostedWebSearchCalls.map((item) => structuredClone(item)) }
+      : {}),
+    ...(turn.orderedOutputBlocks
+      ? {
+          orderedOutputBlocks: turn.orderedOutputBlocks.map((block) => ({
+            ...block,
+            item: structuredClone(block.item),
+          })),
+        }
+      : {}),
+    ...(turn.error ? { error: { ...turn.error } } : {}),
+  };
+}
+
+function validateOrderedProviderOutputBlocks(
+  blocks: readonly ProviderOutputBlock[],
+  orderedCallIds: readonly string[],
+): void {
+  if (blocks.length === 0) throw new Error('provider_output_blocks_empty');
+  const callIds: string[] = [];
+  const allCallIds = new Set<string>();
+  const referenceIds = new Set<string>();
+  const providerCallIds = new Set<string>();
+  let previousOutputIndex = -1;
+  let finalMessageCount = 0;
+  const addUnique = (values: Set<string>, value: string): boolean => {
+    if (values.has(value)) return false;
+    values.add(value);
+    return true;
+  };
+  for (const block of blocks) {
+    if (
+      !Number.isSafeInteger(block.outputIndex)
+      || block.outputIndex < 0
+      || block.outputIndex <= previousOutputIndex
+      || !isRecord(block.item)
+    ) throw new Error('provider_output_block_invalid');
+    previousOutputIndex = block.outputIndex;
+    switch (block.kind) {
+      case 'reasoning':
+        if (block.item.type !== 'reasoning') throw new Error('provider_output_block_invalid');
+        break;
+      case 'narrative':
+        if (
+          block.item.type !== 'message'
+          || !addUnique(referenceIds, `narrative:${block.narrativeId}`)
+        ) throw new Error('provider_output_block_invalid');
+        break;
+      case 'finalMessage':
+        finalMessageCount += 1;
+        if (
+          block.item.type !== 'message'
+          || !addUnique(referenceIds, `message:${block.messageId}`)
+        ) throw new Error('provider_output_block_invalid');
+        break;
+      case 'toolCall':
+      case 'toolCallRejected':
+        if (
+          block.item.type !== 'function_call'
+          || block.item.call_id !== block.providerCallId
+          || !block.callId || !block.providerCallId || !block.toolName
+          || typeof block.item.name !== 'string' || !block.item.name
+          || typeof block.item.arguments !== 'string'
+          || !addUnique(allCallIds, block.callId)
+          || !addUnique(providerCallIds, block.providerCallId)
+        ) throw new Error('provider_output_block_invalid');
+        if (block.kind === 'toolCall') callIds.push(block.callId);
+        else if (!block.error.code || !block.error.message || !block.error.issues?.length
+          || block.error.issues.some((issue) => !issue.path || !issue.rule || !issue.message)) {
+          throw new Error('provider_output_rejection_invalid');
+        }
+        break;
+      case 'providerHosted':
+        if (
+          block.providerToolType !== 'web_search'
+          || block.item.type !== 'web_search_call'
+          || block.item.id !== block.providerCallId
+          || !addUnique(providerCallIds, block.providerCallId)
+          || !addUnique(referenceIds, `activity:${block.activityId}`)
+        ) throw new Error('provider_output_block_invalid');
+        break;
+    }
+  }
+  if (
+    finalMessageCount > 1
+    || callIds.length !== orderedCallIds.length
+    || callIds.some((callId, index) => callId !== orderedCallIds[index])
+    || allCallIds.size === 0 && finalMessageCount !== 1
+    || allCallIds.size > 0 && finalMessageCount !== 0
+  ) throw new Error('provider_output_block_normalization_invalid');
+}
+
+function assertProviderMessageReference(
+  turn: ProviderTurnState,
+  kind: 'narrative' | 'finalMessage',
+  referenceId: string,
+  content: string,
+): void {
+  if (!turn.orderedOutputBlocks) return;
+  const matches = turn.orderedOutputBlocks.filter((block) => (
+    block.kind === kind
+    && (kind === 'narrative'
+      ? block.kind === 'narrative' && block.narrativeId === referenceId
+      : block.kind === 'finalMessage' && block.messageId === referenceId)
+  ));
+  if (
+    matches.length !== 1
+    || providerOutputMessageText(matches[0]!.item) !== content
+  ) throw new Error('provider_output_message_reference_invalid');
+}
+
+function providerOutputMessageText(item: Record<string, unknown>): string {
+  if (item.type !== 'message' || !Array.isArray(item.content)) {
+    throw new Error('provider_output_message_item_invalid');
+  }
+  let text = '';
+  for (const part of item.content) {
+    if (!isRecord(part) || part.type !== 'output_text') continue;
+    if (typeof part.text !== 'string') throw new Error('provider_output_message_item_invalid');
+    text += part.text;
+  }
+  if (!text.trim()) throw new Error('provider_output_message_item_invalid');
+  return text;
+}
+
+function requiredRunRuntimeSnapshot(state: SessionState, runId: string): RunRuntimeSnapshot {
+  const snapshot = state.runRuntimeSnapshots[runId];
+  if (!snapshot) throw new Error('run_runtime_snapshot_missing');
+  return snapshot;
+}
+
+function requiredProviderTurn(
+  state: SessionState,
+  runId: string,
+  providerRequestId: string,
+  purpose?: ProviderTurnState['purpose'],
+): ProviderTurnState {
+  const turn = state.providerTurns[providerRequestId];
+  if (
+    !turn
+    || turn.outcome !== 'completed'
+    || turn.runId !== runId
+    || purpose !== undefined && turn.purpose !== purpose
+  ) {
+    throw new Error('provider_turn_completion_missing');
+  }
+  return turn;
+}
+
+function projectTimeline(state: SessionState): SessionProjection['timeline'] {
+  const groups: Array<{
+    sequence: number;
+    items: SessionProjection['timeline'];
+  }> = [];
+  for (const message of state.messages) {
+    if (message.role !== 'user') continue;
+    groups.push({
+      sequence: message.sequence,
+      items: [{
+        kind: 'message',
+        timelineId: `message:${message.messageId}`,
+        sequence: message.sequence,
+        messageId: message.messageId,
+      }],
+    });
+  }
+  for (const turn of Object.values(state.providerTurns)) {
+    if (turn.purpose !== 'agent' || turn.outcome !== 'completed') continue;
+    const composition = state.contextCompositions.find((candidate) => (
+      candidate.runId === turn.runId
+      && candidate.providerRequestId === turn.providerRequestId
+    ));
+    if (!composition) throw new Error('provider_turn_composition_missing');
+    if (turn.orderedOutputBlocks) {
+      const items = projectOrderedProviderTurnTimeline(state, turn);
+      if (items.length > 0) groups.push({ sequence: composition.sequence, items });
+      continue;
+    }
+    const items: SessionProjection['timeline'] = [];
+    const message = state.messages.find((candidate) => (
+      candidate.role === 'assistant'
+      && candidate.runId === turn.runId
+      && candidate.providerRequestId === turn.providerRequestId
+    ));
+    if (message) {
+      items.push({
+        kind: 'message',
+        timelineId: `message:${message.messageId}`,
+        sequence: message.sequence,
+        messageId: message.messageId,
+      });
+    }
+    const narrative = state.narratives.find((candidate) => (
+      candidate.runId === turn.runId
+      && candidate.providerRequestId === turn.providerRequestId
+    ));
+    if (narrative) {
+      items.push({
+        kind: 'narrative',
+        timelineId: `provider-turn:${turn.providerRequestId}:narrative`,
+        sequence: narrative.sequence,
+        providerRequestId: turn.providerRequestId,
+        narrativeId: narrative.narrativeId,
+      });
+    }
+    const orderedCallIds = turn.orderedCallIds ?? [];
+    for (const callId of orderedCallIds) {
+      const plan = state.plans.find((candidate) => candidate.callId === callId);
+      if (!plan) continue;
+      items.push({
+        kind: 'plan',
+        timelineId: `provider-turn:${turn.providerRequestId}:plan:${callId}`,
+        sequence: plan.sequence,
+        providerRequestId: turn.providerRequestId,
+        planId: plan.planId,
+        revision: plan.revision,
+      });
+    }
+    const toolActivities = orderedCallIds.flatMap((callId) => {
+      const activity = Object.values(state.activities).find((candidate) => (
+        candidate.kind === 'tool' && candidate.callId === callId
+      ));
+      return activity ? [activity] : [];
+    });
+    if (toolActivities.length > 0) {
+      items.push({
+        kind: 'toolGroup',
+        timelineId: `provider-turn:${turn.providerRequestId}:tools`,
+        sequence: Math.max(...toolActivities.map((activity) => activity.sequence)),
+        providerRequestId: turn.providerRequestId,
+        activityIds: toolActivities.map((activity) => activity.activityId),
+      });
+    }
+    if (items.length > 0) groups.push({ sequence: composition.sequence, items });
+  }
+  return groups
+    .sort((left, right) => left.sequence - right.sequence)
+    .flatMap((group) => group.items);
+}
+
+function projectOrderedProviderTurnTimeline(
+  state: SessionState,
+  turn: ProviderTurnState,
+): SessionProjection['timeline'] {
+  const items: SessionProjection['timeline'] = [];
+  let groupedActivities: ActivityProjection[] = [];
+  let activityGroupIndex = 0;
+  const flushActivities = (): void => {
+    if (groupedActivities.length === 0) return;
+    items.push({
+      kind: 'toolGroup',
+      timelineId: `provider-turn:${turn.providerRequestId}:activities:${activityGroupIndex}`,
+      sequence: Math.max(...groupedActivities.map((activity) => activity.sequence)),
+      providerRequestId: turn.providerRequestId,
+      activityIds: groupedActivities.map((activity) => activity.activityId),
+    });
+    activityGroupIndex += 1;
+    groupedActivities = [];
+  };
+  for (const block of turn.orderedOutputBlocks ?? []) {
+    switch (block.kind) {
+      case 'reasoning':
+        break;
+      case 'narrative': {
+        flushActivities();
+        const narrative = state.narratives.find((candidate) => (
+          candidate.narrativeId === block.narrativeId
+          && candidate.providerRequestId === turn.providerRequestId
+        ));
+        if (!narrative) throw new Error('provider_output_narrative_missing');
+        items.push({
+          kind: 'narrative',
+          timelineId: `provider-turn:${turn.providerRequestId}:narrative:${block.outputIndex}`,
+          sequence: narrative.sequence,
+          providerRequestId: turn.providerRequestId,
+          narrativeId: narrative.narrativeId,
+          outputIndex: block.outputIndex,
+        });
+        break;
+      }
+      case 'finalMessage': {
+        flushActivities();
+        const message = state.messages.find((candidate) => (
+          candidate.role === 'assistant'
+          && candidate.messageId === block.messageId
+          && candidate.providerRequestId === turn.providerRequestId
+        ));
+        if (!message) throw new Error('provider_output_final_message_missing');
+        items.push({
+          kind: 'message',
+          timelineId: `message:${message.messageId}`,
+          sequence: message.sequence,
+          messageId: message.messageId,
+          outputIndex: block.outputIndex,
+        });
+        break;
+      }
+      case 'providerHosted': {
+        const activity = state.activities[block.activityId];
+        if (!activity || activity.kind !== 'providerHosted') {
+          throw new Error('provider_hosted_activity_missing');
+        }
+        groupedActivities.push(activity);
+        break;
+      }
+      case 'toolCallRejected':
+      case 'toolCall': {
+        const plan = state.plans.find((candidate) => candidate.callId === block.callId);
+        if (plan) {
+          flushActivities();
+          items.push({
+            kind: 'plan',
+            timelineId: `provider-turn:${turn.providerRequestId}:plan:${block.callId}`,
+            sequence: plan.sequence,
+            providerRequestId: turn.providerRequestId,
+            planId: plan.planId,
+            revision: plan.revision,
+          });
+          break;
+        }
+        const activity = Object.values(state.activities).find((candidate) => (
+          candidate.kind === 'tool' && candidate.callId === block.callId
+        ));
+        if (activity) groupedActivities.push(activity);
+        break;
+      }
+    }
+  }
+  flushActivities();
+  return items;
+}
+
 function cloneApproval(
   approval: SessionProjection['pendingApproval'],
 ): SessionProjection['pendingApproval'] {
@@ -718,6 +1513,28 @@ function cloneApproval(
       logicalTargets: [...approval.preview.logicalTargets],
     },
   };
+}
+
+function cloneRunSettlement(settlement: RunSettlement): RunSettlement {
+  if (settlement.outcome === 'completed') return { ...settlement };
+  if (settlement.outcome === 'failed' || settlement.outcome === 'indeterminate') {
+    return { outcome: settlement.outcome, error: { ...settlement.error } };
+  }
+  return { outcome: 'cancelled' };
+}
+
+function sameRunSettlement(left: RunSettlement, right: RunSettlement): boolean {
+  if (left.outcome !== right.outcome) return false;
+  if (left.outcome === 'completed' && right.outcome === 'completed') {
+    return left.finalMessageId === right.finalMessageId;
+  }
+  if (
+    (left.outcome === 'failed' || left.outcome === 'indeterminate')
+    && (right.outcome === 'failed' || right.outcome === 'indeterminate')
+  ) {
+    return left.error.code === right.error.code && left.error.message === right.error.message;
+  }
+  return left.outcome === 'cancelled' && right.outcome === 'cancelled';
 }
 
 function projectPlan(
@@ -831,7 +1648,7 @@ function cloneContextComposition(
     messages: receipt.messages.map((message) => ({
       ...message,
       blocks: message.blocks.map((block) => ({ ...block })),
-      attachments: message.attachments.map((attachment) => ({ ...attachment })),
+      filesystemReferences: message.filesystemReferences.map((reference) => ({ ...reference })),
     })),
     workspaceBindings: receipt.workspaceBindings.map((binding) => ({ ...binding })),
     tools: receipt.tools.map((tool) => ({ ...tool })),
@@ -846,7 +1663,7 @@ const CONTEXT_PARTITION_ORDER = [
   'workspaceBindings',
   'contextProviders',
   'journalMessages',
-  'messageAttachments',
+  'filesystemReferences',
 ] as const;
 
 function validateContextPartitions(
@@ -904,6 +1721,7 @@ function estimatePartitionTokens(
 function cloneActivity(activity: ActivityProjection): ActivityProjection {
   return {
     ...activity,
+    ...(activity.inputRejection ? { inputRejection: structuredClone(activity.inputRejection) } : {}),
     ...(activity.tool
       ? {
           tool: {
@@ -922,11 +1740,31 @@ function cloneActivity(activity: ActivityProjection): ActivityProjection {
           },
         }
       : {}),
+    ...(activity.providerHosted
+      ? {
+          providerHosted: {
+            ...activity.providerHosted,
+            action: structuredClone(activity.providerHosted.action),
+          },
+        }
+      : {}),
   };
 }
 
 function assertCurrentRun(state: SessionState, runId: string, code: string): void {
   if (!state.run || state.run.runId !== runId) throw new Error(code);
+}
+
+function recordProviderCallFact(
+  state: SessionState,
+  callId: string,
+  runId: string,
+  providerCallId: string,
+  toolName: string,
+  sequence: number,
+): void {
+  if (state.providerCallFacts[callId] !== undefined) throw new Error('provider_call_fact_duplicate');
+  state.providerCallFacts[callId] = { runId, providerCallId, toolName, sequence };
 }
 
 function assertRunningRun(state: SessionState, runId: string, code: string): void {
@@ -941,7 +1779,7 @@ function resumeRun(state: SessionState, runId: string): void {
     runId,
     status: 'running',
     workspaceBindings: state.run!.workspaceBindings.map((binding) => ({ ...binding })),
-    ...(state.run?.profileId ? { profileId: state.run.profileId } : {}),
+    profileId: state.run!.profileId,
   };
 }
 
@@ -974,7 +1812,7 @@ function projectToolActivity(record: ToolExecutionRecord): NonNullable<ActivityP
       }
       return { kind: 'logicalTarget' as const, label: target };
     }),
-    ...(record.toolName === 'process.shell' ? { shell: projectShellActivity(record) } : {}),
+    ...(record.toolName === 'bash' ? { shell: projectShellActivity(record) } : {}),
   };
 }
 
@@ -983,23 +1821,36 @@ function projectShellActivity(
 ): NonNullable<NonNullable<ActivityProjection['tool']>['shell']> {
   const canonicalArguments = record.preparedEffect.canonicalInvocation.arguments;
   if (!isRecord(canonicalArguments)) {
-    throw new Error('process_shell_projection_input_invalid');
+    throw new Error('bash_projection_input_invalid');
   }
   const command = canonicalArguments.command;
-  const cwd = canonicalArguments.cwd;
+  const cwd = '.';
+  const workspaceMode = canonicalArguments.workspaceMode;
+  const executionScope = canonicalArguments.executionScope;
+  const terminal = canonicalArguments.terminal !== undefined;
   if (
     typeof command !== 'string'
     || !command.trim()
-    || typeof cwd !== 'string'
-    || !cwd.trim()
+    || !matchesProcessWorkspaceMode(workspaceMode)
+    || !matchesProcessExecutionScope(executionScope)
+    || terminal && !isCanonicalTerminalInput(canonicalArguments.terminal)
   ) {
-    throw new Error('process_shell_projection_input_invalid');
+    throw new Error('bash_projection_input_invalid');
   }
-  if (record.outcome !== 'completed') return { command, cwd };
-  if (!isRecord(record.output)) throw new Error('process_shell_projection_output_invalid');
+  const output = record.outcome === 'completed'
+    ? record.output
+    : record.outcome === 'failed'
+      ? record.output
+      : undefined;
+  if (output === undefined) return { command, cwd, executionScope, terminal };
+  if (!isRecord(output)) throw new Error('bash_projection_output_invalid');
   const {
     command: outputCommand,
     cwd: outputCwd,
+    workspaceId: outputWorkspaceId,
+    workspaceMode: outputWorkspaceMode,
+    executionScope: outputExecutionScope,
+    terminal: outputTerminal,
     stdout,
     stderr,
     exitCode,
@@ -1008,10 +1859,14 @@ function projectShellActivity(
     truncated,
     capturedBytes,
     durationMs,
-  } = record.output;
+  } = output;
   if (
     outputCommand !== command
     || outputCwd !== cwd
+    || outputWorkspaceId !== record.preparedEffect.workspaceId
+    || outputWorkspaceMode !== workspaceMode
+    || outputExecutionScope !== executionScope
+    || outputTerminal !== terminal
     || typeof stdout !== 'string'
     || typeof stderr !== 'string'
     || !(exitCode === null || typeof exitCode === 'number' && Number.isSafeInteger(exitCode))
@@ -1021,12 +1876,19 @@ function projectShellActivity(
     || !isNaturalSafeInteger(capturedBytes)
     || !isNaturalSafeInteger(durationMs)
   ) {
-    throw new Error('process_shell_projection_output_invalid');
+    throw new Error('bash_projection_output_invalid');
   }
-  const environment = projectShellEnvironment(record.output.environment);
+  const environment = projectShellEnvironment(
+    output.environment,
+    workspaceMode,
+    executionScope,
+    terminal,
+  );
   return {
     command,
     cwd,
+    executionScope,
+    terminal,
     result: {
       stdout,
       stderr,
@@ -1036,26 +1898,73 @@ function projectShellActivity(
       truncated,
       capturedBytes,
       durationMs,
-      ...(environment ? { environment } : {}),
+      environment,
     },
   };
 }
 
-function projectShellEnvironment(value: unknown): ShellExecutionEnvironmentProjection | undefined {
-  if (value === undefined) return undefined;
-  if (!isRecord(value)) throw new Error('process_shell_projection_environment_invalid');
-  const { shell, interactive, pathSource, writeScope, homeWritable } = value;
+function projectShellEnvironment(
+  value: unknown,
+  workspaceMode: 'read' | 'write',
+  executionScope: 'workspace' | 'host',
+  terminal: boolean,
+): ShellExecutionEnvironmentProjection {
+  if (!isRecord(value)) throw new Error('bash_projection_environment_invalid');
+  const {
+    shell,
+    interactive,
+    executionScope: outputExecutionScope,
+    terminal: outputTerminal,
+    pathSource,
+    writeScope,
+    homeWritable,
+    networkAccess,
+  } = value;
+  const expectedWriteScope: ShellExecutionEnvironmentProjection['writeScope'] = (
+    executionScope === 'host'
+      ? 'hostUser'
+      : workspaceMode === 'read'
+        ? 'kernelTemporaryOnly'
+        : 'workspaceAndKernelTemporary'
+  );
   if (
     typeof shell !== 'string'
     || !shell.trim()
-    || interactive !== false
+    || interactive !== terminal
+    || outputExecutionScope !== executionScope
+    || outputTerminal !== terminal
     || pathSource !== 'hostPlusStandardDeveloperPaths'
-    || writeScope !== 'workspaceAndKernelTemporary'
-    || homeWritable !== false
+    || writeScope !== expectedWriteScope
+    || homeWritable !== (executionScope === 'host')
+    || networkAccess !== (executionScope === 'host')
   ) {
-    throw new Error('process_shell_projection_environment_invalid');
+    throw new Error('bash_projection_environment_invalid');
   }
-  return { shell, interactive, pathSource, writeScope, homeWritable };
+  return {
+    shell,
+    interactive,
+    executionScope,
+    terminal,
+    pathSource,
+    writeScope: expectedWriteScope,
+    homeWritable,
+    networkAccess,
+  };
+}
+
+function matchesProcessWorkspaceMode(value: unknown): value is 'read' | 'write' {
+  return value === 'read' || value === 'write';
+}
+
+function matchesProcessExecutionScope(value: unknown): value is 'workspace' | 'host' {
+  return value === 'workspace' || value === 'host';
+}
+
+function isCanonicalTerminalInput(value: unknown): value is { stdin: string } {
+  return isRecord(value)
+    && Object.keys(value).length === 1
+    && typeof value.stdin === 'string'
+    && new TextEncoder().encode(value.stdin).byteLength <= 65_536;
 }
 
 function artifactsFromRecord(record: ToolExecutionRecord): ArtifactProjection[] {
@@ -1096,6 +2005,47 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isNaturalSafeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function withProviderCompletion<T extends SessionProjection['tokenUsage']>(usage: T): T {
+  return recomputeCacheAggregate({
+    ...usage,
+    providerCallCount: addTokenCount(usage.providerCallCount, 1),
+  });
+}
+
+function withProviderUsage<T extends SessionProjection['tokenUsage']>(
+  usage: T,
+  reported: Extract<SessionEvent, { type: 'context.updated' }>['payload'],
+): T {
+  const cacheReported = reported.cacheReadInputTokens !== undefined;
+  return recomputeCacheAggregate({
+    ...usage,
+    reportedCallCount: addTokenCount(usage.reportedCallCount, cacheReported ? 1 : 0),
+    inputTokens: addTokenCount(usage.inputTokens, reported.inputTokens),
+    outputTokens: addTokenCount(usage.outputTokens, reported.outputTokens),
+    cacheReadInputTokens: addTokenCount(
+      usage.cacheReadInputTokens,
+      reported.cacheReadInputTokens ?? 0,
+    ),
+    cacheMissInputTokens: addTokenCount(
+      usage.cacheMissInputTokens,
+      reported.cacheMissInputTokens ?? 0,
+    ),
+  });
+}
+
+function recomputeCacheAggregate<T extends SessionProjection['tokenUsage']>(usage: T): T {
+  const cacheAvailable = usage.reportedCallCount > 0;
+  return {
+    ...usage,
+    cacheAvailable,
+    cacheComplete: usage.providerCallCount > 0
+      && usage.reportedCallCount === usage.providerCallCount,
+    cacheHitRatio: cacheAvailable && usage.inputTokens > 0
+      ? usage.cacheReadInputTokens / usage.inputTokens
+      : null,
+  };
 }
 
 function addTokenCount(left: number, right: number): number {

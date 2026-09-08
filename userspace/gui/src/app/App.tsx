@@ -2,9 +2,9 @@
  * App entry.
  *
  * Boot order:
- *   1. Load workspace and user settings.
- *   2. Start runtime health check.
- *   3. Start heartbeat.
+ *   1. Establish canonical runtime readiness.
+ *   2. Load workspace, user settings and Session state in parallel.
+ *   3. Start heartbeat and optional terminal warmup.
  *   4. Register editor-level shortcuts, auto-save and close guard.
  */
 import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
@@ -16,8 +16,8 @@ import {
   APP_CLOSE_REQUEST_EVENT,
   closeAppWindow,
   getHealth,
-  getRuntimeStatus,
   healthVersion,
+  isRuntimeReady,
   warmupTerminalRuntime,
 } from '../services/runtimeAdapter';
 import { getTabId, useEditorStore } from '../state/editorStore';
@@ -146,7 +146,18 @@ const App: React.FC = () => {
   );
 
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogData>(CLOSED_CONFIRM_DIALOG);
-  const connectedReloadDoneRef = useRef(false);
+  const loadedIncarnationRef = useRef<string | null>(null);
+  const healthWasReadyRef = useRef(false);
+  const healthConnectionSequenceRef = useRef(0);
+  const [connectedIncarnation, setConnectedIncarnation] = useState<string | null>(null);
+
+  const recordRuntimeReady = useCallback(() => {
+    if (!healthWasReadyRef.current) {
+      healthConnectionSequenceRef.current += 1;
+      setConnectedIncarnation(`health:${healthConnectionSequenceRef.current}`);
+    }
+    healthWasReadyRef.current = true;
+  }, []);
 
   const closeConfirmDialog = useCallback(() => {
     setConfirmDialog(CLOSED_CONFIRM_DIALOG);
@@ -215,20 +226,16 @@ const App: React.FC = () => {
   }, [showUnsavedCloseDialog]);
 
   useEffect(() => {
-    return afterFirstPaint(() => {
-      void loadWorkspace().finally(() => markStartup('deepcode:workspace-loaded'));
-      void loadUserSettings().finally(() => markStartup('deepcode:settings-loaded'));
-    });
-  }, [loadWorkspace, loadUserSettings]);
-
-
-  useEffect(() => {
-    if (apiStatus !== 'connected' || connectedReloadDoneRef.current) return;
-    connectedReloadDoneRef.current = true;
+    if (
+      apiStatus !== 'connected'
+      || !connectedIncarnation
+      || loadedIncarnationRef.current === connectedIncarnation
+    ) return;
+    loadedIncarnationRef.current = connectedIncarnation;
     void loadWorkspace().finally(() => markStartup('deepcode:workspace-reloaded-after-connect'));
     void loadUserSettings().finally(() => markStartup('deepcode:settings-reloaded-after-connect'));
     void useLocalAgentStore.getState().initialize();
-  }, [apiStatus, loadWorkspace, loadUserSettings]);
+  }, [apiStatus, connectedIncarnation, loadWorkspace, loadUserSettings]);
 
 
   useEffect(() => {
@@ -252,15 +259,14 @@ const App: React.FC = () => {
     let interval: ReturnType<typeof setInterval> | null = null;
 
     const checkRuntimeAndHealth = async () => {
-      const runtimeStatus = await getRuntimeStatus();
-      if (cancelled) return;
-
       const result = await getHealth();
       if (cancelled) return;
-      if (result.ok && result.data) {
+      if (isRuntimeReady(result)) {
+        recordRuntimeReady();
         setApiStatus('connected');
         setServerVersion(healthVersion(result.data));
       } else {
+        healthWasReadyRef.current = false;
         setApiStatus('error');
         setErrorMessage(result.message || t(language, 'app.apiUnavailable'));
       }
@@ -279,10 +285,11 @@ const App: React.FC = () => {
       cancelFirstPaint();
       if (interval !== null) clearInterval(interval);
     };
-  }, [language, setApiStatus, setErrorMessage, setServerVersion]);
+  }, [language, recordRuntimeReady, setApiStatus, setErrorMessage, setServerVersion]);
 
 
   useEffect(() => {
+    if (apiStatus !== 'connected') return;
     let disconnect: (() => void) | null = null;
     let cancelled = false;
     const cancel = afterFirstPaint(() => {
@@ -297,11 +304,11 @@ const App: React.FC = () => {
       cancel();
       disconnect?.();
     };
-  }, []);
+  }, [apiStatus, connectedIncarnation]);
 
 
   useEffect(() => {
-    if (terminalPrewarm !== 'afterStartup') return;
+    if (apiStatus !== 'connected' || terminalPrewarm !== 'afterStartup') return;
     let cancelIdle: (() => void) | null = null;
     const cancelFirstPaint = afterFirstPaint(() => {
       cancelIdle = scheduleIdle(() => {
@@ -315,7 +322,7 @@ const App: React.FC = () => {
       cancelFirstPaint();
       cancelIdle?.();
     };
-  }, [terminalPrewarm]);
+  }, [apiStatus, connectedIncarnation, terminalPrewarm]);
 
 
   useEffect(() => {

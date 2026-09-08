@@ -12,10 +12,15 @@ mod llm_provider_transport;
 mod llm_stream_parser;
 mod llm_transport;
 mod local_agent_api;
+mod local_agent_first_party_plugins;
 mod local_agent_kernel;
 mod local_agent_mcp;
 mod local_agent_plugins;
+mod local_agent_product_tools;
+mod local_agent_provider_runtime;
 mod local_agent_store;
+mod local_agent_tool_catalog;
+mod local_agent_tool_prompts;
 mod prelude;
 mod routes;
 mod session_service;
@@ -61,13 +66,8 @@ async fn main() {
     );
 
     let gui_state = GuiState::open().expect("打开当前配置根");
-    let (executor_config, secrets) =
-        runtime_tool_configuration(&gui_state).expect("加载当前工具运行配置");
     let session_store_path = gui_state.paths.session_store_path.clone();
     let tool_record_store_path = gui_state.paths.tool_record_store_path.clone();
-    let plugin_config =
-        crate::local_agent_plugins::local_agent_plugin_config(&gui_state.user_settings)
-            .expect("加载本地 Agent 插件配置");
     let user_settings = gui_state.user_settings.clone();
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -81,15 +81,11 @@ async fn main() {
         &tool_record_store_path,
         workspace_resolver,
         &user_settings,
-        executor_config,
-        Arc::new(secrets),
     )
     .expect("打开本地 Agent Runtime");
     let session_service = match SessionServiceProcess::spawn(
         &format!("http://{addr}"),
         local_agent.service_token(),
-        None,
-        &plugin_config,
     ) {
         Ok(service) => service,
         Err(error) => {
@@ -105,7 +101,6 @@ async fn main() {
         session_service,
         host_connection,
         gui,
-        runtime_user_settings: user_settings,
         host_services: HostServices::new(),
         terminal_runtime: Arc::new(Mutex::new(TerminalRuntime::new())),
     };
@@ -157,29 +152,18 @@ pub(crate) fn runtime_tool_configuration(
         Some(_) => return Err("本地 LLM secret 文件不是当前字符串映射格式。".to_string()),
         None => json!({}),
     };
-    let mut secret_values: HashMap<String, String> = secret_store
+    let secret_values: HashMap<String, String> = secret_store
         .as_object()
         .cloned()
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(key, value)| value.as_str().map(|secret| (key, secret.to_string())))
         .collect();
-    let github_auth_secret_ref = std::env::var("DEEPCODE_GITHUB_TOKEN")
-        .ok()
-        .filter(|token| !token.trim().is_empty())
-        .map(|token| {
-            let secret_ref = "runtime:github-token".to_string();
-            secret_values.insert(secret_ref.clone(), token);
-            secret_ref
-        })
-        .unwrap_or_default();
     Ok((
         deepcode_kernel_runtime::executors::KernelExecutorConfig {
             web_search_endpoint_template: setting("agent.web.search.endpointTemplate")?.to_string(),
             web_search_auth_header_name: setting("agent.web.search.authHeaderName")?.to_string(),
             web_search_auth_secret_ref: setting("agent.web.search.authSecretRef")?.to_string(),
-            github_auth_secret_ref,
-            ..deepcode_kernel_runtime::executors::KernelExecutorConfig::default()
         },
         DaemonSecretProvider {
             values: secret_values,

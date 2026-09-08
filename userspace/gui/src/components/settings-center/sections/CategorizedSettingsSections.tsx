@@ -149,7 +149,9 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
   const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
   const sources = useSettingsStore((state) => state.sources);
   const loading = useSettingsStore((state) => state.loading);
-  const restartRequired = useSettingsStore((state) => state.restartRequired);
+  const pendingNextRunActivation = useSettingsStore(
+    (state) => state.pendingNextRunActivation,
+  );
   const errorMessage = useSettingsStore((state) => state.errorMessage);
   const patchUserSetting = useSettingsStore((state) => state.patchUserSetting);
   const resetUserSetting = useSettingsStore((state) => state.resetUserSetting);
@@ -199,9 +201,9 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
       <div className="settings-boundary-notice">
         {t(language, 'settings.agent.scopeHint')}
       </div>
-      {restartRequired && (
-        <div className="settings-restart-notice">
-          {t(language, 'settings.agent.restartRequired')}
+      {pendingNextRunActivation && (
+        <div className="settings-activation-notice">
+          {t(language, 'settings.agent.nextRunActivationPending')}
         </div>
       )}
       {renderCard(t(language, 'settings.agent.instructions'), instructions)}

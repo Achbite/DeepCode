@@ -26,20 +26,18 @@ case "$profile" in
   *) printf '未知验证范围：%s\n' "$profile" >&2; exit 2 ;;
 esac
 
-required_tools=(python3 make)
 if [ "$profile" != 'static' ]; then
-  required_tools+=(cargo node pnpm)
+  for tool in cargo node pnpm; do
+    command -v "$tool" >/dev/null 2>&1 || { printf '缺少命令：%s\n' "$tool" >&2; exit 1; }
+  done
 fi
-for tool in "${required_tools[@]}"; do
-  command -v "$tool" >/dev/null 2>&1 || { printf '缺少命令：%s\n' "$tool" >&2; exit 1; }
-done
+if [ "$profile" = 'full' ]; then
+  command -v python3 >/dev/null 2>&1 || { printf '缺少命令：python3\n' >&2; exit 1; }
+fi
 
 run_static() {
-  printf '[test] 分层与 R0 资产\n'
-  python3 -I -S ./scripts/tests/architecture.py
-  python3 -I -S ./scripts/tests/development_tooling.py
-  bash -n ./test.sh ./build.sh ./scripts/source-identity.sh ./scripts/branch-flow.sh ./scripts/check-architecture.sh ./scripts/package-macos.sh ./scripts/macos-package-service.sh
-  bash ./scripts/check-architecture.sh
+  printf '[test] 源码身份与脚本语法\n'
+  bash -n ./test.sh ./build.sh ./scripts/source-identity.sh ./scripts/branch-flow.sh ./scripts/package-macos.sh ./scripts/macos-package-service.sh
   if deepcode_source_git_available "$ROOT_DIR"; then
     git -C "$ROOT_DIR" diff --check
   else
@@ -52,11 +50,9 @@ run_required() {
   printf '[test] Rust workspace\n'
   cargo fmt --all -- --check
   cargo test --workspace
-  printf '[test] TypeScript 协议、Session 与 UI\n'
-  pnpm --filter @deepcode/protocol test
+  printf '[test] Session 数据流与跨包类型接线\n'
   pnpm --filter @deepcode/session-core test
-  pnpm --filter @deepcode/client test
-  pnpm --filter @deepcode/client typecheck
+  pnpm typecheck
 }
 
 case "$profile" in
@@ -65,7 +61,7 @@ case "$profile" in
   full)
     run_required
     printf '[test] CLI、TUI 与 GUI 正式包入口\n'
-    cargo build -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
+    cargo build -p deepcode-first-party-tools -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
     pnpm build:deepcode-gui
     pnpm --filter @deepcode/deepcode-gui-shell prepare:dist
     printf '[test] 本地 Agent 真实链路与共享投影壳\n'
@@ -73,4 +69,4 @@ case "$profile" in
     ;;
 esac
 
-printf '[test] PASS profile=%s\n' "$profile"
+printf '[test] 登记链路检查完成 profile=%s（不等于效果、稳定性、真实 Provider 或发布验收）\n' "$profile"

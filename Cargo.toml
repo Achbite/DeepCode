@@ -6,6 +6,7 @@ members = [
   "crates/deepcode-kernel-runtime",
   "crates/deepcode-kernel-client",
   "crates/deepcode-kernel-daemon",
+  "crates/deepcode-first-party-tools",
   "crates/deepcode-host-web",
   "shells/cli",
   "shells/tui",

@@ -244,7 +244,7 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
           </div>
           <p className="settings-token-usage__note">
             {t(language, 'settings.gui.usage.cacheCoverage', {
-              reported: tokenUsage?.cacheReportedCallCount ?? 0,
+              reported: tokenUsage?.reportedCallCount ?? 0,
               total: tokenUsage?.providerCallCount ?? 0,
             })}
           </p>
@@ -311,10 +311,6 @@ const UsageRound: React.FC<{
 }> = ({ round, ordinal, language }) => {
   const cache = completeInputCacheMetric(round);
   const cacheWidth = cache ? cache.hitPercent : 0;
-  const missWidth = cache ? (cache.missTokens / cache.inputTokens) * 100 : 0;
-  const inputWidth = cache
-    ? Math.max(0, 100 - cacheWidth - missWidth)
-    : round.inputTokens > 0 ? 100 : 0;
   return (
     <div className="settings-token-request">
       <div className="settings-token-request__header">
@@ -343,8 +339,7 @@ const UsageRound: React.FC<{
       >
         <div className="settings-token-request__total-bar" style={{ width: '100%' }}>
           <span className="settings-token-request__segment settings-token-request__segment--cache" style={{ width: `${cacheWidth}%` }} />
-          <span className="settings-token-request__segment settings-token-request__segment--miss" style={{ width: `${missWidth}%` }} />
-          <span className="settings-token-request__segment settings-token-request__segment--input" style={{ width: `${inputWidth}%` }} />
+          <span className="settings-token-request__segment settings-token-request__segment--miss" style={{ flex: '1 1 0' }} />
         </div>
       </div>
       <div className="settings-token-request__legend">

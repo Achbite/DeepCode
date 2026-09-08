@@ -6,6 +6,8 @@
     "types": ["node", "vite/client"],
     "baseUrl": ".",
     "paths": {
+      "@deepcode/presentation-core": ["../presentation-core/dist/index.d.ts"],
+      "@deepcode/presentation-core/*": ["../presentation-core/dist/*"],
       "@deepcode/protocol": ["../protocol/dist/index.d.ts"],
       "@deepcode/protocol/*": ["../protocol/dist/*"],
       "@deepcode/session-core": ["../session-core/dist/index.d.ts"],
@@ -14,6 +16,7 @@
   },
   "references": [
     { "path": "../protocol" },
+    { "path": "../presentation-core" },
     { "path": "../session-core" }
   ],
   "include": ["src", "vite-env.d.ts"]

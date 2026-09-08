@@ -9,6 +9,7 @@ interface KernelHostTarget {
   host: string;
   port: string;
   uiToken: string;
+  windowChrome: 'custom' | 'nativeOverlay';
 }
 
 interface KernelHostBootstrap {
@@ -16,6 +17,7 @@ interface KernelHostBootstrap {
   host: string;
   port: string;
   uiToken: string;
+  windowChrome: 'custom' | 'nativeOverlay';
 }
 
 declare global {
@@ -51,19 +53,24 @@ function consumeTrustedBootstrap(): KernelHostTarget | null {
   const host = boot.host.trim();
   const port = boot.port.trim();
   const uiToken = boot.uiToken.trim();
+  const windowChrome = boot.windowChrome;
   if (
     !['127.0.0.1', 'localhost', '::1'].includes(host) ||
     !/^[0-9]{1,5}$/.test(port) ||
     Number(port) < 1 ||
     Number(port) > 65_535 ||
-    !/^dcui_[0-9a-f]{64}$/.test(uiToken)
+    !/^dcui_[0-9a-f]{64}$/.test(uiToken) ||
+    !['custom', 'nativeOverlay'].includes(windowChrome)
   ) {
     return null;
   }
-  return { host, port, uiToken };
+  return { host, port, uiToken, windowChrome };
 }
 
 const trustedTarget = consumeTrustedBootstrap();
+if (typeof document !== 'undefined') {
+  document.documentElement.dataset.deepcodeWindowChrome = trustedTarget?.windowChrome ?? 'custom';
+}
 const UNAVAILABLE_LOOPBACK_ORIGIN = 'http://127.0.0.1:0';
 
 function developmentBrowserOrigin(): string | null {
@@ -101,4 +108,8 @@ export function getHostConnectionHeaders(): Record<string, string> {
   return trustedTarget
     ? { 'x-deepcode-host-ui-token': trustedTarget.uiToken }
     : {};
+}
+
+export function usesNativeWindowChrome(): boolean {
+  return trustedTarget?.windowChrome === 'nativeOverlay';
 }

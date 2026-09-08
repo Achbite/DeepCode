@@ -49,9 +49,13 @@ async fn main() {
         TuiHostOptions {
             workspace_path: args.workspace,
             session_id: args.session_id,
+            plugin_uris: args.plugins,
         },
     );
-    app.bootstrap().await;
+    if let Err(error) = app.bootstrap().await {
+        eprintln!("DeepCode TUI 初始化失败：{error}");
+        std::process::exit(1);
+    }
 
     if args.smoke {
         print!("{}", app.renderer().render_plain(&app));
@@ -82,6 +86,7 @@ struct Args {
     smoke: bool,
     workspace: Option<PathBuf>,
     session_id: Option<String>,
+    plugins: Vec<String>,
     no_auto_start_kernel: bool,
 }
 
@@ -93,6 +98,7 @@ impl Args {
             smoke: false,
             workspace: None,
             session_id: None,
+            plugins: Vec::new(),
             no_auto_start_kernel: false,
         };
         let mut index = 0;
@@ -115,6 +121,12 @@ impl Args {
                     parsed.session_id =
                         Some(required_arg(&values, index, "--session")?.to_string());
                 }
+                "--plugin" => {
+                    index += 1;
+                    parsed
+                        .plugins
+                        .push(required_arg(&values, index, "--plugin")?.to_string());
+                }
                 value => return Err(format!("未知选项：{value}")),
             }
             index += 1;
@@ -133,40 +145,111 @@ async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
     terminal.clear()?;
-    loop {
-        app.poll().await;
-        terminal.draw(|frame| app.renderer().draw(frame, &app))?;
-        if event::poll(Duration::from_millis(150))? {
-            match event::read()? {
+    let mut input_task = spawn_terminal_event_task();
+    let mut refresh = tokio::time::interval(Duration::from_millis(150));
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let loop_result = async {
+        loop {
+            terminal.draw(|frame| app.renderer().draw(frame, &app))?;
+            let event_task_result = tokio::select! {
+                result = &mut input_task => Some(result),
+                _ = refresh.tick() => {
+                    tokio::select! {
+                        result = &mut input_task => Some(result),
+                        _ = app.poll() => None,
+                    }
+                }
+            };
+            let Some(event_task_result) = event_task_result else {
+                continue;
+            };
+            input_task = spawn_terminal_event_task();
+            let Some(next_event) = terminal_event_result(event_task_result)? else {
+                continue;
+            };
+            let keep_running = match next_event {
                 CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.interrupt().await;
-                        break;
+                        false
                     }
                     KeyCode::Esc => {
-                        if app.has_pending_plan() {
+                        if app.plugin_picker_open() {
+                            app.dismiss_plugin_picker();
+                        } else if app.has_pending_plan() {
                             app.cancel_plan().await;
                         } else {
                             app.clear_input();
                         }
+                        true
                     }
-                    KeyCode::Backspace => app.backspace_input(),
+                    KeyCode::Backspace => {
+                        app.backspace_input();
+                        true
+                    }
                     KeyCode::Enter => {
-                        let input = app.take_input();
-                        if !app.submit_line(&input).await {
-                            break;
+                        if app.plugin_picker_open() && app.plugin_picker_select() {
+                            true
+                        } else {
+                            let input = app.take_input();
+                            app.submit_line(&input).await
                         }
                     }
-                    KeyCode::Tab => app.push_input('\t'),
-                    KeyCode::Char(value) => app.push_input(value),
-                    _ => {}
+                    KeyCode::Tab => {
+                        if app.plugin_picker_open() {
+                            app.plugin_picker_select();
+                        } else {
+                            app.push_input('\t');
+                        }
+                        true
+                    }
+                    KeyCode::Up if app.plugin_picker_open() => {
+                        app.plugin_picker_move(-1);
+                        true
+                    }
+                    KeyCode::Down if app.plugin_picker_open() => {
+                        app.plugin_picker_move(1);
+                        true
+                    }
+                    KeyCode::Char(value) => {
+                        app.push_input(value);
+                        true
+                    }
+                    _ => true,
                 },
-                CrosstermEvent::Paste(text) => app.push_input_text(&text),
-                _ => {}
+                CrosstermEvent::Paste(text) => {
+                    app.push_input_text(&text);
+                    true
+                }
+                _ => true,
+            };
+            if !keep_running {
+                break Ok(());
             }
         }
     }
-    Ok(())
+    .await;
+    let pump_result = terminal_event_result(input_task.await).map(|_| ());
+    match loop_result {
+        Err(error) => Err(error),
+        Ok(()) => pump_result,
+    }
+}
+
+fn spawn_terminal_event_task() -> tokio::task::JoinHandle<io::Result<Option<CrosstermEvent>>> {
+    tokio::task::spawn_blocking(|| {
+        if event::poll(Duration::from_millis(150))? {
+            event::read().map(Some)
+        } else {
+            Ok(None)
+        }
+    })
+}
+
+fn terminal_event_result(
+    result: Result<io::Result<Option<CrosstermEvent>>, tokio::task::JoinError>,
+) -> io::Result<Option<CrosstermEvent>> {
+    result.map_err(|error| io::Error::other(format!("terminal event pump failed: {error}")))?
 }
 
 async fn run_plain(mut app: TuiApp) -> io::Result<Option<String>> {
@@ -177,7 +260,7 @@ async fn run_plain(mut app: TuiApp) -> io::Result<Option<String>> {
         io::stdout().flush()?;
         line.clear();
         if io::stdin().read_line(&mut line)? == 0 {
-            return Ok(app.take_action_required());
+            return Ok(app.action_required());
         }
         if !app.submit_line(line.trim()).await {
             return Ok(None);
@@ -187,7 +270,7 @@ async fn run_plain(mut app: TuiApp) -> io::Result<Option<String>> {
             app.poll().await;
         }
         print!("{}", app.renderer().render_plain(&app));
-        if let Some(message) = app.take_action_required() {
+        if let Some(message) = app.action_required() {
             return Ok(Some(message));
         }
     }
@@ -198,15 +281,18 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
         Ok(Self)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = disable_raw_mode();
     }
 }
 
@@ -222,12 +308,36 @@ fn print_help() {
         r#"DeepCode TUI
 
 用法：
-  deepcode-tui [-C <workspace>] [--session <id>]
+  deepcode-tui [-C <workspace>] [--session <id>] [--plugin <plugin://uri>]...
   deepcode-tui --smoke
 
 只有显式 -C/--workspace 会给新 Session 创建 workspace binding。
+--plugin 可重复且只选择下一次请求的插件；交互输入 @ 打开同一插件目录。
 Plan 输入 1/确认，其他文本请求修订；Esc 明确取消当前 Plan，空输入、EOF 与 Ctrl-C 不会取消。
-普通文本、/attach <path>、/detach <workspace-id>、/cancel-plan、/model <profile>、/cancel 都通过 ConversationPort。
+普通文本、/focus <task>、/attach <path>、/detach <workspace-id>、/cancel-plan、/model <profile>、/cancel 都通过 ConversationPort。
 上下文视图：/context。"#,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+
+    #[test]
+    fn repeatable_plugins_are_request_scoped_arguments() {
+        let args = Args::parse(vec![
+            "--plugin".into(),
+            "plugin://github@builtin".into(),
+            "--plugin".into(),
+            "plugin://pdf@builtin".into(),
+        ])
+        .expect("plugins parse");
+        assert_eq!(
+            args.plugins,
+            vec![
+                "plugin://github@builtin".to_string(),
+                "plugin://pdf@builtin".to_string()
+            ]
+        );
+    }
 }

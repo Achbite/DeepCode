@@ -190,7 +190,7 @@
   line-height: 1.55;
 }
 
-.settings-restart-notice {
+.settings-activation-notice {
   margin: -6px 0 18px;
   padding: 10px 13px;
   border: 1px solid color-mix(in srgb, var(--warn, #a66308) 30%, transparent);

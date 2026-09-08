@@ -1,6 +1,8 @@
 import React from 'react';
 import WindowControls from '../../components/window-controls/WindowControls';
 import { t, type UiLanguage } from '../../i18n';
+import { usesNativeWindowChrome } from '../../services/hostTarget';
+import DeepCodeBrand from './DeepCodeBrand';
 import { statusLabel } from './DeepCodeShellText';
 
 export interface DeepCodeCacheHitSummary {
@@ -28,10 +30,7 @@ const DeepCodeTitlebar: React.FC<DeepCodeTitlebarProps> = ({
   onRetryKernelStart,
 }) => (
   <header className="deepcode-gui-titlebar" data-tauri-drag-region>
-    <div className="deepcode-gui-titlebar__brand">
-      <span className="deepcode-gui-titlebar__mark">DC</span>
-      <span>DeepCode-GUI</span>
-    </div>
+    {!usesNativeWindowChrome() && <DeepCodeBrand />}
     <div className="deepcode-gui-titlebar__status">
       {cacheHitSummary && (
         <span

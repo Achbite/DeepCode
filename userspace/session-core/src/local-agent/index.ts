@@ -7,3 +7,4 @@ export * from './reducer.js';
 export * from './sessionControls.js';
 export * from './service.js';
 export * from './skillPlugins.js';
+export * from './toolPromptContributions.js';

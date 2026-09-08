@@ -56,7 +56,14 @@ pub(crate) fn build_app(state: AppState) -> Router {
             "/api/local-agent/journal/sessions/:session_id/commands/:command_id",
             get(local_agent_command_read),
         )
-        .route("/api/local-agent/kernel/tools", get(local_agent_tools))
+        .route(
+            "/api/local-agent/runtime/prepare-run",
+            post(local_agent_run_runtime_prepare),
+        )
+        .route(
+            "/api/local-agent/runtime/release-run",
+            post(local_agent_run_runtime_release),
+        )
         .route(
             "/api/local-agent/kernel/execute",
             post(local_agent_tool_execute),
@@ -79,6 +86,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
             post(conversation_session_create),
         )
         .route("/api/conversation/catalog", get(conversation_catalog_get))
+        .route(
+            "/api/conversation/plugins",
+            get(conversation_plugin_catalog_get),
+        )
         .route(
             "/api/conversation/catalog/manage",
             get(conversation_catalog_management_get),
@@ -104,16 +115,24 @@ pub(crate) fn build_app(state: AppState) -> Router {
             post(conversation_directory_index_attach),
         )
         .route(
-            "/api/conversation/sessions/:session_id/directory-attachments/resolve",
-            post(conversation_directory_attachments_resolve),
+            "/api/conversation/sessions/:session_id/filesystem-references/resolve",
+            post(conversation_filesystem_references_resolve),
         )
         .route(
             "/api/conversation/sessions/:session_id/directory-indexes/:workspace_id",
             delete(conversation_directory_index_detach),
         )
         .route(
+            "/api/conversation/sessions/:session_id/read",
+            post(conversation_read),
+        )
+        .route(
             "/api/conversation/sessions/:session_id/projection",
             get(conversation_projection_get),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/context-compositions/:provider_request_id",
+            get(conversation_context_composition_get),
         )
         .route(
             "/api/conversation/sessions/:session_id/resources/read",

@@ -12,6 +12,7 @@ import {
 } from '@deepcode/protocol';
 import type {
   LlmProviderFlavor,
+  LlmHostedWebSearch,
   LlmProviderKind,
   LlmProviderProfile,
 } from '@deepcode/protocol';
@@ -23,7 +24,7 @@ import {
 import { useSettingsStore } from '../../../state/settingsStore';
 import { normalizeUiLanguage, t } from '../../../i18n';
 
-const PROVIDERS: LlmProviderKind[] = ['openaiCompatible', 'anthropic', 'ollama'];
+const PROVIDERS: LlmProviderKind[] = ['openaiCompatible', 'responses', 'anthropic', 'ollama'];
 
 const PROVIDER_FLAVORS: LlmProviderFlavor[] = [
   'openai',
@@ -49,7 +50,7 @@ const PROFILE_PRESETS: Array<{
     labelKey: 'settings.llm.preset.deepseekFlash',
     profile: {
       name: 'DeepSeek V4 Flash',
-      kind: 'openaiCompatible',
+      kind: 'responses',
       providerFlavor: 'deepseek',
       baseUrl: DEEPSEEK_OPENAI_BASE_URL,
       model: 'deepseek-v4-flash',
@@ -58,6 +59,7 @@ const PROFILE_PRESETS: Array<{
       temperature: 0.2,
       reasoningEffort: 'high',
       thinking: 'enabled',
+      hostedWebSearch: 'web_search',
       enabled: true,
     },
   },
@@ -65,7 +67,7 @@ const PROFILE_PRESETS: Array<{
     labelKey: 'settings.llm.preset.deepseekPro',
     profile: {
       name: 'DeepSeek V4 Pro',
-      kind: 'openaiCompatible',
+      kind: 'responses',
       providerFlavor: 'deepseek',
       baseUrl: DEEPSEEK_OPENAI_BASE_URL,
       model: 'deepseek-v4-pro',
@@ -74,6 +76,7 @@ const PROFILE_PRESETS: Array<{
       temperature: 0.2,
       reasoningEffort: 'max',
       thinking: 'enabled',
+      hostedWebSearch: 'web_search',
       enabled: true,
     },
   },
@@ -150,7 +153,9 @@ function profileWithProviderKind(
   profile: LlmProviderProfile,
   kind: LlmProviderKind,
 ): LlmProviderProfile {
-  return { ...profile, kind };
+  return kind === 'responses'
+    ? { ...profile, kind }
+    : { ...profile, kind, hostedWebSearch: undefined };
 }
 
 function optionalNumber(value: string): number | undefined {
@@ -450,6 +455,26 @@ const LlmSection: React.FC = () => {
                         {t(language, `settings.llm.providerFlavor.${flavor}`)}
                       </option>
                     ))}
+                  </select>
+                </label>
+                <label>
+                  <span>{t(language, 'settings.llm.hostedWebSearch')}</span>
+                  <select
+                    className="settings-field__select"
+                    value={profile.hostedWebSearch ?? 'none'}
+                    disabled={profile.kind !== 'responses'}
+                    onChange={(e) => updateProfile(profile.id, {
+                      hostedWebSearch: e.target.value === 'web_search'
+                        ? 'web_search' as LlmHostedWebSearch
+                        : undefined,
+                    })}
+                  >
+                    <option value="none">
+                      {t(language, 'settings.llm.hostedWebSearch.none')}
+                    </option>
+                    <option value="web_search">
+                      {t(language, 'settings.llm.hostedWebSearch.webSearch')}
+                    </option>
                   </select>
                 </label>
                 <label>

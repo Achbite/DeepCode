@@ -2,7 +2,7 @@ use crate::prelude::*;
 use rusqlite::{params, Connection};
 
 const CATALOG_SCHEMA: &str = include_str!("../../../contracts/agent-runtime/catalog.sql");
-const CATALOG_VERSION: u32 = 1;
+const CATALOG_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -16,6 +16,8 @@ pub(crate) struct ConversationWorkspaceRecord {
     pub(crate) workspace_id: String,
     pub(crate) display_name: String,
     pub(crate) canonical_root: String,
+    /// Present only for Host-owned message file snapshots.
+    pub(crate) owner_session_id: Option<String>,
     pub(crate) created_at: String,
 }
 
@@ -100,12 +102,14 @@ impl ConversationCatalog {
         for workspace in &self.workspaces {
             transaction
                 .execute(
-                    "INSERT INTO workspaces(workspace_id, display_name, canonical_root, created_at)
-                     VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO workspaces(
+                         workspace_id, display_name, canonical_root, owner_session_id, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
                         workspace.workspace_id,
                         workspace.display_name,
                         workspace.canonical_root,
+                        workspace.owner_session_id,
                         workspace.created_at,
                     ],
                 )
@@ -197,6 +201,7 @@ impl ConversationCatalog {
         value["workspaces"] = Value::Array(
             self.workspaces
                 .iter()
+                .filter(|workspace| workspace.owner_session_id.is_none())
                 .map(|workspace| {
                     json!({
                         "workspaceId": workspace.workspace_id,
@@ -352,6 +357,7 @@ impl ConversationCatalog {
         &mut self,
         session_id: &str,
         automatic_title: Option<&str>,
+        profile_id: Option<&str>,
         now: &str,
     ) -> bool {
         let Some(session) = self
@@ -366,6 +372,9 @@ impl ConversationCatalog {
                 session.title = title.to_string();
             }
         }
+        if let Some(profile_id) = profile_id {
+            session.profile_id = Some(profile_id.to_string());
+        }
         session.updated_at = now.to_string();
         true
     }
@@ -373,7 +382,12 @@ impl ConversationCatalog {
     pub(crate) fn delete_session(&mut self, session_id: &str) -> bool {
         let before = self.sessions.len();
         self.sessions.retain(|session| session.id != session_id);
-        self.sessions.len() != before
+        if self.sessions.len() == before {
+            return false;
+        }
+        self.workspaces
+            .retain(|workspace| workspace.owner_session_id.as_deref() != Some(session_id));
+        true
     }
 
     fn binding_display(&self, workspace_ids: &[String]) -> Vec<WorkspaceBindingDisplayRecord> {
@@ -392,7 +406,7 @@ impl ConversationCatalog {
         {
             let mut statement = connection
                 .prepare(
-                    "SELECT workspace_id, display_name, canonical_root, created_at
+                    "SELECT workspace_id, display_name, canonical_root, owner_session_id, created_at
                      FROM workspaces ORDER BY created_at, workspace_id",
                 )
                 .map_err(|error| format!("读取 workspace catalog 失败：{error}"))?;
@@ -402,7 +416,8 @@ impl ConversationCatalog {
                         workspace_id: row.get(0)?,
                         display_name: row.get(1)?,
                         canonical_root: row.get(2)?,
-                        created_at: row.get(3)?,
+                        owner_session_id: row.get(3)?,
+                        created_at: row.get(4)?,
                     })
                 })
                 .map_err(|error| format!("读取 workspace catalog 失败：{error}"))?;
@@ -490,11 +505,23 @@ impl ConversationCatalog {
     }
 
     fn validate(&self) -> Result<(), String> {
+        let declared_session_ids = self
+            .sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
         let mut workspace_ids = std::collections::HashSet::new();
         let mut canonical_roots = std::collections::HashSet::new();
         for workspace in &self.workspaces {
             validate_record_id("workspaceId", &workspace.workspace_id)?;
             validate_title(&workspace.display_name)?;
+            if workspace
+                .owner_session_id
+                .as_deref()
+                .is_some_and(|session_id| !declared_session_ids.contains(session_id))
+            {
+                return Err("Host-owned attachment workspace 引用了不存在的 Session。".to_string());
+            }
             if !workspace_ids.insert(workspace.workspace_id.as_str())
                 || !canonical_roots.insert(workspace.canonical_root.as_str())
             {
@@ -510,7 +537,11 @@ impl ConversationCatalog {
             }
             let mut bindings = std::collections::HashSet::new();
             for workspace_id in &project.workspace_ids {
-                if !workspace_ids.contains(workspace_id.as_str()) || !bindings.insert(workspace_id)
+                if !workspace_ids.contains(workspace_id.as_str())
+                    || self
+                        .workspace(workspace_id)
+                        .is_some_and(|workspace| workspace.owner_session_id.is_some())
+                    || !bindings.insert(workspace_id)
                 {
                     return Err(format!("项目 {} 的 workspace binding 无效。", project.id));
                 }
@@ -536,6 +567,7 @@ impl ConversationCatalog {
                 validate_title(&binding.display_name)?;
                 let canonical_display_name = self
                     .workspace(&binding.workspace_id)
+                    .filter(|workspace| workspace.owner_session_id.is_none())
                     .map(|workspace| workspace.display_name.as_str());
                 if canonical_display_name != Some(binding.display_name.as_str())
                     || !bindings.insert(binding.workspace_id.as_str())
@@ -653,6 +685,7 @@ mod tests {
             workspace_id: "workspace:one".to_string(),
             display_name: "One".to_string(),
             canonical_root: "/workspace/one".to_string(),
+            owner_session_id: None,
             created_at: "now".to_string(),
         });
         catalog.insert_project(ConversationProjectRecord {
@@ -708,6 +741,63 @@ mod tests {
     }
 
     #[test]
+    fn accepted_run_updates_the_catalog_profile_selection() {
+        let mut catalog = ConversationCatalog::default();
+        catalog.insert_session(ConversationSessionRecord {
+            id: "session:model-selection".to_string(),
+            title: "新对话".to_string(),
+            workspace_bindings: Vec::new(),
+            project_id: None,
+            profile_id: Some("profile:old".to_string()),
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
+        });
+
+        assert!(catalog.touch_session(
+            "session:model-selection",
+            Some("Keep the latest model"),
+            Some("profile:new"),
+            "later",
+        ));
+
+        let session = catalog.session("session:model-selection").unwrap();
+        assert_eq!(session.profile_id.as_deref(), Some("profile:new"));
+        assert_eq!(session.updated_at, "later");
+    }
+
+    #[test]
+    fn deleting_session_removes_only_its_owned_attachment_workspaces() {
+        let mut catalog = ConversationCatalog::default();
+        catalog.insert_session(ConversationSessionRecord {
+            id: "session:one".to_string(),
+            title: "One".to_string(),
+            workspace_bindings: Vec::new(),
+            project_id: None,
+            profile_id: None,
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
+        });
+        catalog.register_workspace(ConversationWorkspaceRecord {
+            workspace_id: "workspace:shared".to_string(),
+            display_name: "Shared".to_string(),
+            canonical_root: "/workspace/shared".to_string(),
+            owner_session_id: None,
+            created_at: "now".to_string(),
+        });
+        catalog.register_workspace(ConversationWorkspaceRecord {
+            workspace_id: "workspace:attachment".to_string(),
+            display_name: "attachment.txt".to_string(),
+            canonical_root: "/workspace/attachment".to_string(),
+            owner_session_id: Some("session:one".to_string()),
+            created_at: "now".to_string(),
+        });
+
+        assert!(catalog.delete_session("session:one"));
+        assert!(catalog.workspace("workspace:shared").is_some());
+        assert!(catalog.workspace("workspace:attachment").is_none());
+    }
+
+    #[test]
     fn noncurrent_catalog_store_is_rejected() {
         let path = std::env::temp_dir().join(format!(
             "deepcode-catalog-outdated-{}-{}.sqlite3",
@@ -715,7 +805,7 @@ mod tests {
             crate::now_millis()
         ));
         let outdated_schema =
-            CATALOG_SCHEMA.replace("PRAGMA user_version = 1;", "PRAGMA user_version = 2;");
+            CATALOG_SCHEMA.replace("PRAGMA user_version = 2;", "PRAGMA user_version = 1;");
         Connection::open(&path)
             .expect("open outdated catalog")
             .execute_batch(&outdated_schema)
@@ -723,7 +813,7 @@ mod tests {
 
         let error =
             ConversationCatalog::load(&path).expect_err("outdated catalog must be rejected");
-        assert!(error.contains("schema 2"));
+        assert!(error.contains("schema 1"));
 
         std::fs::remove_file(path).expect("remove outdated catalog fixture");
     }
