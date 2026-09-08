@@ -145,6 +145,17 @@ impl LocalAgentRuntime {
                     "当前 run 已使用不同的有效 Profile 完成运行时准备。",
                 ));
             }
+            if prepared
+                .response
+                .pointer("/provider/reasoningEffortOverride")
+                .and_then(Value::as_str)
+                != request.reasoning_effort_override.as_deref()
+            {
+                return Err(RunPreparationError::new(
+                    "run_runtime_identity_conflict",
+                    "当前 run 已使用不同推理强度完成运行时准备。",
+                ));
+            }
             if prepared.requested_plugin_identity != requested_plugin_identity {
                 return Err(RunPreparationError::new(
                     "run_runtime_identity_conflict",
@@ -160,10 +171,12 @@ impl LocalAgentRuntime {
         // Validate and freeze the requested Provider before starting any new
         // out-of-process plugin generation. A bad Profile must not replace the
         // currently usable tool generation or leave an unused MCP process set.
-        let provider_binding =
-            ProviderRuntimeRegistry::prepare(&gui, request.profile_id.as_deref()).map_err(
-                |message| RunPreparationError::new("provider_runtime_prepare_failed", message),
-            )?;
+        let provider_binding = ProviderRuntimeRegistry::prepare(
+            &gui,
+            request.profile_id.as_deref(),
+            request.reasoning_effort_override.as_deref(),
+        )
+        .map_err(|message| RunPreparationError::new("provider_runtime_prepare_failed", message))?;
         let provider_runtime = provider_binding.snapshot().clone();
         let plugin_selection = crate::local_agent_plugins::resolve_plugin_selection(
             settings,
@@ -414,6 +427,7 @@ pub(crate) struct PrepareRunRuntimeRequest {
     session_id: String,
     run_id: String,
     profile_id: Option<String>,
+    reasoning_effort_override: Option<String>,
     plugin_catalog_revision: Option<String>,
     #[serde(default)]
     plugin_selections: Vec<crate::local_agent_plugins::PluginSelectionInput>,
@@ -840,6 +854,7 @@ pub(crate) async fn local_agent_provider_stream(
             &body.run_id,
             &body.provider_runtime_ref,
             &body.profile_id,
+            frozen_provider_runtime.reasoning_effort_override.as_deref(),
         )
     };
     let runtime = match runtime {
@@ -1110,7 +1125,7 @@ fn validate_provider_output_blocks(blocks: &[Value]) -> Result<(), String> {
                         .and_then(Value::as_str)
                         .is_some_and(|id| valid_provider_text(id) && reference_ids.insert(id))
             }
-            "toolCall" => {
+            "toolCall" | "toolCallRejected" => {
                 let provider_call_id = block.get("providerCallId").and_then(Value::as_str);
                 item.get("type").and_then(Value::as_str) == Some("function_call")
                     && block
@@ -1243,6 +1258,9 @@ mod tests {
         hosted_web_search: &'static str,
     ) -> ProviderRuntimeSnapshot {
         ProviderRuntimeSnapshot {
+            reasoning_effort: None,
+            reasoning_effort_override: None,
+            thinking: None,
             provider_runtime_ref: "provider-runtime:test".to_string(),
             profile_id: "profile:test".to_string(),
             context_window_tokens: 4_096,
@@ -1282,6 +1300,7 @@ mod tests {
     #[test]
     fn provider_hosted_search_is_agent_only_and_compaction_remains_tool_free() {
         let runtime = RunProviderRuntime {
+            reasoning_effort_override: None,
             provider_runtime_ref: "provider-runtime:test".to_string(),
             profile_id: "profile:test".to_string(),
             context_window_tokens: 4_096,

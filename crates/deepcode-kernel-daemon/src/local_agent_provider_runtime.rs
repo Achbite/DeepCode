@@ -10,6 +10,12 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct ProviderRuntimeSnapshot {
     pub(crate) provider_runtime_ref: String,
     pub(crate) profile_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning_effort_override: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thinking: Option<String>,
     pub(crate) context_window_tokens: u64,
     pub(crate) max_output_tokens: u32,
     pub(crate) api_surface: &'static str,
@@ -41,8 +47,9 @@ impl ProviderRuntimeRegistry {
     pub(crate) fn prepare(
         gui: &GuiState,
         profile_id: Option<&str>,
+        reasoning_effort_override: Option<&str>,
     ) -> Result<ProviderRuntimeBinding, String> {
-        capture_binding(gui, profile_id)
+        capture_binding(gui, profile_id, reasoning_effort_override)
     }
 
     pub(crate) fn bind(
@@ -72,6 +79,7 @@ impl ProviderRuntimeRegistry {
         run_id: &str,
         provider_runtime_ref: &str,
         profile_id: &str,
+        reasoning_effort_override: Option<&str>,
     ) -> Result<ProviderRuntimeBinding, String> {
         if provider_runtime_ref.trim() != provider_runtime_ref
             || provider_runtime_ref.is_empty()
@@ -84,6 +92,8 @@ impl ProviderRuntimeRegistry {
         if let Some(binding) = self.lock()?.get(&key).cloned() {
             if binding.snapshot.provider_runtime_ref != provider_runtime_ref
                 || binding.snapshot.profile_id != profile_id
+                || binding.snapshot.reasoning_effort_override.as_deref()
+                    != reasoning_effort_override
             {
                 return Err("当前 run 的 Provider runtime identity 不一致。".to_string());
             }
@@ -94,7 +104,7 @@ impl ProviderRuntimeRegistry {
         // from the current profile and accept it solely when the deterministic
         // runtime identity is unchanged. A changed profile remains unavailable
         // instead of silently changing an already-started run.
-        let binding = capture_binding(gui, Some(profile_id))?;
+        let binding = capture_binding(gui, Some(profile_id), reasoning_effort_override)?;
         if binding.snapshot.provider_runtime_ref != provider_runtime_ref {
             return Err("Provider runtime 已不再与 run.started 固定的配置一致。".to_string());
         }
@@ -141,9 +151,13 @@ impl ProviderRunKey {
 fn capture_binding(
     gui: &GuiState,
     requested_profile_id: Option<&str>,
+    reasoning_effort_override: Option<&str>,
 ) -> Result<ProviderRuntimeBinding, String> {
     let profile_id = selected_profile_id(gui, requested_profile_id)?;
-    let profile = resolve_llm_profile(gui, Some(&profile_id))?;
+    let profile = with_reasoning_override(
+        resolve_llm_profile(gui, Some(&profile_id))?,
+        reasoning_effort_override,
+    )?;
     let context_window_tokens = profile
         .context_window_tokens
         .filter(|value| *value > 0)
@@ -178,6 +192,9 @@ fn capture_binding(
             deepcode_kernel_tools::hash_bytes(&encoded)
         ),
         profile_id,
+        reasoning_effort: profile.reasoning_effort.clone(),
+        reasoning_effort_override: reasoning_effort_override.map(str::to_string),
+        thinking: profile.thinking.clone(),
         context_window_tokens,
         max_output_tokens,
         api_surface: match profile.kind.as_str() {
@@ -208,6 +225,73 @@ fn selected_profile_id(gui: &GuiState, requested: Option<&str>) -> Result<String
     }
     selected_profile(gui, profile_id)?;
     Ok(profile_id.to_string())
+}
+
+fn with_reasoning_override(
+    mut profile: ResolvedLlmProfile,
+    effort: Option<&str>,
+) -> Result<ResolvedLlmProfile, String> {
+    if let Some(effort) = effort {
+        if !matches!(effort, "low" | "medium" | "high" | "max") {
+            return Err("对话推理强度无效。".to_string());
+        }
+        if profile.thinking.as_deref() == Some("disabled") {
+            return Err("当前 Profile 已关闭推理，不能覆盖推理强度。".to_string());
+        }
+        profile.reasoning_effort = Some(effort.to_string());
+    }
+    Ok(profile)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_override_reaches_the_provider_body_without_mutating_the_profile_or_enabling_thinking(
+    ) {
+        let configured = ResolvedLlmProfile {
+            kind: "openaiCompatible".into(),
+            provider_flavor: Some("deepseek".into()),
+            base_url: None,
+            model: "fixture-model".into(),
+            context_window_tokens: Some(4096),
+            max_output_tokens: Some(512),
+            temperature: None,
+            reasoning_effort: Some("max".into()),
+            thinking: Some("enabled".into()),
+            hosted_web_search: None,
+            api_key: None,
+        };
+        let effective = with_reasoning_override(configured.clone(), Some("low")).unwrap();
+        let body = crate::llm_transport::openai_compatible_request_body(
+            &effective,
+            vec![json!({"role":"user","content":"Inspect source."})],
+            &[],
+            true,
+            false,
+        );
+        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(configured.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(
+            with_reasoning_override(configured.clone(), None)
+                .unwrap()
+                .reasoning_effort
+                .as_deref(),
+            Some("max")
+        );
+        assert!(with_reasoning_override(configured.clone(), Some("xhigh")).is_err());
+        let mut disabled = configured;
+        disabled.thinking = Some("disabled".into());
+        assert!(with_reasoning_override(disabled.clone(), Some("low")).is_err());
+        assert_eq!(
+            with_reasoning_override(disabled, None)
+                .unwrap()
+                .thinking
+                .as_deref(),
+            Some("disabled")
+        );
+    }
 }
 
 fn selected_profile<'a>(gui: &'a GuiState, profile_id: &str) -> Result<&'a Value, String> {

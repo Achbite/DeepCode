@@ -1,3 +1,5 @@
+import type { LlmReasoningEffort, LlmThinkingMode } from './llm.js';
+
 export const LOCAL_AGENT_PROTOCOL_VERSION = 'deepcode.local-agent' as const;
 export const CONVERSATION_COMMAND_VERSION = 'deepcode.command.v3' as const;
 export const COMMAND_REPLY_VERSION = 'deepcode.command-reply.v3' as const;
@@ -8,6 +10,7 @@ export const KERNEL_REQUEST_VERSION = 'deepcode.kernel-request' as const;
 export const KERNEL_REPLY_VERSION = 'deepcode.kernel-reply' as const;
 export const SESSION_CONTROL_INTERACTION_REQUEST = 'interaction.request' as const;
 export const SESSION_CONTROL_PLAN_PUBLISH = 'plan.publish' as const;
+export const SESSION_CONTROL_PLAN_PROGRESS = 'plan.progress' as const;
 
 export type JsonObject = Record<string, unknown>;
 
@@ -132,7 +135,8 @@ export type PlanOperation =
   | {
       workspaceId: string;
       operation: 'bash';
-      command: string;
+      /** Representative project entrypoint, for review; authorization uses the declared scope. */
+      command?: string;
       workspaceMode: 'write';
       executionScope: 'workspace' | 'host';
       terminal?: { stdin: string };
@@ -164,6 +168,13 @@ export type MessageFeedback = 'up' | 'down';
 export type ConversationCommand =
   | {
       schemaVersion: typeof CONVERSATION_COMMAND_VERSION;
+      type: 'session.model-settings.set';
+      commandId: string;
+      sessionId: string;
+      settings: SessionModelSettings;
+    }
+  | {
+      schemaVersion: typeof CONVERSATION_COMMAND_VERSION;
       type: 'session.directory-index.attach';
       commandId: string;
       sessionId: string;
@@ -184,6 +195,7 @@ export type ConversationCommand =
       text: string;
       filesystemReferences?: FilesystemReference[];
       profileId?: string;
+      reasoningEffortOverride?: LlmReasoningEffort | null;
       pluginCatalogRevision?: string;
       pluginSelections?: PluginSelectionInput[];
     }
@@ -195,6 +207,7 @@ export type ConversationCommand =
       task: string;
       filesystemReferences?: FilesystemReference[];
       profileId?: string;
+      reasoningEffortOverride?: LlmReasoningEffort | null;
       pluginCatalogRevision?: string;
       pluginSelections?: PluginSelectionInput[];
     }
@@ -275,6 +288,14 @@ export type ProviderOutputBlock = {
   | { kind: 'finalMessage'; messageId: string }
   | { kind: 'toolCall'; callId: string; providerCallId: string; toolName: string }
   | {
+      /** Session rejected the original Provider input before requesting any effect. */
+      kind: 'toolCallRejected';
+      callId: string;
+      providerCallId: string;
+      toolName: string;
+      error: LocalAgentError & { issues: ToolInputIssue[] };
+    }
+  | {
       kind: 'providerHosted';
       activityId: string;
       providerCallId: string;
@@ -348,6 +369,7 @@ export interface TokenUsageProjection {
   cacheMissInputTokens: number;
   cacheAvailable: boolean;
   cacheComplete: boolean;
+  /** Known cache-read input tokens / all reported input tokens; coverage is cacheComplete. */
   cacheHitRatio: number | null;
 }
 
@@ -517,6 +539,10 @@ export interface EffectPreview {
 
 export type SessionEvent =
   | (SessionEventBase & {
+      type: 'session.model-settings.updated';
+      payload: { commandId: string; settings: SessionModelSettings };
+    })
+  | (SessionEventBase & {
       type: 'session.created';
       payload: {
         displayTitle: string;
@@ -661,7 +687,9 @@ export type SessionEvent =
   | (SessionEventBase & {
       type: 'todo.progressed';
       runId: string;
+      callId?: string;
       payload: {
+        providerCallId?: string;
         sourcePlanId: string;
         sourcePlanRevision: number;
         sourceFactRef: string;
@@ -695,6 +723,12 @@ export type SessionEvent =
         decision: 'allow' | 'deny';
         authorityId: string;
       };
+    })
+  | (SessionEventBase & {
+      type: 'tool.input-rejected';
+      runId: string;
+      callId: string;
+      payload: { rejection: ToolInputRejection };
     })
   | (SessionEventBase & {
       type: 'tool.completed';
@@ -881,6 +915,14 @@ export interface AssistantDraftProjection {
   content: string;
   reasoningContent?: string;
   orderedBlocks?: AssistantDraftBlockProjection[];
+  activity?: ProviderActivityProjection;
+}
+
+export interface ProviderActivityProjection {
+  purpose: 'agent' | 'contextCompaction';
+  phase: 'waitingResponse' | 'reasoning' | 'awaitingOutput' | 'generatingOutput';
+  startedAt: string;
+  lastContentAt?: string;
 }
 
 export type PlanProjectionStatus =
@@ -923,6 +965,8 @@ export type RunProjectionStatus = typeof RUN_PROJECTION_STATUSES[number];
 export interface RunProjection {
   runId: string;
   profileId: string;
+  reasoningEffort?: LlmReasoningEffort;
+  thinking?: LlmThinkingMode;
   waitingReason?: 'approval' | 'userInput' | 'plan';
   /** Immutable effective directory set captured by run.started. */
   workspaceBindings: WorkspaceBindingDisplay[];
@@ -938,6 +982,7 @@ export interface ActivityProjection {
     | 'waiting'
     | 'completed'
     | 'denied'
+    | 'rejected'
     | 'failed'
     | 'cancelled'
     | 'indeterminate';
@@ -946,6 +991,7 @@ export interface ActivityProjection {
   callId?: string;
   sequence: number;
   tool?: ToolActivityProjection;
+  inputRejection?: ToolInputRejection['error'];
   providerHosted?: ProviderHostedActivityProjection;
 }
 
@@ -1012,7 +1058,13 @@ export interface SessionDisplayProjection {
   creationTitle: string;
 }
 
+export interface SessionModelSettings {
+  profileId: string;
+  reasoningEffortOverride: LlmReasoningEffort | null;
+}
+
 export interface SessionProjection {
+  modelSettings: SessionModelSettings | null;
   schemaVersion: typeof SESSION_PROJECTION_VERSION;
   sessionId: string;
   revision: number;
@@ -1033,6 +1085,7 @@ export interface SessionProjection {
   pendingPlan: PendingPlanProjection | null;
   todoList: TodoListProjection | null;
   contextUsage: ContextUsageProjection | null;
+  /** Latest settled input and latest in-flight composition; history is read on demand. */
   contextCompositions: ContextCompositionProjection[];
   tokenUsage: TokenUsageProjection;
   tokenUsageHistory: TokenUsageRoundProjection[];
@@ -1045,6 +1098,7 @@ export interface SessionProjection {
 export interface ConversationPort {
   submit(command: ConversationCommand): Promise<CommandReply>;
   snapshot(sessionId: string): Promise<SessionProjection>;
+  contextComposition(sessionId: string, providerRequestId: string): Promise<ContextCompositionProjection>;
 }
 
 export interface ModelMessage {
@@ -1075,6 +1129,9 @@ export interface ProviderToolDefinition {
 export interface ProviderRuntimeSnapshot {
   providerRuntimeRef: string;
   profileId: string;
+  reasoningEffort?: LlmReasoningEffort;
+  reasoningEffortOverride?: LlmReasoningEffort;
+  thinking?: LlmThinkingMode;
   contextWindowTokens: number;
   maxOutputTokens: number;
   apiSurface: 'chatCompletions' | 'responses' | 'anthropicMessages' | 'ollamaChat';
@@ -1243,6 +1300,7 @@ export interface PrepareRunRuntimeRequest {
   sessionId: string;
   runId: string;
   profileId?: string;
+  reasoningEffortOverride?: LlmReasoningEffort;
   pluginCatalogRevision?: string;
   pluginSelections?: PluginSelectionInput[];
 }
@@ -1381,7 +1439,28 @@ export type ToolExecutionRecord =
   | (ToolExecutionRecordBase & { outcome: 'cancelled' })
   | (ToolExecutionRecordBase & { outcome: 'indeterminate'; error: LocalAgentError });
 
+export interface ToolInputIssue {
+  path: string;
+  rule: string;
+  message: string;
+  expected?: unknown;
+}
+
+/** Kernel input rejection before effect preparation or execution; journaled by Session. */
+export interface ToolInputRejection extends Omit<ToolExecutionRecordBase, 'recordId' | 'preparedEffect' | 'authority' | 'startedAt' | 'completedAt'> {
+  rejectedAt: string;
+  error: LocalAgentError & { issues: ToolInputIssue[] };
+}
+
 export type ToolExecutionReply =
+  | {
+      schemaVersion: typeof KERNEL_REPLY_VERSION;
+      type: 'tool.execution';
+      requestId: string;
+      callId: string;
+      status: 'inputRejected';
+      rejection: ToolInputRejection;
+    }
   | {
       schemaVersion: typeof KERNEL_REPLY_VERSION;
       type: 'tool.execution';

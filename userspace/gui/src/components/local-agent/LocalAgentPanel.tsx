@@ -20,6 +20,7 @@ import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../../deepcode-gui/layout/DeepCodeShellIcon';
 import ProjectFolderDialog from '../../deepcode-gui/layout/ProjectFolderDialog';
 import SessionModelSelector from '../../deepcode-gui/panel/SessionModelSelector';
+import ProviderStageStatus from './ProviderStageStatus';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import { useSettingsStore } from '../../state/settingsStore';
 import { usePresentedCommittedContent } from '../../presentation/PresentationRuntime';
@@ -113,6 +114,9 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const respondPlan = useLocalAgentStore((state) => state.respondPlan);
   const cancelRun = useLocalAgentStore((state) => state.cancelRun);
   const selectProfile = useLocalAgentStore((state) => state.selectProfile);
+  const selectReasoningEffort = useLocalAgentStore((state) => state.selectReasoningEffort);
+  const reasoningEffortOverride = useLocalAgentStore((state) => state.reasoningEffortOverride);
+  const modelSettingsBusy = useLocalAgentStore((state) => state.modelSettingsBusy);
   const [draft, setDraft] = useState('');
   const [pendingFilesystemPaths, setPendingFilesystemPaths] = useState<
     PendingFilesystemPath[]
@@ -207,18 +211,6 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     || Boolean(projection?.pendingApproval)
     || Boolean(projection?.pendingPlan)
     || Boolean(projection?.terminalError);
-  const latestRunComposition = useMemo(() => {
-    const runId = projection?.run?.runId;
-    if (!runId) return null;
-    for (let index = projection.contextCompositions.length - 1; index >= 0; index -= 1) {
-      const composition = projection.contextCompositions[index];
-      if (composition?.runId === runId) return composition;
-    }
-    return null;
-  }, [projection?.contextCompositions, projection?.run?.runId]);
-  const contextCompacting = projection?.run?.status === 'running'
-    && latestRunComposition?.purpose === 'contextCompaction';
-
   const recordProviderStreamProgress = useCallback((identity: string, length: number) => {
     providerStreamProgressRef.current.set(identity, length);
   }, []);
@@ -958,6 +950,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     projection?.run && ['running', 'waiting'].includes(projection.run.status),
   );
   const canSend = Boolean(draft.trim())
+    && !modelSettingsBusy
     && !loading
     && !submitting
     && !catalogBusy
@@ -1253,14 +1246,12 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
               </div>
             </article>
           )}
-          {projection?.run?.status === 'running' && !assistantDraft?.reasoningContent && (
-            <div className="local-agent__run-thinking" role="status" aria-live="polite">
-              <span className="local-agent__run-spinner" aria-hidden="true" />
-              <span>{t(
-                language,
-                contextCompacting ? 'agent.context.compacting' : 'agent.run.thinking',
-              )}</span>
-            </div>
+          {projection?.run && projection.run.status !== 'completed' && (
+            <ProviderStageStatus run={projection.run} language={language}
+              key={`${projection.run.runId}:${assistantDraft?.turnId ?? 'idle'}`}
+              activity={assistantDraft?.runId === projection.run.runId ? assistantDraft.activity : undefined}
+              toolPending={projection.activities.some((activity) => activity.runId === projection.run?.runId
+                && activity.kind === 'tool' && ['requested', 'active', 'waiting'].includes(activity.status))} />
           )}
           {projection?.terminalError && (
             <article className="local-agent__terminal-error">
@@ -1753,11 +1744,12 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
                 language={language}
                 profiles={profiles}
                 selectedProfileId={selectedProfileId}
+                reasoningEffortOverride={reasoningEffortOverride}
                 contextUsage={projection?.contextUsage ?? null}
                 contextCompositions={projection?.contextCompositions ?? []}
-                tokenUsage={projection?.tokenUsage ?? null}
-                busy={loading}
+                busy={loading || submitting || modelSettingsBusy}
                 onProfileChange={selectProfile}
+                onReasoningEffortChange={selectReasoningEffort}
               />
               <button
                 type="button"
@@ -1930,7 +1922,7 @@ const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
   const terminal = activities.every((activity) => isTerminalActivity(activity.status));
   const [expanded, setExpanded] = useState(() => !terminal);
   const hasFailure = activities.some((activity) => (
-    ['failed', 'denied', 'indeterminate'].includes(activity.status)
+    ['failed', 'denied', 'rejected', 'indeterminate'].includes(activity.status)
   ));
   const groupStatus = toolGroupStatus(activities);
 
@@ -2106,6 +2098,17 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
               </>
             )}
           </dl>
+          {activity.inputRejection && (
+            <div className="local-agent__input-rejection">
+              <p>{activity.inputRejection.message}</p>
+              {activity.inputRejection.issues.map((issue, index) => (
+                <div key={`${issue.path}:${issue.rule}:${index}`}>
+                  <code>{issue.path}</code><span>{issue.message}</span>
+                  {issue.expected !== undefined && <code>{JSON.stringify(issue.expected)}</code>}
+                </div>
+              ))}
+            </div>
+          )}
           {tool?.resources.length ? (
             <div className="local-agent__tool-resources">
               {tool.resources.map((resource, index) => {
@@ -2472,7 +2475,7 @@ function isFileMutationOperation(operation: string | undefined): boolean {
 }
 
 function isTerminalActivity(status: ActivityProjection['status']): boolean {
-  return ['completed', 'denied', 'failed', 'cancelled', 'indeterminate'].includes(status);
+  return ['completed', 'denied', 'rejected', 'failed', 'cancelled', 'indeterminate'].includes(status);
 }
 
 function toolActivityStatus(
@@ -2491,6 +2494,7 @@ function toolGroupStatus(
     'requested',
     'failed',
     'denied',
+    'rejected',
     'indeterminate',
     'cancelled',
     'completed',

@@ -5,19 +5,22 @@ import type {
   ModelInteractionRequest,
   PlanOperation,
   ProviderToolDefinition,
+  TodoProgressUpdate,
 } from '@deepcode/protocol';
 import {
   SESSION_CONTROL_INTERACTION_REQUEST,
   SESSION_CONTROL_PLAN_PUBLISH,
+  SESSION_CONTROL_PLAN_PROGRESS,
 } from '@deepcode/protocol';
 
 export interface SessionControlWireNames {
   interactionRequest: string;
   planPublish: string;
+  planProgress: string;
 }
 
-export function confirmedPlanExecutionInstruction(names: SessionControlWireNames): string {
-  return `The Plan is confirmed. Execute it now; do not ask for confirmation again. The Session tracks Todo progress from completed tool results. Use ${names.interactionRequest} only for a required user decision. Use ${names.planPublish} only when the confirmed Plan must change.`;
+export function confirmedPlanExecutionInstruction(): string {
+  return 'The Plan is confirmed. Execute it now. Report step progress using the Plan progress tool, referencing a tool result recordId. Request user input only for a required decision. Publish a revised Plan only for changes to goals, targets, destructive operations or execution scope, not for routine implementation details.';
 }
 
 export function sessionControlInstructions(
@@ -27,7 +30,7 @@ export function sessionControlInstructions(
   if (!hasWorkspaceBindings) {
     return `Text with calls is progress; text without calls is the final answer. ${names.interactionRequest} must be the only call in its turn. No workspace is bound to this run; do not invent a workspace handle or request workspace operations.`;
   }
-  return `Text with calls is progress; text without calls is the final answer. ${names.interactionRequest} and ${names.planPublish} must be the only call in their turn. Use a logical workspace handle from the current Session binding list and workspace-relative paths; never invent or expose a workspaceId.`;
+  return `Text with calls is progress; text without calls is the final answer. Session controls must be the only call in their turn. Use ${names.planProgress} to report progress for the confirmed Todo list using tool result recordId evidence; command counts do not determine step completion. Session Todo messages are chronological state updates; the latest update is current. Use a logical workspace handle from the Session binding list and workspace-relative paths; never invent or expose a workspaceId.`;
 }
 
 const INTERACTION_SCHEMA: JsonObject = {
@@ -84,7 +87,7 @@ const PLAN_OPERATION_SCHEMA: JsonObject = {
     {
       type: 'object',
       additionalProperties: false,
-      required: ['workspace', 'operation', 'command', 'workspaceMode', 'executionScope'],
+      required: ['workspace', 'operation', 'workspaceMode', 'executionScope'],
       properties: {
         workspace: { type: 'string', minLength: 1 },
         operation: { type: 'string', enum: ['bash'] },
@@ -141,6 +144,12 @@ const PLAN_SCHEMA: JsonObject = {
 
 export type SessionControlCall =
   | {
+      kind: 'planProgress';
+      callId: string;
+      sourceFactRef: string;
+      updates: TodoProgressUpdate[];
+    }
+  | {
       kind: 'interaction';
       callId: string;
       request: ModelInteractionRequest;
@@ -167,8 +176,25 @@ export function sessionControlToolDefinitions(): readonly ProviderToolDefinition
     },
     {
       name: SESSION_CONTROL_PLAN_PUBLISH,
-      description: 'Publish a complete new or revised execution plan for confirmation. mutationManifest must list every intended workspace mutation. A bash mutation must exactly include workspaceMode=write, executionScope, and terminal stdin when PTY input will be used. Confirmation creates the Todo list.',
+      description: 'Publish goals, affected files, steps, build environment and verification for user confirmation. mutationManifest declares file targets, explicit deletions and Bash workspace/execution scope. fs.edit and fs.write cover the same declared file. Bash command and terminal input are optional examples, not an exact script lock; prefer project build/test entrypoints. Continue routine fixes, log handling and verification adjustments within the confirmed scope. Revise only when goals, targets, destructive actions or execution scope change. Preserve successful work. Confirmation creates the Todo list; report progress with plan.progress.',
       inputSchema: structuredClone(PLAN_SCHEMA) as JsonObject,
+    },
+    {
+      name: SESSION_CONTROL_PLAN_PROGRESS,
+      description: 'Update confirmed Todo steps after examining a tool result. sourceFactRef is its recordId. Mark completed only when the step and its verification are done. Batch related updates; this does not request user confirmation.',
+      inputSchema: {
+        type: 'object', additionalProperties: false, required: ['sourceFactRef', 'updates'],
+        properties: {
+          sourceFactRef: { type: 'string', minLength: 1 },
+          updates: { type: 'array', minItems: 1, maxItems: 12, items: {
+            type: 'object', additionalProperties: false, required: ['todoId', 'status'],
+            properties: {
+              todoId: { type: 'string', minLength: 1 },
+              status: { type: 'string', enum: ['pending', 'inProgress', 'completed'] },
+            },
+          } },
+        },
+      },
     },
   ];
 }
@@ -181,8 +207,27 @@ export function decodeSessionControlCall(
   if (
     name !== SESSION_CONTROL_INTERACTION_REQUEST
     && name !== SESSION_CONTROL_PLAN_PUBLISH
+    && name !== SESSION_CONTROL_PLAN_PROGRESS
   ) return null;
   const canonicalCallId = requiredIdentifier(callId, 'callId');
+  if (name === SESSION_CONTROL_PLAN_PROGRESS) {
+    assertExactKeys(input, ['sourceFactRef', 'updates']);
+    if (!Array.isArray(input.updates) || input.updates.length < 1 || input.updates.length > 12) {
+      throw new SessionControlError('plan_progress_invalid', 'updates 必须包含一至十二个步骤更新。');
+    }
+    const seen = new Set<string>();
+    const updates = input.updates.map((item): TodoProgressUpdate => {
+      if (!isRecord(item)) throw new SessionControlError('plan_progress_invalid', '步骤更新必须是对象。');
+      assertExactKeys(item, ['todoId', 'status']);
+      const todoId = requiredIdentifier(item.todoId, 'todoId');
+      if (seen.has(todoId) || !['pending', 'inProgress', 'completed'].includes(String(item.status))) {
+        throw new SessionControlError('plan_progress_invalid', '步骤更新重复或状态无效。');
+      }
+      seen.add(todoId);
+      return { todoId, status: item.status as TodoProgressUpdate['status'] };
+    });
+    return { kind: 'planProgress', callId: canonicalCallId, sourceFactRef: requiredIdentifier(input.sourceFactRef, 'sourceFactRef'), updates };
+  }
   if (name === SESSION_CONTROL_INTERACTION_REQUEST) {
     return {
       kind: 'interaction',
@@ -298,17 +343,17 @@ function decodePlanOperation(value: unknown): PlanOperation {
     assertExactKeys(
       value,
       ['workspaceId', 'operation', 'command', 'workspaceMode', 'executionScope', 'terminal'],
-      ['terminal'],
+      ['command', 'terminal'],
     );
-    const command = requiredText(value.command, 'command');
+    const command = value.command === undefined ? undefined : requiredText(value.command, 'command');
     if (
-      command.length > 16_384
+      command !== undefined && command.length > 16_384
       || value.workspaceMode !== 'write'
       || value.executionScope !== 'workspace' && value.executionScope !== 'host'
     ) {
       throw new SessionControlError(
         'session_control_plan_shell_invalid',
-        'bash Plan operation 必须声明有界 command、workspaceMode=write 和 executionScope。',
+        'bash Plan operation 必须声明 workspaceMode=write 和 executionScope。',
       );
     }
     const terminal = value.terminal === undefined
@@ -317,7 +362,7 @@ function decodePlanOperation(value: unknown): PlanOperation {
     return {
       workspaceId,
       operation,
-      command,
+      ...(command === undefined ? {} : { command }),
       workspaceMode: 'write',
       executionScope: value.executionScope,
       ...(terminal ? { terminal } : {}),

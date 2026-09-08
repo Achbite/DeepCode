@@ -369,16 +369,11 @@ fn skill_plugin(
     let uri = format!("plugin://{}@skill", plugin_slug(&id));
     let display_name = skill_display_name(path, &instructions);
     let short_description = skill_short_description(&instructions, &display_name);
-    let canonical = path
-        .to_str()
+    path.to_str()
         .ok_or_else(|| format!("Skill 路径不是 UTF-8：{}", path.display()))?;
     let plugin_artifact_ref = format!(
         "plugin-artifact:{}",
         deepcode_kernel_tools::hash_bytes(instructions.as_bytes())
-    );
-    let plugin_instance_ref = format!(
-        "plugin-instance:{}",
-        deepcode_kernel_tools::hash_bytes(canonical.as_bytes())
     );
     Ok(PluginSource {
         public: PublicPluginCatalogItem {
@@ -391,7 +386,7 @@ fn skill_plugin(
             available: true,
         },
         plugin_artifact_ref,
-        plugin_instance_ref,
+        plugin_instance_ref: String::new(),
         capability_refs: vec![format!("skill:{id}")],
         capability_summary: truncate_utf8(&instructions, MAX_DYNAMIC_PLUGIN_BYTES),
         tool_prompt_provider: None,

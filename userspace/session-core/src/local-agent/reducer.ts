@@ -20,6 +20,7 @@ import {
 } from '@deepcode/protocol';
 
 export interface SessionState {
+  modelSettings: SessionProjection['modelSettings'];
   sessionId: string;
   revision: number;
   display: SessionProjection['display'];
@@ -77,6 +78,7 @@ export interface ProviderCallFactState {
 
 export function emptySessionState(sessionId: string): SessionState {
   return {
+    modelSettings: null,
     sessionId,
     revision: 0,
     display: { creationTitle: '新对话' },
@@ -126,6 +128,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
     ...previous,
     revision: event.sequence,
     display: { ...previous.display },
+    modelSettings: previous.modelSettings ? { ...previous.modelSettings } : null,
     creationWorkspaceBindings: previous.creationWorkspaceBindings.map((binding) => ({ ...binding })),
     sessionDirectoryIndexes: previous.sessionDirectoryIndexes.map((binding) => ({ ...binding })),
     workspaceBindings: previous.workspaceBindings.map((binding) => ({ ...binding })),
@@ -183,7 +186,12 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
   };
 
   switch (event.type) {
+    case 'session.model-settings.updated':
+      next.modelSettings = { ...event.payload.settings };
+      break;
     case 'session.created':
+      next.modelSettings = event.payload.profileId
+        ? { profileId: event.payload.profileId, reasoningEffortOverride: null } : null;
       next.display = { creationTitle: event.payload.displayTitle };
       next.creationWorkspaceBindings = event.payload.workspaceBindings.map((binding) => ({ ...binding }));
       next.sessionDirectoryIndexes = [];
@@ -550,6 +558,9 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
     }
     case 'todo.progressed': {
       assertRunningRun(next, event.runId, 'todo_run_not_active');
+      if (event.callId && event.payload.providerCallId) {
+        recordProviderCallFact(next, event.callId, event.runId, event.payload.providerCallId, 'plan.progress', event.sequence);
+      }
       if (
         !next.todoList
         || next.todoList.sourcePlanId !== event.payload.sourcePlanId
@@ -636,6 +647,13 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       settleActivity(next, approvalActivityId(event.payload.approvalId), 'completed', event.sequence);
       resumeRun(next, event.runId);
       break;
+    case 'tool.input-rejected':
+      settleActivity(next, toolActivityId(event.callId), 'rejected', event.sequence);
+      next.activities[toolActivityId(event.callId)] = {
+        ...next.activities[toolActivityId(event.callId)],
+        inputRejection: structuredClone(event.payload.rejection.error),
+      };
+      break;
     case 'tool.completed':
       settleActivity(
         next,
@@ -661,6 +679,21 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         event.payload.toolName,
         event.sequence,
       );
+      if (event.payload.error.code !== 'plan_revision_unchanged') {
+        next.activities[toolActivityId(event.callId)] = {
+          activityId: toolActivityId(event.callId),
+          kind: 'tool',
+          status: 'rejected',
+          label: event.payload.toolName,
+          runId: event.runId,
+          callId: event.callId,
+          sequence: event.sequence,
+          inputRejection: {
+            ...event.payload.error,
+            issues: [{ path: '$', rule: 'session_control_schema', message: event.payload.error.message }],
+          },
+        };
+      }
       break;
     case 'context.compaction.requested':
       assertRunningRun(next, event.runId, 'context_compaction_run_not_active');
@@ -805,6 +838,21 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       };
       if (settlement.outcome === 'completed') {
         for (const block of settlement.orderedOutputBlocks ?? []) {
+          if (block.kind === 'toolCallRejected') {
+            if (next.providerCallFacts[block.callId] || next.activities[toolActivityId(block.callId)]) {
+              throw new Error('provider_turn_rejected_call_identity_duplicate');
+            }
+            next.activities[toolActivityId(block.callId)] = {
+              activityId: toolActivityId(block.callId),
+              kind: 'tool',
+              status: 'rejected',
+              label: block.toolName,
+              runId: event.runId,
+              callId: block.callId,
+              sequence: event.sequence,
+              inputRejection: structuredClone(block.error),
+            };
+          }
           if (block.kind !== 'providerHosted') continue;
           const status = block.item.status;
           const action = block.item.action;
@@ -831,6 +879,8 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       const runUsage = next.tokenUsageHistory[event.runId];
       if (!runUsage) throw new Error('token_usage_run_missing');
       next.tokenUsageHistory[event.runId] = withProviderCompletion(runUsage);
+      // The last settled call owns this slot, even when it reports no usage.
+      next.contextUsage = null;
       break;
     }
     case 'context.updated': {
@@ -870,15 +920,13 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         ...receipt,
         partitions: estimatePartitionTokens(receipt.partitions, event.payload.inputTokens),
       };
-      if (receipt.purpose === 'agent') {
-        next.contextUsage = {
-          ...event.payload,
-          providerRequestId,
-          runId: event.runId,
-          sequence: event.sequence,
-          updatedAt: event.occurredAt,
-        };
-      }
+      next.contextUsage = {
+        ...event.payload,
+        providerRequestId,
+        runId: event.runId,
+        sequence: event.sequence,
+        updatedAt: event.occurredAt,
+      };
       next.tokenUsage = withProviderUsage(next.tokenUsage, event.payload);
       const runUsage = next.tokenUsageHistory[event.runId];
       if (!runUsage) throw new Error('token_usage_run_missing');
@@ -991,6 +1039,14 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       delete next.pendingRunSettlements[event.runId];
       break;
   }
+  if (next.run) {
+    const provider = requiredRunRuntimeSnapshot(next, next.run.runId).provider;
+    next.run = {
+      ...next.run,
+      ...(provider.reasoningEffort ? { reasoningEffort: provider.reasoningEffort } : {}),
+      ...(provider.thinking ? { thinking: provider.thinking } : {}),
+    };
+  }
   return next;
 }
 
@@ -1007,6 +1063,7 @@ export function projectSession(
     sessionId: state.sessionId,
     revision: state.revision,
     display: { ...state.display },
+    modelSettings: state.modelSettings ? { ...state.modelSettings } : null,
     workspaceBindings: state.workspaceBindings.map((binding) => ({ ...binding })),
     sessionDirectoryIndexes: state.sessionDirectoryIndexes.map((binding) => ({ ...binding })),
     messages: state.messages.map((message) => ({
@@ -1024,7 +1081,12 @@ export function projectSession(
     pendingPlan: state.pendingPlan ? clonePlanProjection(state.pendingPlan) : null,
     todoList: cloneTodoList(state.todoList),
     contextUsage: state.contextUsage ? { ...state.contextUsage } : null,
-    contextCompositions: state.contextCompositions.map(cloneContextComposition),
+    // The ball displays the last settled call; also expose a pending call's
+    // composition before usage arrives. Historical receipts remain in the journal.
+    contextCompositions: state.contextCompositions.filter((receipt, index) => (
+      receipt.providerRequestId === state.contextUsage?.providerRequestId
+      || index === state.contextCompositions.length - 1
+    )).map(cloneContextComposition),
     tokenUsage: { ...state.tokenUsage },
     tokenUsageHistory: Object.values(state.tokenUsageHistory)
       .sort((left, right) => right.sequence - left.sequence)
@@ -1127,6 +1189,7 @@ function validateOrderedProviderOutputBlocks(
 ): void {
   if (blocks.length === 0) throw new Error('provider_output_blocks_empty');
   const callIds: string[] = [];
+  const allCallIds = new Set<string>();
   const referenceIds = new Set<string>();
   const providerCallIds = new Set<string>();
   let previousOutputIndex = -1;
@@ -1162,12 +1225,21 @@ function validateOrderedProviderOutputBlocks(
         ) throw new Error('provider_output_block_invalid');
         break;
       case 'toolCall':
+      case 'toolCallRejected':
         if (
           block.item.type !== 'function_call'
           || block.item.call_id !== block.providerCallId
+          || !block.callId || !block.providerCallId || !block.toolName
+          || typeof block.item.name !== 'string' || !block.item.name
+          || typeof block.item.arguments !== 'string'
+          || !addUnique(allCallIds, block.callId)
           || !addUnique(providerCallIds, block.providerCallId)
         ) throw new Error('provider_output_block_invalid');
-        callIds.push(block.callId);
+        if (block.kind === 'toolCall') callIds.push(block.callId);
+        else if (!block.error.code || !block.error.message || !block.error.issues?.length
+          || block.error.issues.some((issue) => !issue.path || !issue.rule || !issue.message)) {
+          throw new Error('provider_output_rejection_invalid');
+        }
         break;
       case 'providerHosted':
         if (
@@ -1184,8 +1256,8 @@ function validateOrderedProviderOutputBlocks(
     finalMessageCount > 1
     || callIds.length !== orderedCallIds.length
     || callIds.some((callId, index) => callId !== orderedCallIds[index])
-    || callIds.length === 0 && finalMessageCount !== 1
-    || callIds.length > 0 && finalMessageCount !== 0
+    || allCallIds.size === 0 && finalMessageCount !== 1
+    || allCallIds.size > 0 && finalMessageCount !== 0
   ) throw new Error('provider_output_block_normalization_invalid');
 }
 
@@ -1402,6 +1474,7 @@ function projectOrderedProviderTurnTimeline(
         groupedActivities.push(activity);
         break;
       }
+      case 'toolCallRejected':
       case 'toolCall': {
         const plan = state.plans.find((candidate) => candidate.callId === block.callId);
         if (plan) {
@@ -1648,6 +1721,7 @@ function estimatePartitionTokens(
 function cloneActivity(activity: ActivityProjection): ActivityProjection {
   return {
     ...activity,
+    ...(activity.inputRejection ? { inputRejection: structuredClone(activity.inputRejection) } : {}),
     ...(activity.tool
       ? {
           tool: {
@@ -1963,17 +2037,13 @@ function withProviderUsage<T extends SessionProjection['tokenUsage']>(
 
 function recomputeCacheAggregate<T extends SessionProjection['tokenUsage']>(usage: T): T {
   const cacheAvailable = usage.reportedCallCount > 0;
-  const cachePopulation = addTokenCount(
-    usage.cacheReadInputTokens,
-    usage.cacheMissInputTokens,
-  );
   return {
     ...usage,
     cacheAvailable,
     cacheComplete: usage.providerCallCount > 0
       && usage.reportedCallCount === usage.providerCallCount,
-    cacheHitRatio: cachePopulation > 0
-      ? usage.cacheReadInputTokens / cachePopulation
+    cacheHitRatio: cacheAvailable && usage.inputTokens > 0
+      ? usage.cacheReadInputTokens / usage.inputTokens
       : null,
   };
 }

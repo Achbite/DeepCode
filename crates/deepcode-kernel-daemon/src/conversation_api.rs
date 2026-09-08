@@ -793,6 +793,9 @@ pub(crate) async fn conversation_session_delete(
         }
         return session_service_error(error);
     }
+    if let Err(error) = state.local_agent.kernel.delete_session_outputs(&session_id) {
+        return ApiResponse::error(error.code, error.message);
+    }
     let attachment_root = {
         let gui = state.gui.lock().expect("gui state lock");
         session_attachment_root(&gui.paths.attachment_store_root, &session_id)
@@ -909,6 +912,22 @@ pub(crate) async fn conversation_projection_get(
         state.session_service,
         "snapshot",
         json!({ "sessionId": session_id }),
+    )
+    .await
+    {
+        Ok(value) => ApiResponse::ok(value),
+        Err(error) => session_service_error(error),
+    }
+}
+
+pub(crate) async fn conversation_context_composition_get(
+    State(state): State<AppState>,
+    Path((session_id, provider_request_id)): Path<(String, String)>,
+) -> Json<ApiResponse> {
+    match request_service(
+        state.session_service,
+        "contextComposition",
+        json!({ "sessionId": session_id, "providerRequestId": provider_request_id }),
     )
     .await
     {

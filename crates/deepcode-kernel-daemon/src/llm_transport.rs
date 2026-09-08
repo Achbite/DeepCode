@@ -1770,6 +1770,27 @@ mod tests {
     }
 
     #[test]
+    fn responses_replays_rejected_raw_arguments_and_result_without_repair() {
+        let item = json!({"type":"function_call","call_id":"native:bad","name":"fs_read","arguments":"{\"path\":","status":"completed"});
+        let rejection = json!({"status":"inputRejected","executed":false,"error":{"code":"provider_tool_call_arguments_invalid","message":"Invalid JSON object."}}).to_string();
+        let prepared = prepare_provider_request(&test_profile("responses"), &json!({
+            "messages":[
+                {"role":"user","content":"Read source."},
+                {"role":"assistant","content":"","providerOutputBlocks":[{
+                    "outputIndex":0,"kind":"toolCallRejected","callId":"call:bad","providerCallId":"native:bad","toolName":"fs.read","item":item
+                }]},
+                {"role":"tool","toolCallId":"call:bad","providerCallId":"native:bad","content":rejection}
+            ],"tools":[],"hostedTools":[],"requireToolCall":false
+        })).unwrap();
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(body["input"][1], item);
+        assert_eq!(
+            body["input"][2],
+            json!({"type":"function_call_output","call_id":"native:bad","output":rejection})
+        );
+    }
+
+    #[test]
     fn responses_request_rejects_invalid_hosted_tool_instead_of_rewriting_it() {
         let error = prepare_provider_request(
             &test_profile("responses"),

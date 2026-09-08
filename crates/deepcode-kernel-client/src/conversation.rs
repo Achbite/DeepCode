@@ -95,6 +95,7 @@ pub struct SessionProjection {
     pub session_id: String,
     pub revision: u64,
     pub display: SessionDisplayProjection,
+    pub model_settings: Option<SessionModelSettings>,
     pub workspace_bindings: Vec<WorkspaceBindingDisplay>,
     pub session_directory_indexes: Vec<WorkspaceBindingDisplay>,
     pub timeline: Vec<SessionTimelineItem>,
@@ -142,6 +143,14 @@ impl SessionProjection {
         if self.run.as_ref().is_some_and(|run| {
             let mut run_workspace_ids = HashSet::new();
             run.profile_id.is_empty()
+                || run
+                    .reasoning_effort
+                    .as_deref()
+                    .is_some_and(|effort| !is_reasoning_effort(effort))
+                || run
+                    .thinking
+                    .as_deref()
+                    .is_some_and(|thinking| !matches!(thinking, "enabled" | "disabled"))
                 || !is_run_status(&run.status)
                 || run.workspace_bindings.iter().any(|binding| {
                     binding.workspace_id.is_empty()
@@ -150,6 +159,15 @@ impl SessionProjection {
                 })
         }) {
             return Err("shared Session projection has an invalid run status".to_string());
+        }
+        if self.model_settings.as_ref().is_some_and(|settings| {
+            settings.profile_id.is_empty()
+                || settings
+                    .reasoning_effort_override
+                    .as_deref()
+                    .is_some_and(|effort| !is_reasoning_effort(effort))
+        }) {
+            return Err("shared Session projection has invalid model settings".to_string());
         }
         if self.run.as_ref().is_some_and(|run| {
             run.waiting_reason
@@ -162,6 +180,18 @@ impl SessionProjection {
         if self.assistant_draft.as_ref().is_some_and(|draft| {
             draft.run_id.is_empty()
                 || draft.turn_id.is_empty()
+                || draft.activity.as_ref().is_some_and(|activity| {
+                    !matches!(activity.purpose.as_str(), "agent" | "contextCompaction")
+                        || !matches!(
+                            activity.phase.as_str(),
+                            "waitingResponse" | "reasoning" | "awaitingOutput" | "generatingOutput"
+                        )
+                        || activity.started_at.is_empty()
+                        || activity
+                            .last_content_at
+                            .as_deref()
+                            .is_some_and(str::is_empty)
+                })
                 || self
                     .run
                     .as_ref()
@@ -415,12 +445,26 @@ impl SessionProjection {
                         | "waiting"
                         | "completed"
                         | "denied"
+                        | "rejected"
                         | "failed"
                         | "cancelled"
                         | "indeterminate"
                 )
                 || activity.kind == "tool" && activity.call_id.as_deref().is_none_or(str::is_empty)
                 || activity.kind != "tool" && activity.tool.is_some()
+                || (activity.kind == "tool" && activity.status == "rejected")
+                    != activity.input_rejection.is_some()
+                || activity.status == "rejected" && activity.tool.is_some()
+                || activity.input_rejection.as_ref().is_some_and(|error| {
+                    error.code.is_empty()
+                        || error.message.is_empty()
+                        || error.issues.is_empty()
+                        || error.issues.iter().any(|issue| {
+                            issue.path.is_empty()
+                                || issue.rule.is_empty()
+                                || issue.message.is_empty()
+                        })
+                })
                 || activity.kind != "providerHosted" && activity.provider_hosted.is_some()
                 || activity.kind == "providerHosted"
                     && activity.provider_hosted.as_ref().is_none_or(|hosted| {
@@ -985,6 +1029,27 @@ pub struct AssistantDraftProjection {
     pub content: String,
     pub reasoning_content: Option<String>,
     pub ordered_blocks: Option<Vec<AssistantDraftBlockProjection>>,
+    pub activity: Option<ProviderActivityProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderActivityProjection {
+    pub purpose: String,
+    pub phase: String,
+    pub started_at: String,
+    pub last_content_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionModelSettings {
+    pub profile_id: String,
+    pub reasoning_effort_override: Option<String>,
+}
+
+fn is_reasoning_effort(value: &str) -> bool {
+    matches!(value, "low" | "medium" | "high" | "max")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1328,6 +1393,8 @@ pub struct ContextCompositionTool {
 pub struct RunProjection {
     pub run_id: String,
     pub profile_id: String,
+    pub reasoning_effort: Option<String>,
+    pub thinking: Option<String>,
     pub waiting_reason: Option<String>,
     pub workspace_bindings: Vec<WorkspaceBindingDisplay>,
     pub status: String,
@@ -1344,7 +1411,25 @@ pub struct ActivityProjection {
     pub call_id: Option<String>,
     pub sequence: u64,
     pub tool: Option<ToolActivityProjection>,
+    pub input_rejection: Option<ToolInputRejectionProjection>,
     pub provider_hosted: Option<ProviderHostedActivityProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolInputRejectionProjection {
+    pub code: String,
+    pub message: String,
+    pub issues: Vec<ToolInputIssueProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolInputIssueProjection {
+    pub path: String,
+    pub rule: String,
+    pub message: String,
+    pub expected: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1740,7 +1825,7 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                             && operation
                                 .command
                                 .as_deref()
-                                .is_some_and(|command| !command.is_empty())
+                                .is_none_or(|command| !command.is_empty())
                             && operation.workspace_mode.as_deref() == Some("write")
                             && matches!(
                                 operation.execution_scope.as_deref(),
@@ -1831,11 +1916,11 @@ fn valid_token_usage_fields(
     {
         return false;
     }
-    match (cache_population, cache_hit_ratio) {
-        (0, None) => true,
-        (0, Some(_)) | (_, None) => false,
-        (_, Some(ratio)) => {
-            let expected = cache_read_input_tokens as f64 / cache_population as f64;
+    match (cache_available && input_tokens > 0, cache_hit_ratio) {
+        (false, None) => true,
+        (false, Some(_)) | (true, None) => false,
+        (true, Some(ratio)) => {
+            let expected = cache_read_input_tokens as f64 / input_tokens as f64;
             ratio.is_finite()
                 && (0.0..=1.0).contains(&ratio)
                 && (ratio - expected).abs() <= f64::EPSILON * 8.0
@@ -2263,6 +2348,23 @@ mod tests {
         let invalid_projection: SessionProjection =
             serde_json::from_value(value).expect("invalid shell projection still decodes");
         assert!(invalid_projection.validate().is_err());
+    }
+
+    #[test]
+    fn partial_cache_aggregate_uses_all_reported_input_tokens() {
+        let mut value = projection_value();
+        value["tokenUsage"]["providerCallCount"] = json!(2);
+        value["tokenUsage"]["inputTokens"] = json!(130);
+        value["tokenUsage"]["cacheComplete"] = json!(false);
+        value["tokenUsage"]["cacheHitRatio"] = json!(50.0 / 130.0);
+        let projection: SessionProjection =
+            serde_json::from_value(value.clone()).expect("partial cache projection decodes");
+        assert_eq!(projection.validate(), Ok(()));
+
+        value["tokenUsage"]["cacheHitRatio"] = json!(50.0 / 80.0);
+        let reported_subset: SessionProjection =
+            serde_json::from_value(value).expect("reported-subset ratio decodes");
+        assert!(reported_subset.validate().is_err());
     }
 
     #[test]

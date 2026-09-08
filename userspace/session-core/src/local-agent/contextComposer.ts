@@ -15,6 +15,7 @@ import {
   LOCAL_AGENT_PROTOCOL_VERSION,
   SESSION_CONTROL_INTERACTION_REQUEST,
   SESSION_CONTROL_PLAN_PUBLISH,
+  SESSION_CONTROL_PLAN_PROGRESS,
 } from '@deepcode/protocol';
 import { LoopFailure } from './loopFailure.js';
 import type {
@@ -64,6 +65,7 @@ export async function buildAgentProviderRequest(input: {
   const controlNames = {
     interactionRequest: providerWireName(input.runtime, SESSION_CONTROL_INTERACTION_REQUEST),
     planPublish: providerWireName(input.runtime, SESSION_CONTROL_PLAN_PUBLISH),
+    planProgress: providerWireName(input.runtime, SESSION_CONTROL_PLAN_PROGRESS),
   };
   const runtimeTools = hasWorkspaceBindings
     ? input.runtime.tools
@@ -122,18 +124,6 @@ export async function buildAgentProviderRequest(input: {
       content: sessionControlInstructions(controlNames, hasWorkspaceBindings),
     },
   });
-  // Keep turn-scoped controls behind the journal so they cannot invalidate the stable prefix.
-  const turnControls: ContextMessageContribution[] = input.responseConstraint === 'toolRequired'
-    ? [{
-      contributionId: 'session:confirmed-plan-execution',
-      contributionKind: 'sessionControls',
-      label: 'Confirmed Plan execution',
-      message: {
-        role: 'user',
-        content: confirmedPlanExecutionInstruction(controlNames),
-      },
-    }]
-    : [];
   instructions.push({
     contributionId: 'session:workspace-bindings',
     contributionKind: 'workspaceBindings',
@@ -149,7 +139,7 @@ export async function buildAgentProviderRequest(input: {
   });
   const selected = await input.memory.select({
     events: input.events,
-    messages: [...instructions, ...contextMessages, ...journalMessages, ...turnControls],
+    messages: [...instructions, ...contextMessages, ...journalMessages],
   });
   assertContextContributions(selected);
   const controlTools = hasWorkspaceBindings
@@ -250,7 +240,9 @@ export function messagesFromJournal(
       message: { role: 'system', content: checkpoint.payload.summary },
     });
   }
+  let todoList: TodoListProjection | null = null;
   for (const event of events) {
+    todoList = advanceTodoList(todoList, event);
     if (
       checkpoint
       && event.sequence <= checkpoint.payload.coveredThroughSequence
@@ -344,6 +336,7 @@ export function messagesFromJournal(
             planId: event.payload.planId,
             revision: event.payload.revision,
             todoSeeded: true,
+            nextAction: confirmedPlanExecutionInstruction(),
           }),
         },
       });
@@ -400,7 +393,36 @@ export function messagesFromJournal(
       || event.type === 'todo.reconciled'
       || event.type === 'todo.progressed'
     ) {
-      continue;
+      if (event.type === 'todo.progressed' && event.callId && event.payload.providerCallId) {
+        if (!orderedProviderCallIds.has(event.callId)) attachToolCall(messages, {
+          callId: event.callId, providerCallId: event.payload.providerCallId,
+          name: SESSION_CONTROL_PLAN_PROGRESS,
+          input: { sourceFactRef: event.payload.sourceFactRef, updates: event.payload.updates },
+        });
+        completionResults.set(event.callId, {
+          contributionId: `plan-progress:${event.callId}`,
+          contributionKind: 'journalMessages', label: 'Plan progress result',
+          message: {
+            role: 'tool', toolCallId: event.callId, providerCallId: event.payload.providerCallId,
+            content: JSON.stringify({ accepted: true, type: 'todo.current', ...todoList }),
+          },
+        });
+        continue;
+      }
+      if (todoList) messages.push({
+        contributionId: `todo-state:${event.eventId}`,
+        contributionKind: 'journalMessages',
+        label: 'Session Todo state',
+        message: {
+          role: 'user',
+          content: JSON.stringify({
+            type: 'todo.current',
+            sourcePlanId: todoList.sourcePlanId,
+            sourcePlanRevision: todoList.sourcePlanRevision,
+            items: todoList.items,
+          }),
+        },
+      });
     } else if (event.type === 'session.control.rejected') {
       if (!orderedProviderCallIds.has(event.callId)) {
         attachToolCall(messages, {
@@ -418,7 +440,7 @@ export function messagesFromJournal(
           role: 'tool',
           toolCallId: event.callId,
           providerCallId: event.payload.providerCallId,
-          content: JSON.stringify({ accepted: false, error: event.payload.error }),
+          content: JSON.stringify({ accepted: false, executed: false, error: event.payload.error }),
         },
       });
     } else if (event.type === 'tool.requested') {
@@ -428,6 +450,18 @@ export function messagesFromJournal(
         providerCallId: event.payload.providerCallId,
         name: event.payload.toolName,
         input: event.payload.input,
+      });
+    } else if (event.type === 'tool.input-rejected') {
+      messages.push({
+        contributionId: `tool-result:${event.callId}`,
+        contributionKind: 'journalMessages',
+        label: `${event.payload.rejection.toolName} input rejected`,
+        message: {
+          role: 'tool',
+          toolCallId: event.callId,
+          providerCallId: requiredProviderCallId(providerCallIdByLogicalCallId, event.callId),
+          content: JSON.stringify({ status: 'inputRejected', executed: false, error: event.payload.rejection.error }),
+        },
       });
     } else if (event.type === 'tool.completed') {
       messages.push({
@@ -456,6 +490,20 @@ export function messagesFromJournal(
             })),
           },
         });
+        for (const block of event.payload.orderedOutputBlocks) {
+          if (block.kind !== 'toolCallRejected') continue;
+          messages.push({
+            contributionId: `provider-input-rejection:${block.callId}`,
+            contributionKind: 'journalMessages',
+            label: `${block.toolName} input rejected`,
+            message: {
+              role: 'tool',
+              toolCallId: block.callId,
+              providerCallId: block.providerCallId,
+              content: JSON.stringify({ status: 'inputRejected', executed: false, error: block.error }),
+            },
+          });
+        }
       }
       for (const callId of event.payload.orderedCallIds) {
         const result = completionResults.get(callId);
@@ -471,76 +519,38 @@ export function messagesFromJournal(
       'Session control 结果缺少对应的 Provider turn 完成事实。',
     );
   }
-  const todoList = currentTodoList(events);
-  if (todoList) {
-    const currentTodo: ContextMessageContribution = {
-      contributionId: `todo-current:${todoList.sourcePlanId}:${todoList.sourcePlanRevision}`,
-      contributionKind: 'journalMessages',
-      label: 'Session Todo current state',
-      message: {
-        role: 'system',
-        content: JSON.stringify({
-          type: 'todo.current',
-          sourcePlanId: todoList.sourcePlanId,
-          sourcePlanRevision: todoList.sourcePlanRevision,
-          items: todoList.items,
-        }),
-      },
-    };
-    let subsequentUserMessageId: string | null = null;
-    for (let index = events.length - 1; index >= 0; index -= 1) {
-      const event = events[index]!;
-      if (
-        event.type === 'message.committed'
-        && event.payload.role === 'user'
-        && event.sequence > todoList.sequence
-      ) {
-        subsequentUserMessageId = event.payload.messageId;
-        break;
-      }
-    }
-    const userBoundary = subsequentUserMessageId
-      ? messages.findIndex((message) => (
-          message.contributionId === `message:${subsequentUserMessageId}`
-        ))
-      : -1;
-    if (userBoundary >= 0) messages.splice(userBoundary, 0, currentTodo);
-    else messages.push(currentTodo);
-  }
   applyProviderTurnCompletions(messages, events);
   return messages;
 }
 
-function currentTodoList(events: readonly SessionEvent[]): TodoListProjection | null {
-  let todoList: TodoListProjection | null = null;
-  for (const event of events) {
-    if (event.type === 'todo.seeded' || event.type === 'todo.reconciled') {
-      todoList = {
-        sourcePlanId: event.payload.sourcePlanId,
-        sourcePlanRevision: event.payload.sourcePlanRevision,
-        items: event.payload.items.map((item) => ({ ...item })),
-        sequence: event.sequence,
-        updatedAt: event.occurredAt,
-      };
-      continue;
-    }
-    if (event.type !== 'todo.progressed' || !todoList) continue;
-    if (
-      todoList.sourcePlanId !== event.payload.sourcePlanId
-      || todoList.sourcePlanRevision !== event.payload.sourcePlanRevision
-    ) throw new LoopFailure('todo_source_plan_mismatch', 'Session Todo 当前状态来源不一致。');
-    const updates = new Map(event.payload.updates.map((update) => [update.todoId, update.status]));
-    todoList = {
-      ...todoList,
-      items: todoList.items.map((item) => ({
-        ...item,
-        status: updates.get(item.todoId) ?? item.status,
-      })),
+function advanceTodoList(
+  todoList: TodoListProjection | null,
+  event: SessionEvent,
+): TodoListProjection | null {
+  if (event.type === 'todo.seeded' || event.type === 'todo.reconciled') {
+    return {
+      sourcePlanId: event.payload.sourcePlanId,
+      sourcePlanRevision: event.payload.sourcePlanRevision,
+      items: event.payload.items.map((item) => ({ ...item })),
       sequence: event.sequence,
       updatedAt: event.occurredAt,
     };
   }
-  return todoList;
+  if (event.type !== 'todo.progressed' || !todoList) return todoList;
+  if (
+    todoList.sourcePlanId !== event.payload.sourcePlanId
+    || todoList.sourcePlanRevision !== event.payload.sourcePlanRevision
+  ) throw new LoopFailure('todo_source_plan_mismatch', 'Session Todo 当前状态来源不一致。');
+  const updates = new Map(event.payload.updates.map((update) => [update.todoId, update.status]));
+  return {
+    ...todoList,
+    items: todoList.items.map((item) => ({
+      ...item,
+      status: updates.get(item.todoId) ?? item.status,
+    })),
+    sequence: event.sequence,
+    updatedAt: event.occurredAt,
+  };
 }
 
 export function buildContextCompositionReceipt(
@@ -731,6 +741,10 @@ export function cloneModelMessage(message: ModelMessage): ModelMessage {
 function providerCallIdsFromEvents(events: readonly SessionEvent[]): Map<string, string> {
   const byLogicalCallId = new Map<string, string>();
   for (const event of events) {
+    if (event.type === 'todo.progressed' && event.callId && event.payload.providerCallId) {
+      byLogicalCallId.set(event.callId, event.payload.providerCallId);
+      continue;
+    }
     if (
       event.type !== 'tool.requested'
       && event.type !== 'interaction.requested'
@@ -1008,6 +1022,7 @@ function contextCompositionBlocks(message: ModelMessage): ContextCompositionMess
           append({ kind: 'text' });
           break;
         case 'toolCall':
+        case 'toolCallRejected':
           append({ kind: 'toolCall', callId: block.callId, toolName: block.toolName });
           break;
         case 'providerHosted':
@@ -1068,12 +1083,13 @@ function toolResultForModel(record: ToolExecutionRecord): Record<string, unknown
   if (record.outcome === 'completed') {
     const output = structuredClone(record.output);
     if (isRecord(output)) delete output.workspaceId;
-    return { outcome: record.outcome, output };
+    return { recordId: record.recordId, outcome: record.outcome, output };
   }
   if (record.outcome === 'failed') {
     const output = record.output === undefined ? undefined : structuredClone(record.output);
     if (isRecord(output)) delete output.workspaceId;
     return {
+      recordId: record.recordId,
       outcome: record.outcome,
       ...(output === undefined ? {} : { output }),
       error: record.error,

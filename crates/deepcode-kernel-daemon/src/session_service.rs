@@ -420,6 +420,41 @@ fn read_frame(reader: &mut impl BufRead) -> Result<Vec<u8>, SessionServiceError>
     Ok(encoded)
 }
 
+fn read_response(reader: &mut impl BufRead) -> Result<Vec<u8>, SessionServiceError> {
+    let first = read_frame(reader)?;
+    let first_value: Value = serde_json::from_slice(&first).map_err(|error| {
+        SessionServiceError::new("session_service_response_invalid", error.to_string())
+    })?;
+    if first_value.get("type").and_then(Value::as_str) != Some("response.chunk") {
+        return Ok(first);
+    }
+    let mut chunk = first_value;
+    let mut response = Vec::new();
+    let mut index = 0_u64;
+    loop {
+        let valid = chunk.as_object().is_some_and(|object| object.len() == 5)
+            && chunk.get("protocolVersion").and_then(Value::as_str) == Some(PROTOCOL_VERSION)
+            && chunk.get("type").and_then(Value::as_str) == Some("response.chunk")
+            && chunk.get("index").and_then(Value::as_u64) == Some(index);
+        let text = chunk.get("text").and_then(Value::as_str);
+        let final_chunk = chunk.get("final").and_then(Value::as_bool);
+        if !valid || text.is_none_or(str::is_empty) || final_chunk.is_none() {
+            return Err(SessionServiceError::new(
+                "session_service_response_invalid",
+                "Session Service 回复分帧无效。",
+            ));
+        }
+        response.extend_from_slice(text.expect("validated chunk text").as_bytes());
+        if final_chunk == Some(true) {
+            return Ok(response);
+        }
+        index += 1;
+        chunk = serde_json::from_slice(&read_frame(reader)?).map_err(|error| {
+            SessionServiceError::new("session_service_response_invalid", error.to_string())
+        })?;
+    }
+}
+
 fn read_frame_with_timeout(
     child: &mut Child,
     stdin: &mut Option<BufWriter<ChildStdin>>,
@@ -431,7 +466,7 @@ fn read_frame_with_timeout(
     std::thread::scope(|scope| {
         let (sender, receiver) = mpsc::sync_channel(1);
         scope.spawn(move || {
-            let _ = sender.send(read_frame(reader));
+            let _ = sender.send(read_response(reader));
         });
         match receiver.recv_timeout(timeout) {
             Ok(result) => result.map_err(|error| {
@@ -607,6 +642,45 @@ fn process_wait_error(error: std::io::Error) -> SessionServiceError {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn chunked_snapshot_preserves_unicode_and_next_response_boundary() {
+        let expected = json!({"text": "中文🙂\n".repeat(180_000)});
+        let encoded = json!({"protocolVersion": PROTOCOL_VERSION, "requestId": "large", "ok": true, "data": expected}).to_string();
+        assert!(encoded.len() > MAX_FRAME_BYTES);
+        let chars: Vec<char> = encoded.chars().collect();
+        let chunks: Vec<_> = chars.chunks(64 * 1024).collect();
+        let mut wire = String::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            wire.push_str(&json!({"protocolVersion": PROTOCOL_VERSION, "type": "response.chunk",
+                "index": index, "final": index + 1 == chunks.len(), "text": chunk.iter().collect::<String>()}).to_string());
+            wire.push('\n');
+        }
+        wire.push_str(&json!({"protocolVersion": PROTOCOL_VERSION, "requestId": "next", "ok": true, "data": {"ok": true}}).to_string());
+        wire.push('\n');
+        let mut reader = Cursor::new(wire);
+        assert_eq!(
+            decode_response(read_response(&mut reader).unwrap(), "large").unwrap(),
+            expected
+        );
+        assert_eq!(
+            decode_response(read_response(&mut reader).unwrap(), "next").unwrap(),
+            json!({"ok": true})
+        );
+    }
+
+    #[test]
+    fn incomplete_or_out_of_order_chunks_remain_transport_errors() {
+        let first = json!({"protocolVersion": PROTOCOL_VERSION, "type": "response.chunk", "index": 0, "final": false, "text": "{"});
+        let wrong = json!({"protocolVersion": PROTOCOL_VERSION, "type": "response.chunk", "index": 2, "final": true, "text": "}"});
+        assert!(read_response(&mut Cursor::new(format!("{first}\n"))).is_err());
+        assert_eq!(
+            read_response(&mut Cursor::new(format!("{first}\n{wrong}\n")))
+                .unwrap_err()
+                .code,
+            "session_service_response_invalid"
+        );
+    }
 
     #[test]
     fn local_frame_reader_decodes_one_session_service_response() {

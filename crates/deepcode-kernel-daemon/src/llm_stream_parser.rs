@@ -226,6 +226,13 @@ impl ProviderStreamAccumulator {
         }
         let mut tool_calls = Vec::with_capacity(self.tool_calls.len());
         for (index, call) in self.tool_calls {
+            // Session streaming already receives the original Responses items. Its
+            // input admission owns argument parsing and correction; do not turn an
+            // invalid argument string into a transport failure (or an empty object).
+            // The aggregate probe still needs decoded LlmToolCall values.
+            if self.kind == ProviderStreamKind::Responses && request_id.is_some() {
+                continue;
+            }
             let name = call.name.ok_or_else(|| {
                 ProviderStreamError::new(
                     "provider_tool_call_name_missing",
@@ -1287,6 +1294,47 @@ mod tests {
                 cache_read_input_tokens: Some(18),
                 cache_miss_input_tokens: Some(12),
             })
+        );
+    }
+
+    #[test]
+    fn responses_session_stream_preserves_invalid_arguments_until_native_completion() {
+        let item = json!({
+            "type":"function_call", "call_id":"native:bad", "name":"fs_read",
+            "arguments":"{\"path\":", "status":"completed"
+        });
+        let input = json!({"type":"response.output_item.done","output_index":0,"item":item});
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Responses);
+        let emissions = parser.ingest_payload(input.to_string().as_bytes()).unwrap();
+        assert_eq!(emissions[0].event["item"], item);
+        parser.ingest_payload(br#"{"type":"response.completed","response":{"usage":{"input_tokens":30,"output_tokens":6}}}"#).unwrap();
+        let result = parser.finalize_for_request("request:session").unwrap();
+        assert!(
+            result.output.tool_calls.is_empty(),
+            "Session owns decoding native calls"
+        );
+        assert_eq!(result.completion.usage.unwrap().input_tokens, 30);
+
+        let mut incomplete = ProviderStreamAccumulator::new(ProviderStreamKind::Responses);
+        incomplete
+            .ingest_payload(input.to_string().as_bytes())
+            .unwrap();
+        assert_eq!(
+            incomplete
+                .finalize_for_request("request:interrupted")
+                .unwrap_err()
+                .code,
+            "provider_stream_native_terminal_missing"
+        );
+
+        let mut probe = ProviderStreamAccumulator::new(ProviderStreamKind::Responses);
+        probe.ingest_payload(input.to_string().as_bytes()).unwrap();
+        probe
+            .ingest_payload(br#"{"type":"response.completed","response":{}}"#)
+            .unwrap();
+        assert_eq!(
+            probe.finalize().unwrap_err().code,
+            "provider_tool_call_arguments_invalid"
         );
     }
 

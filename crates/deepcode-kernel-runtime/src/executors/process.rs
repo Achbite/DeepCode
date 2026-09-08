@@ -26,7 +26,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(unix)]
 const PROCESS_TERMINATION_GRACE: Duration = Duration::from_millis(100);
-const BASH_OUTPUT_LIMIT_BYTES: usize = 262_144;
+const BASH_OUTPUT_LIMIT_BYTES: usize = 50 * 1024;
+const BASH_OUTPUT_LIMIT_LINES: usize = 2000;
 const BASH_TERMINAL_COLS: u16 = 120;
 const BASH_TERMINAL_ROWS: u16 = 30;
 const AGENT_SHELL_PATH_SOURCE: &str = "hostPlusStandardDeveloperPaths";
@@ -163,6 +164,9 @@ impl KernelToolExecutor for ProcessShellExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let started = Instant::now();
+        let archive = ShellOutputArchive::create(&context)?;
+        let stdout_file = archive.open("stdout")?;
+        let stderr_file = archive.open("stderr")?;
         let mut child = process.spawn().map_err(|error| {
             KernelError::Other(format!("spawn bash in {}: {error}", cwd.display()))
         })?;
@@ -190,10 +194,18 @@ impl KernelToolExecutor for ProcessShellExecutor {
             return Err(error);
         }
         let stop_capture = Arc::new(AtomicBool::new(false));
-        let stdout_reader =
-            spawn_output_reader(stdout, BASH_OUTPUT_LIMIT_BYTES, Arc::clone(&stop_capture));
-        let stderr_reader =
-            spawn_output_reader(stderr, BASH_OUTPUT_LIMIT_BYTES, Arc::clone(&stop_capture));
+        let stdout_reader = spawn_output_reader(
+            stdout,
+            stdout_file,
+            BASH_OUTPUT_LIMIT_BYTES,
+            Arc::clone(&stop_capture),
+        );
+        let stderr_reader = spawn_output_reader(
+            stderr,
+            stderr_file,
+            BASH_OUTPUT_LIMIT_BYTES,
+            Arc::clone(&stop_capture),
+        );
 
         let wait_result = wait_for_bounded_child(
             &mut child,
@@ -227,6 +239,7 @@ impl KernelToolExecutor for ProcessShellExecutor {
         let mut stdout = stdout_result?;
         let mut stderr = stderr_result?;
         bound_combined_output(&mut stdout, &mut stderr, BASH_OUTPUT_LIMIT_BYTES);
+        bound_output_lines(&mut stdout, &mut stderr);
         #[cfg(target_os = "macos")]
         process_scope_cleanup?;
         #[cfg(target_os = "macos")]
@@ -249,7 +262,7 @@ impl KernelToolExecutor for ProcessShellExecutor {
         let exit_code = status.code();
         let success = !timed_out && status.success();
 
-        let output = serde_json::json!({
+        let mut output = serde_json::json!({
             "workspaceId": workspace_id,
             "command": command_text,
             "cwd": ".",
@@ -275,6 +288,7 @@ impl KernelToolExecutor for ProcessShellExecutor {
                 "networkAccess": execution_scope == "host"
             }
         });
+        archive.finish(&mut output, truncated)?;
         if success {
             Ok(ok(invocation.id, output))
         } else if timed_out {
@@ -374,6 +388,8 @@ fn invoke_terminal_shell(
         command.env("TEMP", process_temp.path());
     }
 
+    let archive = ShellOutputArchive::create(&context)?;
+    let stdout_file = archive.open("stdout")?;
     let spawned_child = pty.slave.spawn_command(command).map_err(|error| {
         KernelError::Other(format!("spawn bash pty in {}: {error}", cwd.display()))
     })?;
@@ -409,8 +425,12 @@ fn invoke_terminal_shell(
         .take_writer()
         .map_err(|error| KernelError::Other(format!("open bash pty writer: {error}")))?;
     let stop_capture = Arc::new(AtomicBool::new(false));
-    let stdout_reader =
-        spawn_pty_output_reader(reader, BASH_OUTPUT_LIMIT_BYTES, Arc::clone(&stop_capture));
+    let stdout_reader = spawn_pty_output_reader(
+        reader,
+        stdout_file,
+        BASH_OUTPUT_LIMIT_BYTES,
+        Arc::clone(&stop_capture),
+    );
     let write_result = writer
         .write_all(terminal_stdin.as_bytes())
         .and_then(|_| writer.flush())
@@ -458,7 +478,9 @@ fn invoke_terminal_shell(
     };
 
     let (status, timed_out, cancelled) = wait_result?;
-    let stdout = stdout_result?;
+    let mut stdout = stdout_result?;
+    stdout.truncated |= retain_tail_lines(&mut stdout.bytes, BASH_OUTPUT_LIMIT_LINES);
+    trim_utf8_prefix(&mut stdout.bytes);
     #[cfg(target_os = "macos")]
     process_scope_cleanup?;
     #[cfg(target_os = "macos")]
@@ -480,7 +502,7 @@ fn invoke_terminal_shell(
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let exit_code = i32::try_from(status.exit_code()).ok();
     let success = !timed_out && status.success();
-    let output = serde_json::json!({
+    let mut output = serde_json::json!({
         "workspaceId": workspace_id,
         "command": command_text,
         "cwd": ".",
@@ -506,6 +528,7 @@ fn invoke_terminal_shell(
             "networkAccess": execution_scope == "host"
         }
     });
+    archive.finish(&mut output, stdout.truncated)?;
     if success {
         Ok(ok(invocation_id, output))
     } else if timed_out {
@@ -1026,6 +1049,70 @@ fn macos_sandbox_path(path: &Path, label: &str) -> KernelResult<String> {
     Ok(path.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+struct ShellOutputArchive {
+    directory: PathBuf,
+    retained: bool,
+}
+
+impl ShellOutputArchive {
+    fn create(context: &KernelToolExecutionContext) -> KernelResult<Self> {
+        let directory = context.output_directory.clone().ok_or_else(|| {
+            KernelError::Other("bash output archive directory is missing".to_string())
+        })?;
+        if let Some(parent) = directory.parent() {
+            fs::create_dir_all(parent).map_err(output_archive_error)?;
+        }
+        fs::create_dir(&directory).map_err(output_archive_error)?;
+        Ok(Self {
+            directory,
+            retained: false,
+        })
+    }
+
+    fn open(&self, stream: &str) -> KernelResult<fs::File> {
+        fs::File::create(self.directory.join(format!("{stream}.log"))).map_err(output_archive_error)
+    }
+
+    fn finish(mut self, output: &mut Value, truncated: bool) -> KernelResult<()> {
+        if truncated {
+            let mut paths = serde_json::Map::new();
+            for stream in ["stdout", "stderr"] {
+                let path = self.directory.join(format!("{stream}.log"));
+                match fs::metadata(&path) {
+                    Ok(metadata) => {
+                        paths.insert(
+                            stream.to_string(),
+                            serde_json::json!({
+                                "path": path, "bytes": metadata.len(),
+                            }),
+                        );
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound && stream == "stderr" => {}
+                    Err(error) => return Err(output_archive_error(error)),
+                }
+            }
+            output["fullOutput"] = Value::Object(paths);
+            self.retained = true;
+        } else {
+            fs::remove_dir_all(&self.directory).map_err(output_archive_error)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ShellOutputArchive {
+    fn drop(&mut self) {
+        if !self.retained {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+}
+
+fn output_archive_error(error: std::io::Error) -> KernelError {
+    KernelError::Other(format!("bash output archive: {error}"))
+}
+
 pub(super) struct CapturedOutput {
     pub(super) bytes: Vec<u8>,
     pub(super) truncated: bool,
@@ -1033,6 +1120,7 @@ pub(super) struct CapturedOutput {
 
 fn spawn_output_reader(
     mut reader: impl Read + Send + 'static,
+    mut archive: fs::File,
     max_bytes: usize,
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<std::io::Result<CapturedOutput>> {
@@ -1056,6 +1144,7 @@ fn spawn_output_reader(
             if read == 0 {
                 break;
             }
+            archive.write_all(&chunk[..read])?;
             truncated |= append_tail(&mut captured, &chunk[..read], max_bytes);
         }
         Ok(CapturedOutput {
@@ -1067,6 +1156,7 @@ fn spawn_output_reader(
 
 fn spawn_pty_output_reader(
     mut reader: impl Read + Send + 'static,
+    mut archive: fs::File,
     max_bytes: usize,
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<std::io::Result<CapturedOutput>> {
@@ -1092,6 +1182,7 @@ fn spawn_pty_output_reader(
             if read == 0 {
                 break;
             }
+            archive.write_all(&chunk[..read])?;
             truncated |= append_tail(&mut captured, &chunk[..read], max_bytes);
         }
         Ok(CapturedOutput {
@@ -1103,9 +1194,10 @@ fn spawn_pty_output_reader(
 
 fn append_tail(target: &mut Vec<u8>, bytes: &[u8], max_bytes: usize) -> bool {
     if bytes.len() >= max_bytes {
+        let truncated = !target.is_empty() || bytes.len() > max_bytes;
         target.clear();
         target.extend_from_slice(&bytes[bytes.len() - max_bytes..]);
-        return true;
+        return truncated;
     }
     let overflow = target
         .len()
@@ -1153,6 +1245,50 @@ fn retain_tail(bytes: &mut Vec<u8>, keep: usize) -> bool {
     let remove = bytes.len() - keep;
     bytes.drain(..remove);
     true
+}
+
+fn line_count(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|byte| **byte == b'\n').count()
+        + usize::from(!bytes.is_empty() && bytes.last() != Some(&b'\n'))
+}
+
+fn retain_tail_lines(bytes: &mut Vec<u8>, keep: usize) -> bool {
+    let count = line_count(bytes);
+    if count <= keep {
+        return false;
+    }
+    if keep == 0 {
+        bytes.clear();
+        return true;
+    }
+    let start = bytes
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'\n')
+        .nth(count - keep - 1)
+        .map(|(index, _)| index + 1)
+        .expect("line boundary");
+    bytes.drain(..start);
+    true
+}
+
+fn trim_utf8_prefix(bytes: &mut Vec<u8>) {
+    let count = bytes
+        .iter()
+        .take_while(|byte| **byte & 0xc0 == 0x80)
+        .count();
+    bytes.drain(..count);
+}
+
+fn bound_output_lines(stdout: &mut CapturedOutput, stderr: &mut CapturedOutput) {
+    let stdout_lines = line_count(&stdout.bytes);
+    let stderr_lines = line_count(&stderr.bytes);
+    let stderr_keep = stderr_lines.min(BASH_OUTPUT_LIMIT_LINES / 2);
+    let stdout_keep = stdout_lines.min(BASH_OUTPUT_LIMIT_LINES - stderr_keep);
+    stdout.truncated |= retain_tail_lines(&mut stdout.bytes, stdout_keep);
+    stderr.truncated |= retain_tail_lines(&mut stderr.bytes, BASH_OUTPUT_LIMIT_LINES - stdout_keep);
+    trim_utf8_prefix(&mut stdout.bytes);
+    trim_utf8_prefix(&mut stderr.bytes);
 }
 
 #[cfg(unix)]

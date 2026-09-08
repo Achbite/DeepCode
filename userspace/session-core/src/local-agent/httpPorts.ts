@@ -30,6 +30,7 @@ import {
   LOCAL_AGENT_PROTOCOL_VERSION,
   SESSION_CONTROL_INTERACTION_REQUEST,
   SESSION_CONTROL_PLAN_PUBLISH,
+  SESSION_CONTROL_PLAN_PROGRESS,
 } from '@deepcode/protocol';
 import { createProviderToolAliases } from './providerToolCodec.js';
 import { sessionControlToolDefinitions } from './sessionControls.js';
@@ -292,6 +293,9 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
     };
     try {
       const provider = decodeProviderRuntime(value.provider);
+      if (provider.reasoningEffortOverride !== request.reasoningEffortOverride) {
+        throw new Error('run_runtime_reasoning_override_mismatch');
+      }
       const pluginConfig = decodeRunPluginConfig(value.pluginConfig);
       if (pluginConfig.extensionGenerationRef !== value.extensionGenerationRef) {
         throw new Error('run_runtime_extension_identity_mismatch');
@@ -335,6 +339,7 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
           instructions: [...runtimeInstructions(this.#stableCoreInstructions, pluginConfig, {
             interactionRequest: wireName(SESSION_CONTROL_INTERACTION_REQUEST),
             planPublish: wireName(SESSION_CONTROL_PLAN_PUBLISH),
+            planProgress: wireName(SESSION_CONTROL_PLAN_PROGRESS),
           })],
           tools,
           toolPromptContributions: toolPromptContributions as PreparedToolPromptContribution[],
@@ -373,7 +378,7 @@ function decodeProviderRuntime(value: unknown): ProviderRuntimeSnapshot {
       'maxOutputTokens',
       'apiSurface',
       'hostedWebSearch',
-    ])
+    ], ['reasoningEffort', 'reasoningEffortOverride', 'thinking'])
     || !isNonEmptyText(value.providerRuntimeRef)
     || !isNonEmptyText(value.profileId)
     || !isPositiveSafeInteger(value.contextWindowTokens)
@@ -383,6 +388,9 @@ function decodeProviderRuntime(value: unknown): ProviderRuntimeSnapshot {
       .includes(String(value.apiSurface))
     || value.hostedWebSearch !== 'none' && value.hostedWebSearch !== 'web_search'
     || value.hostedWebSearch === 'web_search' && value.apiSurface !== 'responses'
+    || [value.reasoningEffort, value.reasoningEffortOverride].some((effort) => effort !== undefined && !['low', 'medium', 'high', 'max'].includes(String(effort)))
+    || value.thinking !== undefined && !['enabled', 'disabled'].includes(String(value.thinking))
+    || value.reasoningEffortOverride !== undefined && (value.reasoningEffort !== value.reasoningEffortOverride || value.thinking === 'disabled')
   ) throw new Error('provider_runtime_snapshot_invalid');
   return Object.freeze({
     providerRuntimeRef: value.providerRuntimeRef,
@@ -391,6 +399,9 @@ function decodeProviderRuntime(value: unknown): ProviderRuntimeSnapshot {
     maxOutputTokens: value.maxOutputTokens,
     apiSurface: value.apiSurface as ProviderRuntimeSnapshot['apiSurface'],
     hostedWebSearch: value.hostedWebSearch as ProviderRuntimeSnapshot['hostedWebSearch'],
+    ...(value.reasoningEffort ? { reasoningEffort: value.reasoningEffort as ProviderRuntimeSnapshot['reasoningEffort'] } : {}),
+    ...(value.reasoningEffortOverride ? { reasoningEffortOverride: value.reasoningEffortOverride as ProviderRuntimeSnapshot['reasoningEffortOverride'] } : {}),
+    ...(value.thinking ? { thinking: value.thinking as ProviderRuntimeSnapshot['thinking'] } : {}),
   });
 }
 
@@ -642,10 +653,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-function isExactRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+function isExactRecord(value: unknown, keys: readonly string[], optional: readonly string[] = []): value is Record<string, unknown> {
   return isRecord(value)
-    && Object.keys(value).length === keys.length
-    && Object.keys(value).every((key) => keys.includes(key));
+    && keys.every((key) => Object.hasOwn(value, key))
+    && Object.keys(value).every((key) => keys.includes(key) || optional.includes(key));
 }
 
 function isNonEmptyText(value: unknown): value is string {

@@ -670,7 +670,10 @@ function cacheHitSummary(
         input: cache.inputTokens.toLocaleString(language),
         hit: cache.hitTokens.toLocaleString(language),
         miss: cache.missTokens.toLocaleString(language),
-      }) + (running ? ` ${t(language, 'deepcodeGui.cache.updatingTitle')}` : ''),
+      }) + (!cache.complete ? ` ${t(language, 'deepcodeGui.cache.partialTitle', {
+        reported: cache.reportedCallCount,
+        calls: cache.providerCallCount,
+      })}` : '') + (running ? ` ${t(language, 'deepcodeGui.cache.updatingTitle')}` : ''),
     };
   }
   if (running) {

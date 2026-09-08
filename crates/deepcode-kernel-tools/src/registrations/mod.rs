@@ -140,8 +140,8 @@ fn canonicalizer_for(tool: KernelToolKind) -> KernelInvocationCanonicalizer {
 fn tool_description(tool: KernelToolKind) -> &'static str {
     match tool {
         KernelToolKind::FsDelete => "Delete one explicitly named workspace file or directory tree.",
-        KernelToolKind::FsEdit => "Apply exact, non-overlapping text replacements to one existing workspace file.",
-        KernelToolKind::FsRead => "Read bounded UTF-8 text from a workspace file. Do not use for PDFs or binary files.",
+        KernelToolKind::FsEdit => "Apply exact, non-overlapping text replacements to one existing workspace file. Every oldText must match a unique region of the original file; later edits do not see earlier replacements. Keep oldText as small as possible while still unique, and do not include large unchanged regions. Combine disjoint changes to the same file in one call. All replacements are applied atomically.",
+        KernelToolKind::FsRead => "Read bounded UTF-8 text from a workspace file. Do not use for PDFs or binary files. The content field contains the selected source text, including whitespace. Check the returned truncation fields and line range before requesting more content.",
         KernelToolKind::FsWrite => "Create or replace one workspace file and any missing parent directories.",
         KernelToolKind::WebFetch => "Fetch bounded HTTP or HTTPS text.",
         KernelToolKind::WebSearch => {

@@ -345,26 +345,28 @@ fn main() {
             app.manage(HostProcessGroup::new(None));
             app.manage(HostStartupStatusStore::new());
             create_main_window(app, &target, &host_tokens)?;
-            if startup_permission_preflight(APP_ASSET_DIR) {
-                let app_handle = app.handle().clone();
-                std::thread::spawn(move || {
+            // Filesystem preflight may wait for a macOS permission dialog. The
+            // window event loop must already be free to accept clicks and input.
+            let app_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                if startup_permission_preflight(APP_ASSET_DIR) {
                     let processes = app_handle.state::<HostProcessGroup>();
                     let status = app_handle.state::<HostStartupStatusStore>();
                     start_host_processes(&target, &host_tokens, &processes, &status);
-                });
-            } else {
-                app.state::<HostStartupStatusStore>().update(
-                    "preflight",
-                    "blocked",
-                    "permissionPreflight",
-                    "host_startup_permission_blocked",
-                    None,
-                    "Startup permission preflight did not complete.",
-                    true,
-                    false,
-                    None,
-                );
-            }
+                } else {
+                    app_handle.state::<HostStartupStatusStore>().update(
+                        "preflight",
+                        "blocked",
+                        "permissionPreflight",
+                        "host_startup_permission_blocked",
+                        None,
+                        "Startup permission preflight did not complete.",
+                        true,
+                        false,
+                        None,
+                    );
+                }
+            });
             Ok(())
         })
         .on_window_event(|window, event| match event {
@@ -2110,5 +2112,4 @@ mod tests {
         assert!(startup_finished.load(std::sync::atomic::Ordering::Acquire));
         startup_thread.join().expect("startup thread exits");
     }
-
 }

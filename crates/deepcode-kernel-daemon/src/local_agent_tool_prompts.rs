@@ -20,7 +20,10 @@ pub(crate) fn core_tool_prompt_providers() -> Value {
                 "promptSnippet": "List, search, discover, build, test, and run commands.",
                 "usageGuidelines": [
                     "Use this for directory listing, text search, file discovery, builds, tests, and command execution.",
-                    "Do not use this as the default way to read a known UTF-8 workspace text file."
+                    "Do not use this as the default way to read a known UTF-8 workspace text file.",
+                    "Use the project's declared build/test scripts in their required environment. Finding docker or another executable does not establish service availability; use an actual permitted service check and report its error.",
+                    "A Plan denial means this call was not executed. Stay within confirmed targets and executionScope; routine command details do not require reconfirmation. Revise the Plan only when the authorized scope must change.",
+                    "Output is limited to the last 2000 lines or 50 KiB. When truncated, fullOutput contains Session-owned log paths; inspect bounded sections with a read-only Bash command instead of repeating the original command."
                 ]
             },
             {

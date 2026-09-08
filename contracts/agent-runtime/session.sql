@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS session_events (
     event_id TEXT NOT NULL UNIQUE CHECK(length(event_id) > 0),
     event_type TEXT NOT NULL CHECK(event_type IN (
         'session.created',
+        'session.model-settings.updated',
         'session.directory-index.attached',
         'session.directory-index.detached',
         'input.accepted',
@@ -48,6 +49,7 @@ CREATE TABLE IF NOT EXISTS session_events (
         'approval.requested',
         'approval.resolved',
         'tool.completed',
+        'tool.input-rejected',
         'session.control.rejected',
         'context.compaction.requested',
         'context.compacted',

@@ -203,6 +203,7 @@ function closesModelContextPrefix(event: SessionEvent): boolean {
     || event.type === 'todo.reconciled'
     || event.type === 'todo.progressed'
     || event.type === 'session.control.rejected'
+    || event.type === 'tool.input-rejected'
     || event.type === 'tool.completed';
 }
 

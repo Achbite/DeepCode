@@ -9,12 +9,12 @@ use deepcode_kernel_runtime::executors::{
     SecretProvider,
 };
 use deepcode_kernel_runtime::workspace_boundary::WorkspaceBoundary;
-use deepcode_kernel_tools::ToolAvailability;
+use deepcode_kernel_tools::{ToolAvailability, ToolInputIssue};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,13 +28,22 @@ const ATTEMPT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) struct LocalAgentKernelError {
     pub(crate) code: &'static str,
     pub(crate) message: String,
+    input_issues: Option<Vec<ToolInputIssue>>,
 }
 
 impl LocalAgentKernelError {
+    fn input(path: &str, rule: &str, message: &str, expected: Option<Value>) -> Self {
+        Self {
+            code: "tool_input_invalid",
+            message: message.into(),
+            input_issues: Some(vec![ToolInputIssue::new(path, rule, message, expected)]),
+        }
+    }
     fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
+            input_issues: None,
         }
     }
 }
@@ -235,6 +244,7 @@ struct NonWorkspaceAuthority {
 
 #[derive(Clone)]
 pub(crate) struct LocalAgentKernel {
+    output_root: PathBuf,
     records: LocalToolRecordStore,
     journal: LocalAgentJournal,
     resolver: Arc<dyn WorkspaceResolverPort>,
@@ -357,6 +367,7 @@ impl LocalAgentKernel {
     ) -> Result<Self, LocalAgentKernelError> {
         Ok(Self {
             records: LocalToolRecordStore::open(record_path)?,
+            output_root: record_path.with_extension("outputs"),
             journal,
             resolver,
             generations: Arc::new(Mutex::new(KernelGenerationState {
@@ -586,7 +597,34 @@ impl LocalAgentKernel {
             return Ok(execution_reply(&request, &record));
         }
 
-        let prepared = self.prepare_tool(&request)?;
+        let prepared = match self.prepare_tool(&request) {
+            Ok(prepared) => prepared,
+            Err(mut error) => {
+                if let Some(issues) = error.input_issues.take() {
+                    return Ok(json!({
+                        "schemaVersion": KERNEL_REPLY_VERSION,
+                        "type": "tool.execution",
+                        "requestId": request.request_id,
+                        "callId": request.call_id,
+                        "status": "inputRejected",
+                        "rejection": {
+                            "sessionId": request.session_id,
+                            "runId": request.run_id,
+                            "extensionGenerationRef": request.extension_generation_ref,
+                            "kernelCatalogSnapshotRef": request.kernel_catalog_snapshot_ref,
+                            "toolBindingRef": request.tool_binding_ref,
+                            "callId": request.call_id,
+                            "attemptId": request.attempt_id,
+                            "toolName": request.tool_name,
+                            "input": request.input,
+                            "rejectedAt": crate::now_text(),
+                            "error": { "code": error.code, "message": error.message, "issues": issues }
+                        }
+                    }));
+                }
+                return Err(error);
+            }
+        };
         let preview = prepared.preview(&request.tool_name);
         let admission = self.admit(&request, &prepared)?;
         match admission {
@@ -894,9 +932,11 @@ impl LocalAgentKernel {
             | PreparedEffectScope::Process => Some(take_workspace_id(&mut tool_input)?),
             PreparedEffectScope::Network | PreparedEffectScope::External => {
                 if tool_input.get("workspaceId").is_some() {
-                    return Err(LocalAgentKernelError::new(
-                        "tool_input_invalid",
+                    return Err(LocalAgentKernelError::input(
+                        "$.workspaceId",
+                        "additionalProperties",
                         "非 workspace 工具不能携带 workspaceId。",
+                        None,
                     ));
                 }
                 None
@@ -1241,7 +1281,7 @@ impl LocalAgentKernel {
         }
         Ok(Admission::denied(
             "workspace_mutation_plan_required",
-            "Workspace mutation 没有被当前 Session 中 active 的已确认 Plan revision 精确覆盖。",
+            "本调用未执行：目标文件、删除类型或 Bash 执行范围未被当前已确认 Plan 覆盖。只有扩大这些范围才需修订 Plan；同一文件的 edit/write 切换与同一执行范围内的命令细节调整无需重新确认。",
         ))
     }
 
@@ -1259,6 +1299,11 @@ impl LocalAgentKernel {
                 &request.attempt_id,
                 prepared.canonical_arguments.clone(),
                 KernelToolExecutionContext {
+                    output_directory: Some(
+                        self.session_output_directory(&request.session_id).join(
+                            deepcode_kernel_tools::hash_bytes(request.attempt_id.as_bytes()),
+                        ),
+                    ),
                     workspace_root: prepared.workspace_root.clone(),
                     workspace_id: prepared.workspace_id.clone(),
                     private_resolved_targets: prepared.private_resolved_targets.clone(),
@@ -1268,6 +1313,25 @@ impl LocalAgentKernel {
             .map_err(|error| format!("{}: {}", error.code, error.message));
         drop(lease);
         result
+    }
+
+    fn session_output_directory(&self, session_id: &str) -> PathBuf {
+        self.output_root
+            .join(deepcode_kernel_tools::hash_bytes(session_id.as_bytes()))
+    }
+
+    pub(crate) fn delete_session_outputs(
+        &self,
+        session_id: &str,
+    ) -> Result<(), LocalAgentKernelError> {
+        match std::fs::remove_dir_all(self.session_output_directory(session_id)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(LocalAgentKernelError::new(
+                "tool_output_cleanup_failed",
+                error.to_string(),
+            )),
+        }
     }
 
     fn bound_generation(
@@ -1363,7 +1427,11 @@ fn dispose_generations(
 }
 
 fn catalog_error(error: ToolCatalogError) -> LocalAgentKernelError {
-    LocalAgentKernelError::new(error.code, error.message)
+    LocalAgentKernelError {
+        code: error.code,
+        message: error.message,
+        input_issues: error.input_issues,
+    }
 }
 
 enum Admission {
@@ -1649,17 +1717,24 @@ fn validate_id(field: &str, value: &str) -> Result<(), LocalAgentKernelError> {
 }
 
 fn take_workspace_id(input: &mut Value) -> Result<String, LocalAgentKernelError> {
-    let object = input
-        .as_object_mut()
-        .ok_or_else(|| LocalAgentKernelError::new("tool_input_invalid", "工具输入必须是对象。"))?;
+    let object = input.as_object_mut().ok_or_else(|| {
+        LocalAgentKernelError::input("$", "type", "工具输入必须是对象。", Some(json!("object")))
+    })?;
     let value = object.remove("workspaceId").ok_or_else(|| {
-        LocalAgentKernelError::new(
-            "workspace_identity_required",
+        LocalAgentKernelError::input(
+            "$.workspaceId",
+            "required",
             "Workspace 工具必须显式携带 workspaceId。",
+            Some(json!("string")),
         )
     })?;
     let workspace_id = value.as_str().ok_or_else(|| {
-        LocalAgentKernelError::new("workspace_identity_invalid", "workspaceId 必须是字符串。")
+        LocalAgentKernelError::input(
+            "$.workspaceId",
+            "type",
+            "workspaceId 必须是字符串。",
+            Some(json!("string")),
+        )
     })?;
     validate_id("workspaceId", workspace_id)?;
     Ok(workspace_id.to_string())
@@ -1744,21 +1819,12 @@ fn authority_covers(authority: &Value, prepared: &PreparedEffect) -> bool {
                     let Some(object) = operation.as_object() else {
                         return false;
                     };
-                    object.len()
-                        == if arguments.get("terminal").is_some() {
-                            6
-                        } else {
-                            5
-                        }
-                        && object.get("workspaceId").and_then(Value::as_str)
-                            == prepared.workspace_id.as_deref()
+                    object.get("workspaceId").and_then(Value::as_str)
+                        == prepared.workspace_id.as_deref()
                         && object.get("operation").and_then(Value::as_str) == Some("bash")
-                        && object.get("command").and_then(Value::as_str)
-                            == arguments.get("command").and_then(Value::as_str)
                         && object.get("workspaceMode").and_then(Value::as_str) == Some("write")
                         && object.get("executionScope").and_then(Value::as_str)
                             == arguments.get("executionScope").and_then(Value::as_str)
-                        && object.get("terminal") == arguments.get("terminal")
                 })
             });
     }
@@ -1776,8 +1842,13 @@ fn authority_covers(authority: &Value, prepared: &PreparedEffect) -> bool {
                 };
                 let base = object.get("workspaceId").and_then(Value::as_str)
                     == prepared.workspace_id.as_deref()
-                    && object.get("operation").and_then(Value::as_str)
+                    && (object.get("operation").and_then(Value::as_str)
                         == Some(prepared.operation.as_str())
+                        || matches!(prepared.operation.as_str(), "fs.write" | "fs.edit")
+                            && matches!(
+                                object.get("operation").and_then(Value::as_str),
+                                Some("fs.write" | "fs.edit")
+                            ))
                     && object.get("target").and_then(Value::as_str) == Some(target.as_str());
                 if !base {
                     return false;
@@ -2099,12 +2170,165 @@ mod attempt_control_tests {
     use super::*;
 
     #[test]
+    fn invalid_bound_tool_input_returns_a_rejection_before_resolution_or_tool_record_creation() {
+        struct UnexpectedResolver;
+        impl WorkspaceResolverPort for UnexpectedResolver {
+            fn resolve(&self, _: &str) -> Result<String, LocalAgentKernelError> {
+                panic!("input rejection must precede filesystem resolution")
+            }
+        }
+        let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
+        let bindings = json!([{"workspaceId":"workspace:test", "displayName":"Fixture"}]);
+        journal
+            .create_session("session:reject", "Input rejection", &bindings, None)
+            .unwrap();
+        let kernel = LocalAgentKernel::open(
+            Path::new(":memory:"),
+            journal.clone(),
+            Arc::new(UnexpectedResolver),
+        )
+        .unwrap();
+        let generation = LocalAgentKernel::prepare_generation(
+            "extension:test",
+            "kernel-generation:test",
+            KernelExecutorConfig::default(),
+            Arc::new(deepcode_kernel_runtime::executors::EmptySecretProvider),
+            McpRuntime::default(),
+            LocalAgentPermissionPolicy::from_settings(&json!({})).unwrap(),
+            false,
+        )
+        .unwrap();
+        let catalog = kernel
+            .bind_run_catalog(
+                PrepareToolCatalogRequest::new("session:reject", "run:reject", "extension:test"),
+                generation,
+            )
+            .unwrap();
+        let tools = catalog["tools"].as_array().unwrap();
+        let binding =
+            tools.iter().find(|tool| tool["name"] == "bash").unwrap()["toolBindingRef"].clone();
+        let mut aliases: Vec<Value> = tools.iter().filter(|tool| tool["availability"] == "callable").map(|tool| json!({"canonicalName":tool["name"],"wireName":tool["name"].as_str().unwrap().replace('.', "_")})).collect();
+        aliases.extend([
+            json!({"canonicalName":"interaction.request","wireName":"interaction_request"}),
+            json!({"canonicalName":"plan.publish","wireName":"plan_publish"}),
+        ]);
+        journal.append(&json!({
+            "type":"run.started", "sessionId":"session:reject", "runId":"run:reject",
+            "payload":{"inputMessageId":"message:reject", "workspaceBindings":bindings,
+                "runtimeSnapshot":{
+                    "runRuntimeSnapshotRef":"runtime:test", "extensionGenerationRef":"extension:test",
+                    "kernelCatalogSnapshotRef":catalog["kernelCatalogSnapshotRef"],
+                    "provider":{"providerRuntimeRef":"provider:test", "profileId":"profile:test", "contextWindowTokens":4096, "maxOutputTokens":512, "apiSurface":"chatCompletions", "hostedWebSearch":"none"},
+                    "webSearch":{"owner":"unavailable"}, "instructions":[], "tools":tools,
+                    "toolPromptContributions":[], "providerToolAliases":aliases,
+                    "selectedPlugins":{"catalogRevision":"plugins:test","plugins":[]}
+                }}
+        })).unwrap();
+        let request: LocalToolExecutionRequest = serde_json::from_value(json!({
+            "schemaVersion":KERNEL_REQUEST_VERSION, "type":"tool.execute", "requestId":"request:reject", "sessionId":"session:reject", "runId":"run:reject",
+            "extensionGenerationRef":"extension:test", "kernelCatalogSnapshotRef":catalog["kernelCatalogSnapshotRef"],
+            "toolBindingRef":binding, "callId":"call:reject", "attemptId":"attempt:reject", "toolName":"bash",
+            "workspaceBindings":["workspace:test"], "input":{"workspaceId":"workspace:test", "command":"pwd", "executionMode":"read"}
+        })).unwrap();
+        let reply = kernel.execute(request.clone()).unwrap();
+        assert_eq!(reply["status"], "inputRejected");
+        assert_eq!(reply["rejection"]["input"], request.input);
+        assert_eq!(reply["rejection"]["callId"], request.call_id);
+        assert!(reply.get("record").is_none());
+        assert!(reply["rejection"].get("preparedEffect").is_none());
+        assert!(reply["rejection"]["error"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["path"] == "$.workspaceMode" && issue["rule"] == "required"));
+        assert!(kernel.records.read(&request.call_id).unwrap().is_none());
+        let mut wrong_binding = request;
+        wrong_binding.tool_binding_ref = "binding:unknown".into();
+        assert!(kernel
+            .execute(wrong_binding)
+            .unwrap_err()
+            .input_issues
+            .is_none());
+        kernel
+            .release_catalog(ReleaseToolCatalogRequest::new(
+                "session:reject",
+                "run:reject",
+                catalog["kernelCatalogSnapshotRef"].as_str().unwrap(),
+            ))
+            .unwrap();
+    }
+
+    #[test]
     fn bash_effect_summary_preserves_the_complete_canonical_command() {
         let command = "docker image inspect cpp-dev:latest >/dev/null 2>&1 && {\n  docker build -t cpp-dev:latest .\n}";
         assert_eq!(
             effect_summary("bash", &[".".to_string()], &json!({ "command": command })),
             format!("执行 bash：{command}"),
         );
+    }
+
+    #[test]
+    fn plan_scope_allows_execution_details_but_preserves_targets_and_boundaries() {
+        let generation = LocalAgentKernel::prepare_generation(
+            "extension:scope",
+            "generation:scope",
+            KernelExecutorConfig::default(),
+            Arc::new(deepcode_kernel_runtime::executors::EmptySecretProvider),
+            McpRuntime::default(),
+            LocalAgentPermissionPolicy::from_settings(&json!({})).unwrap(),
+            false,
+        )
+        .unwrap()
+        .generation;
+        let view = generation.catalog.provider_view();
+        let tool = view
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "bash")
+            .unwrap();
+        let binding = generation
+            .catalog
+            .binding(tool["toolBindingRef"].as_str().unwrap(), "bash")
+            .unwrap();
+        let mut effect = PreparedEffect {
+            generation: Arc::clone(&generation),
+            binding,
+            scope: PreparedEffectScope::Process,
+            workspace_id: Some("workspace:scope".into()),
+            operation: "bash".into(),
+            logical_targets: vec![".".into()],
+            private_resolved_targets: vec![],
+            canonical_invocation: json!({}),
+            canonical_arguments: json!({"command":"make shell", "executionScope":"host", "workspaceMode":"write", "terminal":{"stdin":"./build.sh\nexit\n"}}),
+            workspace_root: None,
+            delete_target_kind: None,
+            process_workspace_mode: Some("write".into()),
+            process_execution_scope: Some("host".into()),
+        };
+        let authority = json!({"coveredOperations":[{"workspaceId":"workspace:scope", "operation":"bash", "workspaceMode":"write", "executionScope":"host", "command":"make build"}]});
+        assert!(authority_covers(&authority, &effect));
+        effect.canonical_arguments["executionScope"] = json!("workspace");
+        assert!(!authority_covers(&authority, &effect));
+        effect.canonical_arguments["executionScope"] = json!("host");
+        effect.workspace_id = Some("workspace:other".into());
+        assert!(!authority_covers(&authority, &effect));
+        effect.workspace_id = Some("workspace:scope".into());
+        effect.operation = "fs.write".into();
+        effect.logical_targets = vec!["src/pool.hpp".into()];
+        let file = json!({"coveredOperations":[{"workspaceId":"workspace:scope", "operation":"fs.edit", "target":"src/pool.hpp"}]});
+        assert!(authority_covers(&file, &effect));
+        effect.logical_targets = vec!["src/other.hpp".into()];
+        assert!(!authority_covers(&file, &effect));
+        effect.logical_targets = vec!["src/pool.hpp".into()];
+        effect.operation = "fs.delete".into();
+        effect.delete_target_kind = Some("file".into());
+        assert!(!authority_covers(&file, &effect));
+        let deletion = json!({"coveredOperations":[{"workspaceId":"workspace:scope", "operation":"fs.delete", "target":"src/pool.hpp", "targetKind":"file"}]});
+        assert!(authority_covers(&deletion, &effect));
+        effect.delete_target_kind = Some("directoryTree".into());
+        assert!(!authority_covers(&deletion, &effect));
+        generation.catalog.dispose().unwrap();
     }
 
     #[test]

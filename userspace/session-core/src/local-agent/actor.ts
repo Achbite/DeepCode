@@ -2,6 +2,7 @@ import type {
   AssistantDraftProjection,
   CommandJournalPort,
   CommandReply,
+  ContextCompositionProjection,
   ConversationCommand,
   InteractionProjection,
   NewSessionEvent,
@@ -92,6 +93,15 @@ export class SessionActor {
     return projectSession((await this.loadSnapshot()).state, this.#assistantDraft);
   }
 
+  async contextComposition(providerRequestId: string): Promise<ContextCompositionProjection> {
+    this.assertOperational();
+    const receipt = (await this.loadSnapshot()).state.contextCompositions.find(
+      (candidate) => candidate.providerRequestId === providerRequestId,
+    );
+    if (!receipt) throw new Error('context_composition_not_found');
+    return structuredClone(receipt);
+  }
+
   hasLoopFailure(): boolean {
     return this.#loopFailure !== undefined;
   }
@@ -134,6 +144,8 @@ export class SessionActor {
     }
 
     switch (command.type) {
+      case 'session.model-settings.set':
+        return await this.handleModelSettings(command);
       case 'session.directory-index.attach':
         return await this.handleDirectoryIndexAttach(command);
       case 'session.directory-index.detach':
@@ -153,6 +165,19 @@ export class SessionActor {
       case 'plan.respond':
         return await this.handlePlan(command);
     }
+  }
+
+  private async handleModelSettings(
+    command: Extract<ConversationCommand, { type: 'session.model-settings.set' }>,
+  ): Promise<CommandReply> {
+    if (!command.settings || !validProfileId(command.settings.profileId)
+      || !validReasoningOverride(command.settings.reasoningEffortOverride)) {
+      return await this.recordRejection(command, 'session_model_settings_invalid', '对话模型设置无效。');
+    }
+    return await this.#journal.commitCommand(command, [{
+      type: 'session.model-settings.updated', sessionId: this.sessionId,
+      payload: { commandId: command.commandId, settings: { ...command.settings } },
+    }], acceptedReply(command));
   }
 
   private async handleDirectoryIndexAttach(
@@ -274,6 +299,9 @@ export class SessionActor {
     if (command.profileId !== undefined && !validProfileId(command.profileId)) {
       return await this.recordRejection(command, 'llm_profile_invalid', '模型 Profile 标识无效。');
     }
+    if (command.reasoningEffortOverride !== undefined && !validReasoningOverride(command.reasoningEffortOverride)) {
+      return await this.recordRejection(command, 'session_model_settings_invalid', '推理强度无效。');
+    }
     const filesystemReferenceError = validateFilesystemReferences(command.filesystemReferences);
     if (filesystemReferenceError) {
       return await this.recordRejection(
@@ -307,7 +335,11 @@ export class SessionActor {
     await this.stopCurrentRunForSteering();
     const messageId = this.#nextId('message');
     const runId = this.#nextId('run');
-    const profileId = command.profileId ?? this.#profileId;
+    const profileId = command.profileId ?? before.state.modelSettings?.profileId ?? this.#profileId;
+    const reasoningEffortOverride = command.reasoningEffortOverride !== undefined
+      ? command.reasoningEffortOverride
+      : before.state.modelSettings && profileId === before.state.modelSettings.profileId
+        ? before.state.modelSettings.reasoningEffortOverride : null;
     const runWorkspaceBindings = mergeWorkspaceBindings(
       before.state.workspaceBindings,
       (command.filesystemReferences ?? []).map((reference) => ({
@@ -319,6 +351,7 @@ export class SessionActor {
       sessionId: this.sessionId,
       runId,
       ...(profileId ? { profileId } : {}),
+      ...(reasoningEffortOverride ? { reasoningEffortOverride } : {}),
       ...(command.pluginCatalogRevision
         ? { pluginCatalogRevision: command.pluginCatalogRevision }
         : {}),
@@ -328,6 +361,11 @@ export class SessionActor {
     });
     const runtimeSnapshot = prepared.runtimeSnapshot;
     const events: NewSessionEvent[] = [
+      {
+        type: 'session.model-settings.updated',
+        sessionId: this.sessionId,
+        payload: { commandId: command.commandId, settings: { profileId: runtimeSnapshot.provider.profileId, reasoningEffortOverride } },
+      },
       {
         type: 'input.accepted',
         sessionId: this.sessionId,
@@ -830,6 +868,7 @@ export class SessionActor {
         sessionId: this.sessionId,
         runId,
         profileId: runtime.provider.profileId,
+        ...(runtime.provider.reasoningEffortOverride ? { reasoningEffortOverride: runtime.provider.reasoningEffortOverride } : {}),
         ...recoveryPluginSelection(snapshot, runId, runtime),
       });
     } catch (error) {
@@ -1181,6 +1220,7 @@ function closesAssistantDraft(
     && event.runId === runId
     && (
       event.type === 'narrative.committed'
+      || event.type === 'provider.turn.settled'
       || event.type === 'interaction.requested'
       || event.type === 'plan.published'
       || event.type === 'tool.requested'
@@ -1192,10 +1232,14 @@ function closesAssistantDraft(
 }
 
 function validProfileId(value: string): boolean {
-  return value.length > 0
+  return typeof value === 'string' && value.length > 0
     && value.length <= 128
     && value.trim() === value
     && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function validReasoningOverride(value: unknown): boolean {
+  return value === null || typeof value === 'string' && ['low', 'medium', 'high', 'max'].includes(value);
 }
 
 function validateFilesystemReferences(

@@ -7,7 +7,9 @@ mod invocation_types;
 mod registrations;
 mod types;
 
-pub use catalog::{CanonicalToolInvocation, KernelToolCatalogError, KernelToolRegistry};
+pub use catalog::{
+    CanonicalToolInvocation, KernelToolCatalogError, KernelToolRegistry, ToolInputIssue,
+};
 pub use types::{ToolAvailability, ToolDescriptor, ToolEffectClass, ToolEffectScope};
 
 /// Kernel-private, cross-crate adapter types.

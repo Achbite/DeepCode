@@ -2,6 +2,44 @@ use deepcode_kernel_tools::{KernelToolRegistry, ToolAvailability};
 use serde_json::json;
 
 #[test]
+fn rejected_arguments_explain_required_unknown_enum_type_and_nested_bounds() {
+    use deepcode_kernel_tools::KernelToolCatalogError;
+    let registry = KernelToolRegistry::new();
+    let error = registry.canonicalize("bash", json!({"command":"pwd", "executionMode":"read", "executionScope":"outside", "timeout":"slow"})).unwrap_err();
+    let KernelToolCatalogError::InvalidArguments { issues, .. } = error else {
+        panic!("expected typed input rejection")
+    };
+    assert!(issues
+        .iter()
+        .any(|issue| issue.path == "$.workspaceMode" && issue.rule == "required"));
+    assert!(issues
+        .iter()
+        .any(|issue| issue.path == "$.executionMode" && issue.rule == "additionalProperties"));
+    assert!(issues.iter().any(|issue| issue.path == "$.executionScope"
+        && issue.rule == "enum"
+        && issue.expected == Some(json!(["workspace", "host"]))));
+    assert!(issues
+        .iter()
+        .any(|issue| issue.path == "$.timeout" && issue.rule == "type"));
+    let error = registry
+        .canonicalize(
+            "fs.edit",
+            json!({"path":"README.md", "edits":[{"oldText":"", "newText":"updated"}]}),
+        )
+        .unwrap_err();
+    let KernelToolCatalogError::InvalidArguments { issues, .. } = error else {
+        panic!("expected typed input rejection")
+    };
+    assert!(issues
+        .iter()
+        .any(|issue| issue.path == "$.edits[0].oldText" && issue.rule == "minLength"));
+    assert!(matches!(
+        registry.canonicalize("missing.tool", json!({})),
+        Err(KernelToolCatalogError::ToolNotRegistered(_))
+    ));
+}
+
+#[test]
 fn catalog_exposes_basic_callable_tools() {
     let registry = KernelToolRegistry::new();
     let names = registry

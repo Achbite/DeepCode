@@ -4,6 +4,8 @@ import type {
   ConversationCatalog,
   ConversationCommand,
   LlmProviderProfile,
+  LlmReasoningEffort,
+  SessionModelSettings,
   MessageFeedback,
   PluginCatalogProjection,
   PluginSelectionInput,
@@ -51,6 +53,8 @@ interface LocalAgentState {
   sessionId: string | null;
   draftProjectId: string | null;
   selectedProfileId: string | null;
+  reasoningEffortOverride: LlmReasoningEffort | null;
+  modelSettingsBusy: boolean;
   profiles: LlmProviderProfile[];
   defaultProfileId: string | null;
   catalog: ConversationCatalog;
@@ -67,7 +71,8 @@ interface LocalAgentState {
   refreshPluginCatalog(): Promise<void>;
   startNewSession(projectId?: string | null): void;
   activateSession(sessionId: string): Promise<void>;
-  selectProfile(profileId: string): void;
+  selectProfile(profileId: string): Promise<void>;
+  selectReasoningEffort(effort: LlmReasoningEffort | null): Promise<void>;
   refresh(): Promise<void>;
   sendMessage(
     text: string,
@@ -120,6 +125,8 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
   sessionId: null,
   draftProjectId: null,
   selectedProfileId: null,
+  reasoningEffortOverride: null,
+  modelSettingsBusy: false,
   profiles: [],
   defaultProfileId: null,
   catalog: EMPTY_CATALOG,
@@ -142,7 +149,6 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
           getPluginCatalog(),
           getLlmProfiles(),
         ]);
-        if (currentGeneration !== generation) return;
         const profiles = profileResult.ok
           ? (profileResult.data?.profiles ?? []).filter((profile) => profile.enabled)
           : [];
@@ -150,6 +156,21 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
           profiles,
           profileResult.data?.defaultProfileId,
         );
+        // Catalog readiness is independent of navigation. Starting a new draft
+        // while boot data loads cancels view restoration, not the shared data.
+        set({ catalog, pluginCatalog, profiles, defaultProfileId });
+        if (currentGeneration !== generation) {
+          set({
+            selectedProfileId: resolveEnabledProfileId(profiles, get().selectedProfileId, defaultProfileId),
+          });
+          if (!profileResult.ok) {
+            set({
+              error: profileResult.message ?? 'llm_profiles_unavailable',
+              errorSource: 'initialization',
+            });
+          }
+          return;
+        }
         const remembered = readRememberedSession();
         const candidate = catalog.sessions.find((session) => session.id === remembered);
         let projection: SessionProjection | null = null;
@@ -167,11 +188,12 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
           pluginCatalog,
           profiles,
           defaultProfileId,
-          selectedProfileId: resolveEnabledProfileId(
+          selectedProfileId: projection?.modelSettings?.profileId ?? resolveEnabledProfileId(
             profiles,
             candidate?.profileId,
             defaultProfileId,
           ),
+          reasoningEffortOverride: projection?.modelSettings?.reasoningEffortOverride ?? null,
           sessionId: projection?.sessionId ?? candidate?.id ?? null,
           projection,
           draftProjectId: null,
@@ -262,6 +284,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
       projection: null,
       draftProjectId: projectId,
       selectedProfileId: get().defaultProfileId,
+      reasoningEffortOverride: null,
       loading: false,
       submitting: activeSubmissionCount > 0,
       error: null,
@@ -290,11 +313,12 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
       rememberSession(sessionId);
       set({
         sessionId,
-        selectedProfileId: resolveEnabledProfileId(
+        selectedProfileId: projection.modelSettings?.profileId ?? resolveEnabledProfileId(
           get().profiles,
           summary.profileId,
           get().defaultProfileId,
         ),
+        reasoningEffortOverride: projection.modelSettings?.reasoningEffortOverride ?? null,
         projection,
         loading: false,
       });
@@ -309,9 +333,16 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
     }
   },
 
-  selectProfile: (profileId) => {
+  selectProfile: async (profileId) => {
     if (!get().profiles.some((profile) => profile.id === profileId && profile.enabled)) return;
-    set({ selectedProfileId: profileId, error: null, errorSource: null });
+    if (get().selectedProfileId === profileId) return;
+    await saveModelSettings(set, get, { profileId, reasoningEffortOverride: null });
+  },
+
+  selectReasoningEffort: async (reasoningEffortOverride) => {
+    const { selectedProfileId, profiles } = get();
+    if (!selectedProfileId || profiles.find((profile) => profile.id === selectedProfileId)?.thinking === 'disabled') return;
+    await saveModelSettings(set, get, { profileId: selectedProfileId, reasoningEffortOverride });
   },
 
   refresh: async () => {
@@ -339,6 +370,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
           ) return state;
           return {
             projection: nextProjection,
+            ...projectModelSettings(nextProjection),
             ...(state.errorSource === 'projection'
               ? { error: null, errorSource: null }
               : {}),
@@ -621,6 +653,7 @@ async function submitNewRun(
   beginSubmission(set);
   try {
     const messageProfileId = get().selectedProfileId;
+    const reasoningEffortOverride = get().reasoningEffortOverride;
     if (!messageProfileId) throw new Error('llm_profile_unavailable');
     const pluginCatalog = get().pluginCatalog;
     const effectivePluginSelections = requiredFilesystemPluginSelections(
@@ -659,6 +692,7 @@ async function submitNewRun(
           }
         : {}),
       profileId: messageProfileId,
+      reasoningEffortOverride,
       ...(effectivePluginSelections.length
         ? {
             pluginCatalogRevision: pluginCatalog.revision,
@@ -752,11 +786,37 @@ async function reconcileProjectionAfterReply(
     );
   }
   if (get().sessionId !== sessionId) return;
-  set((state) => ({
-    projection: shouldApplyProjection(state.projection, projection)
-      ? projection
-      : state.projection,
-  }));
+  set((state) => {
+    const nextProjection = shouldApplyProjection(state.projection, projection) ? projection : state.projection;
+    return { projection: nextProjection, ...projectModelSettings(nextProjection) };
+  });
+}
+
+function projectModelSettings(projection: SessionProjection | null): Partial<LocalAgentState> {
+  return projection?.modelSettings ? {
+    selectedProfileId: projection.modelSettings.profileId,
+    reasoningEffortOverride: projection.modelSettings.reasoningEffortOverride,
+  } : {};
+}
+
+async function saveModelSettings(set: StoreSet, get: StoreGet, settings: SessionModelSettings): Promise<void> {
+  if (get().modelSettingsBusy) return;
+  const sessionId = get().sessionId;
+  if (!sessionId) {
+    set({ selectedProfileId: settings.profileId, reasoningEffortOverride: settings.reasoningEffortOverride });
+    return;
+  }
+  set({ modelSettingsBusy: true });
+  try {
+    await submitCommandAndReconcile(set, get, {
+      schemaVersion: CONVERSATION_COMMAND_VERSION, type: 'session.model-settings.set',
+      sessionId, commandId: nextId('command'), settings,
+    });
+  } catch (error) {
+    if (get().sessionId === sessionId) set({ error: errorMessage(error), errorSource: 'command' });
+  } finally {
+    set({ modelSettingsBusy: false });
+  }
 }
 
 function beginSubmission(set: StoreSet): void {
@@ -847,6 +907,7 @@ function sameAssistantDraft(
     && left.turnId === right.turnId
     && left.content === right.content
     && left.reasoningContent === right.reasoningContent
+    && JSON.stringify(left.activity) === JSON.stringify(right.activity)
     && JSON.stringify(left.orderedBlocks) === JSON.stringify(right.orderedBlocks);
 }
 

@@ -1226,6 +1226,7 @@ mod tests {
             .call(
                 json!({ "text": "DeepCode" }),
                 &KernelToolExecutionContext {
+                    output_directory: None,
                     workspace_root: None,
                     workspace_id: None,
                     private_resolved_targets: Vec::new(),
@@ -1292,6 +1293,7 @@ mod tests {
         let cancellation = KernelCancellationToken::default();
         cancellation.cancel();
         let context = KernelToolExecutionContext {
+            output_directory: None,
             workspace_root: None,
             workspace_id: None,
             private_resolved_targets: Vec::new(),

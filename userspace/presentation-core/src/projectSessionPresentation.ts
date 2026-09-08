@@ -94,7 +94,7 @@ function planBlock(plan: PlanProjection): PresentationBlock {
         entries: plan.mutationManifest.map((operation) => ({
           key: `${operation.workspaceId}:${operation.operation}`,
           value: operation.operation === 'bash'
-            ? `${operation.executionScope}/${operation.workspaceMode}${operation.terminal ? '/pty' : ''} · ${operation.command}`
+            ? `${operation.executionScope}/${operation.workspaceMode}${operation.command ? ` · ${operation.command}` : ''}`
             : operation.target,
         })),
       }]
@@ -138,6 +138,12 @@ function activityBlock(activity: ActivityProjection): PresentationBlock {
       region: 'timeline',
       state: activity.status,
       label: activity.label,
+      ...(activity.inputRejection ? {
+        error: { code: activity.inputRejection.code, message: activity.inputRejection.message },
+        detail: activity.inputRejection.issues.map((issue) => (
+          `${issue.path}: ${issue.message}${issue.expected === undefined ? '' : ` (${JSON.stringify(issue.expected)})`}`
+        )).join('\n'),
+      } : {}),
     },
   ];
   if (activity.tool) {

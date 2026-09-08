@@ -82,6 +82,7 @@ export type PresentationStatusState =
   | 'waiting'
   | 'completed'
   | 'denied'
+  | 'rejected'
   | 'failed'
   | 'releaseFailed'
   | 'cancelled'

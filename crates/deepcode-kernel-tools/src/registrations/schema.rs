@@ -59,7 +59,7 @@ pub(super) fn provider_schema_for_tool(tool: KernelToolKind) -> Value {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": 128,
-                    "description": "Exact non-overlapping replacements applied atomically in array order.",
+                    "description": "Non-overlapping replacements matched against the original file and applied atomically.",
                     "items": {
                         "type": "object",
                         "required": ["oldText", "newText"],

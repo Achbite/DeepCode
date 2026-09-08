@@ -273,6 +273,7 @@ function decodeProjection(value: unknown): SessionProjection {
       'sessionId',
       'revision',
       'display',
+      'modelSettings',
       'workspaceBindings',
       'sessionDirectoryIndexes',
       'timeline',
@@ -298,6 +299,7 @@ function decodeProjection(value: unknown): SessionProjection {
     || !isIdentifier(value.sessionId)
     || !isNaturalNumber(value.revision)
     || !isSessionDisplay(value.display)
+    || !isNullable(value.modelSettings, isModelSettings)
     || !isWorkspaceBindings(value.workspaceBindings)
     || !isWorkspaceBindings(value.sessionDirectoryIndexes)
     || !isArrayOf(value.timeline, isTimelineItem)
@@ -641,12 +643,13 @@ function isAssistantDraft(value: unknown): boolean {
   if (!isExactRecord(
     value,
     ['runId', 'turnId', 'content'],
-    ['reasoningContent', 'orderedBlocks'],
+    ['reasoningContent', 'orderedBlocks', 'activity'],
   )
     || !isIdentifier(value.runId)
     || !isIdentifier(value.turnId)
     || typeof value.content !== 'string'
     || value.reasoningContent !== undefined && typeof value.reasoningContent !== 'string'
+    || value.activity !== undefined && !isProviderActivity(value.activity)
   ) return false;
   if (value.orderedBlocks === undefined) return true;
   const orderedBlocks = value.orderedBlocks;
@@ -660,6 +663,14 @@ function isAssistantDraft(value: unknown): boolean {
   return orderedBlocks.every((block, index) => (
     index === 0 || block.outputIndex > orderedBlocks[index - 1].outputIndex
   ));
+}
+
+function isProviderActivity(value: unknown): boolean {
+  return isExactRecord(value, ['purpose', 'phase', 'startedAt'], ['lastContentAt'])
+    && ['agent', 'contextCompaction'].includes(String(value.purpose))
+    && ['waitingResponse', 'reasoning', 'awaitingOutput', 'generatingOutput'].includes(String(value.phase))
+    && isNonEmptyText(value.startedAt) && Number.isFinite(Date.parse(value.startedAt))
+    && (value.lastContentAt === undefined || isNonEmptyText(value.lastContentAt) && Number.isFinite(Date.parse(value.lastContentAt)));
 }
 
 function isAssistantDraftBlock(value: unknown): value is Record<string, unknown> & {
@@ -808,10 +819,10 @@ function isPlanOperation(value: unknown): boolean {
   if (value.operation === 'bash') {
     return isExactRecord(
       value,
-      ['workspaceId', 'operation', 'command', 'workspaceMode', 'executionScope'],
-      ['terminal'],
+      ['workspaceId', 'operation', 'workspaceMode', 'executionScope'],
+      ['command', 'terminal'],
     )
-      && isNonEmptyText(value.command)
+      && (value.command === undefined || isNonEmptyText(value.command))
       && value.workspaceMode === 'write'
       && (value.executionScope === 'workspace' || value.executionScope === 'host')
       && (value.terminal === undefined || (
@@ -1116,10 +1127,9 @@ function isTokenUsageFields(value: Record<string, unknown>): boolean {
     && value.cacheReadInputTokens + value.cacheMissInputTokens <= value.inputTokens)) {
     return false;
   }
-  const cachePopulation = value.cacheReadInputTokens + value.cacheMissInputTokens;
-  const expectedRatio = cachePopulation === 0
-    ? null
-    : value.cacheReadInputTokens / cachePopulation;
+  const expectedRatio = value.reportedCallCount > 0 && value.inputTokens > 0
+    ? value.cacheReadInputTokens / value.inputTokens
+    : null;
   return value.cacheAvailable === (value.reportedCallCount > 0)
     && value.cacheComplete === (
       value.providerCallCount > 0
@@ -1140,10 +1150,12 @@ function isRun(value: unknown): boolean {
   return isExactRecord(
     value,
     ['runId', 'profileId', 'workspaceBindings', 'status'],
-    ['waitingReason'],
+    ['waitingReason', 'reasoningEffort', 'thinking'],
   )
     && isIdentifier(value.runId)
     && isIdentifier(value.profileId)
+    && (value.reasoningEffort === undefined || isReasoningEffort(value.reasoningEffort))
+    && (value.thinking === undefined || ['enabled', 'disabled'].includes(String(value.thinking)))
     && isWorkspaceBindings(value.workspaceBindings)
     && RUN_PROJECTION_STATUSES.includes(
       value.status as typeof RUN_PROJECTION_STATUSES[number],
@@ -1152,16 +1164,25 @@ function isRun(value: unknown): boolean {
       || ['approval', 'userInput', 'plan'].includes(String(value.waitingReason)));
 }
 
+function isReasoningEffort(value: unknown): boolean {
+  return typeof value === 'string' && ['low', 'medium', 'high', 'max'].includes(value);
+}
+
+function isModelSettings(value: unknown): boolean {
+  return isExactRecord(value, ['profileId', 'reasoningEffortOverride']) && isIdentifier(value.profileId)
+    && (value.reasoningEffortOverride === null || isReasoningEffort(value.reasoningEffortOverride));
+}
+
 function isActivity(value: unknown): boolean {
   return isExactRecord(
     value,
     ['activityId', 'kind', 'status', 'label', 'runId', 'sequence'],
-    ['callId', 'tool', 'providerHosted'],
+    ['callId', 'tool', 'providerHosted', 'inputRejection'],
   )
     && isIdentifier(value.activityId)
     && ['run', 'tool', 'providerHosted', 'approval', 'plan', 'interaction']
       .includes(String(value.kind))
-    && ['active', 'requested', 'waiting', 'completed', 'denied', 'failed', 'cancelled', 'indeterminate']
+    && ['active', 'requested', 'waiting', 'completed', 'denied', 'rejected', 'failed', 'cancelled', 'indeterminate']
       .includes(String(value.status))
     && isNonEmptyText(value.label)
     && isIdentifier(value.runId)
@@ -1169,8 +1190,19 @@ function isActivity(value: unknown): boolean {
     && isNaturalNumber(value.sequence)
     && (value.tool === undefined || isToolActivity(value.tool, String(value.status)))
     && (value.providerHosted === undefined || isProviderHostedActivity(value.providerHosted))
-    && (value.kind === 'tool') === (value.tool !== undefined)
+    && (value.kind === 'tool'
+      ? value.status === 'rejected' ? value.tool === undefined && isInputRejection(value.inputRejection) : value.status === 'requested' || value.tool !== undefined
+      : value.tool === undefined)
+    && (value.status === 'rejected' && value.kind === 'tool') === (value.inputRejection !== undefined)
     && (value.kind === 'providerHosted') === (value.providerHosted !== undefined);
+}
+
+function isInputRejection(value: unknown): boolean {
+  return isExactRecord(value, ['code', 'message', 'issues'])
+    && isNonEmptyText(value.code) && isNonEmptyText(value.message)
+    && Array.isArray(value.issues) && value.issues.length > 0
+    && value.issues.every((issue) => isExactRecord(issue, ['path', 'rule', 'message'], ['expected'])
+      && isNonEmptyText(issue.path) && isNonEmptyText(issue.rule) && isNonEmptyText(issue.message));
 }
 
 function isProviderHostedActivity(value: unknown): boolean {

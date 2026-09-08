@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createServer } from 'node:http';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { createInterface } from 'node:readline';
+import { fileURLToPath } from 'node:url';
 
 import {
   decodeToolPromptProviderSnapshots,
@@ -13,12 +18,35 @@ import {
   sessionControlToolDefinitions,
 } from '../dist/index.js';
 import { messagesFromJournal } from '../dist/local-agent/contextComposer.js';
+import { responseFrames } from '../dist/responseFrames.js';
 import { createProviderToolAliases } from '../dist/local-agent/providerToolCodec.js';
+import {
+  decodeGuiProjection,
+  inputCacheMetric,
+  lastCallInputCacheMetric,
+  loadGuiModelStore,
+} from './gui-projection-contract.mjs';
 
 const workspaceBinding = {
   workspaceId: 'workspace:test',
   displayName: 'Fixture workspace',
 };
+
+test('transport: oversized Unicode replies preserve content within bounded frames', () => {
+  const value = { protocolVersion: 'deepcode.local-agent.v1', requestId: 'large', ok: true,
+    data: { text: '中文🙂\n\"\\'.repeat(180_000) } };
+  const frames = [...responseFrames(value)];
+  assert.ok(frames.length > 1);
+  const chunks = frames.map((frame, index) => {
+    assert.ok(Buffer.byteLength(frame) <= 1024 * 1024);
+    const chunk = JSON.parse(frame);
+    assert.equal(chunk.index, index);
+    assert.equal(chunk.final, index === frames.length - 1);
+    return chunk.text;
+  });
+  assert.deepEqual(JSON.parse(chunks.join('')), value);
+  assert.deepEqual([...responseFrames({ ok: true })], ['{"ok":true}']);
+});
 
 test('A: message uses one prepared runtime through composition, completion, cache projection, settlement, and release', async () => {
   const journal = new InMemoryCommandJournal();
@@ -130,7 +158,141 @@ test('A: message uses one prepared runtime through composition, completion, cach
   await actor.dispose();
 });
 
-test('A0: raw Provider reasoning stays out of the user presentation while the turn is running', async () => {
+test('A-cache: last-call, per-run, and Session cache rates use their own input token totals', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:cache-scopes';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation();
+  const usages = [
+    { inputTokens: 100, outputTokens: 20, cacheReadInputTokens: 75, cacheMissInputTokens: 25 },
+    { inputTokens: 300, outputTokens: 90, cacheReadInputTokens: 25, cacheMissInputTokens: 275 },
+  ];
+  let callIndex = 0;
+  const provider = {
+    async *stream(request) {
+      const usage = usages[callIndex++];
+      yield providerEvent(request.requestId, 'assistant.message', {
+        messageId: `provider-message:cache-${callIndex}`,
+        content: `Answer ${callIndex}.`,
+      });
+      yield providerEvent(request.requestId, 'completed', {
+        usage: { ...usage, contextWindowTokens: 4_096 },
+      });
+    },
+  };
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'cache-scopes');
+  t.after(() => actor.dispose());
+  let projection;
+  for (let index = 0; index < usages.length; index += 1) {
+    await actor.submit(messageCommand(sessionId, `command:cache-${index}`, `Question ${index}.`));
+    projection = await waitForProjection(actor, (value) => (
+      value.run?.status === 'completed' && value.tokenUsage.providerCallCount === index + 1
+    ));
+  }
+  assert.deepEqual(await decodeGuiProjection(projection), projection);
+  const sessionCache = inputCacheMetric(projection.tokenUsage);
+  const lastCallCache = lastCallInputCacheMetric(projection.contextUsage);
+  assert.equal(sessionCache.inputTokens, 400);
+  assert.equal(sessionCache.hitTokens, 100);
+  assert.equal(sessionCache.hitPercent, 25);
+  assert.equal(lastCallCache.inputTokens, 300);
+  assert.equal(lastCallCache.hitTokens, 25);
+  assert.equal(lastCallCache.hitPercent, 25 / 300 * 100);
+  assert.deepEqual(projection.tokenUsageHistory.map((round) => ({
+    input: round.inputTokens,
+    hit: round.cacheReadInputTokens,
+    miss: round.cacheMissInputTokens,
+    ratio: round.cacheHitRatio,
+  })), [
+    { input: 300, hit: 25, miss: 275, ratio: 25 / 300 },
+    { input: 100, hit: 75, miss: 25, ratio: 75 / 100 },
+  ]);
+  const lastReceipt = projection.contextCompositions.find((receipt) => (
+    receipt.providerRequestId === projection.contextUsage.providerRequestId
+  ));
+  assert.ok(lastReceipt);
+  assert.equal(lastReceipt.partitions.reduce((sum, part) => sum + part.estimatedInputTokens, 0), 300);
+  assert.equal(lastCallInputCacheMetric(null), null);
+  assert.equal(lastCallInputCacheMetric({
+    inputTokens: 0, outputTokens: 0, contextWindowTokens: 4_096,
+    cacheReadInputTokens: 0, cacheMissInputTokens: 0,
+  }), null);
+});
+
+test('A-cache-latest: compaction owns last-call usage and an unreported next call clears it without losing Session totals', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:cache-latest';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation();
+  let releaseLastCall;
+  const lastCallHeld = new Promise((resolve) => { releaseLastCall = resolve; });
+  let callCount = 0;
+  const requests = [];
+  const provider = {
+    async *stream(request) {
+      requests.push(structuredClone(request));
+      const index = ++callCount;
+      if (index === 3) await lastCallHeld;
+      yield providerEvent(request.requestId, 'assistant.message', {
+        messageId: `provider-message:cache-latest-${index}`,
+        content: request.purpose === 'contextCompaction' ? 'Keep the established facts.' : `Answer ${index}.`,
+      });
+      yield providerEvent(request.requestId, 'completed', index === 3 ? {} : {
+        usage: {
+          inputTokens: index === 1 ? 100 : 200,
+          outputTokens: 10,
+          cacheReadInputTokens: index === 1 ? 75 : 20,
+          cacheMissInputTokens: index === 1 ? 25 : 180,
+          contextWindowTokens: 4_096,
+        },
+      });
+    },
+  };
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'cache-latest');
+  t.after(async () => { releaseLastCall(); await actor.dispose(); });
+  await actor.submit(messageCommand(sessionId, 'command:cache-latest-seed', 'Establish the facts.'));
+  await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  await actor.submit({
+    schemaVersion: 'deepcode.command.v3',
+    type: 'context.focus',
+    commandId: 'command:cache-latest-focus',
+    sessionId,
+    task: 'Preserve the established facts.',
+  });
+  const waiting = await waitForProjection(actor, (value) => (
+    value.run?.status === 'running' && callCount === 3
+  ));
+  assert.deepEqual(requests.map((request) => request.purpose), ['agent', 'contextCompaction', 'agent']);
+  assert.equal(waiting.contextUsage.providerRequestId, requests[1].requestId);
+  assert.equal(lastCallInputCacheMetric(waiting.contextUsage).hitPercent, 10);
+  const compactedReceipt = waiting.contextCompositions.find((receipt) => (
+    receipt.providerRequestId === waiting.contextUsage.providerRequestId
+  ));
+  assert.equal(compactedReceipt.purpose, 'contextCompaction');
+  assert.equal(compactedReceipt.partitions.reduce((sum, part) => sum + part.estimatedInputTokens, 0), 200);
+  assert.deepEqual(await decodeGuiProjection(waiting), waiting);
+  releaseLastCall();
+  const completed = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.equal(completed.contextUsage, null);
+  assert.equal(lastCallInputCacheMetric(completed.contextUsage), null);
+  assert.equal(completed.contextCompositions.at(-1).providerRequestId, requests[2].requestId);
+  assert.equal(completed.contextCompositions.length, 1);
+  const historical = await actor.contextComposition(requests[0].requestId);
+  assert.equal(historical.providerRequestId, requests[0].requestId);
+  historical.messages.length = 0;
+  assert.ok((await actor.contextComposition(requests[0].requestId)).messages.length > 0);
+  await assert.rejects(actor.contextComposition('provider-request:missing'), /context_composition_not_found/u);
+  assert.equal(completed.tokenUsage.inputTokens, 300);
+  assert.equal(completed.tokenUsage.cacheReadInputTokens, 95);
+  assert.equal(completed.tokenUsage.cacheHitRatio, 95 / 300);
+  assert.equal(completed.tokenUsage.providerCallCount, 3);
+  assert.equal(completed.tokenUsage.reportedCallCount, 2);
+  assert.equal(completed.tokenUsage.cacheComplete, false);
+  assert.equal(inputCacheMetric(completed.tokenUsage).complete, false);
+  assert.deepEqual(await decodeGuiProjection(completed), completed);
+});
+
+test('A0: reasoning-only streaming projects activity without raw reasoning or per-chunk journal events', async () => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:reasoning-draft';
   await createSession(journal, sessionId, [workspaceBinding]);
@@ -170,10 +332,17 @@ test('A0: raw Provider reasoning stays out of the user presentation while the tu
   ));
   await reasoningWasConsumed;
   const running = await waitForProjection(actor, (value) => (
-    value.run?.status === 'running' && value.assistantDraft === null
+    value.run?.status === 'running' && value.assistantDraft?.activity?.phase === 'reasoning'
   ));
   assert.equal(running.run.status, 'running');
-  assert.equal(running.assistantDraft, null);
+  assert.equal(running.assistantDraft.content, '');
+  assert.equal(running.assistantDraft.reasoningContent, undefined);
+  assert.equal(running.assistantDraft.orderedBlocks, undefined);
+  assert.equal(running.assistantDraft.activity.purpose, 'agent');
+  assert.ok(Date.parse(running.assistantDraft.activity.lastContentAt) >= Date.parse(running.assistantDraft.activity.startedAt));
+  assert.deepEqual(await decodeGuiProjection(running), running);
+  assert.ok(!JSON.stringify(running).includes('Inspecting the current workspace state.'));
+  assert.equal((await readEvents(journal, sessionId)).some((event) => event.type.includes('reasoning')), false);
 
   continueStream();
   const completed = await waitForProjection(actor, (value) => value.run?.status === 'completed');
@@ -1132,7 +1301,7 @@ test('A5: Session renders one run-scoped tool guidance message with Provider ali
   await actor.dispose();
 });
 
-test('B: snapshot-scoped wire tool resolves to exact Kernel bindings, durable ToolRecord, and continuation', async () => {
+test('B: snapshot-scoped wire tool resolves to exact Kernel bindings, durable ToolRecord, and continuation', async (t) => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:tool-chain';
   await createSession(journal, sessionId, [workspaceBinding]);
@@ -1155,9 +1324,12 @@ test('B: snapshot-scoped wire tool resolves to exact Kernel bindings, durable To
   };
   const preparation = fakeRunPreparation({ tools: [preparedTool] });
   const kernelRequests = [];
+  let releaseTool;
+  const toolGate = new Promise((resolve) => { releaseTool = resolve; });
   const kernel = emptyKernel({
     async execute(request) {
       kernelRequests.push(structuredClone(request));
+      await toolGate;
       return completedExecutionReply(request, { content: 'fixture file contents' });
     },
   });
@@ -1235,8 +1407,19 @@ test('B: snapshot-scoped wire tool resolves to exact Kernel bindings, durable To
     preparation.port,
     'tool-chain',
   );
+  t.after(async () => { releaseTool(); await actor.dispose(); });
 
   await actor.submit(messageCommand(sessionId, 'command:tool', 'Use the available fixture tool.'));
+  await waitUntil(() => kernelRequests.length === 1, 'pending tool execution');
+  try {
+    const pending = await actor.snapshot();
+    const activity = pending.activities.find((item) => item.kind === 'tool');
+    assert.equal(activity.status, 'requested');
+    assert.equal(activity.tool, undefined, 'requested tools have no execution record yet');
+    assert.deepEqual(await decodeGuiProjection(pending), pending);
+  } finally {
+    releaseTool();
+  }
   const projection = await waitForProjection(
     actor,
     (value) => value.run?.status === 'completed',
@@ -1254,8 +1437,14 @@ test('B: snapshot-scoped wire tool resolves to exact Kernel bindings, durable To
     cacheMissInputTokens: 60,
     cacheAvailable: true,
     cacheComplete: false,
-    cacheHitRatio: 0.4,
+    cacheHitRatio: 40 / 150,
   });
+  assert.deepEqual(await decodeGuiProjection(projection), projection);
+  assert.equal(inputCacheMetric(projection.tokenUsage).inputTokens, 150);
+  assert.equal(lastCallInputCacheMetric(projection.contextUsage), null);
+  const missingToolRecord = structuredClone(projection);
+  delete missingToolRecord.activities.find((item) => item.kind === 'tool').tool;
+  await assert.rejects(decodeGuiProjection(missingToolRecord), /conversation_projection_invalid/u);
   assert.deepEqual(projection.timeline.map((item) => item.kind), [
     'message',
     'narrative',
@@ -1314,8 +1503,6 @@ test('B: snapshot-scoped wire tool resolves to exact Kernel bindings, durable To
     runId: projection.run.runId,
     kernelCatalogSnapshotRef: runtime.kernelCatalogSnapshotRef,
   }]);
-
-  await actor.dispose();
 });
 
 test('B1: read-only bash result projects its real write scope and continues the Loop', async () => {
@@ -1775,9 +1962,8 @@ test('E: one Plan confirmation resumes the same run into Todo-backed execution',
           preConfirmationRequest.messages,
           'Plan confirmation must preserve the preceding Provider message prefix',
         );
-        const executionDirective = request.messages.at(-1);
-        assert.equal(executionDirective?.role, 'user');
-        assert.match(executionDirective?.content ?? '', /^The Plan is confirmed\. Execute it now;/u);
+        const executionDirective = request.messages.map(jsonMessagePayload).find((value) => value?.nextAction);
+        assert.match(executionDirective?.nextAction ?? '', /^The Plan is confirmed\. Execute it now\./u);
         assert.equal(
           request.messages.slice(0, preConfirmationRequest.messages.length)
             .some((message) => message.content.startsWith('The Plan is confirmed.')),
@@ -1813,14 +1999,21 @@ test('E: one Plan confirmation resumes the same run into Todo-backed execution',
         return;
       }
 
-      assert.equal(providerRequests.length, 3);
+      if (providerRequests.length === 3) {
+        yield* planProgressEvents(request, 'completed', true);
+        return;
+      }
+      assert.equal(providerRequests.length, 4);
       assert.equal(request.responseConstraint, 'normal');
       const todoStates = request.messages
         .map(jsonMessagePayload)
         .filter((payload) => payload?.type?.startsWith('todo.'));
-      assert.equal(todoStates.length, 1);
-      assert.equal(todoStates[0].type, 'todo.current');
-      assert.equal(todoStates[0].items[0].status, 'completed');
+      assert.equal(todoStates.length, 2);
+      assert.equal(todoStates[0].items[0].status, 'pending');
+      assert.equal(todoStates.at(-1).items[0].status, 'completed');
+      for (let index = 1; index < providerRequests.length; index += 1) {
+        assert.deepEqual(providerRequests[index].messages.slice(0, providerRequests[index - 1].messages.length), providerRequests[index - 1].messages);
+      }
       yield providerEvent(request.requestId, 'assistant.message', {
         messageId: 'provider-message:plan-complete',
         content: 'Confirmed plan executed.',
@@ -1876,7 +2069,7 @@ test('E: one Plan confirmation resumes the same run into Todo-backed execution',
 
   const completed = await waitForProjection(actor, (value) => value.run?.status === 'completed');
   await waitUntil(() => preparation.released.length === 1, 'confirmed Plan runtime release');
-  assert.equal(providerRequests.length, 3);
+  assert.equal(providerRequests.length, 4);
   assert.equal(kernelRequests.length, 1);
   assert.equal(completed.plans[0].status, 'completed');
   assert.equal(completed.todoList.items[0].status, 'completed');
@@ -2076,7 +2269,11 @@ test('E1: confirmed Host Bash uses composite authority and only a successful ret
         const todo = request.messages
           .map(jsonMessagePayload)
           .find((payload) => payload?.type === 'todo.current');
-        assert.equal(todo?.items[0].status, 'inProgress');
+        assert.equal(todo?.items[0].status, 'pending');
+        yield* planProgressEvents(request, 'inProgress');
+        return;
+      }
+      if (providerRequests.length === 4) {
         yield providerEvent(request.requestId, 'tool.call', {
           callId: 'provider-call:bash-retry',
           name: bashDefinition.name,
@@ -2092,11 +2289,15 @@ test('E1: confirmed Host Bash uses composite authority and only a successful ret
         return;
       }
 
-      assert.equal(providerRequests.length, 4);
+      if (providerRequests.length === 5) {
+        yield* planProgressEvents(request);
+        return;
+      }
+      assert.equal(providerRequests.length, 6);
       assert.equal(request.responseConstraint, 'normal');
       const todo = request.messages
         .map(jsonMessagePayload)
-        .find((payload) => payload?.type === 'todo.current');
+        .findLast((payload) => payload?.type === 'todo.current');
       assert.equal(todo?.items[0].status, 'completed');
       yield providerEvent(request.requestId, 'assistant.message', {
         messageId: 'provider-message:bash-plan-complete',
@@ -2237,10 +2438,14 @@ test('E2: confirmed fs.delete reads targetKind from canonical arguments and comp
         yield providerEvent(request.requestId, 'completed', {});
         return;
       }
-      assert.equal(providerRequests.length, 3);
+      if (providerRequests.length === 3) {
+        yield* planProgressEvents(request);
+        return;
+      }
+      assert.equal(providerRequests.length, 4);
       const todo = request.messages
         .map(jsonMessagePayload)
-        .find((payload) => payload?.type === 'todo.current');
+        .findLast((payload) => payload?.type === 'todo.current');
       assert.equal(todo?.items[0].status, 'completed');
       yield providerEvent(request.requestId, 'assistant.message', {
         messageId: 'provider-message:delete-plan-complete',
@@ -2419,8 +2624,8 @@ test('G: built-in runtime and control prompts stay concise and policy-scoped', (
   ))?.text ?? '';
   assert.ok(planInstruction.includes('publish_plan_wire'));
   assert.ok(planInstruction.includes('ask_user_wire'));
-  assert.ok(planInstruction.includes('After confirmation, execute the Plan directly'));
-  assert.ok(planInstruction.includes('only when the confirmed Plan must change'));
+  assert.ok(planInstruction.includes('Then execute within its file and execution scope'));
+  assert.ok(planInstruction.includes('Routine command or edit details do not require reconfirmation'));
   assert.ok(planInstruction.length < 600);
   const allowInstruction = allowDelegate.find((instruction) => (
     instruction.id === 'deepcode.workspace-autonomy'
@@ -2434,19 +2639,13 @@ test('G: built-in runtime and control prompts stay concise and policy-scoped', (
   assert.ok(pluginInstruction.includes('Fixture'));
   assert.ok(pluginInstruction.includes('structured user input'));
   assert.ok(pluginInstruction.includes('Read the explicitly selected fixture instructions.'));
-  assert.deepEqual(
-    sessionControlToolDefinitions().map(({ name, description }) => ({ name, description })),
-    [
-      {
-        name: 'interaction.request',
-        description: 'Ask the user for missing information or a required decision, then pause the run.',
-      },
-      {
-        name: 'plan.publish',
-        description: 'Publish a complete new or revised execution plan for confirmation. mutationManifest must list every intended workspace mutation. A bash mutation must exactly include workspaceMode=write, executionScope, and terminal stdin when PTY input will be used. Confirmation creates the Todo list.',
-      },
-    ],
-  );
+  const controls = sessionControlToolDefinitions();
+  assert.deepEqual(controls.map((tool) => tool.name), ['interaction.request', 'plan.publish', 'plan.progress']);
+  assert.match(controls[1].description, /not an exact script lock/u);
+  assert.match(controls[2].description, /sourceFactRef is its recordId/u);
+  const bashScope = controls[1].inputSchema.properties.mutationManifest.items.oneOf[2];
+  assert.equal(bashScope.required.includes('command'), false);
+  assert.ok(bashScope.required.includes('executionScope'));
 });
 
 test('H: an explicit Provider failure remains failed with its original error', async () => {
@@ -2529,11 +2728,11 @@ test('H1: Provider cache fields are absent together or exactly partition one cal
       `command:invalid-cache-${label}`,
       'Validate the cache usage contract.',
     ));
-    const failed = await waitForProjection(actor, (value) => value.run?.status === 'indeterminate');
+    const failed = await waitForProjection(actor, (value) => value.run?.status === 'failed');
     await waitUntil(() => preparation.released.length === 1, 'invalid cache runtime release');
-    assert.equal(failed.terminalError?.code, 'provider_turn_outcome_unknown');
-    assert.match(failed.terminalError?.message ?? '', /provider_usage_invalid/u);
+    assert.equal(failed.terminalError?.code, 'provider_usage_invalid');
     const events = await readEvents(journal, sessionId);
+    assert.equal(singleEvent(events, 'provider.turn.settled').payload.outcome, 'failed');
     assert.equal(events.some((event) => event.type === 'context.updated'), false);
     await actor.dispose();
   }
@@ -2644,14 +2843,14 @@ test('I0: current Todo state precedes later inserted user input without splittin
     item.contributionId === 'interaction-result:interaction:one'
   ));
   const todoIndex = contributions.findIndex((item) => (
-    item.contributionId === 'todo-current:plan:todo-user-boundary:1'
+    item.contributionId === 'todo-state:event:2'
   ));
   const userIndex = contributions.findIndex((item) => (
     item.contributionId === 'message:message:interaction-response'
   ));
   assert.ok(resultIndex >= 0);
-  assert.ok(todoIndex > resultIndex, 'Todo current state must follow the completed tool result');
-  assert.ok(userIndex > todoIndex, 'the later tagged user input must remain the final boundary');
+  assert.ok(todoIndex >= 0 && todoIndex < resultIndex, 'Todo stays at its original event boundary');
+  assert.ok(userIndex > resultIndex, 'the later tagged user input must follow its tool result');
   assert.equal(contributions.at(-1)?.message.role, 'user');
 });
 
@@ -3131,6 +3330,479 @@ async function verifyExecutingToolDisposeCleanup() {
   assert.equal(events.some((event) => event.type === 'run.settled'), false);
 }
 
+test('J: input rejection is fed back once, valid batch peers execute once, and a corrected call succeeds', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:input-rejection';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation({ tools: [{
+    toolBindingRef: 'tool-binding:read:g1', name: 'fs.read', description: 'Read source text.',
+    inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' }, maxLines: { type: 'integer', minimum: 1 } }, additionalProperties: false },
+    possibleEffects: ['workspaceRead'], availability: 'callable', origin: 'coreBuiltin',
+  }] });
+  const executed = [];
+  const kernel = emptyKernel({ async execute(request) {
+    executed.push(structuredClone(request));
+    if (request.input.maxLines === 0) {
+      const { recordId, preparedEffect, authority, startedAt, completedAt, outcome, output, ...identity } = completedExecutionReply(request, {}).record;
+      return {
+        schemaVersion: 'deepcode.kernel-reply', type: 'tool.execution', requestId: request.requestId,
+        callId: request.callId, status: 'inputRejected', rejection: { ...identity,
+          rejectedAt: '2026-09-07T00:00:00Z',
+          error: { code: 'tool_input_invalid', message: 'maxLines must be positive', issues: [{ path: '$.maxLines', rule: 'minimum', message: 'Use at least one line.', expected: 1 }] },
+        },
+      };
+    }
+    return completedExecutionReply(request, { content: `${request.input.path} content` });
+  } });
+  let turns = 0;
+  const provider = { async *stream(request) {
+    turns += 1;
+    const wire = request.tools.find((tool) => tool.inputSchema.properties?.path)?.name;
+    if (turns === 1) {
+      for (const [callId, path, maxLines] of [['bad', 'README.md', 0], ['peer', 'overview.md', 10]]) {
+        yield providerEvent(request.requestId, 'tool.call', { callId: `provider-call:${callId}`, name: wire, input: { workspace: 'primary', path, maxLines } });
+      }
+    } else if (turns === 2) {
+      const results = request.messages.filter((message) => message.role === 'tool');
+      const rejection = results.filter((message) => jsonMessagePayload(message)?.status === 'inputRejected');
+      assert.equal(rejection.length, 1);
+      assert.equal(rejection[0].providerCallId, 'provider-call:bad');
+      assert.equal(jsonMessagePayload(rejection[0]).executed, false);
+      assert.equal(jsonMessagePayload(rejection[0]).error.issues[0].path, '$.maxLines');
+      assert.ok(results.some((message) => message.providerCallId === 'provider-call:peer'));
+      yield providerEvent(request.requestId, 'tool.call', { callId: 'provider-call:corrected', name: wire, input: { workspace: 'primary', path: 'README.md', maxLines: 10 } });
+    } else {
+      assert.equal(turns, 3);
+      yield providerEvent(request.requestId, 'assistant.message', { content: 'Read completed after correcting the input.' });
+    }
+    yield providerEvent(request.requestId, 'completed', {});
+  } };
+  const actor = actorWith(journal, sessionId, provider, kernel, preparation.port, 'input-rejection');
+  await actor.submit(messageCommand(sessionId, 'command:rejection', 'Read the files.'));
+  const projection = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.deepEqual(executed.map((request) => [request.input.path, request.input.maxLines]), [['README.md', 0], ['overview.md', 10], ['README.md', 10]]);
+  const events = await readEvents(journal, sessionId);
+  const rejected = singleEvent(events, 'tool.input-rejected');
+  assert.equal(events.filter((event) => event.type === 'tool.completed').length, 2);
+  assert.equal(events.some((event) => event.type === 'tool.completed' && event.callId === rejected.callId), false);
+  assert.equal(events.some((event) => event.type === 'todo.progressed'), false);
+  assert.equal(projection.activities.find((activity) => activity.callId === rejected.callId).status, 'rejected');
+  assert.deepEqual(await decodeGuiProjection(projection), projection);
+  assert.deepEqual(loopSnapshot(sessionId, events).state.modelSettings, projection.modelSettings);
+  await actor.dispose();
+});
+
+test('J-native: completed malformed arguments are durable unexecuted results; valid peers and correction execute once', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:native-input-rejection';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation({ apiSurface: 'responses', contextWindowTokens: 100_000, tools: [{
+    toolBindingRef: 'binding:read', name: 'fs.read', description: 'Read text.',
+    inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } },
+    possibleEffects: ['workspaceRead'], availability: 'callable', origin: 'coreBuiltin',
+  }] });
+  const executed = [];
+  const kernel = emptyKernel({ async execute(request) {
+    executed.push(structuredClone(request));
+    return completedExecutionReply(request, { content: request.input.path });
+  } });
+  const badArguments = '{"workspace":"primary","path":"unterminated';
+  let turns = 0;
+  const provider = { async *stream(request) {
+    turns += 1;
+    const name = request.tools.find((tool) => tool.inputSchema.properties?.path).name;
+    if (turns === 1) {
+      for (const [outputIndex, callId, args] of [
+        [0, 'bad-json', badArguments],
+        [1, 'bad-shape', '[]'],
+        [2, 'peer', JSON.stringify({ workspace: 'primary', path: 'overview.md' })],
+      ]) {
+        yield providerEvent(request.requestId, 'output.item.completed', {
+          outputIndex, item: { type: 'function_call', call_id: callId, name, arguments: args, status: 'completed' },
+        });
+      }
+      // Rendering this message must not reparse the preceding rejected arguments.
+      yield providerEvent(request.requestId, 'output.item.completed', {
+        outputIndex: 3, item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Reading files.' }] },
+      });
+    } else if (turns === 2) {
+      const replay = request.messages.find((message) => message.providerOutputBlocks).providerOutputBlocks;
+      assert.deepEqual(replay.map((block) => block.kind), ['toolCallRejected', 'toolCallRejected', 'toolCall', 'narrative']);
+      assert.equal(replay[0].item.arguments, badArguments);
+      assert.equal(replay[1].item.arguments, '[]');
+      const results = request.messages.filter((message) => message.role === 'tool');
+      assert.equal(results.length, 3);
+      for (const rejected of replay.slice(0, 2)) {
+        const result = results.find((message) => message.providerCallId === rejected.providerCallId);
+        assert.equal(result.toolCallId, rejected.callId);
+        assert.equal(jsonMessagePayload(result).executed, false);
+        assert.equal(jsonMessagePayload(result).error.code, 'provider_tool_call_arguments_invalid');
+      }
+      yield providerEvent(request.requestId, 'output.item.completed', {
+        outputIndex: 0, item: { type: 'function_call', call_id: 'corrected', name, arguments: JSON.stringify({ workspace: 'primary', path: 'README.md' }), status: 'completed' },
+      });
+    } else {
+      assert.equal(turns, 3);
+      yield providerEvent(request.requestId, 'output.item.completed', {
+        outputIndex: 0, item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Corrected and read.' }] },
+      });
+    }
+    yield providerEvent(request.requestId, 'completed', { usage: { inputTokens: 100, outputTokens: 20, contextWindowTokens: 100_000, cacheReadInputTokens: 70, cacheMissInputTokens: 30 } });
+  } };
+  const actor = actorWith(journal, sessionId, provider, kernel, preparation.port, 'native-correction');
+  await actor.submit(messageCommand(sessionId, 'command:native-correction', 'Read the files.'));
+  const projection = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  const events = await readEvents(journal, sessionId);
+  assert.deepEqual(executed.map((request) => request.input.path), ['overview.md', 'README.md']);
+  assert.equal(events.filter((event) => event.type === 'tool.requested').length, 2);
+  assert.equal(events.filter((event) => event.type === 'tool.completed').length, 2);
+  assert.equal(events.some((event) => event.type === 'tool.input-rejected'), false, 'Session rejection must not masquerade as a Kernel fact');
+  assert.equal(projection.activities.filter((activity) => activity.status === 'rejected').length, 2);
+  assert.equal(projection.tokenUsage.reportedCallCount, 3);
+  assert.equal(projection.tokenUsage.cacheHitRatio, 0.7);
+  assert.equal(JSON.stringify(projection).includes(badArguments), false);
+  assert.deepEqual(await decodeGuiProjection(projection), projection);
+  await actor.dispose();
+  const reopened = actorWith(journal, sessionId, provider, kernel, preparation.port, 'native-reopened');
+  assert.deepEqual(await reopened.snapshot(), projection);
+  assert.equal(turns, 3);
+  await reopened.dispose();
+});
+
+test('J-budget: control input can be corrected into a confirmed Plan; a second rejection fails after actor reopen', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:correction-budget';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation({ apiSurface: 'responses', contextWindowTokens: 100_000 });
+  let turns = 0;
+  const provider = { async *stream(request) {
+    turns += 1;
+    assert.ok(turns <= 3, 'a second rejected turn must not trigger another correction');
+    const name = request.tools.find((tool) => tool.inputSchema.properties?.mutationManifest).name;
+    if (turns === 2) {
+      const result = request.messages.find((message) => message.role === 'tool' && jsonMessagePayload(message)?.accepted === false);
+      assert.ok(result);
+      assert.equal(jsonMessagePayload(result).executed, false);
+    }
+    yield providerEvent(request.requestId, 'output.item.completed', {
+      outputIndex: 0,
+      item: { type: 'function_call', call_id: `native-plan-${turns}`, name, status: 'completed', arguments: turns === 1 ? '{}'
+        : turns === 2 ? JSON.stringify({ title: 'Verify', summary: 'Verify remaining work.', steps: [{ stepId: 'verify', title: 'Verify', details: 'Run the project check.' }], mutationManifest: [] }) : '{' },
+    });
+    yield providerEvent(request.requestId, 'completed', {});
+  } };
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'budget');
+  await actor.submit(messageCommand(sessionId, 'command:budget', 'Plan the verification.'));
+  const waiting = await waitForProjection(actor, (value) => value.run?.status === 'waiting' && value.pendingPlan !== null);
+  const before = await readEvents(journal, sessionId);
+  assert.equal(before.filter((event) => event.type === 'session.control.rejected').length, 1);
+  assert.equal(before.filter((event) => event.type === 'plan.published').length, 1);
+  assert.equal(before.some((event) => event.type === 'interaction.requested'), false);
+  assert.deepEqual(await decodeGuiProjection(waiting), waiting);
+  await actor.dispose();
+  const reopened = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'budget-reopened');
+  assert.equal(turns, 2);
+  await reopened.submit({ schemaVersion: 'deepcode.command.v3', type: 'plan.respond', commandId: 'command:budget-confirm', sessionId,
+    runId: waiting.run.runId, planId: waiting.pendingPlan.planId, revision: waiting.pendingPlan.revision, response: { kind: 'confirm' } });
+  const failed = await waitForProjection(reopened, (value) => value.run?.status === 'failed');
+  assert.equal(failed.terminalError.code, 'tool_input_correction_exhausted');
+  assert.match(failed.terminalError.message, /provider_tool_call_arguments_invalid/);
+  assert.equal(turns, 3);
+  const events = await readEvents(journal, sessionId);
+  assert.equal(events.filter((event) => event.type === 'plan.confirmed').length, 1);
+  assert.equal(events.some((event) => event.type === 'tool.requested'), false);
+  assert.ok(events.filter((event) => event.type === 'provider.turn.settled').every((event) => event.payload.outcome === 'completed'));
+  assert.deepEqual(await decodeGuiProjection(failed), failed);
+  await reopened.dispose();
+});
+
+test('J-terminal: missing completion stays indeterminate; a completed unknown alias fails without correction or execution', async () => {
+  for (const completed of [false, true]) {
+    const journal = new InMemoryCommandJournal();
+    const sessionId = `session:native-terminal-${completed}`;
+    await createSession(journal, sessionId);
+    const preparation = fakeRunPreparation({ apiSurface: 'responses' });
+    let turns = 0;
+    const actor = actorWith(journal, sessionId, { async *stream(request) {
+      turns += 1;
+      yield providerEvent(request.requestId, 'output.item.completed', { outputIndex: 0,
+        item: { type: 'function_call', call_id: 'native-terminal', name: completed ? 'undeclared_tool' : request.tools[0].name, arguments: '{', status: 'completed' } });
+      if (completed) yield providerEvent(request.requestId, 'completed', {});
+      else throw new Error('fixture_connection_closed');
+    } }, emptyKernel(), preparation.port, `terminal-${completed}`);
+    await actor.submit(messageCommand(sessionId, 'command:terminal', 'Inspect.'));
+    const result = await waitForProjection(actor, (value) => value.run?.status === (completed ? 'failed' : 'indeterminate'));
+    assert.equal(result.terminalError.code, completed ? 'provider_tool_alias_unknown' : 'provider_turn_outcome_unknown');
+    if (!completed) assert.match(result.terminalError.message, /fixture_connection_closed/);
+    assert.equal(turns, 1);
+    const events = await readEvents(journal, sessionId);
+    assert.equal(events.some((event) => event.type === 'tool.requested' || event.type === 'tool.input-rejected'), false);
+    const settlement = singleEvent(events, 'provider.turn.settled');
+    assert.equal(settlement.payload.outcome, completed ? 'failed' : 'indeterminate');
+    assert.equal('orderedOutputBlocks' in settlement.payload, false);
+    await actor.dispose();
+  }
+});
+
+test('J1: Kernel infrastructure errors remain run failures rather than correctable input results', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:kernel-infrastructure';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation({ tools: [{
+    toolBindingRef: 'binding:read', name: 'fs.read', description: 'Read source.',
+    inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } },
+    possibleEffects: ['workspaceRead'], availability: 'callable', origin: 'coreBuiltin',
+  }] });
+  let turns = 0;
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    turns += 1;
+    yield providerEvent(request.requestId, 'tool.call', { callId: 'provider-call:read', name: request.tools.find((tool) => tool.inputSchema.properties?.path).name, input: { workspace: 'primary', path: 'README.md' } });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel({ async execute() { throw new Error('tool_record_store_read_failed: fixture disk error'); } }), preparation.port, 'infrastructure');
+  await actor.submit(messageCommand(sessionId, 'command:infra', 'Read source.'));
+  const projection = await waitForProjection(actor, (value) => value.run?.status === 'failed');
+  assert.equal(turns, 1);
+  assert.match(projection.terminalError.message, /fixture disk error/);
+  assert.equal((await readEvents(journal, sessionId)).some((event) => event.type === 'tool.input-rejected'), false);
+  await actor.dispose();
+});
+
+test('K: Session settings persist independently while the active run keeps its frozen effort', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:model-settings';
+  await createSession(journal, sessionId);
+  const preparation = fakeRunPreparation({ reasoningEffort: 'high' });
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  let turns = 0;
+  const provider = { async *stream(request) {
+    turns += 1;
+    if (turns === 1) await held;
+    yield providerEvent(request.requestId, 'assistant.message', { content: 'Done.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } };
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'settings');
+  const settingsCommand = (id, profileId, reasoningEffortOverride) => ({
+    schemaVersion: 'deepcode.command.v3', type: 'session.model-settings.set', sessionId,
+    commandId: id, settings: { profileId, reasoningEffortOverride },
+  });
+  await actor.submit(settingsCommand('command:settings1', 'profile:one', 'max'));
+  assert.equal(preparation.prepared.length, 0);
+  assert.equal(turns, 0);
+  await actor.submit(messageCommand(sessionId, 'command:start1', 'First task.'));
+  const first = await waitForProjection(actor, (value) => value.assistantDraft?.activity?.phase === 'waitingResponse');
+  await actor.submit(settingsCommand('command:settings2', 'profile:one', 'low'));
+  const edited = await actor.snapshot();
+  assert.equal(edited.run.runId, first.run.runId);
+  assert.equal(edited.run.reasoningEffort, 'max');
+  assert.equal(edited.modelSettings.reasoningEffortOverride, 'low');
+  assert.equal(preparation.prepared.length, 1);
+  assert.equal(turns, 1);
+  assert.deepEqual(await decodeGuiProjection(edited), edited);
+  release();
+  await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  await actor.dispose();
+  const reopened = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'settings-reopened');
+  assert.equal((await reopened.snapshot()).modelSettings.reasoningEffortOverride, 'low');
+  await reopened.submit(messageCommand(sessionId, 'command:start2', 'Second task.'));
+  const second = await waitForProjection(reopened, (value) => value.run?.status === 'completed' && value.run.runId !== first.run.runId);
+  assert.equal(second.run.reasoningEffort, 'low');
+  await reopened.submit(settingsCommand('command:switch', 'profile:two', null));
+  assert.equal((await reopened.snapshot()).modelSettings.reasoningEffortOverride, null);
+  await reopened.submit(messageCommand(sessionId, 'command:start3', 'Third task.'));
+  const third = await waitForProjection(reopened, (value) => value.run?.status === 'completed' && value.run.runId !== second.run.runId);
+  assert.equal(third.run.profileId, 'profile:two');
+  assert.equal(third.run.reasoningEffort, 'high');
+  assert.deepEqual(preparation.prepared.map((request) => request.reasoningEffortOverride), ['max', 'low', undefined]);
+  await reopened.dispose();
+});
+
+test('K1: the real Session bridge persists model commands and passes effort through message and focus preparation', { timeout: 15_000 }, async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const prepared = [];
+  const server = createServer(async (request, response) => {
+    try {
+      const url = new URL(request.url, 'http://fixture');
+      const parts = url.pathname.split('/').map(decodeURIComponent);
+      let body = '';
+      for await (const chunk of request) body += chunk;
+      const input = body ? JSON.parse(body) : null;
+      let data;
+      if (url.pathname === '/api/local-agent/journal/sessions') data = await journal.createSession(input);
+      else if (parts[6] === 'events') {
+        data = [];
+        for await (const event of journal.read(parts[5], Number(url.searchParams.get('after')))) data.push(event);
+      } else if (parts[6] === 'commands') data = await journal.readCommand(parts[5], parts[7]);
+      else if (url.pathname === '/api/local-agent/journal/commands') data = await journal.commitCommand(input.command, input.events, input.reply);
+      else if (url.pathname === '/api/local-agent/runtime/prepare-run') {
+        prepared.push(input);
+        response.writeHead(422, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ ok: false, error: 'fixture_prepare_boundary', message: 'Preparation reached; no Provider is started.' }));
+        return;
+      } else throw new Error(`unexpected_http_path:${url.pathname}`);
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ ok: true, data }));
+    } catch (error) {
+      response.writeHead(500, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ ok: false, error: String(error) }));
+    }
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const child = spawn(process.execPath, [fileURLToPath(new URL('../dist/sessionServiceBridge.js', import.meta.url))], {
+    env: { ...process.env, DEEPCODE_LOCAL_AGENT_API_BASE: `http://127.0.0.1:${server.address().port}`, DEEPCODE_LOCAL_AGENT_TOKEN: 'fixture-token' },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const lines = createInterface({ input: child.stdout });
+  const frames = lines[Symbol.asyncIterator]();
+  t.after(async () => {
+    if (child.exitCode === null) child.kill();
+    lines.close();
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  let next = 0;
+  const send = async (operation, data) => {
+    const requestId = `bridge-request:${++next}`;
+    child.stdin.write(`${JSON.stringify({ protocolVersion: 'deepcode.local-agent', requestId, operation, data })}\n`);
+    const frame = await frames.next();
+    assert.equal(frame.done, false, stderr);
+    const reply = JSON.parse(frame.value);
+    assert.equal(reply.requestId, requestId);
+    return reply;
+  };
+  const sessionId = 'session:bridge-settings';
+  assert.equal((await send('createSession', { sessionId, displayTitle: 'Bridge fixture', workspaceBindings: [] })).ok, true);
+  const command = { schemaVersion: 'deepcode.command.v3', type: 'session.model-settings.set', commandId: 'command:wire-settings', sessionId, settings: { profileId: 'profile:wire', reasoningEffortOverride: 'medium' } };
+  const saved = await send('submit', { command });
+  assert.equal(saved.ok, true, JSON.stringify(saved));
+  const projection = (await send('snapshot', { sessionId })).data;
+  assert.deepEqual(projection.modelSettings, command.settings);
+  assert.equal(projection.run, null);
+  assert.equal(prepared.length, 0);
+  for (const type of ['message.submit', 'context.focus']) {
+    const reply = await send('submit', { command: { schemaVersion: 'deepcode.command.v3', type, commandId: `command:${type}`, sessionId, [type === 'message.submit' ? 'text' : 'task']: 'Inspect source.', reasoningEffortOverride: 'low' } });
+    assert.equal(reply.ok, false);
+    assert.match(JSON.stringify(reply.error), /fixture_prepare_boundary/);
+  }
+  assert.deepEqual(prepared.map((request) => [request.profileId, request.reasoningEffortOverride]), [['profile:wire', 'low'], ['profile:wire', 'low']]);
+  assert.equal((await send('shutdown', {})).ok, true);
+  await once(child, 'exit');
+  assert.equal(child.exitCode, 0, stderr);
+});
+
+test('K2: reopening a run waiting for Plan confirmation restores its original effort rather than newer Session settings', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:plan-effort';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation({ reasoningEffort: 'high' });
+  let turns = 0;
+  const provider = { async *stream(request) {
+    turns += 1;
+    yield providerEvent(request.requestId, 'tool.call', {
+      callId: 'provider-call:effort-plan', name: request.tools.find((tool) => tool.inputSchema.properties?.mutationManifest).name,
+      input: { title: 'Inspect project', summary: 'Read the relevant sources.', steps: [{ stepId: 'inspect', title: 'Inspect', details: 'Read relevant files.' }], mutationManifest: [] },
+    });
+    yield providerEvent(request.requestId, 'completed', {});
+  } };
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'plan-effort');
+  await actor.submit({ ...messageCommand(sessionId, 'command:plan-effort', 'Plan the inspection.', 'profile:one'), reasoningEffortOverride: 'max' });
+  const waiting = await waitForProjection(actor, (value) => value.run?.status === 'waiting');
+  assert.equal(waiting.run.reasoningEffort, 'max');
+  await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'session.model-settings.set', sessionId, commandId: 'command:change-waiting', settings: { profileId: 'profile:one', reasoningEffortOverride: 'low' } });
+  await actor.dispose();
+  const reopened = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'plan-effort-reopened');
+  await reopened.recover();
+  const restored = await reopened.snapshot();
+  assert.equal(restored.run.runId, waiting.run.runId);
+  assert.equal(restored.run.status, 'waiting');
+  assert.equal(restored.run.reasoningEffort, 'max');
+  assert.equal(restored.modelSettings.reasoningEffortOverride, 'low');
+  assert.equal(restored.pendingPlan.planId, waiting.pendingPlan.planId);
+  assert.equal(turns, 1);
+  assert.deepEqual(preparation.prepared.map((request) => request.reasoningEffortOverride), ['max', 'max']);
+  await reopened.dispose();
+});
+
+test('K3: GUI model settings save after acknowledgement, reset effort on model change, and retain the last saved value on failure', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:gui-settings';
+  await createSession(journal, sessionId);
+  const actor = actorWith(journal, sessionId, { async *stream() { throw new Error('settings must not call Provider'); } }, emptyKernel(), fakeRunPreparation().port, 'gui-settings');
+  let commands = 0;
+  let failSave = false;
+  const store = loadGuiModelStore({
+    async submitLocalAgentCommand(command) {
+      commands += 1;
+      if (failSave) throw new Error('fixture_settings_save_failed');
+      return await actor.submit(command);
+    },
+    async getLocalAgentProjection() { return await actor.snapshot(); },
+  });
+  store.setState({ profiles: [
+    { id: 'profile:one', name: 'My fast model', model: 'configured-model', enabled: true, thinking: 'enabled' },
+    { id: 'profile:two', name: 'My other model', model: 'configured-model', enabled: true, thinking: 'enabled' },
+    { id: 'profile:off', name: 'No reasoning', model: 'configured-model', enabled: true, thinking: 'disabled' },
+  ] });
+  await store.getState().selectProfile('profile:one');
+  await store.getState().selectReasoningEffort('max');
+  assert.equal(commands, 0, 'new draft selection stays in memory until a Session exists');
+  assert.equal(store.getState().reasoningEffortOverride, 'max');
+  store.setState({ sessionId, projection: await actor.snapshot() });
+  await store.getState().selectReasoningEffort('low');
+  assert.equal(store.getState().projection.modelSettings.reasoningEffortOverride, 'low');
+  await store.getState().selectProfile('profile:two');
+  assert.equal(store.getState().selectedProfileId, 'profile:two');
+  assert.equal(store.getState().reasoningEffortOverride, null);
+  assert.equal((await actor.snapshot()).modelSettings.profileId, 'profile:two');
+  failSave = true;
+  await store.getState().selectReasoningEffort('high');
+  assert.equal(store.getState().reasoningEffortOverride, null);
+  assert.match(store.getState().error, /fixture_settings_save_failed/);
+  assert.equal(store.getState().modelSettingsBusy, false);
+  failSave = false;
+  await store.getState().selectProfile('profile:off');
+  const before = commands;
+  await store.getState().selectReasoningEffort('medium');
+  assert.equal(commands, before);
+  assert.equal(store.getState().reasoningEffortOverride, null);
+  assert.equal((await actor.snapshot()).run, null);
+  await actor.dispose();
+});
+
+test('K4: starting a draft during initialization preserves navigation and still loads usable model configuration', async () => {
+  let releaseCatalog;
+  const catalogReady = new Promise((resolve) => { releaseCatalog = resolve; });
+  const catalog = { projects: [{ id: 'project:boot', title: 'Project' }], sessions: [] };
+  const pluginCatalog = { revision: 'plugin-catalog:boot', plugins: [] };
+  const profile = { id: 'profile:boot', name: 'My model', model: 'configured-model', enabled: true, thinking: 'enabled' };
+  const store = loadGuiModelStore({
+    async getConversationCatalog() { return await catalogReady; },
+    async getPluginCatalog() { return pluginCatalog; },
+    async getLocalAgentProjection() { throw new Error('new draft must not restore a Session'); },
+  }, {
+    async getLlmProfiles() { return { ok: true, data: { profiles: [profile], defaultProfileId: profile.id } }; },
+  });
+  const initialization = store.getState().initialize();
+  assert.equal(store.getState().loading, true);
+  store.getState().startNewSession('project:boot');
+  releaseCatalog(catalog);
+  await initialization;
+  const state = store.getState();
+  assert.equal(state.draftProjectId, 'project:boot');
+  assert.equal(state.sessionId, null);
+  assert.equal(state.projection, null);
+  assert.equal(state.loading, false);
+  assert.equal(state.error, null);
+  assert.deepEqual(state.catalog, catalog);
+  assert.deepEqual(state.pluginCatalog, pluginCatalog);
+  assert.deepEqual(state.profiles, [profile]);
+  assert.equal(state.defaultProfileId, profile.id);
+  assert.equal(state.selectedProfileId, profile.id);
+});
+
 function actorWith(
   journal,
   sessionId,
@@ -3176,6 +3848,8 @@ function fakeRunPreparation(options = {}) {
           webSearch: options.webSearch,
           tools: options.tools,
           toolPromptContributions: options.toolPromptContributions,
+          reasoningEffort: request.reasoningEffortOverride ?? options.reasoningEffort,
+          reasoningEffortOverride: request.reasoningEffortOverride,
         });
         snapshots.push(structuredClone(snapshot));
         return { runtimeSnapshot: snapshot };
@@ -3200,6 +3874,8 @@ function runtimeSnapshot(runId, options = {}) {
     maxOutputTokens: options.maxOutputTokens ?? 512,
     apiSurface: options.apiSurface ?? 'chatCompletions',
     hostedWebSearch: options.hostedWebSearch ?? 'none',
+    ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+    ...(options.reasoningEffortOverride ? { reasoningEffortOverride: options.reasoningEffortOverride } : {}),
   };
   const webSearch = options.webSearch ?? (
     tools.some((tool) => tool.name === 'web.search' && tool.availability === 'callable')
@@ -3333,6 +4009,21 @@ function cancelNotFound(callId, attemptId) {
     attemptId,
     status: 'notFound',
   };
+}
+
+function* planProgressEvents(request, status = 'completed', native = false) {
+  const tool = request.tools.find((candidate) => candidate.inputSchema?.properties?.sourceFactRef);
+  const payloads = request.messages.map(jsonMessagePayload);
+  const todo = payloads.findLast((payload) => payload?.type === 'todo.current');
+  const record = payloads.findLast((payload) => payload?.recordId);
+  assert.ok(tool && todo && record, 'progress requires the control, current Todo and real tool result');
+  const callId = `provider-call:progress:${request.requestId}`;
+  const input = { sourceFactRef: record.recordId, updates: todo.items.map((item) => ({ todoId: item.todoId, status })) };
+  yield native
+    ? providerEvent(request.requestId, 'output.item.completed', { outputIndex: 0,
+      item: { type: 'function_call', call_id: callId, name: tool.name, arguments: JSON.stringify(input), status: 'completed' } })
+    : providerEvent(request.requestId, 'tool.call', { callId, name: tool.name, input });
+  yield providerEvent(request.requestId, 'completed', {});
 }
 
 function providerEvent(requestId, type, data) {

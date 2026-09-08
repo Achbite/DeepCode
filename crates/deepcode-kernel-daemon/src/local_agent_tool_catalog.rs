@@ -5,7 +5,8 @@ use deepcode_kernel_runtime::executors::{
     KernelToolExecutionResult, KernelToolInvocation, SecretProvider,
 };
 use deepcode_kernel_tools::{
-    hash_bytes, KernelToolRegistry, ToolAvailability, ToolEffectClass, ToolEffectScope,
+    hash_bytes, KernelToolCatalogError, KernelToolRegistry, ToolAvailability, ToolEffectClass,
+    ToolEffectScope, ToolInputIssue,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -16,6 +17,7 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct ToolCatalogError {
     pub(crate) code: &'static str,
     pub(crate) message: String,
+    pub(crate) input_issues: Option<Vec<ToolInputIssue>>,
 }
 
 impl ToolCatalogError {
@@ -23,6 +25,7 @@ impl ToolCatalogError {
         Self {
             code,
             message: message.into(),
+            input_issues: None,
         }
     }
 }
@@ -570,7 +573,19 @@ impl PreparedCatalogBinding {
             ToolExecutorBinding::Builtin { registry, .. } => registry
                 .canonicalize(self.tool_name(), raw_arguments)
                 .map(|invocation| invocation.arguments)
-                .map_err(|error| ToolCatalogError::new("tool_input_invalid", error.to_string())),
+                .map_err(|error| {
+                    let message = error.to_string();
+                    match error {
+                        KernelToolCatalogError::InvalidArguments { issues, .. } => {
+                            ToolCatalogError {
+                                code: "tool_input_invalid",
+                                message,
+                                input_issues: Some(issues),
+                            }
+                        }
+                        _ => ToolCatalogError::new("tool_catalog_invalid", message),
+                    }
+                }),
             ToolExecutorBinding::Mcp(_) => Ok(raw_arguments),
         }
     }

@@ -1,6 +1,7 @@
 import type {
   CommandJournalPort,
   CommandReply,
+  ContextCompositionProjection,
   ConversationCommand,
   ConversationPort,
   SessionProjection,
@@ -72,6 +73,10 @@ export class SessionService implements ConversationPort {
 
   async snapshot(sessionId: string): Promise<SessionProjection> {
     return await (await this.actor(sessionId)).snapshot();
+  }
+
+  async contextComposition(sessionId: string, providerRequestId: string): Promise<ContextCompositionProjection> {
+    return await (await this.actor(sessionId)).contextComposition(providerRequestId);
   }
 
   async dispose(): Promise<void> {

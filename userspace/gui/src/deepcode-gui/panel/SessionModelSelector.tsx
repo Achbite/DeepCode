@@ -1,13 +1,13 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type {
   ContextCompositionPartitionKind,
   ContextCompositionProjection,
   ContextUsageProjection,
   LlmProviderProfile,
-  TokenUsageProjection,
+  LlmReasoningEffort,
 } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
-import { inputCacheMetric, type InputCacheMetric } from '../../utils/providerUsage';
+import { lastCallInputCacheMetric, type InputCacheMetric } from '../../utils/providerUsage';
 import {
   buildContextCompositionLayout,
   CONTEXT_FOCUS_USED_PERCENT,
@@ -17,11 +17,12 @@ interface SessionModelSelectorProps {
   language: UiLanguage;
   profiles: readonly LlmProviderProfile[];
   selectedProfileId: string | null;
+  reasoningEffortOverride: LlmReasoningEffort | null;
   contextUsage: ContextUsageProjection | null;
   contextCompositions: readonly ContextCompositionProjection[];
-  tokenUsage: TokenUsageProjection | null;
   busy?: boolean;
   onProfileChange: (profileId: string) => void | Promise<void>;
+  onReasoningEffortChange: (effort: LlmReasoningEffort | null) => void | Promise<void>;
 }
 
 type ContextFocusKey = 'input' | 'output' | 'free' | ContextCompositionPartitionKind;
@@ -45,12 +46,17 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
   language,
   profiles,
   selectedProfileId,
+  reasoningEffortOverride,
   contextUsage,
   contextCompositions,
-  tokenUsage,
   busy = false,
   onProfileChange,
+  onReasoningEffortChange,
 }) => {
+  const [menu, setMenu] = useState<'models' | 'reasoning' | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const menuId = useId();
   const [contextOpen, setContextOpen] = useState(false);
   const [hoverContextKey, setHoverContextKey] = useState<ContextFocusKey | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -61,6 +67,40 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
   const selected = enabled.find((profile) => profile.id === selectedProfileId);
   const disabled = busy || enabled.length === 0;
   const title = selected?.name ?? t(language, 'agent.profile.selectionRequired');
+  const effortLabel = selected?.thinking === 'disabled'
+    ? t(language, 'agent.profile.thinkingDisabled')
+    : reasoningEffortOverride
+      ? t(language, `settings.llm.effort.${reasoningEffortOverride}`)
+      : t(language, 'agent.profile.followDefault');
+  const closeMenu = () => { setMenu(null); triggerRef.current?.focus(); };
+  useEffect(() => {
+    if (!menu) return undefined;
+    (menuRef.current?.querySelector<HTMLButtonElement>('button[aria-checked="true"]:not(:disabled)')
+      ?? menuRef.current?.querySelector<HTMLButtonElement>('button:not(:disabled)'))?.focus();
+    const outside = (event: PointerEvent) => {
+      if (event.target instanceof Node && !rootRef.current?.contains(event.target)) setMenu(null);
+    };
+    document.addEventListener('pointerdown', outside);
+    return () => document.removeEventListener('pointerdown', outside);
+  }, [menu]);
+  const menuKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      if (menu === 'reasoning') setMenu('models');
+      else closeMenu();
+      return;
+    }
+    if (event.key === 'ArrowLeft' && menu === 'reasoning') { event.preventDefault(); setMenu('models'); return; }
+    if (event.key === 'Tab') { setMenu(null); return; }
+    if (!['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const options = [...(menuRef.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') ?? [])];
+    const current = options.indexOf(document.activeElement as HTMLButtonElement);
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? options.length - 1
+      : (current + (event.key === 'ArrowDown' ? 1 : -1) + options.length) % options.length;
+    options[next]?.focus();
+  };
   const contextPercent = contextUsage
     ? percentOf(
         contextUsage.inputTokens + contextUsage.outputTokens,
@@ -80,15 +120,14 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
     if (contextUsage) {
       for (let index = contextCompositions.length - 1; index >= 0; index -= 1) {
         if (
-          contextCompositions[index].purpose === 'agent'
-          && contextCompositions[index].providerRequestId === contextUsage.providerRequestId
+          contextCompositions[index].providerRequestId === contextUsage.providerRequestId
         ) {
           return contextCompositions[index];
         }
       }
       return null;
     }
-    return [...contextCompositions].reverse().find((receipt) => receipt.purpose === 'agent') ?? null;
+    return contextCompositions.at(-1) ?? null;
   }, [contextCompositions, contextUsage]);
   const capacityMetrics = useMemo(
     () => buildCapacityMetrics(contextUsage, language),
@@ -127,7 +166,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
   const activeMetric = [...capacityMetrics, ...requestSections]
     .find((metric) => metric.key === activeContextKey)
     ?? capacityMetrics[0];
-  const cache = inputCacheMetric(tokenUsage);
+  const cache = lastCallInputCacheMetric(contextUsage);
   const hasContextFacts = Boolean(contextUsage || contextReceipt);
 
   useEffect(() => {
@@ -202,7 +241,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
         aria-expanded={contextOpen}
         disabled={!hasContextFacts}
         title={contextTitle}
-        onClick={() => setContextOpen((open) => !open)}
+        onClick={() => { setMenu(null); setContextOpen((open) => !open); }}
       >
         <span>{contextLabel}</span>
       </button>
@@ -344,32 +383,48 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
           </div>
         </section>
       )}
-      <label className="deepcode-session-model__selector" title={title}>
-          <span className="deepcode-session-model__label">
-            {t(language, 'agent.profile.selector')}
-          </span>
-          <select
-            value={selected?.id ?? ''}
-            disabled={disabled}
-            aria-label={t(language, 'agent.profile.selector')}
-            onChange={(event) => {
-              if (event.target.value) void onProfileChange(event.target.value);
-            }}
-          >
-            {!selected && (
-              <option value="">
-                {enabled.length === 0
-                  ? t(language, 'agent.profile.unavailable')
-                  : t(language, 'agent.profile.selectionRequired')}
-              </option>
-            )}
-            {enabled.map((profile) => (
-              <option key={profile.id} value={profile.id}>
-                {profile.name} · {profile.model}
-              </option>
+      <button ref={triggerRef} type="button" className="deepcode-session-model__selector"
+        title={title} disabled={disabled} aria-label={`${t(language, 'agent.profile.selector')}：${title}`}
+        aria-haspopup="menu" aria-expanded={menu !== null} aria-controls={menu ? menuId : undefined}
+        onClick={() => { setContextOpen(false); setMenu((current) => current ? null : 'models'); }}>
+        <span>{title}</span><span aria-hidden="true">⌄</span>
+      </button>
+      {menu && (
+        <div ref={menuRef} id={menuId} role="menu" className="deepcode-session-model__menu"
+          aria-label={t(language, menu === 'models' ? 'agent.profile.selector' : 'settings.llm.reasoningEffort')}
+          onKeyDown={menuKeyDown}>
+          {menu === 'models' ? <>
+            <div className="deepcode-session-model__menu-title">{t(language, 'agent.profile.selector')}</div>
+            <div className="deepcode-session-model__model-list">
+              {enabled.map((profile) => (
+                <button key={profile.id} type="button" role="menuitemradio" aria-checked={selected?.id === profile.id}
+                  disabled={busy} onClick={async () => { await onProfileChange(profile.id); closeMenu(); }}>
+                  <span>{profile.name}</span><span className="deepcode-session-model__tick" aria-hidden="true">{selected?.id === profile.id ? '✓' : ''}</span>
+                </button>
+              ))}
+            </div>
+            <div className="deepcode-session-model__menu-divider" role="separator" />
+            <button type="button" role="menuitem" disabled={busy || !selected || selected.thinking === 'disabled'}
+              onKeyDown={(event) => { if (event.key === 'ArrowRight') { event.preventDefault(); setMenu('reasoning'); } }}
+              onClick={() => setMenu('reasoning')}>
+              <span>{t(language, 'settings.llm.reasoningEffort')}</span>
+              <span className="deepcode-session-model__effort-value">{effortLabel}</span><span aria-hidden="true">›</span>
+            </button>
+          </> : <>
+            <button type="button" role="menuitem" className="deepcode-session-model__menu-back" onClick={() => setMenu('models')}>
+              <span aria-hidden="true">‹</span><span>{t(language, 'settings.llm.reasoningEffort')}</span>
+            </button>
+            {([null, 'low', 'medium', 'high', 'max'] as const).map((effort) => (
+              <button key={effort ?? 'default'} type="button" role="menuitemradio" disabled={busy || !selected || selected.thinking === 'disabled'}
+                aria-checked={reasoningEffortOverride === effort}
+                onClick={async () => { await onReasoningEffortChange(effort); setMenu('models'); }}>
+                <span>{effort ? t(language, `settings.llm.effort.${effort}`) : t(language, 'agent.profile.followDefault')}</span>
+                <span className="deepcode-session-model__tick" aria-hidden="true">{reasoningEffortOverride === effort ? '✓' : ''}</span>
+              </button>
             ))}
-          </select>
-      </label>
+          </>}
+        </div>
+      )}
     </div>
   );
 };

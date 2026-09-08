@@ -1,4 +1,5 @@
 import type { ConversationCommand } from '@deepcode/protocol';
+import { responseFrames } from './responseFrames.js';
 import {
   CONVERSATION_COMMAND_VERSION,
   LOCAL_AGENT_PROTOCOL_VERSION,
@@ -31,7 +32,7 @@ const MAX_REQUEST_BYTES = 1024 * 1024;
 type BridgeRequest = {
   protocolVersion: typeof LOCAL_AGENT_PROTOCOL_VERSION;
   requestId: string;
-  operation: 'health' | 'createSession' | 'deleteSession' | 'submit' | 'snapshot' | 'shutdown';
+  operation: 'health' | 'createSession' | 'deleteSession' | 'submit' | 'snapshot' | 'contextComposition' | 'shutdown';
   data: Record<string, unknown>;
 };
 
@@ -51,11 +52,12 @@ Use only the tools and plugin capabilities available for the current run. Inspec
 
 At the start of a new tool phase, emit one brief progress sentence before making calls. Do not repeat it for mechanically related calls that continue the same purpose.
 
-When workspace mutations require a Plan, publish one complete Plan and wait for confirmation. After confirmation, continue the same run immediately and execute the confirmed Plan. The Session creates and tracks Todo progress from completed tool results. Ask the user only when a required decision is missing, and publish a revised Plan only when the confirmed Plan must change. Every revised Plan requires confirmation.
+When workspace mutations require a Plan, publish its goal, affected files, steps, build environment and verification, then wait for confirmation. Execute immediately after confirmation. Report Todo step progress through the available Session progress control with tool-result evidence. Ask only for missing decisions. Revise the Plan for changes to goals, file targets, destructive actions or execution scope; routine edits, command details, log handling and verification adjustments within that scope do not require reconfirmation.
 
-Treat tool failures as facts. Correct the call or report the blocker; never claim unperformed work as complete.
+Once the available evidence is sufficient for the next authorized step, perform that step and use its result to decide what to do next. Re-read or probe to resolve a concrete uncertainty or failure. Avoid repeatedly reconstructing full-file contents when a targeted edit is sufficient.
+Treat tool failures and input rejections as facts. A rejected input was not executed. The Session allows one correction opportunity per run: use the reported field diagnostics to issue a valid call, and do not repeat successful peer calls. Report a blocker when the required action cannot be completed within the available authority and capabilities. Never claim unperformed work as complete.
 
-Use the project's declared build and test entrypoints. If the required environment or execution authority is unavailable, request it or report the blocker; do not substitute another toolchain and describe it as equivalent validation without the user's approval.
+Use the project's declared build and test entrypoints, including its container workflow when required. Finding an executable only establishes its location; determine service availability from an actual permitted service check and preserve its error. If the required environment or execution authority is unavailable, request it or report the blocker; do not substitute a host compiler or another toolchain. Keep verbose build and test logs in files, inspect the relevant result, and do not repeat successful work.
 
 Be concise, use Markdown, show file paths clearly, and do not use emojis unless the user requests them or they are necessary for meaning.
 
@@ -149,6 +151,10 @@ async function dispatch(
     }
     case 'snapshot':
       return await service.snapshot(requiredString(request.data, 'sessionId'));
+    case 'contextComposition':
+      return await service.contextComposition(
+        requiredString(request.data, 'sessionId'), requiredString(request.data, 'providerRequestId'),
+      );
     case 'shutdown':
       return { stopped: true };
   }
@@ -162,6 +168,15 @@ function decodeCommand(value: unknown): ConversationCommand {
     || !validId(value.sessionId)
   ) throw new Error('conversation_command_invalid');
   switch (value.type) {
+    case 'session.model-settings.set':
+      if (!hasExactKeys(value, ['schemaVersion', 'type', 'commandId', 'sessionId', 'settings'])
+        || !isRecord(value.settings)
+        || !hasExactKeys(value.settings, ['profileId', 'reasoningEffortOverride'])
+        || !validId(value.settings.profileId)
+        || !validReasoningOverride(value.settings.reasoningEffortOverride)) {
+        throw new Error('conversation_command_invalid');
+      }
+      return value as unknown as ConversationCommand;
     case 'session.directory-index.attach':
       if (
         !hasExactKeys(value, [
@@ -186,13 +201,14 @@ function decodeCommand(value: unknown): ConversationCommand {
           value,
           ['schemaVersion', 'type', 'commandId', 'sessionId', 'text'],
           [
-            'filesystemReferences', 'profileId', 'pluginCatalogRevision', 'pluginSelections',
+            'filesystemReferences', 'profileId', 'reasoningEffortOverride', 'pluginCatalogRevision', 'pluginSelections',
           ],
         )
         || typeof value.text !== 'string'
         || (value.filesystemReferences !== undefined
           && !isFilesystemReferenceArray(value.filesystemReferences))
         || (value.profileId !== undefined && !validId(value.profileId))
+        || (value.reasoningEffortOverride !== undefined && !validReasoningOverride(value.reasoningEffortOverride))
         || !validPluginSelections(value.pluginCatalogRevision, value.pluginSelections)
       ) throw new Error('conversation_command_invalid');
       return value as unknown as ConversationCommand;
@@ -202,7 +218,7 @@ function decodeCommand(value: unknown): ConversationCommand {
           value,
           ['schemaVersion', 'type', 'commandId', 'sessionId', 'task'],
           [
-            'filesystemReferences', 'profileId', 'pluginCatalogRevision', 'pluginSelections',
+            'filesystemReferences', 'profileId', 'reasoningEffortOverride', 'pluginCatalogRevision', 'pluginSelections',
           ],
         )
         || typeof value.task !== 'string'
@@ -210,6 +226,7 @@ function decodeCommand(value: unknown): ConversationCommand {
         || (value.filesystemReferences !== undefined
           && !isFilesystemReferenceArray(value.filesystemReferences))
         || (value.profileId !== undefined && !validId(value.profileId))
+        || (value.reasoningEffortOverride !== undefined && !validReasoningOverride(value.reasoningEffortOverride))
         || !validPluginSelections(value.pluginCatalogRevision, value.pluginSelections)
       ) throw new Error('conversation_command_invalid');
       return value as unknown as ConversationCommand;
@@ -268,6 +285,10 @@ function decodeCommand(value: unknown): ConversationCommand {
     default:
       throw new Error('conversation_command_invalid');
   }
+}
+
+function validReasoningOverride(value: unknown): boolean {
+  return value === null || typeof value === 'string' && ['low', 'medium', 'high', 'max'].includes(value);
 }
 
 function hasExactKeys(
@@ -388,7 +409,7 @@ function decodeRequest(encoded: string): BridgeRequest {
     || value.protocolVersion !== LOCAL_AGENT_PROTOCOL_VERSION
     || typeof value.requestId !== 'string'
     || !value.requestId
-    || !['health', 'createSession', 'deleteSession', 'submit', 'snapshot', 'shutdown'].includes(String(value.operation))
+    || !['health', 'createSession', 'deleteSession', 'submit', 'snapshot', 'contextComposition', 'shutdown'].includes(String(value.operation))
     || !isRecord(value.data)
   ) {
     throw new Error('session_service_request_invalid');
@@ -428,12 +449,18 @@ function chunkBytes(value: unknown): Uint8Array {
 let outputTail = Promise.resolve();
 
 function writeFrame(value: unknown): Promise<void> {
-  const encoded = `${JSON.stringify(value)}\n`;
-  const next = outputTail.then(() => new Promise<void>((resolve, reject) => {
-    process.stdout.write(encoded, (error) => error ? reject(error) : resolve());
-  }));
+  // Serialize the entire logical response in the output queue, including all chunks.
+  const next = outputTail.then(async () => {
+    for (const frame of responseFrames(value)) await writeLine(frame);
+  });
   outputTail = next;
   return next;
+}
+
+function writeLine(encoded: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    process.stdout.write(`${encoded}\n`, (error) => error ? reject(error) : resolve());
+  });
 }
 
 function bridgeError(error: unknown): { code: string; message: string } {

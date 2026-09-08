@@ -29,10 +29,14 @@ pub(crate) struct LocalAgentJournal {
     connection: Arc<Mutex<Connection>>,
 }
 
+#[derive(Debug)]
+struct ValidatedNewEvent<'a>(&'a Value);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunProviderRuntime {
     pub(crate) provider_runtime_ref: String,
     pub(crate) profile_id: String,
+    pub(crate) reasoning_effort_override: Option<String>,
     pub(crate) context_window_tokens: u64,
     pub(crate) max_output_tokens: u32,
     pub(crate) api_surface: String,
@@ -51,7 +55,7 @@ impl LocalAgentJournal {
             })?;
         }
         let existed = path.exists();
-        let connection = Connection::open(path).map_err(sql_open_error)?;
+        let mut connection = Connection::open(path).map_err(sql_open_error)?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(sql_error("session_store_busy_timeout_failed"))?;
@@ -72,6 +76,7 @@ impl LocalAgentJournal {
             SESSION_STORE_VERSION => {
                 verify_session_store(&connection)?;
                 verify_session_store_version(&connection)?;
+                repair_current_event_constraint(&mut connection)?;
             }
             other => {
                 return Err(LocalAgentStoreError::new(
@@ -134,7 +139,7 @@ impl LocalAgentJournal {
             }
         });
         let event = strip_null_object_fields(event);
-        let committed = insert_event(&transaction, &event, true)?;
+        let committed = insert_event(&transaction, validate_new_event(&event, true)?)?;
         transaction
             .commit()
             .map_err(sql_error("session_create_commit_failed"))?;
@@ -156,9 +161,10 @@ impl LocalAgentJournal {
                 "Session Event batch 不能为空。",
             ));
         }
-        for event in events {
-            validate_new_event(event, false)?;
-        }
+        let validated_events = events
+            .iter()
+            .map(|event| validate_new_event(event, false))
+            .collect::<Result<Vec<_>, _>>()?;
         let session_id = required_string(&events[0], "sessionId")?;
         if events
             .iter()
@@ -174,8 +180,8 @@ impl LocalAgentJournal {
             .transaction()
             .map_err(sql_error("session_event_transaction_failed"))?;
         let mut committed = Vec::with_capacity(events.len());
-        for event in events {
-            committed.push(insert_event(&transaction, event, false)?);
+        for event in validated_events {
+            committed.push(insert_event(&transaction, event)?);
         }
         transaction
             .commit()
@@ -319,7 +325,7 @@ impl LocalAgentJournal {
             ));
         }
         for event in events {
-            insert_event(&transaction, event, false)?;
+            insert_event(&transaction, validate_new_event(event, false)?)?;
         }
         let revision: i64 = transaction
             .query_row(
@@ -621,10 +627,9 @@ pub(crate) fn delete_session_archive(
 
 fn insert_event(
     transaction: &Transaction<'_>,
-    event: &Value,
-    allow_creation: bool,
+    event: ValidatedNewEvent<'_>,
 ) -> Result<Value, LocalAgentStoreError> {
-    validate_new_event(event, allow_creation)?;
+    let ValidatedNewEvent(event) = event;
     validate_event_facts(transaction, event)?;
     let session_id = required_string(event, "sessionId")?;
     let event_type = required_string(event, "type")?;
@@ -664,7 +669,10 @@ fn insert_event(
     Ok(committed)
 }
 
-fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAgentStoreError> {
+fn validate_new_event(
+    event: &Value,
+    allow_creation: bool,
+) -> Result<ValidatedNewEvent<'_>, LocalAgentStoreError> {
     let object = exact_object(
         event,
         &["type", "sessionId", "payload"],
@@ -681,6 +689,7 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
     }
     let allowed = [
         "session.created",
+        "session.model-settings.updated",
         "session.directory-index.attached",
         "session.directory-index.detached",
         "input.accepted",
@@ -704,6 +713,7 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
         "approval.requested",
         "approval.resolved",
         "tool.completed",
+        "tool.input-rejected",
         "session.control.rejected",
         "context.compaction.requested",
         "context.compacted",
@@ -725,6 +735,7 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
     let needs_run = !matches!(
         event_type,
         "session.created"
+            | "session.model-settings.updated"
             | "session.directory-index.attached"
             | "session.directory-index.detached"
             | "input.accepted"
@@ -742,6 +753,7 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
             | "approval.requested"
             | "approval.resolved"
             | "tool.completed"
+            | "tool.input-rejected"
             | "session.control.rejected"
     );
     if needs_run {
@@ -754,13 +766,25 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
             })?,
         )?;
     }
-    if needs_call {
+    let progress_call = event_type == "todo.progressed"
+        && event
+            .get("payload")
+            .and_then(|payload| payload.get("providerCallId"))
+            .is_some();
+    if event_type == "todo.progressed" && event.get("callId").is_some() != progress_call {
+        return Err(LocalAgentStoreError::new(
+            "session_event_invalid",
+            "Todo control 调用必须同时携带 callId 和 providerCallId。",
+        ));
+    }
+    if needs_call || progress_call {
         validate_id("callId", required_string(event, "callId")?)?;
     }
     if matches!(
         event_type,
         "interaction.requested" | "plan.published" | "tool.requested" | "session.control.rejected"
-    ) {
+    ) || progress_call
+    {
         let payload = event.get("payload").expect("validated payload");
         let provider_call_id = required_string(payload, "providerCallId")?;
         validate_id("providerCallId", provider_call_id)?;
@@ -793,6 +817,59 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
         }
     }
     match event_type {
+        "session.model-settings.updated" => {
+            let payload = event.get("payload").expect("validated payload");
+            exact_object(payload, &["commandId", "settings"], &[])?;
+            validate_id("commandId", required_string(payload, "commandId")?)?;
+            validate_model_settings(&payload["settings"])?;
+        }
+        "tool.input-rejected" => {
+            let payload = event.get("payload").expect("validated payload");
+            exact_object(payload, &["rejection"], &[])?;
+            let rejection = &payload["rejection"];
+            exact_object(
+                rejection,
+                &[
+                    "sessionId",
+                    "runId",
+                    "extensionGenerationRef",
+                    "kernelCatalogSnapshotRef",
+                    "toolBindingRef",
+                    "callId",
+                    "attemptId",
+                    "toolName",
+                    "input",
+                    "rejectedAt",
+                    "error",
+                ],
+                &[],
+            )?;
+            for field in ["sessionId", "runId", "callId"] {
+                if required_string(rejection, field)? != required_string(event, field)? {
+                    return Err(LocalAgentStoreError::new(
+                        "tool_rejection_identity_mismatch",
+                        "工具参数拒绝身份与 Session 事件不一致。",
+                    ));
+                }
+            }
+            for field in [
+                "extensionGenerationRef",
+                "kernelCatalogSnapshotRef",
+                "toolBindingRef",
+                "attemptId",
+                "toolName",
+                "rejectedAt",
+            ] {
+                required_string(rejection, field)?;
+            }
+            validate_input_rejection_error(&rejection["error"])?;
+            if !rejection["input"].is_object() {
+                return Err(LocalAgentStoreError::new(
+                    "tool_rejection_invalid",
+                    "工具参数拒绝必须保留原始输入对象。",
+                ));
+            }
+        }
         "input.accepted" => {
             let payload = event.get("payload").expect("validated payload");
             exact_object(
@@ -1042,7 +1119,7 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
                     "sourceFactRef",
                     "updates",
                 ],
-                &[],
+                &["providerCallId"],
             )?;
             validate_id("sourcePlanId", required_string(payload, "sourcePlanId")?)?;
             required_positive_revision(payload, "sourcePlanRevision")?;
@@ -1093,7 +1170,7 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
             )?;
             if !matches!(
                 required_string(payload, "toolName")?,
-                "interaction.request" | "plan.publish"
+                "interaction.request" | "plan.publish" | "plan.progress"
             ) {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
@@ -1558,7 +1635,7 @@ fn validate_new_event(event: &Value, allow_creation: bool) -> Result<(), LocalAg
         }
         _ => {}
     }
-    Ok(())
+    Ok(ValidatedNewEvent(event))
 }
 
 fn validate_event_facts(
@@ -1714,6 +1791,24 @@ fn validate_event_facts(
         }
         "todo.progressed" => {
             let run_id = required_string(event, "runId")?;
+            if let Some(call_id) = event.get("callId").and_then(Value::as_str) {
+                if !pending_provider_composition_exists(transaction, session_id, run_id)? {
+                    return Err(LocalAgentStoreError::new(
+                        "provider_turn_composition_missing",
+                        "Plan progress 必须属于当前未完成的 composition。",
+                    ));
+                }
+                let duplicate: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND call_id=?2)",
+                    params![session_id, call_id], |row| row.get(0),
+                ).map_err(sql_error("session_event_fact_read_failed"))?;
+                if duplicate {
+                    return Err(LocalAgentStoreError::new(
+                        "provider_call_identity_duplicate",
+                        "Plan progress 复用了已有 LogicalCallId。",
+                    ));
+                }
+            }
             let payload = event.get("payload").expect("validated payload");
             let plan_id = required_string(payload, "sourcePlanId")?;
             let revision = required_positive_revision(payload, "sourcePlanRevision")?;
@@ -1749,31 +1844,40 @@ fn validate_event_facts(
                     "sourcePlanRevision 超出 SQLite 整数范围。",
                 )
             })?;
+            let needs_success = payload["updates"]
+                .as_array()
+                .expect("validated updates")
+                .iter()
+                .any(|update| update["status"] == "completed");
             let source_record_exists: bool = transaction
                 .query_row(
                     "SELECT EXISTS(
                          SELECT 1 FROM session_events
                          WHERE session_id=?1 AND run_id=?2 AND event_type='tool.completed'
                            AND json_extract(payload_json, '$.record.recordId')=?3
-                           AND (
-                             (json_extract(payload_json, '$.record.authority.source')='plan'
-                              AND json_extract(payload_json, '$.record.authority.planId')=?4
-                              AND json_extract(payload_json, '$.record.authority.revision')=?5)
-                             OR
-                             (json_extract(payload_json, '$.record.authority.source')='composite'
-                              AND json_extract(payload_json, '$.record.authority.workspaceAuthority.source')='plan'
-                              AND json_extract(payload_json, '$.record.authority.workspaceAuthority.planId')=?4
-                              AND json_extract(payload_json, '$.record.authority.workspaceAuthority.revision')=?5)
+                           AND (?6=0 OR json_extract(payload_json, '$.record.outcome')='completed')
+                           AND sequence > (
+                             SELECT MAX(sequence) FROM session_events
+                             WHERE session_id=?1 AND event_type='plan.confirmed'
+                               AND json_extract(payload_json, '$.planId')=?4
+                               AND json_extract(payload_json, '$.revision')=?5
                            )
                      )",
-                    params![session_id, run_id, source_fact_ref, plan_id, revision_sql],
+                    params![
+                        session_id,
+                        run_id,
+                        source_fact_ref,
+                        plan_id,
+                        revision_sql,
+                        needs_success
+                    ],
                     |row| row.get(0),
                 )
                 .map_err(sql_error("session_event_fact_read_failed"))?;
             if !source_record_exists {
                 return Err(LocalAgentStoreError::new(
                     "todo_source_fact_missing",
-                    "todo.progressed 必须引用同 run、同 Plan revision 的终态 ToolRecord。",
+                    "todo.progressed 必须引用本 run 确认 Plan 后的 ToolRecord；完成步骤需要成功结果。",
                 ));
             }
         }
@@ -1902,7 +2006,7 @@ fn validate_event_facts(
                          WHERE session_id=?1 AND call_id=?2
                            AND event_type IN (
                              'interaction.requested', 'plan.published',
-                             'tool.requested', 'session.control.rejected'
+                             'tool.requested', 'session.control.rejected', 'todo.progressed'
                            )
                      )",
                     params![session_id, call_id],
@@ -2201,13 +2305,14 @@ fn validate_event_facts(
                             CASE event_type
                               WHEN 'interaction.requested' THEN 'interaction.request'
                               WHEN 'plan.published' THEN 'plan.publish'
+                              WHEN 'todo.progressed' THEN 'plan.progress'
                               ELSE json_extract(payload_json, '$.toolName')
                             END
                      FROM session_events
                      WHERE session_id=?1 AND run_id=?2 AND sequence>?3
-                       AND event_type IN (
+                       AND call_id IS NOT NULL AND event_type IN (
                          'interaction.requested', 'plan.published',
-                         'tool.requested', 'session.control.rejected'
+                         'tool.requested', 'session.control.rejected', 'todo.progressed'
                        )
                      ORDER BY sequence ASC",
                 )
@@ -2739,6 +2844,7 @@ fn validate_command(command: &Value) -> Result<(), LocalAgentStoreError> {
     validate_id("commandId", required_string(command, "commandId")?)?;
     let command_type = required_string(command, "type")?;
     if ![
+        "session.model-settings.set",
         "session.directory-index.attach",
         "session.directory-index.detach",
         "message.submit",
@@ -2755,6 +2861,20 @@ fn validate_command(command: &Value) -> Result<(), LocalAgentStoreError> {
             "session_command_type_invalid",
             format!("当前 Session 合同不接受命令：{command_type}"),
         ));
+    }
+    if command_type == "session.model-settings.set" {
+        exact_object(
+            command,
+            &[
+                "schemaVersion",
+                "type",
+                "commandId",
+                "sessionId",
+                "settings",
+            ],
+            &[],
+        )?;
+        validate_model_settings(&command["settings"])?;
     }
     if command_type == "message.feedback.set" {
         exact_object(
@@ -2790,6 +2910,7 @@ fn validate_command(command: &Value) -> Result<(), LocalAgentStoreError> {
             &[
                 "filesystemReferences",
                 "profileId",
+                "reasoningEffortOverride",
                 "pluginCatalogRevision",
                 "pluginSelections",
             ],
@@ -2813,6 +2934,9 @@ fn validate_command(command: &Value) -> Result<(), LocalAgentStoreError> {
         }
         if let Some(references) = command.get("filesystemReferences") {
             validate_filesystem_references(references, "session_command_invalid")?;
+        }
+        if let Some(effort) = command.get("reasoningEffortOverride") {
+            validate_reasoning_override(effort)?;
         }
         validate_plugin_selections(
             command.get("pluginCatalogRevision"),
@@ -2872,6 +2996,22 @@ fn validate_feedback(value: &Value) -> Result<(), LocalAgentStoreError> {
         "local_agent_message_invalid",
         "feedback 必须是 up、down 或 null。",
     ))
+}
+
+fn validate_reasoning_override(value: &Value) -> Result<(), LocalAgentStoreError> {
+    if value.is_null() || matches!(value.as_str(), Some("low" | "medium" | "high" | "max")) {
+        return Ok(());
+    }
+    Err(LocalAgentStoreError::new(
+        "session_model_settings_invalid",
+        "推理强度必须是 low、medium、high、max 或 null。",
+    ))
+}
+
+fn validate_model_settings(value: &Value) -> Result<(), LocalAgentStoreError> {
+    exact_object(value, &["profileId", "reasoningEffortOverride"], &[])?;
+    validate_id("profileId", required_string(value, "profileId")?)?;
+    validate_reasoning_override(&value["reasoningEffortOverride"])
 }
 
 fn required_positive_revision(value: &Value, field: &str) -> Result<u64, LocalAgentStoreError> {
@@ -2974,22 +3114,24 @@ fn validate_plan_operations(value: &Value) -> Result<(), LocalAgentStoreError> {
                 &[
                     "workspaceId",
                     "operation",
-                    "command",
                     "workspaceMode",
                     "executionScope",
                 ],
-                &["terminal"],
+                &["command", "terminal"],
             )?;
-            let command = required_string(operation, "command")?;
             let execution_scope = required_string(operation, "executionScope")?;
-            if command.len() > 16_384
-                || command.contains('\0')
+            let valid_command = operation.get("command").is_none_or(|value| {
+                value.as_str().is_some_and(|command| {
+                    !command.is_empty() && command.len() <= 16_384 && !command.contains('\0')
+                })
+            });
+            if !valid_command
                 || required_string(operation, "workspaceMode")? != "write"
                 || !matches!(execution_scope, "workspace" | "host")
             {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
-                    "bash Plan operation 必须声明有界 command、workspaceMode=write 和 executionScope。",
+                    "bash Plan operation 必须声明 workspaceMode=write 和 executionScope；command 可选且有界。",
                 ));
             }
             if let Some(terminal) = operation.get("terminal") {
@@ -3365,6 +3507,7 @@ fn validate_provider_turn_output_blocks(
         .collect::<Vec<_>>();
     let mut previous_output_index = None;
     let mut call_ids = Vec::new();
+    let mut all_call_ids = std::collections::HashSet::new();
     let mut provider_call_ids = std::collections::HashSet::new();
     let mut projection_refs = std::collections::HashSet::new();
     let mut final_message_count = 0usize;
@@ -3432,26 +3575,30 @@ fn validate_provider_turn_output_blocks(
                     ));
                 }
             }
-            "toolCall" => {
-                exact_object(
-                    block,
-                    &[
-                        "outputIndex",
-                        "kind",
-                        "callId",
-                        "providerCallId",
-                        "toolName",
-                        "item",
-                    ],
-                    &[],
-                )?;
+            "toolCall" | "toolCallRejected" => {
+                let mut fields = vec![
+                    "outputIndex",
+                    "kind",
+                    "callId",
+                    "providerCallId",
+                    "toolName",
+                    "item",
+                ];
+                if kind == "toolCallRejected" {
+                    fields.push("error");
+                    validate_input_rejection_error(&block["error"])?;
+                }
+                exact_object(block, &fields, &[])?;
                 let call_id = required_string(block, "callId")?;
                 let provider_call_id = required_string(block, "providerCallId")?;
                 validate_id("callId", call_id)?;
                 validate_runtime_identity("providerCallId", provider_call_id)?;
                 required_string(block, "toolName")?;
+                required_string(item, "name")?;
                 if item.get("type").and_then(Value::as_str) != Some("function_call")
                     || item.get("call_id").and_then(Value::as_str) != Some(provider_call_id)
+                    || !item.get("arguments").is_some_and(Value::is_string)
+                    || !all_call_ids.insert(call_id)
                     || !provider_call_ids.insert(provider_call_id)
                 {
                     return Err(LocalAgentStoreError::new(
@@ -3459,7 +3606,9 @@ fn validate_provider_turn_output_blocks(
                         "toolCall block 与原生 item 不一致。",
                     ));
                 }
-                call_ids.push(call_id);
+                if kind == "toolCall" {
+                    call_ids.push(call_id);
+                }
             }
             "providerHosted" => {
                 exact_object(
@@ -3500,8 +3649,8 @@ fn validate_provider_turn_output_blocks(
     }
     if call_ids != expected_call_ids
         || final_message_count > 1
-        || call_ids.is_empty() && final_message_count != 1
-        || !call_ids.is_empty() && final_message_count != 0
+        || all_call_ids.is_empty() && final_message_count != 1
+        || !all_call_ids.is_empty() && final_message_count != 0
     {
         return Err(LocalAgentStoreError::new(
             "session_event_invalid",
@@ -4106,7 +4255,7 @@ fn validate_run_runtime_snapshot(
             "apiSurface",
             "hostedWebSearch",
         ],
-        &[],
+        &["reasoningEffort", "reasoningEffortOverride", "thinking"],
     )?;
     let provider_runtime_ref = required_string(provider, "providerRuntimeRef")?;
     let profile_id = required_string(provider, "profileId")?;
@@ -4116,6 +4265,34 @@ fn validate_run_runtime_snapshot(
     let max_output_tokens = required_u64(provider, "maxOutputTokens")?;
     let api_surface = required_string(provider, "apiSurface")?;
     let hosted_web_search = required_string(provider, "hostedWebSearch")?;
+    for field in ["reasoningEffort", "reasoningEffortOverride"] {
+        if let Some(effort) = provider.get(field) {
+            if effort.is_null() {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "冻结的推理强度不能为 null。",
+                ));
+            }
+            validate_reasoning_override(effort)?;
+        }
+    }
+    if let Some(thinking) = provider.get("thinking") {
+        if !matches!(thinking.as_str(), Some("enabled" | "disabled")) {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "冻结的推理模式无效。",
+            ));
+        }
+    }
+    if provider.get("reasoningEffortOverride").is_some()
+        && (provider["reasoningEffortOverride"] != provider["reasoningEffort"]
+            || provider["thinking"] == "disabled")
+    {
+        return Err(LocalAgentStoreError::new(
+            "session_event_invalid",
+            "推理强度覆盖与冻结的 Provider 配置不一致。",
+        ));
+    }
     if !matches!(
         api_surface,
         "chatCompletions" | "responses" | "anthropicMessages" | "ollamaChat"
@@ -4599,6 +4776,10 @@ fn validate_run_runtime_snapshot(
     }
 
     Ok(RunProviderRuntime {
+        reasoning_effort_override: provider
+            .get("reasoningEffortOverride")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         provider_runtime_ref: provider_runtime_ref.to_string(),
         profile_id: profile_id.to_string(),
         context_window_tokens,
@@ -4636,6 +4817,25 @@ fn validate_local_agent_error(value: &Value) -> Result<(), LocalAgentStoreError>
             "session_event_invalid",
             "LocalAgentError code 或 message 无效。",
         ));
+    }
+    Ok(())
+}
+
+fn validate_input_rejection_error(error: &Value) -> Result<(), LocalAgentStoreError> {
+    exact_object(error, &["code", "message", "issues"], &[])?;
+    required_string(error, "code")?;
+    required_string(error, "message")?;
+    let issues = error["issues"]
+        .as_array()
+        .filter(|issues| !issues.is_empty())
+        .ok_or_else(|| {
+            LocalAgentStoreError::new("tool_rejection_invalid", "工具参数拒绝必须包含字段诊断。")
+        })?;
+    for issue in issues {
+        exact_object(issue, &["path", "rule", "message"], &["expected"])?;
+        for field in ["path", "rule", "message"] {
+            required_string(issue, field)?;
+        }
     }
     Ok(())
 }
@@ -4712,6 +4912,75 @@ fn strip_null_object_fields(mut value: Value) -> Value {
         }
     }
     value
+}
+
+// The current schema-7 release omitted two declared events from its SQL CHECK.
+// Repair only that exact defect; preserve every stored event and command.
+fn repair_current_event_constraint(
+    connection: &mut Connection,
+) -> Result<(), LocalAgentStoreError> {
+    let table_sql = SESSION_STORE_SCHEMA
+        .split(';')
+        .map(str::trim)
+        .find(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS session_events ("))
+        .expect("canonical session_events table definition");
+    let normalize = |sql: &str| {
+        sql.replace(" IF NOT EXISTS", "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sql_error("session_store_constraint_repair_failed"))?;
+    let stored_sql: String = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='session_events'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_error("session_store_verify_failed"))?;
+    if normalize(&stored_sql) == normalize(table_sql) {
+        return Ok(());
+    }
+    let omitted_events_sql = table_sql
+        .replace("        'session.model-settings.updated',\n", "")
+        .replace("        'tool.input-rejected',\n", "");
+    if normalize(&stored_sql) != normalize(&omitted_events_sql) {
+        return Err(LocalAgentStoreError::new(
+            "session_store_event_schema_mismatch",
+            "Session event 表与当前合同不一致，无法应用事件白名单修复。",
+        ));
+    }
+    transaction
+        .execute_batch(
+            "ALTER TABLE session_events RENAME TO session_events_before_constraint_repair;",
+        )
+        .map_err(sql_error("session_store_constraint_repair_failed"))?;
+    transaction
+        .execute_batch(table_sql)
+        .map_err(sql_error("session_store_constraint_repair_failed"))?;
+    transaction
+        .execute_batch(
+            "INSERT INTO session_events (
+                 session_id, sequence, event_id, event_type, run_id, call_id, payload_json, occurred_at
+             ) SELECT session_id, sequence, event_id, event_type, run_id, call_id, payload_json, occurred_at
+               FROM session_events_before_constraint_repair;
+             DROP TABLE session_events_before_constraint_repair;",
+        )
+        .map_err(sql_error("session_store_constraint_repair_failed"))?;
+    for index_sql in SESSION_STORE_SCHEMA
+        .split(';')
+        .map(str::trim)
+        .filter(|sql| sql.starts_with("CREATE ") && sql.contains("ON session_events("))
+    {
+        transaction
+            .execute_batch(index_sql)
+            .map_err(sql_error("session_store_constraint_repair_failed"))?;
+    }
+    transaction
+        .commit()
+        .map_err(sql_error("session_store_constraint_repair_failed"))
 }
 
 fn verify_session_store(connection: &Connection) -> Result<(), LocalAgentStoreError> {
@@ -4937,6 +5206,280 @@ mod tests {
         let error = validate_run_runtime_snapshot(&blocked)
             .expect_err("blocked tools must not retain prepared prompt contributions");
         assert_eq!(error.code, "session_event_invalid");
+    }
+
+    #[test]
+    fn journal_writes_model_settings_and_input_rejection_to_sqlite() {
+        let path = std::env::temp_dir().join(format!(
+            "deepcode-session-loop-events-{}.sqlite3",
+            random_id("test").unwrap().replace(':', "-")
+        ));
+        let journal = LocalAgentJournal::open(&path).unwrap();
+        journal
+            .create_session("session:loop", "Loop", &json!([]), Some("profile:test"))
+            .unwrap();
+        append_model_settings_and_rejected_call(&journal);
+        let events = journal.read_events("session:loop", 0).unwrap();
+        let saved_command = journal
+            .read_command("session:loop", "command:settings")
+            .unwrap();
+        drop(journal);
+        let reopened = LocalAgentJournal::open(&path).unwrap();
+        assert_eq!(reopened.read_events("session:loop", 0).unwrap(), events);
+        assert_eq!(
+            reopened
+                .read_command("session:loop", "command:settings")
+                .unwrap(),
+            saved_command
+        );
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn journal_persists_session_input_rejection_without_a_kernel_call() {
+        let path = std::env::temp_dir().join(format!(
+            "deepcode-provider-input-{}.sqlite3",
+            random_id("test").unwrap().replace(':', "-")
+        ));
+        let journal = LocalAgentJournal::open(&path).unwrap();
+        journal
+            .create_session("session:loop", "Loop", &json!([]), Some("profile:test"))
+            .unwrap();
+        append_model_settings_and_rejected_call(&journal);
+        let events = journal.read_events("session:loop", 0).unwrap();
+        let mut composition = events
+            .iter()
+            .find(|event| event["type"] == "context.composed")
+            .unwrap()
+            .clone();
+        let composition = composition.as_object_mut().unwrap();
+        for field in ["schemaVersion", "eventId", "sequence", "occurredAt"] {
+            composition.remove(field);
+        }
+        composition.get_mut("payload").unwrap()["providerRequestId"] =
+            json!("provider-request:bad-arguments");
+        journal.append(&Value::Object(composition.clone())).unwrap();
+        let block = json!({
+            "outputIndex":0,"kind":"toolCallRejected","callId":"call:raw-rejected",
+            "providerCallId":"native:raw-rejected","toolName":"fs.read",
+            "item":{"type":"function_call","call_id":"native:raw-rejected","name":"fs_read","arguments":"{\"path\":","status":"completed"},
+            "error":{"code":"provider_tool_call_arguments_invalid","message":"Invalid JSON object.","issues":[{"path":"$","rule":"json_object","message":"Invalid JSON object."}]}
+        });
+        let completed = json!({
+            "type":"provider.turn.settled","sessionId":"session:loop","runId":"run:loop",
+            "payload":{"outcome":"completed","providerRequestId":"provider-request:bad-arguments","purpose":"agent",
+                "providerRuntimeRef":"provider-runtime:test","orderedCallIds":[],"orderedOutputBlocks":[block]}
+        });
+        let mut fake_call_fact = completed.clone();
+        fake_call_fact["payload"]["orderedCallIds"] = json!(["call:raw-rejected"]);
+        assert!(
+            journal.append(&fake_call_fact).is_err(),
+            "a rejection must not invent an accepted call fact"
+        );
+        journal.append(&completed).unwrap();
+        let saved = journal.read_events("session:loop", 0).unwrap();
+        assert_eq!(
+            saved
+                .iter()
+                .filter(|event| event["type"] == "tool.requested")
+                .count(),
+            1,
+            "only the earlier Kernel fixture call exists"
+        );
+        assert_eq!(
+            saved.last().unwrap()["payload"]["orderedOutputBlocks"][0],
+            block
+        );
+        drop(journal);
+        let reopened = LocalAgentJournal::open(&path).unwrap();
+        assert_eq!(reopened.read_events("session:loop", 0).unwrap(), saved);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn journal_repairs_the_current_event_constraint_without_rewriting_history() {
+        let path = std::env::temp_dir().join(format!(
+            "deepcode-session-constraint-{}.sqlite3",
+            random_id("test").unwrap().replace(':', "-")
+        ));
+        let connection = Connection::open(&path).unwrap();
+        // Reproduce the exact schema-7 omission observed in the installed app.
+        connection
+            .execute_batch(
+                &SESSION_STORE_SCHEMA
+                    .replace("        'session.model-settings.updated',\n", "")
+                    .replace("        'tool.input-rejected',\n", ""),
+            )
+            .unwrap();
+        let journal = LocalAgentJournal {
+            connection: Arc::new(Mutex::new(connection)),
+        };
+        journal
+            .create_session(
+                "session:loop",
+                "Existing conversation",
+                &json!([
+                    {"workspaceId":"workspace:test","displayName":"Test"}
+                ]),
+                Some("profile:test"),
+            )
+            .unwrap();
+        journal.commit_command(&json!({
+            "command":{
+                "schemaVersion":COMMAND_VERSION,"type":"message.submit","sessionId":"session:loop",
+                "commandId":"command:before-repair","text":"Preserve this conversation."
+            },
+            "events":[{
+                "type":"input.accepted","sessionId":"session:loop",
+                "payload":{"commandId":"command:before-repair","messageId":"message:before-repair","text":"Preserve this conversation."}
+            }],
+            "reply":{
+                "schemaVersion":REPLY_VERSION,"sessionId":"session:loop",
+                "commandId":"command:before-repair","status":"accepted","revision":0
+            }
+        })).unwrap();
+        let before_events = journal.read_events("session:loop", 0).unwrap();
+        let before_command = journal
+            .read_command("session:loop", "command:before-repair")
+            .unwrap();
+        let read_indexes = |journal: &LocalAgentJournal| -> Vec<(String, String)> {
+            journal.lock().unwrap()
+                .prepare("SELECT name, sql FROM sqlite_schema WHERE type='index' AND tbl_name='session_events' AND sql IS NOT NULL ORDER BY name")
+                .unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        };
+        let before_indexes = read_indexes(&journal);
+        drop(journal);
+        let repaired =
+            LocalAgentJournal::open(&path).expect("open and repair the affected current store");
+        assert_eq!(
+            repaired.read_events("session:loop", 0).unwrap(),
+            before_events
+        );
+        assert_eq!(
+            repaired
+                .read_command("session:loop", "command:before-repair")
+                .unwrap(),
+            before_command
+        );
+        assert_eq!(read_indexes(&repaired), before_indexes);
+        assert_eq!(repaired.lock().unwrap().query_row(
+            "SELECT display_name FROM session_workspace_bindings WHERE session_id='session:loop'", [],
+            |row| row.get::<_, String>(0)
+        ).unwrap(), "Test");
+        append_model_settings_and_rejected_call(&repaired);
+        let after_events = repaired.read_events("session:loop", 0).unwrap();
+        assert_eq!(
+            &after_events[..before_events.len()],
+            before_events.as_slice()
+        );
+        let schema_revision: u32 = repaired
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert!(repaired.lock().unwrap().execute(
+            "INSERT INTO session_events(session_id,sequence,event_id,event_type,payload_json,occurred_at)
+             VALUES ('session:loop',999,'event:invalid','undeclared.event','{}','2026-09-07T00:00:00Z')", []
+        ).is_err(), "undeclared events must still fail the database CHECK");
+        drop(repaired);
+        let reopened = LocalAgentJournal::open(&path).unwrap();
+        assert_eq!(
+            reopened.read_events("session:loop", 0).unwrap(),
+            after_events
+        );
+        assert_eq!(
+            reopened
+                .lock()
+                .unwrap()
+                .query_row("PRAGMA schema_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            schema_revision
+        );
+        assert_eq!(
+            reopened
+                .lock()
+                .unwrap()
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn append_model_settings_and_rejected_call(journal: &LocalAgentJournal) {
+        let settings = json!({"profileId":"profile:test","reasoningEffortOverride":"high"});
+        let result = journal
+            .commit_command(&json!({
+                "command": {
+                    "schemaVersion": COMMAND_VERSION,
+                    "type":"session.model-settings.set", "sessionId":"session:loop",
+                    "commandId":"command:settings", "settings":settings
+                },
+                "events":[{
+                    "type":"session.model-settings.updated", "sessionId":"session:loop",
+                    "payload":{"commandId":"command:settings","settings":settings}
+                }],
+                "reply":{
+                    "schemaVersion":REPLY_VERSION,"sessionId":"session:loop",
+                    "commandId":"command:settings","status":"accepted","revision":0
+                }
+            }))
+            .expect("save settings through the real SQLite command transaction");
+        assert_eq!(result["status"], "accepted");
+        journal.append(&json!({
+            "type":"run.started", "sessionId":"session:loop", "runId":"run:loop",
+            "payload":{"inputMessageId":"message:loop","workspaceBindings":[],"runtimeSnapshot":runtime_snapshot()}
+        })).unwrap();
+        journal.append(&json!({
+            "type":"context.composed", "sessionId":"session:loop", "runId":"run:loop",
+            "payload":{
+                "providerRequestId":"provider-request:loop","purpose":"agent","responseConstraint":"normal",
+                "stableCoreHash":"context-hash-v1:0000000000000001",
+                "baseToolSchemaHash":"context-hash-v1:0000000000000002",
+                "selectedPluginSnapshotHash":"context-hash-v1:0000000000000003",
+                "dynamicInstructionBytes":0,"messages":[],"workspaceBindings":[],"tools":[],
+                "partitions":[
+                    {"kind":"instructions","itemCount":0,"requestShapeUnits":1},
+                    {"kind":"sessionControls","itemCount":0,"requestShapeUnits":0},
+                    {"kind":"tools","itemCount":0,"requestShapeUnits":0},
+                    {"kind":"workspaceBindings","itemCount":0,"requestShapeUnits":0},
+                    {"kind":"contextProviders","itemCount":0,"requestShapeUnits":0},
+                    {"kind":"journalMessages","itemCount":0,"requestShapeUnits":0},
+                    {"kind":"filesystemReferences","itemCount":0,"requestShapeUnits":0}
+                ]
+            }
+        })).unwrap();
+        journal.append(&json!({
+            "type":"tool.requested", "sessionId":"session:loop", "runId":"run:loop","callId":"call:loop",
+            "payload":{
+                "providerCallId":"provider-call:loop","attemptId":"attempt:loop","toolName":"bash",
+                "input":{"command":"pwd","executionMode":"read"}
+            }
+        })).unwrap();
+        journal.append(&json!({
+            "type":"provider.turn.settled", "sessionId":"session:loop", "runId":"run:loop",
+            "payload":{
+                "outcome":"completed","providerRequestId":"provider-request:loop","purpose":"agent",
+                "providerRuntimeRef":"provider-runtime:test","orderedCallIds":["call:loop"]
+            }
+        })).unwrap();
+        let event = journal.append(&json!({
+            "type":"tool.input-rejected", "sessionId":"session:loop", "runId":"run:loop","callId":"call:loop",
+            "payload":{"rejection":{
+                "sessionId":"session:loop","runId":"run:loop","callId":"call:loop","attemptId":"attempt:loop",
+                "extensionGenerationRef":"extension-generation:test","kernelCatalogSnapshotRef":"kernel-catalog:test",
+                "toolBindingRef":"tool-binding:bash","toolName":"bash","rejectedAt":"2026-09-07T00:00:00Z",
+                "input":{"command":"pwd","executionMode":"read"},
+                "error":{"code":"tool_input_invalid","message":"Tool was not executed.","issues":[{
+                    "path":"$.executionMode","rule":"additionalProperties","message":"Remove this undeclared field."
+                }]}
+            }}
+        })).expect("persist the rejected input without an execution record");
+        assert_eq!(event["type"], "tool.input-rejected");
     }
 
     #[test]
@@ -5170,30 +5713,46 @@ mod tests {
             "code":"provider_turn_outcome_unknown",
             "message":"Provider completion was not observed."
         });
+        let batch = [
+            json!({
+                "type":"provider.turn.settled",
+                "sessionId":"session:terminal",
+                "runId":"run:terminal",
+                "payload":{
+                    "providerRequestId":"provider-request:terminal",
+                    "purpose":"agent",
+                    "providerRuntimeRef":"provider-runtime:test",
+                    "outcome":"indeterminate",
+                    "error":error
+                }
+            }),
+            json!({
+                "type":"run.finishing",
+                "sessionId":"session:terminal",
+                "runId":"run:terminal",
+                "payload":{
+                    "outcome":"indeterminate",
+                    "error":error
+                }
+            }),
+        ];
+        let before = journal.read_events("session:terminal", 0).unwrap();
+        let mut invalid_shape = batch.clone();
+        invalid_shape[1]["payload"] = Value::Null;
+        let shape_error = journal
+            .append_batch(&invalid_shape)
+            .expect_err("invalid event shape must reject the whole batch");
+        assert_eq!(shape_error.code, "session_event_invalid");
+        assert_eq!(journal.read_events("session:terminal", 0).unwrap(), before);
+
+        let fact_error = journal
+            .append_batch(&[batch[0].clone(), batch[1].clone(), batch[1].clone()])
+            .expect_err("invalid lifecycle facts must roll back the whole batch");
+        assert_eq!(fact_error.code, "run_finishing_state_invalid");
+        assert_eq!(journal.read_events("session:terminal", 0).unwrap(), before);
+
         let committed = journal
-            .append_batch(&[
-                json!({
-                    "type":"provider.turn.settled",
-                    "sessionId":"session:terminal",
-                    "runId":"run:terminal",
-                    "payload":{
-                        "providerRequestId":"provider-request:terminal",
-                        "purpose":"agent",
-                        "providerRuntimeRef":"provider-runtime:test",
-                        "outcome":"indeterminate",
-                        "error":error
-                    }
-                }),
-                json!({
-                    "type":"run.finishing",
-                    "sessionId":"session:terminal",
-                    "runId":"run:terminal",
-                    "payload":{
-                        "outcome":"indeterminate",
-                        "error":error
-                    }
-                }),
-            ])
+            .append_batch(&batch)
             .expect("settle provider and start run release in one transaction");
         assert_eq!(committed[0]["type"], "provider.turn.settled");
         assert_eq!(committed[1]["type"], "run.finishing");
@@ -5380,5 +5939,115 @@ mod tests {
 
         validate_command_event_batch(&command, &rejected_with_event, &accepted)
             .expect("the matching accepted Plan lifecycle fact remains valid");
+    }
+
+    #[test]
+    fn explicit_plan_progress_persists_with_provider_order_and_tool_evidence() {
+        let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
+        journal
+            .create_session(
+                "session:progress",
+                "Progress",
+                &json!([]),
+                Some("profile:test"),
+            )
+            .unwrap();
+        let event = |kind: &str, payload: Value| json!({"type":kind, "sessionId":"session:progress", "runId":"run:progress", "payload":payload});
+        let composition = |id: &str| {
+            event(
+                "context.composed",
+                json!({
+                    "providerRequestId":id,"purpose":"agent","responseConstraint":"normal",
+                    "stableCoreHash":"context-hash-v1:0000000000000001", "baseToolSchemaHash":"context-hash-v1:0000000000000002",
+                    "selectedPluginSnapshotHash":"context-hash-v1:0000000000000003", "dynamicInstructionBytes":0,
+                    "messages":[], "workspaceBindings":[], "tools":[],
+                    "partitions":[
+                        {"kind":"instructions","itemCount":0,"requestShapeUnits":1},
+                        {"kind":"sessionControls","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"tools","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"workspaceBindings","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"contextProviders","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"journalMessages","itemCount":0,"requestShapeUnits":0},
+                        {"kind":"filesystemReferences","itemCount":0,"requestShapeUnits":0}
+                    ]
+                }),
+            )
+        };
+        let settled = |id: &str, calls: Value| {
+            event(
+                "provider.turn.settled",
+                json!({
+                    "outcome":"completed", "providerRequestId":id, "purpose":"agent",
+                    "providerRuntimeRef":"provider-runtime:test", "orderedCallIds":calls,
+                }),
+            )
+        };
+        journal.append(&event("run.started", json!({"inputMessageId":"message:progress", "workspaceBindings":[], "runtimeSnapshot":runtime_snapshot()}))).unwrap();
+        journal.append(&composition("request:plan")).unwrap();
+        let mut plan = event(
+            "plan.published",
+            json!({"providerCallId":"provider:plan", "planId":"plan:progress", "revision":1, "title":"Inspect", "summary":"Inspect files.", "steps":[{"stepId":"step:inspect", "title":"Inspect", "details":"Read source."}], "mutationManifest":[]}),
+        );
+        plan["callId"] = json!("call:plan");
+        journal.append(&plan).unwrap();
+        journal
+            .append(&settled("request:plan", json!(["call:plan"])))
+            .unwrap();
+        let mut confirm = event(
+            "plan.confirmed",
+            json!({"planId":"plan:progress", "revision":1, "commandId":"command:confirm", "decisionId":"decision:confirm", "authorities":[]}),
+        );
+        confirm["callId"] = json!("call:plan");
+        journal.append(&confirm).unwrap();
+        journal.append(&event("todo.seeded", json!({"sourcePlanId":"plan:progress", "sourcePlanRevision":1, "items":[{"todoId":"todo:inspect", "sourceStepId":"step:inspect", "label":"Inspect", "status":"pending"}]}))).unwrap();
+        // The store consumes the Kernel result as an opaque canonical record;
+        // this fixture supplies the fields used by the Todo evidence boundary.
+        let mut record = event(
+            "tool.completed",
+            json!({"record":{"recordId":"record:read", "outcome":"completed"}}),
+        );
+        record["callId"] = json!("call:read");
+        journal.append(&record).unwrap();
+        journal.append(&composition("request:progress")).unwrap();
+        let mut progress = event(
+            "todo.progressed",
+            json!({
+                "providerCallId":"provider:progress", "sourcePlanId":"plan:progress", "sourcePlanRevision":1,
+                "sourceFactRef":"record:read", "updates":[{"todoId":"todo:inspect", "status":"completed"}],
+            }),
+        );
+        progress["callId"] = json!("call:progress");
+        let mut missing = progress.clone();
+        missing["payload"]["sourceFactRef"] = json!("record:missing");
+        assert_eq!(
+            journal.append(&missing).unwrap_err().code,
+            "todo_source_fact_missing"
+        );
+        let mut completion = settled("request:progress", json!(["call:progress"]));
+        completion["payload"]["orderedOutputBlocks"] = json!([{
+            "kind":"toolCall", "outputIndex":0, "callId":"call:progress", "providerCallId":"provider:progress", "toolName":"plan.progress",
+            "item":{"type":"function_call", "call_id":"provider:progress", "name":"plan_progress", "arguments":"{}", "status":"completed"},
+        }]);
+        journal
+            .append_batch(&[progress.clone(), completion])
+            .unwrap();
+        assert_eq!(
+            journal.append(&progress).unwrap_err().code,
+            "provider_turn_composition_missing"
+        );
+        journal
+            .append(&event(
+                "plan.completed",
+                json!({"planId":"plan:progress", "revision":1}),
+            ))
+            .unwrap();
+        let events = journal.read_events("session:progress", 0).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|value| value["type"] == "todo.progressed")
+                .count(),
+            1
+        );
     }
 }

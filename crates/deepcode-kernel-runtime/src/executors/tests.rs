@@ -26,6 +26,13 @@ impl Drop for TempWorkspace {
 fn context_with_target(root: &Path, relative_path: &str) -> KernelToolExecutionContext {
     let canonical_root = root.canonicalize().expect("canonical test workspace");
     KernelToolExecutionContext {
+        output_directory: Some(canonical_root.join(format!(
+                "kernel-output-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))),
         workspace_root: Some(canonical_root.to_string_lossy().to_string()),
         workspace_id: Some("workspace:test".to_string()),
         private_resolved_targets: vec![canonical_root
@@ -492,4 +499,41 @@ fn bash_capture_keeps_bounded_stream_tails_deterministically() {
     assert_eq!(stderr.bytes, b"derr");
     assert!(stdout.truncated);
     assert!(stderr.truncated);
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_limits_preview_and_preserves_complete_output_for_bounded_reads() {
+    for line in ["中文🙂", &format!("中文🙂{}", "x".repeat(80))] {
+        let workspace = TempWorkspace::new("bash-output-archive");
+        let command = format!("i=0; while [ $i -lt 4500 ]; do printf '{line}\\n'; i=$((i+1)); done; printf 'diagnostic\\n' >&2");
+        let result = ProcessShellExecutor.invoke(KernelToolInvocation {
+            id: "archive".into(), tool_id: "bash".into(), input: serde_json::json!({
+                "command": command, "workspaceMode": "read", "executionScope": "host", "timeout": 5,
+            }),
+        }, context_with_target(&workspace.0, ".")).unwrap();
+        assert_eq!(result.outcome, KernelToolExecutionOutcome::Completed);
+        assert_eq!(result.output["truncated"], true);
+        let stdout = result.output["stdout"].as_str().unwrap();
+        let stderr = result.output["stderr"].as_str().unwrap();
+        assert!(stdout.len() + stderr.len() <= 50 * 1024);
+        assert!(stdout.lines().count() + stderr.lines().count() <= 2000);
+        assert!(!stdout.contains('\u{fffd}'));
+        assert_eq!(stderr, "diagnostic\n");
+        let full_path = result.output["fullOutput"]["stdout"]["path"]
+            .as_str()
+            .unwrap();
+        let full = fs::read_to_string(full_path).unwrap();
+        assert_eq!(full, format!("{line}\n").repeat(4500));
+        assert_eq!(result.output["fullOutput"]["stdout"]["bytes"], full.len());
+        assert_eq!(
+            fs::read_to_string(
+                result.output["fullOutput"]["stderr"]["path"]
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap(),
+            stderr
+        );
+    }
 }

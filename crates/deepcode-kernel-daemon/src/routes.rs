@@ -127,6 +127,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
             get(conversation_projection_get),
         )
         .route(
+            "/api/conversation/sessions/:session_id/context-compositions/:provider_request_id",
+            get(conversation_context_composition_get),
+        )
+        .route(
             "/api/conversation/sessions/:session_id/resources/read",
             post(conversation_resource_read),
         )

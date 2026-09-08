@@ -388,15 +388,29 @@
   margin-bottom: 0;
 }
 
-.local-agent__run-thinking {
+.local-agent__provider-stage {
+  position: relative;
   display: flex;
-  min-height: 28px;
-  align-items: center;
-  gap: 8px;
+  min-height: 47px;
+  align-items: flex-start;
+  gap: 9px;
   margin: 2px 0 20px;
-  color: var(--dc-faint);
+  color: var(--dc-muted);
   font-size: var(--dc-font-caption);
 }
+
+.local-agent__provider-stage > .local-agent__run-spinner { margin-top: 3px; }
+.local-agent__stage-main { display: flex; gap: 9px; flex-wrap: wrap; align-items: baseline; }
+.local-agent__stage-main > [role="status"] { font-weight: 500; color: var(--dc-foreground); }
+.local-agent__stage-time { font-variant-numeric: tabular-nums; }
+.local-agent__stage-dot { width: 8px; height: 8px; border: 2px solid currentColor; border-radius: 50%; margin-top: 5px; flex: 0 0 auto; }
+.local-agent__provider-stage--completed > .local-agent__stage-dot { color: #16815d; background: currentColor; }
+.local-agent__provider-stage--waiting > .local-agent__stage-dot { color: #987014; }
+.local-agent__provider-stage--failed > .local-agent__stage-dot,
+.local-agent__provider-stage--releaseFailed > .local-agent__stage-dot { color: #bc474b; background: currentColor; }
+.local-agent__input-rejection { font-size: 12px; overflow-wrap: anywhere; }
+.local-agent__input-rejection > div { display: flex; flex-direction: column; gap: 3px; margin: 8px 0; }
+.local-agent__tool-entry--rejected .local-agent__tool-entry-heading { color: #987014; }
 
 .local-agent__run-spinner {
   width: 13px;

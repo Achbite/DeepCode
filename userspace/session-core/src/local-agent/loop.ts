@@ -8,8 +8,8 @@ import type {
   ModelMessage,
   NewSessionEvent,
   PlanAuthority,
-  PlanOperation,
   ProviderTokenUsage,
+  ProviderActivityProjection,
   ProviderEvent,
   ProviderOutputBlock,
   ProviderRequest,
@@ -19,7 +19,9 @@ import type {
   PreparedToolDescriptor,
   ToolExecutionReply,
   ToolExecutionRecord,
+  ToolInputRejection,
   ToolExecutionRequest,
+  TodoProgressUpdate,
   WorkspaceBindingDisplay,
 } from '@deepcode/protocol';
 import {
@@ -27,6 +29,7 @@ import {
   KERNEL_REQUEST_VERSION,
   SESSION_CONTROL_INTERACTION_REQUEST,
   SESSION_CONTROL_PLAN_PUBLISH,
+  SESSION_CONTROL_PLAN_PROGRESS,
 } from '@deepcode/protocol';
 import type { AgentComposition } from './plugins.js';
 import {
@@ -36,7 +39,7 @@ import {
   type ContextCompactionRequestEvent,
 } from './compaction.js';
 import { buildAgentProviderRequest } from './contextComposer.js';
-import { LoopFailure, ProviderReportedFailure } from './loopFailure.js';
+import { LoopFailure, ProviderCompletedFailure, ProviderReportedFailure } from './loopFailure.js';
 import {
   canonicalJsonValue,
   decodeProviderToolInput,
@@ -121,6 +124,12 @@ type DecodedProviderOutputBlock = {
       name: string;
       input: Record<string, unknown>;
     }
+  | {
+      kind: 'toolCallRejected';
+      providerCallId: string;
+      name: string;
+      error: Extract<ProviderOutputBlock, { kind: 'toolCallRejected' }>['error'];
+    }
   | { kind: 'providerHosted'; providerCallId: string }
 );
 
@@ -137,6 +146,8 @@ interface ExpectedToolRecordIdentity {
 }
 
 type ProviderTurn =
+  | ({ kind: 'planProgress'; callId: string; providerCallId: string;
+       sourceFactRef: string; updates: TodoProgressUpdate[] } & ProviderTurnCommon)
   | ({ kind: 'answer'; content: string; messageId?: string } & ProviderTurnCommon)
   | {
       kind: 'interaction';
@@ -227,7 +238,6 @@ export async function runAgentLoop(
           expectedToolRecordIdentity(snapshot, runtime, requestEvent),
           commit,
         );
-        await synchronizeAutomaticTodo(snapshot, runId, commit);
       }
     }
 
@@ -282,7 +292,6 @@ export async function runAgentLoop(
             expectedToolRecordIdentity(snapshot, runtime, requestEvent),
             commit,
           );
-          await synchronizeAutomaticTodo(snapshot, runId, commit);
           continue;
         }
         throwIfAborted(signal);
@@ -316,6 +325,17 @@ export async function runAgentLoop(
         if (reply.callId !== requestEvent.callId) {
           throw new LoopFailure('kernel_call_identity_mismatch', 'Kernel 返回了其他工具调用的结果。');
         }
+        if (reply.status === 'inputRejected') {
+          assertToolRecordIdentity(reply.rejection, expectedToolRecordIdentity(snapshot, runtime, requestEvent));
+          await commit({
+            type: 'tool.input-rejected',
+            sessionId: snapshot.state.sessionId,
+            runId,
+            callId: requestEvent.callId,
+            payload: { rejection: reply.rejection },
+          });
+          continue;
+        }
         if (reply.status === 'approvalRequired') {
           if (approval.resolved) {
             throw new LoopFailure('kernel_approval_not_honored', 'Kernel 未接受已持久化的用户决策。');
@@ -343,10 +363,11 @@ export async function runAgentLoop(
           expectedToolRecordIdentity(snapshot, runtime, requestEvent),
           commit,
         );
-        await synchronizeAutomaticTodo(snapshot, runId, commit);
       }
 
       throwIfAborted(signal);
+      const correctionFailure = inputCorrectionFailure(snapshot.events, runId);
+      if (correctionFailure) throw correctionFailure;
       const completedPlan = completedPlanAwaitingLifecycle(snapshot.state);
       if (completedPlan) {
         await commit({
@@ -432,6 +453,15 @@ export async function runAgentLoop(
         });
       }
       switch (turn.kind) {
+        case 'planProgress': {
+          const fact = planProgressFact(snapshot, runId, turn);
+          await commit([
+            ...orderedProviderCallFacts(turn.completion, [fact]),
+            providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
+            ...completionDerivedFacts,
+          ]);
+          break;
+        }
         case 'interaction': {
           const interactionFact: NewSessionEvent = {
             type: 'interaction.requested',
@@ -647,17 +677,8 @@ export async function runAgentLoop(
             ),
             providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
             ...completionDerivedFacts,
-            {
-              type: 'run.finishing',
-              sessionId: snapshot.state.sessionId,
-              runId,
-              payload: { outcome: 'failed', error: { ...turn.rejection.error } },
-            },
           ]);
-          return finishingResult(runId, {
-            outcome: 'failed',
-            error: { ...turn.rejection.error },
-          });
+          break;
         }
         case 'continue':
           await commit([
@@ -669,7 +690,7 @@ export async function runAgentLoop(
       }
     }
   } catch (error) {
-    if (error instanceof ProviderReportedFailure) {
+    if (error instanceof ProviderReportedFailure || error instanceof ProviderCompletedFailure) {
       const failure = localAgentError(error);
       if (!hasSettlement(snapshot.events, runId)) {
         const pending = uncompletedProviderComposition(snapshot, runId);
@@ -809,6 +830,7 @@ async function consumeCompactionProvider(
     providerRuntimeRef: string;
   };
 }> {
+  const activity = trackProviderActivity(request, deps);
   let deltas = '';
   let completeMessage: Extract<ProviderEvent, { type: 'assistant.message' }>['data'] | undefined;
   const orderedOutputItems: Array<{ outputIndex: number; item: JsonObject }> = [];
@@ -822,6 +844,7 @@ async function consumeCompactionProvider(
         'Provider 在 completed 之后继续发送压缩事件。',
       );
     }
+    activity.observe(event);
     switch (event.type) {
       case 'text.delta':
         deltas += event.data.text;
@@ -961,6 +984,30 @@ async function consumeProvider(
   deps: AgentLoopDeps,
   signal: AbortSignal,
 ): Promise<ProviderTurn> {
+  let completed = false;
+  try {
+    return await consumeProviderOutput(request, toolCodec, runId, deps, signal, () => {
+      completed = true;
+    });
+  } catch (error) {
+    if (completed && !signal.aborted && !(error instanceof ProviderReportedFailure)) {
+      const failure = localAgentError(error);
+      throw new ProviderCompletedFailure(failure.code, failure.message);
+    }
+    throw error;
+  }
+}
+
+async function consumeProviderOutput(
+  request: ProviderRequest,
+  toolCodec: ProviderToolCodec,
+  runId: string,
+  deps: AgentLoopDeps,
+  signal: AbortSignal,
+  onCompleted: () => void,
+): Promise<ProviderTurn> {
+  const activity = trackProviderActivity(request, deps);
+  deps = { ...deps, updateAssistantDraft: activity.updateDraft };
   let deltas = '';
   let reasoningDeltas = '';
   let completeMessage: {
@@ -987,6 +1034,7 @@ async function consumeProvider(
         'Provider 在 completed 之后继续发送事件。',
       );
     }
+    activity.observe(event);
     switch (event.type) {
       case 'reasoning.delta': {
         reasoningDeltas += event.data.text;
@@ -1080,8 +1128,9 @@ async function consumeProvider(
         hostedWebSearchCalls.push(structuredClone(event.data.item));
         break;
       case 'completed':
-        contextUsage = decodeContextUsage(event.data);
         completed = true;
+        onCompleted();
+        contextUsage = decodeContextUsage(event.data);
         break;
       case 'failed':
         throw new ProviderReportedFailure(event.data.code, event.data.message);
@@ -1198,8 +1247,13 @@ async function consumeProvider(
       }
     : {};
   const narrative = decodedOutputBlocks.length === 0 && deltas.trim() ? deltas : undefined;
+  const rejectedCalls = decodedOutputBlocks.filter(
+    (block): block is Extract<DecodedProviderOutputBlock, { kind: 'toolCallRejected' }> => (
+      block.kind === 'toolCallRejected'
+    ),
+  );
   const seenCalls = new Set<string>();
-  for (const call of providerCalls) {
+  for (const call of [...providerCalls, ...rejectedCalls]) {
     if (!call.providerCallId || seenCalls.has(call.providerCallId)) {
       throw new LoopFailure(
         'provider_tool_call_duplicate',
@@ -1208,7 +1262,7 @@ async function consumeProvider(
     }
     seenCalls.add(call.providerCallId);
   }
-  const seenHostedSearchCalls = new Set<string>();
+  const seenHostedSearchCalls = new Set(seenCalls);
   for (const item of hostedWebSearchCalls) {
     const callId = typeof item.id === 'string' ? item.id : '';
     if (!callId || seenHostedSearchCalls.has(callId)) {
@@ -1249,13 +1303,22 @@ async function consumeProvider(
   const logicalCallByProviderCallId = new Map(calls.map((call) => (
     [call.providerCallId, call.callId] as const
   )));
+  for (const call of rejectedCalls) {
+    const callId = deps.nextId('call');
+    if (!callId || callId === call.providerCallId || logicalCallIds.has(callId)) {
+      throw new LoopFailure('logical_call_identity_invalid', 'Session 拒绝调用缺少独立且唯一的 LogicalCallId。');
+    }
+    logicalCallIds.add(callId);
+    logicalCallByProviderCallId.set(call.providerCallId, callId);
+  }
   const orderedMessageBlocks = decodedOutputBlocks.filter(
     (block): block is Extract<DecodedProviderOutputBlock, { kind: 'message' }> => (
       block.kind === 'message'
     ),
   );
-  const finalOrderedMessage = calls.length === 0 ? orderedMessageBlocks.at(-1) : undefined;
-  if (decodedOutputBlocks.length > 0 && calls.length === 0 && !finalOrderedMessage) {
+  const hasCalls = calls.length + rejectedCalls.length > 0;
+  const finalOrderedMessage = !hasCalls ? orderedMessageBlocks.at(-1) : undefined;
+  if (decodedOutputBlocks.length > 0 && !hasCalls && !finalOrderedMessage) {
     throw new LoopFailure(
       'provider_answer_empty',
       'Provider 有序 output items 没有产生最终答复消息。',
@@ -1291,7 +1354,8 @@ async function consumeProvider(
           item: structuredClone(block.item),
         };
       }
-      case 'toolCall': {
+      case 'toolCall':
+      case 'toolCallRejected': {
         const callId = logicalCallByProviderCallId.get(block.providerCallId);
         if (!callId) {
           throw new LoopFailure(
@@ -1299,14 +1363,16 @@ async function consumeProvider(
             'Provider output toolCall 缺少对应的 Session LogicalCallId。',
           );
         }
-        return {
+        const callBlock = {
           outputIndex: block.outputIndex,
-          kind: 'toolCall',
           callId,
           providerCallId: block.providerCallId,
           toolName: block.name,
           item: structuredClone(block.item),
         };
+        return block.kind === 'toolCallRejected'
+          ? { ...callBlock, kind: 'toolCallRejected', error: structuredClone(block.error) }
+          : { ...callBlock, kind: 'toolCall' };
       }
       case 'providerHosted':
         return {
@@ -1340,6 +1406,15 @@ async function consumeProvider(
 
   const controlCalls: Array<SessionControlCall & { providerCallId: string }> = [];
   const kernelCalls: typeof calls = [];
+  if ([...calls, ...rejectedCalls].some((call) => (
+    call.name === SESSION_CONTROL_INTERACTION_REQUEST || call.name === SESSION_CONTROL_PLAN_PUBLISH
+    || call.name === SESSION_CONTROL_PLAN_PROGRESS
+  )) && calls.length + rejectedCalls.length > 1) {
+    throw new LoopFailure(
+      'session_control_turn_conflict',
+      'interaction.request 与 plan.publish 必须独占 Provider turn。',
+    );
+  }
   for (const call of calls) {
     try {
       const control = decodeSessionControlCall(call.callId, call.name, call.input);
@@ -1369,9 +1444,7 @@ async function consumeProvider(
       };
     }
   }
-  const blockingControls = controlCalls.filter(
-    (control) => control.kind === 'interaction' || control.kind === 'plan',
-  );
+  const blockingControls = controlCalls;
   if (
     blockingControls.length > 1
     || blockingControls.length > 0 && kernelCalls.length > 0
@@ -1388,6 +1461,7 @@ async function consumeProvider(
     ...(orderedNarratives.length > 0 ? { narratives: orderedNarratives } : {}),
   };
   const control = blockingControls[0];
+  if (control?.kind === 'planProgress') return { ...control, ...common };
   if (control?.kind === 'interaction') {
     const interactionId = deps.nextId('interaction');
     if (interactionId === control.callId || interactionId === control.providerCallId) {
@@ -1416,7 +1490,7 @@ async function consumeProvider(
       ...common,
     };
   }
-  if (kernelCalls.length > 0) {
+  if (kernelCalls.length > 0 || rejectedCalls.length > 0) {
     return {
       kind: 'tools',
       calls: kernelCalls,
@@ -1438,6 +1512,36 @@ async function consumeProvider(
     content: answer.content,
     ...(answer.messageId ? { messageId: answer.messageId } : {}),
     ...common,
+  };
+}
+
+function trackProviderActivity(request: ProviderRequest, deps: AgentLoopDeps): {
+  updateDraft(draft: AssistantDraftProjection | null): void;
+  observe(event: ProviderEvent): void;
+} {
+  let draft: AssistantDraftProjection = { runId: request.runId, turnId: request.requestId, content: '' };
+  const activity: ProviderActivityProjection = {
+    purpose: request.purpose, phase: 'waitingResponse', startedAt: new Date().toISOString(),
+  };
+  const publish = () => deps.updateAssistantDraft({ ...draft, activity: { ...activity } });
+  publish();
+  return {
+    updateDraft(next) {
+      draft = next ?? { runId: request.runId, turnId: request.requestId, content: '' };
+      publish();
+    },
+    observe(event) {
+      if (event.type === 'reasoning.delta' && event.data.text) activity.phase = 'reasoning';
+      else if (event.type === 'text.delta' && event.data.text) activity.phase = 'generatingOutput';
+      else if (event.type === 'assistant.message') activity.phase = 'generatingOutput';
+      else if (event.type === 'output.item.completed') {
+        activity.phase = event.data.item.type === 'message' ? 'generatingOutput' : 'awaitingOutput';
+      } else if (event.type === 'tool.call' || event.type === 'hosted.web-search.completed') {
+        activity.phase = 'awaitingOutput';
+      } else return;
+      activity.lastContentAt = new Date().toISOString();
+      publish();
+    },
   };
 }
 
@@ -1481,26 +1585,50 @@ function decodeProviderOutputBlock(
         );
       }
       let input: unknown;
+      const rejectInput = (message: string): DecodedProviderOutputBlock => ({
+        outputIndex: output.outputIndex,
+        kind: 'toolCallRejected',
+        providerCallId,
+        name: canonicalName,
+        item,
+        error: {
+          code: 'provider_tool_call_arguments_invalid',
+          message,
+          issues: [{ path: '$', rule: 'json_object', message, expected: 'JSON object' }],
+        },
+      });
       try {
         input = JSON.parse(item.arguments);
       } catch {
-        throw new LoopFailure(
-          'provider_tool_call_arguments_invalid',
-          'Provider function_call arguments 不是有效 JSON。',
-        );
+        return rejectInput('Provider function_call arguments 不是有效 JSON。');
       }
       if (!isRecord(input)) {
-        throw new LoopFailure(
-          'provider_tool_call_arguments_invalid',
-          'Provider function_call arguments 必须是 JSON 对象。',
-        );
+        return rejectInput('Provider function_call arguments 必须是 JSON 对象。');
+      }
+      let decodedInput: JsonObject;
+      try {
+        decodedInput = decodeProviderToolInput(toolCodec, canonicalName, input);
+      } catch (error) {
+        if (!(error instanceof LoopFailure)) throw error;
+        return {
+          outputIndex: output.outputIndex,
+          kind: 'toolCallRejected',
+          providerCallId,
+          name: canonicalName,
+          item,
+          error: {
+            code: error.code,
+            message: error.message,
+            issues: [{ path: '$.workspace', rule: 'workspace_binding', message: error.message }],
+          },
+        };
       }
       return {
         outputIndex: output.outputIndex,
         kind: 'toolCall',
         providerCallId,
         name: canonicalName,
-        input: decodeProviderToolInput(toolCodec, canonicalName, input),
+        input: decodedInput,
         item,
       };
     }
@@ -1531,16 +1659,51 @@ function decodeProviderOutputBlock(
   }
 }
 
+/** One correction turn per run, counted from durable facts rather than process state. */
+function inputCorrectionFailure(events: readonly SessionEvent[], runId: string): LoopFailure | null {
+  const errorsByCall = new Map<string, LocalAgentError>();
+  for (const event of events) {
+    if (!('runId' in event) || event.runId !== runId) continue;
+    if (event.type === 'tool.input-rejected') {
+      errorsByCall.set(event.callId, event.payload.rejection.error);
+    } else if (event.type === 'session.control.rejected' && event.payload.error.code !== 'plan_revision_unchanged') {
+      errorsByCall.set(event.callId, event.payload.error);
+    }
+  }
+  const rejectedTurns: LocalAgentError[][] = [];
+  for (const event of events) {
+    if (event.type !== 'provider.turn.settled' || event.runId !== runId || event.payload.outcome !== 'completed') continue;
+    const errors = [
+      ...event.payload.orderedCallIds.flatMap((callId) => {
+        const error = errorsByCall.get(callId);
+        return error ? [error] : [];
+      }),
+      ...(event.payload.orderedOutputBlocks ?? []).flatMap((block) => (
+        block.kind === 'toolCallRejected' ? [block.error] : []
+      )),
+    ];
+    if (errors.length > 0) rejectedTurns.push(errors);
+  }
+  if (rejectedTurns.length < 2) return null;
+  return new LoopFailure(
+    'tool_input_correction_exhausted',
+    `本次运行的工具参数纠正机会已用尽。原始拒绝：${rejectedTurns.flat().map((error) => `${error.code}: ${error.message}`).join('；')}`,
+  );
+}
+
 function assistantDraftBlocks(
   outputs: readonly { outputIndex: number; item: JsonObject }[],
   toolCodec: ProviderToolCodec,
   streamedTextByOutputIndex: ReadonlyMap<number, string> = new Map(),
 ): AssistantDraftBlockProjection[] {
   const blocks = outputs.flatMap((output): AssistantDraftBlockProjection[] => {
+    // Draft presentation must not admit tool inputs or interrupt their native stream.
+    if (output.item.type === 'function_call' || output.item.type === 'reasoning') return [];
     const block = decodeProviderOutputBlock(output, toolCodec);
     switch (block.kind) {
       case 'reasoning':
       case 'toolCall':
+      case 'toolCallRejected':
         return [];
       case 'message': {
         const phase = block.item.phase;
@@ -1804,7 +1967,7 @@ function expectedToolRecordIdentity(
 }
 
 function assertToolRecordIdentity(
-  record: ToolExecutionRecord,
+  record: ToolExecutionRecord | ToolInputRejection,
   expected: ExpectedToolRecordIdentity,
 ): void {
   if (
@@ -1831,7 +1994,8 @@ function pendingToolRequests(
   runId: string,
 ): Array<Extract<SessionEvent, { type: 'tool.requested' }>> {
   const completed = new Set(events.flatMap((event) => (
-    event.type === 'tool.completed' && event.runId === runId ? [event.callId] : []
+    (event.type === 'tool.completed' || event.type === 'tool.input-rejected')
+      && event.runId === runId ? [event.callId] : []
   )));
   return events.filter(
     (event): event is Extract<SessionEvent, { type: 'tool.requested' }> => (
@@ -2010,159 +2174,43 @@ function planDraftInput(draft: PlanPublicationDraft): Record<string, unknown> {
   };
 }
 
-async function synchronizeAutomaticTodo(
+function planProgressFact(
   snapshot: LoopSnapshot,
   runId: string,
-  commit: (event: NewSessionEvent | readonly NewSessionEvent[]) => Promise<void>,
-): Promise<void> {
-  const progress = automaticTodoProgress(snapshot, runId);
-  if (progress) await commit(progress);
-}
-
-function automaticTodoProgress(
-  snapshot: LoopSnapshot,
-  runId: string,
-): NewSessionEvent | null {
+  turn: Extract<ProviderTurn, { kind: 'planProgress' }>,
+): NewSessionEvent {
   const active = snapshot.state.activePlanRef;
   const todo = snapshot.state.todoList;
-  if (
-    !active
-    || !todo
-    || todo.sourcePlanId !== active.planId
-    || todo.sourcePlanRevision !== active.revision
-    || todo.items.length === 0
-  ) return null;
-  const plan = snapshot.state.plans.find((candidate) => (
-    candidate.planId === active.planId
-    && candidate.revision === active.revision
-    && candidate.status === 'confirmed'
+  const confirmation = snapshot.events.findLast((event) => (
+    event.type === 'plan.confirmed' && event.payload.planId === active?.planId
+    && event.payload.revision === active?.revision
   ));
-  if (!plan || plan.mutationManifest.length === 0) return null;
-
-  const remaining = new Map<string, number>();
-  for (const operation of plan.mutationManifest) {
-    const key = planOperationKey(operation);
-    remaining.set(key, (remaining.get(key) ?? 0) + 1);
-  }
-  let completedOperations = 0;
-  let latestRecord: ToolExecutionRecord | undefined;
-  for (const event of snapshot.events) {
-    if (event.type !== 'tool.completed' || event.runId !== runId) continue;
-    const record = event.payload.record;
-    const authority = planAuthority(record);
-    if (
-      authority?.planId !== active.planId
-      || authority?.revision !== active.revision
-    ) continue;
-    const key = recordOperationKey(record);
-    if (!key || (remaining.get(key) ?? 0) === 0) continue;
-    latestRecord = record;
-    if (record.outcome === 'completed') {
-      remaining.set(key, remaining.get(key)! - 1);
-      completedOperations += 1;
-    }
-  }
-  if (!latestRecord) return null;
-
-  const completedItems = completedOperations === plan.mutationManifest.length
-    ? todo.items.length
-    : Math.floor(
-        completedOperations * todo.items.length / plan.mutationManifest.length,
-      );
-  const updates = todo.items.flatMap((item, index) => {
-    const desired = index < completedItems
-      ? 'completed' as const
-      : index === completedItems
-        ? 'inProgress' as const
-        : 'pending' as const;
-    return item.status === desired ? [] : [{ todoId: item.todoId, status: desired }];
-  });
-  if (updates.length === 0) return null;
-  return {
-    type: 'todo.progressed',
-    sessionId: snapshot.state.sessionId,
-    runId,
+  const evidence = snapshot.events.find((event) => (
+    event.type === 'tool.completed' && event.runId === runId
+    && event.payload.record.recordId === turn.sourceFactRef
+    && event.sequence > (confirmation?.sequence ?? Infinity)
+  ));
+  const valid = active && todo && confirmation
+    && todo.sourcePlanId === active.planId && todo.sourcePlanRevision === active.revision
+    && evidence?.type === 'tool.completed'
+    && turn.updates.every((update) => todo.items.some((item) => item.todoId === update.todoId))
+    && (!turn.updates.some((update) => update.status === 'completed') || evidence.payload.record.outcome === 'completed');
+  if (!valid) return {
+    type: 'session.control.rejected', sessionId: snapshot.state.sessionId, runId, callId: turn.callId,
     payload: {
-      sourcePlanId: active.planId,
-      sourcePlanRevision: active.revision,
-      sourceFactRef: latestRecord.recordId,
-      updates,
+      providerCallId: turn.providerCallId, toolName: SESSION_CONTROL_PLAN_PROGRESS,
+      input: { sourceFactRef: turn.sourceFactRef, updates: turn.updates },
+      error: { code: 'plan_progress_evidence_invalid', message: 'Use current Todo IDs and a tool result recordId from this run after Plan confirmation. Completion requires a successful result.' },
     },
   };
-}
-
-function planOperationKey(operation: PlanOperation): string {
-  return JSON.stringify(canonicalJsonValue(operation));
-}
-
-function recordOperationKey(record: ToolExecutionRecord): string | null {
-  const workspaceId = record.preparedEffect.workspaceId;
-  if (!workspaceId) return null;
-  const invocation = recordCanonicalArguments(record);
-  if (!invocation) return null;
-  if (record.toolName === 'bash') {
-    if (
-      typeof invocation.command !== 'string'
-      || invocation.workspaceMode !== 'write'
-      || invocation.executionScope !== 'workspace' && invocation.executionScope !== 'host'
-      || invocation.terminal !== undefined && !isCanonicalTerminalInput(invocation.terminal)
-    ) return null;
-    return planOperationKey({
-      workspaceId,
-      operation: 'bash',
-      command: invocation.command,
-      workspaceMode: 'write',
-      executionScope: invocation.executionScope,
-      ...(invocation.terminal === undefined
-        ? {}
-        : { terminal: invocation.terminal as { stdin: string } }),
-    });
-  }
-  if (
-    record.toolName !== 'fs.write'
-    && record.toolName !== 'fs.edit'
-    && record.toolName !== 'fs.delete'
-  ) return null;
-  const target = record.preparedEffect.logicalTargets[0];
-  if (!target || record.preparedEffect.logicalTargets.length !== 1) return null;
-  if (record.toolName === 'fs.delete') {
-    const targetKind = invocation.targetKind;
-    if (targetKind !== 'file' && targetKind !== 'directoryTree') return null;
-    return planOperationKey({
-      workspaceId,
-      operation: 'fs.delete',
-      target,
-      targetKind,
-    });
-  }
-  return planOperationKey({
-    workspaceId,
-    operation: record.toolName,
-    target,
-  });
-}
-
-function recordCanonicalArguments(record: ToolExecutionRecord): JsonObject | null {
-  const invocation = record.preparedEffect.canonicalInvocation;
-  return invocation.toolName === record.toolName ? invocation.arguments : null;
-}
-
-function planAuthority(record: ToolExecutionRecord): Extract<
-  ToolExecutionRecord['authority'],
-  { source: 'plan' }
-> | null {
-  const authority = record.authority;
-  if (authority.source === 'plan') return authority;
-  return authority.source === 'composite' && authority.workspaceAuthority.source === 'plan'
-    ? authority.workspaceAuthority
-    : null;
-}
-
-function isCanonicalTerminalInput(value: unknown): value is { stdin: string } {
-  return isRecord(value)
-    && Object.keys(value).length === 1
-    && typeof value.stdin === 'string'
-    && new TextEncoder().encode(value.stdin).byteLength <= 65_536;
+  return {
+    type: 'todo.progressed', sessionId: snapshot.state.sessionId, runId, callId: turn.callId,
+    payload: {
+      providerCallId: turn.providerCallId,
+      sourcePlanId: active.planId, sourcePlanRevision: active.revision,
+      sourceFactRef: turn.sourceFactRef, updates: turn.updates,
+    },
+  };
 }
 
 function completedPlanAwaitingLifecycle(

@@ -167,7 +167,6 @@ fn unix_millis() -> u128 {
 
 fn invoke_web_fetch(invocation: KernelToolInvocation) -> KernelResult<KernelToolExecutionResult> {
     let url = get_string(&invocation.input, "url").unwrap_or_default();
-    validate_http_url(&url)?;
     let max_bytes = invocation
         .input
         .get("maxBytes")
@@ -475,6 +474,21 @@ mod tests {
             web_search_auth_header_name: header.to_string(),
             web_search_auth_secret_ref: secret_ref.to_string(),
         }
+    }
+
+    #[test]
+    fn web_fetch_rejects_non_http_urls_at_the_shared_http_boundary() {
+        let error = invoke_web_fetch(KernelToolInvocation {
+            id: "invocation:fetch".to_string(),
+            tool_id: "web.fetch".to_string(),
+            input: json!({"url": "ftp://example.invalid/document"}),
+        })
+        .expect_err("web.fetch must retain HTTP URL validation");
+        assert!(matches!(
+            error,
+            KernelError::PermissionDenied(message)
+                if message == "network tools only accept http/https URLs"
+        ));
     }
 
     #[test]
