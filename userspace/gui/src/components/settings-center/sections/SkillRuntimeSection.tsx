@@ -6,6 +6,7 @@ interface SkillMount {
   id: string;
   path: string;
   enabled: boolean;
+  activationMediaTypes: string[];
 }
 
 function parseMounts(value: unknown): SkillMount[] {
@@ -17,7 +18,16 @@ function parseMounts(value: unknown): SkillMount[] {
       if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
       const record = item as Record<string, unknown>;
       if (typeof record.id !== 'string' || typeof record.path !== 'string') return [];
-      return [{ id: record.id, path: record.path, enabled: record.enabled !== false }];
+      const activationMediaTypes = Array.isArray(record.activationMediaTypes)
+        ? record.activationMediaTypes.filter((value): value is string =>
+          typeof value === 'string' && value.trim().length > 0)
+        : [];
+      return [{
+        id: record.id,
+        path: record.path,
+        enabled: record.enabled !== false,
+        activationMediaTypes,
+      }];
     });
   } catch {
     return [];
@@ -29,13 +39,14 @@ function newMount(): SkillMount {
     id: `skill-${Date.now().toString(36)}`,
     path: '',
     enabled: true,
+    activationMediaTypes: [],
   };
 }
 
 const SkillRuntimeSection: React.FC = () => {
   const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
   const loading = useSettingsStore((state) => state.loading);
-  const patchUserSetting = useSettingsStore((state) => state.patchUserSetting);
+  const patchUserSettingsBatch = useSettingsStore((state) => state.patchUserSettingsBatch);
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
   const stored = useMemo(
     () => parseMounts(effectiveSettings['skills.mounts']),
@@ -57,9 +68,17 @@ const SkillRuntimeSection: React.FC = () => {
 
   const save = async () => {
     setMessage(null);
-    await patchUserSetting('skills.autoLoad', autoLoad);
-    await patchUserSetting('skills.mounts', JSON.stringify(mounts, null, 2));
-    setMessage(t(language, 'settings.runtime.restartDaemonAfterSave'));
+    const activation = await patchUserSettingsBatch({
+      'skills.autoLoad': autoLoad,
+      'skills.mounts': JSON.stringify(mounts, null, 2),
+    });
+    if (!activation) return;
+    setMessage(t(
+      language,
+      activation === 'nextRun'
+        ? 'settings.runtime.nextRunActivationAfterSave'
+        : 'settings.runtime.savedImmediate',
+    ));
   };
 
   return (
@@ -125,6 +144,17 @@ const SkillRuntimeSection: React.FC = () => {
                 value={mount.path}
                 onChange={(event) => update(mount.id, { path: event.target.value })}
                 placeholder={t(language, 'settings.skill.pathPlaceholder')}
+              />
+              <input
+                className="settings-field__input settings-field__input--wide"
+                value={mount.activationMediaTypes.join(', ')}
+                onChange={(event) => update(mount.id, {
+                  activationMediaTypes: event.target.value
+                    .split(',')
+                    .map((value) => value.trim().toLowerCase())
+                    .filter(Boolean),
+                })}
+                placeholder={t(language, 'settings.skill.activationMediaTypesPlaceholder')}
               />
             </div>
           ))}

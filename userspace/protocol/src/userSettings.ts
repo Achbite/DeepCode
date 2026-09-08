@@ -136,8 +136,10 @@ export interface PatchUserSettingsRequest {
   patches: Record<string, UserSettingValue>;
 }
 
+export type UserSettingsActivation = 'immediate' | 'nextRun';
+
 export interface PatchUserSettingsResult {
   settings: UserSettings;
   changedKeys: string[];
-  restartRequired?: boolean;
+  activation: UserSettingsActivation;
 }

@@ -1,4 +1,5 @@
 import type { ConversationCommand } from '@deepcode/protocol';
+import { responseFrames } from './responseFrames.js';
 import {
   CONVERSATION_COMMAND_VERSION,
   LOCAL_AGENT_PROTOCOL_VERSION,
@@ -7,17 +8,15 @@ import {
   HttpCommandJournal,
   HttpKernelPort,
   HttpProviderPort,
+  HttpRunPreparationPort,
 } from './local-agent/httpPorts.js';
 import {
   completeMemoryProvider,
   composeAgent,
   type AgentPlugin,
 } from './local-agent/plugins.js';
-import {
-  decodeStartupPluginConfig,
-  skillPlugin,
-} from './local-agent/skillPlugins.js';
 import { SessionService } from './local-agent/service.js';
+import { decodeConversationReadQuery } from './local-agent/conversationRead.js';
 
 declare const process: {
   env: Record<string, string | undefined>;
@@ -34,58 +33,44 @@ const MAX_REQUEST_BYTES = 1024 * 1024;
 type BridgeRequest = {
   protocolVersion: typeof LOCAL_AGENT_PROTOCOL_VERSION;
   requestId: string;
-  operation: 'health' | 'createSession' | 'deleteSession' | 'submit' | 'snapshot' | 'shutdown';
+  operation: 'health' | 'createSession' | 'deleteSession' | 'submit' | 'snapshot' | 'contextComposition' | 'read' | 'shutdown';
   data: Record<string, unknown>;
 };
 
 async function main(): Promise<void> {
   const apiBase = requiredEnvironment('DEEPCODE_LOCAL_AGENT_API_BASE');
   const serviceToken = requiredEnvironment('DEEPCODE_LOCAL_AGENT_TOKEN');
-  const configuredProfileId = process.env.DEEPCODE_LOCAL_AGENT_PROFILE_ID?.trim();
-  const startupPlugins = decodeStartupPluginConfig(
-    process.env.DEEPCODE_LOCAL_AGENT_PLUGIN_CONFIG,
-  );
-  delete process.env.DEEPCODE_LOCAL_AGENT_PLUGIN_CONFIG;
   const journal = new HttpCommandJournal({ apiBase, serviceToken });
   const kernel = new HttpKernelPort({ apiBase, serviceToken });
   const provider = new HttpProviderPort({ apiBase, serviceToken });
+  const stableCoreInstructions = Object.freeze([{
+    id: 'deepcode.coding-agent',
+    text: `You are DeepCode, a coding agent.
+
+Follow the user's current request and applicable project instructions. Write the response body in the language of the user's current input unless the user explicitly requests another language.
+
+Use only the tools and plugin capabilities available for the current run. Inspect relevant evidence before changing the workspace, and stay within the user's authorized scope.
+
+At the start of a new tool phase, emit one brief progress sentence before making calls. Do not repeat it for mechanically related calls that continue the same purpose.
+
+When workspace mutations require a Plan, publish its goal, affected files, steps, build environment and verification, then wait for confirmation. Execute immediately after confirmation. Report Todo step progress through the available Session progress control with tool-result evidence. Ask only for missing decisions. Revise the Plan for changes to goals, file targets, destructive actions or execution scope; routine edits, command details, log handling and verification adjustments within that scope do not require reconfirmation.
+
+Once the available evidence is sufficient for the next authorized step, perform that step and use its result to decide what to do next. Re-read or probe to resolve a concrete uncertainty or failure. Avoid repeatedly reconstructing full-file contents when a targeted edit is sufficient.
+Treat tool failures and input rejections as facts. A rejected input was not executed. The Session allows one correction opportunity per run: use the reported field diagnostics to issue a valid call, and do not repeat successful peer calls. Report a blocker when the required action cannot be completed within the available authority and capabilities. Never claim unperformed work as complete.
+
+Use the project's declared build and test entrypoints, including its container workflow when required. Finding an executable only establishes its location; determine service availability from an actual permitted service check and preserve its error. If the required environment or execution authority is unavailable, request it or report the blocker; do not substitute a host compiler or another toolchain. Keep verbose build and test logs in files, inspect the relevant result, and do not repeat successful work.
+
+Be concise, use Markdown, show file paths clearly, and do not use emojis unless the user requests them or they are necessary for meaning.
+
+Write mathematical notation as standard LaTeX: use $...$ for inline math and $$...$$ for display math. Do not render ordinary formulas as plain-text pseudo-notation or code blocks unless the user asks for literal source.`,
+  }]);
+  const runPreparation = new HttpRunPreparationPort({
+    apiBase,
+    serviceToken,
+    stableCoreInstructions,
+  });
   const serviceAbort = new AbortController();
-  const workspaceAutonomyInstruction = startupPlugins.workspaceMutation === 'allow'
-    ? '工作区内 fs.* 修改可直接执行，不要仅因权限发布 Plan；process.shell 可直接用于工作区调试。工作区外副作用等待用户决定。'
-    : '工作区内 fs.* 修改前先调用 plan.publish 并等待确认；只读、process.shell 和普通回答不要求 Plan。';
-  const engineeringDecisionInstruction = startupPlugins.engineeringDecisions === 'delegate'
-    ? '有充分工作区事实时自行选择最小一致工程路线；缺少需求事实、涉及工作区外或不可逆外部动作时调用 interaction.request。'
-    : '实质改变需求、公共合同、事实 owner 或工程路线时调用 interaction.request；不强制提供多个选项。';
   const plugins: readonly AgentPlugin[] = [
-    {
-      id: 'deepcode.core.instructions',
-      setup: () => ({
-        instructions: [{
-          id: 'deepcode.coding-agent',
-          text: '你是本地编码 Agent。依据用户指令和工具事实工作；需要未获授权的副作用时等待用户决定。除非用户明确要求或语义确有必要，避免使用表情符号。',
-        }],
-      }),
-    },
-    ...(startupPlugins.systemPrompt.trim()
-      ? [{
-          id: 'deepcode.user.instructions',
-          setup: () => ({
-            instructions: [{
-              id: 'deepcode.user.system-prompt',
-              text: startupPlugins.systemPrompt,
-            }],
-          }),
-        } satisfies AgentPlugin]
-      : []),
-    {
-      id: 'deepcode.core.workspace-autonomy',
-      setup: () => ({
-        instructions: [{
-          id: 'deepcode.workspace-autonomy',
-          text: `${workspaceAutonomyInstruction}\n${engineeringDecisionInstruction}`,
-        }],
-      }),
-    },
     {
       id: 'deepcode.core.provider',
       setup: () => ({
@@ -96,13 +81,6 @@ async function main(): Promise<void> {
       id: 'deepcode.core.memory',
       setup: () => ({ memoryProviders: [completeMemoryProvider] }),
     },
-    {
-      id: 'deepcode.kernel.tools',
-      setup: async () => ({
-        toolIds: (await kernel.listTools()).map((tool) => tool.name),
-      }),
-    },
-    ...startupPlugins.skills.map(skillPlugin),
   ];
   const service = new SessionService(journal, {
     create: async ({ workspaceBindings }) => ({
@@ -112,9 +90,9 @@ async function main(): Promise<void> {
         providerId: 'provider.configured',
         memoryId: completeMemoryProvider.id,
         kernel,
+        runPreparation,
         signal: serviceAbort.signal,
       }),
-      ...(configuredProfileId ? { profileId: configuredProfileId } : {}),
     }),
   });
 
@@ -174,6 +152,12 @@ async function dispatch(
     }
     case 'snapshot':
       return await service.snapshot(requiredString(request.data, 'sessionId'));
+    case 'read':
+      return await service.read(decodeConversationReadQuery(request.data));
+    case 'contextComposition':
+      return await service.contextComposition(
+        requiredString(request.data, 'sessionId'), requiredString(request.data, 'providerRequestId'),
+      );
     case 'shutdown':
       return { stopped: true };
   }
@@ -187,39 +171,91 @@ function decodeCommand(value: unknown): ConversationCommand {
     || !validId(value.sessionId)
   ) throw new Error('conversation_command_invalid');
   switch (value.type) {
+    case 'session.model-settings.set':
+      if (!hasExactKeys(value, ['schemaVersion', 'type', 'commandId', 'sessionId', 'settings'])
+        || !isRecord(value.settings)
+        || !hasExactKeys(value.settings, ['profileId', 'reasoningEffortOverride'])
+        || !validId(value.settings.profileId)
+        || !validReasoningOverride(value.settings.reasoningEffortOverride)) {
+        throw new Error('conversation_command_invalid');
+      }
+      return value as unknown as ConversationCommand;
     case 'session.directory-index.attach':
-      if (!isWorkspaceBinding(value.workspaceBinding)) {
+      if (
+        !hasExactKeys(value, [
+          'schemaVersion', 'type', 'commandId', 'sessionId', 'workspaceBinding',
+        ])
+        || !isWorkspaceBinding(value.workspaceBinding)
+      ) {
         throw new Error('conversation_command_invalid');
       }
       return value as unknown as ConversationCommand;
     case 'session.directory-index.detach':
-      if (!validId(value.workspaceId)) throw new Error('conversation_command_invalid');
+      if (
+        !hasExactKeys(value, [
+          'schemaVersion', 'type', 'commandId', 'sessionId', 'workspaceId',
+        ])
+        || !validId(value.workspaceId)
+      ) throw new Error('conversation_command_invalid');
       return value as unknown as ConversationCommand;
     case 'message.submit':
       if (
-        typeof value.text !== 'string'
-        || (value.directoryAttachments !== undefined
-          && !isWorkspaceBindingArray(value.directoryAttachments))
+        !hasExactKeys(
+          value,
+          ['schemaVersion', 'type', 'commandId', 'sessionId', 'text'],
+          [
+            'filesystemReferences', 'profileId', 'reasoningEffortOverride', 'pluginCatalogRevision', 'pluginSelections',
+          ],
+        )
+        || typeof value.text !== 'string'
+        || (value.filesystemReferences !== undefined
+          && !isFilesystemReferenceArray(value.filesystemReferences))
         || (value.profileId !== undefined && !validId(value.profileId))
+        || (value.reasoningEffortOverride !== undefined && !validReasoningOverride(value.reasoningEffortOverride))
+        || !validPluginSelections(value.pluginCatalogRevision, value.pluginSelections)
+      ) throw new Error('conversation_command_invalid');
+      return value as unknown as ConversationCommand;
+    case 'context.focus':
+      if (
+        !hasExactKeys(
+          value,
+          ['schemaVersion', 'type', 'commandId', 'sessionId', 'task'],
+          [
+            'filesystemReferences', 'profileId', 'reasoningEffortOverride', 'pluginCatalogRevision', 'pluginSelections',
+          ],
+        )
+        || typeof value.task !== 'string'
+        || !value.task.trim()
+        || (value.filesystemReferences !== undefined
+          && !isFilesystemReferenceArray(value.filesystemReferences))
+        || (value.profileId !== undefined && !validId(value.profileId))
+        || (value.reasoningEffortOverride !== undefined && !validReasoningOverride(value.reasoningEffortOverride))
+        || !validPluginSelections(value.pluginCatalogRevision, value.pluginSelections)
       ) throw new Error('conversation_command_invalid');
       return value as unknown as ConversationCommand;
     case 'message.feedback.set':
       if (
-        !validId(value.messageId)
+        !hasExactKeys(value, [
+          'schemaVersion', 'type', 'commandId', 'sessionId', 'messageId', 'feedback',
+        ])
+        || !validId(value.messageId)
         || value.feedback !== null && value.feedback !== 'up' && value.feedback !== 'down'
       ) throw new Error('conversation_command_invalid');
       return value as unknown as ConversationCommand;
-    case 'run.profile.select':
-      if (!validId(value.runId) || !validId(value.profileId)) {
-        throw new Error('conversation_command_invalid');
-      }
-      return value as unknown as ConversationCommand;
     case 'run.cancel':
-      if (!validId(value.runId)) throw new Error('conversation_command_invalid');
+      if (
+        !hasExactKeys(value, [
+          'schemaVersion', 'type', 'commandId', 'sessionId', 'runId',
+        ])
+        || !validId(value.runId)
+      ) throw new Error('conversation_command_invalid');
       return value as unknown as ConversationCommand;
     case 'interaction.respond':
       if (
-        !validId(value.runId)
+        !hasExactKeys(value, [
+          'schemaVersion', 'type', 'commandId', 'sessionId', 'runId', 'interactionId', 'response',
+        ])
+        || !validId(value.runId)
         || !validId(value.interactionId)
         || typeof value.response !== 'string'
         || !value.response.trim()
@@ -227,7 +263,11 @@ function decodeCommand(value: unknown): ConversationCommand {
       return value as unknown as ConversationCommand;
     case 'approval.respond':
       if (
-        !validId(value.runId)
+        !hasExactKeys(value, [
+          'schemaVersion', 'type', 'commandId', 'sessionId', 'runId', 'callId', 'approvalId',
+          'decision',
+        ])
+        || !validId(value.runId)
         || !validId(value.callId)
         || !validId(value.approvalId)
         || value.decision !== 'allow' && value.decision !== 'deny'
@@ -235,7 +275,11 @@ function decodeCommand(value: unknown): ConversationCommand {
       return value as unknown as ConversationCommand;
     case 'plan.respond':
       if (
-        !validId(value.runId)
+        !hasExactKeys(value, [
+          'schemaVersion', 'type', 'commandId', 'sessionId', 'runId', 'planId', 'revision',
+          'response',
+        ])
+        || !validId(value.runId)
         || !validId(value.planId)
         || !positiveInteger(value.revision)
         || !decodePlanResponse(value.response)
@@ -244,6 +288,20 @@ function decodeCommand(value: unknown): ConversationCommand {
     default:
       throw new Error('conversation_command_invalid');
   }
+}
+
+function validReasoningOverride(value: unknown): boolean {
+  return value === null || typeof value === 'string' && ['low', 'medium', 'high', 'max'].includes(value);
+}
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): boolean {
+  const allowed = new Set([...required, ...optional]);
+  return required.every((key) => Object.hasOwn(value, key))
+    && Object.keys(value).every((key) => allowed.has(key));
 }
 
 function isWorkspaceBinding(value: unknown): value is {
@@ -259,13 +317,80 @@ function isWorkspaceBinding(value: unknown): value is {
     && !/[\u0000-\u001f\u007f]/u.test(value.displayName);
 }
 
-function isWorkspaceBindingArray(value: unknown): boolean {
+function isFilesystemReferenceArray(value: unknown): boolean {
   if (!Array.isArray(value) || value.length > 8) return false;
-  const ids = new Set<string>();
-  return value.every((binding) => (
-    isWorkspaceBinding(binding)
-    && ids.size !== ids.add(binding.workspaceId).size
-  ));
+  const referenceIds = new Set<string>();
+  const targets = new Set<string>();
+  return value.every((reference) => {
+    if (!isRecord(reference)) return false;
+    const commonKeys = ['referenceId', 'workspaceId', 'logicalPath', 'displayName', 'kind'];
+    const allowedKeys = reference.kind === 'file'
+      ? [...commonKeys, 'mediaType', 'byteLength']
+      : commonKeys;
+    if (
+      Object.keys(reference).some((key) => !allowedKeys.includes(key))
+      || !allowedKeys.every((key) => key in reference)
+      || !validId(reference.referenceId)
+      || referenceIds.has(reference.referenceId)
+      || !isWorkspaceBinding({
+        workspaceId: reference.workspaceId,
+        displayName: reference.displayName,
+      })
+      || typeof reference.logicalPath !== 'string'
+      || !validLogicalPath(reference.logicalPath)
+    ) return false;
+    const target = `${reference.workspaceId}\0${reference.logicalPath}`;
+    if (targets.has(target)) return false;
+    if (reference.kind === 'file') {
+      if (
+        reference.logicalPath === '.'
+        || typeof reference.mediaType !== 'string'
+        || !reference.mediaType.trim()
+        || reference.mediaType.length > 128
+        || typeof reference.byteLength !== 'number'
+        || !Number.isSafeInteger(reference.byteLength)
+        || reference.byteLength < 0
+      ) return false;
+    } else if (reference.kind !== 'directory' || reference.logicalPath !== '.') {
+      return false;
+    }
+    referenceIds.add(reference.referenceId);
+    targets.add(target);
+    return true;
+  });
+}
+
+function validLogicalPath(value: string): boolean {
+  if (!value || value.length > 4_096 || value.includes('\0') || value.includes('\\')) return false;
+  if (value === '.') return true;
+  if (value.startsWith('/') || value.endsWith('/')) return false;
+  return value.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
+}
+
+function validPluginSelections(revision: unknown, value: unknown): boolean {
+  if (value === undefined) return revision === undefined || validId(revision);
+  if (!Array.isArray(value) || value.length > 16) return false;
+  if (value.length === 0) return revision === undefined || validId(revision);
+  if (!validId(revision)) return false;
+  const selectionIds = new Set<string>();
+  const uris = new Set<string>();
+  return value.every((selection) => {
+    if (
+      !isRecord(selection)
+      || Object.keys(selection).some((key) => !['selectionId', 'uri', 'label'].includes(key))
+      || !validId(selection.selectionId)
+      || typeof selection.uri !== 'string'
+      || !/^plugin:\/\/[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(selection.uri)
+      || typeof selection.label !== 'string'
+      || !selection.label.trim()
+      || selection.label.length > 160
+      || selectionIds.has(selection.selectionId)
+      || uris.has(selection.uri)
+    ) return false;
+    selectionIds.add(selection.selectionId);
+    uris.add(selection.uri);
+    return true;
+  });
 }
 
 function validId(value: unknown): value is string {
@@ -287,7 +412,7 @@ function decodeRequest(encoded: string): BridgeRequest {
     || value.protocolVersion !== LOCAL_AGENT_PROTOCOL_VERSION
     || typeof value.requestId !== 'string'
     || !value.requestId
-    || !['health', 'createSession', 'deleteSession', 'submit', 'snapshot', 'shutdown'].includes(String(value.operation))
+    || !['health', 'createSession', 'deleteSession', 'submit', 'snapshot', 'contextComposition', 'read', 'shutdown'].includes(String(value.operation))
     || !isRecord(value.data)
   ) {
     throw new Error('session_service_request_invalid');
@@ -327,12 +452,18 @@ function chunkBytes(value: unknown): Uint8Array {
 let outputTail = Promise.resolve();
 
 function writeFrame(value: unknown): Promise<void> {
-  const encoded = `${JSON.stringify(value)}\n`;
-  const next = outputTail.then(() => new Promise<void>((resolve, reject) => {
-    process.stdout.write(encoded, (error) => error ? reject(error) : resolve());
-  }));
+  // Serialize the entire logical response in the output queue, including all chunks.
+  const next = outputTail.then(async () => {
+    for (const frame of responseFrames(value)) await writeLine(frame);
+  });
   outputTail = next;
   return next;
+}
+
+function writeLine(encoded: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    process.stdout.write(`${encoded}\n`, (error) => error ? reject(error) : resolve());
+  });
 }
 
 function bridgeError(error: unknown): { code: string; message: string } {

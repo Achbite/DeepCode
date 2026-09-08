@@ -4,6 +4,8 @@ import type {
   ConversationSessionSummary,
 } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
+import { usesNativeWindowChrome } from '../../services/hostTarget';
+import DeepCodeBrand from './DeepCodeBrand';
 import DeepCodeShellIcon from './DeepCodeShellIcon';
 
 interface DeepCodeSidebarProps {
@@ -91,6 +93,11 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
 
   return (
     <aside className="deepcode-gui-left-rail">
+      {usesNativeWindowChrome() && (
+        <div className="deepcode-gui-sidebar-brand">
+          <DeepCodeBrand />
+        </div>
+      )}
       <div className="deepcode-gui-sidebar-actions">
         <button
           type="button"

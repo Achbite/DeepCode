@@ -3,19 +3,46 @@ import type {
   CommandReply,
   ConversationCommand,
   KernelPort,
+  PrepareRunRuntimeRequest,
+  PreparedRunRuntime,
+  PreparedToolDescriptor,
+  PreparedToolPromptContribution,
+  ProviderRuntimeSnapshot,
   NewSessionEvent,
   ProviderEvent,
   ProviderPort,
   ProviderRequest,
+  ReleaseRunRuntimeRequest,
+  ReleaseRunRuntimeResult,
+  RunPreparationPort,
+  RunRuntimeSnapshot,
+  SelectedPluginSnapshot,
   SessionCreationInput,
   SessionEvent,
   StoredCommand,
   ToolCancelReply,
-  ToolDescriptor,
   ToolExecutionRecord,
   ToolExecutionReply,
   ToolExecutionRequest,
 } from '@deepcode/protocol';
+import {
+  KERNEL_REPLY_VERSION,
+  LOCAL_AGENT_PROTOCOL_VERSION,
+  SESSION_CONTROL_INTERACTION_REQUEST,
+  SESSION_CONTROL_PLAN_PUBLISH,
+  SESSION_CONTROL_PLAN_PROGRESS,
+} from '@deepcode/protocol';
+import { createProviderToolAliases } from './providerToolCodec.js';
+import { sessionControlToolDefinitions } from './sessionControls.js';
+import {
+  decodeRunPluginConfig,
+  runtimeInstructions,
+  type InstructionContribution,
+} from './skillPlugins.js';
+import {
+  decodeToolPromptProviderSnapshots,
+  prepareToolPromptContributions,
+} from './toolPromptContributions.js';
 
 interface HttpPortOptions {
   apiBase: string;
@@ -115,10 +142,6 @@ export class HttpCommandJournal extends LocalAgentHttpPort implements CommandJou
 }
 
 export class HttpKernelPort extends LocalAgentHttpPort implements KernelPort {
-  async listTools(): Promise<readonly ToolDescriptor[]> {
-    return decodeToolDescriptors(await this.json('/api/local-agent/kernel/tools'));
-  }
-
   async execute(request: ToolExecutionRequest): Promise<ToolExecutionReply> {
     return await this.json('/api/local-agent/kernel/execute', {
       method: 'POST',
@@ -140,36 +163,62 @@ export class HttpKernelPort extends LocalAgentHttpPort implements KernelPort {
   }
 }
 
-function decodeToolDescriptors(value: unknown): readonly ToolDescriptor[] {
+function decodePreparedToolDescriptors(value: unknown): readonly PreparedToolDescriptor[] {
   if (!Array.isArray(value)) throw new Error('kernel_tool_catalog_invalid');
-  const seen = new Set<string>();
-  return Object.freeze(value.map((candidate) => {
+  const seenNames = new Set<string>();
+  const seenBindings = new Set<string>();
+  return Object.freeze(value.map((candidate): PreparedToolDescriptor => {
+    const fields = [
+      'toolBindingRef',
+      'name',
+      'description',
+      'inputSchema',
+      'possibleEffects',
+      'availability',
+      'origin',
+    ];
+    if (isRecord(candidate) && Object.hasOwn(candidate, 'pluginUri')) fields.push('pluginUri');
     if (
-      !isExactRecord(candidate, [
-        'name',
-        'description',
-        'inputSchema',
-        'possibleEffects',
-        'availability',
-      ])
+      !isExactRecord(candidate, fields)
+      || !isNonEmptyText(candidate.toolBindingRef)
       || !isNonEmptyText(candidate.name)
       || !/^[A-Za-z0-9_.-]+$/u.test(candidate.name)
       || !isNonEmptyText(candidate.description)
       || !isRecord(candidate.inputSchema)
       || !Array.isArray(candidate.possibleEffects)
       || candidate.possibleEffects.some((effect) => ![
+        'localRead',
         'workspaceRead',
         'workspaceMutation',
         'process',
         'network',
         'external',
       ].includes(String(effect)))
+      || new Set(candidate.possibleEffects.map(String)).size !== candidate.possibleEffects.length
       || candidate.availability !== 'callable' && candidate.availability !== 'blocked'
-      || seen.has(candidate.name)
+      || candidate.origin !== 'coreBuiltin' && candidate.origin !== 'extension'
+      || (candidate.origin === 'coreBuiltin' && candidate.pluginUri !== undefined)
+      || (candidate.origin === 'extension'
+        && (!isNonEmptyText(candidate.pluginUri)
+          || !/^plugin:\/\/[^@\s]+@[^@\s]+$/u.test(candidate.pluginUri)))
+      || seenNames.has(candidate.name)
+      || seenBindings.has(candidate.toolBindingRef)
     ) throw new Error('kernel_tool_catalog_invalid');
-    seen.add(candidate.name);
-    return candidate as unknown as ToolDescriptor;
-  }));
+    seenNames.add(candidate.name);
+    seenBindings.add(candidate.toolBindingRef);
+    return Object.freeze({
+      toolBindingRef: candidate.toolBindingRef,
+      name: candidate.name,
+      description: candidate.description,
+      inputSchema: structuredClone(candidate.inputSchema),
+      possibleEffects: [...candidate.possibleEffects] as PreparedToolDescriptor['possibleEffects'],
+      availability: candidate.availability,
+      origin: candidate.origin,
+      ...(candidate.origin === 'extension'
+        ? { pluginUri: candidate.pluginUri as PreparedToolDescriptor['pluginUri'] }
+        : {}),
+    });
+  }).sort((left, right) => left.name.localeCompare(right.name, 'en')));
 }
 
 export class HttpProviderPort extends LocalAgentHttpPort implements ProviderPort {
@@ -196,6 +245,277 @@ export class HttpProviderPort extends LocalAgentHttpPort implements ProviderPort
     }
     yield* decodeProviderEvents(response.body, request.requestId, signal);
   }
+}
+
+interface HttpRunPreparationPortOptions extends HttpPortOptions {
+  stableCoreInstructions: readonly InstructionContribution[];
+}
+
+export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPreparationPort {
+  readonly #stableCoreInstructions: readonly InstructionContribution[];
+
+  constructor(options: HttpRunPreparationPortOptions) {
+    super(options);
+    this.#stableCoreInstructions = Object.freeze(options.stableCoreInstructions
+      .map((instruction) => Object.freeze({ ...instruction })));
+  }
+
+  async prepare(request: PrepareRunRuntimeRequest): Promise<PreparedRunRuntime> {
+    const value = await this.json('/api/local-agent/runtime/prepare-run', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+    if (!isExactRecord(value, [
+      'schemaVersion',
+      'type',
+      'sessionId',
+      'runId',
+      'provider',
+      'webSearch',
+      'extensionGenerationRef',
+      'kernelCatalogSnapshotRef',
+      'tools',
+      'toolPromptProviders',
+      'pluginConfig',
+      'selectedPlugins',
+    ])) throw new Error('run_runtime_prepared_invalid');
+    if (
+      value.schemaVersion !== LOCAL_AGENT_PROTOCOL_VERSION
+      || value.type !== 'run.runtime.prepared'
+      || value.sessionId !== request.sessionId
+      || value.runId !== request.runId
+      || !isNonEmptyText(value.extensionGenerationRef)
+      || !isNonEmptyText(value.kernelCatalogSnapshotRef)
+    ) throw new Error('run_runtime_prepared_invalid');
+    const releaseRequest = {
+      sessionId: request.sessionId,
+      runId: request.runId,
+      kernelCatalogSnapshotRef: value.kernelCatalogSnapshotRef,
+    };
+    try {
+      const provider = decodeProviderRuntime(value.provider);
+      if (provider.reasoningEffortOverride !== request.reasoningEffortOverride) {
+        throw new Error('run_runtime_reasoning_override_mismatch');
+      }
+      const pluginConfig = decodeRunPluginConfig(value.pluginConfig);
+      if (pluginConfig.extensionGenerationRef !== value.extensionGenerationRef) {
+        throw new Error('run_runtime_extension_identity_mismatch');
+      }
+      if (request.profileId !== undefined && provider.profileId !== request.profileId) {
+        throw new Error('run_runtime_profile_identity_mismatch');
+      }
+      const tools = [...decodePreparedToolDescriptors(value.tools)];
+      const webSearch = decodeWebSearchBinding(value.webSearch, provider, tools);
+      const selectedPlugins = decodeSelectedPluginSnapshot(
+        value.selectedPlugins,
+        value.extensionGenerationRef,
+        request,
+      );
+      const toolPromptProviders = decodeToolPromptProviderSnapshots(value.toolPromptProviders);
+      const toolPromptContributions = prepareToolPromptContributions(
+        toolPromptProviders,
+        tools,
+        selectedPlugins,
+      );
+      const providerToolAliases = createProviderToolAliases([
+        ...tools
+          .filter((tool) => tool.availability === 'callable')
+          .map((tool) => tool.name),
+        ...sessionControlToolDefinitions().map((tool) => tool.name),
+      ]);
+      const wireName = (canonicalName: string): string => {
+        const alias = providerToolAliases.find((candidate) => (
+          candidate.canonicalName === canonicalName
+        ));
+        if (!alias) throw new Error(`run_runtime_provider_tool_alias_missing:${canonicalName}`);
+        return alias.wireName;
+      };
+      return {
+        runtimeSnapshot: Object.freeze({
+          runRuntimeSnapshotRef: `run-runtime:${request.sessionId}:${request.runId}`,
+          extensionGenerationRef: value.extensionGenerationRef,
+          kernelCatalogSnapshotRef: value.kernelCatalogSnapshotRef,
+          provider,
+          webSearch,
+          instructions: [...runtimeInstructions(this.#stableCoreInstructions, pluginConfig, {
+            interactionRequest: wireName(SESSION_CONTROL_INTERACTION_REQUEST),
+            planPublish: wireName(SESSION_CONTROL_PLAN_PUBLISH),
+            planProgress: wireName(SESSION_CONTROL_PLAN_PROGRESS),
+          })],
+          tools,
+          toolPromptContributions: toolPromptContributions as PreparedToolPromptContribution[],
+          providerToolAliases,
+          selectedPlugins,
+        }),
+      };
+    } catch (error) {
+      try {
+        await this.release(releaseRequest);
+      } catch (releaseError) {
+        throw new AggregateError([error, releaseError], 'run_runtime_prepare_rollback_failed');
+      }
+      throw error;
+    }
+  }
+
+  async release(request: ReleaseRunRuntimeRequest): Promise<ReleaseRunRuntimeResult> {
+    const released = decodeRunRuntimeReleased(await this.json('/api/local-agent/runtime/release-run', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    }), request);
+    return Object.freeze({
+      kernelCatalogSnapshotRef: released.kernelCatalogSnapshotRef,
+      alreadyReleased: released.alreadyReleased,
+    });
+  }
+}
+
+function decodeProviderRuntime(value: unknown): ProviderRuntimeSnapshot {
+  if (
+    !isExactRecord(value, [
+      'providerRuntimeRef',
+      'profileId',
+      'contextWindowTokens',
+      'maxOutputTokens',
+      'apiSurface',
+      'hostedWebSearch',
+    ], ['reasoningEffort', 'reasoningEffortOverride', 'thinking'])
+    || !isNonEmptyText(value.providerRuntimeRef)
+    || !isNonEmptyText(value.profileId)
+    || !isPositiveSafeInteger(value.contextWindowTokens)
+    || !isPositiveSafeInteger(value.maxOutputTokens)
+    || value.maxOutputTokens >= value.contextWindowTokens
+    || !['chatCompletions', 'responses', 'anthropicMessages', 'ollamaChat']
+      .includes(String(value.apiSurface))
+    || value.hostedWebSearch !== 'none' && value.hostedWebSearch !== 'web_search'
+    || value.hostedWebSearch === 'web_search' && value.apiSurface !== 'responses'
+    || [value.reasoningEffort, value.reasoningEffortOverride].some((effort) => effort !== undefined && !['low', 'medium', 'high', 'max'].includes(String(effort)))
+    || value.thinking !== undefined && !['enabled', 'disabled'].includes(String(value.thinking))
+    || value.reasoningEffortOverride !== undefined && (value.reasoningEffort !== value.reasoningEffortOverride || value.thinking === 'disabled')
+  ) throw new Error('provider_runtime_snapshot_invalid');
+  return Object.freeze({
+    providerRuntimeRef: value.providerRuntimeRef,
+    profileId: value.profileId,
+    contextWindowTokens: value.contextWindowTokens,
+    maxOutputTokens: value.maxOutputTokens,
+    apiSurface: value.apiSurface as ProviderRuntimeSnapshot['apiSurface'],
+    hostedWebSearch: value.hostedWebSearch as ProviderRuntimeSnapshot['hostedWebSearch'],
+    ...(value.reasoningEffort ? { reasoningEffort: value.reasoningEffort as ProviderRuntimeSnapshot['reasoningEffort'] } : {}),
+    ...(value.reasoningEffortOverride ? { reasoningEffortOverride: value.reasoningEffortOverride as ProviderRuntimeSnapshot['reasoningEffortOverride'] } : {}),
+    ...(value.thinking ? { thinking: value.thinking as ProviderRuntimeSnapshot['thinking'] } : {}),
+  });
+}
+
+function decodeWebSearchBinding(
+  value: unknown,
+  provider: ProviderRuntimeSnapshot,
+  tools: readonly PreparedToolDescriptor[],
+): RunRuntimeSnapshot['webSearch'] {
+  const kernelSearchCallable = tools.some((tool) => (
+    tool.name === 'web.search' && tool.availability === 'callable'
+  ));
+  if (
+    isExactRecord(value, ['owner', 'providerToolType'])
+    && value.owner === 'providerHosted'
+    && value.providerToolType === 'web_search'
+    && provider.apiSurface === 'responses'
+    && provider.hostedWebSearch === 'web_search'
+    && !kernelSearchCallable
+  ) return Object.freeze({ owner: 'providerHosted', providerToolType: 'web_search' });
+  if (
+    isExactRecord(value, ['owner', 'toolName'])
+    && value.owner === 'kernelAdapter'
+    && value.toolName === 'web.search'
+    && kernelSearchCallable
+  ) return Object.freeze({ owner: 'kernelAdapter', toolName: 'web.search' });
+  if (
+    isExactRecord(value, ['owner'])
+    && value.owner === 'unavailable'
+    && !kernelSearchCallable
+  ) return Object.freeze({ owner: 'unavailable' });
+  throw new Error('run_runtime_web_search_binding_invalid');
+}
+
+function decodeSelectedPluginSnapshot(
+  value: unknown,
+  extensionGenerationRef: string,
+  request: PrepareRunRuntimeRequest,
+): SelectedPluginSnapshot {
+  if (
+    !isExactRecord(value, ['catalogRevision', 'plugins'])
+    || !isNonEmptyText(value.catalogRevision)
+    || !Array.isArray(value.plugins)
+    || value.plugins.length > 16
+  ) throw new Error('selected_plugin_snapshot_invalid');
+  const seen = new Set<string>();
+  const plugins = value.plugins.map((plugin) => {
+    if (
+      !isExactRecord(plugin, [
+        'uri',
+        'pluginArtifactRef',
+        'pluginInstanceRef',
+        'extensionGenerationRef',
+        'capabilityRefs',
+      ])
+      || typeof plugin.uri !== 'string'
+      || !/^plugin:\/\/[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(plugin.uri)
+      || seen.has(plugin.uri)
+      || !isNonEmptyText(plugin.pluginArtifactRef)
+      || !isNonEmptyText(plugin.pluginInstanceRef)
+      || plugin.extensionGenerationRef !== extensionGenerationRef
+      || !Array.isArray(plugin.capabilityRefs)
+      || plugin.capabilityRefs.some((capability) => !isNonEmptyText(capability))
+    ) throw new Error('selected_plugin_snapshot_invalid');
+    seen.add(plugin.uri);
+    return {
+      uri: plugin.uri as SelectedPluginSnapshot['plugins'][number]['uri'],
+      pluginArtifactRef: plugin.pluginArtifactRef,
+      pluginInstanceRef: plugin.pluginInstanceRef,
+      extensionGenerationRef,
+      capabilityRefs: [...plugin.capabilityRefs] as string[],
+    };
+  });
+  const requested = request.pluginSelections ?? [];
+  if (
+    requested.length > 0
+    && (
+      value.catalogRevision !== request.pluginCatalogRevision
+      || requested.length !== plugins.length
+      || requested.some((selection) => !seen.has(selection.uri))
+    )
+  ) throw new Error('selected_plugin_snapshot_identity_mismatch');
+  return {
+    catalogRevision: value.catalogRevision,
+    plugins,
+  };
+}
+
+function decodeRunRuntimeReleased(
+  value: unknown,
+  request: ReleaseRunRuntimeRequest,
+): ReleaseRunRuntimeResult {
+  if (
+    !isExactRecord(value, [
+      'schemaVersion',
+      'type',
+      'sessionId',
+      'runId',
+      'kernelCatalogSnapshotRef',
+      'released',
+      'alreadyReleased',
+    ])
+    || value.schemaVersion !== KERNEL_REPLY_VERSION
+    || value.type !== 'tool.catalog.released'
+    || value.sessionId !== request.sessionId
+    || value.runId !== request.runId
+    || value.kernelCatalogSnapshotRef !== request.kernelCatalogSnapshotRef
+    || value.released !== true
+    || typeof value.alreadyReleased !== 'boolean'
+  ) throw new Error('kernel_tool_catalog_released_invalid');
+  return Object.freeze({
+    kernelCatalogSnapshotRef: request.kernelCatalogSnapshotRef,
+    alreadyReleased: value.alreadyReleased,
+  });
 }
 
 async function* decodeProviderEvents(
@@ -254,9 +574,29 @@ function decodeProviderFrame(frame: string): ProviderEvent {
   ) throw new Error('provider_event_invalid');
   switch (value.type) {
     case 'text.delta':
-      if (!isExactRecord(value.data, ['text']) || typeof value.data.text !== 'string') {
-        throw new Error('provider_event_invalid');
+    case 'reasoning.delta':
+      {
+        const fields = ['text'];
+        if (Object.hasOwn(value.data, 'outputIndex')) fields.push('outputIndex');
+        if (
+          !isExactRecord(value.data, fields)
+          || typeof value.data.text !== 'string'
+          || value.data.outputIndex !== undefined
+            && (!Number.isSafeInteger(value.data.outputIndex) || Number(value.data.outputIndex) < 0)
+        ) {
+          throw new Error('provider_event_invalid');
+        }
       }
+      break;
+    case 'output.item.completed':
+      if (
+        !isExactRecord(value.data, ['outputIndex', 'item'])
+        || !Number.isSafeInteger(value.data.outputIndex)
+        || Number(value.data.outputIndex) < 0
+        || !isRecord(value.data.item)
+        || !['message', 'reasoning', 'function_call', 'web_search_call']
+          .includes(String(value.data.item.type))
+      ) throw new Error('provider_event_invalid');
       break;
     case 'assistant.message':
       {
@@ -284,6 +624,17 @@ function decodeProviderFrame(frame: string): ProviderEvent {
         || !isRecord(value.data.input)
       ) throw new Error('provider_event_invalid');
       break;
+    case 'hosted.web-search.completed':
+      if (
+        !isExactRecord(value.data, ['item'])
+        || !isRecord(value.data.item)
+        || value.data.item.type !== 'web_search_call'
+        || !isNonEmptyText(value.data.item.id)
+        || value.data.item.status !== 'completed'
+          && value.data.item.status !== 'failed'
+        || !isRecord(value.data.item.action)
+      ) throw new Error('provider_event_invalid');
+      break;
     case 'completed':
       break;
     case 'failed':
@@ -303,12 +654,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-function isExactRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+function isExactRecord(value: unknown, keys: readonly string[], optional: readonly string[] = []): value is Record<string, unknown> {
   return isRecord(value)
-    && Object.keys(value).length === keys.length
-    && Object.keys(value).every((key) => keys.includes(key));
+    && keys.every((key) => Object.hasOwn(value, key))
+    && Object.keys(value).every((key) => keys.includes(key) || optional.includes(key));
 }
 
 function isNonEmptyText(value: unknown): value is string {
   return typeof value === 'string' && Boolean(value.trim());
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) > 0;
 }

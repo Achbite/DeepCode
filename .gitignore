@@ -18,6 +18,10 @@ target/
 .deepcode/build-baselines/
 .deepcode-recovery.*/
 
+# ---- Python 字节码缓存 ----
+__pycache__/
+*.py[cod]
+
 # ---- 本地可执行打包产物 ----
 # bin/ 用于输出统一分发目录；二进制产物不入库
 bin/*

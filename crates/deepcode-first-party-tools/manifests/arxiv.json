@@ -1,0 +1,69 @@
+{
+  "schemaVersion": "deepcode.first-party-plugin.v1",
+  "id": "arxiv",
+  "uri": "plugin://arxiv@first-party",
+  "displayName": "arXiv",
+  "shortDescription": "Search arXiv metadata and read canonical paper records through the arXiv Atom API.",
+  "activationMediaTypes": [],
+  "providerRef": "tool-provider:first-party:arxiv",
+  "capabilityRefs": [
+    "arxiv:metadata-search",
+    "arxiv:paper-read"
+  ],
+  "capabilitySummary": "Provides arXiv-native metadata search and canonical paper record reads.",
+  "tools": [
+    {
+      "remoteName": "search",
+      "canonicalName": "arxiv.search",
+      "description": "Search arXiv paper metadata through the arXiv Atom API.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "minLength": 1 },
+          "field": { "type": "string", "enum": ["all", "title", "author", "abstract", "category", "id"], "default": "all" },
+          "start": { "type": "integer", "minimum": 0, "maximum": 10000, "default": 0 },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 30, "default": 10 },
+          "sortBy": { "type": "string", "enum": ["relevance", "lastUpdatedDate", "submittedDate"], "default": "relevance" },
+          "sortOrder": { "type": "string", "enum": ["ascending", "descending"], "default": "descending" }
+        },
+        "required": ["query"],
+        "additionalProperties": false
+      },
+      "effect": "networkRead",
+      "logicalTarget": "https://export.arxiv.org/api",
+      "binding": { "kind": "none" },
+      "toolContributionRef": "tool-contribution:first-party:arxiv.search",
+      "promptContribution": {
+        "contributionRef": "tool-prompt-contribution:first-party:arxiv.search",
+        "promptSnippet": "Search arXiv paper metadata through its native Atom API.",
+        "usageGuidelines": [
+          "Use this for arXiv discovery instead of routing arXiv queries through the general web search tool."
+        ]
+      }
+    },
+    {
+      "remoteName": "read",
+      "canonicalName": "arxiv.read",
+      "description": "Read one canonical arXiv paper metadata record by arXiv identifier.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "description": "Canonical arXiv identifier, optionally including a version." }
+        },
+        "required": ["id"],
+        "additionalProperties": false
+      },
+      "effect": "networkRead",
+      "logicalTarget": "https://export.arxiv.org/api",
+      "binding": { "kind": "none" },
+      "toolContributionRef": "tool-contribution:first-party:arxiv.read",
+      "promptContribution": {
+        "contributionRef": "tool-prompt-contribution:first-party:arxiv.read",
+        "promptSnippet": "Read the canonical metadata record for a known arXiv identifier.",
+        "usageGuidelines": [
+          "Use an identifier returned by arXiv search when the full canonical paper record is needed."
+        ]
+      }
+    }
+  ]
+}

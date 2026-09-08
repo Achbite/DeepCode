@@ -131,7 +131,7 @@ cd "$ROOT_DIR"
 if [ "${DEEPCODE_DEV_SKIP_BUILD:-0}" != "1" ]; then
   pnpm --filter @deepcode/protocol build
   pnpm --filter @deepcode/session-core build
-  cargo build -p deepcode-kernel-daemon -p deepcode-host-web
+  cargo build -p deepcode-first-party-tools -p deepcode-kernel-daemon -p deepcode-host-web
 fi
 
 DAEMON_BIN="$ROOT_DIR/target/debug/deepcode-kernel-daemon"

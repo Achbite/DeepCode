@@ -321,12 +321,14 @@ clean_shared_package_cache() {
   rm -rf "$BIN_DIR/session-core" "$BIN_DIR/node_modules" "$BIN_DIR/node" "$LIBEXEC_DIR"
   rm -f \
     "$BIN_DIR/deepcode-kernel" \
+    "$BIN_DIR/deepcode-first-party-provider" \
     "$BIN_DIR/deepcode-cli" \
     "$BIN_DIR/deepcode-tui" \
     "$BIN_DIR/$CLI_COMMAND_NAME" \
     "$BIN_DIR/README.txt" \
     "$BIN_DIR/build-info.json" \
     "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" \
+    "$CARGO_TARGET_ROOT/release/deepcode-first-party-provider" \
     "$CARGO_TARGET_ROOT/release/deepcode-host-web" \
     "$CARGO_TARGET_ROOT/release/deepcode-cli" \
     "$CARGO_TARGET_ROOT/release/deepcode-tui"
@@ -699,7 +701,7 @@ build_gui_dist() {
 build_rust_bins() {
   log "build Darwin Kernel/private Host proxy/CLI/TUI release binaries"
   DEEPCODE_BUILD_COMMIT="$BUILD_COMMIT" cargo build --locked --release \
-    -p deepcode-kernel-daemon -p deepcode-host-web -p deepcode-cli -p deepcode-tui
+    -p deepcode-first-party-tools -p deepcode-kernel-daemon -p deepcode-host-web -p deepcode-cli -p deepcode-tui
 }
 
 build_tauri_app() {
@@ -757,7 +759,7 @@ validate_protocol_dist() {
       || fail "$label protocol dist is missing $name"
   done
   if find "$dist_dir" -maxdepth 1 -type f \
-    \( -name 'agent.*' -o -name 'kernelAbiV1.*' -o -name 'kernelAbiV2.*' \) -print -quit | grep -q .; then
+    -name 'agent.*' -print -quit | grep -q .; then
     fail "$label protocol dist contains a retired Agent protocol module"
   fi
 }
@@ -1134,6 +1136,7 @@ $terminal_section
 Files:
 $app_entries
   deepcode-kernel           Darwin arm64 Kernel daemon.
+  deepcode-first-party-provider  Out-of-process GitHub, arXiv, and PDF tool provider.
   $TUI_COMMAND_NAME         User-facing TUI launcher.
   $CLI_COMMAND_NAME         User-facing CLI launcher.
   libexec/$CLI_EXEC_NAME    Internal Darwin arm64 CLI host.
@@ -1179,6 +1182,7 @@ prepare_shared_distribution() {
   configure_product "DeepCode"
   prepare_portable_config_root
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$BIN_DIR/deepcode-kernel" 755
+  copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-first-party-provider" "$BIN_DIR/deepcode-first-party-provider" 755
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-cli" "$LIBEXEC_DIR/$CLI_EXEC_NAME" 755
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-tui" "$LIBEXEC_DIR/$TUI_EXEC_NAME" 755
   copy_session_core_runtime
@@ -1197,6 +1201,7 @@ stage_product_app() {
 
   copy_required_file "$CARGO_TARGET_ROOT/release/$TAURI_BIN_NAME" "$app_macos_dir/$TAURI_BIN_NAME" 755
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$app_macos_dir/deepcode-kernel" 755
+  copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-first-party-provider" "$app_macos_dir/deepcode-first-party-provider" 755
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-host-web" "$app_macos_dir/deepcode-host-web" 755
   write_build_info "$app_macos_dir/build-info.json"
 
@@ -1238,11 +1243,13 @@ finalize_shared_distribution() {
 
 verify_packaged_runtime_identity() {
   local kernel_bin="$BIN_DIR/deepcode-kernel"
+  local provider_bin="$BIN_DIR/deepcode-first-party-provider"
   local original_product="$PRODUCT"
   local product app_kernel_bin app_host_proxy root_hash app_hash build_info build_info_commit build_info_fingerprint build_info_product
   local build_info_session_bridge
   local checked_app=0
   [ -x "$kernel_bin" ] || fail "missing packaged Kernel binary: $kernel_bin"
+  [ -x "$provider_bin" ] || fail "missing packaged first-party provider: $provider_bin"
   root_hash="$(shasum -a 256 "$kernel_bin" | awk '{print $1}')"
   [ -f "$BIN_DIR/build-info.json" ] || fail "missing root build-info.json"
 
@@ -1261,9 +1268,11 @@ verify_packaged_runtime_identity() {
     checked_app=1
     app_kernel_bin="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-kernel"
     app_host_proxy="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-host-web"
+    local app_first_party_provider="$BIN_DIR/$APP_NAME.app/Contents/MacOS/deepcode-first-party-provider"
     build_info="$BIN_DIR/$APP_NAME.app/Contents/MacOS/build-info.json"
     [ -x "$app_kernel_bin" ] || fail "missing bundled Kernel binary: $app_kernel_bin"
     [ -x "$app_host_proxy" ] || fail "missing bundled private Host proxy: $app_host_proxy"
+    [ -x "$app_first_party_provider" ] || fail "missing bundled first-party provider: $app_first_party_provider"
     codesign --verify --deep --strict "$BIN_DIR/$APP_NAME.app" >/dev/null 2>&1 \
       || fail "published $APP_NAME.app failed strict signature verification"
     app_hash="$(shasum -a 256 "$app_kernel_bin" | awk '{print $1}')"

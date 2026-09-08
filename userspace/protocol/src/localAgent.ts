@@ -1,15 +1,16 @@
+import type { LlmReasoningEffort, LlmThinkingMode } from './llm.js';
+
 export const LOCAL_AGENT_PROTOCOL_VERSION = 'deepcode.local-agent' as const;
-export const CONVERSATION_COMMAND_VERSION = 'deepcode.command' as const;
-export const COMMAND_REPLY_VERSION = 'deepcode.command-reply' as const;
-export const SESSION_EVENT_VERSION = 'deepcode.session-event' as const;
-export const SESSION_PROJECTION_VERSION = 'deepcode.session-projection' as const;
+export const CONVERSATION_COMMAND_VERSION = 'deepcode.command.v3' as const;
+export const COMMAND_REPLY_VERSION = 'deepcode.command-reply.v3' as const;
+export const SESSION_EVENT_VERSION = 'deepcode.session-event.v4' as const;
+export const SESSION_PROJECTION_VERSION = 'deepcode.session-projection.v5' as const;
 export const PROVIDER_EVENT_VERSION = 'deepcode.provider-event' as const;
 export const KERNEL_REQUEST_VERSION = 'deepcode.kernel-request' as const;
 export const KERNEL_REPLY_VERSION = 'deepcode.kernel-reply' as const;
 export const SESSION_CONTROL_INTERACTION_REQUEST = 'interaction.request' as const;
 export const SESSION_CONTROL_PLAN_PUBLISH = 'plan.publish' as const;
-export const SESSION_CONTROL_TODO_PROGRESS = 'todo.progress' as const;
-export const SESSION_CONTROL_CONTEXT_FOCUS = 'context.focus' as const;
+export const SESSION_CONTROL_PLAN_PROGRESS = 'plan.progress' as const;
 
 export type JsonObject = Record<string, unknown>;
 
@@ -57,34 +58,72 @@ export interface ConversationCatalogManagement extends ConversationCatalog {
   workspaces: WorkspaceManagementRecord[];
 }
 
-export interface UserMessageAttachment {
-  attachmentId: string;
-  name: string;
-  mediaType: string;
-  content: string;
+/**
+ * Message-level reference to a Host-resolved filesystem object. Host canonical paths remain
+ * private; Provider requests receive the corresponding logical workspace handle and path.
+ */
+export type FilesystemReference = {
+  referenceId: string;
+  workspaceId: string;
+  logicalPath: string;
+  displayName: string;
+} & (
+  | {
+      kind: 'file';
+      mediaType: string;
+      byteLength: number;
+    }
+  | {
+      kind: 'directory';
+      mediaType?: never;
+      byteLength?: never;
+    }
+);
+
+export type PluginUri = `plugin://${string}@${string}`;
+
+export interface PluginCatalogItem {
+  uri: PluginUri;
+  displayName: string;
+  shortDescription: string;
+  iconRef?: string;
+  activationMediaTypes: string[];
+  enabled: true;
+  available: true;
 }
 
-export interface MessageAttachmentProjection {
-  attachmentId: string;
-  name: string;
-  mediaType: string;
-  byteLength: number;
+export interface PluginCatalogProjection {
+  revision: string;
+  plugins: PluginCatalogItem[];
 }
 
-/** Logical directory reference owned by one user message; absolute roots remain Host-private. */
-export interface MessageDirectoryAttachment extends WorkspaceBindingDisplay {}
+export interface PluginSelectionInput {
+  selectionId: string;
+  uri: PluginUri;
+  label: string;
+}
+
+export interface SelectedPluginSnapshot {
+  catalogRevision: string;
+  plugins: Array<{
+    uri: PluginUri;
+    pluginArtifactRef: string;
+    pluginInstanceRef: string;
+    extensionGenerationRef: string;
+    capabilityRefs: string[];
+  }>;
+}
 
 export type PlanOperationName =
-  | 'fs.create'
   | 'fs.write'
   | 'fs.edit'
   | 'fs.delete'
-  | 'fs.ensure_directory';
+  | 'bash';
 
 export type PlanOperation =
   | {
       workspaceId: string;
-      operation: Exclude<PlanOperationName, 'fs.delete'>;
+      operation: Exclude<PlanOperationName, 'fs.delete' | 'bash'>;
       target: string;
     }
   | {
@@ -92,6 +131,15 @@ export type PlanOperation =
       operation: 'fs.delete';
       target: string;
       targetKind: 'file' | 'directoryTree';
+    }
+  | {
+      workspaceId: string;
+      operation: 'bash';
+      /** Representative project entrypoint, for review; authorization uses the declared scope. */
+      command?: string;
+      workspaceMode: 'write';
+      executionScope: 'workspace' | 'host';
+      terminal?: { stdin: string };
     };
 
 export interface ExecutionPlanStep {
@@ -120,6 +168,13 @@ export type MessageFeedback = 'up' | 'down';
 export type ConversationCommand =
   | {
       schemaVersion: typeof CONVERSATION_COMMAND_VERSION;
+      type: 'session.model-settings.set';
+      commandId: string;
+      sessionId: string;
+      settings: SessionModelSettings;
+    }
+  | {
+      schemaVersion: typeof CONVERSATION_COMMAND_VERSION;
       type: 'session.directory-index.attach';
       commandId: string;
       sessionId: string;
@@ -138,9 +193,23 @@ export type ConversationCommand =
       commandId: string;
       sessionId: string;
       text: string;
-      attachments?: UserMessageAttachment[];
-      directoryAttachments?: MessageDirectoryAttachment[];
+      filesystemReferences?: FilesystemReference[];
       profileId?: string;
+      reasoningEffortOverride?: LlmReasoningEffort | null;
+      pluginCatalogRevision?: string;
+      pluginSelections?: PluginSelectionInput[];
+    }
+  | {
+      schemaVersion: typeof CONVERSATION_COMMAND_VERSION;
+      type: 'context.focus';
+      commandId: string;
+      sessionId: string;
+      task: string;
+      filesystemReferences?: FilesystemReference[];
+      profileId?: string;
+      reasoningEffortOverride?: LlmReasoningEffort | null;
+      pluginCatalogRevision?: string;
+      pluginSelections?: PluginSelectionInput[];
     }
   | {
       schemaVersion: typeof CONVERSATION_COMMAND_VERSION;
@@ -149,14 +218,6 @@ export type ConversationCommand =
       sessionId: string;
       messageId: string;
       feedback: MessageFeedback | null;
-    }
-  | {
-      schemaVersion: typeof CONVERSATION_COMMAND_VERSION;
-      type: 'run.profile.select';
-      commandId: string;
-      sessionId: string;
-      runId: string;
-      profileId: string;
     }
   | {
       schemaVersion: typeof CONVERSATION_COMMAND_VERSION;
@@ -218,6 +279,58 @@ export type RunSettlement =
   | { outcome: 'cancelled' }
   | { outcome: 'indeterminate'; error: LocalAgentError };
 
+export type ProviderOutputBlock = {
+  outputIndex: number;
+  item: JsonObject;
+} & (
+  | { kind: 'reasoning' }
+  | { kind: 'narrative'; narrativeId: string }
+  | { kind: 'finalMessage'; messageId: string }
+  | { kind: 'toolCall'; callId: string; providerCallId: string; toolName: string }
+  | {
+      /** Session rejected the original Provider input before requesting any effect. */
+      kind: 'toolCallRejected';
+      callId: string;
+      providerCallId: string;
+      toolName: string;
+      error: LocalAgentError & { issues: ToolInputIssue[] };
+    }
+  | {
+      kind: 'providerHosted';
+      activityId: string;
+      providerCallId: string;
+      providerToolType: 'web_search';
+    }
+);
+
+export type ProviderTurnSettlement = {
+  providerRequestId: string;
+  purpose: 'agent' | 'contextCompaction';
+  providerRuntimeRef: string;
+} & (
+  | {
+      outcome: 'completed';
+      orderedCallIds: string[];
+      reasoningContent?: string;
+      reasoningSignature?: string;
+      hostedWebSearchCalls?: JsonObject[];
+      orderedOutputBlocks?: ProviderOutputBlock[];
+    }
+  | {
+      outcome: 'failed' | 'indeterminate';
+      error: LocalAgentError;
+    }
+);
+
+export interface RunRuntimeReleaseReceipt {
+  runRuntimeSnapshotRef: string;
+  extensionGenerationRef: string;
+  kernelCatalogSnapshotRef: string;
+  providerRuntimeRef: string;
+  pluginInstanceRefs: string[];
+  alreadyReleased: boolean;
+}
+
 export interface InteractionOption {
   id: string;
   label: string;
@@ -241,6 +354,7 @@ export interface ProviderTokenUsage {
 
 export interface ContextUsageProjection extends ProviderTokenUsage {
   providerRequestId: string;
+  providerRuntimeRef: string;
   runId: string;
   sequence: number;
   updatedAt: string;
@@ -248,11 +362,15 @@ export interface ContextUsageProjection extends ProviderTokenUsage {
 
 export interface TokenUsageProjection {
   providerCallCount: number;
+  reportedCallCount: number;
   inputTokens: number;
   outputTokens: number;
   cacheReadInputTokens: number;
   cacheMissInputTokens: number;
-  cacheReportedCallCount: number;
+  cacheAvailable: boolean;
+  cacheComplete: boolean;
+  /** Known cache-read input tokens / all reported input tokens; coverage is cacheComplete. */
+  cacheHitRatio: number | null;
 }
 
 export interface TokenUsageRoundProjection extends TokenUsageProjection {
@@ -271,7 +389,7 @@ export type ContextCompositionPartitionKind =
   | 'sessionControls'
   | 'journalMessages'
   | 'contextProviders'
-  | 'messageAttachments'
+  | 'filesystemReferences'
   | 'tools';
 
 export interface ContextCompositionItem {
@@ -279,9 +397,17 @@ export interface ContextCompositionItem {
   label: string;
 }
 
+export interface ContextCompositionTool extends ContextCompositionItem {
+  canonicalName: string;
+  wireName: string;
+  origin: 'coreBuiltin' | 'extension' | 'sessionControl' | 'providerHosted';
+  availability: 'callable' | 'blocked';
+  pluginUri?: PluginUri;
+}
+
 export type ContextCompositionMessageKind = Exclude<
   ContextCompositionPartitionKind,
-  'messageAttachments' | 'tools'
+  'filesystemReferences' | 'tools'
 >;
 
 export type ContextCompositionMessageBlock =
@@ -299,6 +425,11 @@ export type ContextCompositionMessageBlock =
       blockIndex: number;
       kind: 'toolResult';
       resultForCallId: string;
+    }
+  | {
+      blockIndex: number;
+      kind: 'hostedWebSearch';
+      providerCallId: string;
     };
 
 export interface ContextCompositionMessage {
@@ -308,7 +439,7 @@ export interface ContextCompositionMessage {
   label: string;
   role: 'system' | 'user' | 'assistant' | 'tool';
   blocks: ContextCompositionMessageBlock[];
-  attachments: ContextCompositionItem[];
+  filesystemReferences: ContextCompositionItem[];
 }
 
 export interface ContextCompositionPartitionReceipt {
@@ -323,29 +454,39 @@ export interface ContextCompositionPartitionProjection
   tokenSource?: 'sessionEstimated';
 }
 
+export type ProviderResponseConstraint = 'normal' | 'toolRequired' | 'answerOnly';
+
 export interface ContextCompositionReceipt {
   providerRequestId: string;
   purpose: 'agent' | 'contextCompaction';
-  responseConstraint: 'normal' | 'answerOnly';
+  responseConstraint: ProviderResponseConstraint;
+  stableCoreHash: string;
+  baseToolSchemaHash: string;
+  selectedPluginSnapshotHash: string;
+  dynamicInstructionBytes: number;
   messages: ContextCompositionMessage[];
   workspaceBindings: ContextCompositionItem[];
-  tools: ContextCompositionItem[];
+  tools: ContextCompositionTool[];
   partitions: ContextCompositionPartitionReceipt[];
 }
 
 interface ContextCompositionProjectionBase {
   providerRequestId: string;
   purpose: 'agent' | 'contextCompaction';
-  responseConstraint: 'normal' | 'answerOnly';
+  responseConstraint: ProviderResponseConstraint;
   runId: string;
   sequence: number;
   createdAt: string;
 }
 
 export interface ContextCompositionProjection extends ContextCompositionProjectionBase {
+  stableCoreHash: string;
+  baseToolSchemaHash: string;
+  selectedPluginSnapshotHash: string;
+  dynamicInstructionBytes: number;
   messages: ContextCompositionMessage[];
   workspaceBindings: ContextCompositionItem[];
-  tools: ContextCompositionItem[];
+  tools: ContextCompositionTool[];
   partitions: ContextCompositionPartitionProjection[];
 }
 
@@ -371,7 +512,7 @@ export interface TodoProgressUpdate {
   status: TodoStatus;
 }
 
-export type ContextCompactionTrigger = 'pressure' | 'userFocus' | 'agentFocus';
+export type ContextCompactionTrigger = 'pressure' | 'userFocus';
 
 export type ContextCompactionRequestPayload = {
   compactionId: string;
@@ -380,7 +521,6 @@ export type ContextCompactionRequestPayload = {
 } & (
   | { trigger: 'pressure' }
   | { trigger: 'userFocus'; focus: string; commandId: string }
-  | { trigger: 'agentFocus'; focus: string; providerCallId: string }
 );
 
 export interface ContextCompactedPayload {
@@ -399,6 +539,10 @@ export interface EffectPreview {
 
 export type SessionEvent =
   | (SessionEventBase & {
+      type: 'session.model-settings.updated';
+      payload: { commandId: string; settings: SessionModelSettings };
+    })
+  | (SessionEventBase & {
       type: 'session.created';
       payload: {
         displayTitle: string;
@@ -416,7 +560,12 @@ export type SessionEvent =
     })
   | (SessionEventBase & {
       type: 'input.accepted';
-      payload: { commandId: string; messageId: string; text: string };
+      payload: {
+        commandId: string;
+        messageId: string;
+        text: string;
+        pluginSelections?: PluginSelectionInput[];
+      };
     })
   | (SessionEventBase & {
       type: 'run.started';
@@ -424,13 +573,21 @@ export type SessionEvent =
       payload: {
         inputMessageId: string;
         workspaceBindings: WorkspaceBindingDisplay[];
-        profileId?: string;
+        runtimeSnapshot: RunRuntimeSnapshot;
       };
     })
   | (SessionEventBase & {
-      type: 'run.profile.selected';
+      type: 'message.committed';
       runId: string;
-      payload: { commandId: string; profileId: string };
+      callId?: string;
+      payload: {
+        messageId: string;
+        role: 'assistant';
+        content: string;
+        filesystemReferences?: FilesystemReference[];
+        pluginSelections?: PluginSelectionInput[];
+        providerRequestId: string;
+      };
     })
   | (SessionEventBase & {
       type: 'message.committed';
@@ -438,10 +595,10 @@ export type SessionEvent =
       callId?: string;
       payload: {
         messageId: string;
-        role: 'user' | 'assistant' | 'tool' | 'system';
+        role: 'user' | 'tool' | 'system';
         content: string;
-        attachments?: UserMessageAttachment[];
-        directoryAttachments?: MessageDirectoryAttachment[];
+        filesystemReferences?: FilesystemReference[];
+        pluginSelections?: PluginSelectionInput[];
       };
     })
   | (SessionEventBase & {
@@ -455,11 +612,12 @@ export type SessionEvent =
   | (SessionEventBase & {
       type: 'narrative.committed';
       runId: string;
-      payload: { narrativeId: string; content: string };
+      payload: { narrativeId: string; content: string; providerRequestId: string };
     })
   | (SessionEventBase & {
       type: 'interaction.requested';
       runId: string;
+      callId: string;
       payload: ModelInteractionRequest & { interactionId: string; providerCallId: string };
     })
   | (SessionEventBase & {
@@ -529,11 +687,12 @@ export type SessionEvent =
   | (SessionEventBase & {
       type: 'todo.progressed';
       runId: string;
-      callId: string;
+      callId?: string;
       payload: {
-        providerCallId: string;
+        providerCallId?: string;
         sourcePlanId: string;
         sourcePlanRevision: number;
+        sourceFactRef: string;
         updates: TodoProgressUpdate[];
       };
     })
@@ -566,6 +725,12 @@ export type SessionEvent =
       };
     })
   | (SessionEventBase & {
+      type: 'tool.input-rejected';
+      runId: string;
+      callId: string;
+      payload: { rejection: ToolInputRejection };
+    })
+  | (SessionEventBase & {
       type: 'tool.completed';
       runId: string;
       callId: string;
@@ -585,13 +750,11 @@ export type SessionEvent =
   | (SessionEventBase & {
       type: 'context.compaction.requested';
       runId: string;
-      callId?: string;
       payload: ContextCompactionRequestPayload;
     })
   | (SessionEventBase & {
       type: 'context.compacted';
       runId: string;
-      callId?: string;
       payload: ContextCompactedPayload;
     })
   | (SessionEventBase & {
@@ -600,14 +763,40 @@ export type SessionEvent =
       payload: ContextCompositionReceipt;
     })
   | (SessionEventBase & {
+      type: 'provider.turn.settled';
+      runId: string;
+      payload: ProviderTurnSettlement;
+    })
+  | (SessionEventBase & {
       type: 'context.updated';
       runId: string;
-      payload: ProviderTokenUsage & { providerRequestId: string };
+      payload: ProviderTokenUsage & { providerRequestId: string; providerRuntimeRef: string };
     })
   | (SessionEventBase & {
       type: 'run.waiting';
       runId: string;
       payload: { reason: 'approval' | 'userInput' | 'plan'; detail?: string };
+    })
+  | (SessionEventBase & {
+      type: 'run.finishing';
+      runId: string;
+      payload: RunSettlement;
+    })
+  | (SessionEventBase & {
+      type: 'run.runtime.released';
+      runId: string;
+      payload: RunRuntimeReleaseReceipt;
+    })
+  | (SessionEventBase & {
+      type: 'run.runtime.release_failed';
+      runId: string;
+      payload: {
+        runRuntimeSnapshotRef: string;
+        extensionGenerationRef: string;
+        kernelCatalogSnapshotRef: string;
+        providerRuntimeRef: string;
+        error: LocalAgentError;
+      };
     })
   | (SessionEventBase & {
       type: 'run.settled';
@@ -621,28 +810,74 @@ export type NewSessionEvent = SessionEvent extends infer Event
     : never
   : never;
 
-export interface ProjectionMessage {
+interface ProjectionMessageBase {
   messageId: string;
-  role: 'user' | 'assistant' | 'tool' | 'system';
   content: string;
-  attachments: MessageAttachmentProjection[];
-  directoryAttachments: MessageDirectoryAttachment[];
+  filesystemReferences: FilesystemReference[];
+  pluginSelections: PluginSelectionInput[];
   feedback: MessageFeedback | null;
   sequence: number;
   createdAt: string;
 }
 
+export type ProjectionMessage = ProjectionMessageBase & (
+  | {
+      role: 'assistant';
+      runId: string;
+      providerRequestId: string;
+    }
+  | {
+      role: 'user' | 'tool' | 'system';
+      runId?: string;
+      providerRequestId?: never;
+    }
+);
+
 export interface NarrativeProjection {
   narrativeId: string;
   runId: string;
+  providerRequestId: string;
   content: string;
   sequence: number;
   createdAt: string;
 }
 
+export type SessionTimelineItem =
+  | {
+      kind: 'message';
+      timelineId: string;
+      sequence: number;
+      messageId: string;
+      outputIndex?: number;
+    }
+  | {
+      kind: 'narrative';
+      timelineId: string;
+      sequence: number;
+      providerRequestId: string;
+      narrativeId: string;
+      outputIndex?: number;
+    }
+  | {
+      kind: 'plan';
+      timelineId: string;
+      sequence: number;
+      providerRequestId: string;
+      planId: string;
+      revision: number;
+    }
+  | {
+      kind: 'toolGroup';
+      timelineId: string;
+      sequence: number;
+      providerRequestId: string;
+      activityIds: string[];
+    };
+
 export interface InteractionProjection extends ModelInteractionRequest {
   interactionId: string;
   runId: string;
+  callId: string;
   sequence: number;
   createdAt: string;
 }
@@ -656,14 +891,38 @@ export interface ApprovalProjection {
   createdAt: string;
 }
 
+export type AssistantDraftBlockProjection =
+  | { outputIndex: number; kind: 'narrative'; content: string }
+  | { outputIndex: number; kind: 'finalMessage'; content: string }
+  | { outputIndex: number; kind: 'message'; content: string }
+  | {
+      outputIndex: number;
+      kind: 'providerHosted';
+      providerCallId: string;
+      providerToolType: 'web_search';
+      status: 'completed' | 'failed';
+      action: JsonObject;
+    };
+
 /**
- * Session-owned, non-durable text for the one Provider turn currently streaming.
- * It is replaced by a canonical narrative or assistant message when the typed turn ends.
+ * Session-owned, non-durable presentation for the one Provider turn currently streaming.
+ * Ordered blocks retain Provider output_index so the GUI can continue the same display buffer
+ * when the typed turn becomes canonical timeline content.
  */
 export interface AssistantDraftProjection {
   runId: string;
   turnId: string;
   content: string;
+  reasoningContent?: string;
+  orderedBlocks?: AssistantDraftBlockProjection[];
+  activity?: ProviderActivityProjection;
+}
+
+export interface ProviderActivityProjection {
+  purpose: 'agent' | 'contextCompaction';
+  phase: 'waitingResponse' | 'reasoning' | 'awaitingOutput' | 'generatingOutput';
+  startedAt: string;
+  lastContentAt?: string;
 }
 
 export type PlanProjectionStatus =
@@ -690,30 +949,40 @@ export interface PendingPlanProjection extends PlanProjection {
   responseMode: 'confirmReviseOrCancel';
 }
 
+export const RUN_PROJECTION_STATUSES = [
+  'running',
+  'waiting',
+  'releasing',
+  'releaseFailed',
+  'completed',
+  'failed',
+  'cancelled',
+  'indeterminate',
+] as const;
+
+export type RunProjectionStatus = typeof RUN_PROJECTION_STATUSES[number];
+
 export interface RunProjection {
   runId: string;
-  profileId?: string;
+  profileId: string;
+  reasoningEffort?: LlmReasoningEffort;
+  thinking?: LlmThinkingMode;
   waitingReason?: 'approval' | 'userInput' | 'plan';
   /** Immutable effective directory set captured by run.started. */
   workspaceBindings: WorkspaceBindingDisplay[];
-  status:
-    | 'running'
-    | 'waiting'
-    | 'completed'
-    | 'failed'
-    | 'cancelled'
-    | 'indeterminate';
+  status: RunProjectionStatus;
 }
 
 export interface ActivityProjection {
   activityId: string;
-  kind: 'run' | 'tool' | 'approval' | 'plan' | 'interaction';
+  kind: 'run' | 'tool' | 'providerHosted' | 'approval' | 'plan' | 'interaction';
   status:
     | 'active'
     | 'requested'
     | 'waiting'
     | 'completed'
     | 'denied'
+    | 'rejected'
     | 'failed'
     | 'cancelled'
     | 'indeterminate';
@@ -722,6 +991,14 @@ export interface ActivityProjection {
   callId?: string;
   sequence: number;
   tool?: ToolActivityProjection;
+  inputRejection?: ToolInputRejection['error'];
+  providerHosted?: ProviderHostedActivityProjection;
+}
+
+export interface ProviderHostedActivityProjection {
+  providerToolType: 'web_search';
+  providerCallId: string;
+  action: JsonObject;
 }
 
 export interface ActivityResourceProjection {
@@ -741,6 +1018,8 @@ export interface ToolActivityProjection {
 export interface ShellActivityProjection {
   command: string;
   cwd: string;
+  executionScope: 'workspace' | 'host';
+  terminal: boolean;
   result?: ShellActivityResultProjection;
 }
 
@@ -753,15 +1032,18 @@ export interface ShellActivityResultProjection {
   truncated: boolean;
   capturedBytes: number;
   durationMs: number;
-  environment?: ShellExecutionEnvironmentProjection;
+  environment: ShellExecutionEnvironmentProjection;
 }
 
 export interface ShellExecutionEnvironmentProjection {
   shell: string;
-  interactive: false;
+  interactive: boolean;
+  executionScope: 'workspace' | 'host';
+  terminal: boolean;
   pathSource: 'hostPlusStandardDeveloperPaths';
-  writeScope: 'workspaceAndKernelTemporary';
-  homeWritable: false;
+  writeScope: 'kernelTemporaryOnly' | 'workspaceAndKernelTemporary' | 'hostUser';
+  homeWritable: boolean;
+  networkAccess: boolean;
 }
 
 export interface ArtifactProjection {
@@ -776,7 +1058,13 @@ export interface SessionDisplayProjection {
   creationTitle: string;
 }
 
+export interface SessionModelSettings {
+  profileId: string;
+  reasoningEffortOverride: LlmReasoningEffort | null;
+}
+
 export interface SessionProjection {
+  modelSettings: SessionModelSettings | null;
   schemaVersion: typeof SESSION_PROJECTION_VERSION;
   sessionId: string;
   revision: number;
@@ -787,6 +1075,8 @@ export interface SessionProjection {
   sessionDirectoryIndexes: WorkspaceBindingDisplay[];
   messages: ProjectionMessage[];
   narratives: NarrativeProjection[];
+  /** Session-owned semantic transcript order. Shells render this list without re-sorting it. */
+  timeline: SessionTimelineItem[];
   assistantDraft: AssistantDraftProjection | null;
   pendingInteraction: InteractionProjection | null;
   pendingApproval: ApprovalProjection | null;
@@ -795,6 +1085,7 @@ export interface SessionProjection {
   pendingPlan: PendingPlanProjection | null;
   todoList: TodoListProjection | null;
   contextUsage: ContextUsageProjection | null;
+  /** Latest settled input and latest in-flight composition; history is read on demand. */
   contextCompositions: ContextCompositionProjection[];
   tokenUsage: TokenUsageProjection;
   tokenUsageHistory: TokenUsageRoundProjection[];
@@ -807,6 +1098,27 @@ export interface SessionProjection {
 export interface ConversationPort {
   submit(command: ConversationCommand): Promise<CommandReply>;
   snapshot(sessionId: string): Promise<SessionProjection>;
+  contextComposition(sessionId: string, providerRequestId: string): Promise<ContextCompositionProjection>;
+  read(query: ConversationReadQuery): Promise<ConversationReadResult>;
+}
+
+export interface ConversationReadQuery {
+  sessionId: string;
+  view?: 'summary' | 'messages' | 'tools' | 'plans' | 'context';
+  before?: number;
+  limit?: number;
+  recordId?: string;
+  providerRequestId?: string;
+}
+
+/** A bounded journal read. Reading does not open/recover an Actor or run a Provider. */
+export interface ConversationReadResult {
+  sessionId: string;
+  revision: number;
+  view: NonNullable<ConversationReadQuery['view']>;
+  summary?: JsonObject;
+  items: JsonObject[];
+  nextBefore: number | null;
 }
 
 export interface ModelMessage {
@@ -815,11 +1127,15 @@ export interface ModelMessage {
   reasoningContent?: string;
   reasoningSignature?: string;
   toolCallId?: string;
+  providerCallId?: string;
   toolCalls?: readonly ModelToolCall[];
+  providerItems?: readonly JsonObject[];
+  providerOutputBlocks?: readonly ProviderOutputBlock[];
 }
 
 export interface ModelToolCall {
   callId: string;
+  providerCallId: string;
   name: string;
   input: JsonObject;
 }
@@ -830,18 +1146,42 @@ export interface ProviderToolDefinition {
   inputSchema: JsonObject;
 }
 
+export interface ProviderRuntimeSnapshot {
+  providerRuntimeRef: string;
+  profileId: string;
+  reasoningEffort?: LlmReasoningEffort;
+  reasoningEffortOverride?: LlmReasoningEffort;
+  thinking?: LlmThinkingMode;
+  contextWindowTokens: number;
+  maxOutputTokens: number;
+  apiSurface: 'chatCompletions' | 'responses' | 'anthropicMessages' | 'ollamaChat';
+  hostedWebSearch: 'none' | 'web_search';
+}
+
+export type WebSearchBinding =
+  | { owner: 'providerHosted'; providerToolType: 'web_search' }
+  | { owner: 'kernelAdapter'; toolName: 'web.search' }
+  | { owner: 'unavailable' };
+
+export interface ProviderHostedToolDefinition {
+  type: 'webSearch';
+  providerToolType: 'web_search';
+}
+
 export interface ProviderRequest {
   protocolVersion: typeof LOCAL_AGENT_PROTOCOL_VERSION;
   requestId: string;
   sessionId: string;
   runId: string;
-  profileId?: string;
+  providerRuntimeRef: string;
+  profileId: string;
   purpose: 'agent' | 'contextCompaction';
-  responseConstraint: 'normal' | 'answerOnly';
-  maxOutputTokens?: number;
+  responseConstraint: ProviderResponseConstraint;
+  maxOutputTokens: number;
   workspaceBindings: readonly WorkspaceBindingDisplay[];
   messages: readonly ModelMessage[];
   tools: readonly ProviderToolDefinition[];
+  hostedTools: readonly ProviderHostedToolDefinition[];
 }
 
 export type ProviderEvent =
@@ -849,7 +1189,19 @@ export type ProviderEvent =
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
       requestId: string;
       type: 'text.delta';
-      data: { text: string };
+      data: { text: string; outputIndex?: number };
+    }
+  | {
+      schemaVersion: typeof PROVIDER_EVENT_VERSION;
+      requestId: string;
+      type: 'reasoning.delta';
+      data: { text: string; outputIndex?: number };
+    }
+  | {
+      schemaVersion: typeof PROVIDER_EVENT_VERSION;
+      requestId: string;
+      type: 'output.item.completed';
+      data: { outputIndex: number; item: JsonObject };
     }
   | {
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
@@ -871,6 +1223,12 @@ export type ProviderEvent =
   | {
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
       requestId: string;
+      type: 'hosted.web-search.completed';
+      data: { item: JsonObject };
+    }
+  | {
+      schemaVersion: typeof PROVIDER_EVENT_VERSION;
+      requestId: string;
       type: 'completed';
       data: JsonObject;
     }
@@ -886,6 +1244,7 @@ export interface ProviderPort {
 }
 
 export type EffectKind =
+  | 'localRead'
   | 'workspaceRead'
   | 'workspaceMutation'
   | 'process'
@@ -900,12 +1259,101 @@ export interface ToolDescriptor {
   availability: 'callable' | 'blocked';
 }
 
+export interface PreparedToolDescriptor extends ToolDescriptor {
+  toolBindingRef: string;
+  origin: 'coreBuiltin' | 'extension';
+  pluginUri?: PluginUri;
+}
+
+export interface ToolPromptContribution {
+  contributionRef: string;
+  canonicalToolName: string;
+  promptSnippet?: string;
+  usageGuidelines: string[];
+}
+
+export type ToolPromptProviderSnapshot = {
+  providerRef: string;
+  contributions: ToolPromptContribution[];
+} & (
+  | {
+      origin: 'coreBuiltin';
+      pluginUri?: never;
+    }
+  | {
+      origin: 'extension';
+      pluginUri: PluginUri;
+    }
+);
+
+export type PreparedToolPromptContribution = ToolPromptContribution & {
+  preparedToolBindingRef: string;
+} & (
+  | {
+      origin: 'coreBuiltin';
+      pluginUri?: never;
+    }
+  | {
+      origin: 'extension';
+      pluginUri: PluginUri;
+    }
+);
+
+export interface ProviderToolAlias {
+  canonicalName: string;
+  wireName: string;
+}
+
+export interface RunRuntimeSnapshot {
+  runRuntimeSnapshotRef: string;
+  extensionGenerationRef: string;
+  kernelCatalogSnapshotRef: string;
+  provider: ProviderRuntimeSnapshot;
+  webSearch: WebSearchBinding;
+  instructions: { id: string; text: string }[];
+  tools: PreparedToolDescriptor[];
+  toolPromptContributions: PreparedToolPromptContribution[];
+  providerToolAliases: ProviderToolAlias[];
+  selectedPlugins: SelectedPluginSnapshot;
+}
+
+export interface PrepareRunRuntimeRequest {
+  sessionId: string;
+  runId: string;
+  profileId?: string;
+  reasoningEffortOverride?: LlmReasoningEffort;
+  pluginCatalogRevision?: string;
+  pluginSelections?: PluginSelectionInput[];
+}
+
+export interface PreparedRunRuntime {
+  runtimeSnapshot: RunRuntimeSnapshot;
+}
+
+export interface ReleaseRunRuntimeRequest {
+  sessionId: string;
+  runId: string;
+  kernelCatalogSnapshotRef: string;
+}
+
+export interface ReleaseRunRuntimeResult {
+  kernelCatalogSnapshotRef: string;
+  alreadyReleased: boolean;
+}
+
+/** Host composition root owns atomic run preparation across Provider and Kernel generations. */
+export interface RunPreparationPort {
+  prepare(request: PrepareRunRuntimeRequest): Promise<PreparedRunRuntime>;
+  release(request: ReleaseRunRuntimeRequest): Promise<ReleaseRunRuntimeResult>;
+}
+
 export interface PlanAuthority {
   authorityId: string;
   planId: string;
   revision: number;
   decisionId: string;
   sessionId: string;
+  runId: string;
   workspaceId: string;
   coveredOperations: PlanOperation[];
 }
@@ -915,11 +1363,23 @@ export interface PreparedEffectProjection {
   attemptId: string;
   sessionId: string;
   runId: string;
+  extensionGenerationRef: string;
+  kernelCatalogSnapshotRef: string;
+  toolBindingRef: string;
+  contributionRef: string;
+  providerRef: string;
+  origin: 'coreBuiltin' | 'extension';
+  pluginInstanceRef?: string;
   toolName: string;
   workspaceId?: string;
+  processWorkspaceMode?: 'read' | 'write';
+  processExecutionScope?: 'workspace' | 'host';
   operation: string;
   logicalTargets: string[];
-  canonicalInvocation: JsonObject;
+  canonicalInvocation: {
+    toolName: string;
+    arguments: JsonObject;
+  };
 }
 
 export interface ToolExecutionRequest {
@@ -928,6 +1388,9 @@ export interface ToolExecutionRequest {
   requestId: string;
   sessionId: string;
   runId: string;
+  extensionGenerationRef: string;
+  kernelCatalogSnapshotRef: string;
+  toolBindingRef: string;
   callId: string;
   attemptId: string;
   toolName: string;
@@ -940,7 +1403,7 @@ export interface ToolExecutionRequest {
   };
 }
 
-export type AuthorityDecision =
+export type WorkspaceAuthorityDecision =
   | { decision: 'allow'; source: 'workspaceBinding'; workspaceId: string }
   | {
       decision: 'allow';
@@ -951,13 +1414,36 @@ export type AuthorityDecision =
       revision: number;
       decisionId: string;
     }
+  | {
+      decision: 'allow';
+      source: 'userSetting';
+      authorityId: string;
+      workspaceId: string;
+    };
+
+export type NonWorkspaceAuthorityDecision =
   | { decision: 'allow'; source: 'user' | 'userSetting'; authorityId: string }
-  | { decision: 'deny'; source: 'kernel' | 'user' | 'userSetting'; reason: string };
+  | { decision: 'deny'; source: 'user'; authorityId: string }
+  | { decision: 'deny'; source: 'kernel' | 'userSetting'; reason: string };
+
+export type AuthorityDecision =
+  | { decision: 'allow'; source: 'localRead' }
+  | WorkspaceAuthorityDecision
+  | NonWorkspaceAuthorityDecision
+  | {
+      decision: 'allow' | 'deny';
+      source: 'composite';
+      workspaceAuthority: WorkspaceAuthorityDecision;
+      externalAuthority: NonWorkspaceAuthorityDecision;
+    };
 
 interface ToolExecutionRecordBase {
   recordId: string;
   sessionId: string;
   runId: string;
+  extensionGenerationRef: string;
+  kernelCatalogSnapshotRef: string;
+  toolBindingRef: string;
   callId: string;
   attemptId: string;
   toolName: string;
@@ -971,11 +1457,32 @@ interface ToolExecutionRecordBase {
 export type ToolExecutionRecord =
   | (ToolExecutionRecordBase & { outcome: 'completed'; output: unknown })
   | (ToolExecutionRecordBase & { outcome: 'denied'; error?: LocalAgentError })
-  | (ToolExecutionRecordBase & { outcome: 'failed'; error: LocalAgentError })
+  | (ToolExecutionRecordBase & { outcome: 'failed'; output?: unknown; error: LocalAgentError })
   | (ToolExecutionRecordBase & { outcome: 'cancelled' })
   | (ToolExecutionRecordBase & { outcome: 'indeterminate'; error: LocalAgentError });
 
+export interface ToolInputIssue {
+  path: string;
+  rule: string;
+  message: string;
+  expected?: unknown;
+}
+
+/** Kernel input rejection before effect preparation or execution; journaled by Session. */
+export interface ToolInputRejection extends Omit<ToolExecutionRecordBase, 'recordId' | 'preparedEffect' | 'authority' | 'startedAt' | 'completedAt'> {
+  rejectedAt: string;
+  error: LocalAgentError & { issues: ToolInputIssue[] };
+}
+
 export type ToolExecutionReply =
+  | {
+      schemaVersion: typeof KERNEL_REPLY_VERSION;
+      type: 'tool.execution';
+      requestId: string;
+      callId: string;
+      status: 'inputRejected';
+      rejection: ToolInputRejection;
+    }
   | {
       schemaVersion: typeof KERNEL_REPLY_VERSION;
       type: 'tool.execution';
@@ -1014,7 +1521,6 @@ export type ToolCancelReply =
     };
 
 export interface KernelPort {
-  listTools(): Promise<readonly ToolDescriptor[]>;
   execute(request: ToolExecutionRequest): Promise<ToolExecutionReply>;
   cancel(callId: string, attemptId: string): Promise<ToolCancelReply>;
   readRecord(callId: string): Promise<ToolExecutionRecord | null>;

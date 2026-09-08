@@ -6,6 +6,7 @@ members = [
   "crates/deepcode-kernel-runtime",
   "crates/deepcode-kernel-client",
   "crates/deepcode-kernel-daemon",
+  "crates/deepcode-first-party-tools",
   "crates/deepcode-host-web",
   "shells/cli",
   "shells/tui",
@@ -16,7 +17,7 @@ exclude = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.45"
+version = "0.5.50"
 edition = "2021"
 rust-version = "1.86"
 license = "MIT"

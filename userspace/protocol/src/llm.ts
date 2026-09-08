@@ -1,11 +1,13 @@
 export type LlmProviderKind =
   | 'openaiCompatible'
+  | 'responses'
   | 'anthropic'
   | 'ollama';
 
 export type LlmProviderFlavor = 'openai' | 'deepseek' | 'zhipu' | 'moonshot';
 export type LlmReasoningEffort = 'low' | 'medium' | 'high' | 'max';
 export type LlmThinkingMode = 'enabled' | 'disabled';
+export type LlmHostedWebSearch = 'web_search';
 
 interface LlmProviderProfileFields {
   id: string;
@@ -19,6 +21,7 @@ interface LlmProviderProfileFields {
   temperature?: number;
   reasoningEffort?: LlmReasoningEffort;
   thinking?: LlmThinkingMode;
+  hostedWebSearch?: LlmHostedWebSearch;
   secretRef?: string;
   enabled: boolean;
 }
@@ -49,7 +52,7 @@ export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
   {
     id: 'deepseek-v4-flash-openai',
     name: 'DeepSeek V4 Flash',
-    kind: 'openaiCompatible',
+    kind: 'responses',
     providerFlavor: 'deepseek',
     baseUrl: DEEPSEEK_OPENAI_BASE_URL,
     model: 'deepseek-v4-flash',
@@ -58,12 +61,13 @@ export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
     temperature: 0.2,
     reasoningEffort: 'high',
     thinking: 'enabled',
+    hostedWebSearch: 'web_search',
     enabled: true,
   },
   {
     id: 'deepseek-v4-pro-openai',
     name: 'DeepSeek V4 Pro',
-    kind: 'openaiCompatible',
+    kind: 'responses',
     providerFlavor: 'deepseek',
     baseUrl: DEEPSEEK_OPENAI_BASE_URL,
     model: 'deepseek-v4-pro',
@@ -72,6 +76,7 @@ export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
     temperature: 0.2,
     reasoningEffort: 'max',
     thinking: 'enabled',
+    hostedWebSearch: 'web_search',
     enabled: true,
   },
 ];
