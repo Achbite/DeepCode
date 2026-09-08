@@ -1,4 +1,5 @@
 use crate::local_agent_mcp::{McpRuntime, McpTool, McpToolBindingRequirement, McpToolEffectScope};
+use crate::local_agent_product_tools::ProductTools;
 use deepcode_kernel_runtime::executors::{
     builtin_executors, web_search_availability, KernelExecutorConfig, KernelExecutorRegistry,
     KernelToolExecutionContext, KernelToolExecutionFailure, KernelToolExecutionOutcome,
@@ -32,6 +33,7 @@ impl ToolCatalogError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CatalogEffectScope {
+    LocalRead,
     WorkspaceRead,
     WorkspaceMutation,
     Process,
@@ -46,6 +48,7 @@ enum ToolExecutorBinding {
         executors: Arc<KernelExecutorRegistry>,
     },
     Mcp(Box<McpTool>),
+    Product(Arc<ProductTools>),
 }
 
 struct PendingToolContribution {
@@ -74,6 +77,38 @@ struct InstalledToolProvider {
 
 trait ToolProvider: Send {
     fn install(self: Box<Self>) -> Result<InstalledToolProvider, ToolCatalogError>;
+}
+
+struct ProductToolProvider(Arc<ProductTools>);
+
+impl ToolProvider for ProductToolProvider {
+    fn install(self: Box<Self>) -> Result<InstalledToolProvider, ToolCatalogError> {
+        let tools = ProductTools::definitions()
+            .into_iter()
+            .map(
+                |(name, description, input_schema)| PendingToolContribution {
+                    origin: "coreBuiltin",
+                    provider_ref: "deepcode:product".into(),
+                    plugin_uri: None,
+                    plugin_instance_ref: None,
+                    contribution_ref: format!("deepcode:product/{name}"),
+                    binding_identity: format!("product:{name}"),
+                    name: name.into(),
+                    description,
+                    input_schema,
+                    effect_class: Some(ToolEffectClass::Read),
+                    effect_scope: CatalogEffectScope::LocalRead,
+                    availability: ToolAvailability::Callable,
+                    logical_target: None,
+                    binding: ToolExecutorBinding::Product(Arc::clone(&self.0)),
+                },
+            )
+            .collect();
+        Ok(InstalledToolProvider {
+            tools,
+            dispose: Box::new(|| Ok(())),
+        })
+    }
 }
 
 struct BuiltinToolProvider {
@@ -305,6 +340,7 @@ impl ToolCatalogSnapshot {
         secret_provider: Arc<dyn SecretProvider>,
         mcp: McpRuntime,
         enable_web_search: bool,
+        product: Arc<ProductTools>,
     ) -> Result<Arc<Self>, ToolCatalogError> {
         validate_ref("extensionGenerationRef", extension_generation_ref)?;
         validate_ref("kernelRuntimeGenerationKey", kernel_runtime_generation_key)?;
@@ -315,6 +351,7 @@ impl ToolCatalogSnapshot {
                 enable_web_search,
             )?),
             Box::new(McpToolProvider::prepare(mcp)?),
+            Box::new(ProductToolProvider(product)),
         ];
         Self::from_providers(
             extension_generation_ref,
@@ -587,6 +624,10 @@ impl PreparedCatalogBinding {
                     }
                 }),
             ToolExecutorBinding::Mcp(_) => Ok(raw_arguments),
+            ToolExecutorBinding::Product(_) => {
+                product_logical_targets(self.tool_name(), &raw_arguments)?;
+                Ok(raw_arguments)
+            }
         }
     }
 
@@ -596,6 +637,9 @@ impl PreparedCatalogBinding {
     ) -> Result<Option<Vec<String>>, ToolCatalogError> {
         match &self.entry().binding {
             ToolExecutorBinding::Builtin { .. } => Ok(None),
+            ToolExecutorBinding::Product(_) => {
+                product_logical_targets(self.tool_name(), arguments).map(Some)
+            }
             ToolExecutorBinding::Mcp(tool) => tool
                 .logical_targets(arguments)
                 .map(Some)
@@ -621,6 +665,26 @@ impl PreparedCatalogBinding {
                     context,
                 )
                 .map_err(|error| ToolCatalogError::new("tool_execution_failed", error.to_string())),
+            ToolExecutorBinding::Product(product) => {
+                let result = product.call(self.tool_name(), input);
+                Ok(match result {
+                    Ok(output) => KernelToolExecutionResult {
+                        invocation_id: invocation_id.into(),
+                        outcome: KernelToolExecutionOutcome::Completed,
+                        output,
+                        error: None,
+                    },
+                    Err(error) => KernelToolExecutionResult {
+                        invocation_id: invocation_id.into(),
+                        outcome: KernelToolExecutionOutcome::Failed,
+                        output: Value::Null,
+                        error: Some(KernelToolExecutionFailure {
+                            code: error.code,
+                            message: error.message,
+                        }),
+                    },
+                })
+            }
             ToolExecutorBinding::Mcp(tool) => tool
                 .call(input, &context)
                 .map(|result| {
@@ -666,11 +730,32 @@ impl Drop for PhysicalAttemptLease {
     }
 }
 
+fn product_logical_targets(name: &str, input: &Value) -> Result<Vec<String>, ToolCatalogError> {
+    let field = if name == "session.read" {
+        "sessionId"
+    } else {
+        "name"
+    };
+    let id = input
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            ToolCatalogError::new("tool_input_invalid", format!("{field} is required"))
+        })?;
+    Ok(vec![if name == "session.read" {
+        id.to_string()
+    } else {
+        format!("skill:{id}")
+    }])
+}
+
 fn possible_effects(
     effect_class: Option<ToolEffectClass>,
     scope: CatalogEffectScope,
 ) -> Vec<&'static str> {
     match scope {
+        CatalogEffectScope::LocalRead => vec!["localRead"],
         CatalogEffectScope::WorkspaceRead => vec!["workspaceRead"],
         CatalogEffectScope::WorkspaceMutation => vec!["workspaceMutation"],
         CatalogEffectScope::Process => vec!["process", "workspaceMutation", "external"],

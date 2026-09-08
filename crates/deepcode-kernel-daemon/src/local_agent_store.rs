@@ -1838,12 +1838,6 @@ fn validate_event_facts(
                 }
             }
             let source_fact_ref = required_string(payload, "sourceFactRef")?;
-            let revision_sql = i64::try_from(revision).map_err(|_| {
-                LocalAgentStoreError::new(
-                    "session_event_invalid",
-                    "sourcePlanRevision 超出 SQLite 整数范围。",
-                )
-            })?;
             let needs_success = payload["updates"]
                 .as_array()
                 .expect("validated updates")
@@ -1855,29 +1849,16 @@ fn validate_event_facts(
                          SELECT 1 FROM session_events
                          WHERE session_id=?1 AND run_id=?2 AND event_type='tool.completed'
                            AND json_extract(payload_json, '$.record.recordId')=?3
-                           AND (?6=0 OR json_extract(payload_json, '$.record.outcome')='completed')
-                           AND sequence > (
-                             SELECT MAX(sequence) FROM session_events
-                             WHERE session_id=?1 AND event_type='plan.confirmed'
-                               AND json_extract(payload_json, '$.planId')=?4
-                               AND json_extract(payload_json, '$.revision')=?5
-                           )
+                           AND (?4=0 OR json_extract(payload_json, '$.record.outcome')='completed')
                      )",
-                    params![
-                        session_id,
-                        run_id,
-                        source_fact_ref,
-                        plan_id,
-                        revision_sql,
-                        needs_success
-                    ],
+                    params![session_id, run_id, source_fact_ref, needs_success],
                     |row| row.get(0),
                 )
                 .map_err(sql_error("session_event_fact_read_failed"))?;
             if !source_record_exists {
                 return Err(LocalAgentStoreError::new(
                     "todo_source_fact_missing",
-                    "todo.progressed 必须引用本 run 确认 Plan 后的 ToolRecord；完成步骤需要成功结果。",
+                    "todo.progressed 必须引用本 run 的 ToolRecord（可早于 Plan 确认）；完成步骤需要成功结果。",
                 ));
             }
         }
@@ -4419,7 +4400,12 @@ fn validate_run_runtime_snapshot(
             })?;
             if !matches!(
                 effect,
-                "workspaceRead" | "workspaceMutation" | "process" | "network" | "external"
+                "localRead"
+                    | "workspaceRead"
+                    | "workspaceMutation"
+                    | "process"
+                    | "network"
+                    | "external"
             ) || !seen_effects.insert(effect)
             {
                 return Err(LocalAgentStoreError::new(

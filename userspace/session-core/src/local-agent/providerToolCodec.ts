@@ -23,6 +23,8 @@ export const CORE_TOOL_ORDER = [
   'bash',
   'web.search',
   'web.fetch',
+  'session.read',
+  'skill.read',
 ] as const;
 
 export interface ProviderToolCodec {

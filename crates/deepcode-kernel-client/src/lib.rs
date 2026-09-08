@@ -244,6 +244,24 @@ impl HttpKernelClient {
         decode_api_data(value)
     }
 
+    /// Read persisted facts without opening or recovering the target Session Actor.
+    pub async fn conversation_read(
+        &self,
+        session_id: &str,
+        query: &Value,
+    ) -> KernelClientResult<Value> {
+        let value = self
+            .http
+            .post(self.url(&format!("/api/conversation/sessions/{session_id}/read")))
+            .json(query)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data(value)
+    }
+
     pub async fn conversation_projection(
         &self,
         session_id: &str,

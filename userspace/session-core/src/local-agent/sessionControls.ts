@@ -181,7 +181,7 @@ export function sessionControlToolDefinitions(): readonly ProviderToolDefinition
     },
     {
       name: SESSION_CONTROL_PLAN_PROGRESS,
-      description: 'Update confirmed Todo steps after examining a tool result. sourceFactRef is its recordId. Mark completed only when the step and its verification are done. Batch related updates; this does not request user confirmation.',
+      description: 'Update confirmed Todo steps after examining a tool result. sourceFactRef is its recordId from this run, including investigation before Plan confirmation. Mark completed only when the step and its verification are done. Batch related updates; this does not request user confirmation.',
       inputSchema: {
         type: 'object', additionalProperties: false, required: ['sourceFactRef', 'updates'],
         properties: {

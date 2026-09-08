@@ -738,12 +738,12 @@ stage_hash() {
         tracked_files Cargo.toml Cargo.lock contracts/agent-runtime crates/deepcode-kernel-abi \
           crates/deepcode-kernel-runtime crates/deepcode-kernel-tools crates/deepcode-kernel-config \
           crates/deepcode-kernel-client crates/deepcode-kernel-daemon crates/deepcode-first-party-tools crates/deepcode-host-web \
-          shells/cli shells/tui
+          shells/cli shells/tui skills
         ;;
       daemon)
         tracked_files Cargo.toml Cargo.lock contracts/agent-runtime crates/deepcode-kernel-abi \
           crates/deepcode-kernel-runtime crates/deepcode-kernel-tools crates/deepcode-kernel-config \
-          crates/deepcode-kernel-daemon crates/deepcode-first-party-tools crates/deepcode-host-web
+          crates/deepcode-kernel-daemon crates/deepcode-first-party-tools crates/deepcode-host-web skills
         ;;
       cli)
         tracked_files Cargo.toml Cargo.lock crates/deepcode-kernel-abi crates/deepcode-kernel-client shells/cli

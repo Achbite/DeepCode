@@ -462,6 +462,7 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("DELETE", ["api", "conversation", "sessions", _, "directory-indexes", _])
         | ("GET", ["api", "conversation", "sessions", _, "projection"])
         | ("GET", ["api", "conversation", "sessions", _, "context-compositions", _])
+        | ("POST", ["api", "conversation", "sessions", _, "read"])
         | ("POST", ["api", "conversation", "sessions", _, "resources", "read"]) => true,
         _ => false,
     }

@@ -111,6 +111,7 @@ enum WorkspaceMutationMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreparedEffectScope {
+    LocalRead,
     WorkspaceRead,
     WorkspaceMutation,
     Process,
@@ -146,7 +147,8 @@ impl LocalAgentPermissionPolicy {
         match scope {
             PreparedEffectScope::Network => Some(self.network),
             PreparedEffectScope::External => Some(self.external),
-            PreparedEffectScope::WorkspaceRead
+            PreparedEffectScope::LocalRead
+            | PreparedEffectScope::WorkspaceRead
             | PreparedEffectScope::WorkspaceMutation
             | PreparedEffectScope::Process => None,
         }
@@ -386,6 +388,7 @@ impl LocalAgentKernel {
         mcp: McpRuntime,
         permissions: LocalAgentPermissionPolicy,
         enable_web_search: bool,
+        product: Arc<crate::local_agent_product_tools::ProductTools>,
     ) -> Result<PreparedKernelGeneration, LocalAgentKernelError> {
         let catalog = ToolCatalogSnapshot::prepare(
             extension_generation_ref,
@@ -394,6 +397,7 @@ impl LocalAgentKernel {
             secret_provider,
             mcp,
             enable_web_search,
+            product,
         )
         .map_err(catalog_error)?;
         Ok(PreparedKernelGeneration {
@@ -919,6 +923,7 @@ impl LocalAgentKernel {
             ));
         }
         let scope = match binding.effect_scope() {
+            CatalogEffectScope::LocalRead => PreparedEffectScope::LocalRead,
             CatalogEffectScope::WorkspaceRead => PreparedEffectScope::WorkspaceRead,
             CatalogEffectScope::WorkspaceMutation => PreparedEffectScope::WorkspaceMutation,
             CatalogEffectScope::Process => PreparedEffectScope::Process,
@@ -930,7 +935,9 @@ impl LocalAgentKernel {
             PreparedEffectScope::WorkspaceRead
             | PreparedEffectScope::WorkspaceMutation
             | PreparedEffectScope::Process => Some(take_workspace_id(&mut tool_input)?),
-            PreparedEffectScope::Network | PreparedEffectScope::External => {
+            PreparedEffectScope::LocalRead
+            | PreparedEffectScope::Network
+            | PreparedEffectScope::External => {
                 if tool_input.get("workspaceId").is_some() {
                     return Err(LocalAgentKernelError::input(
                         "$.workspaceId",
@@ -1002,7 +1009,9 @@ impl LocalAgentKernel {
                         boundary.resolve_read(target)
                     }
                     PreparedEffectScope::WorkspaceMutation => boundary.resolve_mutation(target),
-                    PreparedEffectScope::Network | PreparedEffectScope::External => {
+                    PreparedEffectScope::LocalRead
+                    | PreparedEffectScope::Network
+                    | PreparedEffectScope::External => {
                         unreachable!("workspace target scope")
                     }
                 };
@@ -1100,6 +1109,9 @@ impl LocalAgentKernel {
             ));
         }
         match prepared.scope {
+            PreparedEffectScope::LocalRead => Ok(Admission::Allowed(
+                json!({"decision":"allow", "source":"localRead"}),
+            )),
             PreparedEffectScope::WorkspaceRead => {
                 let workspace_id = prepared
                     .workspace_id
@@ -1904,7 +1916,8 @@ fn permission_setting_id(scope: PreparedEffectScope) -> &'static str {
     match scope {
         PreparedEffectScope::Network => "user-setting:agent.permissions.networkRead",
         PreparedEffectScope::External => "user-setting:agent.permissions.external",
-        PreparedEffectScope::WorkspaceRead
+        PreparedEffectScope::LocalRead
+        | PreparedEffectScope::WorkspaceRead
         | PreparedEffectScope::WorkspaceMutation
         | PreparedEffectScope::Process => {
             unreachable!("workspace effects are not setting-authorized")
@@ -1914,6 +1927,7 @@ fn permission_setting_id(scope: PreparedEffectScope) -> &'static str {
 
 fn effect_names(scope: PreparedEffectScope) -> Vec<&'static str> {
     match scope {
+        PreparedEffectScope::LocalRead => vec!["localRead"],
         PreparedEffectScope::WorkspaceRead => vec!["workspaceRead"],
         PreparedEffectScope::WorkspaceMutation => vec!["workspaceMutation"],
         PreparedEffectScope::Process => vec!["process"],
@@ -2196,6 +2210,7 @@ mod attempt_control_tests {
             McpRuntime::default(),
             LocalAgentPermissionPolicy::from_settings(&json!({})).unwrap(),
             false,
+            crate::local_agent_product_tools::test_product_tools(),
         )
         .unwrap();
         let catalog = kernel
@@ -2277,6 +2292,7 @@ mod attempt_control_tests {
             McpRuntime::default(),
             LocalAgentPermissionPolicy::from_settings(&json!({})).unwrap(),
             false,
+            crate::local_agent_product_tools::test_product_tools(),
         )
         .unwrap()
         .generation;

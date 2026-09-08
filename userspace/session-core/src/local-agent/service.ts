@@ -4,11 +4,15 @@ import type {
   ContextCompositionProjection,
   ConversationCommand,
   ConversationPort,
+  ConversationReadQuery,
+  ConversationReadResult,
   SessionProjection,
   WorkspaceBindingDisplay,
 } from '@deepcode/protocol';
 import { SessionActor } from './actor.js';
 import type { AgentComposition } from './plugins.js';
+import { readConversation, readSessionEvents } from './conversationRead.js';
+import { recoverSession } from './reducer.js';
 
 export interface SessionCompositionFactory {
   create(input: {
@@ -76,7 +80,14 @@ export class SessionService implements ConversationPort {
   }
 
   async contextComposition(sessionId: string, providerRequestId: string): Promise<ContextCompositionProjection> {
-    return await (await this.actor(sessionId)).contextComposition(providerRequestId);
+    const state = recoverSession(sessionId, await readSessionEvents(this.journal, sessionId));
+    const receipt = state.contextCompositions.find((item) => item.providerRequestId === providerRequestId);
+    if (!receipt) throw new Error('context_composition_not_found');
+    return structuredClone(receipt);
+  }
+
+  async read(query: ConversationReadQuery): Promise<ConversationReadResult> {
+    return await readConversation(this.journal, query);
   }
 
   async dispose(): Promise<void> {

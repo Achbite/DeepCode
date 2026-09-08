@@ -74,6 +74,24 @@ struct FilesystemReferencePathInput {
     kind: String,
 }
 
+pub(crate) async fn conversation_read(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(mut body): Json<Value>,
+) -> Json<ApiResponse> {
+    let Some(query) = body.as_object_mut() else {
+        return ApiResponse::error("conversation_read_invalid", "读取选项必须是对象。");
+    };
+    if query.contains_key("sessionId") {
+        return ApiResponse::error("conversation_read_invalid", "sessionId 使用请求路径。");
+    }
+    query.insert("sessionId".into(), Value::String(session_id));
+    match request_service(state.session_service.clone(), "read", body).await {
+        Ok(value) => ApiResponse::ok(value),
+        Err(error) => session_service_error(error),
+    }
+}
+
 pub(crate) async fn conversation_catalog_get(State(state): State<AppState>) -> Json<ApiResponse> {
     let gui = state.gui.lock().expect("gui state lock");
     if let Some(error) = gui.conversation_catalog_error.as_deref() {

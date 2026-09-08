@@ -187,6 +187,7 @@ function decodePreparedToolDescriptors(value: unknown): readonly PreparedToolDes
       || !isRecord(candidate.inputSchema)
       || !Array.isArray(candidate.possibleEffects)
       || candidate.possibleEffects.some((effect) => ![
+        'localRead',
         'workspaceRead',
         'workspaceMutation',
         'process',

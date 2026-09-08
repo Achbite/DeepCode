@@ -123,6 +123,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
             delete(conversation_directory_index_detach),
         )
         .route(
+            "/api/conversation/sessions/:session_id/read",
+            post(conversation_read),
+        )
+        .route(
             "/api/conversation/sessions/:session_id/projection",
             get(conversation_projection_get),
         )

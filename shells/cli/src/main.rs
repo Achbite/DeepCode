@@ -7,6 +7,7 @@ use deepcode_kernel_client::{
     NarrativeProjection, PendingPlanProjection, PlanProjection, PluginCatalogProjection,
     PluginSelectionInput, ProjectionMessage, SessionProjection, SessionTimelineItem,
 };
+use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::env;
 use std::io::{self, IsTerminal, Write};
@@ -73,6 +74,9 @@ enum Command {
     Ask(String),
     Chat,
     Show,
+    Read {
+        query: Value,
+    },
     CancelPlan,
     Cancel {
         run_id: String,
@@ -112,6 +116,7 @@ impl Args {
         let mut plugins = Vec::new();
         let mut files = Vec::new();
         let mut directories = Vec::new();
+        let mut read_query = serde_json::Map::new();
         let mut positional = Vec::new();
         let mut index = 0;
         while index < values.len() {
@@ -128,6 +133,33 @@ impl Args {
                 "--session" => {
                     index += 1;
                     session_id = Some(required_arg(&values, index, "--session")?.to_string());
+                }
+                "--view" | "--record" | "--request" | "--before" | "--limit" => {
+                    let option = values[index].clone();
+                    index += 1;
+                    let value = required_arg(&values, index, &option)?;
+                    let field = match option.as_str() {
+                        "--view" => "view",
+                        "--record" => "recordId",
+                        "--request" => "providerRequestId",
+                        "--before" => "before",
+                        _ => "limit",
+                    };
+                    let value = if matches!(field, "before" | "limit") {
+                        let number = value
+                            .parse::<u64>()
+                            .map_err(|_| format!("{option} 需要正整数。"))?;
+                        if number == 0
+                            || (field == "limit" && number > 50)
+                            || number > 9_007_199_254_740_991
+                        {
+                            return Err(format!("{option} 超出有效范围。"));
+                        }
+                        json!(number)
+                    } else {
+                        json!(value)
+                    };
+                    read_query.insert(field.into(), value);
                 }
                 "--plain" => plain = true,
                 "--plugin" => {
@@ -159,6 +191,14 @@ impl Args {
             Some("status") => Command::Status,
             Some("chat") => Command::Chat,
             Some("show") => Command::Show,
+            Some("read") => {
+                if positional.len() != 1 || session_id.is_none() {
+                    return Err("用法：read --session <id> [--view summary|messages|tools|plans|context] [--before <sequence>] [--limit 1..50]".into());
+                }
+                Command::Read {
+                    query: Value::Object(read_query.clone()),
+                }
+            }
             Some("ask") => {
                 let text = positional[1..].join(" ");
                 if text.trim().is_empty() {
@@ -210,6 +250,9 @@ impl Args {
             }
             Some(other) => return Err(format!("未知命令：{other}")),
         };
+        if !read_query.is_empty() && !matches!(command, Command::Read { .. }) {
+            return Err("--view/--record/--request/--before/--limit 仅用于 read。".into());
+        }
         Ok(Self {
             api,
             no_auto_start_kernel,
@@ -396,6 +439,18 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
                 &args.plugins,
             )
             .await
+        }
+        Command::Read { query } => {
+            let session_id = require_session(args.session_id.as_deref())?;
+            let result = client
+                .conversation_read(session_id, &query)
+                .await
+                .map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).map_err(|error| error.to_string())?
+            );
+            Ok(Outcome::Done)
         }
         Command::Show => {
             let session_id = require_session(args.session_id.as_deref())?;
@@ -1511,6 +1566,7 @@ fn print_help() {
   deepcode-cli ask [-C <workspace>] [--session <id>] [--file <path>]... [--directory <path>]... [--plugin <plugin://uri>]... [--plain] <message-or-response>
   deepcode-cli chat [-C <workspace>] [--session <id>] [--plugin <plugin://uri>]...
   deepcode-cli show --session <id>
+  deepcode-cli read --session <id> [--view summary|messages|tools|plans|context] [--before <sequence>] [--limit 1..50] [--record <id>] [--request <id>]
   deepcode-cli cancel-plan --session <id>
   deepcode-cli cancel --session <id> <run-id>
   deepcode-cli attach-directory --session <id> <path>

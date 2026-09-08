@@ -2188,7 +2188,6 @@ function planProgressFact(
   const evidence = snapshot.events.find((event) => (
     event.type === 'tool.completed' && event.runId === runId
     && event.payload.record.recordId === turn.sourceFactRef
-    && event.sequence > (confirmation?.sequence ?? Infinity)
   ));
   const valid = active && todo && confirmation
     && todo.sourcePlanId === active.planId && todo.sourcePlanRevision === active.revision
@@ -2200,7 +2199,7 @@ function planProgressFact(
     payload: {
       providerCallId: turn.providerCallId, toolName: SESSION_CONTROL_PLAN_PROGRESS,
       input: { sourceFactRef: turn.sourceFactRef, updates: turn.updates },
-      error: { code: 'plan_progress_evidence_invalid', message: 'Use current Todo IDs and a tool result recordId from this run after Plan confirmation. Completion requires a successful result.' },
+      error: { code: 'plan_progress_evidence_invalid', message: 'Use current Todo IDs and a tool result recordId from this run. Earlier investigation results remain valid evidence; Completion requires a successful result.' },
     },
   };
   return {

@@ -732,7 +732,7 @@ function isApproval(value: unknown): boolean {
 }
 
 function isEffectPreview(value: unknown): boolean {
-  const effects = ['workspaceRead', 'workspaceMutation', 'process', 'network', 'external'];
+  const effects = ['localRead', 'workspaceRead', 'workspaceMutation', 'process', 'network', 'external'];
   return isExactRecord(value, ['summary', 'effects', 'logicalTargets'])
     && isNonEmptyText(value.summary)
     && Array.isArray(value.effects)

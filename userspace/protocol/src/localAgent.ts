@@ -1099,6 +1099,26 @@ export interface ConversationPort {
   submit(command: ConversationCommand): Promise<CommandReply>;
   snapshot(sessionId: string): Promise<SessionProjection>;
   contextComposition(sessionId: string, providerRequestId: string): Promise<ContextCompositionProjection>;
+  read(query: ConversationReadQuery): Promise<ConversationReadResult>;
+}
+
+export interface ConversationReadQuery {
+  sessionId: string;
+  view?: 'summary' | 'messages' | 'tools' | 'plans' | 'context';
+  before?: number;
+  limit?: number;
+  recordId?: string;
+  providerRequestId?: string;
+}
+
+/** A bounded journal read. Reading does not open/recover an Actor or run a Provider. */
+export interface ConversationReadResult {
+  sessionId: string;
+  revision: number;
+  view: NonNullable<ConversationReadQuery['view']>;
+  summary?: JsonObject;
+  items: JsonObject[];
+  nextBefore: number | null;
 }
 
 export interface ModelMessage {
@@ -1224,6 +1244,7 @@ export interface ProviderPort {
 }
 
 export type EffectKind =
+  | 'localRead'
   | 'workspaceRead'
   | 'workspaceMutation'
   | 'process'
@@ -1406,6 +1427,7 @@ export type NonWorkspaceAuthorityDecision =
   | { decision: 'deny'; source: 'kernel' | 'userSetting'; reason: string };
 
 export type AuthorityDecision =
+  | { decision: 'allow'; source: 'localRead' }
   | WorkspaceAuthorityDecision
   | NonWorkspaceAuthorityDecision
   | {

@@ -94,6 +94,7 @@ impl LocalAgentRuntime {
     fn prepare_run_runtime(
         &self,
         gui: &Arc<Mutex<GuiState>>,
+        session_service: SessionServiceProcess,
         request: PrepareRunRuntimeRequest,
     ) -> Result<Value, RunPreparationError> {
         for (field, value) in [
@@ -228,6 +229,9 @@ impl LocalAgentRuntime {
             mcp,
             permissions,
             enable_kernel_web_search,
+            Arc::new(crate::local_agent_product_tools::ProductTools::new(
+                Arc::new(session_service),
+            )),
         )
         .map_err(RunPreparationError::from)?;
         *self.active_runtime_settings.lock().map_err(|_| {
@@ -641,7 +645,10 @@ pub(crate) async fn local_agent_run_runtime_prepare(
     if let Err(response) = require_session_service(&state, &headers) {
         return response;
     }
-    match state.local_agent.prepare_run_runtime(&state.gui, body) {
+    match state
+        .local_agent
+        .prepare_run_runtime(&state.gui, state.session_service.clone(), body)
+    {
         Ok(runtime) => ApiResponse::ok(runtime),
         Err(error) => ApiResponse::error(error.code, error.message),
     }
