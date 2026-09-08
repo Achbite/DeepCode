@@ -28,14 +28,14 @@ Usage:
   scripts/macos-package-service.sh run
   scripts/macos-package-service.sh stop
   scripts/macos-package-service.sh status [--quiet]
-  scripts/macos-package-service.sh submit [--products DeepCode-GUI,DeepCode] [--clean] [--refresh-gui-dist] [--no-kill-running] [--wait] [--timeout-seconds N]
+  scripts/macos-package-service.sh submit [--products DeepCode-GUI,DeepCode] [--clean] [--no-kill-running] [--wait] [--timeout-seconds N]
 
 Commands:
   start   Start the macOS host package worker in the background.
   run     Run the package worker in the foreground.
   stop    Stop the background worker.
   status  Report whether the worker process is alive.
-  submit  Queue one product-set transaction in this repository. This command can run inside Docker. GUI dist refresh and releasing old app bundles are the defaults.
+  submit  Queue one product-set transaction in this repository. This command can run inside Docker. Every request builds current frontend source in Docker before native packaging.
 USAGE
 }
 
@@ -290,21 +290,18 @@ validate_bool() {
 
 process_request() {
   local request_path="$1"
-  local request_id product products clean refresh kill_running log_path started_at finished_at exit_code package_pid
+  local request_id product products clean kill_running log_path started_at finished_at exit_code package_pid
 
   request_id="$(basename "$request_path" .running)"
   products="$(read_request_value "$request_path" products)"
   product="$(read_request_value "$request_path" product)"
   clean="$(read_request_value "$request_path" clean)"
-  refresh="$(read_request_value "$request_path" refresh_gui_dist)"
   kill_running="$(read_request_value "$request_path" kill_running)"
   products="${products:-${product:-DeepCode-GUI,DeepCode}}"
   products="$(normalize_products "$products")"
   clean="${clean:-0}"
-  refresh="${refresh:-1}"
   kill_running="${kill_running:-1}"
   validate_bool "$clean"
-  validate_bool "$refresh"
   validate_bool "$kill_running"
 
   log_path="$LOG_DIR/$request_id.log"
@@ -315,13 +312,12 @@ process_request() {
 
   set +e
   {
-    printf '==[macos-package-service]== request=%s products=%s clean=%s refresh_gui_dist=%s kill_running=%s root=%s output=%s started_at=%s\n' \
-      "$request_id" "$products" "$clean" "$refresh" "$kill_running" "$ROOT_DIR" "$ROOT_DIR/bin/macos-arm64" "$started_at"
+    printf '==[macos-package-service]== request=%s products=%s clean=%s kill_running=%s root=%s output=%s started_at=%s\n' \
+      "$request_id" "$products" "$clean" "$kill_running" "$ROOT_DIR" "$ROOT_DIR/bin/macos-arm64" "$started_at"
     cd "$ROOT_DIR"
     env \
       DEEPCODE_MACOS_PRODUCTS="$products" \
       DEEPCODE_MACOS_CLEAN="$clean" \
-      DEEPCODE_MACOS_REFRESH_GUI_DIST="$refresh" \
       DEEPCODE_MACOS_KILL_RUNNING="$kill_running" \
       DEEPCODE_MACOS_CARGO_OFFLINE="${DEEPCODE_MACOS_CARGO_OFFLINE:-0}" \
       bash ./scripts/package-macos.sh
@@ -406,7 +402,6 @@ submit_cmd() {
   ensure_dirs
   local products="DeepCode-GUI,DeepCode"
   local clean=0
-  local refresh=1
   local kill_running="${DEEPCODE_MACOS_KILL_RUNNING:-1}"
   local wait=0
   local timeout_seconds="${DEEPCODE_MACOS_PACKAGE_TIMEOUT_SECONDS:-3600}"
@@ -425,10 +420,6 @@ submit_cmd() {
         ;;
       --clean)
         clean=1
-        shift
-        ;;
-      --refresh-gui-dist)
-        refresh=1
         shift
         ;;
       --kill-running)
@@ -455,7 +446,6 @@ submit_cmd() {
   done
   products="$(normalize_products "$products")"
   validate_bool "$clean"
-  validate_bool "$refresh"
   validate_bool "$kill_running"
   case "$timeout_seconds" in
     ''|*[!0-9]*) fail "invalid timeout seconds: $timeout_seconds" ;;
@@ -470,7 +460,6 @@ submit_cmd() {
   {
     printf 'products=%s\n' "$products"
     printf 'clean=%s\n' "$clean"
-    printf 'refresh_gui_dist=%s\n' "$refresh"
     printf 'kill_running=%s\n' "$kill_running"
     printf 'created_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   } >"$request_tmp"

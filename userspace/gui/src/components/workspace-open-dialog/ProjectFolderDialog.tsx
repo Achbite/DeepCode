@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import type { BrowseEntry, BrowsePathResult, InitialLocation } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { browsePath, getInitialLocations } from '../../services/runtimeAdapter';
-import '../../components/workspace-open-dialog/workspaceOpenDialog.css';
+import './workspaceOpenDialog.css';
 
 interface ProjectFolderDialogProps {
   language: UiLanguage;

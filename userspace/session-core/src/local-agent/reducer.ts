@@ -1,3 +1,4 @@
+import { providerTextStreamId } from './streamIdentity.js';
 import type {
   ActivityProjection,
   AssistantDraftProjection,
@@ -369,7 +370,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         || next.pendingInteraction.runId !== event.runId
       ) throw new Error('interaction_request_missing');
       next.pendingInteraction = null;
-      settleActivity(next, interactionActivityId(event.payload.interactionId), 'completed', event.sequence);
+      settleActivity(next, interactionActivityId(event.payload.interactionId), 'completed');
       resumeRun(next, event.runId);
       break;
     case 'plan.published': {
@@ -422,7 +423,6 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         next,
         planActivityId(event.payload.planId, event.payload.revision),
         'completed',
-        event.sequence,
       );
       resumeRun(next, event.runId);
       break;
@@ -440,7 +440,6 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         next,
         planActivityId(event.payload.planId, event.payload.revision),
         'completed',
-        event.sequence,
       );
       resumeRun(next, event.runId);
       break;
@@ -458,7 +457,6 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         next,
         planActivityId(event.payload.planId, event.payload.revision),
         'cancelled',
-        event.sequence,
       );
       resumeRun(next, event.runId);
       break;
@@ -495,7 +493,6 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         next,
         planActivityId(event.payload.planId, event.payload.revision),
         'completed',
-        event.sequence,
       );
       break;
     case 'plan.invalidated':
@@ -516,7 +513,6 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
           next,
           planActivityId(event.payload.planId, event.payload.revision),
           'failed',
-          event.sequence,
         );
         if (invalidatedPending) resumeRun(next, event.runId);
       }
@@ -644,11 +640,11 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         || next.pendingApproval.runId !== event.runId
       ) throw new Error('approval_request_missing');
       next.pendingApproval = null;
-      settleActivity(next, approvalActivityId(event.payload.approvalId), 'completed', event.sequence);
+      settleActivity(next, approvalActivityId(event.payload.approvalId), 'completed');
       resumeRun(next, event.runId);
       break;
     case 'tool.input-rejected':
-      settleActivity(next, toolActivityId(event.callId), 'rejected', event.sequence);
+      settleActivity(next, toolActivityId(event.callId), 'rejected');
       next.activities[toolActivityId(event.callId)] = {
         ...next.activities[toolActivityId(event.callId)],
         inputRejection: structuredClone(event.payload.rejection.error),
@@ -659,7 +655,6 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         next,
         toolActivityId(event.callId),
         event.payload.record.outcome,
-        event.sequence,
       );
       next.activities[toolActivityId(event.callId)] = {
         ...next.activities[toolActivityId(event.callId)],
@@ -1031,7 +1026,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       };
       next.pendingInteraction = null;
       next.pendingApproval = null;
-      settleActivity(next, runActivityId(event.runId), event.payload.outcome, event.sequence);
+      settleActivity(next, runActivityId(event.runId), event.payload.outcome);
       next.terminalError = event.payload.outcome === 'failed'
         || event.payload.outcome === 'indeterminate'
         ? { ...event.payload.error }
@@ -1359,6 +1354,7 @@ function projectTimeline(state: SessionState): SessionProjection['timeline'] {
         timelineId: `message:${message.messageId}`,
         sequence: message.sequence,
         messageId: message.messageId,
+        streamId: providerTextStreamId(state.sessionId, turn.runId, turn.providerRequestId),
       });
     }
     const narrative = state.narratives.find((candidate) => (
@@ -1372,6 +1368,7 @@ function projectTimeline(state: SessionState): SessionProjection['timeline'] {
         sequence: narrative.sequence,
         providerRequestId: turn.providerRequestId,
         narrativeId: narrative.narrativeId,
+        streamId: providerTextStreamId(state.sessionId, turn.runId, turn.providerRequestId),
       });
     }
     const orderedCallIds = turn.orderedCallIds ?? [];
@@ -1446,6 +1443,9 @@ function projectOrderedProviderTurnTimeline(
           providerRequestId: turn.providerRequestId,
           narrativeId: narrative.narrativeId,
           outputIndex: block.outputIndex,
+          streamId: providerTextStreamId(
+            state.sessionId, turn.runId, turn.providerRequestId, block.outputIndex,
+          ),
         });
         break;
       }
@@ -1463,6 +1463,9 @@ function projectOrderedProviderTurnTimeline(
           sequence: message.sequence,
           messageId: message.messageId,
           outputIndex: block.outputIndex,
+          streamId: providerTextStreamId(
+            state.sessionId, turn.runId, turn.providerRequestId, block.outputIndex,
+          ),
         });
         break;
       }
@@ -1787,7 +1790,6 @@ function settleActivity(
   state: SessionState,
   activityId: string,
   status: ActivityProjection['status'],
-  _sequence: number,
 ): void {
   const activity = state.activities[activityId];
   if (!activity) throw new Error(`activity_source_missing:${activityId}`);

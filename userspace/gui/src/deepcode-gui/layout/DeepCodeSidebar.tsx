@@ -2,16 +2,21 @@ import React, { useEffect, useMemo, useState } from 'react';
 import type {
   ConversationProject,
   ConversationSessionSummary,
+  ConversationSessionStatus,
 } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { usesNativeWindowChrome } from '../../services/hostTarget';
 import DeepCodeBrand from './DeepCodeBrand';
-import DeepCodeShellIcon from './DeepCodeShellIcon';
+import DeepCodeShellIcon from '../../components/shared/DeepCodeShellIcon';
+import { SessionRunStatus } from '../../components/local-agent/SessionRunStatus';
+import { runReadMarker } from './useReadRunMarkers';
 
 interface DeepCodeSidebarProps {
   language: UiLanguage;
   projects: ConversationProject[];
   sessions: ConversationSessionSummary[];
+  sessionStatuses: Readonly<Record<string, ConversationSessionStatus>>;
+  readRunMarkers: Readonly<Record<string, string>>;
   collapsedProjectIds: ReadonlySet<string>;
   activeSessionId: string | null;
   draftProjectId: string | null;
@@ -37,6 +42,8 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
   language,
   projects,
   sessions,
+  sessionStatuses,
+  readRunMarkers,
   collapsedProjectIds,
   activeSessionId,
   draftProjectId,
@@ -51,6 +58,12 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
   onOpenSessionContextMenu,
   onOpenSettings,
 }) => {
+  const renderStatus = (sessionId: string) => {
+    const run = sessionStatuses[sessionId]?.run;
+    const marker = runReadMarker(run ?? null);
+    if (!run || (marker && readRunMarkers[sessionId] === marker)) return null;
+    return <SessionRunStatus run={run} language={language} compact />;
+  };
   const standalone = sessions.filter((session) => !session.projectId);
   const [commandPressed, setCommandPressed] = useState(false);
   const shortcutSessions = useMemo(() => [
@@ -211,7 +224,8 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
                               title={session.title || session.id}
                               aria-keyshortcuts={shortcut ? `Meta+${shortcut}` : undefined}
                             >
-                              <span>{sessionTitle(session, language)}</span>
+                              <span className="deepcode-gui-session-row__title">{sessionTitle(session, language)}</span>
+                              {renderStatus(session.id)}
                               {commandPressed && shortcut && <kbd>⌘{shortcut}</kbd>}
                             </button>
                             <button
@@ -270,7 +284,8 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
                     title={session.title || session.id}
                     aria-keyshortcuts={shortcut ? `Meta+${shortcut}` : undefined}
                   >
-                    <span>{sessionTitle(session, language)}</span>
+                    <span className="deepcode-gui-session-row__title">{sessionTitle(session, language)}</span>
+                    {renderStatus(session.id)}
                     {commandPressed && shortcut && <kbd>⌘{shortcut}</kbd>}
                   </button>
                   <button

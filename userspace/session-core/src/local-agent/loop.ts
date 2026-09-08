@@ -21,7 +21,6 @@ import type {
   ToolExecutionRecord,
   ToolInputRejection,
   ToolExecutionRequest,
-  TodoProgressUpdate,
   WorkspaceBindingDisplay,
 } from '@deepcode/protocol';
 import {
@@ -46,6 +45,7 @@ import {
   type ProviderToolCodec,
 } from './providerToolCodec.js';
 import { recoverSession, type SessionState } from './reducer.js';
+import { providerTextStreamId } from './streamIdentity.js';
 import {
   decodeSessionControlCall,
   SessionControlError,
@@ -145,9 +145,19 @@ interface ExpectedToolRecordIdentity {
   input: Record<string, unknown>;
 }
 
+type ProviderPlanProgress = Extract<SessionControlCall, { kind: 'planProgress' }> & {
+  providerCallId: string;
+};
+
+interface ProviderControlRejection {
+  callId: string;
+  providerCallId: string;
+  toolName: string;
+  input: Record<string, unknown>;
+  error: LocalAgentError;
+}
+
 type ProviderTurn =
-  | ({ kind: 'planProgress'; callId: string; providerCallId: string;
-       sourceFactRef: string; updates: TodoProgressUpdate[] } & ProviderTurnCommon)
   | ({ kind: 'answer'; content: string; messageId?: string } & ProviderTurnCommon)
   | {
       kind: 'interaction';
@@ -172,17 +182,15 @@ type ProviderTurn =
         name: string;
         input: Record<string, unknown>;
       }>;
+      progress?: ProviderPlanProgress | {
+        kind: 'controlRejected';
+        rejection: ProviderControlRejection;
+      };
       narrative?: string;
     } & ProviderTurnCommon)
   | ({
       kind: 'controlRejected';
-      rejection: {
-        callId: string;
-        providerCallId: string;
-        toolName: string;
-        input: Record<string, unknown>;
-        error: LocalAgentError;
-      };
+      rejection: ProviderControlRejection;
       narrative?: string;
     } & ProviderTurnCommon)
   | ({ kind: 'continue'; narrative?: string } & ProviderTurnCommon);
@@ -453,15 +461,6 @@ export async function runAgentLoop(
         });
       }
       switch (turn.kind) {
-        case 'planProgress': {
-          const fact = planProgressFact(snapshot, runId, turn);
-          await commit([
-            ...orderedProviderCallFacts(turn.completion, [fact]),
-            providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
-            ...completionDerivedFacts,
-          ]);
-          break;
-        }
         case 'interaction': {
           const interactionFact: NewSessionEvent = {
             type: 'interaction.requested',
@@ -629,6 +628,13 @@ export async function runAgentLoop(
         case 'tools': {
           const seenCalls = new Set<string>();
           const callFacts: NewSessionEvent[] = [...providerCallFacts];
+          // Progress describes results already observed by the Provider. Validate it
+          // before this batch's ordinary calls are requested or executed.
+          if (turn.progress) {
+            callFacts.push(turn.progress.kind === 'planProgress'
+              ? planProgressFact(snapshot, runId, turn.progress)
+              : controlRejectionFact(snapshot.state.sessionId, runId, turn.progress.rejection));
+          }
           for (const call of turn.calls) {
             if (seenCalls.has(call.callId)) {
               throw new LoopFailure('provider_tool_call_duplicate', 'Provider 重复了工具调用标识。');
@@ -658,18 +664,7 @@ export async function runAgentLoop(
           break;
         }
         case 'controlRejected': {
-          const rejectionEvent: NewSessionEvent = {
-            type: 'session.control.rejected',
-            sessionId: snapshot.state.sessionId,
-            runId,
-            callId: turn.rejection.callId,
-            payload: {
-              providerCallId: turn.rejection.providerCallId,
-              toolName: turn.rejection.toolName,
-              input: { ...turn.rejection.input },
-              error: { ...turn.rejection.error },
-            },
-          };
+          const rejectionEvent = controlRejectionFact(snapshot.state.sessionId, runId, turn.rejection);
           await commit([
             ...orderedProviderCallFacts(
               turn.completion,
@@ -1056,8 +1051,8 @@ async function consumeProviderOutput(
           deps.updateAssistantDraft({
             runId,
             turnId: request.requestId,
-            content: '',
-            orderedBlocks: assistantDraftBlocks(
+            blocks: assistantDraftBlocks(
+              request,
               orderedOutputItems,
               toolCodec,
               streamedTextByOutputIndex,
@@ -1067,7 +1062,7 @@ async function consumeProviderOutput(
           deps.updateAssistantDraft({
             runId,
             turnId: request.requestId,
-            content: deltas,
+            blocks: aggregateDraftBlocks(request, deltas),
           });
         }
         break;
@@ -1085,19 +1080,13 @@ async function consumeProviderOutput(
           item: structuredClone(event.data.item),
         });
         streamedTextByOutputIndex.delete(event.data.outputIndex);
-        const orderedBlocks = assistantDraftBlocks(
+        const blocks = assistantDraftBlocks(
+          request,
           orderedOutputItems,
           toolCodec,
           streamedTextByOutputIndex,
         );
-        deps.updateAssistantDraft(orderedBlocks.length > 0
-          ? {
-              runId,
-              turnId: request.requestId,
-              content: '',
-              orderedBlocks,
-            }
-          : null);
+        deps.updateAssistantDraft({ runId, turnId: request.requestId, blocks });
         break;
       }
       case 'assistant.message':
@@ -1192,7 +1181,7 @@ async function consumeProviderOutput(
         deps.updateAssistantDraft({
           runId,
           turnId: request.requestId,
-          content: deltas,
+          blocks: aggregateDraftBlocks(request, deltas),
         });
       }
     }
@@ -1406,37 +1395,44 @@ async function consumeProviderOutput(
 
   const controlCalls: Array<SessionControlCall & { providerCallId: string }> = [];
   const kernelCalls: typeof calls = [];
-  if ([...calls, ...rejectedCalls].some((call) => (
+  let progress: Extract<ProviderTurn, { kind: 'tools' }>['progress'];
+  const allCalls = [...calls, ...rejectedCalls];
+  if (allCalls.some((call) => (
     call.name === SESSION_CONTROL_INTERACTION_REQUEST || call.name === SESSION_CONTROL_PLAN_PUBLISH
-    || call.name === SESSION_CONTROL_PLAN_PROGRESS
-  )) && calls.length + rejectedCalls.length > 1) {
+  )) && allCalls.length > 1) {
     throw new LoopFailure(
       'session_control_turn_conflict',
       'interaction.request 与 plan.publish 必须独占 Provider turn。',
     );
   }
+  if (allCalls.filter((call) => call.name === SESSION_CONTROL_PLAN_PROGRESS).length > 1) {
+    throw new LoopFailure(
+      'session_control_turn_conflict',
+      '每个 Provider turn 最多包含一个 plan.progress 调用；请合并步骤更新。',
+    );
+  }
   for (const call of calls) {
     try {
       const control = decodeSessionControlCall(call.callId, call.name, call.input);
-      if (control) controlCalls.push({ ...control, providerCallId: call.providerCallId });
+      if (control?.kind === 'planProgress') progress = { ...control, providerCallId: call.providerCallId };
+      else if (control) controlCalls.push({ ...control, providerCallId: call.providerCallId });
       else kernelCalls.push(call);
     } catch (error) {
       if (!(error instanceof SessionControlError)) throw error;
-      if (calls.length !== 1) {
-        throw new LoopFailure(
-          'session_control_rejection_turn_ambiguous',
-          '包含多个调用的 Provider turn 无法只持久化单个 control rejection。',
-        );
+      const rejection: ProviderControlRejection = {
+        callId: call.callId,
+        providerCallId: call.providerCallId,
+        toolName: call.name,
+        input: { ...call.input },
+        error: { code: error.code, message: error.message },
+      };
+      if (call.name === SESSION_CONTROL_PLAN_PROGRESS) {
+        progress = { kind: 'controlRejected', rejection };
+        continue;
       }
       return {
         kind: 'controlRejected',
-        rejection: {
-          callId: call.callId,
-          providerCallId: call.providerCallId,
-          toolName: call.name,
-          input: { ...call.input },
-          error: { code: error.code, message: error.message },
-        },
+        rejection,
         ...(narrative ? { narrative } : {}),
         ...(orderedNarratives.length > 0 ? { narratives: orderedNarratives } : {}),
         ...usage,
@@ -1444,24 +1440,12 @@ async function consumeProviderOutput(
       };
     }
   }
-  const blockingControls = controlCalls;
-  if (
-    blockingControls.length > 1
-    || blockingControls.length > 0 && kernelCalls.length > 0
-  ) {
-    throw new LoopFailure(
-      'session_control_turn_conflict',
-      'interaction.request 与 plan.publish 必须独占 Provider turn。',
-    );
-  }
-
   const common = {
     ...usage,
     completion,
     ...(orderedNarratives.length > 0 ? { narratives: orderedNarratives } : {}),
   };
-  const control = blockingControls[0];
-  if (control?.kind === 'planProgress') return { ...control, ...common };
+  const control = controlCalls[0];
   if (control?.kind === 'interaction') {
     const interactionId = deps.nextId('interaction');
     if (interactionId === control.callId || interactionId === control.providerCallId) {
@@ -1490,10 +1474,11 @@ async function consumeProviderOutput(
       ...common,
     };
   }
-  if (kernelCalls.length > 0 || rejectedCalls.length > 0) {
+  if (kernelCalls.length > 0 || rejectedCalls.length > 0 || progress) {
     return {
       kind: 'tools',
       calls: kernelCalls,
+      ...(progress ? { progress } : {}),
       ...(narrative ? { narrative } : {}),
       ...common,
     };
@@ -1519,7 +1504,7 @@ function trackProviderActivity(request: ProviderRequest, deps: AgentLoopDeps): {
   updateDraft(draft: AssistantDraftProjection | null): void;
   observe(event: ProviderEvent): void;
 } {
-  let draft: AssistantDraftProjection = { runId: request.runId, turnId: request.requestId, content: '' };
+  let draft: AssistantDraftProjection = { runId: request.runId, turnId: request.requestId, blocks: [] };
   const activity: ProviderActivityProjection = {
     purpose: request.purpose, phase: 'waitingResponse', startedAt: new Date().toISOString(),
   };
@@ -1527,7 +1512,7 @@ function trackProviderActivity(request: ProviderRequest, deps: AgentLoopDeps): {
   publish();
   return {
     updateDraft(next) {
-      draft = next ?? { runId: request.runId, turnId: request.requestId, content: '' };
+      draft = next ?? { runId: request.runId, turnId: request.requestId, blocks: [] };
       publish();
     },
     observe(event) {
@@ -1691,12 +1676,26 @@ function inputCorrectionFailure(events: readonly SessionEvent[], runId: string):
   );
 }
 
+type NativeAssistantDraftBlock = AssistantDraftBlockProjection & { outputIndex: number };
+
+function aggregateDraftBlocks(
+  request: ProviderRequest,
+  content: string,
+): AssistantDraftBlockProjection[] {
+  return content ? [{
+    kind: 'message',
+    content,
+    streamId: providerTextStreamId(request.sessionId, request.runId, request.requestId),
+  }] : [];
+}
+
 function assistantDraftBlocks(
+  request: ProviderRequest,
   outputs: readonly { outputIndex: number; item: JsonObject }[],
   toolCodec: ProviderToolCodec,
   streamedTextByOutputIndex: ReadonlyMap<number, string> = new Map(),
-): AssistantDraftBlockProjection[] {
-  const blocks = outputs.flatMap((output): AssistantDraftBlockProjection[] => {
+): NativeAssistantDraftBlock[] {
+  const blocks = outputs.flatMap((output): NativeAssistantDraftBlock[] => {
     // Draft presentation must not admit tool inputs or interrupt their native stream.
     if (output.item.type === 'function_call' || output.item.type === 'reasoning') return [];
     const block = decodeProviderOutputBlock(output, toolCodec);
@@ -1730,6 +1729,9 @@ function assistantDraftBlocks(
           outputIndex: block.outputIndex,
           kind,
           content: block.content,
+          streamId: providerTextStreamId(
+            request.sessionId, request.runId, request.requestId, block.outputIndex,
+          ),
         }];
       }
       case 'providerHosted': {
@@ -1764,7 +1766,10 @@ function assistantDraftBlocks(
         'Provider 在 output item 完成后继续发送该 item 的正文增量。',
       );
     }
-    blocks.push({ outputIndex, kind: 'message', content });
+    if (content) blocks.push({
+      outputIndex, kind: 'message', content,
+      streamId: providerTextStreamId(request.sessionId, request.runId, request.requestId, outputIndex),
+    });
   }
   return blocks.sort((left, right) => left.outputIndex - right.outputIndex);
 }
@@ -2174,10 +2179,26 @@ function planDraftInput(draft: PlanPublicationDraft): Record<string, unknown> {
   };
 }
 
+function controlRejectionFact(
+  sessionId: string,
+  runId: string,
+  rejection: ProviderControlRejection,
+): NewSessionEvent {
+  return {
+    type: 'session.control.rejected', sessionId, runId, callId: rejection.callId,
+    payload: {
+      providerCallId: rejection.providerCallId,
+      toolName: rejection.toolName,
+      input: { ...rejection.input },
+      error: { ...rejection.error },
+    },
+  };
+}
+
 function planProgressFact(
   snapshot: LoopSnapshot,
   runId: string,
-  turn: Extract<ProviderTurn, { kind: 'planProgress' }>,
+  turn: ProviderPlanProgress,
 ): NewSessionEvent {
   const active = snapshot.state.activePlanRef;
   const todo = snapshot.state.todoList;

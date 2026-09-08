@@ -49,14 +49,6 @@ impl ToolInputIssue {
 pub struct CanonicalToolInvocation {
     pub tool_name: String,
     pub arguments: Value,
-    invocation: crate::invocation_types::KernelCanonicalInvocation,
-}
-
-impl CanonicalToolInvocation {
-    #[doc(hidden)]
-    pub fn into_kernel_invocation(self) -> crate::kernel_internal::KernelCanonicalInvocation {
-        self.invocation
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -150,7 +142,6 @@ impl KernelToolRegistry {
         Ok(CanonicalToolInvocation {
             tool_name: tool_name.to_owned(),
             arguments,
-            invocation,
         })
     }
 }
