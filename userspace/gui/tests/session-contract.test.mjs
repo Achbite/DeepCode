@@ -6,6 +6,7 @@ import {
   inputCacheMetric,
   lastCallInputCacheMetric,
   loadGuiModelStore,
+  loadGuiModule,
   installGuiFetch,
 } from './gui-projection-contract.mjs';
 import {
@@ -755,4 +756,172 @@ test('starting a draft during initialization preserves navigation and still load
   assert.deepEqual(state.profiles, [profile]);
   assert.equal(state.defaultProfileId, profile.id);
   assert.equal(state.selectedProfileId, profile.id);
+});
+
+
+test('independent views own navigation, errors and pending commands separately', async (t) => {
+  const { createLocalAgentStore } = await loadGuiModule(t, '/src/state/localAgentStore.ts');
+  const first = createLocalAgentStore('view:one');
+  const second = createLocalAgentStore('view:two');
+  first.setState({ sessionId: 'session:one', error: 'old failure', submitting: true });
+  second.setState({ sessionId: 'session:two', error: null, submitting: false });
+  first.getState().startNewSession();
+  assert.equal(first.getState().sessionId, null);
+  assert.equal(first.getState().submitting, false);
+  assert.equal(second.getState().sessionId, 'session:two');
+  assert.equal(second.getState().error, null);
+  second.setState({ submitting: true });
+  assert.equal(first.getState().submitting, false);
+});
+
+test('large GUI input uploads the complete text and submits only the resulting resource reference', async (t) => {
+  const api = await loadGuiModule(t, '/src/services/localAgentApi.ts');
+  const content = '  完整输入🙂\n'.repeat(10000);
+  const reference = { referenceId: 'input:one', workspaceId: 'workspace:input', logicalPath: 'user-input.txt', displayName: 'user-input.txt', kind: 'file', mediaType: 'text/plain', byteLength: Buffer.byteLength(content) };
+  const seen = [];
+  installGuiFetch(t, (url, init) => {
+    seen.push(url.pathname);
+    if (url.pathname.includes('/input-resources/')) {
+      assert.equal(init.body, content);
+      return Response.json({ ok: true, data: { text: 'Read the original user input.', reference } });
+    }
+    const command = JSON.parse(init.body);
+    assert.equal(command.text, 'Read the original user input.');
+    assert.deepEqual(command.filesystemReferences, [reference]);
+    assert.ok(Buffer.byteLength(init.body) < 2000);
+    return Response.json({ ok: true, data: { schemaVersion: 'deepcode.command-reply.v3', commandId: command.commandId, sessionId: command.sessionId, status: 'accepted', revision: 1 } });
+  });
+  await api.submitLocalAgentCommand({ schemaVersion: 'deepcode.command.v3', type: 'message.submit', commandId: 'command:upload', sessionId: 'session:upload', text: content });
+  assert.equal(seen.length, 2);
+});
+
+test('tool rows accumulate across adjacent requests without crossing message or run boundaries', async (t) => {
+  const { projectionItems } = await loadGuiModule(t, '/src/components/local-agent/conversationItems.ts');
+  const activities = [1, 2, 3, 4].map((id) => ({ activityId: `a${id}`, runId: id === 4 ? 'run:two' : 'run:one' }));
+  const group = (id) => ({ kind: 'toolGroup', timelineId: `group:${id}`, sequence: id, activityIds: [`a${id}`] });
+  const projection = { activities, messages: [{ messageId: 'message:boundary', runId: 'run:one', role: 'user' }], timeline: [group(1), group(2), { kind: 'message', sequence: 3, messageId: 'message:boundary' }, group(3), group(4)] };
+  const items = projectionItems(projection);
+  assert.deepEqual(items.map((item) => item.type), ['toolGroup', 'message', 'toolGroup', 'toolGroup']);
+  assert.equal(items[0].groupId, 'group:1');
+  assert.deepEqual(items[0].values.map((activity) => activity.activityId), ['a1', 'a2']);
+  assert.equal(projection.timeline.length, 5, 'presentation grouping leaves the canonical timeline intact');
+});
+
+test('plan preview occupies its native output position and has no confirmation identity', async (t) => {
+  const { assistantDraftItems } = await loadGuiModule(t, '/src/components/local-agent/conversationItems.ts');
+  const preview = { callIndex: 1, providerCallId: 'call:plan', outputIndex: 1, title: 'Plan', summary: '', steps: ['Inspect'], truncated: false };
+  const draft = { runId: 'run:one', turnId: 'request:one', planPreview: preview, blocks: [
+    { kind: 'narrative', streamId: 'stream:before', outputIndex: 0, content: 'Before' },
+    { kind: 'message', streamId: 'stream:after', outputIndex: 2, content: 'After' },
+  ] };
+  const items = assistantDraftItems(draft);
+  assert.deepEqual(items.map((item) => item.type), ['text', 'planPreview', 'text']);
+  assert.deepEqual(items[1].value, preview);
+  assert.equal(items[1].value.planId, undefined);
+  assert.equal(items[1].value.revision, undefined);
+});
+
+test('reasoning details are a default-off shell preference in the real Settings catalog', async (t) => {
+  const { SETTING_DEFINITIONS } = await loadGuiModule(t, '/src/state/settingsStore.ts');
+  const definition = SETTING_DEFINITIONS.find((definition) => definition.key === 'gui.showReasoning');
+  assert.ok(definition);
+  const { DEFAULT_USER_SETTINGS } = await import('../../protocol/dist/index.js');
+  assert.equal(DEFAULT_USER_SETTINGS['gui.showReasoning'], false);
+  assert.equal(definition.control, 'boolean');
+  assert.equal(definition.group, 'gui');
+});
+
+test('GUI refresh accepts plan preview changes without a new journal revision or activity timestamp', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:gui-plan-preview';
+  await createSession(journal, sessionId);
+  const provider = { async *stream(_request, signal) {
+    if (!signal.aborted) await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+  } };
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), fakeRunPreparation().port, 'gui-plan-preview');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:gui-preview', 'Plan the work.'));
+  const base = structuredClone(await waitForProjection(actor, (value) => Boolean(value.assistantDraft)));
+  base.assistantDraft.activity.phase = 'generatingOutput';
+  let incoming = structuredClone(base);
+  installGuiFetch(t, async (url) => {
+    if (url.pathname === '/api/conversation/statuses') return Response.json({ ok: true, data: [] });
+    assert.equal(url.pathname, `/api/conversation/sessions/${encodeURIComponent(sessionId)}/projection`);
+    return Response.json({ ok: true, data: incoming });
+  });
+  const store = await loadGuiModelStore(t);
+  store.setState({ sessionId, projection: base });
+  incoming.assistantDraft.planPreview = { callIndex: 0, providerCallId: 'call:plan-preview', title: 'Inspect source', summary: '', steps: [], truncated: false };
+  await store.getState().refresh();
+  assert.equal(store.getState().error, null);
+  assert.equal(store.getState().projection.assistantDraft.planPreview.title, 'Inspect source');
+  incoming.assistantDraft.planPreview.steps.push('Read the current implementation');
+  await store.getState().refresh();
+  assert.deepEqual(store.getState().projection.assistantDraft.planPreview.steps, ['Read the current implementation']);
+  assert.equal(store.getState().projection.pendingPlan, null);
+  assert.equal(store.getState().projection.revision, base.revision);
+  delete incoming.assistantDraft.planPreview;
+  await store.getState().refresh();
+  assert.equal(store.getState().projection.assistantDraft.planPreview, undefined);
+});
+
+test('streaming Markdown retains stable blocks and reconciles GFM and references on completion', async (t) => {
+  const { StreamingMarkdownParser } = await loadGuiModule(t, '/src/components/local-agent/streamingMarkdown.ts');
+  const parser = new StreamingMarkdownParser();
+  const prefix = '# Result\n\nFirst paragraph.\n\nSecond paragraph.\n\n';
+  const first = parser.update(prefix + 'Last', true);
+  const next = parser.update(prefix + 'Last paragraph.\n\n```cpp\nint value', true);
+  assert.equal(next[0], first[0], 'already displayed heading must retain its render block');
+  const text = prefix + 'Last paragraph.\n\n```cpp\nint value = 1;\n```\n\n[Guide][guide]\n\n[guide]: https://example.com\n';
+  const complete = parser.update(text, false);
+  assert.equal(complete[0].key, first[0].key, 'completion must retain source keys');
+  assert.deepEqual(complete, new StreamingMarkdownParser().update(text, false));
+  assert.match(JSON.stringify(complete), /https:\/\/example.com/);
+  const replacement = parser.update('Replacement\n\n| A | B |\n| - | - |\n| 1 | 2 |', true);
+  assert.doesNotMatch(JSON.stringify(replacement), /First paragraph/);
+  assert.match(JSON.stringify(replacement), /"tagName":"table"/);
+});
+
+test('draft and committed provider text occupy the same round and row identity', async (t) => {
+  const { conversationRounds } = await loadGuiModule(t, '/src/components/local-agent/conversationItems.ts');
+  const user = { type: 'message', sequence: 1, value: { messageId: 'user:1', role: 'user', content: 'Continue' } };
+  const draft = { type: 'text', block: { streamId: 'stream:answer', kind: 'message', content: 'Answer', outputIndex: 0 } };
+  const before = conversationRounds([user], [draft], 'run:1');
+  const answer = { type: 'message', sequence: 5, streamId: 'stream:answer', value: { messageId: 'answer:1', role: 'assistant', runId: 'run:1', content: 'Answer' } };
+  const after = conversationRounds([user, answer], [draft], 'run:1');
+  assert.equal(after.at(-1).key, before.at(-1).key);
+  assert.equal(after.at(-1).rows[0].key, before.at(-1).rows[0].key);
+  assert.equal(after.at(-1).rows.length, 1, 'commit and residual draft must not duplicate text');
+});
+
+test('round change totals use first before and final after, without summing repeated edits', async (t) => {
+  const { changedFiles, readRoundChange } = await loadGuiModule(t, '/src/components/local-agent/fileChangeSummary.ts');
+  const { calculateChangedLines: countChangedLines } = await loadGuiModule(t, '/src/components/local-agent/fileChangeLineCounts.ts');
+  const change = { workspaceId: 'workspace:1', path: 'src/pool.cpp', kind: 'modify', before: { exists: true }, after: { exists: true } };
+  const activity = (recordId) => ({ tool: { recordId, fileChanges: [change] } });
+  const files = changedFiles([activity('edit:1'), activity('edit:2'), activity('edit:2')]);
+  assert.equal(files.length, 1);
+  assert.equal(files[0].changes.length, 2);
+  const read = async (_session, recordId) => ({ workspaceId: change.workspaceId, path: change.path,
+    before: recordId === 'edit:1' ? 'original\n' : 'temporary\n',
+    after: recordId === 'edit:1' ? 'temporary\n' : 'original\nadded\n',
+  });
+  const round = await readRoundChange(read, 'session:1', files[0], new AbortController().signal);
+  assert.deepEqual(await countChangedLines(round.before, round.after), { added: 1, removed: 0 });
+  assert.deepEqual(await countChangedLines(null, 'new\nfile\n'), { added: 2, removed: 0 });
+  assert.deepEqual(await countChangedLines('removed\n', null), { added: 0, removed: 1 });
+});
+
+test('line statistics compute full-file creation, deletion and replacement without per-edit timers', async (t) => {
+  const { calculateChangedLines } = await loadGuiModule(t, '/src/components/local-agent/fileChangeLineCounts.ts');
+  const source = Array.from({ length: 1200 }, (_, index) => `line ${index}\n`).join('');
+  const replacement = Array.from({ length: 400 }, (_, index) => `replacement ${index}\n`).join('');
+  assert.deepEqual(calculateChangedLines(null, source), { added: 1200, removed: 0 });
+  assert.deepEqual(calculateChangedLines(source, null), { added: 0, removed: 1200 });
+  assert.deepEqual(calculateChangedLines(source, source), { added: 0, removed: 0 });
+  assert.deepEqual(calculateChangedLines(source, replacement), { added: 400, removed: 1200 });
+  assert.deepEqual(calculateChangedLines(null, ''), { added: 0, removed: 0 });
+  assert.deepEqual(calculateChangedLines(null, 'first\r\nsecond'), { added: 2, removed: 0 });
+  assert.deepEqual(calculateChangedLines('first\r\nsecond\r\n', null), { added: 0, removed: 2 });
+  assert.deepEqual(calculateChangedLines('unchanged', 'unchanged\n'), { added: 1, removed: 1 });
 });

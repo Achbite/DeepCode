@@ -83,10 +83,55 @@ pub struct KernelBootstrap {
 
 impl KernelBootstrap {
     pub async fn connect(options: KernelBootstrapOptions) -> KernelClientResult<Self> {
+        let implicit_endpoint = options.api.is_none()
+            && std::env::var_os("DEEPCODE_API_URL").is_none()
+            && std::env::var_os("DEEPCODE_PORT").is_none();
+        let _shared_start_guard;
+        let shared_connection = if implicit_endpoint {
+            let distribution = find_kernel_binary()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+                .or_else(|| {
+                    std::env::current_exe()
+                        .ok()
+                        .and_then(|path| path.parent().map(Path::to_path_buf))
+                })
+                .ok_or_else(|| {
+                    KernelClientError::Bootstrap(
+                        "cannot resolve the Host distribution directory".into(),
+                    )
+                })?;
+            let root = deepcode_host_connection::config_root(&distribution)
+                .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?;
+            _shared_start_guard = Some(
+                deepcode_host_connection::HostStartGuard::acquire(&root)
+                    .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?,
+            );
+            deepcode_host_connection::LocalHostConnection::discover(&root)
+                .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?
+        } else {
+            _shared_start_guard = None;
+            None
+        };
         let mut config = options
             .api
             .map(KernelClientConfig::new)
             .unwrap_or_else(KernelClientConfig::from_env);
+        if let Some(connection) = shared_connection {
+            config.base_url = connection.identity.address.clone();
+            if !config.has_host_shell_token() {
+                config = config.with_host_shell_token(connection.shell_token());
+            }
+        } else if implicit_endpoint && kernel_auto_start_enabled(options.auto_start) {
+            // A different config root may already use the conventional port.
+            // New shared Hosts receive a private port; other shells discover it.
+            let host = std::env::var("DEEPCODE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+            let listener = std::net::TcpListener::bind((host.as_str(), 0))
+                .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?;
+            let address = listener
+                .local_addr()
+                .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?;
+            config.base_url = format!("http://{address}");
+        }
         if let Some(token) = options.host_shell_token {
             config.host_shell_token = Some(token);
         }
@@ -230,6 +275,12 @@ impl KernelBootstrap {
                                 .to_string(),
                         ));
                     }
+                    // Startup owns failure cleanup. A ready service is shared by all shells.
+                    #[cfg(windows)]
+                    if let Err(error) = process.job.release_on_close() {
+                        terminate_owned_kernel_process(&mut process);
+                        return Err(KernelClientError::Bootstrap(error.to_string()));
+                    }
                     return Ok(Self {
                         client,
                         _guard: KernelBootstrapGuard::owned(process),
@@ -297,11 +348,8 @@ impl KernelBootstrapGuard {
 
 impl Drop for KernelBootstrapGuard {
     fn drop(&mut self) {
-        // Only the shell that spawned the daemon owns its lifetime. Connections to an
-        // already-running daemon use the external guard and are never terminated here.
-        if let Some(mut process) = self.process.take() {
-            terminate_owned_kernel_process(&mut process);
-        }
+        // Dropping a client releases handles only. Host shutdown is an explicit command.
+        drop(self.process.take());
     }
 }
 
@@ -656,8 +704,11 @@ fn spawn_kernel_binary(
         KernelClientError::Bootstrap(format!("failed to clone kernel log handle: {error}"))
     })?;
     let mut command = Command::new(kernel_bin);
+    let config_root = deepcode_host_connection::config_root(&kernel_dir)
+        .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?;
     command
         .current_dir(&kernel_dir)
+        .env("DEEPCODE_CONFIG_DIR", config_root)
         .env("DEEPCODE_HOST", host)
         .env("DEEPCODE_PORT", port)
         .env(HOST_SHELL_TOKEN_ENV, host_shell_token)
@@ -919,6 +970,26 @@ impl WindowsKillOnCloseJob {
         })
     }
 
+    fn release_on_close(&self) -> std::io::Result<()> {
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("Kernel Job Object is closed"))?;
+        let information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle.as_raw_handle() as HANDLE,
+                JobObjectExtendedLimitInformation,
+                (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn assign(&self, child: &Child) -> std::io::Result<()> {
         let Some(handle) = self.handle.as_ref() else {
             return Err(std::io::Error::other("Kernel Job Object is closed"));
@@ -933,6 +1004,14 @@ impl WindowsKillOnCloseJob {
     }
 
     fn close(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            unsafe {
+                windows_sys::Win32::System::JobObjects::TerminateJobObject(
+                    handle.as_raw_handle() as HANDLE,
+                    1,
+                );
+            }
+        }
         drop(self.handle.take());
     }
 }
@@ -1028,4 +1107,48 @@ fn open_log_in_dir(log_dir: &Path) -> std::io::Result<File> {
         .create(true)
         .append(true)
         .open(log_dir.join("deepcode-kernel.log"))
+}
+
+#[cfg(all(test, unix))]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn closing_a_client_leaves_the_ready_host_running() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let guard = KernelBootstrapGuard::owned(OwnedKernelProcess {
+            child,
+            process_group_id: pid,
+            shutdown_target: OwnedKernelShutdownTarget {
+                host: "127.0.0.1".into(),
+                port: 0,
+                host_shell_token: String::new(),
+                expected_instance_id: "fixture".into(),
+                expected_pid: pid as u32,
+                expected_identity: None,
+            },
+        });
+        drop(guard);
+        let mut status = 0;
+        let still_running = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) == 0 };
+        // Reclaim only this test's child, including when the assertion fails.
+        if still_running {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+            }
+        }
+        assert!(
+            still_running,
+            "a client exit must not terminate the shared Host"
+        );
+    }
 }

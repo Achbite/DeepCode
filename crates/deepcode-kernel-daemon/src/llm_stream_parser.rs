@@ -89,6 +89,28 @@ struct ToolBuffer {
     name: Option<String>,
     arguments: String,
     complete_arguments: Option<Value>,
+    emitted_arguments: usize,
+}
+
+fn emit_tool_arguments(
+    index: i64,
+    buffer: &mut ToolBuffer,
+    native: bool,
+    emissions: &mut Vec<ProviderEmission>,
+) {
+    let (Some(id), Some(name)) = (&buffer.id, &buffer.name) else {
+        return;
+    };
+    if buffer.emitted_arguments == buffer.arguments.len() {
+        return;
+    }
+    let mut event = json!({ "type": "tool_call_delta", "callIndex": index,
+        "callId": id, "name": name, "argumentsDelta": &buffer.arguments[buffer.emitted_arguments..] });
+    if native {
+        event["outputIndex"] = json!(index);
+    }
+    buffer.emitted_arguments = buffer.arguments.len();
+    emissions.push(ProviderEmission { event });
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +213,22 @@ impl ProviderStreamAccumulator {
             ));
         }
         if self.kind == ProviderStreamKind::Responses {
+            for output_index in self.tool_calls.keys() {
+                if self
+                    .responses_output_items
+                    .get(output_index)
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str)
+                    != Some("function_call")
+                {
+                    return Err(ProviderStreamError::new(
+                        "provider_response_item_terminal_missing",
+                        format!(
+                            "Responses output_index {output_index} 的工具参数缺少对应的原生 function_call 完成项。"
+                        ),
+                    ));
+                }
+            }
             for output_index in self.responses_text_by_index.keys() {
                 if self
                     .responses_output_items
@@ -398,6 +436,7 @@ impl ProviderStreamAccumulator {
                 if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                     buffer.arguments.push_str(arguments);
                 }
+                emit_tool_arguments(index, buffer, false, &mut emissions);
             }
         }
         Ok(emissions)
@@ -430,6 +469,18 @@ impl ProviderStreamAccumulator {
                     self.push_responses_text(index, text, &mut emissions);
                 }
             }
+            "response.reasoning_summary_text.delta" => {
+                if let Some(text) = value.get("delta").and_then(Value::as_str) {
+                    let index = required_output_index(
+                        value.get("output_index"),
+                        "Responses reasoning summary delta",
+                    )?;
+                    emissions.push(ProviderEmission {
+                        event: json!({ "type": "reasoning_delta", "content": text,
+                        "output_index": index, "kind": "summary" }),
+                    });
+                }
+            }
             "response.reasoning_text.delta" => {
                 if let Some(text) = value.get("delta").and_then(Value::as_str) {
                     let index = required_output_index(
@@ -441,6 +492,45 @@ impl ProviderStreamAccumulator {
                         .or_default()
                         .push_str(text);
                     self.push_responses_reasoning(index, text, &mut emissions);
+                }
+            }
+            "response.output_item.added" => {
+                if let Some(item) = value.get("item").filter(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("function_call")
+                }) {
+                    let index = required_output_index(
+                        value.get("output_index"),
+                        "Responses function call",
+                    )?;
+                    let buffer = self.tool_calls.entry(index).or_default();
+                    set_once(
+                        &mut buffer.id,
+                        item.get("call_id").and_then(Value::as_str),
+                        "工具调用 ID",
+                    )?;
+                    set_once(
+                        &mut buffer.name,
+                        item.get("name").and_then(Value::as_str),
+                        "工具名称",
+                    )?;
+                    emit_tool_arguments(index, buffer, true, &mut emissions);
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let index = required_output_index(
+                    value.get("output_index"),
+                    "Responses function arguments",
+                )?;
+                if self.responses_output_items.contains_key(&index) {
+                    return Err(ProviderStreamError::new(
+                        "provider_output_delta_after_completion",
+                        "工具参数在完成后继续返回。",
+                    ));
+                }
+                if let Some(text) = value.get("delta").and_then(Value::as_str) {
+                    let buffer = self.tool_calls.entry(index).or_default();
+                    buffer.arguments.push_str(text);
+                    emit_tool_arguments(index, buffer, true, &mut emissions);
                 }
             }
             "response.output_item.done" => {
@@ -492,13 +582,16 @@ impl ProviderStreamAccumulator {
                         let buffer = self.tool_calls.entry(index).or_default();
                         set_once(&mut buffer.id, Some(call_id), "工具调用 ID")?;
                         set_once(&mut buffer.name, Some(name), "工具名称")?;
-                        if !buffer.arguments.is_empty() {
+                        if !buffer.arguments.is_empty() && buffer.arguments != arguments {
                             return Err(ProviderStreamError::new(
-                                "provider_tool_call_duplicate",
-                                "Responses function_call output item 重复。",
+                                "provider_tool_call_arguments_conflict",
+                                "Responses 工具参数增量与完成内容不一致。",
                             ));
                         }
-                        buffer.arguments.push_str(arguments);
+                        if buffer.arguments.is_empty() {
+                            buffer.arguments.push_str(arguments);
+                        }
+                        emit_tool_arguments(index, buffer, true, &mut emissions);
                     }
                     Some("web_search_call") => {
                         if !valid_responses_hosted_search_item(item) {
@@ -678,11 +771,9 @@ impl ProviderStreamAccumulator {
                     }
                     Some("input_json_delta") => {
                         if let Some(text) = delta.get("partial_json").and_then(Value::as_str) {
-                            self.tool_calls
-                                .entry(index)
-                                .or_default()
-                                .arguments
-                                .push_str(text);
+                            let buffer = self.tool_calls.entry(index).or_default();
+                            buffer.arguments.push_str(text);
+                            emit_tool_arguments(index, buffer, false, &mut emissions);
                         }
                     }
                     _ => {}
@@ -1098,6 +1189,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn responses_summary_stays_distinct_from_native_reasoning_text() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Responses);
+        let emissions = parser.ingest_payload(br#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"Display summary."}"#).unwrap();
+        assert_eq!(emissions[0].event["kind"], "summary");
+        assert_eq!(emissions[0].event["content"], "Display summary.");
+        let item = json!({"type":"reasoning", "id":"reasoning:summary", "summary":[{"type":"summary_text","text":"Display summary."}]});
+        parser
+            .ingest_payload(
+                json!({"type":"response.output_item.done","output_index":0,"item":item})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        parser
+            .ingest_payload(br#"{"type":"response.completed","response":{}}"#)
+            .unwrap();
+        let result = parser.finalize_for_request("request:summary").unwrap();
+        assert!(result.output.reasoning.is_none());
+    }
+
+    #[test]
     fn openai_text_does_not_require_reasoning() {
         let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
         parser
@@ -1209,6 +1321,101 @@ mod tests {
     }
 
     #[test]
+    fn tool_argument_deltas_stream_before_completion_without_changing_final_input() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
+        let mut received = String::new();
+        for fragment in ["{\"title\":\"", "Plan", "\",\"steps\":[]}"] {
+            let events = parser.ingest_payload(json!({"choices":[{"delta":{"tool_calls":[{
+                "index": 2, "id": "call-plan", "function": {"name":"plan_publish", "arguments":fragment}
+            }]}}]}).to_string().as_bytes()).unwrap();
+            assert!(!parser.source_done());
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event["type"], "tool_call_delta");
+            assert_eq!(events[0].event["callIndex"], 2);
+            received.push_str(events[0].event["argumentsDelta"].as_str().unwrap());
+        }
+        parser.ingest_payload(b"[DONE]").unwrap();
+        let result = parser.finalize().unwrap();
+        assert_eq!(
+            result.output.tool_calls[0].arguments,
+            serde_json::from_str::<Value>(&received).unwrap()
+        );
+    }
+
+    #[test]
+    fn responses_tool_preview_preserves_native_index_and_rejects_conflicting_completion() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Responses);
+        let input = json!({"title":"Preview"}).to_string();
+        let mut item = json!({"type":"function_call", "id":"item-plan", "call_id":"call-plan", "name":"plan_publish", "arguments":""});
+        parser
+            .ingest_payload(
+                json!({"type":"response.output_item.added", "output_index":3, "item":item})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let events = parser.ingest_payload(json!({"type":"response.function_call_arguments.delta", "output_index":3, "delta":input}).to_string().as_bytes()).unwrap();
+        assert_eq!(events[0].event["outputIndex"], 3);
+        assert_eq!(events[0].event["argumentsDelta"], input);
+        let mut missing_completion = parser.clone();
+        missing_completion
+            .ingest_payload(br#"{"type":"response.completed","response":{}}"#)
+            .unwrap();
+        assert_eq!(
+            missing_completion
+                .finalize_for_request("request:preview")
+                .unwrap_err()
+                .code,
+            "provider_response_item_terminal_missing"
+        );
+        let mut conflicting = parser.clone();
+        item["arguments"] = json!("{}");
+        assert_eq!(
+            conflicting
+                .ingest_payload(
+                    json!({"type":"response.output_item.done", "output_index":3, "item":item})
+                        .to_string()
+                        .as_bytes()
+                )
+                .unwrap_err()
+                .code,
+            "provider_tool_call_arguments_conflict"
+        );
+        item["arguments"] = json!(input);
+        let done = parser
+            .ingest_payload(
+                json!({"type":"response.output_item.done", "output_index":3, "item":item})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        assert!(done
+            .iter()
+            .all(|event| event.event["type"] != "tool_call_delta"));
+        parser
+            .ingest_payload(br#"{"type":"response.completed","response":{}}"#)
+            .unwrap();
+        let result = parser.finalize().unwrap();
+        assert_eq!(result.output.tool_calls[0].arguments["title"], "Preview");
+    }
+
+    #[test]
+    fn anthropic_input_json_delta_emits_tool_preview() {
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Anthropic);
+        parser.ingest_payload(br#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call-plan","name":"plan_publish","input":{}}}"#).unwrap();
+        let events = parser.ingest_payload(br#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"title\":\"Plan\"}"}}"#).unwrap();
+        assert_eq!(events[0].event["argumentsDelta"], "{\"title\":\"Plan\"}");
+        assert!(!parser.source_done());
+        parser
+            .ingest_payload(br#"{"type":"message_stop"}"#)
+            .unwrap();
+        assert_eq!(
+            parser.finalize().unwrap().output.tool_calls[0].arguments["title"],
+            "Plan"
+        );
+    }
+
+    #[test]
     fn responses_hosted_search_is_preserved_with_text_and_cache_usage() {
         let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Responses);
         let text = parser
@@ -1306,7 +1513,11 @@ mod tests {
         let input = json!({"type":"response.output_item.done","output_index":0,"item":item});
         let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Responses);
         let emissions = parser.ingest_payload(input.to_string().as_bytes()).unwrap();
-        assert_eq!(emissions[0].event["item"], item);
+        assert_eq!(emissions.len(), 2);
+        assert_eq!(emissions[0].event["type"], "tool_call_delta");
+        assert_eq!(emissions[0].event["argumentsDelta"], item["arguments"]);
+        assert_eq!(emissions[1].event["type"], "output_item_completed");
+        assert_eq!(emissions[1].event["item"], item);
         parser.ingest_payload(br#"{"type":"response.completed","response":{"usage":{"input_tokens":30,"output_tokens":6}}}"#).unwrap();
         let result = parser.finalize_for_request("request:session").unwrap();
         assert!(

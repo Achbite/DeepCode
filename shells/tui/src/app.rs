@@ -6,6 +6,8 @@ use deepcode_kernel_client::{
     CreateConversationSessionRequest, HttpKernelClient, InteractionProjection, PluginCatalogItem,
     PluginCatalogProjection, PluginSelectionInput, SessionProjection,
 };
+use serde_json::json;
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,6 +59,12 @@ pub struct TuiApp {
     plugin_picker: Option<PluginPickerState>,
     resource_preview: Option<ConversationResourceReadResult>,
     context_open: bool,
+    tasks_open: bool,
+    detail_preview: Option<String>,
+    reasoning_enabled: bool,
+    detail_scroll: u16,
+    transcript_scroll: Cell<Option<usize>>,
+    transcript_scroll_max: Cell<usize>,
 }
 
 impl TuiApp {
@@ -75,6 +83,12 @@ impl TuiApp {
             plugin_picker: None,
             resource_preview: None,
             context_open: false,
+            tasks_open: false,
+            detail_preview: None,
+            reasoning_enabled: false,
+            detail_scroll: 0,
+            transcript_scroll: Cell::new(None),
+            transcript_scroll_max: Cell::new(0),
         }
     }
 
@@ -110,7 +124,7 @@ impl TuiApp {
                     .map_err(|error| format!("插件目录加载失败：{error}"))?;
                 let selected_plugins =
                     plugin_selections_from_uris(&catalog, &self.host.plugin_uris)?;
-                self.status = format!("session {} · ready", projection.session_id);
+                self.status = "就绪 · /help 查看命令".to_string();
                 self.projection = Some(projection);
                 self.plugin_catalog = Some(catalog);
                 self.selected_plugins = selected_plugins;
@@ -136,8 +150,8 @@ impl TuiApp {
                 self.status = projection
                     .run
                     .as_ref()
-                    .map(|run| format!("run {} · {}", run.run_id, run.status))
-                    .unwrap_or_else(|| format!("session {} · ready", projection.session_id));
+                    .map(|run| format!("运行状态 · {}", run.status))
+                    .unwrap_or_else(|| "就绪 · /help 查看命令".to_string());
                 self.projection = Some(projection);
             }
             Err(error) => self.status = format!("刷新共享投影失败：{error}"),
@@ -149,10 +163,15 @@ impl TuiApp {
         if input.is_empty() {
             return true;
         }
+        self.transcript_scroll.set(None);
         match input {
             "/quit" | "/exit" => return false,
             "/help" => {
-                self.status = "@ 选择下一次请求的插件；/focus <task> /attach <path> /detach <workspace-id> /cancel-plan /model <profile> /cancel /context /open <workspace-id> <logical-path> /close /show /clear /quit；Plan 输入 1/确认".to_string();
+                self.context_open = false;
+                self.tasks_open = false;
+                self.resource_preview = None;
+                self.detail_scroll = 0;
+                self.detail_preview = Some("DeepCode 命令\n\n@ 选择下一次请求的插件\n/tasks 查看任务\n/context 查看上下文\n/focus <task> 开始任务\n/model <profile> 选择后续请求的模型\n/attach <path> 附加目录\n/detach <workspace-id> 移除目录索引\n/open <workspace-id> <logical-path> 读取文件\n/next 继续读取\n/diff <record-id> <index> 查看修改\n/reasoning 开关推理详情\n/reasoning <request-id> 按需读取推理\n/cancel 取消运行\n/cancel-plan 取消计划\n/close 返回会话\n/clear 清空输入\n/show 查看会话信息\n/quit 退出\n\nPgUp / PgDn 滚动当前视图；计划输入 1/确认。".into());
             }
             "/show" => self.status = self.projection_label(),
             "/clear" => {
@@ -161,9 +180,27 @@ impl TuiApp {
                     "可见输入与下一次请求的插件选择已清理；durable Session 未修改".to_string();
             }
             "/context" => self.toggle_context(),
-            "/close" => {
+            "/tasks" => {
+                self.tasks_open = !self.tasks_open;
                 self.context_open = false;
                 self.resource_preview = None;
+                self.detail_preview = None;
+                self.detail_scroll = 0;
+            }
+            "/next" => self.next_resource().await,
+            "/reasoning" => {
+                self.reasoning_enabled = !self.reasoning_enabled;
+                self.status = if self.reasoning_enabled { "推理详情已开启；使用 /reasoning <request-id> [offset] 展开，/reasoning-history 查阅历史。" } else { "推理详情已关闭，仅显示状态。" }.into();
+            }
+            value if value.starts_with("/diff ") => self.read_detail(value, false).await,
+            value if value.starts_with("/reasoning ") || value == "/reasoning-history" => {
+                self.read_detail(value, true).await
+            }
+            "/close" => {
+                self.context_open = false;
+                self.tasks_open = false;
+                self.resource_preview = None;
+                self.detail_preview = None;
                 self.status = "已关闭辅助视图。".to_string();
             }
             "/cancel-plan" => self.cancel_plan().await,
@@ -185,7 +222,7 @@ impl TuiApp {
             }
             value if value.starts_with('/') => self.status = format!("未知命令：{value}"),
             value if value.starts_with('@') => self.select_plugin_from_plain_input(value).await,
-            text => self.submit_contextual_input(text).await,
+            _ => self.submit_contextual_input(line).await,
         }
         true
     }
@@ -302,6 +339,90 @@ impl TuiApp {
             .await;
     }
 
+    async fn next_resource(&mut self) {
+        let Some(resource) = self.resource_preview.clone() else {
+            return;
+        };
+        let Some(next) = resource.next_byte else {
+            self.status = "资源已读到末尾。".into();
+            return;
+        };
+        let Some(projection) = &self.projection else {
+            return;
+        };
+        match self
+            .client
+            .conversation_resource_read_range(
+                &projection.session_id,
+                &resource.workspace_id,
+                &resource.logical_path,
+                Some(next),
+            )
+            .await
+        {
+            Ok(resource) => {
+                self.status = "已读取下一段；/next 续读。".into();
+                self.detail_scroll = 0;
+                self.resource_preview = Some(resource);
+            }
+            Err(error) => self.status = error.to_string(),
+        }
+    }
+
+    async fn read_detail(&mut self, command: &str, reasoning: bool) {
+        if reasoning && !self.reasoning_enabled {
+            self.status = "先输入 /reasoning 开启可选详情。".into();
+            return;
+        }
+        let Some(projection) = &self.projection else {
+            return;
+        };
+        let words: Vec<_> = command.split_whitespace().collect();
+        let result: Result<String, String> = if reasoning {
+            let offset = words.get(2).map(|value| value.parse::<u64>()).transpose();
+            match offset {
+                Err(_) => Err("推理 offset 必须为非负整数。".into()),
+                Ok(offset) => {
+                    let query = if let Some(request) = words.get(1) {
+                        json!({ "view": "reasoning", "providerRequestId": request, "offset": offset.unwrap_or(0) })
+                    } else {
+                        json!({ "view": "reasoning" })
+                    };
+                    self.client
+                        .conversation_read(&projection.session_id, &query)
+                        .await
+                        .map(|value| {
+                            serde_json::to_string_pretty(&value)
+                                .unwrap_or_else(|error| error.to_string())
+                        })
+                        .map_err(|error| error.to_string())
+                }
+            }
+        } else if words.len() == 3 {
+            match words[2].parse::<usize>() {
+                Ok(index) => self
+                    .client
+                    .conversation_change_read(&projection.session_id, words[1], index)
+                    .await
+                    .map(|change| change.unified_diff())
+                    .map_err(|error| error.to_string()),
+                Err(_) => Err("Diff index 必须为非负整数。".into()),
+            }
+        } else {
+            Err("用法：/diff <record-id> <file-index>".into())
+        };
+        match result {
+            Ok(content) => {
+                self.detail_scroll = 0;
+                self.detail_preview = Some(content);
+                self.resource_preview = None;
+                self.context_open = false;
+                self.status = "按需详情 · /close 关闭".into();
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
     async fn open_resource(&mut self, command: &str) {
         let mut parts = command.splitn(3, ' ');
         let _ = parts.next();
@@ -336,6 +457,8 @@ impl TuiApp {
                     "只读资源 {} · {} bytes",
                     resource.logical_path, resource.size_bytes
                 );
+                self.detail_preview = None;
+                self.detail_scroll = 0;
                 self.resource_preview = Some(resource);
             }
             Err(error) => self.status = format!("资源读取失败：{error}"),
@@ -462,6 +585,55 @@ impl TuiApp {
 
     pub fn projection(&self) -> Option<&SessionProjection> {
         self.projection.as_ref()
+    }
+
+    pub fn scroll_content(&mut self, down: bool) {
+        if self.detail_preview.is_some()
+            || self.resource_preview.is_some()
+            || self.context_open
+            || self.tasks_open
+        {
+            self.detail_scroll = if down {
+                self.detail_scroll.saturating_add(12)
+            } else {
+                self.detail_scroll.saturating_sub(12)
+            };
+        } else {
+            let maximum = self.transcript_scroll_max.get();
+            let current = self.transcript_scroll.get().unwrap_or(maximum);
+            let next = if down {
+                current.saturating_add(12).min(maximum)
+            } else {
+                current.saturating_sub(12)
+            };
+            self.transcript_scroll.set((next < maximum).then_some(next));
+        }
+    }
+
+    pub fn transcript_offset(&self, maximum: usize) -> usize {
+        self.transcript_scroll_max.set(maximum);
+        match self.transcript_scroll.get() {
+            Some(offset) => {
+                let offset = offset.min(maximum);
+                self.transcript_scroll.set(Some(offset));
+                offset
+            }
+            None => maximum,
+        }
+    }
+
+    pub fn tasks_open(&self) -> bool {
+        self.tasks_open
+    }
+    pub fn detail_scroll(&self) -> u16 {
+        self.detail_scroll
+    }
+    pub fn detail_preview(&self) -> Option<&str> {
+        self.detail_preview.as_deref()
+    }
+
+    pub fn reasoning_enabled(&self) -> bool {
+        self.reasoning_enabled
     }
 
     pub fn resource_preview(&self) -> Option<&ConversationResourceReadResult> {
@@ -778,6 +950,8 @@ impl TuiApp {
 
     fn toggle_context(&mut self) {
         self.context_open = !self.context_open;
+        self.tasks_open = false;
+        self.detail_scroll = 0;
         if self.context_open {
             self.resource_preview = None;
             self.status = "上下文视图已打开。".to_string();

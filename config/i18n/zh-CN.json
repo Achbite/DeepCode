@@ -785,6 +785,10 @@
         "compact": "紧凑"
       }
     },
+    "gui.showReasoning": {
+      "label": "推理详情",
+      "description": "允许点击推理状态查看模型提供的推理文本。默认关闭，仅影响显示，不改变模型推理强度。"
+    },
     "gui.showContextRail": {
       "label": "显示上下文栏",
       "description": "在 DeepCode-GUI 右侧显示 Todo 任务和产物的共享投影。"

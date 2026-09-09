@@ -42,3 +42,5 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
     }
     output
 }
+
+pub mod text_range;

@@ -44,6 +44,7 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'gui.accentColor': 'blue',
   'gui.navigationDensity': 'comfortable',
   'gui.showContextRail': true,
+  'gui.showReasoning': false,
   'terminal.integrated.defaultProfile.windows': 'wsl',
   'terminal.integrated.prewarm': 'afterStartup',
   'terminal.integrated.spawnTimeoutMs': 8000,

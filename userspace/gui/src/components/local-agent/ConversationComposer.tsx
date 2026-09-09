@@ -8,6 +8,7 @@ import { ComposerPermissionControl } from './ComposerPermissionControl';
 import type { AgentComposer } from './useAgentComposer';
 
 interface ConversationComposerProps {
+  changeBar?: React.ReactNode;
   language: UiLanguage;
   composer: AgentComposer;
   uiActionError: string | null;
@@ -15,6 +16,7 @@ interface ConversationComposerProps {
 }
 
 export function ConversationComposer({
+  changeBar,
   language,
   composer,
   uiActionError,
@@ -80,6 +82,7 @@ export function ConversationComposer({
           {presentationStatus.error.message}
         </div>
       )}
+      <div className="conversation-change-dock" aria-live="polite">{changeBar}</div>
       <ComposerDecisionPanels language={language} composer={composer} />
       {!pendingPlan && !pendingInteraction && !pendingApproval && <div
         className="local-agent__composer"

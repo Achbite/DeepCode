@@ -35,6 +35,7 @@ import {
   pendingContextCompaction,
   prepareContextCompaction,
   pressureCompactionCutoff,
+  estimateContextInput,
   type ContextCompactionRequestEvent,
 } from './compaction.js';
 import { buildAgentProviderRequest } from './contextComposer.js';
@@ -46,6 +47,7 @@ import {
 } from './providerToolCodec.js';
 import { recoverSession, type SessionState } from './reducer.js';
 import { providerTextStreamId } from './streamIdentity.js';
+import { PlanPreviewBuffer } from './planPreview.js';
 import {
   decodeSessionControlCall,
   SessionControlError,
@@ -89,6 +91,7 @@ export interface AgentLoopDeps {
   composition: AgentComposition;
   commit(event: NewSessionEvent | readonly NewSessionEvent[]): Promise<LoopSnapshot>;
   updateAssistantDraft(draft: AssistantDraftProjection | null): void;
+  updateReasoning?(requestId: string, runId: string, text: string, kind: 'text' | 'summary'): void;
   nextId(kind: string): string;
 }
 
@@ -417,6 +420,9 @@ export async function runAgentLoop(
           },
         });
         continue;
+      }
+      if (estimateContextInput(snapshot, preparedProviderRequest.receipt, runtime) + runtime.provider.maxOutputTokens >= runtime.provider.contextWindowTokens) {
+        throw new LoopFailure('context_input_budget_exceeded', '当前输入与工具定义加上输出预留已达到上下文预算；没有可继续压缩的历史。原始输入与资源保持完整。');
       }
       throwIfAborted(signal);
       await commit({
@@ -1019,6 +1025,7 @@ async function consumeProviderOutput(
   const hostedWebSearchCalls: JsonObject[] = [];
   const orderedOutputItems: Array<{ outputIndex: number; item: JsonObject }> = [];
   const streamedTextByOutputIndex = new Map<number, string>();
+  const planPreview = new PlanPreviewBuffer(toolCodec.wireByCanonical.get(SESSION_CONTROL_PLAN_PUBLISH));
   let contextUsage: ProviderTokenUsage | undefined;
   let completed = false;
   for await (const event of deps.composition.provider.stream(request, signal)) {
@@ -1031,8 +1038,16 @@ async function consumeProviderOutput(
     }
     activity.observe(event);
     switch (event.type) {
+      case 'tool.call.delta': {
+        if (event.data.outputIndex !== undefined && orderedOutputItems.some((item) => item.outputIndex === event.data.outputIndex)) {
+          throw new LoopFailure('provider_output_delta_after_completion', '工具参数在完成后继续返回。');
+        }
+        const preview = planPreview.append(event.data);
+        if (preview) activity.updatePlanPreview(preview);
+        break;
+      }
       case 'reasoning.delta': {
-        reasoningDeltas += event.data.text;
+        if (event.data.kind !== 'summary') reasoningDeltas += event.data.text;
         break;
       }
       case 'text.delta': {
@@ -1502,6 +1517,7 @@ async function consumeProviderOutput(
 
 function trackProviderActivity(request: ProviderRequest, deps: AgentLoopDeps): {
   updateDraft(draft: AssistantDraftProjection | null): void;
+  updatePlanPreview(preview: NonNullable<AssistantDraftProjection['planPreview']>): void;
   observe(event: ProviderEvent): void;
 } {
   let draft: AssistantDraftProjection = { runId: request.runId, turnId: request.requestId, blocks: [] };
@@ -1512,12 +1528,17 @@ function trackProviderActivity(request: ProviderRequest, deps: AgentLoopDeps): {
   publish();
   return {
     updateDraft(next) {
-      draft = next ?? { runId: request.runId, turnId: request.requestId, blocks: [] };
+      draft = next ? { ...next, ...(draft.planPreview ? { planPreview: draft.planPreview } : {}) }
+        : { runId: request.runId, turnId: request.requestId, blocks: [] };
       publish();
     },
+    updatePlanPreview(preview) { draft = { ...draft, planPreview: preview }; publish(); },
     observe(event) {
-      if (event.type === 'reasoning.delta' && event.data.text) activity.phase = 'reasoning';
-      else if (event.type === 'text.delta' && event.data.text) activity.phase = 'generatingOutput';
+      if (event.type === 'reasoning.delta' && event.data.text) {
+        activity.phase = 'reasoning';
+        deps.updateReasoning?.(request.requestId, request.runId, event.data.text, event.data.kind ?? 'text');
+      }
+      else if (event.type === 'text.delta' && event.data.text || event.type === 'tool.call.delta') activity.phase = 'generatingOutput';
       else if (event.type === 'assistant.message') activity.phase = 'generatingOutput';
       else if (event.type === 'output.item.completed') {
         activity.phase = event.data.item.type === 'message' ? 'generatingOutput' : 'awaitingOutput';

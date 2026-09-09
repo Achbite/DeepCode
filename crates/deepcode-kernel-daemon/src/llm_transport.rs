@@ -1208,6 +1208,11 @@ pub(crate) fn local_agent_provider_stream_response(
                 for emission in emissions {
                     let event_type = emission.event.get("type").and_then(Value::as_str);
                     match event_type {
+                        Some("tool_call_delta") => {
+                            let mut data = emission.event;
+                            data.as_object_mut().expect("tool delta object").remove("type");
+                            yield Ok(Bytes::from(provider_event(&request_id, "tool.call.delta", data)));
+                        }
                         Some("text_delta") | Some("reasoning_delta") => {
                             let Some(text) = emission.event.get("content").and_then(Value::as_str) else {
                                 continue;
@@ -1217,7 +1222,7 @@ pub(crate) fn local_agent_provider_stream_response(
                             } else {
                                 "reasoning.delta"
                             };
-                            let data = match emission
+                            let mut data = match emission
                                 .event
                                 .get("output_index")
                                 .and_then(Value::as_i64)
@@ -1227,6 +1232,7 @@ pub(crate) fn local_agent_provider_stream_response(
                                 }
                                 None => json!({ "text": text }),
                             };
+                            if emission.event.get("kind").and_then(Value::as_str) == Some("summary") { data["kind"] = json!("summary"); }
                             yield Ok(Bytes::from(provider_event(
                                 &request_id,
                                 provider_type,

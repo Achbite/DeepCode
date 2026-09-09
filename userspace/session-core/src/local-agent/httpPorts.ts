@@ -573,11 +573,27 @@ function decodeProviderFrame(frame: string): ProviderEvent {
     || !isRecord(value.data)
   ) throw new Error('provider_event_invalid');
   switch (value.type) {
+    case 'tool.call.delta': {
+      const fields = ['callIndex', 'callId', 'name', 'argumentsDelta'];
+      if (Object.hasOwn(value.data, 'outputIndex')) fields.push('outputIndex');
+      if (!isExactRecord(value.data, fields)
+        || !Number.isSafeInteger(value.data.callIndex) || Number(value.data.callIndex) < 0
+        || !isNonEmptyText(value.data.callId) || !isNonEmptyText(value.data.name)
+        || typeof value.data.argumentsDelta !== 'string'
+        || value.data.outputIndex !== undefined && (!Number.isSafeInteger(value.data.outputIndex) || Number(value.data.outputIndex) < 0)) {
+        throw new Error('provider_event_invalid');
+      }
+      break;
+    }
     case 'text.delta':
     case 'reasoning.delta':
       {
         const fields = ['text'];
         if (Object.hasOwn(value.data, 'outputIndex')) fields.push('outputIndex');
+        if (value.type === 'reasoning.delta' && Object.hasOwn(value.data, 'kind')) {
+          if (!['text', 'summary'].includes(String(value.data.kind))) throw new Error('provider_event_invalid');
+          fields.push('kind');
+        }
         if (
           !isExactRecord(value.data, fields)
           || typeof value.data.text !== 'string'

@@ -1,21 +1,27 @@
-import React, { useCallback, useLayoutEffect, useRef, useState } from 'react';
+import React, { useLayoutEffect, useRef, useState } from 'react';
 import type { MessageFeedback, SessionProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
-import { openExternalUrl } from '../../services/runtimeAdapter';
+import { useConversationHost } from './ConversationHost';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import type { PresentedCommittedContent } from '../../presentation/PresentationRuntime';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
+import { FileChanges, roundChangeActivities } from './FileChanges';
+import { ReasoningHistory } from './ReasoningDetails';
+import { PlanPreviewCard } from './PlanPreviewCard';
 import ProviderStageStatus from './ProviderStageStatus';
-import { BufferedMarkdown } from './BufferedMarkdown';
+import { BufferedMarkdown, MarkdownContent } from './BufferedMarkdown';
 import PlanCard from './PlanCard';
 import { ToolActivityGroup, ProviderHostedDraftGroup } from './ToolActivityDetails';
-import type { ProjectionItem, AssistantDraftItem } from './conversationItems';
+import { conversationRounds, type ProjectionItem, type AssistantDraftItem } from './conversationItems';
 import type { ConversationViewport } from './useConversationViewport';
 import { formatBytes } from './conversationFormatting';
 
 interface ConversationTranscriptProps {
   language: UiLanguage;
   loading: boolean;
+  showReasoning?: boolean;
+  completedRuns: Set<string>;
+  onDisplayed(identity: string, text: string): void;
   projection: SessionProjection | null;
   activeProject: { title: string } | undefined;
   hasConversationContent: boolean;
@@ -29,6 +35,9 @@ interface ConversationTranscriptProps {
 
 export function ConversationTranscript({
   language,
+  showReasoning = false,
+  completedRuns,
+  onDisplayed,
   loading,
   projection,
   activeProject,
@@ -40,62 +49,39 @@ export function ConversationTranscript({
   openWorkspaceResource,
   setUiActionError,
 }: ConversationTranscriptProps) {
+  const host = useConversationHost();
   const { transcriptRef, messageEndRef, setLatestFollowMode } = viewport;
   const assistantDraft = projection?.assistantDraft ?? null;
   const submitting = useLocalAgentStore((state) => state.submitting);
   const setMessageFeedback = useLocalAgentStore((state) => state.setMessageFeedback);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
-  const [, setProviderStreamCompletionRevision] = useState(0);
-  const providerStreamProgressRef = useRef(new Map<string, number>());
-  const transitioningProviderStreamsRef = useRef(new Set<string>());
-  const recordProviderStreamProgress = useCallback((identity: string, length: number) => {
-    providerStreamProgressRef.current.set(identity, length);
-  }, []);
-
-  const finishProviderStream = useCallback((identity: string) => {
-    providerStreamProgressRef.current.delete(identity);
-    if (transitioningProviderStreamsRef.current.delete(identity)) {
-      setProviderStreamCompletionRevision((revision) => revision + 1);
-    }
-  }, []);
-
-  const committedProviderContent = (
-    identity: string | undefined,
-    content: string,
-    committed: React.ReactNode,
-  ): React.ReactNode => {
+  const currentSessionRef = useRef({ sessionId: projection?.sessionId });
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  if (currentSessionRef.current.sessionId !== projection?.sessionId) currentSessionRef.current = { sessionId: projection?.sessionId };
+  useLayoutEffect(() => {
+    setCopiedMessageId(null);
+    return () => clearTimeout(copyTimerRef.current);
+  }, [projection?.sessionId]);
+  const committedProviderContent = (identity: string | undefined, content: string, committed: React.ReactNode): React.ReactNode => {
     if (!identity) throw new Error('conversation_timeline_stream_missing');
-    if (!transitioningProviderStreamsRef.current.has(identity)) return committed;
-    return (
-      <BufferedMarkdown
-        key={`committed:${identity}`}
-        text={content}
-        streamIdentity={identity}
-        initialVisibleLength={providerStreamProgressRef.current.get(identity) ?? 0}
-        onVisibleLengthChange={recordProviderStreamProgress}
-        onCaughtUp={finishProviderStream}
-      />
-    );
+    // Custom presentation renderers retain their output; the builtin Markdown keeps its stream node.
+    if (!React.isValidElement(committed) || committed.type !== MarkdownContent) return <CommittedPresentation identity={identity} text={content} onDisplayed={onDisplayed}>{committed}</CommittedPresentation>;
+    return <BufferedMarkdown text={content} streamIdentity={identity} streaming={false} onDisplayed={onDisplayed} />;
   };
 
-  useLayoutEffect(() => {
-    if (!assistantDraft) return;
-    for (const block of assistantDraft.blocks) {
-      if (block.kind !== 'providerHosted') {
-        transitioningProviderStreamsRef.current.add(block.streamId);
-      }
-    }
-  }, [assistantDraft]);
-
   const copyAssistantMessage = async (messageId: string, content: string) => {
+    const requestedView = currentSessionRef.current;
     try {
-      await copyTextToClipboard(content);
+      await host.copyText(content);
+      if (currentSessionRef.current !== requestedView) return;
       setCopiedMessageId(messageId);
       setUiActionError(null);
-      window.setTimeout(() => {
+      clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = setTimeout(() => {
         setCopiedMessageId((current) => current === messageId ? null : current);
       }, 1_500);
     } catch (copyError) {
+      if (currentSessionRef.current !== requestedView) return;
       setUiActionError(copyError instanceof Error ? copyError.message : String(copyError));
     }
   };
@@ -104,10 +90,13 @@ export function ConversationTranscript({
     messageId: string,
     feedback: MessageFeedback | null,
   ) => {
+    const requestedView = currentSessionRef.current;
     try {
       await setMessageFeedback(messageId, feedback);
+      if (currentSessionRef.current !== requestedView) return;
       setUiActionError(null);
     } catch (feedbackError) {
+      if (currentSessionRef.current !== requestedView) return;
       setUiActionError(feedbackError instanceof Error
         ? feedbackError.message
         : String(feedbackError));
@@ -123,35 +112,18 @@ export function ConversationTranscript({
     const href = anchor.getAttribute('href') ?? '';
     if (!/^https?:\/\//i.test(href)) return;
     event.preventDefault();
-    void openExternalUrl(href).then(() => {
+    const requestedView = currentSessionRef.current;
+    void host.openExternalLink(href).then(() => {
+      if (currentSessionRef.current !== requestedView) return;
       setUiActionError(null);
     }).catch((error: unknown) => {
+      if (currentSessionRef.current !== requestedView) return;
       setUiActionError(error instanceof Error ? error.message : String(error));
     });
   };
 
-  return (
-    <div
-      ref={transcriptRef}
-      className="local-agent__transcript"
-      onClick={openTranscriptLink}
-      onAuxClick={openTranscriptLink}
-    >
-      {loading && !projection && (
-        <div className="local-agent__empty">{t(language, 'agent.chat.opening')}</div>
-      )}
-      {!hasConversationContent && !loading && (
-        <div className="local-agent__empty local-agent__empty--welcome">
-          <strong>
-            {activeProject
-              ? t(language, 'agent.chat.welcomeProject', { project: activeProject.title })
-              : t(language, 'agent.chat.welcomeDefault')}
-          </strong>
-        </div>
-      )}
-      {conversationItems.map((item) => item.type === 'message' ? (
+  const renderItem = (item: ProjectionItem): React.ReactNode => item.type === 'message' ? (
         <article
-          key={`message:${item.value.messageId}`}
           className={`local-agent__message local-agent__message--${item.value.role}`}
         >
           <div className="local-agent__message-content">
@@ -165,7 +137,8 @@ export function ConversationTranscript({
             {item.value.filesystemReferences.length > 0 && (
               <div className="local-agent__message-attachments">
                 {item.value.filesystemReferences.map((reference) => (
-                  <span
+                  <button type="button"
+                    onClick={() => { if (reference.kind === 'file') void openWorkspaceResource(reference.workspaceId, reference.logicalPath); }}
                     className={reference.kind === 'directory'
                       ? 'local-agent__message-directory'
                       : undefined}
@@ -178,7 +151,7 @@ export function ConversationTranscript({
                     {reference.kind === 'file' && (
                       <small>{formatBytes(reference.byteLength, language)}</small>
                     )}
-                  </span>
+                  </button>
                 ))}
               </div>
             )}
@@ -190,13 +163,16 @@ export function ConversationTranscript({
             >
               <button
                 type="button"
-                title={t(language, 'agent.message.copy')}
+                className="conversation-copy-button"
                 aria-label={copiedMessageId === item.value.messageId
                   ? t(language, 'agent.message.copied')
                   : t(language, 'agent.message.copyResponse')}
                 onClick={() => void copyAssistantMessage(item.value.messageId, item.value.content)}
               >
                 <DeepCodeShellIcon name="copy" />
+                <span className="conversation-copy-hint" role="status">{copiedMessageId === item.value.messageId
+                  ? t(language, 'agent.message.copied')
+                  : t(language, 'agent.message.copy')}</span>
               </button>
               <button
                     type="button"
@@ -230,7 +206,7 @@ export function ConversationTranscript({
           )}
         </article>
       ) : item.type === 'narrative' ? (
-        <article className="local-agent__narrative" key={`narrative:${item.value.narrativeId}`}>
+        <article className="local-agent__narrative">
           <div>
             {committedProviderContent(
               item.streamId,
@@ -254,13 +230,12 @@ export function ConversationTranscript({
           onExpand={() => setLatestFollowMode(false)}
           onOpenWorkspaceResource={openWorkspaceResource}
         />
-      ))}
-      {draftItems.map((item) => item.type === 'text' ? (
+      );
+  const renderDraft = (item: AssistantDraftItem): React.ReactNode => item.type === 'text' ? (
         <article
           className={item.block.kind === 'narrative'
             ? 'local-agent__narrative local-agent__narrative--draft'
             : 'local-agent__message local-agent__message--assistant local-agent__message--draft'}
-          key={item.block.streamId}
         >
           <div className={item.block.kind === 'narrative'
             ? undefined
@@ -269,26 +244,64 @@ export function ConversationTranscript({
             <BufferedMarkdown
               text={item.block.content}
               streamIdentity={item.block.streamId}
-              initialVisibleLength={providerStreamProgressRef.current.get(item.block.streamId) ?? 0}
-              onVisibleLengthChange={recordProviderStreamProgress}
             />
           </div>
         </article>
-      ) : (
+      ) : item.type === 'planPreview' ? <PlanPreviewCard preview={item.value} key={item.key} language={language} /> : (
         <ProviderHostedDraftGroup
           blocks={item.blocks}
           key={item.groupId}
           language={language}
           onExpand={() => setLatestFollowMode(false)}
         />
-      ))}
+      );
+  const providerStatus = <>
       {projection?.run && projection.run.status !== 'completed' && (
         <ProviderStageStatus run={projection.run} language={language}
+          reasoning={showReasoning && assistantDraft ? { sessionId: projection.sessionId, requestId: assistantDraft.turnId } : undefined}
           key={`${projection.run.runId}:${assistantDraft?.turnId ?? 'idle'}`}
           activity={assistantDraft?.runId === projection.run.runId ? assistantDraft.activity : undefined}
           toolPending={projection.activities.some((activity) => activity.runId === projection.run?.runId
             && activity.kind === 'tool' && ['requested', 'active', 'waiting'].includes(activity.status))} />
       )}
+</>;
+  const rounds = conversationRounds(conversationItems, draftItems, projection?.run?.runId);
+
+  return (
+    <div
+      ref={transcriptRef}
+      className="local-agent__transcript"
+      onClick={openTranscriptLink}
+      onAuxClick={openTranscriptLink}
+    >
+      {loading && !projection && (
+        <div className="local-agent__empty">{t(language, 'agent.chat.opening')}</div>
+      )}
+      {!hasConversationContent && !loading && (
+        <div className="local-agent__empty local-agent__empty--welcome">
+          <strong>
+            {activeProject
+              ? t(language, 'agent.chat.welcomeProject', { project: activeProject.title })
+              : t(language, 'agent.chat.welcomeDefault')}
+          </strong>
+        </div>
+      )}
+      {rounds.map((round) => {
+        const current = projection?.run?.runId === round.runId;
+        const completed = completedRuns.has(round.runId);
+        const terminal = current && ['failed', 'cancelled', 'indeterminate'].includes(projection!.run!.status);
+        const rows = round.rows.map((row) => ({
+          key: row.key,
+          process: row.item ? row.item.type !== 'message' : row.draft?.type !== 'text' || row.draft.block.kind === 'narrative',
+          required: row.item?.type === 'plan' && samePlanReference(projection?.pendingPlan, row.item.value),
+          content: row.item ? renderItem(row.item) : renderDraft(row.draft!),
+        }));
+        if (current && !completed) rows.push({ key: 'provider-status', process: true, required: false, content: providerStatus });
+        if (showReasoning && projection && completed) rows.push({ key: 'reasoning-history', process: true, required: false, content: <ReasoningHistory sessionId={projection.sessionId} runId={round.runId} /> });
+        return <ConversationRoundView key={`${projection?.sessionId}:${round.key}`} completed={completed} followingLatest={viewport.followingLatest} rows={rows}>
+          {(completed || terminal) && <FileChanges activities={roundChangeActivities(projection, round.runId)} />}
+        </ConversationRoundView>;
+      })}
       {projection?.terminalError && (
         <article className="local-agent__terminal-error">
           <strong>{projection.terminalError.code}</strong>
@@ -300,25 +313,34 @@ export function ConversationTranscript({
   );
 }
 
-async function copyTextToClipboard(text: string): Promise<void> {
-  if (window.navigator.clipboard?.writeText) {
-    await window.navigator.clipboard.writeText(text);
-    return;
-  }
-  const textarea = document.createElement('textarea');
-  textarea.value = text;
-  textarea.style.position = 'fixed';
-  textarea.style.left = '-9999px';
-  document.body.appendChild(textarea);
-  textarea.select();
-  const copied = document.execCommand('copy');
-  textarea.remove();
-  if (!copied) throw new Error('clipboard_copy_failed');
-}
-
 function samePlanReference(
   reference: { planId: string; revision: number } | null | undefined,
   plan: { planId: string; revision: number },
 ): boolean {
   return reference?.planId === plan.planId && reference.revision === plan.revision;
+}
+
+function ConversationRoundView({ completed, followingLatest, rows, children }: {
+  completed: boolean; followingLatest: boolean;
+  rows: Array<{ key: string; process: boolean; required: boolean; content: React.ReactNode }>;
+  children: React.ReactNode;
+}) {
+  const [disclosure, setDisclosure] = useState({ completed, open: false });
+  if (disclosure.completed !== completed) setDisclosure({ completed, open: completed && !followingLatest });
+  const expanded = !completed || disclosure.open;
+  const firstProcess = rows.find((row) => row.process)?.key;
+  return <section className="conversation-round">
+    {rows.map((row) => <React.Fragment key={row.key}>
+      {completed && row.key === firstProcess && <button className="conversation-process-toggle" type="button" aria-expanded={expanded} onClick={() => setDisclosure({ completed, open: !expanded })}>
+        <DeepCodeShellIcon name="tool" /><span>{expanded ? '执行过程' : '查看执行过程'}</span><DeepCodeShellIcon name="chevronDown" className="conversation-disclosure-chevron" />
+      </button>}
+      <div data-conversation-anchor={row.key} hidden={row.process && !expanded && !row.required}>{row.content}</div>
+    </React.Fragment>)}
+    {children}
+  </section>;
+}
+
+function CommittedPresentation({ identity, text, onDisplayed, children }: { identity: string; text: string; onDisplayed(identity: string, text: string): void; children: React.ReactNode }) {
+  useLayoutEffect(() => onDisplayed(identity, text), [identity, text, onDisplayed]);
+  return <>{children}</>;
 }

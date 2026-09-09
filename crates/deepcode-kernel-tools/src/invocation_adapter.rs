@@ -103,7 +103,7 @@ fn adapt_public_arguments(
         Tool::FsRead => {
             ensure_allowed_fields(
                 fields,
-                &["path", "startLine", "maxLines", "maxBytes"],
+                &["path", "startLine", "startByte", "maxLines", "maxBytes"],
                 tool_id,
             )?;
         }

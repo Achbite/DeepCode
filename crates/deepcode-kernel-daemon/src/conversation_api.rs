@@ -3,13 +3,13 @@ use crate::conversation_catalog::{
     ConversationCatalog, ConversationProjectRecord, ConversationSessionRecord,
     ConversationWorkspaceRecord, WorkspaceBindingDisplayRecord,
 };
-use crate::host_inspection::HostInspectionExecutor;
 use crate::prelude::*;
 use crate::{ApiResponse, AppState, SessionServiceError, SessionServiceProcess};
-use deepcode_kernel_abi::{HostInspectionOutput, HostInspectionQuery};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::Path as StdPath;
 
 const MAX_MESSAGE_FILESYSTEM_REFERENCES: usize = 8;
@@ -53,6 +53,15 @@ pub(crate) struct UpdateConversationSessionRequest {
 pub(crate) struct ReadConversationResourceRequest {
     workspace_id: String,
     logical_path: String,
+    start_byte: Option<u64>,
+    format: Option<ResourceReadFormat>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum ResourceReadFormat {
+    Text,
+    Image,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,9 +147,10 @@ pub(crate) async fn conversation_resource_read(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     Json(body): Json<ReadConversationResourceRequest>,
-) -> Json<ApiResponse> {
+) -> Response {
     if !valid_id(&session_id) || !valid_id(&body.workspace_id) {
-        return ApiResponse::error("conversation_resource_identity_invalid", "资源身份无效。");
+        return ApiResponse::error("conversation_resource_identity_invalid", "资源身份无效。")
+            .into_response();
     }
     let projection = match request_service(
         state.session_service.clone(),
@@ -150,48 +160,154 @@ pub(crate) async fn conversation_resource_read(
     .await
     {
         Ok(value) => value,
-        Err(error) => return session_service_error(error),
+        Err(error) => return session_service_error(error).into_response(),
     };
     if !projection_references_workspace(&projection, &body.workspace_id) {
         return ApiResponse::error(
             "conversation_resource_workspace_not_bound",
             "资源不属于当前 Session 的有效目录集合。",
-        );
+        )
+        .into_response();
     }
     let root = {
         let gui = state.gui.lock().expect("gui state lock");
         if let Some(error) = gui.conversation_catalog_error.as_deref() {
-            return ApiResponse::error("conversation_catalog_unavailable", error);
+            return ApiResponse::error("conversation_catalog_unavailable", error).into_response();
         }
         if gui.conversation_catalog.session(&session_id).is_none() {
-            return ApiResponse::error("conversation_session_not_found", "对话不存在。");
+            return ApiResponse::error("conversation_session_not_found", "对话不存在。")
+                .into_response();
         }
         let Some(workspace) = gui.conversation_catalog.workspace(&body.workspace_id) else {
-            return ApiResponse::error("conversation_workspace_not_found", "工作目录不存在。");
+            return ApiResponse::error("conversation_workspace_not_found", "工作目录不存在。")
+                .into_response();
         };
         workspace.canonical_root.clone()
     };
 
-    match HostInspectionExecutor.execute(
-        HostInspectionQuery::Read {
-            folder_id: Some(body.workspace_id.clone()),
-            path: body.logical_path.clone(),
-        },
-        Some(StdPath::new(&root)),
+    let target = match crate::host_inspection::resolve_workspace_read_path(
+        StdPath::new(&root),
+        &body.logical_path,
     ) {
-        Ok(HostInspectionOutput::Read(read)) => ApiResponse::ok(json!({
-            "workspaceId": body.workspace_id,
-            "logicalPath": read.path,
-            "content": read.content,
-            "sizeBytes": read.size_bytes,
-            "startLine": read.start_line,
-            "endLine": read.end_line,
-        })),
-        Ok(_) => ApiResponse::error(
-            "conversation_resource_kind_invalid",
-            "资源读取返回了非文件结果。",
+        Ok(path) => path,
+        Err(error) => return ApiResponse::error(error.code, &error.message).into_response(),
+    };
+    if matches!(body.format, Some(ResourceReadFormat::Image)) {
+        if body.start_byte.is_some() {
+            return ApiResponse::error(
+                "conversation_image_range_invalid",
+                "图片读取不接受文本游标。",
+            )
+            .into_response();
+        }
+        return match read_image_resource(&target) {
+            Ok((media_type, bytes)) => {
+                ([(axum::http::header::CONTENT_TYPE, media_type)], bytes).into_response()
+            }
+            Err(error) => {
+                ApiResponse::error("conversation_image_read_failed", error).into_response()
+            }
+        };
+    }
+    match deepcode_kernel_tools::text_range::read_text_range(
+        &target,
+        1,
+        body.start_byte,
+        2000,
+        262144,
+    ) {
+        Ok(mut read) => {
+            read["workspaceId"] = json!(body.workspace_id);
+            read["logicalPath"] = json!(body.logical_path);
+            ApiResponse::ok(read)
+        }
+        Err(error) => ApiResponse::error("conversation_resource_read_failed", &error),
+    }
+    .into_response()
+}
+
+// Image presentation uses the same Session/workspace binding check as text.
+// The byte cap applies while reading, including if the file grows concurrently.
+fn read_image_resource(path: &StdPath) -> Result<(&'static str, Vec<u8>), String> {
+    const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .map_err(|error| error.to_string())?
+        .take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return Err("图片超过 8 MiB 读取限额。".into());
+    }
+    let media = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        "image/jpeg"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "image/gif"
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        "image/webp"
+    } else {
+        return Err("当前资源不是支持的 PNG、JPEG、GIF 或 WebP 图片。".into());
+    };
+    Ok((media, bytes))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ReadFileChangeRequest {
+    record_id: String,
+    index: usize,
+}
+
+pub(crate) async fn conversation_change_read(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<ReadFileChangeRequest>,
+) -> Json<ApiResponse> {
+    let projection = match request_service(
+        state.session_service,
+        "snapshot",
+        json!({ "sessionId": session_id }),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return session_service_error(error),
+    };
+    let change = projection["activities"]
+        .as_array()
+        .and_then(|activities| {
+            activities.iter().find(|activity| {
+                activity["tool"]["recordId"].as_str() == Some(body.record_id.as_str())
+            })
+        })
+        .and_then(|activity| activity["tool"]["fileChanges"].as_array())
+        .and_then(|changes| changes.get(body.index));
+    let Some(change) = change else {
+        return ApiResponse::error("file_change_not_found", "变更记录不存在。");
+    };
+    let read = |side: &Value| -> Result<Value, String> {
+        if side["exists"] == false {
+            return Ok(Value::Null);
+        }
+        if let Some(error) = side["error"].as_str() {
+            return Err(error.to_string());
+        }
+        let path = side["contentRef"]
+            .as_str()
+            .ok_or("file_change_content_missing")?;
+        deepcode_kernel_tools::file_content::read_text_file_for_llm(StdPath::new(path))
+            .map(|read| json!(read.content))
+            .map_err(|error| error.message)
+    };
+    match (read(&change["before"]), read(&change["after"])) {
+        (Ok(before), Ok(after)) => ApiResponse::ok(
+            json!({ "workspaceId": change["workspaceId"], "path": change["path"], "before": before, "after": after }),
         ),
-        Err(error) => ApiResponse::error(error.code, "无法读取所选工作区资源。"),
+        (Err(error), _) | (_, Err(error)) => {
+            ApiResponse::error("file_change_content_unavailable", &error)
+        }
     }
 }
 
@@ -857,13 +973,149 @@ pub(crate) async fn conversation_session_delete(
     ApiResponse::ok(gui.conversation_catalog.public_value())
 }
 
+const INPUT_FILE_THRESHOLD: usize = 32 * 1024;
+const FILE_INPUT_MESSAGE: &str = "本条用户消息的完整原文已保存到 user-input.txt 文件引用。原文包含用户的任务指令、约束和资料，具有本条用户输入的原始语义。请先用 fs.read 按 nextByte 分段读取并完整接纳原文，再继续任务；不要把它当作可忽略的普通附件。";
+
+fn save_input_resource(
+    state: &AppState,
+    session_id: &str,
+    input_id: &str,
+    content: &str,
+) -> Result<Value, String> {
+    if !valid_id(session_id) || !valid_id(input_id) {
+        return Err("input_resource_identity_invalid".into());
+    }
+    if content.len() as u64 > MAX_REFERENCE_FILE_BYTES {
+        return Err("input_resource_capacity_exceeded: single input limit is 32 MiB".into());
+    }
+    let mut gui = state.gui.lock().expect("gui state lock");
+    if let Some(error) = &gui.conversation_catalog_error {
+        return Err(error.clone());
+    }
+    if gui.conversation_catalog.session(session_id).is_none() {
+        return Err("conversation_session_not_found".into());
+    }
+    let key = json!([session_id, input_id]).to_string();
+    let reference_id = format!("input-{}", reference_storage_segment(&key));
+    let workspace_id = format!("input-workspace-{}", reference_storage_segment(&key));
+    let root = session_attachment_root(&gui.paths.attachment_store_root, session_id)
+        .join(reference_storage_segment(&reference_id));
+    let target = root.join("user-input.txt");
+    if target.exists() {
+        let existing = fs::read(&target).map_err(|error| error.to_string())?;
+        if existing != content.as_bytes() {
+            return Err("input_resource_identity_conflict".into());
+        }
+    } else {
+        fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let result = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .and_then(|mut file| {
+                file.write_all(content.as_bytes())?;
+                file.sync_all()
+            });
+        if let Err(error) = result {
+            cleanup_created_snapshot_roots(&[root]);
+            return Err(error.to_string());
+        }
+    }
+    if gui.conversation_catalog.workspace(&workspace_id).is_none() {
+        let previous = gui.conversation_catalog.clone();
+        let canonical_root = fs::canonicalize(&root)
+            .map_err(|error| error.to_string())?
+            .to_string_lossy()
+            .to_string();
+        gui.conversation_catalog
+            .register_workspace(ConversationWorkspaceRecord {
+                workspace_id: workspace_id.clone(),
+                display_name: "user-input.txt".into(),
+                canonical_root,
+                owner_session_id: Some(session_id.to_string()),
+                created_at: crate::now_text(),
+            });
+        if let Err(error) = persist_catalog_or_rollback(&mut gui, previous) {
+            cleanup_created_snapshot_roots(&[root]);
+            return Err(error);
+        }
+    }
+    Ok(json!({ "text": FILE_INPUT_MESSAGE, "reference": {
+        "referenceId": reference_id, "workspaceId": workspace_id, "logicalPath": "user-input.txt",
+        "displayName": "user-input.txt", "kind": "file", "mediaType": "text/plain", "byteLength": content.len(),
+    } }))
+}
+
+pub(crate) async fn conversation_input_upload(
+    State(state): State<AppState>,
+    Path((session_id, input_id)): Path<(String, String)>,
+    body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
+) -> Json<ApiResponse> {
+    let body = match body {
+        Ok(body) => body,
+        Err(error) if error.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE => {
+            return ApiResponse::error(
+                "input_resource_capacity_exceeded",
+                "单条输入超过 32 MiB 接纳限额；原文未被截断或提交。",
+            );
+        }
+        Err(error) => {
+            return ApiResponse::error("input_resource_body_read_failed", error.to_string())
+        }
+    };
+    let content = match std::str::from_utf8(&body) {
+        Ok(content) => content,
+        Err(error) => return ApiResponse::error("input_resource_invalid_utf8", &error.to_string()),
+    };
+    match save_input_resource(&state, &session_id, &input_id, content) {
+        Ok(value) => ApiResponse::ok(value),
+        Err(error) => ApiResponse::error("input_resource_save_failed", &error),
+    }
+}
+
 pub(crate) async fn conversation_command_submit(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
-    Json(command): Json<Value>,
+    Json(mut command): Json<Value>,
 ) -> Json<ApiResponse> {
     if command.get("sessionId").and_then(Value::as_str) != Some(&session_id) {
         return ApiResponse::error("session_identity_mismatch", "命令 sessionId 与路径不一致。");
+    }
+    let input_field = match command["type"].as_str() {
+        Some("message.submit") => Some("text"),
+        Some("context.focus") => Some("task"),
+        _ => None,
+    };
+    if let Some(field) = input_field {
+        if command
+            .get("filesystemReferences")
+            .is_some_and(|value| !value.is_array())
+        {
+            return ApiResponse::error(
+                "filesystem_reference_invalid",
+                "filesystemReferences 必须是数组。",
+            );
+        }
+        if let Some(content) = command[field]
+            .as_str()
+            .filter(|content| content.len() > INPUT_FILE_THRESHOLD)
+        {
+            let input_id = match command["commandId"].as_str() {
+                Some(id) => id,
+                None => return ApiResponse::error("command_identity_missing", "缺少 commandId。"),
+            };
+            let saved = match save_input_resource(&state, &session_id, input_id, content) {
+                Ok(value) => value,
+                Err(error) => return ApiResponse::error("input_resource_save_failed", &error),
+            };
+            command[field] = saved["text"].clone();
+            let mut references = command["filesystemReferences"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            references.push(saved["reference"].clone());
+            command["filesystemReferences"] = json!(references);
+        }
     }
     if command.get("type").and_then(Value::as_str) == Some("session.directory-index.attach") {
         let gui = state.gui.lock().expect("gui state lock");

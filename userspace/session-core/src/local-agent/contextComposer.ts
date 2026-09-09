@@ -62,6 +62,8 @@ export async function buildAgentProviderRequest(input: {
   providerRequestId: string;
 }): Promise<PreparedProviderRequest> {
   const hasWorkspaceBindings = input.workspaceBindings.length > 0;
+  const firstRun = input.events.find((event) => event.type === 'run.started');
+  const prefixBindings = firstRun?.type === 'run.started' ? firstRun.payload.workspaceBindings : input.workspaceBindings;
   const controlNames = {
     interactionRequest: providerWireName(input.runtime, SESSION_CONTROL_INTERACTION_REQUEST),
     planPublish: providerWireName(input.runtime, SESSION_CONTROL_PLAN_PUBLISH),
@@ -132,7 +134,7 @@ export async function buildAgentProviderRequest(input: {
       role: 'system',
       content: hasWorkspaceBindings
         ? `Current Session workspace bindings (logical handles only): ${JSON.stringify(
-          providerWorkspaceBindings(input.workspaceBindings),
+          providerWorkspaceBindings(prefixBindings),
         )}`
         : 'Current Session workspace bindings: []. Workspace-scoped filesystem and Bash tools are unavailable for this run.',
     },
@@ -227,6 +229,8 @@ export function messagesFromJournal(
       : []
   )));
   const retainedRunInputId = runInputMessageEvent(events, runId)?.payload.messageId;
+  const runs = events.filter((event): event is Extract<SessionEvent, { type: 'run.started' }> => event.type === 'run.started');
+  const runForInput = new Map(runs.map((event) => [event.payload.inputMessageId, event]));
   const checkpoint = [...events]
     .reverse()
     .find((event): event is Extract<SessionEvent, { type: 'context.compacted' }> => (
@@ -256,13 +260,23 @@ export function messagesFromJournal(
       const reasoning = event.payload.role === 'assistant'
         ? providerReasoning(events, event.payload.providerRequestId)
         : {};
+      const inputRun = runForInput.get(event.payload.messageId);
+      const messageBindings = inputRun?.payload.workspaceBindings ?? workspaceBindings;
+      const previousRun = inputRun ? runs[runs.indexOf(inputRun) - 1] : undefined;
+      if (inputRun && previousRun && JSON.stringify(inputRun.payload.workspaceBindings) !== JSON.stringify(previousRun.payload.workspaceBindings)) {
+        messages.push({
+          contributionId: `workspace-snapshot:${inputRun.runId}`, contributionKind: 'workspaceBindings',
+          label: '本轮目录与资源引用', message: { role: 'system',
+            content: `Current Session workspace bindings (logical handles only; supersedes earlier binding snapshots): ${JSON.stringify(providerWorkspaceBindings(messageBindings))}` },
+        });
+      }
       messages.push({
         contributionId: `message:${event.payload.messageId}`,
         contributionKind: 'journalMessages',
         label: event.payload.role === 'user' ? '用户消息' : 'Assistant 消息',
         message: {
           role: event.payload.role,
-          content: messageContentForModel(event.payload, workspaceBindings),
+          content: messageContentForModel(event.payload, messageBindings),
           ...reasoning,
         },
       });
@@ -1082,12 +1096,12 @@ function messageContentForModel(
 function toolResultForModel(record: ToolExecutionRecord): Record<string, unknown> {
   if (record.outcome === 'completed') {
     const output = structuredClone(record.output);
-    if (isRecord(output)) delete output.workspaceId;
+    if (isRecord(output)) { delete output.workspaceId; delete output.fileChanges; }
     return { recordId: record.recordId, outcome: record.outcome, output };
   }
   if (record.outcome === 'failed') {
     const output = record.output === undefined ? undefined : structuredClone(record.output);
-    if (isRecord(output)) delete output.workspaceId;
+    if (isRecord(output)) { delete output.workspaceId; delete output.fileChanges; }
     return {
       recordId: record.recordId,
       outcome: record.outcome,

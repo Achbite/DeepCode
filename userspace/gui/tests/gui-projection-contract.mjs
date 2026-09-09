@@ -56,3 +56,9 @@ export async function decodeGuiProjection(projection) {
     globalThis.fetch = previousFetch;
   }
 }
+
+export async function loadGuiModule(t, path) {
+  const loader = await createGuiLoader();
+  t.after(() => loader.close());
+  return await loader.ssrLoadModule(path);
+}

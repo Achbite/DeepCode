@@ -211,6 +211,14 @@ async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
                         app.plugin_picker_move(1);
                         true
                     }
+                    KeyCode::PageDown => {
+                        app.scroll_content(true);
+                        true
+                    }
+                    KeyCode::PageUp => {
+                        app.scroll_content(false);
+                        true
+                    }
                     KeyCode::Char(value) => {
                         app.push_input(value);
                         true
@@ -262,7 +270,7 @@ async fn run_plain(mut app: TuiApp) -> io::Result<Option<String>> {
         if io::stdin().read_line(&mut line)? == 0 {
             return Ok(app.action_required());
         }
-        if !app.submit_line(line.trim()).await {
+        if !app.submit_line(line.trim_end_matches(['\r', '\n'])).await {
             return Ok(None);
         }
         while app.is_run_pending() {

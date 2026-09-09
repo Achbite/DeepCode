@@ -29,6 +29,7 @@ COMMAND_VERSION = "deepcode.command.v3"
 GENERATION_ONE = "SKILL_GENERATION_ONE"
 GENERATION_TWO = "SKILL_GENERATION_TWO"
 ATTACHMENT_CONTENT = "LOCAL_ATTACHMENT_CONTENT_MUST_NOT_REACH_PROVIDER"
+LONG_INPUT = "  原始任务约束与资料🙂\n" * 4000
 PDF_CONTENT = "DEEPCODE_FIRST_PARTY_PDF_BINDING_OK"
 CORE_TOOL_NAMES = [
     "fs.read", "fs.write", "fs.edit", "fs.delete",
@@ -217,6 +218,8 @@ class ProviderState:
                 "第一轮 pdf.read 未从 Kernel prepared workspace binding 提取正文",
             )
         elif ordinal == 3:
+            require(LONG_INPUT not in joined, "长文本仍被整篇内联到 Provider 请求")
+            require('"path":"user-input.txt"' in joined, "长文本资源引用未进入当前输入")
             require(GENERATION_TWO in joined, "下一 run 未加载新 Skill generation")
             require(GENERATION_ONE not in joined, "下一 run 仍暴露旧 Skill generation")
             require(wire_name != self.old_wire_name(), "下一 run 未取得新的 MCP wire tool")
@@ -943,7 +946,7 @@ def write_configuration(
             "providerFlavor": "openai",
             "baseUrl": provider_url,
             "model": "mock-main",
-            "contextWindowTokens": 8192,
+            "contextWindowTokens": 65536,
             "maxOutputTokens": 512,
             "enabled": True,
         }],
@@ -1342,6 +1345,26 @@ def assert_shells_read_projection(
         "TUI 没有读取精确 SessionProjection identity",
     )
 
+    # Ordinary launchers supply the config root, not process-private credentials.
+    # Both shells must discover and authenticate the exact existing Host.
+    discovered_environment = os.environ.copy()
+    for key in ("DEEPCODE_API_URL", "DEEPCODE_PORT", "DEEPCODE_HOST_SHELL_TOKEN", "DEEPCODE_HOST_INSTANCE_ID"):
+        discovered_environment.pop(key, None)
+    discovered_environment["DEEPCODE_CONFIG_DIR"] = str(daemon.config_root)
+    for binary, action in ((TUI_BINARY, "--smoke"), (CLI_BINARY, "show")):
+        attached = subprocess.run(
+            [str(binary), "--no-auto-start-kernel", "--session", session_id, action],
+            cwd=ROOT, env=discovered_environment, check=False,
+            capture_output=True, text=True, timeout=18,
+        )
+        require(attached.returncode == 0, f"{binary.name} 共享连接失败：{attached.stderr}")
+        require(
+            f"session={session_id} revision={revision}" in f"{attached.stdout}\n{attached.stderr}",
+            f"{binary.name} 自动发现后未读取原 Session",
+        )
+        require(daemon.process is not None and daemon.process.poll() is None, "壳退出后错误地停止了共享 Host")
+        require(api_json(daemon.base_url, "/api/host/identity") == daemon.identity, "壳连接时替换了 Host 实例")
+
 
 def assert_provider_count_stable(provider: ProviderState, expected: int) -> None:
     deadline = time.monotonic() + 0.35
@@ -1468,7 +1491,21 @@ def main() -> None:
                 "共享 SessionProjection 的文件引用字段不精确",
             )
 
-            submit_message(daemon_one, session_id, "command-round-two", "第二轮链路输入。")
+            input_path = f"/api/conversation/sessions/{urllib.parse.quote(session_id, safe='')}/input-resources/command-round-two"
+            upload = urllib.request.Request(daemon_one.base_url + input_path, method="POST",
+                data=LONG_INPUT.encode("utf-8"), headers={HOST_TOKEN_HEADER: daemon_one.token, "content-type": "text/plain; charset=utf-8"})
+            with URL_OPENER.open(upload, timeout=10) as response:
+                saved = json.loads(response.read())
+            require(saved.get("ok") is True, "长文本原文保存失败")
+            reference = saved["data"]["reference"]
+            unbound = api_envelope(daemon_one.base_url,
+                f"/api/conversation/sessions/{urllib.parse.quote(session_id, safe='')}/resources/read",
+                token=daemon_one.token, method="POST",
+                body={"workspaceId": reference["workspaceId"], "logicalPath": reference["logicalPath"]})
+            require(unbound.get("ok") is False, "未接纳输入的暂存资源提前成为会话可读事实")
+            # Reusing the same command identity with the complete text must retain
+            # exactly the same saved original before Session admission.
+            submit_message(daemon_one, session_id, "command-round-two", LONG_INPUT)
             final = wait_completed(daemon_one, provider, session_id, "second run completed")
             provider.assert_healthy()
             require(provider.count() == 4, "两轮 tool/continuation Provider 调用数不是四次")
@@ -1486,6 +1523,26 @@ def main() -> None:
             require((recovered.get("run") or {}).get("status") == "completed", "重启后完成态丢失")
             require(int(recovered["revision"]) == final_revision, "重启后 projection revision 漂移")
             assert_projection_flow(recovered)
+            second_input = [message for message in recovered["messages"] if message["role"] == "user"][1]
+            require(second_input["filesystemReferences"] == [reference], "长文本原文引用在接纳或重启后漂移")
+            require(second_input["content"] != LONG_INPUT, "长文本未从命令传输中资源化")
+            segments: list[str] = []
+            cursor: int | None = None
+            while True:
+                query = {"workspaceId": reference["workspaceId"], "logicalPath": reference["logicalPath"]}
+                if cursor is not None:
+                    query["startByte"] = cursor
+                page = api_json(daemon_two.base_url,
+                    f"/api/conversation/sessions/{urllib.parse.quote(session_id, safe='')}/resources/read",
+                    token=daemon_two.token, method="POST", body=query)
+                require(len(page["content"].encode("utf-8")) <= 262144, "资源读取超过单次字节预算")
+                segments.append(page["content"])
+                next_byte = page.get("nextByte")
+                if next_byte is None:
+                    break
+                require(next_byte > (cursor or 0), "资源续读游标没有前进")
+                cursor = next_byte
+            require(len(segments) > 1 and "".join(segments) == LONG_INPUT, "分页读取未完整保留 Unicode 原文")
             assert_provider_count_stable(provider, 4)
             assert_shells_read_projection(daemon_two, session_id, final_revision)
             attachment_root = config_root / "runtime" / "agent-runtime" / "attachments"
@@ -1507,7 +1564,7 @@ def main() -> None:
             print(
                 "[local-agent-e2e] PASS "
                 "basic-loop/sequential-tools/web/first-party-plugin/pdf-binding/cache/release/restart/"
-                "filesystem-reference/shared-projection "
+                "filesystem-reference/long-input/bounded-read/shared-projection "
                 "(CLI chain verification only; not GUI, package, or release acceptance)"
             )
     finally:

@@ -26,13 +26,14 @@ pub use conversation::{
     ContextCompositionPartitionProjection, ContextCompositionProjection, ContextCompositionTool,
     ContextUsageProjection, ConversationError, ConversationResourceReadRequest,
     ConversationResourceReadResult, CreateConversationSessionRequest, EffectPreview,
-    ExecutionPlanStep, FilesystemReference, FilesystemReferencePathInput, InteractionOption,
-    InteractionProjection, NarrativeProjection, PendingPlanProjection, PlanOperation,
-    PlanProjection, PlanRef, PluginCatalogItem, PluginCatalogProjection, PluginSelectionInput,
-    ProjectionMessage, ResolveConversationFilesystemReferencesRequest, RunProjection,
-    SessionDisplayProjection, SessionProjection, SessionTimelineItem, TodoItem, TodoListProjection,
-    TokenUsageProjection, TokenUsageRoundProjection, WorkspaceBindingDisplay,
-    CONVERSATION_COMMAND_VERSION, SESSION_PROJECTION_VERSION,
+    ExecutionPlanStep, FileChangeContent, FilesystemReference, FilesystemReferencePathInput,
+    InteractionOption, InteractionProjection, NarrativeProjection, PendingPlanProjection,
+    PlanOperation, PlanPreviewProjection, PlanProjection, PlanRef, PluginCatalogItem,
+    PluginCatalogProjection, PluginSelectionInput, ProjectionMessage,
+    ResolveConversationFilesystemReferencesRequest, RunProjection, SessionDisplayProjection,
+    SessionProjection, SessionTimelineItem, TodoItem, TodoListProjection, TokenUsageProjection,
+    TokenUsageRoundProjection, WorkspaceBindingDisplay, CONVERSATION_COMMAND_VERSION,
+    SESSION_PROJECTION_VERSION,
 };
 
 #[derive(Debug, Error)]
@@ -232,10 +233,54 @@ impl HttpKernelClient {
         session_id: &str,
         command: &Value,
     ) -> KernelClientResult<CommandReply> {
+        let mut command = command.clone();
+        let field = match command["type"].as_str() {
+            Some("message.submit") => Some("text"),
+            Some("context.focus") => Some("task"),
+            _ => None,
+        };
+        if let Some(field) = field {
+            if command
+                .get("filesystemReferences")
+                .is_some_and(|value| !value.is_array())
+            {
+                return Err(KernelClientError::Api(
+                    "filesystemReferences 必须是数组。".into(),
+                ));
+            }
+            if let Some(text) = command[field]
+                .as_str()
+                .filter(|text| text.len() > 32 * 1024)
+            {
+                let id = command["commandId"]
+                    .as_str()
+                    .ok_or_else(|| KernelClientError::Api("command_identity_missing".into()))?;
+                let value = self
+                    .http
+                    .post(self.url(&format!(
+                        "/api/conversation/sessions/{session_id}/input-resources/{id}"
+                    )))
+                    .header("Content-Type", "text/plain; charset=utf-8")
+                    .body(text.to_string())
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json::<Value>()
+                    .await?;
+                let saved: Value = decode_api_data(value)?;
+                command[field] = saved["text"].clone();
+                let mut references = command["filesystemReferences"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                references.push(saved["reference"].clone());
+                command["filesystemReferences"] = serde_json::json!(references);
+            }
+        }
         let value = self
             .http
             .post(self.url(&format!("/api/conversation/sessions/{session_id}/commands")))
-            .json(command)
+            .json(&command)
             .send()
             .await?
             .error_for_status()?
@@ -279,21 +324,79 @@ impl HttpKernelClient {
         decode_projection(value)
     }
 
+    pub async fn conversation_change_read(
+        &self,
+        session_id: &str,
+        record_id: &str,
+        index: usize,
+    ) -> KernelClientResult<FileChangeContent> {
+        let value = self
+            .http
+            .post(self.url(&format!(
+                "/api/conversation/sessions/{session_id}/changes/read"
+            )))
+            .json(&serde_json::json!({ "recordId": record_id, "index": index }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        decode_api_data(value)
+    }
+
+    pub async fn stop_host(&self) -> KernelClientResult<deepcode_kernel_abi::HostShutdownReceipt> {
+        let value = self
+            .http
+            .get(self.url("/api/host/identity"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        let identity: deepcode_kernel_abi::HostProcessIdentity = decode_api_data(value)?;
+        let value = self
+            .http
+            .post(self.url("/api/host/shutdown"))
+            .json(&deepcode_kernel_abi::HostShutdownRequest {
+                expected_identity: identity.clone(),
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        let receipt: deepcode_kernel_abi::HostShutdownReceipt = decode_api_data(value)?;
+        if !receipt.confirms_shutdown_of(&identity) {
+            return Err(KernelClientError::Api(
+                "host_shutdown_identity_mismatch".into(),
+            ));
+        }
+        Ok(receipt)
+    }
+
     pub async fn conversation_resource_read(
         &self,
         session_id: &str,
         workspace_id: &str,
         logical_path: &str,
     ) -> KernelClientResult<ConversationResourceReadResult> {
+        self.conversation_resource_read_range(session_id, workspace_id, logical_path, None)
+            .await
+    }
+
+    pub async fn conversation_resource_read_range(
+        &self,
+        session_id: &str,
+        workspace_id: &str,
+        logical_path: &str,
+        start_byte: Option<u64>,
+    ) -> KernelClientResult<ConversationResourceReadResult> {
         let value = self
             .http
             .post(self.url(&format!(
                 "/api/conversation/sessions/{session_id}/resources/read"
             )))
-            .json(&ConversationResourceReadRequest {
-                workspace_id,
-                logical_path,
-            })
+            .json(&serde_json::json!({ "workspaceId": workspace_id, "logicalPath": logical_path, "startByte": start_byte }))
             .send()
             .await?
             .error_for_status()?

@@ -41,7 +41,8 @@ async fn main() {
         return;
     }
     let bootstrap = match KernelBootstrap::connect(
-        KernelBootstrapOptions::new(args.api.clone()).auto_start(!args.no_auto_start_kernel),
+        KernelBootstrapOptions::new(args.api.clone())
+            .auto_start(!args.no_auto_start_kernel && !matches!(args.command, Command::StopHost)),
     )
     .await
     {
@@ -71,6 +72,11 @@ async fn main() {
 enum Command {
     Help,
     Status,
+    StopHost,
+    Diff {
+        record_id: String,
+        index: usize,
+    },
     Ask(String),
     Chat,
     Show,
@@ -90,6 +96,7 @@ enum Command {
     OpenResource {
         workspace_id: String,
         logical_path: String,
+        start_byte: Option<u64>,
     },
 }
 
@@ -134,7 +141,7 @@ impl Args {
                     index += 1;
                     session_id = Some(required_arg(&values, index, "--session")?.to_string());
                 }
-                "--view" | "--record" | "--request" | "--before" | "--limit" => {
+                "--view" | "--record" | "--request" | "--before" | "--limit" | "--offset" => {
                     let option = values[index].clone();
                     index += 1;
                     let value = required_arg(&values, index, &option)?;
@@ -143,13 +150,14 @@ impl Args {
                         "--record" => "recordId",
                         "--request" => "providerRequestId",
                         "--before" => "before",
+                        "--offset" => "offset",
                         _ => "limit",
                     };
-                    let value = if matches!(field, "before" | "limit") {
+                    let value = if matches!(field, "before" | "limit" | "offset") {
                         let number = value
                             .parse::<u64>()
                             .map_err(|_| format!("{option} 需要正整数。"))?;
-                        if number == 0
+                        if (number == 0 && field != "offset")
                             || (field == "limit" && number > 50)
                             || number > 9_007_199_254_740_991
                         {
@@ -189,11 +197,18 @@ impl Args {
             None => Command::Chat,
             Some("help") => Command::Help,
             Some("status") => Command::Status,
+            Some("stop-host") if positional.len() == 1 => Command::StopHost,
+            Some("diff") if positional.len() == 3 => Command::Diff {
+                record_id: positional[1].clone(),
+                index: positional[2]
+                    .parse()
+                    .map_err(|_| "diff index must be a nonnegative integer")?,
+            },
             Some("chat") => Command::Chat,
             Some("show") => Command::Show,
             Some("read") => {
                 if positional.len() != 1 || session_id.is_none() {
-                    return Err("用法：read --session <id> [--view summary|messages|tools|plans|context] [--before <sequence>] [--limit 1..50]".into());
+                    return Err("用法：read --session <id> [--view summary|messages|tools|plans|context|reasoning] [--before <sequence>] [--limit 1..50]".into());
                 }
                 Command::Read {
                     query: Value::Object(read_query.clone()),
@@ -237,7 +252,7 @@ impl Args {
                 }
             }
             Some("open-resource") => {
-                if positional.len() != 3 {
+                if positional.len() != 3 && positional.len() != 4 {
                     return Err(
                         "用法：open-resource --session <id> <workspace-id> <logical-path>"
                             .to_string(),
@@ -246,6 +261,10 @@ impl Args {
                 Command::OpenResource {
                     workspace_id: positional[1].clone(),
                     logical_path: positional[2].clone(),
+                    start_byte: positional
+                        .get(3)
+                        .map(|value| value.parse::<u64>().map_err(|_| "invalid startByte"))
+                        .transpose()?,
                 }
             }
             Some(other) => return Err(format!("未知命令：{other}")),
@@ -393,6 +412,23 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
     }
     match args.command {
         Command::Help => Ok(Outcome::Done),
+        Command::StopHost => {
+            client
+                .stop_host()
+                .await
+                .map_err(|error| error.to_string())?;
+            println!("共享 Host 已接纳停止请求。");
+            Ok(Outcome::Done)
+        }
+        Command::Diff { record_id, index } => {
+            let session_id = require_session(args.session_id.as_deref())?;
+            let change = client
+                .conversation_change_read(session_id, &record_id, index)
+                .await
+                .map_err(|error| error.to_string())?;
+            print!("{}", change.unified_diff());
+            Ok(Outcome::Done)
+        }
         Command::Status => {
             let status = client
                 .daemon_status()
@@ -537,12 +573,21 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
         Command::OpenResource {
             workspace_id,
             logical_path,
+            start_byte,
         } => {
             let session_id = require_session(args.session_id.as_deref())?;
             let resource = client
-                .conversation_resource_read(session_id, &workspace_id, &logical_path)
+                .conversation_resource_read_range(
+                    session_id,
+                    &workspace_id,
+                    &logical_path,
+                    start_byte,
+                )
                 .await
                 .map_err(|error| error.to_string())?;
+            if let Some(next) = resource.next_byte {
+                eprintln!("部分内容；续读：deepcode-cli open-resource --session {session_id} {workspace_id} {logical_path:?} {next}");
+            }
             print!("{}", resource.content);
             if !resource.content.ends_with('\n') {
                 println!();
@@ -618,6 +663,7 @@ fn contextual_input_command(
     filesystem_references: &[FilesystemReference],
     plugin_binding: Option<&PluginBinding>,
 ) -> Result<serde_json::Value, String> {
+    let original_text = text;
     let text = text.trim();
     if text.is_empty() {
         return Err("输入不能为空。".to_string());
@@ -695,7 +741,7 @@ fn contextual_input_command(
     Ok(message_command_with_profile_and_plugins(
         &projection.session_id,
         &new_id("command"),
-        text,
+        original_text,
         profile_id,
         filesystem_references,
         &plugins.catalog_revision,
@@ -798,6 +844,25 @@ async fn wait_for_projection(
         }
         if !plain {
             if let Some(draft) = projection.assistant_draft.as_ref() {
+                if let Some(preview) = draft.plan_preview.as_ref() {
+                    let key = format!(
+                        "plan-preview:{}:{}",
+                        draft.turn_id, preview.provider_call_id
+                    );
+                    let status = format!(
+                        "正在生成计划 · {} · {} 个步骤",
+                        preview.title,
+                        preview.steps.len()
+                    );
+                    if live_text.get(&key) != Some(&status) {
+                        if live_open {
+                            eprintln!();
+                            live_open = false;
+                        }
+                        eprintln!("{status}");
+                        live_text.insert(key, status);
+                    }
+                }
                 for block in &draft.blocks {
                     let Some((stream_id, content)) = block.text() else {
                         continue;
@@ -1021,7 +1086,7 @@ async fn run_chat(
                 let outcome = submit_input_and_wait(
                     client,
                     &projection,
-                    text,
+                    line.trim_end_matches(['\r', '\n']),
                     next_message_profile_id.as_deref(),
                     &[],
                     plugin_binding.as_ref(),
@@ -1131,44 +1196,63 @@ fn render_increment_except(
     after_sequence: u64,
     mut streamed_text: Option<&mut HashMap<String, String>>,
 ) {
-    for item in timeline_items(projection)
+    let items = timeline_items(projection);
+    let last_by_run: HashMap<_, _> = items
+        .iter()
+        .filter_map(|item| item.run_id().map(|run| (run.to_string(), item.sequence())))
+        .collect();
+    for item in items
         .into_iter()
         .filter(|item| item.sequence() > after_sequence)
     {
+        let last_run = item
+            .run_id()
+            .filter(|run| last_by_run.get(*run) == Some(&item.sequence()))
+            .map(str::to_string);
         match item {
             TimelineItem::Message {
                 value: message,
                 stream_id,
                 ..
             } => {
-                if render_stream_remainder(
+                if !render_stream_remainder(
                     &message.content,
                     stream_id,
                     streamed_text.as_deref_mut(),
                 ) {
-                    continue;
+                    println!("{}: {}", message.role, message.content);
+                    render_attachments(message);
                 }
-                println!("{}: {}", message.role, message.content);
-                render_attachments(message);
             }
             TimelineItem::Narrative {
                 value: narrative,
                 stream_id,
                 ..
             } => {
-                if render_stream_remainder(
+                if !render_stream_remainder(
                     &narrative.content,
                     Some(stream_id),
                     streamed_text.as_deref_mut(),
                 ) {
-                    continue;
+                    println!("{}", narrative.content);
                 }
-                println!("{}", narrative.content);
             }
             TimelineItem::Plan { value: plan, .. } => render_timeline_plan(plan),
             TimelineItem::ToolGroup { activities, .. } => {
                 for activity in activities {
                     render_tool_activity(projection, activity);
+                }
+            }
+        }
+        if let Some(run_id) = last_run {
+            let changes = projection.file_changes_for_run(&run_id);
+            if !changes.is_empty() {
+                println!("本轮修改 · {run_id}");
+                for (record, index, change) in changes {
+                    println!(
+                        "  {} {} · deepcode-cli diff --session {} {} {}",
+                        change.kind, change.path, projection.session_id, record, index
+                    );
                 }
             }
         }
@@ -1235,6 +1319,14 @@ fn render_tool_activity(projection: &SessionProjection, activity: &ActivityProje
                 );
                 print_tool_stream("stdout", &result.stdout);
                 print_tool_stream("stderr", &result.stderr);
+            }
+        }
+        for (index, change) in tool.file_changes.iter().enumerate() {
+            if let Some(record) = &tool.record_id {
+                println!(
+                    "  {} {} -> deepcode-cli diff --session {} {} {}",
+                    change.kind, change.path, projection.session_id, record, index
+                );
             }
         }
         for resource in &tool.resources {
@@ -1433,6 +1525,17 @@ enum TimelineItem<'a> {
 }
 
 impl TimelineItem<'_> {
+    fn run_id(&self) -> Option<&str> {
+        match self {
+            Self::Message { value, .. } => value.run_id.as_deref(),
+            Self::Narrative { value, .. } => Some(&value.run_id),
+            Self::Plan { value, .. } => Some(&value.run_id),
+            Self::ToolGroup { activities, .. } => {
+                activities.first().map(|activity| activity.run_id.as_str())
+            }
+        }
+    }
+
     fn sequence(&self) -> u64 {
         match self {
             Self::Message { sequence, .. }
@@ -1581,12 +1684,14 @@ fn print_help() {
   deepcode-cli ask [-C <workspace>] [--session <id>] [--file <path>]... [--directory <path>]... [--plugin <plugin://uri>]... [--plain] <message-or-response>
   deepcode-cli chat [-C <workspace>] [--session <id>] [--plugin <plugin://uri>]...
   deepcode-cli show --session <id>
-  deepcode-cli read --session <id> [--view summary|messages|tools|plans|context] [--before <sequence>] [--limit 1..50] [--record <id>] [--request <id>]
+  deepcode-cli read --session <id> [--view summary|messages|tools|plans|context|reasoning] [--before <sequence>] [--limit 1..50] [--record <id>] [--request <id>]
   deepcode-cli cancel-plan --session <id>
   deepcode-cli cancel --session <id> <run-id>
   deepcode-cli attach-directory --session <id> <path>
   deepcode-cli detach-directory --session <id> <workspace-id>
   deepcode-cli open-resource --session <id> <workspace-id> <logical-path>
+  deepcode-cli diff --session <id> <record-id> <file-index>
+  deepcode-cli stop-host
   deepcode-cli status
 
 只有显式 -C/--workspace 会为新 Session 创建 creation binding；已有 Session 通过 attach-directory/detach-directory 管理对话目录索引。
@@ -1673,6 +1778,7 @@ mod tests {
             Command::OpenResource {
                 workspace_id: "workspace:test".to_string(),
                 logical_path: "docs/设计 说明.md".to_string(),
+                start_byte: None,
             }
         );
     }

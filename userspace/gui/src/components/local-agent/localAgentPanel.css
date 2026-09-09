@@ -142,6 +142,7 @@
   min-height: 0;
   overflow: auto;
   scrollbar-gutter: stable;
+  overflow-anchor: none;
 }
 
 .local-agent__transcript {
@@ -302,12 +303,14 @@
   gap: 2px;
   margin-top: 5px;
   opacity: 0;
+  pointer-events: none;
   transition: opacity 120ms ease;
 }
 
 .local-agent__message--assistant:hover .local-agent__message-actions,
 .local-agent__message-actions:focus-within {
   opacity: 1;
+  pointer-events: auto;
 }
 
 .local-agent .local-agent__message-actions button {
@@ -359,54 +362,6 @@
 
 .local-agent__message--draft * {
   caret-color: transparent;
-}
-
-.local-agent__reasoning-draft {
-  margin: 2px 0 14px;
-  color: var(--dc-faint);
-  font-size: var(--dc-font-caption);
-}
-
-.local-agent__reasoning-draft > summary {
-  display: inline-flex;
-  min-height: 28px;
-  align-items: center;
-  gap: 7px;
-  padding: 2px 4px 2px 0;
-  color: var(--dc-faint);
-  cursor: pointer;
-  list-style: none;
-  user-select: none;
-}
-
-.local-agent__reasoning-draft > summary::-webkit-details-marker {
-  display: none;
-}
-
-.local-agent__reasoning-draft > summary > svg {
-  width: 14px;
-  height: 14px;
-  transition: transform 140ms ease;
-}
-
-.local-agent__reasoning-draft[open] > summary > svg {
-  transform: rotate(180deg);
-}
-
-.local-agent__reasoning-draft-content {
-  margin-top: 5px;
-  padding-left: 20px;
-  color: var(--dc-faint);
-  font-size: var(--dc-font-body);
-  font-style: italic;
-}
-
-.local-agent__reasoning-draft-content > :first-child {
-  margin-top: 0;
-}
-
-.local-agent__reasoning-draft-content > :last-child {
-  margin-bottom: 0;
 }
 
 .local-agent__provider-stage {
@@ -642,12 +597,6 @@
   white-space: nowrap;
 }
 
-.local-agent__tool-group-summary[aria-expanded='true'] > strong {
-  overflow: visible;
-  overflow-wrap: anywhere;
-  white-space: normal;
-}
-
 .local-agent__tool-group-summary > span:nth-last-child(2) {
   flex: 0 0 auto;
   color: var(--dc-faint);
@@ -672,6 +621,10 @@
 .local-agent__tool-group-items {
   display: grid;
   padding: 0 0 3px 18px;
+  max-height: min(360px, 45vh);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  overscroll-behavior: contain;
 }
 
 .local-agent__tool-entry {

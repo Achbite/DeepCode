@@ -96,6 +96,7 @@ interface SettingsActions {
 type SettingsStore = SettingsStateData & SettingsActions;
 
 const SETTING_DEFINITION_SCHEMAS: SettingDefinitionSchema[] = [
+  { key: 'gui.showReasoning', group: 'gui', control: 'boolean' },
   {
     key: 'workbench.language',
     group: 'workbench',

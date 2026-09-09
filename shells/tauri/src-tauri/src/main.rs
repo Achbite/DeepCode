@@ -43,7 +43,8 @@ struct HostProcessGroup {
 }
 
 struct OwnedHostChildren {
-    daemon: OwnedHostProcess,
+    daemon: Option<OwnedHostProcess>,
+    start_guard: Option<deepcode_host_connection::HostStartGuard>,
     proxy: OwnedHostProcess,
     daemon_host: String,
     daemon_port: String,
@@ -71,42 +72,47 @@ impl HostProcessGroup {
         }
     }
 
-    fn replace(&self, children: Option<OwnedHostChildren>) {
+    fn replace(&self, mut children: Option<OwnedHostChildren>) {
         if let Ok(mut current) = self.children.lock() {
             if let Some(mut processes) = current.take() {
                 processes.shutdown();
+            }
+            if let Some(children) = children.as_mut() {
+                children.share_ready_daemon();
             }
             *current = children;
         }
     }
 
-    fn terminate(&self) {
+    fn detach(&self) {
         if let Ok(mut children) = self.children.lock() {
-            if let Some(mut processes) = children.take() {
-                processes.shutdown();
-            }
+            drop(children.take());
         }
     }
 }
 
 impl OwnedHostChildren {
+    fn share_ready_daemon(&mut self) {
+        // Authenticated startup succeeded. From here the service outlives shells.
+        drop(self.daemon.take());
+        drop(self.start_guard.take());
+    }
+
     fn shutdown(&mut self) {
         terminate_owned_process_tree(&mut self.proxy);
-        let requested = request_daemon_shutdown(
+        shutdown_daemon_process(
+            &mut self.daemon,
             &self.daemon_host,
             &self.daemon_port,
             &self.daemon_token,
             &self.daemon_identity,
         );
-        if !requested || !wait_for_child_exit(&mut self.daemon, 80) {
-            terminate_owned_process_tree(&mut self.daemon);
-        }
     }
 }
 
 impl Drop for HostProcessGroup {
     fn drop(&mut self) {
-        self.terminate();
+        self.detach();
     }
 }
 
@@ -138,7 +144,7 @@ fn main() {
         })
         .on_window_event(|window, event| match event {
             WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed => {
-                window.state::<HostProcessGroup>().terminate();
+                window.state::<HostProcessGroup>().detach();
                 window.app_handle().exit(0);
             }
             _ => {}
@@ -148,7 +154,7 @@ fn main() {
 
     app.run(|app_handle, event| match event {
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
-            app_handle.state::<HostProcessGroup>().terminate();
+            app_handle.state::<HostProcessGroup>().detach();
         }
         _ => {}
     });
@@ -570,53 +576,89 @@ fn spawn_host_processes_if_available(
         .map(PathBuf::from)
         .unwrap_or_else(|| package_root(&exe_dir).unwrap_or_else(|| daemon_dir.clone()));
 
+    let shared_start_guard = deepcode_host_connection::HostStartGuard::acquire(&config_root)
+        .inspect_err(|error| eprintln!("host_connection_start_failed: {error}"))
+        .ok()?;
+    let config_root = config_root
+        .canonicalize()
+        .inspect_err(|error| eprintln!("host_config_root_invalid: {error}"))
+        .ok()?;
+    let shared = deepcode_host_connection::LocalHostConnection::discover(&config_root)
+        .inspect_err(|error| eprintln!("host_connection_discovery_failed: {error}"))
+        .ok()?;
+    let proxy_host = target.host.clone();
+    let mut target = target.clone();
+    let mut host_tokens = host_tokens.clone();
+    if let Some(connection) = shared.as_ref() {
+        let address = connection.address().expect("validated Host address");
+        target.host = address.ip().to_string();
+        target.daemon_port = address.port().to_string();
+        host_tokens.daemon = connection.shell_token().to_string();
+        host_tokens.instance_id = connection.identity.instance_id.clone();
+    }
+
     let web_dir = std::env::var("DEEPCODE_CLIENT_DIST")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             find_bundled_dir(&exe_dir, "web").unwrap_or_else(|| proxy_dir.join("web"))
         });
 
-    let mut daemon_command = Command::new(daemon_path);
-    daemon_command
-        .current_dir(&daemon_dir)
-        .env("DEEPCODE_HOST", &target.host)
-        .env("DEEPCODE_PORT", &target.daemon_port)
-        .env("DEEPCODE_CONFIG_DIR", config_root)
-        .env_remove(HOST_UI_TOKEN_ENV)
-        .env(HOST_SHELL_TOKEN_ENV, host_tokens.daemon_token())
-        .env(HOST_INSTANCE_ID_ENV, host_tokens.instance_id())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    let (mut daemon, daemon_identity) = if let Some(connection) = shared {
+        if !authenticated_health_ready(
+            &target.host,
+            &target.daemon_port,
+            HOST_SHELL_TOKEN_HEADER,
+            host_tokens.daemon_token(),
+        ) {
+            eprintln!("host_connection_health_failed: shared Host is not ready");
+            return None;
+        }
+        (None, connection.identity)
+    } else {
+        let mut daemon_command = Command::new(daemon_path);
+        daemon_command
+            .current_dir(&daemon_dir)
+            .env("DEEPCODE_HOST", &target.host)
+            .env("DEEPCODE_PORT", &target.daemon_port)
+            .env("DEEPCODE_CONFIG_DIR", config_root)
+            .env_remove(HOST_UI_TOKEN_ENV)
+            .env(HOST_SHELL_TOKEN_ENV, host_tokens.daemon_token())
+            .env(HOST_INSTANCE_ID_ENV, host_tokens.instance_id())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
 
-    let mut daemon = spawn_owned_host_process(&mut daemon_command).ok()?;
-    let Some(daemon_identity) = wait_for_public_identity(
-        &mut daemon,
-        &target.host,
-        &target.daemon_port,
-        KERNEL_DAEMON_SERVICE,
-        host_tokens.instance_id(),
-        40,
-    ) else {
-        terminate_owned_process_tree(&mut daemon);
-        return None;
+        let mut daemon = spawn_owned_host_process(&mut daemon_command).ok()?;
+        let Some(daemon_identity) = wait_for_public_identity(
+            &mut daemon,
+            &target.host,
+            &target.daemon_port,
+            KERNEL_DAEMON_SERVICE,
+            host_tokens.instance_id(),
+            40,
+        ) else {
+            terminate_owned_process_tree(&mut daemon);
+            return None;
+        };
+        if !wait_for_authenticated_health(
+            &mut daemon,
+            &target.host,
+            &target.daemon_port,
+            HOST_SHELL_TOKEN_HEADER,
+            host_tokens.daemon_token(),
+            40,
+        ) {
+            terminate_owned_process_tree(&mut daemon);
+            return None;
+        }
+
+        (Some(daemon), daemon_identity)
     };
-    if !wait_for_authenticated_health(
-        &mut daemon,
-        &target.host,
-        &target.daemon_port,
-        HOST_SHELL_TOKEN_HEADER,
-        host_tokens.daemon_token(),
-        40,
-    ) {
-        terminate_owned_process_tree(&mut daemon);
-        return None;
-    }
 
     let mut proxy_command = Command::new(proxy_path);
     proxy_command
         .current_dir(&proxy_dir)
-        .env("DEEPCODE_HOST", &target.host)
+        .env("DEEPCODE_HOST", &proxy_host)
         .env("DEEPCODE_PORT", &target.port)
         .env("DEEPCODE_DAEMON_HOST", &target.host)
         .env("DEEPCODE_DAEMON_PORT", &target.daemon_port)
@@ -644,7 +686,7 @@ fn spawn_host_processes_if_available(
     };
     if wait_for_public_identity(
         &mut proxy,
-        &target.host,
+        &proxy_host,
         &target.port,
         "deepcode-host-web",
         host_tokens.instance_id(),
@@ -653,7 +695,7 @@ fn spawn_host_processes_if_available(
     .is_none()
         || !wait_for_authenticated_health(
             &mut proxy,
-            &target.host,
+            &proxy_host,
             &target.port,
             HOST_UI_TOKEN_HEADER,
             host_tokens.ui_token(),
@@ -670,8 +712,27 @@ fn spawn_host_processes_if_available(
         );
         return None;
     }
+    #[cfg(windows)]
+    if let Err(error) = daemon
+        .as_ref()
+        .map(|process| process.job.release_on_close())
+        .unwrap_or(Ok(()))
+        .and_then(|_| proxy.job.release_on_close())
+    {
+        terminate_owned_process_tree(&mut proxy);
+        shutdown_daemon_process(
+            &mut daemon,
+            &target.host,
+            &target.daemon_port,
+            host_tokens.daemon_token(),
+            &daemon_identity,
+        );
+        eprintln!("host_lifetime_transfer_failed: {error}");
+        return None;
+    }
     Some(OwnedHostChildren {
         daemon,
+        start_guard: Some(shared_start_guard),
         proxy,
         daemon_host: target.host.clone(),
         daemon_port: target.daemon_port.clone(),
@@ -891,12 +952,15 @@ fn request_daemon_shutdown(
 }
 
 fn shutdown_daemon_process(
-    process: &mut OwnedHostProcess,
+    process: &mut Option<OwnedHostProcess>,
     host: &str,
     port: &str,
     token: &str,
     expected_identity: &HostProcessIdentity,
 ) {
+    let Some(process) = process.as_mut() else {
+        return;
+    };
     if !request_daemon_shutdown(host, port, token, expected_identity)
         || !wait_for_child_exit(process, 80)
     {
@@ -1017,6 +1081,26 @@ impl WindowsKillOnCloseJob {
         })
     }
 
+    fn release_on_close(&self) -> std::io::Result<()> {
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("Kernel Job Object is closed"))?;
+        let information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle.as_raw_handle() as HANDLE,
+                JobObjectExtendedLimitInformation,
+                (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn assign(&self, child: &Child) -> std::io::Result<()> {
         let Some(handle) = self.handle.as_ref() else {
             return Err(std::io::Error::other("Host Job Object is closed"));
@@ -1031,6 +1115,14 @@ impl WindowsKillOnCloseJob {
     }
 
     fn close(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            unsafe {
+                windows_sys::Win32::System::JobObjects::TerminateJobObject(
+                    handle.as_raw_handle() as HANDLE,
+                    1,
+                );
+            }
+        }
         drop(self.handle.take());
     }
 }

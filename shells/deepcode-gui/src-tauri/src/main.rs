@@ -15,7 +15,6 @@ use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Condvar, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::http::{header, Request, Response, StatusCode};
 use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent};
@@ -56,7 +55,6 @@ struct HostStartupLease<'a> {
 }
 
 const HOST_STARTUP_STATUS_SCHEMA: &str = "deepcode.host-shell.startup-status";
-const HOST_STARTUP_LOG_LIMIT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -165,7 +163,8 @@ impl HostStartupStatusStore {
 }
 
 struct OwnedHostChildren {
-    daemon: OwnedHostProcess,
+    daemon: Option<OwnedHostProcess>,
+    start_guard: Option<deepcode_host_connection::HostStartGuard>,
     proxy: OwnedHostProcess,
     daemon_host: String,
     daemon_port: String,
@@ -175,19 +174,10 @@ struct OwnedHostChildren {
 
 struct OwnedHostProcess {
     child: Child,
-    capture_threads: Vec<JoinHandle<()>>,
     #[cfg(unix)]
     process_group_id: libc::pid_t,
     #[cfg(windows)]
     job: WindowsKillOnCloseJob,
-}
-
-impl OwnedHostProcess {
-    fn join_capture_threads(&mut self) {
-        for handle in self.capture_threads.drain(..) {
-            let _ = handle.join();
-        }
-    }
 }
 
 #[cfg(windows)]
@@ -229,6 +219,10 @@ impl HostProcessGroup {
             if state.shutting_down {
                 None
             } else {
+                candidate
+                    .as_mut()
+                    .expect("candidate is present")
+                    .share_ready_daemon();
                 state
                     .children
                     .replace(candidate.take().expect("candidate is present"))
@@ -256,22 +250,13 @@ impl HostProcessGroup {
         }
     }
 
-    fn shutdown(&self) {
-        let current = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.shutting_down = true;
-            state.children.take()
-        };
-        if let Some(mut processes) = current {
-            processes.shutdown();
-        }
+    fn detach(&self) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.shutting_down = true;
+        drop(state.children.take());
         while state.active_startups > 0 {
             state = self
                 .startup_idle
@@ -303,23 +288,27 @@ impl Drop for HostStartupLease<'_> {
 }
 
 impl OwnedHostChildren {
+    fn share_ready_daemon(&mut self) {
+        // Authenticated startup succeeded. From here the service outlives shells.
+        drop(self.daemon.take());
+        drop(self.start_guard.take());
+    }
+
     fn shutdown(&mut self) {
         terminate_owned_process_tree(&mut self.proxy);
-        let requested = request_daemon_shutdown(
+        shutdown_daemon_process(
+            &mut self.daemon,
             &self.daemon_host,
             &self.daemon_port,
             &self.daemon_token,
             &self.daemon_identity,
         );
-        if !requested || !wait_for_child_exit(&mut self.daemon, 80) {
-            terminate_owned_process_tree(&mut self.daemon);
-        }
     }
 }
 
 impl Drop for HostProcessGroup {
     fn drop(&mut self) {
-        self.shutdown();
+        self.detach();
     }
 }
 
@@ -372,7 +361,7 @@ fn main() {
         })
         .on_window_event(|window, event| match event {
             WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed => {
-                window.state::<HostProcessGroup>().shutdown();
+                window.state::<HostProcessGroup>().detach();
                 window.app_handle().exit(0);
             }
             _ => {}
@@ -382,7 +371,7 @@ fn main() {
 
     app.run(|app_handle, event| match event {
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
-            app_handle.state::<HostProcessGroup>().shutdown();
+            app_handle.state::<HostProcessGroup>().detach();
         }
         _ => {}
     });
@@ -1028,6 +1017,46 @@ fn spawn_host_processes_if_available(
         .map(PathBuf::from)
         .unwrap_or_else(|| package_root(&exe_dir).unwrap_or_else(|| daemon_dir.clone()));
 
+    let shared_start_guard = deepcode_host_connection::HostStartGuard::acquire(&config_root)
+        .map_err(|error| {
+            startup_failure(
+                "sharedHost",
+                "host_connection_start_failed",
+                None,
+                error.to_string(),
+                true,
+            )
+        })?;
+    let config_root = config_root.canonicalize().map_err(|error| {
+        startup_failure(
+            "sharedHost",
+            "host_config_root_invalid",
+            None,
+            error.to_string(),
+            false,
+        )
+    })?;
+    let shared =
+        deepcode_host_connection::LocalHostConnection::discover(&config_root).map_err(|error| {
+            startup_failure(
+                "sharedHost",
+                "host_connection_discovery_failed",
+                None,
+                error.to_string(),
+                true,
+            )
+        })?;
+    let proxy_host = target.host.clone();
+    let mut target = target.clone();
+    let mut host_tokens = host_tokens.clone();
+    if let Some(connection) = shared.as_ref() {
+        let address = connection.address().expect("validated Host address");
+        target.host = address.ip().to_string();
+        target.daemon_port = address.port().to_string();
+        host_tokens.daemon = connection.shell_token().to_string();
+        host_tokens.instance_id = connection.identity.instance_id.clone();
+    }
+
     let web_dir = std::env::var("DEEPCODE_CLIENT_DIST")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -1035,111 +1064,135 @@ fn spawn_host_processes_if_available(
                 .unwrap_or_else(|| proxy_dir.join("web-deepcode-gui"))
         });
 
-    status.update(
-        attempt_id,
-        "starting",
-        "daemonSpawn",
-        "host_startup_spawning_daemon",
-        None,
-        "Starting the Kernel daemon.",
-        true,
-        false,
-        diagnostic.map(|value| value.reference.clone()),
-    );
-    if processes.is_shutting_down() {
-        return Err(startup_stopped_failure());
-    }
-    let mut daemon_command = Command::new(daemon_path);
-    daemon_command
-        .current_dir(&daemon_dir)
-        .env("DEEPCODE_HOST", &target.host)
-        .env("DEEPCODE_PORT", &target.daemon_port)
-        .env("DEEPCODE_CONFIG_DIR", config_root)
-        .env_remove(HOST_UI_TOKEN_ENV)
-        .env(HOST_SHELL_TOKEN_ENV, host_tokens.daemon_token())
-        .env(HOST_INSTANCE_ID_ENV, host_tokens.instance_id())
-        .stdin(Stdio::null());
-    configure_process_capture(&mut daemon_command, diagnostic.is_some());
-
-    let mut daemon = spawn_owned_host_process(&mut daemon_command).map_err(|error| {
-        startup_failure(
-            "daemonSpawn",
-            "host_startup_daemon_spawn_failed",
-            None,
-            format!("The Kernel daemon could not be started: {error}"),
-            true,
-        )
-    })?;
-    if let Some(diagnostic) = diagnostic {
-        if let Err(error) = attach_process_capture(&mut daemon, &diagnostic.directory, "daemon") {
-            terminate_owned_process_tree(&mut daemon);
+    let (mut daemon, daemon_identity) = if let Some(connection) = shared {
+        if !matches!(
+            authenticated_health_status(
+                &target.host,
+                &target.daemon_port,
+                HOST_SHELL_TOKEN_HEADER,
+                host_tokens.daemon_token()
+            ),
+            AuthenticatedHealthStatus::Ready
+        ) {
             return Err(startup_failure(
-                "daemonSpawn",
-                "host_startup_daemon_log_capture_failed",
+                "sharedHost",
+                "host_connection_health_failed",
                 None,
-                format!("The Kernel daemon diagnostic stream could not be captured: {error}"),
+                "The shared Host did not pass authenticated health.",
                 true,
             ));
         }
-    }
-    status.update(
-        attempt_id,
-        "starting",
-        "daemonIdentity",
-        "host_startup_waiting_daemon_identity",
-        None,
-        "Waiting for the Kernel daemon identity.",
-        true,
-        true,
-        diagnostic.map(|value| value.reference.clone()),
-    );
-    let Some(daemon_identity) = wait_for_public_identity(
-        &mut daemon,
-        &target.host,
-        &target.daemon_port,
-        KERNEL_DAEMON_SERVICE,
-        host_tokens.instance_id(),
-        processes,
-        40,
-    ) else {
-        terminate_owned_process_tree(&mut daemon);
-        return Err(startup_failure(
-            "daemonIdentity",
-            "host_startup_daemon_identity_failed",
+        (None, connection.identity)
+    } else {
+        status.update(
+            attempt_id,
+            "starting",
+            "daemonSpawn",
+            "host_startup_spawning_daemon",
             None,
-            "The Kernel daemon did not publish the expected process identity.",
+            "Starting the Kernel daemon.",
             true,
-        ));
-    };
-    status.update(
-        attempt_id,
-        "starting",
-        "daemonRecovery",
-        "host_startup_waiting_daemon_recovery",
-        None,
-        "Waiting for Kernel and Session recovery.",
-        true,
-        true,
-        diagnostic.map(|value| value.reference.clone()),
-    );
-    if let Err(failure) = wait_for_authenticated_health(
-        &mut daemon,
-        &target.host,
-        &target.daemon_port,
-        HOST_SHELL_TOKEN_HEADER,
-        host_tokens.daemon_token(),
-        processes,
-        400,
-    ) {
-        terminate_owned_process_tree(&mut daemon);
-        return Err(startup_failure(
+            false,
+            diagnostic.map(|value| value.reference.clone()),
+        );
+        if processes.is_shutting_down() {
+            return Err(startup_stopped_failure());
+        }
+        let mut daemon_command = Command::new(daemon_path);
+        daemon_command
+            .current_dir(&daemon_dir)
+            .env("DEEPCODE_HOST", &target.host)
+            .env("DEEPCODE_PORT", &target.daemon_port)
+            .env("DEEPCODE_CONFIG_DIR", config_root)
+            .env_remove(HOST_UI_TOKEN_ENV)
+            .env(HOST_SHELL_TOKEN_ENV, host_tokens.daemon_token())
+            .env(HOST_INSTANCE_ID_ENV, host_tokens.instance_id())
+            .stdin(Stdio::null());
+        if let Err(error) = configure_process_capture(
+            &mut daemon_command,
+            diagnostic.map(|value| value.directory.as_path()),
+            "daemon",
+        ) {
+            return Err(startup_failure(
+                "daemonSpawn",
+                "host_startup_log_capture_failed",
+                None,
+                error.to_string(),
+                true,
+            ));
+        }
+
+        let mut daemon = spawn_owned_host_process(&mut daemon_command).map_err(|error| {
+            startup_failure(
+                "daemonSpawn",
+                "host_startup_daemon_spawn_failed",
+                None,
+                format!("The Kernel daemon could not be started: {error}"),
+                true,
+            )
+        })?;
+
+        status.update(
+            attempt_id,
+            "starting",
+            "daemonIdentity",
+            "host_startup_waiting_daemon_identity",
+            None,
+            "Waiting for the Kernel daemon identity.",
+            true,
+            true,
+            diagnostic.map(|value| value.reference.clone()),
+        );
+        let Some(daemon_identity) = wait_for_public_identity(
+            &mut daemon,
+            &target.host,
+            &target.daemon_port,
+            KERNEL_DAEMON_SERVICE,
+            host_tokens.instance_id(),
+            processes,
+            40,
+        ) else {
+            terminate_owned_process_tree(&mut daemon);
+            return Err(startup_failure(
+                "daemonIdentity",
+                "host_startup_daemon_identity_failed",
+                None,
+                "The Kernel daemon did not publish the expected process identity.",
+                true,
+            ));
+        };
+        status.update(
+            attempt_id,
+            "starting",
             "daemonRecovery",
-            failure.code,
-            failure.reason_code,
-            failure.message,
-            failure.retryable,
-        ));
-    }
+            "host_startup_waiting_daemon_recovery",
+            None,
+            "Waiting for Kernel and Session recovery.",
+            true,
+            true,
+            diagnostic.map(|value| value.reference.clone()),
+        );
+        if let Err(failure) = wait_for_authenticated_health(
+            &mut daemon,
+            &target.host,
+            &target.daemon_port,
+            HOST_SHELL_TOKEN_HEADER,
+            host_tokens.daemon_token(),
+            processes,
+            400,
+        ) {
+            terminate_owned_process_tree(&mut daemon);
+            return Err(startup_failure(
+                "daemonRecovery",
+                failure.code,
+                failure.reason_code,
+                failure.message,
+                failure.retryable,
+            ));
+        }
+
+        (Some(daemon), daemon_identity)
+    };
 
     status.update(
         attempt_id,
@@ -1165,7 +1218,7 @@ fn spawn_host_processes_if_available(
     let mut proxy_command = Command::new(proxy_path);
     proxy_command
         .current_dir(&proxy_dir)
-        .env("DEEPCODE_HOST", &target.host)
+        .env("DEEPCODE_HOST", &proxy_host)
         .env("DEEPCODE_PORT", &target.port)
         .env("DEEPCODE_DAEMON_HOST", &target.host)
         .env("DEEPCODE_DAEMON_PORT", &target.daemon_port)
@@ -1175,7 +1228,26 @@ fn spawn_host_processes_if_available(
         .env(HOST_SHELL_TOKEN_ENV, host_tokens.daemon_token())
         .env(HOST_INSTANCE_ID_ENV, host_tokens.instance_id())
         .stdin(Stdio::null());
-    configure_process_capture(&mut proxy_command, diagnostic.is_some());
+    if let Err(error) = configure_process_capture(
+        &mut proxy_command,
+        diagnostic.map(|value| value.directory.as_path()),
+        "proxy",
+    ) {
+        shutdown_daemon_process(
+            &mut daemon,
+            &target.host,
+            &target.daemon_port,
+            host_tokens.daemon_token(),
+            &daemon_identity,
+        );
+        return Err(startup_failure(
+            "proxySpawn",
+            "host_startup_log_capture_failed",
+            None,
+            error.to_string(),
+            true,
+        ));
+    }
 
     let mut proxy = match spawn_owned_host_process(&mut proxy_command) {
         Ok(proxy) => proxy,
@@ -1196,25 +1268,7 @@ fn spawn_host_processes_if_available(
             ));
         }
     };
-    if let Some(diagnostic) = diagnostic {
-        if let Err(error) = attach_process_capture(&mut proxy, &diagnostic.directory, "proxy") {
-            terminate_owned_process_tree(&mut proxy);
-            shutdown_daemon_process(
-                &mut daemon,
-                &target.host,
-                &target.daemon_port,
-                host_tokens.daemon_token(),
-                &daemon_identity,
-            );
-            return Err(startup_failure(
-                "proxySpawn",
-                "host_startup_proxy_log_capture_failed",
-                None,
-                format!("The Host UI proxy diagnostic stream could not be captured: {error}"),
-                true,
-            ));
-        }
-    }
+
     status.update(
         attempt_id,
         "starting",
@@ -1228,7 +1282,7 @@ fn spawn_host_processes_if_available(
     );
     if wait_for_public_identity(
         &mut proxy,
-        &target.host,
+        &proxy_host,
         &target.port,
         "deepcode-host-web",
         host_tokens.instance_id(),
@@ -1266,7 +1320,7 @@ fn spawn_host_processes_if_available(
     );
     if let Err(failure) = wait_for_authenticated_health(
         &mut proxy,
-        &target.host,
+        &proxy_host,
         &target.port,
         HOST_UI_TOKEN_HEADER,
         host_tokens.ui_token(),
@@ -1289,8 +1343,32 @@ fn spawn_host_processes_if_available(
             failure.retryable,
         ));
     }
+    #[cfg(windows)]
+    if let Err(error) = daemon
+        .as_ref()
+        .map(|process| process.job.release_on_close())
+        .unwrap_or(Ok(()))
+        .and_then(|_| proxy.job.release_on_close())
+    {
+        terminate_owned_process_tree(&mut proxy);
+        shutdown_daemon_process(
+            &mut daemon,
+            &target.host,
+            &target.daemon_port,
+            host_tokens.daemon_token(),
+            &daemon_identity,
+        );
+        return Err(startup_failure(
+            "sharedHost",
+            "host_lifetime_transfer_failed",
+            None,
+            error.to_string(),
+            true,
+        ));
+    }
     Ok(OwnedHostChildren {
         daemon,
+        start_guard: Some(shared_start_guard),
         proxy,
         daemon_host: target.host.clone(),
         daemon_port: target.daemon_port.clone(),
@@ -1408,39 +1486,22 @@ fn set_private_file_permissions(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn configure_process_capture(command: &mut Command, enabled: bool) {
-    if enabled {
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+fn configure_process_capture(
+    command: &mut Command,
+    directory: Option<&Path>,
+    process_name: &str,
+) -> std::io::Result<()> {
+    if let Some(directory) = directory {
+        command
+            .stdout(Stdio::from(private_log_file(
+                &directory.join(format!("{process_name}.stdout.log")),
+            )?))
+            .stderr(Stdio::from(private_log_file(
+                &directory.join(format!("{process_name}.stderr.log")),
+            )?));
     } else {
         command.stdout(Stdio::null()).stderr(Stdio::null());
     }
-}
-
-fn attach_process_capture(
-    process: &mut OwnedHostProcess,
-    directory: &Path,
-    process_name: &str,
-) -> std::io::Result<()> {
-    let stdout = process
-        .child
-        .stdout
-        .take()
-        .ok_or_else(|| std::io::Error::other("managed Host stdout pipe is unavailable"))?;
-    let stderr = process
-        .child
-        .stderr
-        .take()
-        .ok_or_else(|| std::io::Error::other("managed Host stderr pipe is unavailable"))?;
-    let stdout_path = directory.join(format!("{process_name}.stdout.log"));
-    let stderr_path = directory.join(format!("{process_name}.stderr.log"));
-    let stdout_file = private_log_file(&stdout_path)?;
-    let stderr_file = private_log_file(&stderr_path)?;
-    process.capture_threads.push(std::thread::spawn(move || {
-        drain_bounded_log(stdout, stdout_file);
-    }));
-    process.capture_threads.push(std::thread::spawn(move || {
-        drain_bounded_log(stderr, stderr_file);
-    }));
     Ok(())
 }
 
@@ -1448,32 +1509,6 @@ fn private_log_file(path: &Path) -> std::io::Result<File> {
     let file = OpenOptions::new().create_new(true).write(true).open(path)?;
     set_private_file_permissions(path)?;
     Ok(file)
-}
-
-fn drain_bounded_log<R: Read>(mut source: R, mut destination: File) {
-    let mut remaining = HOST_STARTUP_LOG_LIMIT_BYTES;
-    let mut truncated = false;
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let Ok(read) = source.read(&mut buffer) else {
-            break;
-        };
-        if read == 0 {
-            break;
-        }
-        if remaining > 0 {
-            let writable = usize::try_from(remaining).unwrap_or(usize::MAX).min(read);
-            if destination.write_all(&buffer[..writable]).is_err() {
-                break;
-            }
-            remaining = remaining.saturating_sub(writable as u64);
-        }
-        if remaining == 0 && !truncated {
-            let _ = destination.write_all(b"\n[deepcode host startup log truncated]\n");
-            truncated = true;
-        }
-    }
-    let _ = destination.flush();
 }
 
 struct KernelStartLock {
@@ -1557,7 +1592,6 @@ fn wait_for_authenticated_health(
         }
         match process.child.try_wait() {
             Ok(Some(status)) => {
-                process.join_capture_threads();
                 return Err(startup_failure(
                     "daemonRecovery",
                     "host_startup_process_exited",
@@ -1716,12 +1750,15 @@ fn request_daemon_shutdown(
 }
 
 fn shutdown_daemon_process(
-    process: &mut OwnedHostProcess,
+    process: &mut Option<OwnedHostProcess>,
     host: &str,
     port: &str,
     token: &str,
     expected_identity: &HostProcessIdentity,
 ) {
+    let Some(process) = process.as_mut() else {
+        return;
+    };
     if !request_daemon_shutdown(host, port, token, expected_identity)
         || !wait_for_child_exit(process, 80)
     {
@@ -1733,7 +1770,6 @@ fn wait_for_child_exit(process: &mut OwnedHostProcess, attempts: usize) -> bool 
     for _ in 0..attempts {
         match process.child.try_wait() {
             Ok(Some(_)) => {
-                process.join_capture_threads();
                 return true;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(25)),
@@ -1784,7 +1820,6 @@ fn terminate_owned_process_tree(process: &mut OwnedHostProcess) {
         }
     }
     let _ = process.child.wait();
-    process.join_capture_threads();
 }
 
 fn spawn_owned_host_process(command: &mut Command) -> std::io::Result<OwnedHostProcess> {
@@ -1803,7 +1838,6 @@ fn spawn_owned_host_process(command: &mut Command) -> std::io::Result<OwnedHostP
         }
         return Ok(OwnedHostProcess {
             child,
-            capture_threads: Vec::new(),
             process_group_id,
         });
     }
@@ -1817,11 +1851,7 @@ fn spawn_owned_host_process(command: &mut Command) -> std::io::Result<OwnedHostP
             let _ = child.wait();
             return Err(error);
         }
-        return Ok(OwnedHostProcess {
-            child,
-            capture_threads: Vec::new(),
-            job,
-        });
+        return Ok(OwnedHostProcess { child, job });
     }
 }
 
@@ -1851,6 +1881,26 @@ impl WindowsKillOnCloseJob {
         })
     }
 
+    fn release_on_close(&self) -> std::io::Result<()> {
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("Kernel Job Object is closed"))?;
+        let information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle.as_raw_handle() as HANDLE,
+                JobObjectExtendedLimitInformation,
+                (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn assign(&self, child: &Child) -> std::io::Result<()> {
         let Some(handle) = self.handle.as_ref() else {
             return Err(std::io::Error::other("Host Job Object is closed"));
@@ -1865,6 +1915,14 @@ impl WindowsKillOnCloseJob {
     }
 
     fn close(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            unsafe {
+                windows_sys::Win32::System::JobObjects::TerminateJobObject(
+                    handle.as_raw_handle() as HANDLE,
+                    1,
+                );
+            }
+        }
         drop(self.handle.take());
     }
 }
@@ -2077,7 +2135,7 @@ mod tests {
         let processes = HostProcessGroup::new(None);
         assert!(!processes.is_shutting_down());
 
-        processes.shutdown();
+        processes.detach();
 
         assert!(processes.is_shutting_down());
     }
@@ -2086,14 +2144,15 @@ mod tests {
     #[test]
     fn application_shutdown_rejects_and_reclaims_late_host_children() {
         let processes = HostProcessGroup::new(None);
-        processes.shutdown();
+        processes.detach();
 
         let daemon = sleeping_owned_host_process();
         let proxy = sleeping_owned_host_process();
         let daemon_pid = daemon.child.id();
         let proxy_pid = proxy.child.id();
         let children = OwnedHostChildren {
-            daemon,
+            daemon: Some(daemon),
+            start_guard: None,
             proxy,
             daemon_host: "127.0.0.1".to_string(),
             daemon_port: "0".to_string(),
@@ -2143,7 +2202,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("startup lease is active");
 
-        processes.shutdown();
+        processes.detach();
 
         assert!(startup_finished.load(std::sync::atomic::Ordering::Acquire));
         startup_thread.join().expect("startup thread exits");

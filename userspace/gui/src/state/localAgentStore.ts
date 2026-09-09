@@ -1,4 +1,5 @@
-import { create } from 'zustand';
+import { create, useStore } from 'zustand';
+import { createContext, createElement, useContext, type ReactNode } from 'react';
 import type {
   CommandReply,
   ConversationCatalog,
@@ -33,7 +34,7 @@ import {
   updateConversationSession as updateSessionRequest,
 } from '../services/localAgentApi';
 
-const SESSION_STORAGE_KEY = 'deepcode.local-agent.active-session';
+
 const EMPTY_CATALOG: ConversationCatalog = { projects: [], sessions: [] };
 const EMPTY_PLUGIN_CATALOG: PluginCatalogProjection = { revision: 'plugin-catalog:empty', plugins: [] };
 
@@ -52,7 +53,7 @@ type StoreErrorSource =
   | 'command'
   | 'operation';
 
-interface LocalAgentState {
+export interface LocalAgentState {
   sessionId: string | null;
   draftProjectId: string | null;
   selectedProfileId: string | null;
@@ -115,6 +116,8 @@ type StoreSet = (
 ) => void;
 type StoreGet = () => LocalAgentState;
 
+export function createLocalAgentStore(viewId = 'main') {
+const SESSION_STORAGE_KEY = `deepcode.local-agent.active-session:${viewId}`;
 let initialization: Promise<void> | null = null;
 let generation = 0;
 let activeSubmissionCount = 0;
@@ -125,7 +128,7 @@ let projectionRefreshFlight: {
   promise: Promise<void>;
 } | null = null;
 
-export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
+const store = create<LocalAgentState>((set, get) => ({
   sessionId: null,
   draftProjectId: null,
   selectedProfileId: null,
@@ -284,6 +287,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
 
   startNewSession: (projectId = null) => {
     generation += 1;
+    activeSubmissionCount = 0;
     forgetSession();
     set({
       sessionId: null,
@@ -305,7 +309,10 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
       return;
     }
     const currentGeneration = ++generation;
+    activeSubmissionCount = 0;
     set({
+      submitting: false,
+      modelSettingsBusy: false,
       loading: true,
       error: null,
       errorSource: null,
@@ -365,6 +372,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
       const statuses = (async () => {
         try {
           const items = await getConversationStatuses();
+          if (generation !== refreshGeneration) return;
           set((state) => ({
             sessionStatuses: Object.fromEntries(items.map((item) => {
               const current = state.sessionStatuses[item.sessionId];
@@ -373,7 +381,7 @@ export const useLocalAgentStore = create<LocalAgentState>((set, get) => ({
             ...(state.errorSource === 'statuses' ? { error: null, errorSource: null } : {}),
           }));
         } catch (error) {
-          set({ sessionStatuses: {}, error: errorMessage(error), errorSource: 'statuses' });
+          if (generation === refreshGeneration) set({ sessionStatuses: {}, error: errorMessage(error), errorSource: 'statuses' });
         }
       })();
       try {
@@ -672,7 +680,7 @@ async function submitNewRun(
   filesystemPaths: PendingFilesystemPath[],
   pluginSelections: PluginSelectionInput[],
 ): Promise<CommandReply> {
-  beginSubmission(set);
+  const submissionGeneration = beginSubmission(set);
   try {
     const messageProfileId = get().selectedProfileId;
     const reasoningEffortOverride = get().reasoningEffortOverride;
@@ -693,6 +701,7 @@ async function submitNewRun(
       const created = await createLocalAgentSession({
         ...(draftProjectId ? { projectId: draftProjectId } : {}),
       });
+      if (generation !== submissionGeneration) throw new Error('conversation_session_changed');
       sessionId = created.sessionId;
       rememberSession(sessionId);
       set({ sessionId, projection: created, draftProjectId: null });
@@ -701,7 +710,7 @@ async function submitNewRun(
     const filesystemReferences = filesystemPaths.length
       ? await resolveConversationFilesystemReferences(sessionId, filesystemPaths)
       : [];
-    if (get().sessionId !== sessionId) throw new Error('conversation_session_changed');
+    if (generation !== submissionGeneration || get().sessionId !== sessionId) throw new Error('conversation_session_changed');
     const common = {
       schemaVersion: CONVERSATION_COMMAND_VERSION,
       commandId: nextId('command'),
@@ -735,10 +744,10 @@ async function submitNewRun(
     if (errorMessage(error).includes('plugin_selection_stale')) {
       await get().refreshPluginCatalog();
     }
-    set({ error: errorMessage(error), errorSource: 'command' });
+    if (generation === submissionGeneration) set({ error: errorMessage(error), errorSource: 'command' });
     throw error;
   } finally {
-    endSubmission(set);
+    endSubmission(set, submissionGeneration);
   }
 }
 
@@ -766,14 +775,14 @@ async function submitExisting(
   get: () => LocalAgentState,
   command: ConversationCommand,
 ): Promise<CommandReply> {
-  beginSubmission(set);
+  const submissionGeneration = beginSubmission(set);
   try {
     return await submitCommandAndReconcile(set, get, command);
   } catch (error) {
-    set({ error: errorMessage(error), errorSource: 'command' });
+    if (generation === submissionGeneration) set({ error: errorMessage(error), errorSource: 'command' });
     throw error;
   } finally {
-    endSubmission(set);
+    endSubmission(set, submissionGeneration);
   }
 }
 
@@ -782,16 +791,17 @@ async function submitCommandAndReconcile(
   get: StoreGet,
   command: ConversationCommand,
 ): Promise<CommandReply> {
+  const commandGeneration = generation;
   const reply = await submitLocalAgentCommand(command);
   const rejection = reply.status === 'rejected' ? commandRejectionMessage(reply) : null;
   try {
-    await reconcileProjectionAfterReply(set, get, command.sessionId, reply.revision);
+    await reconcileProjectionAfterReply(set, get, command.sessionId, reply.revision, commandGeneration);
   } catch (error) {
     const reconciliation = `conversation_projection_reconcile_failed:${errorMessage(error)}`;
     throw new Error(rejection ? `${rejection};${reconciliation}` : reconciliation);
   }
   if (rejection) throw new Error(rejection);
-  set({ error: null, errorSource: null });
+  if (generation === commandGeneration) set({ error: null, errorSource: null });
   return reply;
 }
 
@@ -800,6 +810,7 @@ async function reconcileProjectionAfterReply(
   get: StoreGet,
   sessionId: string,
   replyRevision: number,
+  commandGeneration: number,
 ): Promise<void> {
   const projection = await getLocalAgentProjection(sessionId);
   if (projection.revision < replyRevision) {
@@ -807,7 +818,7 @@ async function reconcileProjectionAfterReply(
       `conversation_projection_behind_command_reply:${projection.revision}:${replyRevision}`,
     );
   }
-  if (get().sessionId !== sessionId) return;
+  if (get().sessionId !== sessionId || generation !== commandGeneration) return;
   set((state) => {
     const nextProjection = shouldApplyProjection(state.projection, projection) ? projection : state.projection;
     return { projection: nextProjection, ...projectModelSettings(nextProjection) };
@@ -828,6 +839,7 @@ async function saveModelSettings(set: StoreSet, get: StoreGet, settings: Session
     set({ selectedProfileId: settings.profileId, reasoningEffortOverride: settings.reasoningEffortOverride });
     return;
   }
+  const settingsGeneration = generation;
   set({ modelSettingsBusy: true });
   try {
     await submitCommandAndReconcile(set, get, {
@@ -835,18 +847,20 @@ async function saveModelSettings(set: StoreSet, get: StoreGet, settings: Session
       sessionId, commandId: nextId('command'), settings,
     });
   } catch (error) {
-    if (get().sessionId === sessionId) set({ error: errorMessage(error), errorSource: 'command' });
+    if (generation === settingsGeneration && get().sessionId === sessionId) set({ error: errorMessage(error), errorSource: 'command' });
   } finally {
-    set({ modelSettingsBusy: false });
+    if (generation === settingsGeneration) set({ modelSettingsBusy: false });
   }
 }
 
-function beginSubmission(set: StoreSet): void {
+function beginSubmission(set: StoreSet): number {
   activeSubmissionCount += 1;
   set({ submitting: true, error: null, errorSource: null });
+  return generation;
 }
 
-function endSubmission(set: StoreSet): void {
+function endSubmission(set: StoreSet, submissionGeneration: number): void {
+  if (generation !== submissionGeneration) return;
   activeSubmissionCount -= 1;
   set({ submitting: activeSubmissionCount > 0 });
 }
@@ -928,6 +942,7 @@ function sameAssistantDraft(
   return left.runId === right.runId
     && left.turnId === right.turnId
     && JSON.stringify(left.activity) === JSON.stringify(right.activity)
+    && JSON.stringify(left.planPreview) === JSON.stringify(right.planPreview)
     && JSON.stringify(left.blocks) === JSON.stringify(right.blocks);
 }
 
@@ -995,3 +1010,18 @@ function forgetSession(): void {
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+
+return store;
+}
+
+export type LocalAgentStore = ReturnType<typeof createLocalAgentStore>;
+const defaultStore = createLocalAgentStore();
+const LocalAgentStoreContext = createContext<LocalAgentStore>(defaultStore);
+export function LocalAgentStoreProvider({ store, children }: { store: LocalAgentStore; children: ReactNode }) {
+  return createElement(LocalAgentStoreContext.Provider, { value: store }, children);
+}
+export const useLocalAgentStore = Object.assign(
+  function useLocalAgentStore<Selected>(selector: (state: LocalAgentState) => Selected): Selected {
+    return useStore(useContext(LocalAgentStoreContext), selector);
+  }, defaultStore,
+);

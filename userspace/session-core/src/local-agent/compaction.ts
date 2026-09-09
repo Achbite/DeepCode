@@ -144,33 +144,8 @@ export function pressureCompactionCutoff(
   currentReceipt: ContextCompositionReceipt,
   runtime: RunRuntimeSnapshot,
 ): number | null {
-  const usage = snapshot.state.contextUsage;
-  if (
-    !usage
-    || usage.providerRuntimeRef !== runtime.provider.providerRuntimeRef
-    || usage.contextWindowTokens !== runtime.provider.contextWindowTokens
-  ) return null;
-  const latestCheckpoint = [...snapshot.events]
-    .reverse()
-    .find((event): event is Extract<SessionEvent, { type: 'context.compacted' }> => (
-      event.type === 'context.compacted'
-    ));
-  if (latestCheckpoint && latestCheckpoint.sequence > usage.sequence) return null;
-  const priorReceipt = [...snapshot.state.contextCompositions]
-    .reverse()
-    .find((receipt) => (
-      receipt.purpose === 'agent'
-      && receipt.providerRequestId === usage.providerRequestId
-    ));
-  if (!priorReceipt) return null;
-  const priorUnits = contextShapeUnits(priorReceipt.partitions);
-  const currentUnits = contextShapeUnits(currentReceipt.partitions);
-  if (priorUnits <= 0 || currentUnits <= 0) return null;
-  const estimatedCurrentInput = Math.round(usage.inputTokens * currentUnits / priorUnits);
-  if (
-    Math.max(usage.inputTokens, estimatedCurrentInput) + runtime.provider.maxOutputTokens
-    < runtime.provider.contextWindowTokens
-  ) return null;
+  const latestCheckpoint = [...snapshot.events].reverse().find((event): event is Extract<SessionEvent, { type: 'context.compacted' }> => event.type === 'context.compacted');
+  if (estimateContextInput(snapshot, currentReceipt, runtime) + runtime.provider.maxOutputTokens < runtime.provider.contextWindowTokens) return null;
   const input = runInputMessageEvent(snapshot.events, runId);
   if (!input) return null;
   const coveredThrough = latestCheckpoint?.payload.coveredThroughSequence ?? 0;
@@ -211,4 +186,23 @@ function contextShapeUnits(
   partitions: readonly { requestShapeUnits: number }[],
 ): number {
   return partitions.reduce((total, partition) => total + partition.requestShapeUnits, 0);
+}
+
+/** Admission estimate only: never report this as Provider token usage. */
+export function estimateContextInput(
+  snapshot: { events: readonly SessionEvent[]; state: SessionState },
+  receipt: ContextCompositionReceipt, runtime: RunRuntimeSnapshot,
+): number {
+  const units = contextShapeUnits(receipt.partitions);
+  const usage = snapshot.state.contextUsage;
+  const prior = usage && snapshot.state.contextCompositions.find((item) => item.providerRequestId === usage.providerRequestId);
+  const checkpointAfterUsage = usage && snapshot.events.some((event) => event.type === 'context.compacted' && event.sequence > usage.sequence);
+  if (usage && prior && !checkpointAfterUsage && usage.providerRuntimeRef === runtime.provider.providerRuntimeRef
+    && usage.contextWindowTokens === runtime.provider.contextWindowTokens) {
+    const priorUnits = contextShapeUnits(prior.partitions);
+    if (priorUnits > 0) return Math.ceil(usage.inputTokens * units / priorUnits);
+  }
+  // No prior usage exists for a first request or after a checkpoint. Bound the
+  // request shape, including schemas, instead of treating unavailable usage as zero.
+  return Math.ceil(units / 3);
 }

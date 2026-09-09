@@ -251,6 +251,8 @@ fn assert_executor_bindings_match_tool_registry(
     }
 }
 
+#[path = "executors/file_changes.rs"]
+mod file_changes;
 #[path = "executors/fs.rs"]
 mod filesystem;
 mod process;

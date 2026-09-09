@@ -1053,8 +1053,15 @@ export function projectSession(
   state: SessionState,
   assistantDraft: AssistantDraftProjection | null = null,
 ): SessionProjection {
+  const rounds = new Map<string, string[]>();
+  for (const activity of Object.values(state.activities).sort((left, right) => left.sequence - right.sequence)) {
+    if (!activity.tool?.fileChanges?.length || !activity.tool.recordId) continue;
+    const records = rounds.get(activity.runId) ?? [];
+    records.push(activity.tool.recordId); rounds.set(activity.runId, records);
+  }
   return {
     schemaVersion: SESSION_PROJECTION_VERSION,
+    ...(rounds.size ? { fileChangeRounds: [...rounds].map(([runId, recordIds]) => ({ runId, recordIds })) } : {}),
     sessionId: state.sessionId,
     revision: state.revision,
     display: { ...state.display },
@@ -1730,6 +1737,7 @@ function cloneActivity(activity: ActivityProjection): ActivityProjection {
           tool: {
             ...activity.tool,
             resources: activity.tool.resources.map((resource) => ({ ...resource })),
+            ...(activity.tool.fileChanges ? { fileChanges: structuredClone(activity.tool.fileChanges) } : {}),
             ...(activity.tool.shell
               ? {
                   shell: {
@@ -1799,6 +1807,7 @@ function settleActivity(
 function projectToolActivity(record: ToolExecutionRecord): NonNullable<ActivityProjection['tool']> {
   const { preparedEffect } = record;
   return {
+    recordId: record.recordId,
     operation: preparedEffect.operation,
     resources: preparedEffect.logicalTargets.map((target) => {
       if (preparedEffect.workspaceId) {
@@ -1815,6 +1824,7 @@ function projectToolActivity(record: ToolExecutionRecord): NonNullable<ActivityP
       return { kind: 'logicalTarget' as const, label: target };
     }),
     ...(record.toolName === 'bash' ? { shell: projectShellActivity(record) } : {}),
+    ...projectFileChanges(record),
   };
 }
 
@@ -2054,4 +2064,21 @@ function addTokenCount(left: number, right: number): number {
   const total = left + right;
   if (!Number.isSafeInteger(total)) throw new Error('token_usage_overflow');
   return total;
+}
+
+function projectFileChanges(record: ToolExecutionRecord): Pick<NonNullable<ActivityProjection['tool']>, 'fileChanges'> {
+  if (!('output' in record) || !record.output || typeof record.output !== 'object' || Array.isArray(record.output)) return {};
+  const changes = (record.output as Record<string, unknown>).fileChanges;
+  if (changes === undefined) return {};
+  if (!Array.isArray(changes) || changes.some((change) => {
+    if (!change || typeof change !== 'object' || Array.isArray(change)) return true;
+    return typeof change.workspaceId !== 'string' || change.workspaceId !== record.preparedEffect.workspaceId
+      || typeof change.path !== 'string' || !['create', 'modify', 'delete'].includes(String(change.kind))
+      || ![change.before, change.after].every((side) => side && typeof side === 'object' && !Array.isArray(side)
+        && typeof side.exists === 'boolean' && (!side.exists || typeof side.contentRef === 'string' || typeof side.error === 'string'))
+      || (change.kind === 'create' && (change.before?.exists !== false || change.after?.exists !== true))
+      || (change.kind === 'delete' && (change.before?.exists !== true || change.after?.exists !== false))
+      || (change.kind === 'modify' && (change.before?.exists !== true || change.after?.exists !== true));
+  })) throw new Error('kernel_file_changes_invalid');
+  return { fileChanges: structuredClone(changes) as unknown as NonNullable<ActivityProjection['tool']>['fileChanges'] };
 }

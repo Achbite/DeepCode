@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 deepcode-kernel-abi = { path = "../deepcode-kernel-abi" }
+deepcode-host-connection.workspace = true
 getrandom = "0.3"
 libc = "0.2"
 reqwest.workspace = true

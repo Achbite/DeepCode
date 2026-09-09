@@ -17,6 +17,7 @@ import {
   sessionControlToolDefinitions,
 } from '../dist/index.js';
 import { messagesFromJournal } from '../dist/local-agent/contextComposer.js';
+import { HttpProviderPort } from '../dist/local-agent/httpPorts.js';
 import { responseFrames } from '../dist/responseFrames.js';
 import { createProviderToolAliases } from '../dist/local-agent/providerToolCodec.js';
 import {
@@ -65,7 +66,7 @@ test('message uses one prepared runtime through composition, completion, cache p
   await createSession(journal, sessionId, [workspaceBinding]);
 
   const preparation = fakeRunPreparation({
-    contextWindowTokens: 1_000,
+    contextWindowTokens: 16_000,
     maxOutputTokens: 128,
   });
   const providerRequests = [];
@@ -89,7 +90,7 @@ test('message uses one prepared runtime through composition, completion, cache p
         usage: {
           inputTokens: 100,
           outputTokens: 20,
-          contextWindowTokens: 1_000,
+          contextWindowTokens: 16_000,
           cacheReadInputTokens: 75,
           cacheMissInputTokens: 25,
         },
@@ -1762,7 +1763,7 @@ test('confirmed Host Bash uses composite authority and only a successful retry c
     availability: 'callable',
     origin: 'coreBuiltin',
   };
-  const preparation = fakeRunPreparation({ tools: [preparedTool] });
+  const preparation = fakeRunPreparation({ contextWindowTokens: 64_000, tools: [preparedTool] });
   const kernelRequests = [];
   const shellOutput = (request, exitCode, stderr = '') => ({
     workspaceId: workspaceBinding.workspaceId,
@@ -3111,4 +3112,211 @@ test('reopening a run waiting for Plan confirmation restores its original effort
   assert.equal(turns, 1);
   assert.deepEqual(preparation.prepared.map((request) => request.reasoningEffortOverride), ['max', 'max']);
   await reopened.dispose();
+});
+
+
+test('first request reserves output budget before calling a Provider and preserves original input', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:first-budget';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  let calls = 0;
+  const provider = { async *stream() { calls += 1; throw new Error('must not call Provider'); } };
+  const preparation = fakeRunPreparation({ contextWindowTokens: 100, maxOutputTokens: 30 });
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'first-budget');
+  const original = 'Full original input '.repeat(500);
+  await actor.submit(messageCommand(sessionId, 'command:first-budget', original));
+  const projection = await waitForProjection(actor, (projection) => projection.run?.status === 'failed');
+  assert.equal(calls, 0);
+  assert.equal(projection.terminalError.code, 'context_input_budget_exceeded');
+  assert.equal(projection.messages[0].content, original);
+  assert.equal((await readEvents(journal, sessionId)).some((event) => event.type === 'context.compacted'), false);
+  await actor.dispose();
+});
+
+test('new file inputs preserve the existing Provider prefix and keep historical files readable', async () => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:input-cache';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const requests = [];
+  const provider = { async *stream(request) {
+    requests.push(structuredClone(request));
+    yield providerEvent(request.requestId, 'assistant.message', { messageId: `message:cache-${requests.length}`, content: 'Read the referenced input.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } };
+  const preparation = fakeRunPreparation({ contextWindowTokens: 64000 });
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'input-cache');
+  for (let index = 0; index < 3; index += 1) {
+    const command = messageCommand(sessionId, `command:cache-${index}`, `Original input ${index}`);
+    if (index < 2) command.filesystemReferences = [{ referenceId: `reference:${index}`, workspaceId: `file-workspace:${index}`,
+      logicalPath: 'user-input.txt', displayName: 'user-input.txt', kind: 'file', mediaType: 'text/plain', byteLength: 100000 }];
+    await actor.submit(command);
+    await waitForProjection(actor, (projection) => projection.run?.status === 'completed');
+  }
+  for (let index = 1; index < requests.length; index += 1) {
+    assert.deepEqual(requests[index].tools, requests[0].tools);
+    assert.deepEqual(requests[index].messages.slice(0, requests[index - 1].messages.length), requests[index - 1].messages);
+  }
+  assert.deepEqual(requests[2].workspaceBindings.map((binding) => binding.workspaceId), ['workspace:test', 'file-workspace:0', 'file-workspace:1']);
+  await actor.dispose();
+});
+
+test('reasoning display bounds real text and summary independently without changing replay data', async () => {
+  const { LiveReasoning, reasoningReadItem } = await import('../dist/local-agent/reasoningRead.js');
+  const live = new LiveReasoning();
+  live.append('request:one', 'run:one', '中文🙂'.repeat(5000), 'text');
+  live.append('request:one', 'run:one', 'Native summary.', 'summary');
+  const window = live.read('request:one');
+  assert.equal(window.truncated, true);
+  assert.deepEqual(window.parts.map((part) => part.kind), ['text', 'summary']);
+  assert.ok(window.parts.reduce((total, part) => total + part.content.length, 0) <= 8192);
+  const event = { sequence: 10, runId: 'run:one', payload: { outcome: 'completed', providerRequestId: 'request:one',
+    reasoningContent: 'x'.repeat(20000), orderedOutputBlocks: [{ kind: 'reasoning', item: { summary: [{ type: 'summary_text', text: 'Native summary.' }] } }] } };
+  const page = reasoningReadItem(event, 0);
+  assert.equal(page.nextOffset, 8192);
+  assert.equal(page.parts[0].kind, 'summary');
+  assert.equal(reasoningReadItem(event, null).parts, undefined);
+  assert.equal(event.payload.reasoningContent.length, 20000);
+});
+
+test('Kernel changes produce ordered round references while display evidence stays out of Provider context', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:change-round';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation({ apiSurface: 'responses', contextWindowTokens: 64000, tools: [{
+    toolBindingRef: 'binding:write', name: 'fs.write', description: 'Write text.', origin: 'coreBuiltin',
+    availability: 'callable', possibleEffects: ['workspaceMutation'],
+    inputSchema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] },
+  }] });
+  const changes = [{ workspaceId: workspaceBinding.workspaceId, path: 'sample.txt', kind: 'modify',
+    before: { exists: true, contentRef: '/fixture/attempt/before' }, after: { exists: true, contentRef: '/fixture/attempt/after' } }];
+  const requests = [];
+  const provider = { async *stream(request) {
+    requests.push(request);
+    const item = requests.length === 1
+      ? { type: 'function_call', call_id: 'provider-call:change', name: request.tools.find((tool) => tool.inputSchema.properties?.path).name,
+          arguments: JSON.stringify({ workspace: 'primary', path: 'sample.txt', content: 'new' }), status: 'completed' }
+      : { type: 'message', id: 'provider-message:change', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Saved.' }] };
+    yield providerEvent(request.requestId, 'output.item.completed', { outputIndex: 0, item });
+    yield providerEvent(request.requestId, 'completed', {});
+  } };
+  const actor = actorWith(journal, sessionId, provider, emptyKernel({ execute: async (request) =>
+    completedExecutionReply(request, { saved: true, fileChanges: changes }) }), preparation.port, 'changes');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:changes', 'Update the file.'));
+  const projection = await waitForProjection(actor, (projection) => projection.run?.status === 'completed');
+  const tool = projection.activities.find((activity) => activity.tool?.fileChanges?.length)?.tool;
+  assert.ok(tool);
+  assert.deepEqual(tool.fileChanges, changes);
+  assert.deepEqual(projection.fileChangeRounds, [{ runId: projection.run.runId, recordIds: [tool.recordId] }]);
+  const toolMessage = requests[1].messages.find((message) => message.role === 'tool');
+  assert.ok(toolMessage);
+  assert.equal(JSON.stringify(toolMessage).includes('fileChanges'), false);
+  assert.equal(JSON.stringify(toolMessage).includes('/fixture/attempt/'), false);
+  const event = (await readEvents(journal, sessionId)).find((event) => event.type === 'tool.completed');
+  assert.deepEqual(event.payload.record.output.fileChanges, changes);
+});
+
+test('plan preview streams formed fields at the same revision and publishes only after complete validation', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:streamed-plan';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation();
+  const input = { title: 'Inspect the project', summary: 'Read the relevant source.', steps: [{ stepId: 'inspect', title: 'Read source', details: 'Inspect the source.' }], mutationManifest: [] };
+  const serialized = JSON.stringify(input);
+  const split = serialized.indexOf(',"steps"');
+  const secondSplit = serialized.indexOf(',"details"');
+  const releases = [];
+  const gate = () => new Promise((resolve) => releases.push(resolve));
+  const requests = [];
+  const provider = { async *stream(request, signal) {
+    requests.push(structuredClone(request));
+    const name = request.tools.find((tool) => tool.inputSchema.properties?.mutationManifest).name;
+    for (const fragment of [serialized.slice(0, split), serialized.slice(split, secondSplit), serialized.slice(secondSplit)]) {
+      yield providerEvent(request.requestId, 'tool.call.delta', { callIndex: 0, callId: 'call:plan', name, argumentsDelta: fragment });
+      await Promise.race([gate(), waitForAbort(signal)]);
+      if (signal.aborted) return;
+    }
+    yield providerEvent(request.requestId, 'tool.call', { callId: 'call:plan', name, input });
+    yield providerEvent(request.requestId, 'completed', { usage: { inputTokens: 100, outputTokens: 30, cacheReadInputTokens: 90, cacheMissInputTokens: 10, contextWindowTokens: 4096 } });
+  } };
+  const wireProvider = new HttpProviderPort({ apiBase: 'http://fixture', serviceToken: 'fixture', fetchImpl: async (_url, init) => {
+    const request = JSON.parse(init.body);
+    const encoder = new TextEncoder();
+    return new Response(new ReadableStream({ async start(controller) {
+      try {
+        for await (const event of provider.stream(request, init.signal)) controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+        controller.close();
+      } catch (error) { controller.error(error); }
+    } }), { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const actor = actorWith(journal, sessionId, wireProvider, emptyKernel(), preparation.port, 'streamed-plan');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:preview', 'Plan an inspection.'));
+  const first = await waitForProjection(actor, (p) => p.assistantDraft?.planPreview?.title === input.title);
+  assert.equal(first.pendingPlan, null);
+  assert.equal(first.plans.length, 0);
+  assert.equal(first.activities.some((activity) => activity.kind === 'tool'), false);
+  assert.equal(first.assistantDraft.planPreview.summary, input.summary);
+  assert.equal((await readEvents(journal, sessionId)).some((event) => event.type === 'plan.published'), false);
+  await waitUntil(() => releases.length === 1, 'first preview fragment'); releases.shift()();
+  const second = await waitForProjection(actor, (p) => p.assistantDraft?.planPreview?.steps.length === 1);
+  assert.equal(second.revision, first.revision);
+  assert.deepEqual(second.assistantDraft.planPreview.steps, ['Read source']);
+  assert.equal(second.pendingPlan, null);
+  await waitUntil(() => releases.length === 1, 'second preview fragment'); releases.shift()();
+  await waitUntil(() => releases.length === 1, 'complete preview fragment'); releases.shift()();
+  const published = await waitForProjection(actor, (p) => p.run?.status === 'waiting' && p.pendingPlan !== null);
+  assert.equal(published.assistantDraft, null);
+  assert.equal(published.pendingPlan.title, input.title);
+  assert.deepEqual(published.pendingPlan.steps, input.steps);
+  assert.deepEqual(published.pendingPlan.mutationManifest, []);
+  assert.equal(published.activePlanRef, null);
+  assert.equal(published.contextUsage.cacheReadInputTokens, 90);
+  assert.equal(requests.length, 1, 'preview never requests another model response');
+  const events = await readEvents(journal, sessionId);
+  assert.equal(events.filter((event) => event.type === 'plan.published').length, 1);
+  assert.equal(events.some((event) => event.type === 'plan.confirmed' || event.type === 'tool.requested'), false);
+});
+
+for (const outcome of ['failed', 'cancelled']) test(`an unfinished plan preview is cleared when its request is ${outcome}`, async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = `session:preview-${outcome}`;
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const provider = { async *stream(request, signal) {
+    const name = request.tools.find((tool) => tool.inputSchema.properties?.mutationManifest).name;
+    yield providerEvent(request.requestId, 'tool.call.delta', { callIndex: 0, callId: 'call:draft', name, argumentsDelta: '{"title":"Unfinished",' });
+    await Promise.race([gate, waitForAbort(signal)]);
+    if (signal.aborted) return;
+    yield providerEvent(request.requestId, 'failed', { code: 'fixture_provider_failed', message: 'Provider failed during plan generation.' });
+  } };
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, `preview-${outcome}`);
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:begin', 'Plan this inspection.'));
+  const streaming = await waitForProjection(actor, (p) => p.assistantDraft?.planPreview?.title === 'Unfinished');
+  if (outcome === 'cancelled') await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'run.cancel', sessionId, runId: streaming.run.runId, commandId: 'command:cancel-preview' });
+  else release();
+  // An interrupted Provider with no terminal receipt keeps the existing unknown-outcome contract.
+  const settled = await waitForProjection(actor, (p) => p.run?.status === (outcome === 'cancelled' ? 'indeterminate' : 'failed'));
+  if (outcome === 'cancelled') assert.equal(settled.terminalError.code, 'provider_turn_outcome_unknown');
+  else assert.equal(settled.terminalError.code, 'fixture_provider_failed');
+  assert.equal(settled.assistantDraft, null);
+  assert.equal(settled.pendingPlan, null);
+  assert.equal(settled.plans.length, 0);
+  assert.equal(preparation.released.length, 1);
+});
+
+test('plan preview reads complete JSON fields and keeps its display buffer bounded', async () => {
+  const { PlanPreviewBuffer } = await import('../dist/local-agent/planPreview.js');
+  const preview = new PlanPreviewBuffer('plan_publish');
+  const delta = (argumentsDelta, name = 'plan_publish') => preview.append({ callIndex: 0, callId: 'call:prefix', name, argumentsDelta });
+  assert.equal(delta('{"title":"Ignored"}', 'fs_read'), undefined);
+  assert.equal(delta('{"title":"Escaped \\').title, '');
+  assert.equal(delta('" quote", "steps":[{"title":"Step one",').title, 'Escaped " quote');
+  assert.deepEqual(delta('"details":"pending').steps, ['Step one']);
+  const bounded = delta('x'.repeat(100_000));
+  assert.equal(bounded.truncated, true);
+  assert.ok(JSON.stringify(bounded).length < 9000);
 });

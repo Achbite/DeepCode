@@ -785,6 +785,10 @@
         "compact": "Compact"
       }
     },
+    "gui.showReasoning": {
+      "label": "Reasoning details",
+      "description": "Click the reasoning status to read reasoning supplied by the model. Off by default; this display preference does not change reasoning effort."
+    },
     "gui.showContextRail": {
       "label": "Show context rail",
       "description": "Show the shared run, tool, and artifact projection in the DeepCode-GUI right rail."

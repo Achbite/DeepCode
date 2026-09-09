@@ -12,7 +12,7 @@ import type {
 } from '@deepcode/protocol';
 import { SessionActor } from './actor.js';
 import type { AgentComposition } from './plugins.js';
-import { readConversation, readSessionEvents } from './conversationRead.js';
+import { decodeConversationReadQuery, readConversation, readSessionEvents } from './conversationRead.js';
 import { emptySessionState, recoverSession, reduceSession, type SessionState } from './reducer.js';
 
 export interface SessionCompositionFactory {
@@ -113,6 +113,15 @@ export class SessionService implements ConversationPort {
   }
 
   async read(query: ConversationReadQuery): Promise<ConversationReadResult> {
+    decodeConversationReadQuery(query);
+    if (query.view === 'reasoning' && query.providerRequestId && this.#actors.has(query.sessionId)) {
+      const actor = await this.#actors.get(query.sessionId)!;
+      const projection = await actor.snapshot();
+      if (projection.assistantDraft?.turnId === query.providerRequestId) {
+        return { sessionId: query.sessionId, revision: projection.revision, view: 'reasoning',
+          items: [actor.liveReasoning.read(query.providerRequestId)], nextBefore: null };
+      }
+    }
     return await readConversation(this.journal, query);
   }
 

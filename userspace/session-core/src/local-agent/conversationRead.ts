@@ -1,6 +1,7 @@
 import type {
   CommandJournalPort, ConversationReadQuery, ConversationReadResult, JsonObject, SessionEvent,
 } from '@deepcode/protocol';
+import { reasoningReadItem } from './reasoningRead.js';
 import { recoverSession } from './reducer.js';
 
 const encoder = new TextEncoder();
@@ -9,13 +10,14 @@ const MAX_PAGE_BYTES = 48 * 1024;
 export function decodeConversationReadQuery(value: unknown): ConversationReadQuery {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('conversation_read_invalid');
   const query = value as Record<string, unknown>;
-  if (Object.keys(query).some((key) => !['sessionId', 'view', 'before', 'limit', 'recordId', 'providerRequestId'].includes(key))
+  if (Object.keys(query).some((key) => !['sessionId', 'view', 'before', 'limit', 'recordId', 'providerRequestId', 'offset'].includes(key))
     || !identifier(query.sessionId)
-    || (query.view !== undefined && (typeof query.view !== 'string' || !['summary', 'messages', 'tools', 'plans', 'context'].includes(query.view)))
+    || (query.view !== undefined && (typeof query.view !== 'string' || !['summary', 'messages', 'tools', 'plans', 'context', 'reasoning'].includes(query.view)))
     || (query.before !== undefined && (!Number.isSafeInteger(query.before) || Number(query.before) < 1))
     || (query.limit !== undefined && (!Number.isInteger(query.limit) || Number(query.limit) < 1 || Number(query.limit) > 50))
     || (query.recordId !== undefined && (!identifier(query.recordId) || query.view !== 'tools'))
-    || (query.providerRequestId !== undefined && (!identifier(query.providerRequestId) || query.view !== 'context'))) {
+    || (query.providerRequestId !== undefined && (!identifier(query.providerRequestId) || !['context', 'reasoning'].includes(String(query.view))))
+    || (query.offset !== undefined && (query.view !== 'reasoning' || !Number.isSafeInteger(query.offset) || Number(query.offset) < 0))) {
     throw new Error('conversation_read_invalid');
   }
   return query as unknown as ConversationReadQuery;
@@ -64,16 +66,20 @@ export async function readConversation(journal: CommandJournalPort, input: Conve
       case 'tools': return event.type === 'tool.completed'
         && (!query.recordId || event.payload.record.recordId === query.recordId);
       case 'plans': return event.type.startsWith('plan.') || event.type.startsWith('todo.');
+      case 'reasoning': return event.type === 'provider.turn.settled' && event.payload.outcome === 'completed'
+        && (!query.providerRequestId || event.payload.providerRequestId === query.providerRequestId);
       case 'context': return event.type === 'context.composed'
         && (!query.providerRequestId || event.payload.providerRequestId === query.providerRequestId);
     }
   }).reverse();
   if (query.recordId && !candidates.length) throw new Error('tool_record_not_found');
-  if (query.providerRequestId && !candidates.length) throw new Error('context_composition_not_found');
+  if (query.providerRequestId && !candidates.length) throw new Error(view === 'reasoning' ? 'reasoning_not_found' : 'context_composition_not_found');
   let size = encoder.encode(JSON.stringify(result)).byteLength;
   const limit = query.limit ?? (view === 'summary' ? 5 : 10);
   for (const event of candidates) {
-    const item = readItem(event, view === 'summary', events);
+    const item = view === 'reasoning' && event.type === 'provider.turn.settled'
+      ? reasoningReadItem(event, query.providerRequestId ? query.offset ?? 0 : null)
+      : readItem(event, view === 'summary', events);
     const itemBytes = encoder.encode(JSON.stringify(item)).byteLength;
     if (result.items.length >= limit || (result.items.length > 0 && size + itemBytes > MAX_PAGE_BYTES)) {
       result.nextBefore = Number(result.items.at(-1)!.sequence);

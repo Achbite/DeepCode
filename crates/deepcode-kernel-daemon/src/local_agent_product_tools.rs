@@ -37,11 +37,12 @@ impl ProductTools {
                 "type":"object", "additionalProperties":false, "required":["sessionId"],
                 "properties": {
                     "sessionId":{"type":"string","description":"Exact complete ID from the user or DeepCode. Preserve it verbatim, including prefixes such as session:."},
-                    "view":{"type":"string","enum":["summary","messages","tools","plans","context"]},
+                    "view":{"type":"string","enum":["summary","messages","tools","plans","context","reasoning"]},
                     "before":{"type":"integer","minimum":1},
                     "limit":{"type":"integer","minimum":1,"maximum":50},
                     "recordId":{"type":"string","description":"Exact ToolRecord ID; requires view=tools."},
-                    "providerRequestId":{"type":"string","description":"Exact Provider request ID; requires view=context."}
+                    "providerRequestId":{"type":"string","description":"Exact Provider request ID; requires view=context or reasoning."},
+                    "offset":{"type":"integer","minimum":0,"description":"Character offset for a bounded reasoning page."}
                 }
             })),
             ("skill.read", format!("Read a DeepCode product Skill or its reference when guidance is needed. Read only content relevant to the current question. Available: {}. Omit path to read SKILL.md.",

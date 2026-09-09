@@ -72,6 +72,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .unwrap_or_else(|error| panic!("无法绑定 DeepCode 本地 daemon：{error}"));
+    let addr = listener.local_addr().expect("读取 Host 监听地址");
     let gui = Arc::new(Mutex::new(gui_state));
     let workspace_resolver = Arc::new(crate::local_agent_kernel::HostWorkspaceResolver::new(
         gui.clone(),
@@ -105,6 +106,14 @@ async fn main() {
         terminal_runtime: Arc::new(Mutex::new(TerminalRuntime::new())),
     };
     let app = routes::build_app(state.clone());
+    // Host bootstrap publishes transport credentials while the config-root lease
+    // is held. Shells attach to this instance; they never copy Session state.
+    let _connection_publication = deepcode_host_connection::LocalHostConnection::new(
+        host_process_identity().clone(),
+        std::env::var(HOST_SHELL_TOKEN_ENV).expect("Host shell token"),
+    )
+    .and_then(|connection| connection.publish(&user_config_root()))
+    .expect("发布共享 Host 本地连接");
     println!("DeepCode local Agent daemon listening on http://{addr}");
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(wait_for_host_shutdown())

@@ -926,6 +926,18 @@ export interface AssistantDraftProjection {
   /** Session orders these blocks. An empty list can still carry Provider activity. */
   blocks: AssistantDraftBlockProjection[];
   activity?: ProviderActivityProjection;
+  /** Display only; not a published plan or authority to execute. */
+  planPreview?: PlanPreviewProjection;
+}
+
+export interface PlanPreviewProjection {
+  callIndex: number;
+  providerCallId: string;
+  outputIndex?: number;
+  title: string;
+  summary: string;
+  steps: string[];
+  truncated: boolean;
 }
 
 export interface ProviderActivityProjection {
@@ -1020,9 +1032,25 @@ export interface ActivityResourceProjection {
 }
 
 export interface ToolActivityProjection {
+  recordId?: string;
   operation: string;
   resources: ActivityResourceProjection[];
   shell?: ShellActivityProjection;
+  fileChanges?: FileChangeProjection[];
+}
+
+export interface FileChangeSide {
+  exists: boolean;
+  contentRef?: string;
+  sizeBytes?: number;
+  error?: string;
+}
+export interface FileChangeProjection {
+  workspaceId: string;
+  path: string;
+  kind: 'create' | 'modify' | 'delete';
+  before: FileChangeSide;
+  after: FileChangeSide;
 }
 
 export interface ShellActivityProjection {
@@ -1101,6 +1129,7 @@ export interface SessionProjection {
   tokenUsageHistory: TokenUsageRoundProjection[];
   run: RunProjection | null;
   activities: ActivityProjection[];
+  fileChangeRounds?: Array<{ runId: string; recordIds: string[] }>;
   artifacts: ArtifactProjection[];
   terminalError: LocalAgentError | null;
 }
@@ -1115,7 +1144,8 @@ export interface ConversationPort {
 
 export interface ConversationReadQuery {
   sessionId: string;
-  view?: 'summary' | 'messages' | 'tools' | 'plans' | 'context';
+  view?: 'summary' | 'messages' | 'tools' | 'plans' | 'context' | 'reasoning';
+  offset?: number;
   before?: number;
   limit?: number;
   recordId?: string;
@@ -1199,6 +1229,12 @@ export type ProviderEvent =
   | {
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
       requestId: string;
+      type: 'tool.call.delta';
+      data: { callIndex: number; callId: string; name: string; argumentsDelta: string; outputIndex?: number };
+    }
+  | {
+      schemaVersion: typeof PROVIDER_EVENT_VERSION;
+      requestId: string;
       type: 'text.delta';
       data: { text: string; outputIndex?: number };
     }
@@ -1206,7 +1242,7 @@ export type ProviderEvent =
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
       requestId: string;
       type: 'reasoning.delta';
-      data: { text: string; outputIndex?: number };
+      data: { text: string; outputIndex?: number; kind?: 'text' | 'summary' };
     }
   | {
       schemaVersion: typeof PROVIDER_EVENT_VERSION;

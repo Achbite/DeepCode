@@ -114,11 +114,33 @@ pub struct SessionProjection {
     pub token_usage_history: Vec<TokenUsageRoundProjection>,
     pub run: Option<RunProjection>,
     pub activities: Vec<ActivityProjection>,
+    #[serde(default)]
+    pub file_change_rounds: Vec<FileChangeRound>,
     pub artifacts: Vec<ArtifactProjection>,
     pub terminal_error: Option<ConversationError>,
 }
 
 impl SessionProjection {
+    pub fn file_changes_for_run(&self, run_id: &str) -> Vec<(&str, usize, &FileChangeProjection)> {
+        self.file_change_rounds
+            .iter()
+            .filter(|round| round.run_id == run_id)
+            .flat_map(|round| round.record_ids.iter())
+            .flat_map(|record| {
+                self.activities
+                    .iter()
+                    .filter_map(|activity| activity.tool.as_ref())
+                    .filter(move |tool| tool.record_id.as_ref() == Some(record))
+                    .flat_map(move |tool| {
+                        tool.file_changes
+                            .iter()
+                            .enumerate()
+                            .map(move |(index, change)| (record.as_str(), index, change))
+                    })
+            })
+            .collect()
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != SESSION_PROJECTION_VERSION || self.session_id.is_empty() {
             return Err("shared Session projection identity is invalid".to_string());
@@ -180,6 +202,16 @@ impl SessionProjection {
         if self.assistant_draft.as_ref().is_some_and(|draft| {
             draft.run_id.is_empty()
                 || draft.turn_id.is_empty()
+                || draft.plan_preview.as_ref().is_some_and(|preview| {
+                    preview.provider_call_id.is_empty()
+                        || preview.title.encode_utf16().count() > 256
+                        || preview.summary.encode_utf16().count() > 4096
+                        || preview.steps.len() > 12
+                        || preview
+                            .steps
+                            .iter()
+                            .any(|title| title.encode_utf16().count() > 256)
+                })
                 || draft.activity.as_ref().is_some_and(|activity| {
                     !matches!(activity.purpose.as_str(), "agent" | "contextCompaction")
                         || !matches!(
@@ -1045,6 +1077,19 @@ pub struct AssistantDraftProjection {
     pub turn_id: String,
     pub blocks: Vec<AssistantDraftBlockProjection>,
     pub activity: Option<ProviderActivityProjection>,
+    pub plan_preview: Option<PlanPreviewProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanPreviewProjection {
+    pub call_index: u64,
+    pub provider_call_id: String,
+    pub output_index: Option<u64>,
+    pub title: String,
+    pub summary: String,
+    pub steps: Vec<String>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1485,9 +1530,30 @@ pub struct ProviderHostedActivityProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolActivityProjection {
+    pub record_id: Option<String>,
     pub operation: String,
     pub resources: Vec<ActivityResourceProjection>,
     pub shell: Option<ShellActivityProjection>,
+    #[serde(default)]
+    pub file_changes: Vec<FileChangeProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangeProjection {
+    pub workspace_id: String,
+    pub path: String,
+    pub kind: String,
+    pub before: FileChangeSide,
+    pub after: FileChangeSide,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangeSide {
+    pub exists: bool,
+    pub content_ref: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1582,6 +1648,9 @@ pub struct ConversationResourceReadResult {
     pub size_bytes: u64,
     pub start_line: u64,
     pub end_line: u64,
+    pub next_byte: Option<u64>,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 pub fn message_command(session_id: &str, command_id: &str, text: &str) -> Value {
@@ -2426,5 +2495,88 @@ mod tests {
         let projection: SessionProjection =
             serde_json::from_value(value).expect("projection decodes");
         assert!(projection.validate().is_err());
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangeRound {
+    pub run_id: String,
+    pub record_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangeContent {
+    pub workspace_id: String,
+    pub path: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+impl FileChangeContent {
+    pub fn unified_diff(&self) -> String {
+        let before: Vec<_> = self
+            .before
+            .as_deref()
+            .unwrap_or("")
+            .split_inclusive('\n')
+            .collect();
+        let after: Vec<_> = self
+            .after
+            .as_deref()
+            .unwrap_or("")
+            .split_inclusive('\n')
+            .collect();
+        let prefix = before
+            .iter()
+            .zip(&after)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let suffix = before[prefix..]
+            .iter()
+            .rev()
+            .zip(after[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let start = prefix.saturating_sub(3);
+        let old_end = (before.len() - suffix + 3).min(before.len());
+        let new_end = (after.len() - suffix + 3).min(after.len());
+        let mut output = format!(
+            "--- {}\n+++ {}\n@@ -{},{} +{},{} @@\n",
+            if self.before.is_some() {
+                self.path.as_str()
+            } else {
+                "/dev/null (不存在)"
+            },
+            if self.after.is_some() {
+                self.path.as_str()
+            } else {
+                "/dev/null (不存在)"
+            },
+            if old_end == start { 0 } else { start + 1 },
+            old_end - start,
+            if new_end == start { 0 } else { start + 1 },
+            new_end - start
+        );
+        let mut line = |marker: char, text: &str| {
+            output.push(marker);
+            output.push_str(text);
+            if !text.ends_with('\n') {
+                output.push_str("\n\\ No newline at end of file\n");
+            }
+        };
+        for value in &before[start..prefix] {
+            line(' ', value);
+        }
+        for value in &before[prefix..before.len() - suffix] {
+            line('-', value);
+        }
+        for value in &after[prefix..after.len() - suffix] {
+            line('+', value);
+        }
+        for value in &before[before.len() - suffix..old_end] {
+            line(' ', value);
+        }
+        output
     }
 }

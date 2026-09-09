@@ -23,6 +23,7 @@ const INTERFACE_KEYS = [
   'workbench.language',
   'gui.navigationDensity',
   'gui.showContextRail',
+  'gui.showReasoning',
 ] as const;
 const AGENT_INSTRUCTION_KEYS = ['agent.systemPrompt'] as const;
 const AGENT_PERMISSION_KEYS = [

@@ -2,6 +2,8 @@ import React from 'react';
 
 export type DeepCodeShellIconName =
   | 'compose'
+  | 'close'
+  | 'terminal'
   | 'folder'
   | 'paperclip'
   | 'plus'
@@ -40,6 +42,10 @@ const DeepCodeShellIcon: React.FC<DeepCodeShellIconProps> = ({ name, className }
     'aria-hidden': true,
   };
   switch (name) {
+    case 'close':
+      return <svg {...common}><path d="m6 6 12 12M18 6 6 18" /></svg>;
+    case 'terminal':
+      return <svg {...common}><rect x="3" y="4" width="18" height="16" rx="3" /><path d="m7 9 3 3-3 3M13 15h4" /></svg>;
     case 'compose':
       return <svg {...common}><path d="M4 20h4l11-11-4-4L4 16v4Z" /><path d="m13.5 6.5 4 4" /></svg>;
     case 'folder':

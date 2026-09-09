@@ -54,8 +54,13 @@ impl From<LocalAgentStoreError> for LocalAgentKernelError {
     }
 }
 
+pub(crate) struct ResolvedWorkspace {
+    pub root: String,
+    pub read_only: bool,
+}
+
 pub(crate) trait WorkspaceResolverPort: Send + Sync {
-    fn resolve(&self, workspace_id: &str) -> Result<String, LocalAgentKernelError>;
+    fn resolve(&self, workspace_id: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError>;
 }
 
 #[derive(Clone)]
@@ -70,7 +75,7 @@ impl HostWorkspaceResolver {
 }
 
 impl WorkspaceResolverPort for HostWorkspaceResolver {
-    fn resolve(&self, workspace_id: &str) -> Result<String, LocalAgentKernelError> {
+    fn resolve(&self, workspace_id: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
         validate_id("workspaceId", workspace_id)?;
         let gui = self.gui.lock().map_err(|_| {
             LocalAgentKernelError::new(
@@ -86,7 +91,10 @@ impl WorkspaceResolverPort for HostWorkspaceResolver {
         }
         gui.conversation_catalog
             .workspace(workspace_id)
-            .map(|workspace| workspace.canonical_root.clone())
+            .map(|workspace| ResolvedWorkspace {
+                root: workspace.canonical_root.clone(),
+                read_only: workspace.owner_session_id.is_some(),
+            })
             .ok_or_else(|| {
                 LocalAgentKernelError::new(
                     "workspace_not_found",
@@ -990,7 +998,19 @@ impl LocalAgentKernel {
         }
         let (workspace_root, private_resolved_targets) = match workspace_id.as_deref() {
             Some(workspace_id) => {
-                let root = self.resolver.resolve(workspace_id)?;
+                let resolved = self.resolver.resolve(workspace_id)?;
+                if resolved.read_only
+                    && matches!(
+                        scope,
+                        PreparedEffectScope::WorkspaceMutation | PreparedEffectScope::Process
+                    )
+                {
+                    return Err(LocalAgentKernelError::new(
+                        "input_resource_read_only",
+                        "会话输入快照只读；请在工作目录中创建处理产物。",
+                    ));
+                }
+                let root = resolved.root;
                 let canonical_root = std::fs::canonicalize(&root).map_err(|error| {
                     LocalAgentKernelError::new(
                         "workspace_root_unavailable",
@@ -2187,7 +2207,7 @@ mod attempt_control_tests {
     fn invalid_bound_tool_input_returns_a_rejection_before_resolution_or_tool_record_creation() {
         struct UnexpectedResolver;
         impl WorkspaceResolverPort for UnexpectedResolver {
-            fn resolve(&self, _: &str) -> Result<String, LocalAgentKernelError> {
+            fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
                 panic!("input rejection must precede filesystem resolution")
             }
         }

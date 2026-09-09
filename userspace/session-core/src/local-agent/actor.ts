@@ -1,3 +1,4 @@
+import { LiveReasoning } from './reasoningRead.js';
 import type {
   AssistantDraftProjection,
   CommandJournalPort,
@@ -49,6 +50,7 @@ export class SessionActor {
   #loopFailure?: Error;
   #projectionState?: LoopSnapshot['state'];
   #assistantDraft: AssistantDraftProjection | null = null;
+  readonly liveReasoning = new LiveReasoning();
 
   constructor(
     readonly sessionId: string,
@@ -342,7 +344,8 @@ export class SessionActor {
         ? before.state.modelSettings.reasoningEffortOverride : null;
     const runWorkspaceBindings = mergeWorkspaceBindings(
       before.state.workspaceBindings,
-      (command.filesystemReferences ?? []).map((reference) => ({
+      [...before.state.messages.flatMap((message) => message.filesystemReferences.filter((reference) => reference.kind === 'file')),
+        ...(command.filesystemReferences ?? [])].map((reference) => ({
         workspaceId: reference.workspaceId,
         displayName: reference.displayName,
       })),
@@ -819,6 +822,7 @@ export class SessionActor {
           this.#assistantDraft = draft ? structuredClone(draft) : null;
           if (!this.#projectionState) throw new Error('session_projection_state_missing');
         },
+        updateReasoning: (requestId, runId, text, kind) => this.liveReasoning.append(requestId, runId, text, kind),
         nextId: this.#nextId,
       },
       signal,
