@@ -39,11 +39,14 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
   const selected = enabled.find((profile) => profile.id === selectedProfileId);
   const disabled = busy || enabled.length === 0;
   const title = selected?.name ?? t(language, 'agent.profile.selectionRequired');
+  const effectiveEffort = reasoningEffortOverride ?? selected?.reasoningEffort;
+  const selectorEffortLabel = selected && selected.thinking !== 'disabled' && effectiveEffort
+    ? t(language, `settings.llm.effort.${effectiveEffort}`)
+    : null;
   const effortLabel = selected?.thinking === 'disabled'
     ? t(language, 'agent.profile.thinkingDisabled')
-    : reasoningEffortOverride
-      ? t(language, `settings.llm.effort.${reasoningEffortOverride}`)
-      : t(language, 'agent.profile.followDefault');
+    : selectorEffortLabel ?? t(language, 'agent.profile.followDefault');
+  const selectionLabel = selectorEffortLabel ? `${title} · ${selectorEffortLabel}` : title;
   const closeMenu = () => { setMenu(null); triggerRef.current?.focus(); };
   useEffect(() => {
     if (!menu) return undefined;
@@ -85,10 +88,12 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
         onToggle={() => { setMenu(null); setContextOpen((open) => !open); }}
       />
       <button ref={triggerRef} type="button" className="deepcode-session-model__selector"
-        title={title} disabled={disabled} aria-label={`${t(language, 'agent.profile.selector')}：${title}`}
+        title={selectionLabel} disabled={disabled} aria-label={`${t(language, 'agent.profile.selector')}：${selectionLabel}`}
         aria-haspopup="menu" aria-expanded={menu !== null} aria-controls={menu ? menuId : undefined}
         onClick={() => { setContextOpen(false); setMenu((current) => current ? null : 'models'); }}>
-        <span>{title}</span><span aria-hidden="true">⌄</span>
+        <span>{title}</span>
+        {selectorEffortLabel && <span className="deepcode-session-model__selector-effort">{selectorEffortLabel}</span>}
+        <span aria-hidden="true">⌄</span>
       </button>
       {menu && (
         <div ref={menuRef} id={menuId} role="menu" className="deepcode-session-model__menu"
