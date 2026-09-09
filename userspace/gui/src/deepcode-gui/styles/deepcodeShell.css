@@ -1602,9 +1602,20 @@
 }
 
 .deepcode-session-model__selector > span:first-child {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.deepcode-session-model__selector-effort {
+  flex-shrink: 0;
+  color: var(--dc-muted);
+  white-space: nowrap;
+}
+
+.deepcode-session-model__selector > span:last-child {
+  flex-shrink: 0;
 }
 
 .deepcode-session-model__selector[aria-expanded="true"] {
