@@ -785,6 +785,7 @@ fn builtin_binding_identity(config: &KernelExecutorConfig) -> Result<String, Too
         "webSearchEndpointTemplate": config.web_search_endpoint_template,
         "webSearchAuthHeaderName": config.web_search_auth_header_name,
         "webSearchAuthSecretRef": config.web_search_auth_secret_ref,
+        "cloudWebSearch": config.cloud_web_search,
     }))
     .map_err(|error| ToolCatalogError::new("builtin_binding_encode_failed", error.to_string()))?;
     Ok(format!("builtin-binding:{}", hash_bytes(&encoded)))
@@ -857,12 +858,14 @@ mod tests {
                 web_search_endpoint_template: String::new(),
                 web_search_auth_header_name: "Authorization".to_string(),
                 web_search_auth_secret_ref: "local-secret:brave".to_string(),
+                ..Default::default()
             },
             KernelExecutorConfig {
                 web_search_endpoint_template: "https://search.example/v1?q={query}&limit={limit}"
                     .to_string(),
                 web_search_auth_header_name: "Authorization".to_string(),
                 web_search_auth_secret_ref: String::new(),
+                ..Default::default()
             },
         ] {
             let provider =
@@ -891,6 +894,7 @@ mod tests {
                 web_search_endpoint_template: String::new(),
                 web_search_auth_header_name: "X-Subscription-Token".to_string(),
                 web_search_auth_secret_ref: "local-secret:brave".to_string(),
+                ..Default::default()
             },
             Arc::new(EmptySecretProvider),
             false,

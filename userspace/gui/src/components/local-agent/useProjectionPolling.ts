@@ -5,37 +5,40 @@ export function useProjectionPolling(
   projectionPollingActive: boolean,
   refresh: () => Promise<void>,
 ) {
-  useEffect(() => {
-    let cancelled = false;
-    let timeout: number | null = null;
+  useEffect(() => startProjectionPolling(projectionPollingActive, refresh), [projectionPollingActive, refresh, sessionId]);
+}
 
-    const schedule = () => {
-      if (cancelled || timeout !== null) return;
-      const delay = document.visibilityState === 'hidden'
-        ? 10_000
-        : projectionPollingActive
-          ? 750
-          : 4_000;
-      timeout = window.setTimeout(() => {
-        timeout = null;
-        void refresh().finally(schedule);
-      }, delay);
-    };
-    const refreshWhenVisible = () => {
-      if (document.visibilityState !== 'visible') return;
-      if (timeout !== null) window.clearTimeout(timeout);
+/** One in-flight snapshot read; visibility changes never create a second polling chain. */
+export function startProjectionPolling(active: boolean, refresh: () => Promise<void>): () => void {
+  let cancelled = false;
+  let refreshing = false;
+  let timeout: number | null = null;
+  const schedule = () => {
+    if (cancelled || refreshing || timeout !== null) return;
+    const delay = document.visibilityState === 'hidden' ? 10_000 : active ? 120 : 4_000;
+    timeout = window.setTimeout(() => {
       timeout = null;
-      void refresh().finally(schedule);
-    };
-
-    schedule();
-    document.addEventListener('visibilitychange', refreshWhenVisible);
-    return () => {
-      cancelled = true;
-      document.removeEventListener('visibilitychange', refreshWhenVisible);
-      if (timeout !== null) window.clearTimeout(timeout);
-    };
-  }, [projectionPollingActive, refresh, sessionId]);
+      poll();
+    }, delay);
+  };
+  const poll = () => {
+    if (cancelled || refreshing) return;
+    refreshing = true;
+    void refresh().finally(() => { refreshing = false; schedule(); });
+  };
+  const visibilityChanged = () => {
+    if (timeout !== null) window.clearTimeout(timeout);
+    timeout = null;
+    if (document.visibilityState === 'visible') poll();
+    else schedule();
+  };
+  schedule();
+  document.addEventListener('visibilitychange', visibilityChanged);
+  return () => {
+    cancelled = true;
+    document.removeEventListener('visibilitychange', visibilityChanged);
+    if (timeout !== null) window.clearTimeout(timeout);
+  };
 }
 
 export function useProfilesUpdated(refreshProfiles: () => Promise<void>) {

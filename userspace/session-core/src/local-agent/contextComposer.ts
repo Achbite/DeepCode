@@ -76,6 +76,20 @@ export async function buildAgentProviderRequest(input: {
       || effect === 'workspaceMutation'
       || effect === 'process'
     )));
+  const hostedTools: ProviderRequest['hostedTools'] = input.runtime.webSearch.owner === 'providerHosted'
+    ? [{ type: 'webSearch', providerToolType: input.runtime.webSearch.providerToolType }]
+    : [];
+  const controlTools = hasWorkspaceBindings
+    ? sessionControlToolDefinitions()
+    : sessionControlToolDefinitions().filter((tool) => (
+      tool.name === SESSION_CONTROL_INTERACTION_REQUEST
+    ));
+  const toolCodec = createProviderToolCodec(
+    runtimeTools,
+    controlTools,
+    input.runtime.providerToolAliases,
+    input.workspaceBindings,
+  );
   const journalMessages = messagesFromJournal(input.events, input.runId, input.workspaceBindings);
   const contextMessages = (
     await Promise.all(input.contextProviders.map(async (provider) => (
@@ -97,8 +111,9 @@ export async function buildAgentProviderRequest(input: {
     }));
   const toolGuidance = renderActiveToolGuidance(
     input.runtime.toolPromptContributions,
-    input.runtime.providerToolAliases,
+    toolCodec.receiptTools,
     runtimeTools,
+    hostedTools,
   );
   if (toolGuidance) {
     const stableCoreIndex = instructions.findIndex((instruction) => (
@@ -144,17 +159,6 @@ export async function buildAgentProviderRequest(input: {
     messages: [...instructions, ...contextMessages, ...journalMessages],
   });
   assertContextContributions(selected);
-  const controlTools = hasWorkspaceBindings
-    ? sessionControlToolDefinitions()
-    : sessionControlToolDefinitions().filter((tool) => (
-      tool.name === SESSION_CONTROL_INTERACTION_REQUEST
-    ));
-  const toolCodec = createProviderToolCodec(
-    runtimeTools,
-    controlTools,
-    input.runtime.providerToolAliases,
-    input.workspaceBindings,
-  );
   const journalCodecsByCallId = providerMessageCodecsByCallId(input.events);
   const providerSelected = selected.map<ContextMessageContribution>((contribution) => ({
     ...contribution,
@@ -173,9 +177,7 @@ export async function buildAgentProviderRequest(input: {
     workspaceBindings: input.workspaceBindings.map((binding) => ({ ...binding })),
     messages: providerSelected.map((item) => cloneModelMessage(item.message)),
     tools: toolCodec.definitions,
-    hostedTools: input.runtime.webSearch.owner === 'providerHosted'
-      ? [{ type: 'webSearch', providerToolType: input.runtime.webSearch.providerToolType }]
-      : [],
+    hostedTools,
   };
   const hostedReceiptTools: ContextCompositionTool[] = request.hostedTools.map((tool) => ({
     itemId: 'web.search',
@@ -434,6 +436,18 @@ export function messagesFromJournal(
             sourcePlanId: todoList.sourcePlanId,
             sourcePlanRevision: todoList.sourcePlanRevision,
             items: todoList.items,
+          }),
+        },
+      });
+    } else if (event.type === 'plan.completed') {
+      messages.push({
+        contributionId: `plan-completed:${event.eventId}`,
+        contributionKind: 'journalMessages', label: 'Plan phase completed',
+        message: {
+          role: 'user',
+          content: JSON.stringify({
+            type: 'plan.completed', ...event.payload,
+            nextAction: 'All current Todo steps are completed. Plan progress is closed. Provide the final explanation; publish a complete revision only if new scope is required.',
           }),
         },
       });

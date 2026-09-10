@@ -1,8 +1,11 @@
-import React, { createContext, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, memo, useContext, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Fragment, jsx, jsxs } from 'react/jsx-runtime';
 import { toJsxRuntime } from 'hast-util-to-jsx-runtime';
 import { CodeContent, ImageContent, MermaidContent } from './RichContent';
+import { MarkdownTable } from './MarkdownTable';
 import { StreamingMarkdownParser, type MarkdownBlock } from './streamingMarkdown';
+import { StreamingTextBuffer } from './streamingText';
+import type { ElementContent, Root, RootContent } from 'hast';
 import './richContent.css';
 import 'katex/dist/katex.min.css';
 
@@ -17,7 +20,7 @@ const COMPONENTS = {
     return language === 'mermaid' && !streaming
       ? <MermaidContent source={code} /> : <CodeContent code={code} language={language} streaming={streaming} />;
   },
-  table: function MarkdownTable({ children }: { children?: React.ReactNode }) { return <div className="conversation-table"><table>{children}</table></div>; },
+  table: MarkdownTable,
   img: function MarkdownImage({ src, alt }: { src?: string; alt?: string }) { return <ImageContent source={src ?? ''} alt={alt ?? ''} />; },
 };
 
@@ -31,23 +34,50 @@ export const MarkdownContent = memo(function MarkdownContent({ children, streami
   return <div className="conversation-markdown">{blocks.map((block) => <RenderedBlock key={block.key} block={block} />)}</div>;
 });
 
-/** Coalesce real deltas once per frame; do not put another typewriter queue behind the Provider. */
+/** Inline fields share the Markdown grammar, without nested links or block layout in buttons/headings. */
+export const MarkdownInline = memo(function MarkdownInline({ children }: { children: string }) {
+  const tree = useMemo(() => {
+    const blocks = new StreamingMarkdownParser().update(children, false);
+    const inline = (node: RootContent): ElementContent[] => {
+      if (node.type === 'text') return [node];
+      if (node.type !== 'element') return [];
+      const descendants = node.children.flatMap(inline);
+      return ['strong', 'em', 'del', 'code', 'br'].includes(node.tagName)
+        ? [{ ...node, children: descendants }] : descendants;
+    };
+    return { type: 'root', children: blocks.flatMap((block) => block.tree.children.flatMap(inline)) } as Root;
+  }, [children]);
+  return <span className="conversation-markdown-inline">{toJsxRuntime(tree, { Fragment, jsx, jsxs })}</span>;
+});
+
+/** Smooth snapshot-sized deltas over a short, bounded window without a character-rate backlog. */
 export const BufferedMarkdown = memo(function BufferedMarkdown({ text, streamIdentity, streaming = true, onDisplayed }: {
   text: string;
   streamIdentity: string;
   streaming?: boolean;
   onDisplayed?(identity: string, text: string): void;
 }) {
-  const [visible, setVisible] = useState({ identity: streamIdentity, text });
-  const latest = useRef({ identity: streamIdentity, text });
-  const frame = useRef<number | null>(null);
+  const playback = useRef({ identity: streamIdentity, buffer: new StreamingTextBuffer(streaming ? '' : text) });
+  const [visible, setVisible] = useState({ identity: streamIdentity, text: playback.current.buffer.text });
   useLayoutEffect(() => {
-    latest.current = { identity: streamIdentity, text };
-    if (visible.identity === streamIdentity && visible.text === text || frame.current !== null) return;
-    frame.current = requestAnimationFrame(() => { frame.current = null; setVisible(latest.current); });
-  }, [streamIdentity, text, visible]);
-  useEffect(() => () => { if (frame.current !== null) cancelAnimationFrame(frame.current); }, []);
-  const displayed = visible.identity === streamIdentity ? visible.text : text;
+    if (playback.current.identity !== streamIdentity) {
+      playback.current = { identity: streamIdentity, buffer: new StreamingTextBuffer(streaming ? '' : text) };
+    }
+    const { buffer } = playback.current;
+    buffer.update(text, performance.now());
+    let frame: number | null = null;
+    const publish = () => setVisible((current) => current.identity === streamIdentity && current.text === buffer.text
+      ? current : { identity: streamIdentity, text: buffer.text });
+    const tick = (now: number) => {
+      buffer.advance(now);
+      publish();
+      frame = buffer.complete ? null : requestAnimationFrame(tick);
+    };
+    publish();
+    if (!buffer.complete) frame = requestAnimationFrame(tick);
+    return () => { if (frame !== null) cancelAnimationFrame(frame); };
+  }, [streamIdentity, text, streaming]);
+  const displayed = visible.identity === streamIdentity ? visible.text : streaming ? '' : text;
   const caughtUp = displayed === text;
   useLayoutEffect(() => {
     if (!streaming && caughtUp) onDisplayed?.(streamIdentity, displayed);

@@ -34,27 +34,26 @@ export const GLM_OPENAI_BASE_URL = 'https://open.bigmodel.cn/api/paas/v4';
 export const KIMI_OPENAI_BASE_URL = 'https://api.moonshot.ai/v1';
 
 export const DEEPSEEK_LLM_MODEL_OPTIONS = [
-  'deepseek-v4-flash',
+  'deepseek-flash',
   'deepseek-v4-pro',
 ] as const;
 
-export const GLM_LLM_MODEL_OPTIONS = ['glm-5.2', 'glm-5.1', 'glm-5'] as const;
-export const KIMI_LLM_MODEL_OPTIONS = ['kimi-k2.6', 'kimi-k2.5'] as const;
+export const GLM_LLM_MODEL_OPTIONS = ['glm-5.3', 'glm-5.2', 'glm-5.1'] as const;
+export const KIMI_LLM_MODEL_OPTIONS = ['kimi-k3', 'kimi-k2.7-code', 'kimi-k2.7-code-highspeed', 'kimi-k2.6'] as const;
 
 export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
   {
     id: 'deepseek-v4-flash-openai',
-    name: 'DeepSeek V4 Flash',
+    name: 'DeepSeek Flash',
     kind: 'responses',
     providerFlavor: 'deepseek',
     baseUrl: DEEPSEEK_OPENAI_BASE_URL,
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-flash',
     contextWindowTokens: 1000000,
     maxOutputTokens: 384000,
     temperature: 0.2,
     reasoningEffort: 'high',
     thinking: 'enabled',
-    hostedWebSearch: 'web_search',
     enabled: true,
   },
   {
@@ -69,7 +68,6 @@ export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
     temperature: 0.2,
     reasoningEffort: 'max',
     thinking: 'enabled',
-    hostedWebSearch: 'web_search',
     enabled: true,
   },
 ];

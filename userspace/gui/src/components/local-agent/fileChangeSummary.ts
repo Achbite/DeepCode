@@ -1,9 +1,38 @@
 import type { ActivityProjection, FileChangeProjection, SessionProjection } from '@deepcode/protocol';
-import type { readFileChange } from '../../services/localAgentApi';
+import { isBinaryFileChange, type readFileChange } from '../../services/localAgentApi';
 
 export type Change = { change: FileChangeProjection; index: number; recordId: string };
 export type ChangedFile = { key: string; path: string; changes: Change[] };
 export type ChangeCounts = { added: number; removed: number };
+export type FileChangeStatistics = { kind: 'text'; counts: ChangeCounts } | { kind: 'binary' };
+
+// Only immutable, successfully classified revisions are retained; aborted and failed reads are not cached.
+const statisticsCaches = new WeakMap<typeof readFileChange, Map<string, FileChangeStatistics>>();
+const MAX_CACHED_STATISTICS = 512;
+
+export async function readChangeStatistics(
+  read: typeof readFileChange, sessionId: string, file: ChangedFile, signal: AbortSignal,
+  count = countChangedLines,
+): Promise<FileChangeStatistics> {
+  signal.throwIfAborted();
+  let cache = statisticsCaches.get(read);
+  if (!cache) { cache = new Map(); statisticsCaches.set(read, cache); }
+  const key = JSON.stringify([sessionId, file.key, file.changes.map(({ recordId, index }) => [recordId, index])]);
+  const cached = cache.get(key);
+  if (cached) { cache.delete(key); cache.set(key, cached); return cached; }
+  let result: FileChangeStatistics;
+  try {
+    const change = await readRoundChange(read, sessionId, file, signal);
+    result = { kind: 'text', counts: await count(change.before, change.after, signal) };
+  } catch (error) {
+    if (!isBinaryFileChange(error)) throw error;
+    result = { kind: 'binary' };
+  }
+  signal.throwIfAborted();
+  cache.set(key, result);
+  if (cache.size > MAX_CACHED_STATISTICS) cache.delete(cache.keys().next().value!);
+  return result;
+}
 
 export function roundChangeActivities(projection: SessionProjection | null, runId: string): ActivityProjection[] {
   const records = new Set(projection?.fileChangeRounds?.find((round) => round.runId === runId)?.recordIds ?? []);

@@ -151,6 +151,7 @@ export type PlanOperation =
 
 export interface ExecutionPlanStep {
   stepId: string;
+  /** Inline Markdown for display; stepId remains the task identity. */
   title: string;
   details: string;
   verification?: string[];
@@ -159,6 +160,7 @@ export interface ExecutionPlanStep {
 export interface ExecutionPlan {
   planId: string;
   revision: number;
+  /** Inline Markdown, never an execution or authorization input. */
   title: string;
   summary: string;
   steps: ExecutionPlanStep[];
@@ -825,6 +827,8 @@ interface ProjectionMessageBase {
   feedback: MessageFeedback | null;
   sequence: number;
   createdAt: string;
+  /** Derived from the matching input command and resolved interaction in the Session journal. */
+  replyToInteraction?: { interactionId: string; prompt: string };
 }
 
 export type ProjectionMessage = ProjectionMessageBase & (

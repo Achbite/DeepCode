@@ -208,10 +208,16 @@ impl LocalAgentRuntime {
         .map_err(|message| {
             RunPreparationError::new("kernel_runtime_identity_prepare_failed", message)
         })?;
-        let (executor_config, secrets) =
+        let (mut executor_config, mut secrets) =
             crate::runtime_tool_configuration(&gui).map_err(|message| {
                 RunPreparationError::new("kernel_runtime_config_prepare_failed", message)
             })?;
+        crate::local_agent_search::bind_cloud_search(
+            &mut executor_config,
+            &mut secrets,
+            &provider_binding.profile(),
+            &provider_runtime.profile_id,
+        );
         let permissions = LocalAgentPermissionPolicy::from_settings(settings)
             .map_err(RunPreparationError::from)?;
         let web_search = prepare_web_search_binding(
@@ -883,7 +889,28 @@ pub(crate) async fn local_agent_provider_stream(
         "hostedTools": body.hosted_tools,
         "requireToolCall": body.response_constraint == "toolRequired",
     });
-    local_agent_provider_stream_response(runtime.profile(), request_envelope, request_id)
+    let archive_directory = state
+        .local_agent
+        .kernel
+        .session_output_directory(&body.session_id)
+        .join(format!(
+            "provider-{}",
+            deepcode_kernel_tools::hash_bytes(request_id.as_bytes())
+        ));
+    let archive_identity = json!({
+        "sessionId": body.session_id,
+        "runId": body.run_id,
+        "requestId": request_id,
+        "purpose": body.purpose,
+        "profileId": body.profile_id,
+    });
+    local_agent_provider_stream_response(
+        runtime.profile(),
+        request_envelope,
+        request_id,
+        archive_directory,
+        archive_identity,
+    )
 }
 
 fn valid_provider_text(value: &str) -> bool {

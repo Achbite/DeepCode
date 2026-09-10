@@ -1,3 +1,4 @@
+import { MarkdownInline } from '../../components/local-agent/BufferedMarkdown';
 import React from 'react';
 import type { SessionProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
@@ -36,7 +37,7 @@ const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, project
               >
                 <span className="deepcode-gui-task-item__dot" aria-hidden="true" />
                 <div>
-                  <div className="deepcode-gui-task-item__title">{todo.label}</div>
+                  <div className="deepcode-gui-task-item__title"><MarkdownInline>{todo.label}</MarkdownInline></div>
                 </div>
                 <strong>{todoStatus(todo.status, language)}</strong>
               </div>

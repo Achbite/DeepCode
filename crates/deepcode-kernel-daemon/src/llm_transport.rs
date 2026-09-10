@@ -335,11 +335,24 @@ pub(crate) fn openai_compatible_request_body(
             body["temperature"] = json!(temperature);
         }
     }
-    if let Some(effort) = profile.reasoning_effort.as_ref() {
+    let kimi_k3 = compatibility == ProviderThinkingCompatibility::Moonshot
+        && profile.model.starts_with("kimi-k3");
+    if let Some(effort) = profile
+        .reasoning_effort
+        .as_ref()
+        .filter(|_| compatibility != ProviderThinkingCompatibility::Moonshot || kimi_k3)
+    {
         body["reasoning_effort"] = json!(effort);
     }
-    if let Some(thinking) = profile.thinking.as_ref() {
-        body["thinking"] = json!({ "type": thinking });
+    if let Some(thinking) = profile.thinking.as_ref().filter(|_| !kimi_k3) {
+        body["thinking"] = if compatibility == ProviderThinkingCompatibility::Moonshot
+            && profile.model.starts_with("kimi-k2.7-code")
+            && thinking == "enabled"
+        {
+            json!({ "type": "enabled", "keep": "all" })
+        } else {
+            json!({ "type": thinking })
+        };
     }
     if compatibility == ProviderThinkingCompatibility::Glm && stream && !tools.is_empty() {
         body["tool_stream"] = json!(true);
@@ -359,6 +372,7 @@ pub(crate) fn openai_compatible_request_body(
         if require_tool_call
             && !(compatibility == ProviderThinkingCompatibility::DeepSeek
                 && profile.thinking.as_deref() == Some("enabled"))
+            && !(compatibility == ProviderThinkingCompatibility::Moonshot && !kimi_k3)
         {
             body["tool_choice"] = json!("required");
         }
@@ -660,6 +674,7 @@ fn openai_compatible_message(
                 output[if matches!(
                     compatibility,
                     ProviderThinkingCompatibility::DeepSeek
+                        | ProviderThinkingCompatibility::Glm
                         | ProviderThinkingCompatibility::Moonshot
                 ) {
                     "reasoning_content"
@@ -699,13 +714,30 @@ fn openai_compatible_message(
                 .get("providerCallId")
                 .and_then(Value::as_str)
                 .expect("validated tool message has providerCallId"),
-            "content": message_content_string(record.get("content"))
+            "content": provider_tool_content(record.get("content"), compatibility)
         }),
         _ => json!({
             "role": role,
             "content": message_content_string(record.get("content"))
         }),
     }
+}
+
+fn provider_tool_content(
+    content: Option<&Value>,
+    compatibility: ProviderThinkingCompatibility,
+) -> String {
+    let text = message_content_string(content);
+    if compatibility == ProviderThinkingCompatibility::Moonshot {
+        if let Ok(result) = serde_json::from_str::<Value>(&text) {
+            if result["outcome"] == "completed" && result["output"]["provider"] == "kimi-formula" {
+                if let Some(output) = result["output"]["providerContent"].as_str() {
+                    return output.to_string();
+                }
+            }
+        }
+    }
+    text
 }
 
 fn openai_tool_call(value: &Value) -> Option<Value> {
@@ -885,16 +917,20 @@ fn prepare_provider_request(
     })
 }
 
-fn build_provider_request(
-    profile: &ResolvedLlmProfile,
-    prepared: &PreparedProviderRequest,
-) -> Result<reqwest::RequestBuilder, ProviderTransportError> {
-    let url = match prepared.kind {
+fn provider_request_url(profile: &ResolvedLlmProfile, kind: ProviderStreamKind) -> String {
+    match kind {
         ProviderStreamKind::OpenAiCompatible => normalize_openai_base_url(profile),
         ProviderStreamKind::Responses => normalize_responses_base_url(profile),
         ProviderStreamKind::Anthropic => normalize_anthropic_base_url(profile),
         ProviderStreamKind::Ollama => normalize_ollama_base_url(profile),
-    };
+    }
+}
+
+fn build_provider_request(
+    profile: &ResolvedLlmProfile,
+    prepared: &PreparedProviderRequest,
+) -> Result<reqwest::RequestBuilder, ProviderTransportError> {
+    let url = provider_request_url(profile, prepared.kind);
     let mut request = reqwest::Client::new()
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -1102,94 +1138,192 @@ pub(crate) fn local_agent_provider_stream_response(
     profile: ResolvedLlmProfile,
     request_envelope: Value,
     request_id: String,
+    archive_directory: std::path::PathBuf,
+    archive_identity: Value,
 ) -> Response {
     let response_request_id = request_id.clone();
     let stream = async_stream::stream! {
-        let prepared = match prepare_provider_request(&profile, &request_envelope) {
-            Ok(prepared) => prepared,
+        let mut archive = match deepcode_kernel_runtime::execution_archive::ExecutionArchive::open(
+            Some(&archive_directory),
+            archive_identity,
+        ) {
+            Ok(archive) => archive,
             Err(error) => {
                 yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(
                     &request_id,
                     "failed",
-                    json!({ "code": error.code, "message": error.safe_message() }),
+                    json!({"code": "execution_archive_failed", "message": error.to_string()}),
                 )));
                 return;
             }
         };
-        let kind = prepared.kind;
-        let request = match build_provider_request(&profile, &prepared) {
-            Ok(request) => request,
+        let prepared = match prepare_provider_request(&profile, &request_envelope) {
+            Ok(prepared) => prepared,
             Err(error) => {
-                yield Ok(Bytes::from(provider_event(
+                let (packet, archive_failed) = archived_provider_event(
+                    &mut archive,
                     &request_id,
                     "failed",
                     json!({ "code": error.code, "message": error.safe_message() }),
-                )));
+                );
+                yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+                if archive_failed {
+                    return;
+                }
+                return;
+            }
+        };
+        let kind = prepared.kind;
+        // Retain the wire body, never the credential-bearing profile or headers.
+        if let Err(error) = archive
+            .record(
+                "request.started",
+                json!({
+                    "method": "POST", "url": provider_request_url(&profile, kind),
+                    "model": profile.model, "apiSurface": profile.kind,
+                }),
+            )
+            .and_then(|()| archive.bytes("request.body", &prepared.body))
+        {
+            yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(
+                &request_id,
+                "failed",
+                json!({"code": "execution_archive_failed", "message": error.to_string()}),
+            )));
+            return;
+        }
+        let request = match build_provider_request(&profile, &prepared) {
+            Ok(request) => request,
+            Err(error) => {
+                let (packet, archive_failed) = archived_provider_event(
+                    &mut archive,
+                    &request_id,
+                    "failed",
+                    json!({ "code": error.code, "message": error.safe_message() }),
+                );
+                yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+                if archive_failed {
+                    return;
+                }
                 return;
             }
         };
         let mut response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
-                yield Ok(Bytes::from(provider_event(
+                let (packet, archive_failed) = archived_provider_event(
+                    &mut archive,
                     &request_id,
                     "failed",
                     json!({
                         "code": "provider_transport_failed",
                         "message": format!("Provider 连接失败：{error}"),
                     }),
-                )));
+                );
+                yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+                if archive_failed {
+                    return;
+                }
                 return;
             }
         };
+        if let Err(error) = archive.record("response.headers", json!({
+                "statusCode": response.status().as_u16(),
+                "url": response.url().as_str(),
+                "contentType": response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            })) {
+                yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(&request_id, "failed",
+                    json!({"code": "execution_archive_failed", "message": error.to_string()}))));
+                return;
+            }
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let message = provider_http_error_message(&mut response, status).await;
-            yield Ok(Bytes::from(provider_event(
+            let message = match provider_http_error_message(&mut response, status, &mut archive).await {
+                Ok(message) => message,
+                Err(error) => {
+                    yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(
+                        &request_id,
+                        "failed",
+                        json!({"code": "execution_archive_failed", "message": error.to_string()}),
+                    )));
+                    return;
+                }
+            };
+            let (packet, archive_failed) = archived_provider_event(
+                &mut archive,
                 &request_id,
                 "failed",
                 json!({
                     "code": "provider_http_failed",
                     "message": message,
                 }),
-            )));
+            );
+            yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+            if archive_failed {
+                return;
+            }
             return;
         }
         let mut framer = ProviderEnvelopeFramer::new(kind);
         let mut accumulator = ProviderStreamAccumulator::new(kind);
         'provider: loop {
             let (payloads, eof) = match response.chunk().await {
-                Ok(Some(chunk)) => match framer.push(&chunk) {
-                    Ok(payloads) => (payloads, false),
-                    Err(error) => {
-                        yield Ok(Bytes::from(provider_event(
+                Ok(Some(chunk)) => {
+                    if let Err(error) = archive.bytes("response.chunk", &chunk) {
+                        yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(
                             &request_id,
                             "failed",
-                            json!({ "code": error.code, "message": error.safe_message() }),
+                            json!({"code": "execution_archive_failed", "message": error.to_string()}),
                         )));
                         return;
                     }
-                },
+                    match framer.push(&chunk) {
+                        Ok(payloads) => (payloads, false),
+                        Err(error) => {
+                            let (packet, archive_failed) = archived_provider_event(
+                                &mut archive,
+                                &request_id,
+                                "failed",
+                                json!({ "code": error.code, "message": error.safe_message() }),
+                            );
+                            yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+                            if archive_failed {
+                                return;
+                            }
+                            return;
+                        }
+                    }
+                }
                 Ok(None) => match framer.finish() {
                     Ok(payloads) => (payloads, true),
                     Err(error) => {
-                        yield Ok(Bytes::from(provider_event(
+                        let (packet, archive_failed) = archived_provider_event(
+                            &mut archive,
                             &request_id,
                             "failed",
                             json!({ "code": error.code, "message": error.safe_message() }),
-                        )));
+                        );
+                        yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+                        if archive_failed {
+                            return;
+                        }
                         return;
                     }
                 },
                 Err(error) => {
-                    yield Ok(Bytes::from(provider_event(
+                    let (packet, archive_failed) = archived_provider_event(
+                        &mut archive,
                         &request_id,
                         "failed",
                         json!({
                             "code": "provider_stream_read_failed",
                             "message": format!("读取 Provider 流失败：{error}"),
                         }),
-                    )));
+                    );
+                    yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+                    if archive_failed {
+                        return;
+                    }
                     return;
                 }
             };
@@ -1197,11 +1331,16 @@ pub(crate) fn local_agent_provider_stream_response(
                 let emissions = match accumulator.ingest_payload(&payload) {
                     Ok(emissions) => emissions,
                     Err(error) => {
-                        yield Ok(Bytes::from(provider_event(
+                        let (packet, archive_failed) = archived_provider_event(
+                            &mut archive,
                             &request_id,
                             "failed",
                             json!({ "code": error.code, "message": error.message }),
-                        )));
+                        );
+                        yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+                        if archive_failed {
+                            return;
+                        }
                         return;
                     }
                 };
@@ -1210,11 +1349,23 @@ pub(crate) fn local_agent_provider_stream_response(
                     match event_type {
                         Some("tool_call_delta") => {
                             let mut data = emission.event;
-                            data.as_object_mut().expect("tool delta object").remove("type");
-                            yield Ok(Bytes::from(provider_event(&request_id, "tool.call.delta", data)));
+                            data.as_object_mut()
+                                .expect("tool delta object")
+                                .remove("type");
+                            let (packet, archive_failed) = archived_provider_event(
+                                &mut archive,
+                                &request_id,
+                                "tool.call.delta",
+                                data,
+                            );
+                            yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+                            if archive_failed {
+                                return;
+                            }
                         }
                         Some("text_delta") | Some("reasoning_delta") => {
-                            let Some(text) = emission.event.get("content").and_then(Value::as_str) else {
+                            let Some(text) = emission.event.get("content").and_then(Value::as_str)
+                            else {
                                 continue;
                             };
                             let provider_type = if event_type == Some("text_delta") {
@@ -1222,72 +1373,89 @@ pub(crate) fn local_agent_provider_stream_response(
                             } else {
                                 "reasoning.delta"
                             };
-                            let mut data = match emission
-                                .event
-                                .get("output_index")
-                                .and_then(Value::as_i64)
-                            {
-                                Some(output_index) => {
-                                    json!({ "text": text, "outputIndex": output_index })
-                                }
-                                None => json!({ "text": text }),
-                            };
-                            if emission.event.get("kind").and_then(Value::as_str) == Some("summary") { data["kind"] = json!("summary"); }
-                            yield Ok(Bytes::from(provider_event(
-                                &request_id,
-                                provider_type,
-                                data,
-                            )));
+                            let mut data =
+                                match emission.event.get("output_index").and_then(Value::as_i64) {
+                                    Some(output_index) => {
+                                        json!({ "text": text, "outputIndex": output_index })
+                                    }
+                                    None => json!({ "text": text }),
+                                };
+                            if emission.event.get("kind").and_then(Value::as_str) == Some("summary") {
+                                data["kind"] = json!("summary");
+                            }
+                            let (packet, archive_failed) =
+                                archived_provider_event(&mut archive, &request_id, provider_type, data);
+                            yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+                            if archive_failed {
+                                return;
+                            }
                         }
                         Some("output_item_completed") => {
-                            let Some(output_index) = emission
-                                .event
-                                .get("output_index")
-                                .and_then(Value::as_i64)
+                            let Some(output_index) =
+                                emission.event.get("output_index").and_then(Value::as_i64)
                             else {
-                                yield Ok(Bytes::from(provider_event(
+                                let (packet, archive_failed) = archived_provider_event(
+                                    &mut archive,
                                     &request_id,
                                     "failed",
                                     json!({
                                         "code": "provider_stream_emission_invalid",
                                         "message": "Kernel 流解析器产生了缺少 output_index 的完成项。",
                                     }),
-                                )));
+                                );
+                                yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+                                if archive_failed {
+                                    return;
+                                }
                                 return;
                             };
                             let Some(item) = emission.event.get("item") else {
-                                yield Ok(Bytes::from(provider_event(
+                                let (packet, archive_failed) = archived_provider_event(
+                                    &mut archive,
                                     &request_id,
                                     "failed",
                                     json!({
                                         "code": "provider_stream_emission_invalid",
                                         "message": "Kernel 流解析器产生了缺少 item 的完成项。",
                                     }),
-                                )));
+                                );
+                                yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+                                if archive_failed {
+                                    return;
+                                }
                                 return;
                             };
-                            if item.get("type").and_then(Value::as_str)
-                                == Some("web_search_call")
+                            if item.get("type").and_then(Value::as_str) == Some("web_search_call")
                                 && !prepared.hosted_web_search_enabled
                             {
-                                yield Ok(Bytes::from(provider_event(
+                                let (packet, archive_failed) = archived_provider_event(
+                                    &mut archive,
                                     &request_id,
                                     "failed",
                                     json!({
                                         "code": "provider_hosted_search_unrequested",
                                         "message": "Provider 返回了当前请求未启用的 hosted search 事实。",
                                     }),
-                                )));
+                                );
+                                yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+                                if archive_failed {
+                                    return;
+                                }
                                 return;
                             }
-                            yield Ok(Bytes::from(provider_event(
+                            let (packet, archive_failed) = archived_provider_event(
+                                &mut archive,
                                 &request_id,
                                 "output.item.completed",
                                 json!({
                                     "outputIndex": output_index,
                                     "item": item,
                                 }),
-                            )));
+                            );
+                            yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+                            if archive_failed {
+                                return;
+                            }
                         }
                         _ => {}
                     }
@@ -1300,35 +1468,43 @@ pub(crate) fn local_agent_provider_stream_response(
         let result = match accumulator.finalize_for_request(&request_id) {
             Ok(result) => result,
             Err(error) => {
-                yield Ok(Bytes::from(provider_event(
+                let (packet, archive_failed) = archived_provider_event(
+                    &mut archive,
                     &request_id,
                     "failed",
                     json!({ "code": error.code, "message": error.message }),
-                )));
+                );
+                yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+                if archive_failed {
+                    return;
+                }
                 return;
             }
         };
-        if !prepared.hosted_web_search_enabled
-            && !result.output.hosted_web_search_calls.is_empty()
-        {
-            yield Ok(Bytes::from(provider_event(
+        if !prepared.hosted_web_search_enabled && !result.output.hosted_web_search_calls.is_empty() {
+            let (packet, archive_failed) = archived_provider_event(
+                &mut archive,
                 &request_id,
                 "failed",
                 json!({
                     "code": "provider_hosted_search_unrequested",
                     "message": "Provider 返回了当前请求未启用的 hosted search 事实。",
                 }),
-            )));
+            );
+            yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+            if archive_failed {
+                return;
+            }
             return;
         }
         if result.completion.provider_kind != ProviderStreamKind::Responses
             && (!result.output.content.is_empty()
-            || result
-                .output
-                .reasoning
-                .as_deref()
-                .is_some_and(|reasoning| !reasoning.trim().is_empty())
-            || !result.output.tool_calls.is_empty())
+                || result
+                    .output
+                    .reasoning
+                    .as_deref()
+                    .is_some_and(|reasoning| !reasoning.trim().is_empty())
+                || !result.output.tool_calls.is_empty())
         {
             let mut message = json!({
                 "messageId": format!("provider-message:{request_id}"),
@@ -1350,11 +1526,12 @@ pub(crate) fn local_agent_provider_stream_response(
             {
                 message["reasoningSignature"] = json!(signature);
             }
-            yield Ok(Bytes::from(provider_event(
-                &request_id,
-                "assistant.message",
-                message,
-            )));
+            let (packet, archive_failed) =
+                archived_provider_event(&mut archive, &request_id, "assistant.message", message);
+            yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+            if archive_failed {
+                return;
+            }
         }
         let completed_data = match (result.completion.usage, profile.context_window_tokens) {
             (Some(usage), Some(context_window_tokens)) => {
@@ -1363,10 +1540,9 @@ pub(crate) fn local_agent_provider_stream_response(
                     "outputTokens": usage.output_tokens,
                     "contextWindowTokens": context_window_tokens,
                 });
-                if let (Some(cache_read), Some(cache_miss)) = (
-                    usage.cache_read_input_tokens,
-                    usage.cache_miss_input_tokens,
-                ) {
+                if let (Some(cache_read), Some(cache_miss)) =
+                    (usage.cache_read_input_tokens, usage.cache_miss_input_tokens)
+                {
                     usage_data["cacheReadInputTokens"] = json!(cache_read);
                     usage_data["cacheMissInputTokens"] = json!(cache_miss);
                 }
@@ -1376,7 +1552,8 @@ pub(crate) fn local_agent_provider_stream_response(
         };
         if result.completion.provider_kind != ProviderStreamKind::Responses {
             for call in result.output.tool_calls {
-                yield Ok(Bytes::from(provider_event(
+                let (packet, archive_failed) = archived_provider_event(
+                    &mut archive,
                     &request_id,
                     "tool.call",
                     json!({
@@ -1384,21 +1561,31 @@ pub(crate) fn local_agent_provider_stream_response(
                         "name": call.name,
                         "input": call.arguments,
                     }),
-                )));
+                );
+                yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+                if archive_failed {
+                    return;
+                }
             }
             for item in result.output.hosted_web_search_calls {
-                yield Ok(Bytes::from(provider_event(
+                let (packet, archive_failed) = archived_provider_event(
+                    &mut archive,
                     &request_id,
                     "hosted.web-search.completed",
                     json!({ "item": item }),
-                )));
+                );
+                yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+                if archive_failed {
+                    return;
+                }
             }
         }
-        yield Ok(Bytes::from(provider_event(
-            &request_id,
-            "completed",
-            completed_data,
-        )));
+        let (packet, archive_failed) =
+            archived_provider_event(&mut archive, &request_id, "completed", completed_data);
+        yield Ok::<Bytes, Infallible>(Bytes::from(packet));
+        if archive_failed {
+            return;
+        }
     };
     Response::builder()
         .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
@@ -1416,21 +1603,65 @@ pub(crate) fn local_agent_provider_stream_response(
         })
 }
 
-async fn provider_http_error_message(response: &mut reqwest::Response, status: u16) -> String {
+// Archive the same envelope that is delivered to Session, preserving outputIndex
+// and event ordering. A failed archive write terminates this transport explicitly.
+fn archived_provider_event(
+    archive: &mut deepcode_kernel_runtime::execution_archive::ExecutionArchive,
+    request_id: &str,
+    event_type: &str,
+    data: Value,
+) -> (String, bool) {
+    let written = archive
+        .record("session.event", json!({"type": event_type, "data": &data}))
+        .and_then(|()| {
+            if matches!(event_type, "completed" | "failed") {
+                archive.finish(event_type, json!({}))
+            } else {
+                Ok(())
+            }
+        });
+    match written {
+        Ok(()) => (provider_event(request_id, event_type, data), false),
+        Err(error) => (
+            provider_event(
+                request_id,
+                "failed",
+                json!({
+                    "code": "execution_archive_failed", "message": error.to_string(),
+                }),
+            ),
+            true,
+        ),
+    }
+}
+
+async fn provider_http_error_message(
+    response: &mut reqwest::Response,
+    status: u16,
+    archive: &mut deepcode_kernel_runtime::execution_archive::ExecutionArchive,
+) -> std::io::Result<String> {
     let mut body = Vec::new();
     while body.len() < PROVIDER_ERROR_BODY_LIMIT {
         match response.chunk().await {
             Ok(Some(chunk)) => {
+                archive.bytes("response.chunk", &chunk)?;
                 let remaining = PROVIDER_ERROR_BODY_LIMIT - body.len();
                 body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
             }
             Ok(None) | Err(_) => break,
         }
     }
-    match provider_http_error_detail(&body) {
+    archive.record(
+        "response.error-body.read",
+        json!({
+            "retainedBytes": body.len(), "readLimitBytes": PROVIDER_ERROR_BODY_LIMIT,
+            "limitReached": body.len() == PROVIDER_ERROR_BODY_LIMIT,
+        }),
+    )?;
+    Ok(match provider_http_error_detail(&body) {
         Some(detail) => format!("Provider 返回 HTTP {status}：{detail}"),
         None => format!("Provider 返回 HTTP {status}。"),
-    }
+    })
 }
 
 fn provider_http_error_detail(body: &[u8]) -> Option<String> {
@@ -1813,6 +2044,180 @@ mod tests {
         .expect_err("invalid hosted tool must fail");
 
         assert_eq!(error.code, "provider_hosted_tool_invalid");
+    }
+
+    #[test]
+    fn kimi_formula_result_is_replayed_verbatim_only_for_moonshot() {
+        let encrypted =
+            "----MOONSHOT ENCRYPTED BEGIN----opaque\nbytes----MOONSHOT ENCRYPTED END----";
+        let content = json!(
+            json!({"recordId":"record:1", "outcome":"completed", "output": {
+                "provider":"kimi-formula", "providerContent":encrypted, "responseId":"fiber:1"
+            }})
+            .to_string()
+        );
+        assert_eq!(
+            provider_tool_content(Some(&content), ProviderThinkingCompatibility::Moonshot),
+            encrypted
+        );
+        assert_eq!(
+            provider_tool_content(Some(&content), ProviderThinkingCompatibility::DeepSeek),
+            content.as_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn current_provider_templates_preserve_supported_thinking_and_tool_parameters() {
+        let tools = vec![LlmToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: json!({"type":"object"}),
+        }];
+        let mut kimi = test_profile("openaiCompatible");
+        kimi.provider_flavor = Some("moonshot".into());
+        kimi.model = "kimi-k3".into();
+        kimi.reasoning_effort = Some("max".into());
+        kimi.thinking = Some("enabled".into());
+        let body = openai_compatible_request_body(&kimi, vec![], &tools, true, true);
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["reasoning_effort"], "max");
+        assert_eq!(body["tool_choice"], "required");
+        kimi.model = "kimi-k2.7-code".into();
+        let body = openai_compatible_request_body(&kimi, vec![], &tools, true, true);
+        assert_eq!(body["thinking"], json!({"type":"enabled", "keep":"all"}));
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("tool_choice").is_none());
+        let mut deepseek = test_profile("anthropic");
+        deepseek.provider_flavor = Some("deepseek".into());
+        deepseek.thinking = Some("enabled".into());
+        deepseek.reasoning_effort = Some("high".into());
+        let body = anthropic_stream_request_body(&deepseek, vec![], &[], false);
+        assert_eq!(body["thinking"], json!({"type":"enabled"}));
+        assert_eq!(body["output_config"], json!({"effort":"high"}));
+        let glm = openai_compatible_message(
+            json!({"role":"assistant", "content":"", "reasoningContent":"reasoning"}),
+            ProviderThinkingCompatibility::Glm,
+        );
+        assert_eq!(glm["reasoning_content"], "reasoning");
+    }
+
+    #[tokio::test]
+    async fn provider_archive_keeps_raw_stream_wire_request_and_delivered_events() {
+        use base64::Engine;
+        use std::io::{Read, Write};
+        let valid = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"检查\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"完成\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4}}\n\n",
+            "data: [DONE]\n\n"
+        ).as_bytes().to_vec();
+        for (raw, outcome) in [
+            (valid, "completed"),
+            (b"data: {invalid}\n\n".to_vec(), "failed"),
+        ] {
+            let directory = std::env::temp_dir().join(format!(
+                "deepcode-provider-archive-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut profile = test_profile("openaiCompatible");
+            profile.base_url = Some(format!("http://{}/v1", listener.local_addr().unwrap()));
+            profile.api_key = Some("test-provider-key".into());
+            let payload = raw.clone();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                let (start, length) = loop {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = request.windows(4).position(|p| p == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        break (end + 4, length);
+                    }
+                };
+                while request.len() < start + length {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload.len()).unwrap();
+                // Exercise framing across arbitrary byte boundaries, including UTF-8.
+                for bytes in payload.chunks(37) {
+                    socket.write_all(bytes).unwrap();
+                }
+                request[start..start + length].to_vec()
+            });
+            let response = local_agent_provider_stream_response(
+                profile,
+                json!({
+                    "messages":[{"role":"user","content":"归档检查"}], "tools":[], "hostedTools":[], "requireToolCall":false,
+                }),
+                "request:archive".into(),
+                directory.clone(),
+                json!({"sessionId":"session:archive","runId":"run:archive","requestId":"request:archive"}),
+            );
+            let delivered = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let wire_request = server.join().unwrap();
+            let log = std::fs::read_to_string(directory.join("timeline.jsonl")).unwrap();
+            assert!(!log.contains("test-provider-key"));
+            let lines: Vec<Value> = log
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let original: Vec<u8> = lines
+                .iter()
+                .filter(|line| line["type"] == "response.chunk")
+                .flat_map(|line| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(line["data"]["base64"].as_str().unwrap())
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(original, raw);
+            let request_line = lines
+                .iter()
+                .find(|line| line["type"] == "request.body")
+                .unwrap();
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(request_line["data"]["base64"].as_str().unwrap())
+                    .unwrap(),
+                wire_request
+            );
+            let replay: String = lines
+                .iter()
+                .filter(|line| line["type"] == "session.event")
+                .map(|line| {
+                    provider_event(
+                        "request:archive",
+                        line["data"]["type"].as_str().unwrap(),
+                        line["data"]["data"].clone(),
+                    )
+                })
+                .collect();
+            assert_eq!(replay.as_bytes(), delivered.as_ref());
+            assert_eq!(lines.last().unwrap()["data"]["outcome"], outcome);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     fn test_profile(kind: &str) -> ResolvedLlmProfile {

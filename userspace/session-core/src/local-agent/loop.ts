@@ -1,7 +1,6 @@
 import type {
   AssistantDraftBlockProjection,
   AssistantDraftProjection,
-  ExecutionPlan,
   JsonObject,
   LocalAgentError,
   ModelInteractionRequest,
@@ -48,6 +47,7 @@ import {
 import { recoverSession, type SessionState } from './reducer.js';
 import { providerTextStreamId } from './streamIdentity.js';
 import { PlanPreviewBuffer } from './planPreview.js';
+import { completedPlanAwaitingLifecycle, planFinalSettlement, planProgressFact, publishPlan } from './planStage.js';
 import {
   decodeSessionControlCall,
   SessionControlError,
@@ -377,9 +377,7 @@ export async function runAgentLoop(
       }
 
       throwIfAborted(signal);
-      const correctionFailure = inputCorrectionFailure(snapshot.events, runId);
-      if (correctionFailure) throw correctionFailure;
-      const completedPlan = completedPlanAwaitingLifecycle(snapshot.state);
+      const completedPlan = completedPlanAwaitingLifecycle(snapshot.state, runId);
       if (completedPlan) {
         await commit({
           type: 'plan.completed',
@@ -388,13 +386,12 @@ export async function runAgentLoop(
           payload: completedPlan,
         });
       }
-      const executionPlan = confirmedPlanAwaitingExecution(snapshot.state);
       const preparedProviderRequest = await buildAgentProviderRequest({
         sessionId: snapshot.state.sessionId,
         runId,
         runtime,
         events: snapshot.events,
-        responseConstraint: executionPlan ? 'toolRequired' : 'normal',
+        responseConstraint: 'normal',
         workspaceBindings: runWorkspaceBindings(snapshot, runId),
         contextProviders: deps.composition.contextProviders,
         memory: deps.composition.memory,
@@ -501,112 +498,27 @@ export async function runAgentLoop(
           };
         }
         case 'plan': {
-          const identity = nextPlanIdentity(snapshot.events, runId, () => deps.nextId('plan'));
-          if (
-            identity.planId === turn.callId
-            || identity.planId === turn.providerCallId
-            || turn.callId === turn.providerCallId
-          ) {
-            throw new LoopFailure(
-              'plan_identity_invalid',
-              'PlanId、LogicalCallId 与 ProviderCallId 必须是互不复用的独立身份。',
-            );
-          }
-          const plan: ExecutionPlan = {
-            planId: identity.planId,
-            revision: identity.revision,
-            title: turn.draft.title,
-            summary: turn.draft.summary,
-            steps: turn.draft.steps.map((step) => ({
-              ...step,
-              ...(step.verification ? { verification: [...step.verification] } : {}),
-            })),
-            mutationManifest: turn.draft.mutationManifest.map((operation) => ({ ...operation })),
-          };
-          assertPlanWorkspaceBindings(
-            plan,
-            runWorkspaceBindings(snapshot, runId).map((binding) => binding.workspaceId),
+          const fact = publishPlan(
+            snapshot.state, runId, turn.callId, turn.providerCallId, turn.draft,
+            runWorkspaceBindings(snapshot, runId).map((binding) => binding.workspaceId), deps.nextId,
           );
-          const comparable = comparablePriorPlan(snapshot.state, plan);
-          if (comparable && planDefinitionKey(comparable) === planDefinitionKey(plan)) {
-            const rejectionEvent: NewSessionEvent = {
-              type: 'session.control.rejected',
-              sessionId: snapshot.state.sessionId,
-              runId,
-              callId: turn.callId,
-              payload: {
-                providerCallId: turn.providerCallId,
-                toolName: SESSION_CONTROL_PLAN_PUBLISH,
-                input: planDraftInput(turn.draft),
-                error: {
-                  code: 'plan_revision_unchanged',
-                  message: 'The proposed Plan is unchanged. Continue executing the confirmed Plan, or publish a materially revised Plan only when its scope must change.',
-                },
-              },
-            };
-            await commit([
-              ...orderedProviderCallFacts(
-                turn.completion,
-                [...providerCallFacts, rejectionEvent],
-              ),
-              providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
-              ...completionDerivedFacts,
-            ]);
-            break;
-          }
-          const planFact: NewSessionEvent = {
-            type: 'plan.published',
-            sessionId: snapshot.state.sessionId,
-            runId,
-            callId: turn.callId,
-            payload: { ...clonePlan(plan), providerCallId: turn.providerCallId },
-          };
           await commit([
-            ...orderedProviderCallFacts(turn.completion, [...providerCallFacts, planFact]),
+            ...orderedProviderCallFacts(turn.completion, [...providerCallFacts, fact]),
             providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
             ...completionDerivedFacts,
-            {
-              type: 'run.waiting',
+            ...(fact.type === 'plan.published' ? [{
+              type: 'run.waiting' as const,
               sessionId: snapshot.state.sessionId,
               runId,
-              payload: { reason: 'plan', detail: plan.title },
-            },
+              payload: { reason: 'plan' as const, detail: fact.payload.title },
+            }] : []),
           ]);
-          return {
-            status: 'waiting',
-            runId,
-            reason: 'plan',
-            planId: plan.planId,
-          };
+          if (fact.type !== 'plan.published') break;
+          return { status: 'waiting', runId, reason: 'plan', planId: fact.payload.planId };
         }
         case 'answer': {
-          if (executionPlan) {
-            await commit([
-              ...orderedProviderCallFacts(turn.completion, providerCallFacts),
-              providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
-              ...completionDerivedFacts,
-              {
-                type: 'run.finishing',
-                sessionId: snapshot.state.sessionId,
-                runId,
-                payload: {
-                  outcome: 'failed',
-                  error: {
-                    code: 'confirmed_plan_execution_required',
-                    message: `Plan ${executionPlan.planId} revision ${executionPlan.revision} 已确认且 Todo 尚未完成；execution turn 不接受普通终答。`,
-                  },
-                },
-              },
-            ]);
-            return finishingResult(runId, {
-              outcome: 'failed',
-              error: {
-                code: 'confirmed_plan_execution_required',
-                message: `Plan ${executionPlan.planId} revision ${executionPlan.revision} 已确认且 Todo 尚未完成；execution turn 不接受普通终答。`,
-              },
-            });
-          }
           const messageId = turn.messageId ?? deps.nextId('message');
+          const settlement = planFinalSettlement(snapshot.state, runId, messageId);
           await commit([
             ...orderedProviderCallFacts(turn.completion, providerCallFacts),
             providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
@@ -626,10 +538,10 @@ export async function runAgentLoop(
               type: 'run.finishing',
               sessionId: snapshot.state.sessionId,
               runId,
-              payload: { outcome: 'completed', finalMessageId: messageId },
+              payload: settlement,
             },
           ]);
-          return finishingResult(runId, { outcome: 'completed', finalMessageId: messageId });
+          return finishingResult(runId, settlement);
         }
         case 'tools': {
           const seenCalls = new Set<string>();
@@ -964,18 +876,6 @@ async function consumeCompactionProvider(
         }
       : {}),
   };
-}
-
-function assertPlanWorkspaceBindings(plan: ExecutionPlan, bindings: readonly string[]): void {
-  const bound = new Set(bindings);
-  for (const operation of plan.mutationManifest) {
-    if (!bound.has(operation.workspaceId)) {
-      throw new LoopFailure(
-        'plan_workspace_not_bound',
-        `Plan 引用了当前 Session creation snapshot 之外的 workspaceId：${operation.workspaceId}`,
-      );
-    }
-  }
 }
 
 async function consumeProvider(
@@ -1665,38 +1565,6 @@ function decodeProviderOutputBlock(
   }
 }
 
-/** One correction turn per run, counted from durable facts rather than process state. */
-function inputCorrectionFailure(events: readonly SessionEvent[], runId: string): LoopFailure | null {
-  const errorsByCall = new Map<string, LocalAgentError>();
-  for (const event of events) {
-    if (!('runId' in event) || event.runId !== runId) continue;
-    if (event.type === 'tool.input-rejected') {
-      errorsByCall.set(event.callId, event.payload.rejection.error);
-    } else if (event.type === 'session.control.rejected' && event.payload.error.code !== 'plan_revision_unchanged') {
-      errorsByCall.set(event.callId, event.payload.error);
-    }
-  }
-  const rejectedTurns: LocalAgentError[][] = [];
-  for (const event of events) {
-    if (event.type !== 'provider.turn.settled' || event.runId !== runId || event.payload.outcome !== 'completed') continue;
-    const errors = [
-      ...event.payload.orderedCallIds.flatMap((callId) => {
-        const error = errorsByCall.get(callId);
-        return error ? [error] : [];
-      }),
-      ...(event.payload.orderedOutputBlocks ?? []).flatMap((block) => (
-        block.kind === 'toolCallRejected' ? [block.error] : []
-      )),
-    ];
-    if (errors.length > 0) rejectedTurns.push(errors);
-  }
-  if (rejectedTurns.length < 2) return null;
-  return new LoopFailure(
-    'tool_input_correction_exhausted',
-    `本次运行的工具参数纠正机会已用尽。原始拒绝：${rejectedTurns.flat().map((error) => `${error.code}: ${error.message}`).join('；')}`,
-  );
-}
-
 type NativeAssistantDraftBlock = AssistantDraftBlockProjection & { outputIndex: number };
 
 function aggregateDraftBlocks(
@@ -2100,106 +1968,6 @@ function assertProviderEvent(event: ProviderEvent, requestId: string): void {
   }
 }
 
-function clonePlan(plan: ExecutionPlan): ExecutionPlan {
-  return {
-    planId: plan.planId,
-    revision: plan.revision,
-    title: plan.title,
-    summary: plan.summary,
-    steps: plan.steps.map((step) => ({
-      ...step,
-      ...(step.verification ? { verification: [...step.verification] } : {}),
-    })),
-    mutationManifest: plan.mutationManifest.map((operation) => ({ ...operation })),
-  };
-}
-
-function nextPlanIdentity(
-  events: readonly SessionEvent[],
-  runId: string,
-  createPlanId: () => string,
-): Pick<ExecutionPlan, 'planId' | 'revision'> {
-  const revisionRequest = events.findLast(
-    (event): event is Extract<SessionEvent, { type: 'plan.revision.requested' }> => (
-      event.type === 'plan.revision.requested'
-      && event.runId === runId
-      && !events.some((candidate) => (
-        candidate.sequence > event.sequence
-        && candidate.type === 'run.settled'
-        && candidate.runId === runId
-      ))
-      && !events.some((candidate) => (
-        candidate.sequence > event.sequence
-        && (
-          candidate.type === 'plan.cancelled'
-          || candidate.type === 'plan.invalidated'
-        )
-        && candidate.payload.planId === event.payload.planId
-        && candidate.payload.revision === event.payload.revision
-      ))
-      && !events.some((candidate) => (
-        candidate.type === 'plan.published'
-        && candidate.sequence > event.sequence
-        && candidate.payload.planId === event.payload.planId
-        && candidate.payload.revision === event.payload.revision + 1
-      ))
-    ),
-  );
-  if (revisionRequest) {
-    return {
-      planId: revisionRequest.payload.planId,
-      revision: revisionRequest.payload.revision + 1,
-    };
-  }
-  const planId = createPlanId();
-  if (!planId || events.some((event) => event.type === 'plan.published' && event.payload.planId === planId)) {
-    throw new LoopFailure('plan_id_reused', 'Session 生成的 planId 已经存在。');
-  }
-  return { planId, revision: 1 };
-}
-
-function comparablePriorPlan(
-  state: SessionState,
-  proposed: ExecutionPlan,
-): ExecutionPlan | null {
-  if (proposed.revision > 1) {
-    return state.plans.find((candidate) => (
-      candidate.planId === proposed.planId
-      && candidate.revision === proposed.revision - 1
-    )) ?? null;
-  }
-  const active = state.activePlanRef;
-  if (!active) return null;
-  return state.plans.find((candidate) => (
-    candidate.planId === active.planId
-    && candidate.revision === active.revision
-    && candidate.status === 'confirmed'
-  )) ?? null;
-}
-
-function planDefinitionKey(
-  plan: Pick<ExecutionPlan, 'title' | 'summary' | 'steps' | 'mutationManifest'>,
-): string {
-  return JSON.stringify(canonicalJsonValue({
-    title: plan.title,
-    summary: plan.summary,
-    steps: plan.steps,
-    mutationManifest: plan.mutationManifest,
-  }));
-}
-
-function planDraftInput(draft: PlanPublicationDraft): Record<string, unknown> {
-  return {
-    title: draft.title,
-    summary: draft.summary,
-    steps: draft.steps.map((step) => ({
-      ...step,
-      ...(step.verification ? { verification: [...step.verification] } : {}),
-    })),
-    mutationManifest: draft.mutationManifest.map((operation) => ({ ...operation })),
-  };
-}
-
 function controlRejectionFact(
   sessionId: string,
   runId: string,
@@ -2214,80 +1982,6 @@ function controlRejectionFact(
       error: { ...rejection.error },
     },
   };
-}
-
-function planProgressFact(
-  snapshot: LoopSnapshot,
-  runId: string,
-  turn: ProviderPlanProgress,
-): NewSessionEvent {
-  const active = snapshot.state.activePlanRef;
-  const todo = snapshot.state.todoList;
-  const confirmation = snapshot.events.findLast((event) => (
-    event.type === 'plan.confirmed' && event.payload.planId === active?.planId
-    && event.payload.revision === active?.revision
-  ));
-  const evidence = snapshot.events.find((event) => (
-    event.type === 'tool.completed' && event.runId === runId
-    && event.payload.record.recordId === turn.sourceFactRef
-  ));
-  const valid = active && todo && confirmation
-    && todo.sourcePlanId === active.planId && todo.sourcePlanRevision === active.revision
-    && evidence?.type === 'tool.completed'
-    && turn.updates.every((update) => todo.items.some((item) => item.todoId === update.todoId))
-    && (!turn.updates.some((update) => update.status === 'completed') || evidence.payload.record.outcome === 'completed');
-  if (!valid) return {
-    type: 'session.control.rejected', sessionId: snapshot.state.sessionId, runId, callId: turn.callId,
-    payload: {
-      providerCallId: turn.providerCallId, toolName: SESSION_CONTROL_PLAN_PROGRESS,
-      input: { sourceFactRef: turn.sourceFactRef, updates: turn.updates },
-      error: { code: 'plan_progress_evidence_invalid', message: 'Use current Todo IDs and a tool result recordId from this run. Earlier investigation results remain valid evidence; Completion requires a successful result.' },
-    },
-  };
-  return {
-    type: 'todo.progressed', sessionId: snapshot.state.sessionId, runId, callId: turn.callId,
-    payload: {
-      providerCallId: turn.providerCallId,
-      sourcePlanId: active.planId, sourcePlanRevision: active.revision,
-      sourceFactRef: turn.sourceFactRef, updates: turn.updates,
-    },
-  };
-}
-
-function completedPlanAwaitingLifecycle(
-  state: SessionState,
-): { planId: string; revision: number } | null {
-  const todo = state.todoList;
-  if (!todo) return null;
-  const plan = state.plans.find((candidate) => (
-    candidate.planId === todo.sourcePlanId
-    && candidate.revision === todo.sourcePlanRevision
-  ));
-  return plan?.status === 'confirmed'
-    && todo.items.length > 0
-    && todo.items.every((item) => item.status === 'completed')
-    ? { planId: plan.planId, revision: plan.revision }
-    : null;
-}
-
-function confirmedPlanAwaitingExecution(
-  state: SessionState,
-): { planId: string; revision: number } | null {
-  const active = state.activePlanRef;
-  const todo = state.todoList;
-  if (
-    !active
-    || !todo
-    || todo.sourcePlanId !== active.planId
-    || todo.sourcePlanRevision !== active.revision
-    || todo.items.length === 0
-    || todo.items.every((item) => item.status === 'completed')
-  ) return null;
-  const plan = state.plans.find((candidate) => (
-    candidate.planId === active.planId
-    && candidate.revision === active.revision
-  ));
-  return plan?.status === 'confirmed' ? { ...active } : null;
 }
 
 function hasSettlement(events: readonly SessionEvent[], runId: string): boolean {

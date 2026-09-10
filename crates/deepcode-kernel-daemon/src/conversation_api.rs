@@ -287,27 +287,42 @@ pub(crate) async fn conversation_change_read(
     let Some(change) = change else {
         return ApiResponse::error("file_change_not_found", "变更记录不存在。");
     };
-    let read = |side: &Value| -> Result<Value, String> {
+    read_file_change_response(change)
+}
+
+fn read_file_change_response(change: &Value) -> Json<ApiResponse> {
+    let read = |side: &Value| -> Result<Value, (&str, String)> {
         if side["exists"] == false {
             return Ok(Value::Null);
         }
         if let Some(error) = side["error"].as_str() {
-            return Err(error.to_string());
+            return Err(("file_change_content_unavailable", error.to_string()));
         }
-        let path = side["contentRef"]
-            .as_str()
-            .ok_or("file_change_content_missing")?;
+        let path = side["contentRef"].as_str().ok_or((
+            "file_change_content_unavailable",
+            "file_change_content_missing".to_string(),
+        ))?;
         deepcode_kernel_tools::file_content::read_text_file_for_llm(StdPath::new(path))
             .map(|read| json!(read.content))
-            .map_err(|error| error.message)
+            .map_err(|error| {
+                if error.classification.binary {
+                    (
+                        "file_change_binary_content",
+                        format!(
+                            "{} 是二进制文件，不提供文本行数和逐行对比。",
+                            change["path"].as_str().unwrap_or("文件")
+                        ),
+                    )
+                } else {
+                    ("file_change_content_unavailable", error.message)
+                }
+            })
     };
     match (read(&change["before"]), read(&change["after"])) {
         (Ok(before), Ok(after)) => ApiResponse::ok(
             json!({ "workspaceId": change["workspaceId"], "path": change["path"], "before": before, "after": after }),
         ),
-        (Err(error), _) | (_, Err(error)) => {
-            ApiResponse::error("file_change_content_unavailable", &error)
-        }
+        (Err((code, error)), _) | (_, Err((code, error))) => ApiResponse::error(code, &error),
     }
 }
 
@@ -1917,6 +1932,35 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn change_read_distinguishes_binary_deletions_text_and_missing_snapshots() {
+        let tree = TemporaryTree::new("change-read");
+        let binary = tree.0.join("binary-before");
+        let text = tree.0.join("text-before");
+        std::fs::write(&binary, b"\x7fELF\x00\x01").unwrap();
+        std::fs::write(&text, "first\nsecond\n").unwrap();
+        let mut change = json!({"workspaceId":"workspace:test", "path":"bin/demo", "before":{"exists":true,"contentRef":binary}, "after":{"exists":false}});
+        let response = read_file_change_response(&change).0;
+        assert_eq!(
+            response.error.as_deref(),
+            Some("file_change_binary_content")
+        );
+        assert!(response.message.unwrap().contains("bin/demo"));
+        assert!(
+            response.data.is_none(),
+            "binary content is not an empty text diff"
+        );
+        change["before"]["contentRef"] = json!(text);
+        let response = read_file_change_response(&change).0;
+        assert!(response.ok);
+        assert_eq!(response.data.unwrap()["before"], "first\nsecond\n");
+        change["before"]["contentRef"] = json!(tree.0.join("missing"));
+        assert_eq!(
+            read_file_change_response(&change).0.error.as_deref(),
+            Some("file_change_content_unavailable")
+        );
     }
 
     fn catalog_fixture() -> ConversationCatalog {

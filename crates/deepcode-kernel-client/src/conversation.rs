@@ -256,6 +256,11 @@ impl SessionProjection {
                     .as_deref()
                     .is_some_and(|feedback| !matches!(feedback, "up" | "down"))
                 || message.feedback.is_some() && message.role != "assistant"
+                || message.reply_to_interaction.as_ref().is_some_and(|reply| {
+                    message.role != "user"
+                        || reply.interaction_id.is_empty()
+                        || reply.prompt.trim().is_empty()
+                })
                 || message.run_id.as_deref().is_some_and(str::is_empty)
                 || message
                     .provider_request_id
@@ -979,6 +984,14 @@ pub struct ProjectionMessage {
     pub feedback: Option<String>,
     pub sequence: u64,
     pub created_at: String,
+    pub reply_to_interaction: Option<InteractionReplyContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InteractionReplyContext {
+    pub interaction_id: String,
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

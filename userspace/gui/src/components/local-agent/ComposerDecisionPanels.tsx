@@ -2,6 +2,7 @@ import React from 'react';
 import { t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import type { AgentComposer } from './useAgentComposer';
+import { MarkdownContent, MarkdownInline } from './BufferedMarkdown';
 
 export function ComposerDecisionPanels({ language, composer }: { language: UiLanguage; composer: AgentComposer }) {
   const {
@@ -23,11 +24,12 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
   return (
     <>
       {(pendingPlan || pendingInteraction) && (
-        <section className="local-agent__interaction-panel">
+        <section className={`local-agent__interaction-panel${pendingPlan ? ' local-agent__interaction-panel--plan' : ''}`}>
+          <div className="local-agent__interaction-document-scroll">
           <header className="local-agent__interaction-panel-heading">
-            <strong>{pendingPlan
-              ? t(language, 'agent.plan.confirmQuestion', { title: pendingPlan.title })
-              : pendingInteraction?.prompt}</strong>
+            {pendingPlan
+              ? <strong><MarkdownInline>{t(language, 'agent.plan.confirmQuestion', { title: pendingPlan.title })}</MarkdownInline></strong>
+              : <MarkdownContent>{pendingInteraction?.prompt ?? ''}</MarkdownContent>}
             {pendingPlan && (
               <button
                 type="button"
@@ -47,7 +49,6 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
                   disabled={submitting}
                   onClick={() => void submitPlanDecision({ kind: 'confirm' })}
                 >
-                  <span className="local-agent__interaction-option-marker" aria-hidden="true">1</span>
                   <span className="local-agent__interaction-option-copy">
                     <b>{t(language, 'agent.plan.adopt')}</b>
                     <small>{t(language, 'agent.plan.adoptTodoHint')}</small>
@@ -71,16 +72,17 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
                     {index + 1}
                   </span>
                   <span className="local-agent__interaction-option-copy">
-                    <b>{option.label}</b>
-                    {option.description && <small>{option.description}</small>}
+                    <b><MarkdownInline>{option.label}</MarkdownInline></b>
                   </span>
                   <span className="local-agent__interaction-option-chevron" aria-hidden="true">
                     <DeepCodeShellIcon name="chevronRight" />
                   </span>
                 </button>
+                {option.description && <div className="local-agent__interaction-option-description"><MarkdownContent>{option.description}</MarkdownContent></div>}
               </li>
             ))}
           </ol>
+          </div>
           {(pendingPlan || pendingInteraction?.allowFreeform) && (
             <div className="local-agent__interaction-composer">
               <span className="local-agent__interaction-compose-mark" aria-hidden="true">

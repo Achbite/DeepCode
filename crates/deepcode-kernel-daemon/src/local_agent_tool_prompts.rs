@@ -31,8 +31,15 @@ pub(crate) fn core_tool_prompt_providers() -> Value {
                 "canonicalToolName": "web.fetch",
                 "promptSnippet": "Read bounded text from a known HTTP or HTTPS URL.",
                 "usageGuidelines": [
-                    "Use this to inspect a URL supplied by the user or returned by an earlier tool result.",
-                    "Do not use this as a substitute for unavailable search by guessing URLs or selecting general-purpose websites; report that search is unavailable instead."
+                    "Read URLs supplied by the user or returned by search."
+                ]
+            },
+            {
+                "contributionRef": "tool-prompt-contribution:core:web.search",
+                "canonicalToolName": "web.search",
+                "promptSnippet": "Search the web by keyword.",
+                "usageGuidelines": [
+                    "Cite returned sources and report search errors."
                 ]
             }
         ]
@@ -67,7 +74,7 @@ mod tests {
                 .iter()
                 .map(|item| item["canonicalToolName"].as_str().expect("tool name"))
                 .collect::<Vec<_>>(),
-            vec!["fs.read", "bash", "web.fetch"]
+            vec!["fs.read", "bash", "web.fetch", "web.search"]
         );
         assert!(contributions
             .iter()
@@ -77,7 +84,7 @@ mod tests {
                 .iter()
                 .all(|guideline| {
                     let guideline = guideline.as_str().expect("guideline text");
-                    ["fs.read", "bash", "web.fetch"]
+                    ["fs.read", "bash", "web.fetch", "web.search"]
                         .iter()
                         .all(|tool_name| !guideline.contains(tool_name))
                 })));
@@ -92,10 +99,10 @@ mod tests {
         assert!(contributions[2]["usageGuidelines"][0]
             .as_str()
             .expect("fetch guideline")
-            .contains("supplied by the user or returned by an earlier tool result"));
-        assert!(contributions[2]["usageGuidelines"][1]
+            .contains("supplied by the user or returned by search"));
+        assert!(contributions[3]["usageGuidelines"][0]
             .as_str()
             .expect("fetch guideline")
-            .contains("not use this as a substitute for unavailable search"));
+            .contains("Cite returned sources and report search errors"));
     }
 }

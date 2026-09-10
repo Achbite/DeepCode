@@ -290,6 +290,18 @@ export async function readConversationImage(sessionId: string, workspaceId: stri
   return response.blob();
 }
 
+export class ConversationRequestError extends Error {
+  constructor(public readonly code: string, message: string) {
+    super(`${code}:${message}`);
+    this.name = 'ConversationRequestError';
+  }
+}
+
+export function isBinaryFileChange(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error
+    && error.code === 'file_change_binary_content';
+}
+
 async function request<T>(url: string, init: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...init,
@@ -306,8 +318,8 @@ async function request<T>(url: string, init: RequestInit): Promise<T> {
     throw new Error(`conversation_response_invalid:HTTP ${response.status}`);
   }
   if (!response.ok || !envelope.ok || envelope.data === undefined || envelope.data === null) {
-    throw new Error(
-      `${envelope.error ?? 'conversation_request_failed'}:${envelope.message ?? `HTTP ${response.status}`}`,
+    throw new ConversationRequestError(
+      envelope.error ?? 'conversation_request_failed', envelope.message ?? `HTTP ${response.status}`,
     );
   }
   return envelope.data;
@@ -632,10 +644,13 @@ function isProjectionMessage(value: unknown): boolean {
   if (!isExactRecord(value, [
     'messageId', 'role', 'content', 'filesystemReferences',
     'pluginSelections', 'feedback', 'sequence', 'createdAt',
-  ], ['runId', 'providerRequestId'])) return false;
+  ], ['runId', 'providerRequestId', 'replyToInteraction'])) return false;
   const hasRunId = value.runId !== undefined;
   const hasProviderRequestId = value.providerRequestId !== undefined;
   return isIdentifier(value.messageId)
+    && (value.replyToInteraction === undefined || value.role === 'user'
+      && isExactRecord(value.replyToInteraction, ['interactionId', 'prompt'])
+      && isIdentifier(value.replyToInteraction.interactionId) && isNonEmptyText(value.replyToInteraction.prompt))
     && ['user', 'assistant', 'tool', 'system'].includes(String(value.role))
     && typeof value.content === 'string'
     && isArrayOf(value.filesystemReferences, isFilesystemReference)

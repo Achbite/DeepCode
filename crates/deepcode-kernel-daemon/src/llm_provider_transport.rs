@@ -18,7 +18,14 @@ pub(crate) fn anthropic_stream_request_body(
         "max_tokens": max_tokens,
         "stream": true,
     });
-    if profile.thinking.as_deref() == Some("enabled") {
+    if profile.provider_flavor.as_deref() == Some("deepseek") {
+        if let Some(thinking) = &profile.thinking {
+            body["thinking"] = json!({"type": thinking});
+        }
+        if let Some(effort) = &profile.reasoning_effort {
+            body["output_config"] = json!({"effort": effort});
+        }
+    } else if profile.thinking.as_deref() == Some("enabled") {
         if max_tokens > 1024 {
             body["thinking"] = json!({
                 "type": "enabled",

@@ -9,7 +9,7 @@ import { FileChanges, roundChangeActivities } from './FileChanges';
 import { ReasoningHistory } from './ReasoningDetails';
 import { PlanPreviewCard } from './PlanPreviewCard';
 import ProviderStageStatus from './ProviderStageStatus';
-import { BufferedMarkdown, MarkdownContent } from './BufferedMarkdown';
+import { BufferedMarkdown, MarkdownContent, MarkdownInline } from './BufferedMarkdown';
 import PlanCard from './PlanCard';
 import { ToolActivityGroup, ProviderHostedDraftGroup } from './ToolActivityDetails';
 import { conversationRounds, type ProjectionItem, type AssistantDraftItem } from './conversationItems';
@@ -127,12 +127,14 @@ export function ConversationTranscript({
           className={`local-agent__message local-agent__message--${item.value.role}`}
         >
           <div className="local-agent__message-content">
+            {item.value.replyToInteraction && <InteractionReplyQuote prompt={item.value.replyToInteraction.prompt} />}
             {item.value.role === 'assistant'
               ? committedProviderContent(
                   item.streamId,
                   item.value.content,
                   presentation.content(`message:${item.value.messageId}:content`),
                 )
+              : item.value.replyToInteraction ? <MarkdownContent>{item.value.content}</MarkdownContent>
               : presentation.content(`message:${item.value.messageId}:content`)}
             {item.value.filesystemReferences.length > 0 && (
               <div className="local-agent__message-attachments">
@@ -219,6 +221,8 @@ export function ConversationTranscript({
         <PlanCard
           key={`plan:${item.value.planId}:${item.value.revision}`}
           plan={item.value}
+          previousPlan={projection?.plans.find((plan) => plan.planId === item.value.planId && plan.revision === item.value.revision - 1)}
+          workspaceBindings={projection?.workspaceBindings}
           active={samePlanReference(projection?.activePlanRef, item.value)}
           language={language}
         />
@@ -343,4 +347,11 @@ function ConversationRoundView({ completed, followingLatest, rows, children }: {
 function CommittedPresentation({ identity, text, onDisplayed, children }: { identity: string; text: string; onDisplayed(identity: string, text: string): void; children: React.ReactNode }) {
   useLayoutEffect(() => onDisplayed(identity, text), [identity, text, onDisplayed]);
   return <>{children}</>;
+}
+
+export function InteractionReplyQuote({ prompt }: { prompt: string }) {
+  return <details className="conversation-answered-question">
+    <summary><span><MarkdownInline>{prompt.split(/\n\s*\n/)[0]!}</MarkdownInline></span><DeepCodeShellIcon name="chevronDown" /></summary>
+    <div className="conversation-answered-question-body"><MarkdownContent>{prompt}</MarkdownContent></div>
+  </details>;
 }

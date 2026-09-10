@@ -373,13 +373,15 @@ const store = create<LocalAgentState>((set, get) => ({
         try {
           const items = await getConversationStatuses();
           if (generation !== refreshGeneration) return;
-          set((state) => ({
-            sessionStatuses: Object.fromEntries(items.map((item) => {
+          set((state) => {
+            const sessionStatuses = Object.fromEntries(items.map((item) => {
               const current = state.sessionStatuses[item.sessionId];
               return [item.sessionId, current && current.revision > item.revision ? current : item];
-            })),
-            ...(state.errorSource === 'statuses' ? { error: null, errorSource: null } : {}),
-          }));
+            }));
+            if (state.errorSource !== 'statuses'
+              && JSON.stringify(sessionStatuses) === JSON.stringify(state.sessionStatuses)) return state;
+            return { sessionStatuses, ...(state.errorSource === 'statuses' ? { error: null, errorSource: null } : {}) };
+          });
         } catch (error) {
           if (generation === refreshGeneration) set({ sessionStatuses: {}, error: errorMessage(error), errorSource: 'statuses' });
         }

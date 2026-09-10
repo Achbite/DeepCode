@@ -29,6 +29,7 @@ export interface SessionState {
   sessionDirectoryIndexes: WorkspaceBindingDisplay[];
   workspaceBindings: WorkspaceBindingDisplay[];
   messages: SessionProjection['messages'];
+  acceptedInputs: Record<string, { messageId: string; replyToInteraction?: { interactionId: string; prompt: string } }>;
   narratives: SessionProjection['narratives'];
   pendingInteraction: SessionProjection['pendingInteraction'];
   pendingApproval: SessionProjection['pendingApproval'];
@@ -87,6 +88,7 @@ export function emptySessionState(sessionId: string): SessionState {
     sessionDirectoryIndexes: [],
     workspaceBindings: [],
     messages: [],
+    acceptedInputs: {},
     narratives: [],
     pendingInteraction: null,
     pendingApproval: null,
@@ -135,9 +137,13 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
     workspaceBindings: previous.workspaceBindings.map((binding) => ({ ...binding })),
     messages: previous.messages.map((message) => ({
       ...message,
+      ...(message.replyToInteraction ? { replyToInteraction: { ...message.replyToInteraction } } : {}),
       filesystemReferences: message.filesystemReferences.map((reference) => ({ ...reference })),
       pluginSelections: message.pluginSelections.map((selection) => ({ ...selection })),
     })),
+    acceptedInputs: Object.fromEntries(Object.entries(previous.acceptedInputs).map(([id, input]) => [id, {
+      ...input, ...(input.replyToInteraction ? { replyToInteraction: { ...input.replyToInteraction } } : {}),
+    }])),
     narratives: previous.narratives.map((narrative) => ({ ...narrative })),
     pendingInteraction: cloneInteraction(previous.pendingInteraction),
     pendingApproval: cloneApproval(previous.pendingApproval),
@@ -187,6 +193,9 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
   };
 
   switch (event.type) {
+    case 'input.accepted':
+      next.acceptedInputs[event.payload.commandId] = { messageId: event.payload.messageId };
+      break;
     case 'session.model-settings.updated':
       next.modelSettings = { ...event.payload.settings };
       break;
@@ -265,6 +274,10 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     case 'message.committed':
       {
+        const acceptedInput = Object.entries(next.acceptedInputs).find(([, input]) => input.messageId === event.payload.messageId);
+        const replyToInteraction = acceptedInput?.[1].replyToInteraction;
+        if (replyToInteraction && event.payload.role !== 'user') throw new Error('interaction_response_role_invalid');
+        if (acceptedInput) delete next.acceptedInputs[acceptedInput[0]];
         const common = {
           messageId: event.payload.messageId,
           content: event.payload.content,
@@ -277,6 +290,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
           feedback: null,
           sequence: event.sequence,
           createdAt: event.occurredAt,
+          ...(replyToInteraction ? { replyToInteraction: { ...replyToInteraction } } : {}),
         };
         if (event.payload.role === 'assistant') {
           if (!event.runId) throw new Error('assistant_message_run_identity_missing');
@@ -363,16 +377,22 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         sequence: event.sequence,
       };
       break;
-    case 'interaction.resolved':
+    case 'interaction.resolved': {
       if (
         !next.pendingInteraction
         || next.pendingInteraction.interactionId !== event.payload.interactionId
         || next.pendingInteraction.runId !== event.runId
       ) throw new Error('interaction_request_missing');
+      const input = next.acceptedInputs[event.payload.commandId];
+      if (!input) throw new Error('interaction_response_input_missing');
+      input.replyToInteraction = {
+        interactionId: next.pendingInteraction.interactionId, prompt: next.pendingInteraction.prompt,
+      };
       next.pendingInteraction = null;
       settleActivity(next, interactionActivityId(event.payload.interactionId), 'completed');
       resumeRun(next, event.runId);
       break;
+    }
     case 'plan.published': {
       if (findPlanIndex(next, event.payload.planId, event.payload.revision) >= 0) {
         throw new Error('plan_revision_duplicate');
@@ -1070,6 +1090,7 @@ export function projectSession(
     sessionDirectoryIndexes: state.sessionDirectoryIndexes.map((binding) => ({ ...binding })),
     messages: state.messages.map((message) => ({
       ...message,
+      ...(message.replyToInteraction ? { replyToInteraction: { ...message.replyToInteraction } } : {}),
       filesystemReferences: message.filesystemReferences.map((reference) => ({ ...reference })),
       pluginSelections: message.pluginSelections.map((selection) => ({ ...selection })),
     })),

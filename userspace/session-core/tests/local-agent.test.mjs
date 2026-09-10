@@ -17,6 +17,7 @@ import {
   sessionControlToolDefinitions,
 } from '../dist/index.js';
 import { messagesFromJournal } from '../dist/local-agent/contextComposer.js';
+import { decodeSessionControlCall } from '../dist/local-agent/sessionControls.js';
 import { HttpProviderPort } from '../dist/local-agent/httpPorts.js';
 import { responseFrames } from '../dist/responseFrames.js';
 import { createProviderToolAliases } from '../dist/local-agent/providerToolCodec.js';
@@ -189,6 +190,21 @@ test('run binding exposes hosted search once and replays its Provider item uncha
     apiSurface: 'responses',
     hostedWebSearch: 'web_search',
     webSearch: { owner: 'providerHosted', providerToolType: 'web_search' },
+    tools: [{
+      name: 'web.search', toolBindingRef: 'tool-binding:search:blocked',
+      description: 'Local search adapter.', inputSchema: { type: 'object' },
+      possibleEffects: ['network'], availability: 'blocked', origin: 'coreBuiltin',
+    }, {
+      name: 'web.fetch', toolBindingRef: 'tool-binding:fetch:g1',
+      description: 'Read a known URL.', inputSchema: { type: 'object' },
+      possibleEffects: ['network'], availability: 'callable', origin: 'coreBuiltin',
+    }],
+    toolPromptContributions: [{
+      contributionRef: 'tool-prompt-contribution:fetch',
+      canonicalToolName: 'web.fetch', preparedToolBindingRef: 'tool-binding:fetch:g1',
+      origin: 'coreBuiltin', promptSnippet: 'Read a known URL.',
+      usageGuidelines: ['Read URLs supplied by the user or earlier results.'],
+    }],
   });
   const providerRequests = [];
   const provider = {
@@ -198,7 +214,17 @@ test('run binding exposes hosted search once and replays its Provider item uncha
         type: 'webSearch',
         providerToolType: 'web_search',
       }]);
-      assert.equal(request.tools.some((tool) => tool.name === 'web.search'), false);
+      assert.equal(request.tools.some((tool) => tool.name === 'web_search'), false);
+      assert.ok(request.tools.some((tool) => tool.name === 'web_fetch'));
+      const searchGuidance = request.messages.filter((message) => (
+        message.role === 'system' && message.content.startsWith('Active tool guidance:')
+      ));
+      assert.equal(searchGuidance.length, 1);
+      assert.match(searchGuidance[0].content, /web_search: Search by keyword/u);
+      assert.match(searchGuidance[0].content, /fetch reads known URLs/u);
+      assert.match(searchGuidance[0].content, /Cite sources and report search errors/u);
+      assert.match(searchGuidance[0].content, /web_fetch: Read a known URL/u);
+      assert.equal(searchGuidance[0].content.match(/^- web_search:/gmu)?.length, 1);
       if (providerRequests.length === 1) {
         for (const item of hostedItems) {
           yield providerEvent(request.requestId, 'hosted.web-search.completed', {
@@ -253,6 +279,10 @@ test('run binding exposes hosted search once and replays its Provider item uncha
   const events = await readEvents(journal, sessionId);
   const settlements = events.filter((event) => event.type === 'provider.turn.settled');
   assert.deepEqual(settlements[0].payload.hostedWebSearchCalls, hostedItems);
+  const systemPrefix = (request) => request.messages.slice(
+    0, request.messages.findIndex((message) => message.role === 'user'),
+  );
+  assert.deepEqual(systemPrefix(providerRequests[1]), systemPrefix(providerRequests[0]));
   const firstAssistant = events.find((event) => (
     event.type === 'message.committed'
     && event.payload.content === 'First current answer.'
@@ -264,6 +294,10 @@ test('run binding exposes hosted search once and replays its Provider item uncha
     && tool.canonicalName === 'web.search'
     && tool.wireName === 'web_search'
   )));
+  assert.equal(compositions[0].payload.tools.filter((tool) => tool.canonicalName === 'web.search').length, 1);
+  assert.equal(compositions[0].payload.messages.filter((message) => (
+    message.contributionId === 'instruction:deepcode.tool-guidance'
+  )).length, 1);
   assert.ok(compositions[1].payload.messages.some((message) => (
     message.blocks.some((block) => (
       block.kind === 'hostedWebSearch' && block.providerCallId === hostedItems[0].id
@@ -864,7 +898,7 @@ test('tool prompt preparation binds exact callable tools and rejects invalid own
   }, {
     canonicalName: 'bash',
     wireName: 'bash',
-  }], [readTool, bashTool]);
+  }], [readTool, bashTool], []);
   assert.ok(rendered);
   const [snippetSection, guidelineSection] = rendered.split('\n\n');
   assert.deepEqual(snippetSection.split('\n'), [
@@ -1016,6 +1050,7 @@ test('tool prompt preparation binds exact callable tools and rejects invalid own
     collidingPrepared,
     collidingAliases,
     collidingTools,
+    [],
   );
   assert.ok(collidingGuidance);
   const collidingLines = new Set(collidingGuidance.split('\n'));
@@ -1102,6 +1137,8 @@ test('Session renders one run-scoped tool guidance message with Provider aliases
   ));
   assert.equal(guidanceMessages.length, 1);
   assert.equal(systemMessages.indexOf(guidanceMessages[0]), 1);
+  assert.deepEqual(requests[0].hostedTools, []);
+  assert.doesNotMatch(guidanceMessages[0].content, /API's native search tool/u);
   const aliases = new Map(preparation.snapshots[0].providerToolAliases.map((alias) => (
     [alias.canonicalName, alias.wireName]
   )));
@@ -1320,7 +1357,17 @@ test('a run without workspace bindings never exposes workspace-scoped tools', as
       pluginUri: 'plugin://echo@test',
     },
   ];
-  const preparation = fakeRunPreparation({ tools });
+  const preparation = fakeRunPreparation({
+    tools,
+    toolPromptContributions: tools.filter((tool) => tool.origin === 'coreBuiltin').map((tool) => ({
+      contributionRef: `tool-prompt-contribution:${tool.name}`,
+      canonicalToolName: tool.name,
+      preparedToolBindingRef: tool.toolBindingRef,
+      origin: tool.origin,
+      promptSnippet: tool.description,
+      usageGuidelines: [],
+    })),
+  });
   let capturedRequest;
   const actor = actorWith(
     journal,
@@ -1351,6 +1398,13 @@ test('a run without workspace bindings never exposes workspace-scoped tools', as
     'interaction_request',
     'mcp_echo',
   ]);
+  const guidance = capturedRequest.messages.find((message) => (
+    message.role === 'system' && message.content.startsWith('Active tool guidance:')
+  ));
+  assert.ok(guidance);
+  assert.match(guidance.content, /web_search: Search a non-workspace source/u);
+  assert.doesNotMatch(guidance.content, /fs_read:|bash:|API's native search tool/u);
+  assert.deepEqual(capturedRequest.hostedTools, []);
   assert.equal(capturedRequest.tools.some((tool) => (
     tool.inputSchema?.properties?.workspaceId !== undefined
   )), false);
@@ -1579,7 +1633,7 @@ test('one Plan confirmation resumes the same run into Todo-backed execution', as
       }
 
       if (providerRequests.length === 2) {
-        assert.equal(request.responseConstraint, 'toolRequired');
+        assert.equal(request.responseConstraint, 'normal');
         const preConfirmationRequest = providerRequests[0];
         assert.deepEqual(
           request.messages.slice(0, preConfirmationRequest.messages.length),
@@ -1865,7 +1919,7 @@ test('confirmed Host Bash uses composite authority and only a successful retry c
       }
 
       if (providerRequests.length === 2) {
-        assert.equal(request.responseConstraint, 'toolRequired');
+        assert.equal(request.responseConstraint, 'normal');
         yield providerEvent(request.requestId, 'tool.call', {
           callId: 'provider-call:bash-first',
           name: bashDefinition.name,
@@ -1882,7 +1936,7 @@ test('confirmed Host Bash uses composite authority and only a successful retry c
       }
 
       if (providerRequests.length === 3) {
-        assert.equal(request.responseConstraint, 'toolRequired');
+        assert.equal(request.responseConstraint, 'normal');
         const failedResult = request.messages
           .map(jsonMessagePayload)
           .find((payload) => payload?.outcome === 'failed');
@@ -2049,7 +2103,7 @@ test('confirmed fs.delete reads targetKind from canonical arguments and complete
         return;
       }
       if (providerRequests.length === 2) {
-        assert.equal(request.responseConstraint, 'toolRequired');
+        assert.equal(request.responseConstraint, 'normal');
         yield providerEvent(request.requestId, 'tool.call', {
           callId: 'provider-call:delete',
           name: deleteDefinition.name,
@@ -2115,7 +2169,7 @@ test('confirmed fs.delete reads targetKind from canonical arguments and complete
   await actor.dispose();
 });
 
-test('confirmed Plan execution turn rejects a plain terminal answer', async () => {
+test('unfinished Plan preserves final explanation and pending Todo without reporting success', async () => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:confirmed-plan-answer-rejected';
   await createSession(journal, sessionId, [workspaceBinding]);
@@ -2149,7 +2203,7 @@ test('confirmed Plan execution turn rejects a plain terminal answer', async () =
       }
 
       assert.equal(providerRequests.length, 2);
-      assert.equal(request.responseConstraint, 'toolRequired');
+      assert.equal(request.responseConstraint, 'normal');
       assert.ok(request.messages
         .map(jsonMessagePayload)
         .some((payload) => payload?.response?.kind === 'confirm'));
@@ -2158,7 +2212,7 @@ test('confirmed Plan execution turn rejects a plain terminal answer', async () =
         .some((payload) => payload?.type === 'todo.current'));
       yield providerEvent(request.requestId, 'assistant.message', {
         messageId: 'provider-message:invalid-execution-answer',
-        content: 'The plan is published; wait for another confirmation.',
+        content: 'Execution is blocked. The confirmed work has not been completed.',
       });
       yield providerEvent(request.requestId, 'completed', {});
     },
@@ -2198,7 +2252,7 @@ test('confirmed Plan execution turn rejects a plain terminal answer', async () =
   assert.equal(providerRequests.length, 2);
   assert.equal(failed.plans[0].status, 'confirmed');
   assert.equal(failed.todoList.items[0].status, 'pending');
-  assert.equal(failed.terminalError.code, 'confirmed_plan_execution_required');
+  assert.equal(failed.terminalError.code, 'plan_incomplete');
 
   const events = await readEvents(journal, sessionId);
   const confirmed = singleEvent(events, 'plan.confirmed');
@@ -2207,16 +2261,135 @@ test('confirmed Plan execution turn rejects a plain terminal answer', async () =
   const settlement = singleEvent(events, 'run.settled');
   assert.equal(completions.length, 2);
   assert.equal(settlement.payload.outcome, 'failed');
-  assert.equal(settlement.payload.error.code, 'confirmed_plan_execution_required');
-  assert.equal(events.some((event) => (
-    event.type === 'message.committed'
-    && event.payload.role === 'assistant'
-    && event.payload.content.includes('another confirmation')
-  )), false);
+  assert.equal(settlement.payload.error.code, 'plan_incomplete');
+  const finalMessage = events.find((event) => event.type === 'message.committed' && event.payload.role === 'assistant');
+  assert.equal(finalMessage?.payload.content, 'Execution is blocked. The confirmed work has not been completed.');
+  assert.equal(events.some((event) => event.type === 'plan.completed'), false);
   assert.equal(events.some((event) => event.type === 'tool.requested'), false);
-  assertEventOrder(confirmed, seeded, completions[1], settlement);
+  assertEventOrder(confirmed, seeded, completions[1], finalMessage, singleEvent(events, 'run.finishing'), singleEvent(events, 'run.runtime.released'), settlement);
 
   await actor.dispose();
+});
+
+test('execution-time Plan revisions retain Todo identity and rejected progress cannot consume final output', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:plan-revision-progress';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation({ contextWindowTokens: 100_000, tools: [{
+    toolBindingRef: 'tool-binding:write:g1', name: 'fs.write', description: 'Write an approved file.',
+    inputSchema: { type: 'object', required: ['path', 'content'], properties: { path: { type: 'string' }, content: { type: 'string' } } },
+    possibleEffects: ['workspaceMutation'], availability: 'callable', origin: 'coreBuiltin',
+  }] });
+  const initial = {
+    title: 'Implement and verify', summary: 'Complete the approved work.',
+    steps: [
+      { stepId: 'implement', title: 'Implement', details: 'Write the implementation.' },
+      { stepId: 'verify', title: 'Verify', details: 'Check the result.' },
+    ],
+    mutationManifest: [{ workspace: 'primary', operation: 'fs.write', target: 'README.md' }],
+  };
+  const cleanup = { stepId: 'cleanup', title: 'Clean up', details: 'Ignore generated files.' };
+  const revised = {
+    ...initial, title: 'Implement, verify and clean up',
+    steps: [initial.steps[0], { ...initial.steps[1], details: 'Check the result and generated files.' }, cleanup],
+    mutationManifest: [...initial.mutationManifest, { workspace: 'primary', operation: 'fs.write', target: '.gitignore' }],
+  };
+  const requests = [];
+  const executions = [];
+  let originalTodo;
+  const kernel = emptyKernel({ async execute(request) {
+    executions.push(structuredClone(request));
+    const authority = request.planAuthorities[0];
+    assert.equal(authority.revision, executions.length);
+    assert.deepEqual(authority.coveredOperations.map((operation) => operation.target), executions.length === 1 ? ['README.md'] : ['README.md', '.gitignore']);
+    return completedExecutionReply(request, { written: true });
+  } });
+  const provider = { async *stream(request) {
+    requests.push(structuredClone(request));
+    const turn = requests.length;
+    assert.ok(turn <= 10);
+    if (turn > 1) {
+      const previous = requests.at(-2);
+      assert.deepEqual(request.tools, previous.tools, 'Plan phases preserve tool definitions and ordering');
+      assert.deepEqual(request.messages.slice(0, previous.messages.length), previous.messages, 'Plan phases append facts without rewriting the cached prefix');
+    }
+    assert.equal(request.responseConstraint, 'normal');
+    const payloads = request.messages.map(jsonMessagePayload);
+    const todo = payloads.findLast((payload) => payload?.type === 'todo.current');
+    const record = payloads.find((payload) => payload?.recordId);
+    const planTool = request.tools.find((tool) => tool.inputSchema.properties?.mutationManifest);
+    const progressTool = request.tools.find((tool) => tool.inputSchema.properties?.sourceFactRef);
+    const writeTool = request.tools.find((tool) => tool.inputSchema.properties?.content);
+    let name, input;
+    if (turn === 1) { name = planTool.name; input = initial; }
+    else if (turn === 2) {
+      originalTodo = structuredClone(todo);
+      name = writeTool.name; input = { workspace: 'primary', path: 'README.md', content: 'Implemented.' };
+    } else if (turn === 3) {
+      name = progressTool.name; input = { sourceFactRef: record.recordId, updates: todo.items.map((item, index) => ({ todoId: item.todoId, status: index === 0 ? 'completed' : 'inProgress' })) };
+    } else if (turn === 4) {
+      name = planTool.name; input = { ...revised, steps: [cleanup] };
+    } else if (turn === 5) {
+      const error = payloads.findLast((payload) => payload?.accepted === false).error;
+      assert.equal(error.code, 'plan_revision_steps_missing');
+      assert.match(error.message, /implement.*verify/);
+      name = planTool.name; input = revised;
+    } else if (turn === 6) {
+      assert.equal(todo.sourcePlanId, originalTodo.sourcePlanId);
+      assert.equal(todo.sourcePlanRevision, 2);
+      assert.deepEqual(todo.items.slice(0, 2).map((item) => item.todoId), originalTodo.items.map((item) => item.todoId));
+      assert.deepEqual(todo.items.map((item) => item.status), ['completed', 'pending', 'pending']);
+      name = writeTool.name; input = { workspace: 'primary', path: '.gitignore', content: 'core\n' };
+    } else if (turn === 7) {
+      name = progressTool.name; input = { sourceFactRef: record.recordId, updates: [
+        { todoId: todo.items[2].todoId, status: 'completed' }, { todoId: 'todo:unknown', status: 'completed' },
+      ] };
+    } else if (turn === 8) {
+      const error = payloads.findLast((payload) => payload?.accepted === false).error;
+      assert.equal(error.code, 'plan_progress_todo_unknown');
+      assert.ok(error.message.includes(todo.items[2].todoId));
+      assert.equal(todo.items[2].status, 'pending', 'invalid progress applies no partial update');
+      name = progressTool.name; input = { sourceFactRef: record.recordId, updates: todo.items.map((item) => ({ todoId: item.todoId, status: 'completed' })) };
+    } else if (turn === 9) {
+      assert.ok(payloads.some((payload) => payload?.type === 'plan.completed' && payload.revision === 2));
+      name = progressTool.name; input = { sourceFactRef: record.recordId, updates: [{ todoId: originalTodo.items[0].todoId, status: 'completed' }] };
+    } else {
+      assert.equal(payloads.findLast((payload) => payload?.accepted === false).error.code, 'plan_progress_not_active');
+      yield providerEvent(request.requestId, 'assistant.message', { messageId: 'message:revision-finished', content: 'The revised work and cleanup are complete.' });
+      yield providerEvent(request.requestId, 'completed', {});
+      return;
+    }
+    yield providerEvent(request.requestId, 'tool.call', { callId: `provider-call:revision-${turn}`, name, input });
+    yield providerEvent(request.requestId, 'completed', {});
+  } };
+  const actor = actorWith(journal, sessionId, provider, kernel, preparation.port, 'revision');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:revision-start', 'Implement and verify.'));
+  let waiting = await waitForProjection(actor, (value) => value.pendingPlan?.revision === 1);
+  const firstId = waiting.pendingPlan.planId;
+  for (const revision of [1, 2]) {
+    if (revision === 2) {
+      waiting = await waitForProjection(actor, (value) => value.pendingPlan?.revision === 2);
+      assert.equal(waiting.pendingPlan.planId, firstId);
+      assert.equal(waiting.todoList.items.length, 2, 'the proposed revision cannot replace Todo before confirmation');
+      assert.equal(executions.length, 1, 'new scope must wait for user confirmation');
+    }
+    await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'plan.respond', commandId: `command:revision-confirm-${revision}`, sessionId,
+      runId: waiting.run.runId, planId: firstId, revision, response: { kind: 'confirm' } });
+  }
+  const completed = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.deepEqual(completed.plans.map((plan) => plan.status), ['superseded', 'completed']);
+  assert.ok(completed.todoList.items.every((item) => item.status === 'completed'));
+  assert.equal(requests.length, 10);
+  assert.equal(executions.length, 2);
+  const events = await readEvents(journal, sessionId);
+  assert.equal(events.filter((event) => event.type === 'todo.seeded').length, 1);
+  assert.equal(events.filter((event) => event.type === 'todo.reconciled').length, 1);
+  assert.deepEqual(events.filter((event) => event.type === 'session.control.rejected').map((event) => event.payload.error.code),
+    ['plan_revision_steps_missing', 'plan_progress_todo_unknown', 'plan_progress_not_active']);
+  const final = events.find((event) => event.type === 'message.committed' && event.payload.role === 'assistant');
+  assertEventOrder(singleEvent(events, 'plan.completed'), final, singleEvent(events, 'run.finishing'), singleEvent(events, 'run.runtime.released'), singleEvent(events, 'run.settled'));
+  assert.equal(preparation.released.length, 1);
 });
 
 test('built-in runtime and control prompts stay concise and policy-scoped', () => {
@@ -2270,6 +2443,53 @@ test('built-in runtime and control prompts stay concise and policy-scoped', () =
   const bashScope = controls[1].inputSchema.properties.mutationManifest.items.oneOf[2];
   assert.equal(bashScope.required.includes('command'), false);
   assert.ok(bashScope.required.includes('executionScope'));
+});
+
+test('plan rejection names the invalid manifest field and preserves the Provider prefix for correction', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:plan-field-diagnostic';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const input = {
+    title: 'Create the project', summary: 'Write sources and build script.',
+    steps: [{ stepId: 'write', title: 'Write files', details: 'Create the source files and build script.' }],
+    mutationManifest: ['include/pool.hpp', 'src/main.cpp', 'build.sh', 'run.sh'].map((target) => ({
+      workspace: 'primary', operation: 'fs.write', target,
+    })),
+  };
+  const requests = [];
+  const provider = { async *stream(request) {
+    requests.push(structuredClone(request));
+    assert.ok(requests.length <= 2);
+    const plan = request.tools.find((tool) => tool.inputSchema.properties?.mutationManifest);
+    const candidate = structuredClone(input);
+    if (requests.length === 1) {
+      candidate.mutationManifest[2].executable = true;
+      candidate.mutationManifest[3].executable = true;
+    }
+    else {
+      const rejection = request.messages.map(jsonMessagePayload).find((value) => value?.accepted === false);
+      assert.equal(rejection.executed, false);
+      assert.equal(rejection.error.code, 'session_control_shape_invalid');
+      assert.match(rejection.error.message, /mutationManifest\[2\].*不支持字段 executable/u);
+      assert.match(rejection.error.message, /mutationManifest\[3\].*不支持字段 executable/u);
+      assert.match(rejection.error.message, /允许字段：workspace, operation, target/u);
+      assert.deepEqual(request.tools, requests[0].tools, 'correction must not change the cached tool definitions');
+      assert.deepEqual(request.messages.slice(0, requests[0].messages.length), requests[0].messages);
+    }
+    yield providerEvent(request.requestId, 'tool.call', { callId: `call:plan-${requests.length}`, name: plan.name, input: candidate });
+    yield providerEvent(request.requestId, 'completed', {});
+  } };
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), fakeRunPreparation().port, 'plan-field-diagnostic');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:plan-field', 'Prepare the project.'));
+  const waiting = await waitForProjection(actor, (value) => value.run?.status === 'waiting' && value.pendingPlan !== null);
+  assert.equal(waiting.pendingPlan.mutationManifest.length, 4);
+  assert.equal(waiting.activePlanRef, null, 'valid publication still requires user confirmation');
+  const events = await readEvents(journal, sessionId);
+  const rejected = singleEvent(events, 'session.control.rejected');
+  assert.equal(rejected.payload.input.mutationManifest[2].executable, true, 'keep the original invalid input in the journal');
+  assert.equal(events.filter((event) => event.type === 'plan.published').length, 1);
+  assert.equal(events.some((event) => event.type === 'tool.requested' || event.type === 'plan.confirmed'), false);
 });
 
 test('an explicit Provider failure remains failed with its original error', async () => {
@@ -2573,10 +2793,29 @@ test('an interaction response is inserted after its tool result and a stale seco
   assert.equal(completed.pendingInteraction, null);
   const events = await readEvents(journal, sessionId);
   assert.equal(events.filter((event) => event.type === 'interaction.resolved').length, 1);
+  const answer = completed.messages.find((message) => message.content === 'Use option A.');
+  assert.deepEqual(answer.replyToInteraction, { interactionId: interaction.interactionId, prompt: 'Which fixture option?' });
+  assert.deepEqual(loopSnapshot(sessionId, events).state.messages.find((message) => message.messageId === answer.messageId).replyToInteraction,
+    answer.replyToInteraction, 'journal replay preserves the exact question without GUI caching or inference');
   assert.equal(events.filter((event) => (
     event.type === 'message.committed' && event.payload.role === 'user'
   )).length, 2);
   await actor.dispose();
+});
+
+test('Plan title schema advertises the same single-line boundary enforced during publication', () => {
+  const schema = sessionControlToolDefinitions().find((tool) => tool.name === 'plan.publish').inputSchema;
+  const pattern = new RegExp(schema.properties.title.pattern, 'u');
+  const input = { title: '保留 `Dockerfile`、`Makefile`', summary: '说明',
+    steps: [{ stepId: 'inspect', title: '检查工作区', details: '读取目录' }], mutationManifest: [] };
+  assert.ok(pattern.test(input.title));
+  assert.equal(decodeSessionControlCall('call:title', 'plan.publish', input).draft.title, input.title);
+  for (const title of ['计划\n\n', '计划\n第二行', ' 计划', '计划 ', '\u0000']) {
+    assert.equal(pattern.test(title), false, 'the advertised schema must reject the actual failing input');
+    assert.throws(() => decodeSessionControlCall('call:title', 'plan.publish', { ...input, title }),
+      (error) => error.code === 'session_control_display_text_invalid' && /单行/.test(error.message));
+  }
+  assert.equal(schema.properties.steps.items.properties.title.pattern, schema.properties.title.pattern);
 });
 
 async function verifyExplicitFocusCompaction() {

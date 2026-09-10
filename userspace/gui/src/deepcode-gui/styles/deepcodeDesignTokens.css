@@ -225,7 +225,7 @@
   background: var(--dc-background);
   color: var(--dc-foreground);
   font-family: var(--dc-font-ui);
-  font-size: var(--dc-font-body-large);
+  font-size: var(--dc-font-body);
   letter-spacing: 0;
 }
 

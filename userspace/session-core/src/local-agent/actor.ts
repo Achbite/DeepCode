@@ -1,4 +1,5 @@
 import { LiveReasoning } from './reasoningRead.js';
+import { todoItemsForPlan } from './planStage.js';
 import type {
   AssistantDraftProjection,
   CommandJournalPort,
@@ -647,7 +648,11 @@ export class SessionActor {
           authorities,
         },
       });
-      const todoItems = todoItemsForPlan(plan, snapshot.state.todoList, this.#nextId);
+      const previousTodo = snapshot.state.todoList;
+      const previousPlan = previousTodo && snapshot.state.plans.find((candidate) => (
+        candidate.planId === previousTodo.sourcePlanId && candidate.revision === previousTodo.sourcePlanRevision
+      ));
+      const todoItems = todoItemsForPlan(plan, previousTodo, previousPlan ?? undefined, this.#nextId);
       events.push({
         type: snapshot.state.todoList?.sourcePlanId === plan.planId
           ? 'todo.reconciled'
@@ -1092,27 +1097,6 @@ function planToSupersede(
   return previousRevision
     ? { planId: previousRevision.planId, revision: previousRevision.revision }
     : null;
-}
-
-function todoItemsForPlan(
-  plan: NonNullable<SessionProjection['pendingPlan']>,
-  previous: SessionProjection['todoList'],
-  nextId: (kind: string) => string,
-): NonNullable<SessionProjection['todoList']>['items'] {
-  const previousByStep = new Map(
-    previous?.sourcePlanId === plan.planId
-      ? previous.items.map((item) => [item.sourceStepId, item] as const)
-      : [],
-  );
-  return plan.steps.map((step) => {
-    const existing = previousByStep.get(step.stepId);
-    return {
-      todoId: existing?.todoId ?? nextId('todo'),
-      sourceStepId: step.stepId,
-      label: step.title,
-      status: existing?.status ?? 'pending',
-    };
-  });
 }
 
 function validInteractionResponse(interaction: InteractionProjection, response: string): boolean {

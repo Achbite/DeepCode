@@ -1347,7 +1347,7 @@ impl LocalAgentKernel {
         result
     }
 
-    fn session_output_directory(&self, session_id: &str) -> PathBuf {
+    pub(crate) fn session_output_directory(&self, session_id: &str) -> PathBuf {
         self.output_root
             .join(deepcode_kernel_tools::hash_bytes(session_id.as_bytes()))
     }

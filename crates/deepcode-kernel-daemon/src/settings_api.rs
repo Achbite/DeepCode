@@ -418,17 +418,16 @@ pub(crate) fn default_llm_profiles() -> Value {
         "profiles": [
             {
                 "id": "deepseek-v4-flash-openai",
-                "name": "DeepSeek V4 Flash",
+                "name": "DeepSeek Flash",
                 "kind": "responses",
                 "providerFlavor": "deepseek",
                 "baseUrl": "https://api.deepseek.com",
-                "model": "deepseek-v4-flash",
+                "model": "deepseek-flash",
                 "contextWindowTokens": 1000000,
                 "maxOutputTokens": 384000,
                 "temperature": 0.2,
                 "reasoningEffort": "high",
                 "thinking": "enabled",
-                "hostedWebSearch": "web_search",
                 "enabled": true
             },
             {
@@ -443,7 +442,6 @@ pub(crate) fn default_llm_profiles() -> Value {
                 "temperature": 0.2,
                 "reasoningEffort": "max",
                 "thinking": "enabled",
-                "hostedWebSearch": "web_search",
                 "enabled": true
             }
         ],

@@ -1,18 +1,23 @@
 import React, { useEffect, useRef, useState } from 'react';
-import type { PlanOperation, PlanProjection } from '@deepcode/protocol';
+import type { PlanOperation, PlanProjection, WorkspaceBindingDisplay } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
-import { MarkdownContent } from './BufferedMarkdown';
+import { MarkdownInline } from './BufferedMarkdown';
+import { PlanDocument } from './PlanDocument';
 
 interface PlanCardProps {
   plan: PlanProjection;
   active: boolean;
+  previousPlan?: PlanProjection;
+  workspaceBindings?: readonly WorkspaceBindingDisplay[];
   language: UiLanguage;
 }
 
 const PlanCard: React.FC<PlanCardProps> = ({
   plan,
   active,
+  previousPlan,
+  workspaceBindings = [],
   language,
 }) => {
   const previousStatus = useRef(plan.status);
@@ -50,54 +55,30 @@ const PlanCard: React.FC<PlanCardProps> = ({
             <span className="local-agent__plan-card-status">{status}</span>
             <DeepCodeShellIcon name="chevronDown" />
           </button>
-          <h2>{plan.title}</h2>
-          <div className="local-agent__plan-card-overview">
-            <MarkdownContent>{plan.summary}</MarkdownContent>
-          </div>
-
-          <ol className="local-agent__plan-steps">
-            {plan.steps.map((step, index) => (
-              <li key={step.stepId}>
-                <span className="local-agent__plan-step-marker" aria-hidden="true">{index + 1}</span>
-                <div>
-                  <strong>{step.title}</strong>
-                  <div className="local-agent__plan-step-details">
-                    <MarkdownContent>{step.details}</MarkdownContent>
-                  </div>
-                  {step.verification && step.verification.length > 0 && (
-                    <div className="local-agent__plan-verification">
-                      <span>{t(language, 'agent.plan.verification')}</span>
-                      <ul>
-                        {step.verification.map((item, index) => (
-                          <li key={`${item}:${index}`}>{item}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
-                </div>
-              </li>
-            ))}
-          </ol>
-
-          {plan.mutationManifest.length > 0 && (
-            <details className="local-agent__plan-manifest">
-              <summary>
-                {t(language, 'agent.plan.mutationManifest', {
-                  count: plan.mutationManifest.length,
-                })}
-              </summary>
-              <ul>
-                {plan.mutationManifest.map((operation, index) => (
-                  <li key={`${operation.workspaceId}:${operation.operation}:${planOperationDetail(operation)}:${index}`}>
-                    <code>
-                      {operation.workspaceId} · {operation.operation} · {planOperationDetail(operation)}
-                      {'targetKind' in operation ? ` · ${operation.targetKind}` : ''}
-                    </code>
-                  </li>
-                ))}
-              </ul>
-            </details>
-          )}
+          {previousPlan && <p className="conversation-plan-revision-note">
+            {planRevisionSummary(previousPlan, plan, language)}
+          </p>}
+          <PlanDocument title={plan.title} summary={plan.summary} steps={plan.steps} language={language}>
+            {plan.mutationManifest.length > 0 && (
+              <details className="local-agent__plan-manifest">
+                <summary>
+                  {t(language, 'agent.plan.mutationManifest', {
+                    count: plan.mutationManifest.length,
+                  })}
+                </summary>
+                <ul>
+                  {plan.mutationManifest.map((operation, index) => (
+                    <li key={`${operation.workspaceId}:${operation.operation}:${planOperationDetail(operation)}:${index}`}>
+                      <code>
+                        {workspaceBindings.length > 1 ? `${workspaceBindings.find((binding) => binding.workspaceId === operation.workspaceId)?.displayName ?? operation.workspaceId} · ` : ''}
+                        {planOperationDetail(operation, language)}
+                      </code>
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
+          </PlanDocument>
         </div>
       ) : (
         <button
@@ -108,7 +89,7 @@ const PlanCard: React.FC<PlanCardProps> = ({
           onClick={() => setExpanded(true)}
         >
           <DeepCodeShellIcon name="activity" />
-          <strong>{plan.title}</strong>
+          <strong><MarkdownInline>{plan.title}</MarkdownInline></strong>
           <span className="local-agent__plan-card-status">{status} · {stepCount}</span>
           <span className="local-agent__plan-card-chevron" aria-hidden="true">
             <DeepCodeShellIcon name="chevronRight" />
@@ -119,11 +100,27 @@ const PlanCard: React.FC<PlanCardProps> = ({
   );
 };
 
-function planOperationDetail(operation: PlanOperation): string {
+function planOperationDetail(operation: PlanOperation, language: UiLanguage = 'zh-CN'): string {
+  const chinese = language === 'zh-CN';
   if (operation.operation === 'bash') {
-    return `${operation.command} · executionScope=${operation.executionScope} · workspaceMode=${operation.workspaceMode}${operation.terminal ? ' · PTY' : ''}`;
+    const scope = operation.executionScope === 'host' ? (chinese ? '宿主机' : 'Host') : (chinese ? '工作区' : 'Workspace');
+    const mode = chinese ? '允许修改' : 'May modify';
+    return `${chinese ? '执行命令' : 'Run command'} · ${scope} · ${mode}${operation.command ? `\n${operation.command}` : ''}${operation.terminal ? (chinese ? ' · 交互终端' : ' · Interactive terminal') : ''}`;
   }
-  return operation.target;
+  const label = operation.operation === 'fs.delete' ? (chinese ? '删除' : 'Delete')
+    : operation.operation === 'fs.write' ? (chinese ? '写入' : 'Write') : (chinese ? '编辑' : 'Edit');
+  return `${label} · ${operation.target}${'targetKind' in operation && operation.targetKind === 'directoryTree' ? (chinese ? '（目录）' : ' (directory)') : ''}`;
+}
+
+function planRevisionSummary(previous: PlanProjection, current: PlanProjection, language: UiLanguage): string {
+  const added = current.steps.filter((step) => !previous.steps.some((old) => old.stepId === step.stepId)).length;
+  const removed = previous.steps.filter((step) => !current.steps.some((next) => next.stepId === step.stepId)).length;
+  const changed = current.steps.filter((step) => previous.steps.some((old) => old.stepId === step.stepId
+    && (old.title !== step.title || old.details !== step.details || JSON.stringify(old.verification) !== JSON.stringify(step.verification)))).length;
+  const scopeChanged = JSON.stringify(previous.mutationManifest) !== JSON.stringify(current.mutationManifest);
+  return language === 'zh-CN'
+    ? `本次修订：新增 ${added} 步 · 调整 ${changed} 步 · 移除 ${removed} 步${scopeChanged ? ' · 执行范围有变化，请核对后确认' : ''}`
+    : `Revision: ${added} added · ${changed} changed · ${removed} removed${scopeChanged ? ' · Execution scope changed; review before confirming' : ''}`;
 }
 
 export default PlanCard;
