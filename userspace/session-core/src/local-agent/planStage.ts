@@ -98,10 +98,16 @@ export function planProgressFact(
     return reject('plan_progress_not_active', 'There is no confirmed active Plan in this run. Do not update previous Todo IDs. Provide a final explanation of the recorded results, or publish a Plan if new scope is required.');
   }
   const unknown = turn.updates.filter((update) => !todo.items.some((item) => item.todoId === update.todoId));
-  if (unknown.length > 0) return reject(
-    'plan_progress_todo_unknown',
-    `Unknown Todo IDs: ${JSON.stringify(unknown.map((item) => item.todoId))}. No updates were applied. Current Plan and Todo: ${JSON.stringify(todo)}.`,
-  );
+  if (unknown.length > 0) {
+    const candidates = todo.items.map((item) => item.todoId);
+    const nearest = unknown.map((item) => ({
+      todoId: item.todoId, nearestTodoId: nearestTodoId(item.todoId, candidates),
+    }));
+    return reject(
+      'plan_progress_todo_unknown',
+      `Unknown Todo IDs: ${JSON.stringify(unknown.map((item) => item.todoId))}. No updates were applied. Nearest valid Todo IDs: ${JSON.stringify(nearest)}. Current Plan and Todo: ${JSON.stringify(todo)}.`,
+    );
+  }
   const evidence = events.find((event) => event.type === 'tool.completed' && event.runId === runId
     && event.payload.record.recordId === turn.sourceFactRef);
   if (!evidence || evidence.type !== 'tool.completed') return reject(
@@ -143,4 +149,36 @@ export function planFinalSettlement(state: SessionState, runId: string, finalMes
     },
   };
   return { outcome: 'completed', finalMessageId };
+}
+
+/**
+ * Suggests the closest valid Todo ID for a mistyped one. The batch stays atomic,
+ * but the rejecting message must let the model correct a single character.
+ */
+function nearestTodoId(value: string, candidates: readonly string[]): string | null {
+  let best: string | null = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const candidate of candidates) {
+    const distance = editDistance(value, candidate);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+function editDistance(left: string, right: string): number {
+  if (left === right) return 0;
+  let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  let current = new Array<number>(right.length + 1);
+  for (let i = 1; i <= left.length; i += 1) {
+    current[0] = i;
+    for (let j = 1; j <= right.length; j += 1) {
+      const substitution = previous[j - 1] + (left[i - 1] === right[j - 1] ? 0 : 1);
+      current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, substitution);
+    }
+    [previous, current] = [current, previous];
+  }
+  return previous[right.length];
 }

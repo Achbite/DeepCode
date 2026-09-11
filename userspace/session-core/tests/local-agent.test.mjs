@@ -2427,6 +2427,7 @@ test('execution-time Plan revisions retain Todo identity and rejected progress c
       const error = payloads.findLast((payload) => payload?.accepted === false).error;
       assert.equal(error.code, 'plan_progress_todo_unknown');
       assert.ok(error.message.includes(todo.items[2].todoId));
+      assert.match(error.message, /Nearest valid Todo IDs/);
       assert.equal(todo.items[2].status, 'pending', 'invalid progress applies no partial update');
       name = progressTool.name; input = { sourceFactRef: record.recordId, updates: todo.items.map((item) => ({ todoId: item.todoId, status: 'completed' })) };
     } else if (turn === 9) {
@@ -3643,6 +3644,7 @@ test('aggregate input admission preserves raw errors, permits correction, and ne
   for (const [suffix, invalid, code] of [
     ['json', '{"workspace":"primary","path":', 'provider_tool_call_arguments_invalid'],
     ['workspace', '{"workspace":"unknown","path":"probe.txt"}', 'provider_workspace_handle_not_bound'],
+    ['missing', '{"path":"probe.txt"}', 'provider_workspace_handle_required'],
   ]) {
     const journal = new InMemoryCommandJournal();
     const sessionId = `session:aggregate-input-${suffix}`;
@@ -3669,6 +3671,9 @@ test('aggregate input admission preserves raw errors, permits correction, and ne
         const rejected = request.messages.map(jsonMessagePayload).find((value) => value?.status === 'inputRejected');
         assert.equal(rejected.executed, false);
         assert.equal(rejected.error.code, code);
+        if (code.startsWith('provider_workspace_')) {
+          assert.ok(rejected.error.message.includes('primary'), 'the rejection must name the bound logical handles');
+        }
         assert.deepEqual(request.tools, requests[0].tools);
         assert.deepEqual(request.messages.slice(0, requests[0].messages.length), requests[0].messages);
         yield providerEvent(request.requestId, 'tool.call', { callId: 'native:corrected', name, arguments: '{"workspace":"primary","path":"probe.txt"}' });
