@@ -5,6 +5,7 @@ import type { SessionProjection } from '@deepcode/protocol';
 interface SessionViewport {
   mode: 'following' | 'detached';
   scrollTop: number;
+  anchor?: { key: string; offset: number };
 }
 
 interface ConversationViewportInput {
@@ -41,6 +42,25 @@ export function useConversationViewport({
   const scrollFrameRef = useRef<number | null>(null);
   const viewportRestoreFrameRef = useRef<number | null>(null);
   const detachedViewportFrameRef = useRef<number | null>(null);
+  const capturePosition = useCallback((): Pick<SessionViewport, 'scrollTop' | 'anchor'> => {
+    const body = bodyRef.current;
+    if (!body) return { scrollTop: lastScrollTopRef.current };
+    const top = body.getBoundingClientRect().top;
+    const node = [...body.querySelectorAll<HTMLElement>('[data-conversation-anchor]')]
+      .find((node) => node.getClientRects().length > 0 && node.getBoundingClientRect().bottom > top);
+    return { scrollTop: body.scrollTop, ...(node ? { anchor: { key: node.dataset.conversationAnchor!, offset: node.getBoundingClientRect().top - top } } : {}) };
+  }, []);
+  const restorePosition = useCallback((saved: SessionViewport) => {
+    const body = bodyRef.current;
+    if (!body) return;
+    const anchor = saved.anchor;
+    const node = anchor ? [...body.querySelectorAll<HTMLElement>('[data-conversation-anchor]')]
+      .find((node) => node.dataset.conversationAnchor === anchor.key && node.getClientRects().length > 0) : undefined;
+    body.scrollTop = node && anchor
+      ? body.scrollTop + node.getBoundingClientRect().top - body.getBoundingClientRect().top - anchor.offset
+      : saved.scrollTop;
+    lastScrollTopRef.current = body.scrollTop;
+  }, []);
   const applyLatestFollowMode = useCallback((following: boolean) => {
     followingLatestRef.current = following;
     setFollowingLatest(following);
@@ -52,10 +72,10 @@ export function useConversationViewport({
     if (activeSessionId && pendingViewportRestoreRef.current !== activeSessionId) {
       sessionViewportsRef.current.set(activeSessionId, {
         mode: following ? 'following' : 'detached',
-        scrollTop: bodyRef.current?.scrollTop ?? lastScrollTopRef.current,
+        ...capturePosition(),
       });
     }
-  }, [applyLatestFollowMode]);
+  }, [applyLatestFollowMode, capturePosition]);
 
   const scrollToLatestNow = useCallback((behavior: ScrollBehavior = 'auto') => {
     const body = bodyRef.current;
@@ -65,7 +85,7 @@ export function useConversationViewport({
 
   const scheduleScrollToLatest = useCallback((behavior: ScrollBehavior = 'auto') => {
     if (!followingLatestRef.current || pendingViewportRestoreRef.current !== null) return;
-    if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current);
+    if (scrollFrameRef.current !== null) return;
     scrollFrameRef.current = window.requestAnimationFrame(() => {
       scrollFrameRef.current = null;
       if (followingLatestRef.current && pendingViewportRestoreRef.current === null) {
@@ -132,7 +152,8 @@ export function useConversationViewport({
       const saved = sessionViewportsRef.current.get(targetSessionId);
       const following = saved?.mode !== 'detached';
       applyLatestFollowMode(following);
-      body.scrollTop = following ? body.scrollHeight : (saved?.scrollTop ?? 0);
+      if (following) body.scrollTop = body.scrollHeight;
+      else restorePosition(saved!);
       lastScrollTopRef.current = body.scrollTop;
       pendingViewportRestoreRef.current = null;
     });
@@ -140,10 +161,20 @@ export function useConversationViewport({
     applyLatestFollowMode,
     loading,
     presentationLayoutKey,
+    restorePosition,
     projection?.sessionId,
     sessionId,
     timelineExtentKey,
   ]);
+
+  // React layout changes (including process disclosure at completion) must preserve
+  // the reader's anchor before paint, even during a wheel gesture. ResizeObserver
+  // continues to cover asynchronous image/code layout outside React commits.
+  useLayoutEffect(() => {
+    if (followingLatestRef.current || pendingViewportRestoreRef.current !== null) return;
+    const saved = sessionId ? sessionViewportsRef.current.get(sessionId) : undefined;
+    if (saved?.mode === 'detached') restorePosition(saved);
+  });
 
   useEffect(() => {
     if (followingLatest) scheduleScrollToLatest();
@@ -172,9 +203,7 @@ export function useConversationViewport({
         || touchScrollActiveRef.current
         || pointerScrollActiveRef.current;
       if (!activeSessionId || saved?.mode !== 'detached' || userScrolling) return;
-      if (detachedViewportFrameRef.current !== null) {
-        window.cancelAnimationFrame(detachedViewportFrameRef.current);
-      }
+      if (detachedViewportFrameRef.current !== null) return;
       detachedViewportFrameRef.current = window.requestAnimationFrame(() => {
         detachedViewportFrameRef.current = null;
         const currentBody = bodyRef.current;
@@ -189,8 +218,7 @@ export function useConversationViewport({
           || touchScrollActiveRef.current
           || pointerScrollActiveRef.current
         ) return;
-        currentBody.scrollTop = currentSaved.scrollTop;
-        lastScrollTopRef.current = currentBody.scrollTop;
+        restorePosition(currentSaved);
       });
     });
     observer.observe(transcript);
@@ -202,7 +230,7 @@ export function useConversationViewport({
         detachedViewportFrameRef.current = null;
       }
     };
-  }, [scheduleScrollToLatest, sessionId]);
+  }, [restorePosition, scheduleScrollToLatest, sessionId]);
 
   useEffect(() => () => {
     if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current);
@@ -294,7 +322,7 @@ export function useConversationViewport({
       if (sessionId) {
         sessionViewportsRef.current.set(sessionId, {
           mode: followingLatestRef.current ? 'following' : 'detached',
-          scrollTop: body.scrollTop,
+          ...capturePosition(),
         });
       }
     },

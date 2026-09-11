@@ -1,6 +1,6 @@
 {
   "name": "@deepcode/client",
-  "version": "0.5.50",
+  "version": "0.5.51",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -20,6 +20,8 @@
     "@deepcode/protocol": "workspace:*",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
+    "diff": "8.0.2",
+    "hast-util-to-jsx-runtime": "2.3.6",
     "katex": "^0.17.0",
     "mermaid": "^11.15.0",
     "react": "^19.0.0",
@@ -28,10 +30,15 @@
     "rehype-katex": "^7.0.1",
     "remark-gfm": "^4.0.1",
     "remark-math": "^6.0.0",
+    "remark-parse": "11.0.0",
+    "remark-rehype": "11.1.2",
+    "unified": "11.0.5",
     "zustand": "^5.0.0"
   },
   "devDependencies": {
     "@monaco-editor/react": "^4.7.0",
+    "@types/hast": "3.0.4",
+    "@types/mdast": "4.0.4",
     "@types/node": "^22.19.19",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",

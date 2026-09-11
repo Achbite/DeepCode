@@ -269,7 +269,7 @@ export function encodeProviderMessage(
     return {
       ...call,
       name: wire,
-      input: encodeProviderToolInput(callCodec, call.name, call.input),
+      input: typeof call.input === 'string' ? call.input : encodeProviderToolInput(callCodec, call.name, call.input),
     };
   });
   return encoded;
@@ -304,22 +304,27 @@ export function providerMessageCodecsByCallId(
 
   const result = new Map<string, ProviderMessageToolCodec>();
   for (const event of events) {
-    if (!('callId' in event) || !event.callId || !event.runId) continue;
+    const callIds = event.type === 'provider.turn.settled' && event.payload.outcome === 'completed'
+      ? (event.payload.toolCallInputs ?? []).map((call) => call.callId)
+      : 'callId' in event && event.callId ? [event.callId] : [];
+    if (!callIds.length || !('runId' in event) || !event.runId) continue;
     const ownerCodec = codecsByRunId.get(event.runId);
     if (!ownerCodec) {
       throw new LoopFailure(
         'provider_tool_call_runtime_missing',
-        `工具调用缺少所属 run runtime snapshot：${event.callId}`,
+        `工具调用缺少所属 run runtime snapshot：${event.runId}`,
       );
     }
-    const existing = result.get(event.callId);
-    if (existing && existing !== ownerCodec) {
-      throw new LoopFailure(
-        'provider_tool_call_runtime_conflict',
-        `LogicalCallId 关联了多个 run runtime snapshot：${event.callId}`,
-      );
+    for (const callId of callIds) {
+      const existing = result.get(callId);
+      if (existing && existing !== ownerCodec) {
+        throw new LoopFailure(
+          'provider_tool_call_runtime_conflict',
+          `LogicalCallId 关联了多个 run runtime snapshot：${callId}`,
+        );
+      }
+      result.set(callId, ownerCodec);
     }
-    result.set(event.callId, ownerCodec);
   }
   return result;
 }

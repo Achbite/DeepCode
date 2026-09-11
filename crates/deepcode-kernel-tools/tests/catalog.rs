@@ -144,3 +144,32 @@ fn canonical_arguments_reach_the_executor_boundary() {
     assert!(shell.arguments.get("cwd").is_none());
     assert!(shell.arguments.get("maxOutputBytes").is_none());
 }
+
+#[test]
+fn file_names_keep_distinct_unicode_spelling_through_invocation_and_identity() {
+    use deepcode_kernel_tools::kernel_internal::{normalize_canonical_platform_path, Platform};
+    let registry = KernelToolRegistry::new();
+    let decomposed = "e\u{301}.txt";
+    let composed = "é.txt";
+    for path in [decomposed, composed] {
+        let read = registry
+            .canonicalize("fs.read", json!({"path": path}))
+            .unwrap();
+        assert_eq!(read.arguments["path"], path);
+        let absolute = format!("/workspace/{path}");
+        assert_eq!(
+            normalize_canonical_platform_path(Platform::Linux, &absolute).unwrap(),
+            absolute
+        );
+    }
+    assert_ne!(
+        registry
+            .canonicalize("fs.read", json!({"path": decomposed}))
+            .unwrap()
+            .arguments,
+        registry
+            .canonicalize("fs.read", json!({"path": composed}))
+            .unwrap()
+            .arguments
+    );
+}

@@ -316,7 +316,7 @@ fn binary_extension(extension: &str) -> bool {
     )
 }
 
-fn binary_magic(bytes: &[u8]) -> Option<&'static str> {
+pub(crate) fn binary_magic(bytes: &[u8]) -> Option<&'static str> {
     if bytes.len() >= 4 {
         let head4 = &bytes[..4];
         if head4 == b"\x7FELF" {
@@ -362,7 +362,7 @@ fn binary_magic(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-fn has_high_control_byte_ratio(bytes: &[u8]) -> bool {
+pub(crate) fn has_high_control_byte_ratio(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return false;
     }

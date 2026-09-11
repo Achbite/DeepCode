@@ -232,6 +232,7 @@
       "additionalProperties": false,
       "required": ["runId", "turnId", "blocks"],
       "properties": {
+        "planPreview": { "$ref": "#/$defs/PlanPreviewProjection" },
         "runId": { "$ref": "#/$defs/Id" },
         "turnId": { "$ref": "#/$defs/Id" },
         "blocks": {
@@ -249,6 +250,20 @@
             "lastContentAt": { "$ref": "#/$defs/Timestamp" }
           }
         }
+      }
+    },
+    "PlanPreviewProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["callIndex", "providerCallId", "title", "summary", "steps", "truncated"],
+      "properties": {
+        "callIndex": { "type": "integer", "minimum": 0 },
+        "providerCallId": { "$ref": "#/$defs/Id" },
+        "outputIndex": { "type": "integer", "minimum": 0 },
+        "title": { "type": "string", "maxLength": 256 },
+        "summary": { "type": "string", "maxLength": 4096 },
+        "steps": { "type": "array", "maxItems": 12, "items": { "type": "string", "maxLength": 256 } },
+        "truncated": { "type": "boolean" }
       }
     },
     "ModelMessage": {
@@ -561,6 +576,26 @@
     "ProviderEvent": {
       "oneOf": [
         {
+          "type": "object", "additionalProperties": false,
+          "required": ["schemaVersion", "requestId", "type", "data"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.provider-event" },
+            "requestId": { "$ref": "#/$defs/Id" },
+            "type": { "const": "tool.call.delta" },
+            "data": {
+              "type": "object", "additionalProperties": false,
+              "required": ["callIndex", "callId", "name", "argumentsDelta"],
+              "properties": {
+                "callIndex": { "type": "integer", "minimum": 0 },
+                "callId": { "$ref": "#/$defs/Id" },
+                "name": { "type": "string", "minLength": 1 },
+                "argumentsDelta": { "type": "string" },
+                "outputIndex": { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        },
+        {
           "type": "object",
           "additionalProperties": false,
           "required": ["schemaVersion", "requestId", "type", "data"],
@@ -593,6 +628,7 @@
               "required": ["text"],
               "properties": {
                 "text": { "type": "string", "minLength": 1 },
+                "kind": { "enum": ["text", "summary"] },
                 "outputIndex": { "type": "integer", "minimum": 0 }
               }
             }

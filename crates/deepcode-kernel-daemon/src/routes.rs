@@ -109,11 +109,15 @@ pub(crate) fn build_app(state: AppState) -> Router {
         )
         .route(
             "/api/conversation/sessions/:session_id/commands",
-            post(conversation_command_submit),
+            post(conversation_command_submit).layer(DefaultBodyLimit::max(34 * 1024 * 1024)),
         )
         .route(
             "/api/conversation/sessions/:session_id/directory-indexes",
             post(conversation_directory_index_attach),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/input-resources/:input_id",
+            post(conversation_input_upload).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .route(
             "/api/conversation/sessions/:session_id/filesystem-references/resolve",
@@ -134,6 +138,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/api/conversation/sessions/:session_id/context-compositions/:provider_request_id",
             get(conversation_context_composition_get),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/changes/read",
+            post(conversation_change_read),
         )
         .route(
             "/api/conversation/sessions/:session_id/resources/read",

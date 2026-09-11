@@ -151,6 +151,7 @@ export type PlanOperation =
 
 export interface ExecutionPlanStep {
   stepId: string;
+  /** Inline Markdown for display; stepId remains the task identity. */
   title: string;
   details: string;
   verification?: string[];
@@ -159,6 +160,7 @@ export interface ExecutionPlanStep {
 export interface ExecutionPlan {
   planId: string;
   revision: number;
+  /** Inline Markdown, never an execution or authorization input. */
   title: string;
   summary: string;
   steps: ExecutionPlanStep[];
@@ -310,6 +312,15 @@ export type ProviderOutputBlock = {
     }
 );
 
+/** Original aggregate Provider calls; rejected inputs never request a Kernel effect. */
+export interface ProviderToolCallInput {
+  callId: string;
+  providerCallId: string;
+  toolName: string;
+  arguments: string;
+  error?: LocalAgentError & { issues: ToolInputIssue[] };
+}
+
 export type ProviderTurnSettlement = {
   providerRequestId: string;
   purpose: 'agent' | 'contextCompaction';
@@ -322,6 +333,7 @@ export type ProviderTurnSettlement = {
       reasoningSignature?: string;
       hostedWebSearchCalls?: JsonObject[];
       orderedOutputBlocks?: ProviderOutputBlock[];
+      toolCallInputs?: ProviderToolCallInput[];
     }
   | {
       outcome: 'failed' | 'indeterminate';
@@ -825,6 +837,8 @@ interface ProjectionMessageBase {
   feedback: MessageFeedback | null;
   sequence: number;
   createdAt: string;
+  /** Derived from the matching input command and resolved interaction in the Session journal. */
+  replyToInteraction?: { interactionId: string; prompt: string };
 }
 
 export type ProjectionMessage = ProjectionMessageBase & (
@@ -926,6 +940,18 @@ export interface AssistantDraftProjection {
   /** Session orders these blocks. An empty list can still carry Provider activity. */
   blocks: AssistantDraftBlockProjection[];
   activity?: ProviderActivityProjection;
+  /** Display only; not a published plan or authority to execute. */
+  planPreview?: PlanPreviewProjection;
+}
+
+export interface PlanPreviewProjection {
+  callIndex: number;
+  providerCallId: string;
+  outputIndex?: number;
+  title: string;
+  summary: string;
+  steps: string[];
+  truncated: boolean;
 }
 
 export interface ProviderActivityProjection {
@@ -1020,9 +1046,25 @@ export interface ActivityResourceProjection {
 }
 
 export interface ToolActivityProjection {
+  recordId?: string;
   operation: string;
   resources: ActivityResourceProjection[];
   shell?: ShellActivityProjection;
+  fileChanges?: FileChangeProjection[];
+}
+
+export interface FileChangeSide {
+  exists: boolean;
+  contentRef?: string;
+  sizeBytes?: number;
+  error?: string;
+}
+export interface FileChangeProjection {
+  workspaceId: string;
+  path: string;
+  kind: 'create' | 'modify' | 'delete';
+  before: FileChangeSide;
+  after: FileChangeSide;
 }
 
 export interface ShellActivityProjection {
@@ -1101,6 +1143,7 @@ export interface SessionProjection {
   tokenUsageHistory: TokenUsageRoundProjection[];
   run: RunProjection | null;
   activities: ActivityProjection[];
+  fileChangeRounds?: Array<{ runId: string; recordIds: string[] }>;
   artifacts: ArtifactProjection[];
   terminalError: LocalAgentError | null;
 }
@@ -1115,7 +1158,8 @@ export interface ConversationPort {
 
 export interface ConversationReadQuery {
   sessionId: string;
-  view?: 'summary' | 'messages' | 'tools' | 'plans' | 'context';
+  view?: 'summary' | 'messages' | 'tools' | 'plans' | 'context' | 'reasoning';
+  offset?: number;
   before?: number;
   limit?: number;
   recordId?: string;
@@ -1148,7 +1192,7 @@ export interface ModelToolCall {
   callId: string;
   providerCallId: string;
   name: string;
-  input: JsonObject;
+  input: JsonObject | string;
 }
 
 export interface ProviderToolDefinition {
@@ -1199,6 +1243,12 @@ export type ProviderEvent =
   | {
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
       requestId: string;
+      type: 'tool.call.delta';
+      data: { callIndex: number; callId: string; name: string; argumentsDelta: string; outputIndex?: number };
+    }
+  | {
+      schemaVersion: typeof PROVIDER_EVENT_VERSION;
+      requestId: string;
       type: 'text.delta';
       data: { text: string; outputIndex?: number };
     }
@@ -1206,7 +1256,7 @@ export type ProviderEvent =
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
       requestId: string;
       type: 'reasoning.delta';
-      data: { text: string; outputIndex?: number };
+      data: { text: string; outputIndex?: number; kind?: 'text' | 'summary' };
     }
   | {
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
@@ -1229,7 +1279,7 @@ export type ProviderEvent =
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
       requestId: string;
       type: 'tool.call';
-      data: { callId: string; name: string; input: JsonObject };
+      data: { callId: string; name: string } & ({ input: JsonObject; arguments?: never } | { arguments: string; input?: never });
     }
   | {
       schemaVersion: typeof PROVIDER_EVENT_VERSION;

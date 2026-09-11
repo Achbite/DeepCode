@@ -516,7 +516,7 @@ export function useAgentComposer(
     && !submitting
     && !catalogBusy
     && !pendingApproval
-    && Boolean(selectedProfileId || pendingInteraction || pendingPlan);
+    && Boolean(profiles.some((profile) => profile.id === selectedProfileId && profile.enabled) || pendingInteraction || pendingPlan);
   const showStopAction = canCancel && !pendingPlan && !draft.trim();
 
   return {

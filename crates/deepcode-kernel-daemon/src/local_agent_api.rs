@@ -169,6 +169,8 @@ impl LocalAgentRuntime {
             RunPreparationError::new("gui_state_lock_failed", "GUI state 锁已损坏。")
         })?;
         let settings = &gui.user_settings;
+        let environment = crate::session_environment::capture(settings)
+            .map_err(|message| RunPreparationError::new("session_environment_invalid", message))?;
         // Validate and freeze the requested Provider before starting any new
         // out-of-process plugin generation. A bad Profile must not replace the
         // currently usable tool generation or leave an unused MCP process set.
@@ -208,10 +210,16 @@ impl LocalAgentRuntime {
         .map_err(|message| {
             RunPreparationError::new("kernel_runtime_identity_prepare_failed", message)
         })?;
-        let (executor_config, secrets) =
+        let (mut executor_config, mut secrets) =
             crate::runtime_tool_configuration(&gui).map_err(|message| {
                 RunPreparationError::new("kernel_runtime_config_prepare_failed", message)
             })?;
+        crate::local_agent_search::bind_cloud_search(
+            &mut executor_config,
+            &mut secrets,
+            &provider_binding.profile(),
+            &provider_runtime.profile_id,
+        );
         let permissions = LocalAgentPermissionPolicy::from_settings(settings)
             .map_err(RunPreparationError::from)?;
         let web_search = prepare_web_search_binding(
@@ -295,6 +303,7 @@ impl LocalAgentRuntime {
             ),
             "pluginConfig": plugin_config,
             "selectedPlugins": selected_plugins,
+            "environment": environment,
         });
         prepared_runs.insert(
             key,
@@ -883,7 +892,28 @@ pub(crate) async fn local_agent_provider_stream(
         "hostedTools": body.hosted_tools,
         "requireToolCall": body.response_constraint == "toolRequired",
     });
-    local_agent_provider_stream_response(runtime.profile(), request_envelope, request_id)
+    let archive_directory = state
+        .local_agent
+        .kernel
+        .session_output_directory(&body.session_id)
+        .join(format!(
+            "provider-{}",
+            crate::local_agent_kernel::output_directory_key(&request_id)
+        ));
+    let archive_identity = json!({
+        "sessionId": body.session_id,
+        "runId": body.run_id,
+        "requestId": request_id,
+        "purpose": body.purpose,
+        "profileId": body.profile_id,
+    });
+    local_agent_provider_stream_response(
+        runtime.profile(),
+        request_envelope,
+        request_id,
+        archive_directory,
+        archive_identity,
+    )
 }
 
 fn valid_provider_text(value: &str) -> bool {
@@ -1042,7 +1072,7 @@ fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), St
             if !valid_provider_text(&call.call_id)
                 || !valid_provider_text(&call.provider_call_id)
                 || !valid_provider_tool_name(&call.name)
-                || !call.input.is_object()
+                || !(call.input.is_object() || call.input.is_string())
                 || !call_ids.insert(call.call_id.as_str())
             {
                 return Err("Provider 请求的 toolCalls 无效或重复。".to_string());

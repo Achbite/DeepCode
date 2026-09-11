@@ -10,6 +10,7 @@ description = "DeepCode Kernel daemon that owns runtime, provider transport, and
 [dependencies]
 axum.workspace = true
 deepcode-kernel-abi.workspace = true
+deepcode-host-connection.workspace = true
 deepcode-kernel-runtime.workspace = true
 deepcode-kernel-tools.workspace = true
 serde.workspace = true
@@ -24,3 +25,6 @@ getrandom = "0.3"
 sha2.workspace = true
 regex.workspace = true
 rusqlite.workspace = true
+
+[dev-dependencies]
+base64.workspace = true

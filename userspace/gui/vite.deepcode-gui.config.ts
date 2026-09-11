@@ -1,5 +1,6 @@
 import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
+import { monacoHostWorkers } from './vite.monaco';
 
 function deepcodeGuiDevelopmentEntry(): Plugin {
   return {
@@ -44,7 +45,7 @@ export default defineConfig(({ command }) => {
     },
   };
   return {
-    plugins: [deepcodeGuiDevelopmentEntry(), react()],
+    plugins: [deepcodeGuiDevelopmentEntry(), react(), monacoHostWorkers()],
     base: './',
     build: {
       outDir: 'dist-deepcode-gui',

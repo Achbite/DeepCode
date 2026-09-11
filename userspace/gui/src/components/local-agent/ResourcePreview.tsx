@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import { useConversationHost } from './ConversationHost';
+import React, { useEffect, useRef, useState } from 'react';
 import { t, type UiLanguage } from '../../i18n';
-import { readConversationResource, type ConversationResourceReadResult } from '../../services/localAgentApi';
+import { type ConversationResourceReadResult } from '../../services/localAgentApi';
 import { formatBytes } from './conversationFormatting';
 
 type ResourcePreviewState =
@@ -23,19 +24,35 @@ type ResourcePreviewState =
     };
 
 export function useResourcePreview(sessionId: string | null) {
+  const { readResource: readConversationResource, openFile } = useConversationHost();
   const [resourcePreview, setResourcePreview] = useState<ResourcePreviewState | null>(null);
-  const openWorkspaceResource = async (workspaceId: string, logicalPath: string) => {
+  const readController = useRef<AbortController | null>(null);
+  const lifecycle = useRef({ sessionId, version: 0 });
+  if (lifecycle.current.sessionId !== sessionId) lifecycle.current = { sessionId, version: lifecycle.current.version + 1 };
+  useEffect(() => { setResourcePreview(null); return () => { lifecycle.current.version += 1; readController.current?.abort(); }; }, [sessionId]);
+  const openWorkspaceResource = async (workspaceId: string, logicalPath: string, startByte?: number) => {
     if (!sessionId) return;
+    const version = ++lifecycle.current.version;
+    readController.current?.abort();
+    const controller = new AbortController();
+    readController.current = controller;
     const requested = { workspaceId, logicalPath };
     setResourcePreview({ ...requested, status: 'loading' });
     try {
-      const result = await readConversationResource(sessionId, workspaceId, logicalPath);
+      if (openFile && startByte === undefined) {
+        await openFile(sessionId, workspaceId, logicalPath);
+        if (version === lifecycle.current.version) setResourcePreview(null);
+        return;
+      }
+      const result = await readConversationResource(sessionId, workspaceId, logicalPath, controller.signal, startByte);
+      if (version !== lifecycle.current.version) return;
       setResourcePreview((current) => (
         current?.workspaceId === workspaceId && current.logicalPath === logicalPath
           ? { ...requested, status: 'ready', result }
           : current
       ));
     } catch (readError) {
+      if (version !== lifecycle.current.version) return;
       setResourcePreview((current) => (
         current?.workspaceId === workspaceId && current.logicalPath === logicalPath
           ? {
@@ -48,17 +65,18 @@ export function useResourcePreview(sessionId: string | null) {
     }
   };
 
-  return { resourcePreview, setResourcePreview, openWorkspaceResource };
+  const closeResourcePreview = () => { lifecycle.current.version += 1; readController.current?.abort(); setResourcePreview(null); };
+  return { resourcePreview, closeResourcePreview, openWorkspaceResource };
 }
 
 export function ResourcePreview({ language, preview }: { language: UiLanguage; preview: ReturnType<typeof useResourcePreview> }) {
-  const { resourcePreview, setResourcePreview } = preview;
+  const { resourcePreview, closeResourcePreview } = preview;
   return resourcePreview && (
     <div
       className="local-agent__resource-overlay"
       role="presentation"
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget) setResourcePreview(null);
+        if (event.target === event.currentTarget) closeResourcePreview();
       }}
     >
       <section
@@ -75,7 +93,7 @@ export function ResourcePreview({ language, preview }: { language: UiLanguage; p
           <button
             type="button"
             aria-label={t(language, 'window.close')}
-            onClick={() => setResourcePreview(null)}
+            onClick={closeResourcePreview}
           >×</button>
         </header>
         <div className="local-agent__resource-body">
@@ -95,6 +113,8 @@ export function ResourcePreview({ language, preview }: { language: UiLanguage; p
                 </span>
               </div>
               <pre>{resourcePreview.result.content}</pre>
+              {resourcePreview.result.truncated && <span>当前为部分内容。</span>}
+              {resourcePreview.result.nextByte !== undefined && <button type="button" onClick={() => void preview.openWorkspaceResource(resourcePreview.workspaceId, resourcePreview.logicalPath, resourcePreview.result.nextByte)}>读取下一段</button>}
             </>
           )}
         </div>

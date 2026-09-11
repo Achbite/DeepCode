@@ -69,7 +69,7 @@
   font-family: 'Cascadia Code', Consolas, 'Courier New', monospace;
 }
 .ws-open-dialog__address:focus {
-  border-color: #007acc;
+  border-color: var(--dc-border-strong, var(--line, #666));
   outline: none;
 }
 .ws-open-dialog__btn {
@@ -339,8 +339,8 @@
 }
 
 :root[data-product='deepcode-gui'] .ws-open-dialog__address:focus {
-  border-color: var(--dc-accent-border);
-  outline: 2px solid var(--dc-focus-ring);
+  border-color: var(--dc-border-strong, var(--line, #666));
+  outline: none;
   outline-offset: -1px;
 }
 

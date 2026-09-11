@@ -21,6 +21,23 @@ pub struct KernelExecutorConfig {
     pub web_search_endpoint_template: String,
     pub web_search_auth_header_name: String,
     pub web_search_auth_secret_ref: String,
+    pub cloud_web_search: Option<CloudWebSearchConfig>,
+}
+
+/// Frozen, secret-free search transport selected when preparing a run.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudWebSearchConfig {
+    pub provider: CloudWebSearchProvider,
+    pub endpoint: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CloudWebSearchProvider {
+    DeepSeek,
+    Glm,
+    Kimi,
 }
 
 pub trait SecretProvider: Send + Sync {
@@ -251,6 +268,8 @@ fn assert_executor_bindings_match_tool_registry(
     }
 }
 
+#[path = "executors/file_changes.rs"]
+mod file_changes;
 #[path = "executors/fs.rs"]
 mod filesystem;
 mod process;

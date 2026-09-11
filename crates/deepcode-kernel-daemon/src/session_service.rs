@@ -552,7 +552,7 @@ fn decode_response(encoded: Vec<u8>, request_id: &str) -> Result<Value, SessionS
 }
 
 fn resolve_bridge() -> Result<PathBuf, SessionServiceError> {
-    if let Some(path) = environment_file("DEEPCODE_SESSION_BRIDGE") {
+    if let Some(path) = environment_file("DEEPCODE_SESSION_BRIDGE")? {
         return Ok(path);
     }
     let executable = std::env::current_exe().map_err(|error| {
@@ -581,7 +581,7 @@ fn resolve_bridge() -> Result<PathBuf, SessionServiceError> {
 }
 
 fn resolve_node() -> Result<PathBuf, SessionServiceError> {
-    if let Some(path) = environment_file("DEEPCODE_NODE") {
+    if let Some(path) = environment_file("DEEPCODE_NODE")? {
         return Ok(path);
     }
     let executable = std::env::current_exe().map_err(|error| {
@@ -624,11 +624,18 @@ fn resolve_node() -> Result<PathBuf, SessionServiceError> {
         })
 }
 
-fn environment_file(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
+fn environment_file(name: &str) -> Result<Option<PathBuf>, SessionServiceError> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(value);
+    if !path.is_file() {
+        return Err(SessionServiceError::new(
+            "session_service_configured_path_invalid",
+            format!("{name} 指定的文件不存在：{}", path.display()),
+        ));
+    }
+    Ok(Some(path))
 }
 
 fn process_wait_error(error: std::io::Error) -> SessionServiceError {

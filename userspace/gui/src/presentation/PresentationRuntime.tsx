@@ -81,7 +81,7 @@ class GuiBuiltinPresentationRenderer implements GuiPresentationRenderer {
 function renderBuiltinBlock(block: PresentationBlock): React.ReactNode {
   switch (block.kind) {
     case 'text':
-      return <MarkdownContent>{block.text}</MarkdownContent>;
+      return block.format === 'plain' ? <div className="conversation-plain">{block.text}</div> : <MarkdownContent>{block.text}</MarkdownContent>;
     case 'group':
       return (
         <div className="local-agent__presentation-group">

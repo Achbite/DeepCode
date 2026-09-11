@@ -12,6 +12,7 @@ pub(super) fn provider_schema_for_tool(tool: KernelToolKind) -> Value {
                     "minLength": 1,
                     "description": "Workspace-relative UTF-8 text file path."
                 },
+                "startByte": { "type": "integer", "minimum": 0, "maximum": 9007199254740991u64, "description": "Resume at nextByte from the previous read, including within long lines. Takes precedence over startLine." },
                 "startLine": {
                     "type": "integer",
                     "minimum": 1,

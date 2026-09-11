@@ -1009,8 +1009,8 @@
 }
 
 .deepcode-gui-text-dialog input:focus {
-  border-color: var(--dc-accent-border);
-  box-shadow: 0 0 0 3px var(--dc-accent-soft);
+  border-color: var(--dc-border-strong, var(--line, #666));
+  box-shadow: none;
 }
 
 .deepcode-gui-workspace-manager {
@@ -1619,8 +1619,7 @@
 }
 
 .deepcode-session-model__selector[aria-expanded="true"] {
-  border-color: var(--dc-accent);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--dc-accent) 12%, transparent);
+  border-color: var(--dc-border-strong);
 }
 
 .deepcode-session-model__selector:disabled {
@@ -1643,7 +1642,7 @@
 }
 .deepcode-session-model__menu button:hover,
 .deepcode-session-model__menu button[aria-checked="true"] { background: var(--dc-surface-subtle); }
-.deepcode-session-model__menu button:focus-visible { outline: 2px solid var(--dc-accent); outline-offset: -2px; }
+.deepcode-session-model__menu button:focus-visible { outline: none; outline-offset: -2px; }
 .deepcode-session-model__menu button:disabled { opacity: .48; cursor: default; }
 .deepcode-session-model__menu button > span:first-child { overflow-wrap: anywhere; }
 .deepcode-session-model__tick { margin-left: auto; color: var(--dc-accent); min-width: 14px; }

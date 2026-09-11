@@ -36,11 +36,13 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
     () => profiles.filter((profile) => profile.enabled),
     [profiles],
   );
-  const selected = enabled.find((profile) => profile.id === selectedProfileId);
+  const selected = profiles.find((profile) => profile.id === selectedProfileId);
   const disabled = busy || enabled.length === 0;
-  const title = selected?.name ?? t(language, 'agent.profile.selectionRequired');
+  const unavailable = Boolean(selectedProfileId) && !selected?.enabled;
+  const title = (selected?.name ?? selectedProfileId ?? t(language, 'agent.profile.selectionRequired'))
+    + (unavailable ? ` · ${t(language, selected ? 'agent.profile.disabled' : 'agent.profile.missing')}` : '');
   const effectiveEffort = reasoningEffortOverride ?? selected?.reasoningEffort;
-  const selectorEffortLabel = selected && selected.thinking !== 'disabled' && effectiveEffort
+  const selectorEffortLabel = selected?.enabled && selected.thinking !== 'disabled' && effectiveEffort
     ? t(language, `settings.llm.effort.${effectiveEffort}`)
     : null;
   const effortLabel = selected?.thinking === 'disabled'
@@ -102,6 +104,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
           {menu === 'models' ? <>
             <div className="deepcode-session-model__menu-title">{t(language, 'agent.profile.selector')}</div>
             <div className="deepcode-session-model__model-list">
+              {unavailable && <button type="button" role="menuitemradio" aria-checked="true" disabled><span>{title}</span></button>}
               {enabled.map((profile) => (
                 <button key={profile.id} type="button" role="menuitemradio" aria-checked={selected?.id === profile.id}
                   disabled={busy} onClick={async () => { await onProfileChange(profile.id); closeMenu(); }}>
@@ -110,7 +113,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
               ))}
             </div>
             <div className="deepcode-session-model__menu-divider" role="separator" />
-            <button type="button" role="menuitem" disabled={busy || !selected || selected.thinking === 'disabled'}
+            <button type="button" role="menuitem" disabled={busy || !selected?.enabled || selected.thinking === 'disabled'}
               onKeyDown={(event) => { if (event.key === 'ArrowRight') { event.preventDefault(); setMenu('reasoning'); } }}
               onClick={() => setMenu('reasoning')}>
               <span>{t(language, 'settings.llm.reasoningEffort')}</span>
@@ -121,7 +124,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
               <span aria-hidden="true">‹</span><span>{t(language, 'settings.llm.reasoningEffort')}</span>
             </button>
             {([null, 'low', 'medium', 'high', 'max'] as const).map((effort) => (
-              <button key={effort ?? 'default'} type="button" role="menuitemradio" disabled={busy || !selected || selected.thinking === 'disabled'}
+              <button key={effort ?? 'default'} type="button" role="menuitemradio" disabled={busy || !selected?.enabled || selected.thinking === 'disabled'}
                 aria-checked={reasoningEffortOverride === effort}
                 onClick={async () => { await onReasoningEffortChange(effort); setMenu('models'); }}>
                 <span>{effort ? t(language, `settings.llm.effort.${effort}`) : t(language, 'agent.profile.followDefault')}</span>

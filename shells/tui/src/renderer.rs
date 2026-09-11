@@ -5,55 +5,145 @@ use deepcode_kernel_client::{
     ProjectionMessage, SessionProjection, SessionTimelineItem, TokenUsageProjection,
 };
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     prelude::Frame,
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarState, Wrap},
 };
 
 #[derive(Clone, Default)]
 pub struct Renderer;
 
+fn multiline_text(lines: Vec<Line<'_>>) -> Text<'static> {
+    let mut result = Vec::new();
+    for line in lines {
+        let mut current = Line::default().style(line.style);
+        for span in line.spans {
+            for (index, part) in span.content.split('\n').enumerate() {
+                if index > 0 {
+                    result.push(current);
+                    current = Line::default().style(line.style);
+                }
+                current
+                    .spans
+                    .push(Span::styled(part.to_string(), span.style));
+            }
+        }
+        result.push(current);
+    }
+    Text::from(result)
+}
+
+/// Hard-wrap the editor by terminal cells, retaining a final cursor cell.
+fn input_lines(input: &str, width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    let mut lines = Vec::new();
+    let text = format!("{input} ");
+    for part in text.split('\n') {
+        let source = Line::from(part);
+        let mut current = String::new();
+        let mut column = 0;
+        for grapheme in source.styled_graphemes(Style::default()) {
+            let cells = Span::raw(grapheme.symbol).width();
+            if column + cells > width && !current.is_empty() {
+                lines.push(Line::from(current));
+                current = String::new();
+                column = 0;
+            }
+            current.push_str(grapheme.symbol);
+            column += cells;
+        }
+        lines.push(Line::from(current));
+    }
+    lines
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use crate::app::TuiHostOptions;
+    use deepcode_kernel_client::{HttpKernelClient, KernelClientConfig};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn single_column_layout_keeps_long_input_cursor_inside_editor() {
+        let client = HttpKernelClient::new(
+            KernelClientConfig::new("http://127.0.0.1:1")
+                .with_host_shell_token(format!("dchost_{}", "01".repeat(32))),
+        )
+        .unwrap();
+        let mut app = TuiApp::new(
+            client,
+            Renderer,
+            TuiHostOptions {
+                workspace_path: None,
+                session_id: None,
+                plugin_uris: vec![],
+            },
+        );
+        app.push_input_text(&format!("{}\n最后一行", "中文输入 e\u{301} ".repeat(100)));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| app.renderer().draw(frame, &app))
+            .unwrap();
+        let contents = format!("{:?}", terminal.backend().buffer());
+        assert!(contents.contains("DC  DeepCode"));
+        assert!(contents.contains("最后一行"));
+        assert!(!contents.contains("本对话暂无任务"));
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert!(
+            cursor.x < 79 && cursor.y >= 17 && cursor.y < 21,
+            "{cursor:?}"
+        );
+    }
+
+    #[test]
+    fn transcript_preserves_newlines_and_scrolls_wrapped_rows() {
+        let paragraph = Paragraph::new(multiline_text(vec![Line::from(
+            "abcdefghijklmnop\n最终正文",
+        )]))
+        .wrap(Wrap { trim: false });
+        assert_eq!(paragraph.line_count(8), 3);
+        let mut terminal = Terminal::new(TestBackend::new(8, 1)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(paragraph.clone().scroll((2, 0)), frame.area()))
+            .unwrap();
+        assert!(format!("{:?}", terminal.backend().buffer()).contains("最终正文"));
+    }
+}
+
 impl Renderer {
     pub fn draw(&self, frame: &mut Frame<'_>, app: &TuiApp) {
+        let area = frame.area().inner(Margin::new(1, 0));
+        let input_height = input_lines(app.input(), area.width.saturating_sub(2))
+            .len()
+            .clamp(1, 4) as u16
+            + 2;
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(input_height),
                 Constraint::Length(2),
-                Constraint::Min(8),
-                Constraint::Length(4),
-                Constraint::Length(1),
             ])
-            .split(frame.area());
+            .split(area);
         self.draw_header(frame, rows[0], app);
         if app.context_open() {
             self.draw_context(frame, rows[1], app);
-        } else if app.resource_preview().is_some() {
+        } else if app.resource_preview().is_some() || app.detail_preview().is_some() {
             self.draw_resource(frame, rows[1], app);
-        } else if rows[1].width >= 88 {
-            let columns = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(42), Constraint::Length(32)])
-                .split(rows[1]);
-            self.draw_projection(frame, columns[0], app);
-            self.draw_todo(frame, columns[1], app);
+        } else if app.tasks_open() {
+            self.draw_todo(frame, rows[1], app);
         } else {
-            let content = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(6), Constraint::Length(8)])
-                .split(rows[1]);
-            self.draw_projection(frame, content[0], app);
-            self.draw_todo(frame, content[1], app);
+            self.draw_projection(frame, rows[1], app);
         }
         self.draw_input(frame, rows[2], app);
         if app.plugin_picker_open() {
             self.draw_plugin_picker(frame, rows[1], app);
         }
-        frame.render_widget(
-            Paragraph::new(app.status()).style(Style::default().fg(Color::DarkGray)),
-            rows[3],
-        );
+        self.draw_footer(frame, rows[3], app);
     }
 
     pub fn render_plain(&self, app: &TuiApp) -> String {
@@ -73,7 +163,17 @@ impl Renderer {
             if app.context_open() {
                 render_context_plain(&mut output, projection);
             }
-            for item in timeline_items(projection) {
+            let items = timeline_items(projection);
+            let last_by_run: std::collections::HashMap<_, _> = items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| item.run_id().map(|run| (run.to_string(), index)))
+                .collect();
+            for (index, item) in items.into_iter().enumerate() {
+                let last_run = item
+                    .run_id()
+                    .filter(|run| last_by_run.get(*run) == Some(&index))
+                    .map(str::to_string);
                 match item {
                     TimelineItem::Message { value: message, .. } => {
                         output.push_str(&format!("{}: {}\n", message.role, message.content));
@@ -103,8 +203,24 @@ impl Renderer {
                         }
                     }
                 }
+                if let Some(run) = last_run {
+                    for line in round_change_lines(projection, &run) {
+                        output.push_str(&line);
+                        output.push('\n');
+                    }
+                }
             }
             if let Some(draft) = visible_assistant_draft(projection) {
+                if let Some(preview) = draft.plan_preview.as_ref() {
+                    output.push_str(&format!(
+                        "正在生成计划 · {}\n{}\n",
+                        preview.title, preview.summary
+                    ));
+                    for (index, title) in preview.steps.iter().enumerate() {
+                        output.push_str(&format!("{}. {title}\n", index + 1));
+                    }
+                    output.push_str("生成完成后统一确认\n");
+                }
                 for block in &draft.blocks {
                     if let Some((_, content)) = block.text() {
                         output.push_str(content);
@@ -170,40 +286,80 @@ impl Renderer {
             }
         }
         output.push_str("────────────────────────────────────────\n");
+        if let Some(detail) = app.detail_preview() {
+            output.push_str(detail);
+            output.push('\n');
+        }
+        if let Some(resource) = app.resource_preview() {
+            output.push_str(&resource.content);
+            if resource.truncated {
+                output.push_str("\n部分内容；/next 续读。\n");
+            }
+        }
+        if app.reasoning_enabled() {
+            if let Some(draft) = app
+                .projection()
+                .and_then(|projection| projection.assistant_draft.as_ref())
+            {
+                output.push_str(&format!("查看推理：/reasoning {}\n", draft.turn_id));
+            }
+        }
         output.push_str(app.status());
         output.push('\n');
         output
     }
 
     fn draw_header(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-        let projection = app.projection();
-        let session = projection
-            .map(|projection| projection.session_id.as_str())
-            .unwrap_or("-");
-        let cache = projection
-            .map(cache_hit_label)
-            .unwrap_or_else(|| "--%".to_string());
+        let title = app
+            .projection()
+            .map(|projection| projection.display.creation_title.as_str())
+            .unwrap_or("");
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(vec![
                     Span::styled(
-                        "DeepCode",
+                        "DC",
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw(" TUI · 本地编码 Agent"),
+                    Span::raw("  DeepCode"),
+                    Span::styled(format!("  {title}"), Style::default().fg(Color::DarkGray)),
                 ]),
                 Line::from(Span::styled(
-                    format!(
-                        "Session {session} · indexes {} · cache {cache}",
-                        projection
-                            .map(|value| value.session_directory_indexes.len())
-                            .unwrap_or(0)
-                    ),
+                    "/help 命令 · @ 插件 · /tasks 任务 · PgUp/PgDn 滚动",
                     Style::default().fg(Color::DarkGray),
                 )),
             ]),
+            area,
+        );
+    }
+
+    fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+        let projection = app.projection();
+        let workspace = projection
+            .map(|projection| {
+                projection
+                    .session_directory_indexes
+                    .iter()
+                    .map(|index| index.display_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            })
+            .unwrap_or_default();
+        let cache = projection
+            .map(cache_hit_label)
+            .unwrap_or_else(|| "--%".into());
+        let model = projection
+            .and_then(|projection| projection.model_settings.as_ref())
+            .map(|settings| settings.profile_id.as_str())
+            .unwrap_or("");
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!("{workspace}  ·  缓存 {cache}  ·  {model}")),
+                Line::from(app.status()),
+            ])
+            .style(Style::default().fg(Color::DarkGray)),
             area,
         );
     }
@@ -241,17 +397,37 @@ impl Renderer {
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::ALL).title(" Todo ")),
+                .scroll((app.detail_scroll(), 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::TOP)
+                        .title(" 任务 · /close 返回 "),
+                ),
             area,
         );
     }
 
     fn draw_resource(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+        if let Some(detail) = app.detail_preview() {
+            frame.render_widget(
+                Paragraph::new(detail)
+                    .scroll((app.detail_scroll(), 0))
+                    .wrap(Wrap { trim: false })
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" 按需详情 · /close "),
+                    ),
+                area,
+            );
+            return;
+        }
         let Some(resource) = app.resource_preview() else {
             return;
         };
         frame.render_widget(
             Paragraph::new(resource.content.as_str())
+                .scroll((app.detail_scroll(), 0))
                 .wrap(Wrap { trim: false })
                 .block(
                     Block::default()
@@ -267,6 +443,7 @@ impl Renderer {
         frame.render_widget(
             Paragraph::new(context_lines(app.projection(), width))
                 .wrap(Wrap { trim: false })
+                .scroll((app.detail_scroll(), 0))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -279,7 +456,17 @@ impl Renderer {
     fn draw_projection(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         let mut lines = Vec::new();
         if let Some(projection) = app.projection() {
-            for item in timeline_items(projection) {
+            let items = timeline_items(projection);
+            let last_by_run: std::collections::HashMap<_, _> = items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| item.run_id().map(|run| (run.to_string(), index)))
+                .collect();
+            for (index, item) in items.into_iter().enumerate() {
+                let last_run = item
+                    .run_id()
+                    .filter(|run| last_by_run.get(*run) == Some(&index))
+                    .map(str::to_string);
                 match item {
                     TimelineItem::Message { value: message, .. } => {
                         let color = if message.role == "user" {
@@ -325,9 +512,32 @@ impl Renderer {
                         }
                     }
                 }
+                if let Some(run) = last_run {
+                    lines.extend(
+                        round_change_lines(projection, &run)
+                            .into_iter()
+                            .map(Line::from),
+                    );
+                }
                 lines.push(Line::from(""));
             }
+            if app.reasoning_enabled() {
+                if let Some(draft) = projection.assistant_draft.as_ref() {
+                    lines.push(Line::from(format!(
+                        "推理详情：/reasoning {}",
+                        draft.turn_id
+                    )));
+                }
+            }
             if let Some(draft) = visible_assistant_draft(projection) {
+                if let Some(preview) = draft.plan_preview.as_ref() {
+                    lines.push(Line::from(format!("正在生成计划 · {}", preview.title)));
+                    lines.push(Line::from(preview.summary.clone()));
+                    for (index, title) in preview.steps.iter().enumerate() {
+                        lines.push(Line::from(format!("{}. {title}", index + 1)));
+                    }
+                    lines.push(Line::from("生成完成后统一确认"));
+                }
                 for block in &draft.blocks {
                     if let Some((_, content)) = block.text() {
                         lines.push(Line::from(Span::styled(
@@ -422,45 +632,62 @@ impl Renderer {
                 Style::default().fg(Color::DarkGray),
             )));
         }
-        let visible = usize::from(area.height.saturating_sub(2));
-        let start = lines.len().saturating_sub(visible);
+        let body = Rect {
+            width: area.width.saturating_sub(1),
+            ..area
+        };
+        let paragraph = Paragraph::new(multiline_text(lines)).wrap(Wrap { trim: false });
+        let height = paragraph.line_count(body.width);
+        let maximum = height.saturating_sub(usize::from(body.height));
+        let offset = app.transcript_offset(maximum);
         frame.render_widget(
-            Paragraph::new(lines.into_iter().skip(start).collect::<Vec<_>>())
-                .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Conversation "),
-                ),
-            area,
+            paragraph.scroll((offset.min(u16::MAX as usize) as u16, 0)),
+            body,
         );
+        if maximum > 0 {
+            frame.render_stateful_widget(
+                Scrollbar::default().begin_symbol(None).end_symbol(None),
+                area,
+                &mut ScrollbarState::new(maximum + 1).position(offset),
+            );
+        }
     }
 
     fn draw_input(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         let selected_plugins = app.selected_plugin_labels();
         let title = if app.has_pending_plan() {
-            " Plan response ".to_string()
+            " 确认计划 · 输入 1/确认，其他文本用于修订 ".to_string()
         } else if app
             .projection()
             .is_some_and(|projection| projection.pending_approval.is_some())
         {
-            " Approval (1 allow / 2 deny) ".to_string()
+            " 等待审批 · 1 允许 / 2 拒绝 ".to_string()
         } else if selected_plugins.is_empty() {
-            " Message · @ plugins ".to_string()
+            " 输入消息 · @ 插件 ".to_string()
         } else {
             format!(" Message · plugins: {} ", selected_plugins.join(", "))
         };
+        let block = Block::default()
+            .borders(Borders::TOP | Borders::BOTTOM)
+            .title(title)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let inner = block.inner(area).inner(Margin::new(1, 0));
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let lines = input_lines(app.input(), inner.width);
+        let column = lines
+            .last()
+            .map(|line| line.width().saturating_sub(1))
+            .unwrap_or(0) as u16;
+        let start = lines.len().saturating_sub(usize::from(inner.height));
+        let row = lines.len().saturating_sub(start + 1) as u16;
         frame.render_widget(
-            Paragraph::new(app.input())
-                .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::ALL).title(title)),
-            area,
+            Paragraph::new(lines.into_iter().skip(start).collect::<Vec<_>>()),
+            inner,
         );
-        let width = usize::from(area.width.saturating_sub(2).max(1));
-        let offset = Line::from(app.input()).width();
-        let column = u16::try_from(offset % width).unwrap_or(0);
-        let row = u16::try_from(offset / width).unwrap_or(u16::MAX);
-        frame.set_cursor_position((area.x + 1 + column, area.y + 1 + row));
+        frame.set_cursor_position((inner.x + column.min(inner.width - 1), inner.y + row));
     }
 
     fn draw_plugin_picker(&self, frame: &mut Frame<'_>, anchor: Rect, app: &TuiApp) {
@@ -861,6 +1088,34 @@ enum TimelineItem<'a> {
     },
 }
 
+impl TimelineItem<'_> {
+    fn run_id(&self) -> Option<&str> {
+        match self {
+            Self::Message { value } => value.run_id.as_deref(),
+            Self::Narrative { value } => Some(&value.run_id),
+            Self::Plan { value } => Some(&value.run_id),
+            Self::ToolGroup { activities } => {
+                activities.first().map(|activity| activity.run_id.as_str())
+            }
+        }
+    }
+}
+
+fn round_change_lines(projection: &SessionProjection, run_id: &str) -> Vec<String> {
+    let changes = projection.file_changes_for_run(run_id);
+    if changes.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!("本轮修改 · {run_id}")];
+    lines.extend(changes.into_iter().map(|(record, index, change)| {
+        format!(
+            "  {} {} · /diff {} {}",
+            change.kind, change.path, record, index
+        )
+    }));
+    lines
+}
+
 fn timeline_items(projection: &SessionProjection) -> Vec<TimelineItem<'_>> {
     projection
         .timeline
@@ -963,6 +1218,14 @@ fn push_tool_lines(lines: &mut Vec<Line<'_>>, activity: &ActivityProjection) {
                 push_tool_stream_lines(lines, "stderr", &result.stderr);
             }
         }
+        for (index, change) in tool.file_changes.iter().enumerate() {
+            if let Some(record) = &tool.record_id {
+                lines.push(Line::from(format!(
+                    "  {} {} · /diff {} {}",
+                    change.kind, change.path, record, index
+                )));
+            }
+        }
         for resource in &tool.resources {
             let detail = match (
                 resource.kind.as_str(),
@@ -1054,6 +1317,14 @@ fn render_tool_plain(output: &mut String, activity: &ActivityProjection) {
                 ));
                 push_tool_stream_plain(output, "stdout", &result.stdout);
                 push_tool_stream_plain(output, "stderr", &result.stderr);
+            }
+        }
+        for (index, change) in tool.file_changes.iter().enumerate() {
+            if let Some(record) = &tool.record_id {
+                output.push_str(&format!(
+                    "  {} {} · /diff {} {}\n",
+                    change.kind, change.path, record, index
+                ));
             }
         }
         for resource in &tool.resources {

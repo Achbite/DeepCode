@@ -52,6 +52,8 @@ export interface ConversationResourceReadResult {
   sizeBytes: number;
   startLine: number;
   endLine: number;
+  nextByte?: number;
+  truncated?: boolean;
 }
 
 export async function createLocalAgentSession(
@@ -212,6 +214,18 @@ export async function submitLocalAgentCommand(
   command: ConversationCommand,
   signal?: AbortSignal,
 ): Promise<CommandReply> {
+  if (command.type === 'message.submit' || command.type === 'context.focus') {
+    const content = command.type === 'message.submit' ? command.text : command.task;
+    if (new TextEncoder().encode(content).byteLength > 32 * 1024) {
+      const saved = await request<{ text: string; reference: FilesystemReference }>(
+        `${API_BASE}/conversation/sessions/${encodeURIComponent(command.sessionId)}/input-resources/${encodeURIComponent(command.commandId)}`,
+        { method: 'POST', body: content, headers: { 'Content-Type': 'text/plain; charset=utf-8' }, signal },
+      );
+      const filesystemReferences = [...(command.filesystemReferences ?? []), saved.reference];
+      command = command.type === 'message.submit' ? { ...command, text: saved.text, filesystemReferences }
+        : { ...command, task: saved.text, filesystemReferences };
+    }
+  }
   const reply = await request<unknown>(
     `${API_BASE}/conversation/sessions/${encodeURIComponent(command.sessionId)}/commands`,
     {
@@ -239,12 +253,13 @@ export async function readConversationResource(
   workspaceId: string,
   logicalPath: string,
   signal?: AbortSignal,
+  startByte?: number,
 ): Promise<ConversationResourceReadResult> {
   const value = await request<unknown>(
     `${API_BASE}/conversation/sessions/${encodeURIComponent(sessionId)}/resources/read`,
     {
       method: 'POST',
-      body: JSON.stringify({ workspaceId, logicalPath }),
+      body: JSON.stringify({ workspaceId, logicalPath, ...(startByte !== undefined ? { startByte } : {}) }),
       signal,
     },
   );
@@ -260,6 +275,31 @@ export async function readConversationResource(
     throw new Error('conversation_resource_response_invalid');
   }
   return value as unknown as ConversationResourceReadResult;
+}
+
+export async function readConversationImage(sessionId: string, workspaceId: string, logicalPath: string, signal?: AbortSignal): Promise<Blob> {
+  const response = await fetch(`${API_BASE}/conversation/sessions/${encodeURIComponent(sessionId)}/resources/read`, {
+    method: 'POST', signal,
+    headers: { 'Content-Type': 'application/json', ...getHostConnectionHeaders() },
+    body: JSON.stringify({ workspaceId, logicalPath, format: 'image' }),
+  });
+  if (!response.ok || !response.headers.get('content-type')?.startsWith('image/')) {
+    const error = await response.json() as ApiEnvelope<never>;
+    throw new Error(error.message ?? error.error ?? `conversation_image_read_failed:HTTP ${response.status}`);
+  }
+  return response.blob();
+}
+
+export class ConversationRequestError extends Error {
+  constructor(public readonly code: string, message: string) {
+    super(`${code}:${message}`);
+    this.name = 'ConversationRequestError';
+  }
+}
+
+export function isBinaryFileChange(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error
+    && error.code === 'file_change_binary_content';
 }
 
 async function request<T>(url: string, init: RequestInit): Promise<T> {
@@ -278,8 +318,8 @@ async function request<T>(url: string, init: RequestInit): Promise<T> {
     throw new Error(`conversation_response_invalid:HTTP ${response.status}`);
   }
   if (!response.ok || !envelope.ok || envelope.data === undefined || envelope.data === null) {
-    throw new Error(
-      `${envelope.error ?? 'conversation_request_failed'}:${envelope.message ?? `HTTP ${response.status}`}`,
+    throw new ConversationRequestError(
+      envelope.error ?? 'conversation_request_failed', envelope.message ?? `HTTP ${response.status}`,
     );
   }
   return envelope.data;
@@ -313,7 +353,8 @@ function decodeProjection(value: unknown): SessionProjection {
       'activities',
       'artifacts',
       'terminalError',
-    ])
+    ], ['fileChangeRounds'])
+    || (value.fileChangeRounds !== undefined && !isArrayOf(value.fileChangeRounds, (round) => isRecord(round) && isIdentifier(round.runId) && isArrayOf(round.recordIds, isIdentifier)))
     || value.schemaVersion !== SESSION_PROJECTION_VERSION
     || !isIdentifier(value.sessionId)
     || !isNaturalNumber(value.revision)
@@ -603,10 +644,13 @@ function isProjectionMessage(value: unknown): boolean {
   if (!isExactRecord(value, [
     'messageId', 'role', 'content', 'filesystemReferences',
     'pluginSelections', 'feedback', 'sequence', 'createdAt',
-  ], ['runId', 'providerRequestId'])) return false;
+  ], ['runId', 'providerRequestId', 'replyToInteraction'])) return false;
   const hasRunId = value.runId !== undefined;
   const hasProviderRequestId = value.providerRequestId !== undefined;
   return isIdentifier(value.messageId)
+    && (value.replyToInteraction === undefined || value.role === 'user'
+      && isExactRecord(value.replyToInteraction, ['interactionId', 'prompt'])
+      && isIdentifier(value.replyToInteraction.interactionId) && isNonEmptyText(value.replyToInteraction.prompt))
     && ['user', 'assistant', 'tool', 'system'].includes(String(value.role))
     && typeof value.content === 'string'
     && isArrayOf(value.filesystemReferences, isFilesystemReference)
@@ -667,12 +711,13 @@ function isAssistantDraft(value: unknown): boolean {
   if (!isExactRecord(
     value,
     ['runId', 'turnId', 'blocks'],
-    ['activity'],
+    ['activity', 'planPreview'],
   )
     || !isIdentifier(value.runId)
     || !isIdentifier(value.turnId)
     || !isArrayOf(value.blocks, isAssistantDraftBlock)
     || value.activity !== undefined && !isProviderActivity(value.activity)
+    || value.planPreview !== undefined && !isPlanPreview(value.planPreview)
   ) return false;
   const streams = new Set<string>();
   const blockCount = value.blocks.length;
@@ -688,6 +733,17 @@ function isAssistantDraft(value: unknown): boolean {
     streams.add(block.streamId);
     return true;
   });
+}
+
+function isPlanPreview(value: unknown): boolean {
+  return isExactRecord(value, ['callIndex', 'providerCallId', 'title', 'summary', 'steps', 'truncated'], ['outputIndex'])
+    && Number.isSafeInteger(value.callIndex) && Number(value.callIndex) >= 0
+    && isIdentifier(value.providerCallId)
+    && (value.outputIndex === undefined || Number.isSafeInteger(value.outputIndex) && Number(value.outputIndex) >= 0)
+    && typeof value.title === 'string' && value.title.length <= 256
+    && typeof value.summary === 'string' && value.summary.length <= 4096
+    && isArrayOf(value.steps, (step) => typeof step === 'string' && step.length <= 256) && value.steps.length <= 12
+    && typeof value.truncated === 'boolean';
 }
 
 function isProviderActivity(value: unknown): boolean {
@@ -1239,9 +1295,15 @@ function isProviderHostedActivity(value: unknown): boolean {
 }
 
 function isToolActivity(value: unknown, activityStatus: string): boolean {
-  return isExactRecord(value, ['operation', 'resources'], ['shell'])
+  return isExactRecord(value, ['operation', 'resources'], ['shell', 'fileChanges', 'recordId'])
+    && (value.recordId === undefined || isIdentifier(value.recordId))
     && isNonEmptyText(value.operation)
     && isArrayOf(value.resources, isActivityResource)
+    && (value.fileChanges === undefined || isArrayOf(value.fileChanges, (change) => isRecord(change)
+      && isIdentifier(change.workspaceId) && isNonEmptyText(change.path)
+      && ['create', 'modify', 'delete'].includes(String(change.kind))
+      && [change.before, change.after].every((side) => isRecord(side) && typeof side.exists === 'boolean'
+        && (!side.exists || typeof side.contentRef === 'string' || typeof side.error === 'string'))))
     && (value.operation === 'bash'
       ? isShellActivity(value.shell, activityStatus)
       : value.shell === undefined);
@@ -1341,4 +1403,21 @@ function isPositiveNaturalNumber(value: unknown): value is number {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+export async function readConversation(sessionId: string, query: Omit<import('@deepcode/protocol').ConversationReadQuery, 'sessionId'>, signal?: AbortSignal) {
+  return await request<import('@deepcode/protocol').ConversationReadResult>(
+    `${API_BASE}/conversation/sessions/${encodeURIComponent(sessionId)}/read`,
+    { method: 'POST', body: JSON.stringify(query), signal },
+  );
+}
+export async function readFileChange(sessionId: string, recordId: string, index: number, signal?: AbortSignal) {
+  const value = await request<unknown>(
+    `${API_BASE}/conversation/sessions/${encodeURIComponent(sessionId)}/changes/read`,
+    { method: 'POST', body: JSON.stringify({ recordId, index }), signal },
+  );
+  if (!isRecord(value) || typeof value.path !== 'string' || typeof value.workspaceId !== 'string'
+    || ![value.before, value.after].every((side) => side === null || typeof side === 'string')
+    || (value.before === null && value.after === null)) throw new Error('file_change_response_invalid');
+  return value as { before: string | null; after: string | null; path: string; workspaceId: string };
 }

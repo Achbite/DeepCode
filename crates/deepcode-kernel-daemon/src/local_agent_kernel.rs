@@ -54,8 +54,13 @@ impl From<LocalAgentStoreError> for LocalAgentKernelError {
     }
 }
 
+pub(crate) struct ResolvedWorkspace {
+    pub root: String,
+    pub read_only: bool,
+}
+
 pub(crate) trait WorkspaceResolverPort: Send + Sync {
-    fn resolve(&self, workspace_id: &str) -> Result<String, LocalAgentKernelError>;
+    fn resolve(&self, workspace_id: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError>;
 }
 
 #[derive(Clone)]
@@ -70,7 +75,7 @@ impl HostWorkspaceResolver {
 }
 
 impl WorkspaceResolverPort for HostWorkspaceResolver {
-    fn resolve(&self, workspace_id: &str) -> Result<String, LocalAgentKernelError> {
+    fn resolve(&self, workspace_id: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
         validate_id("workspaceId", workspace_id)?;
         let gui = self.gui.lock().map_err(|_| {
             LocalAgentKernelError::new(
@@ -86,7 +91,10 @@ impl WorkspaceResolverPort for HostWorkspaceResolver {
         }
         gui.conversation_catalog
             .workspace(workspace_id)
-            .map(|workspace| workspace.canonical_root.clone())
+            .map(|workspace| ResolvedWorkspace {
+                root: workspace.canonical_root.clone(),
+                read_only: workspace.owner_session_id.is_some(),
+            })
             .ok_or_else(|| {
                 LocalAgentKernelError::new(
                     "workspace_not_found",
@@ -990,7 +998,19 @@ impl LocalAgentKernel {
         }
         let (workspace_root, private_resolved_targets) = match workspace_id.as_deref() {
             Some(workspace_id) => {
-                let root = self.resolver.resolve(workspace_id)?;
+                let resolved = self.resolver.resolve(workspace_id)?;
+                if resolved.read_only
+                    && matches!(
+                        scope,
+                        PreparedEffectScope::WorkspaceMutation | PreparedEffectScope::Process
+                    )
+                {
+                    return Err(LocalAgentKernelError::new(
+                        "input_resource_read_only",
+                        "会话输入快照只读；请在工作目录中创建处理产物。",
+                    ));
+                }
+                let root = resolved.root;
                 let canonical_root = std::fs::canonicalize(&root).map_err(|error| {
                     LocalAgentKernelError::new(
                         "workspace_root_unavailable",
@@ -1312,9 +1332,8 @@ impl LocalAgentKernel {
                 prepared.canonical_arguments.clone(),
                 KernelToolExecutionContext {
                     output_directory: Some(
-                        self.session_output_directory(&request.session_id).join(
-                            deepcode_kernel_tools::hash_bytes(request.attempt_id.as_bytes()),
-                        ),
+                        self.session_output_directory(&request.session_id)
+                            .join(output_directory_key(&request.attempt_id)),
                     ),
                     workspace_root: prepared.workspace_root.clone(),
                     workspace_id: prepared.workspace_id.clone(),
@@ -1327,9 +1346,8 @@ impl LocalAgentKernel {
         result
     }
 
-    fn session_output_directory(&self, session_id: &str) -> PathBuf {
-        self.output_root
-            .join(deepcode_kernel_tools::hash_bytes(session_id.as_bytes()))
+    pub(crate) fn session_output_directory(&self, session_id: &str) -> PathBuf {
+        self.output_root.join(output_directory_key(session_id))
     }
 
     pub(crate) fn delete_session_outputs(
@@ -2187,7 +2205,7 @@ mod attempt_control_tests {
     fn invalid_bound_tool_input_returns_a_rejection_before_resolution_or_tool_record_creation() {
         struct UnexpectedResolver;
         impl WorkspaceResolverPort for UnexpectedResolver {
-            fn resolve(&self, _: &str) -> Result<String, LocalAgentKernelError> {
+            fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
                 panic!("input rejection must precede filesystem resolution")
             }
         }
@@ -2368,5 +2386,25 @@ mod attempt_control_tests {
         assert!(!control.is_cancelled());
         control.finish();
         assert!(control.wait_complete(Duration::ZERO));
+    }
+}
+
+/// Storage names are portable; logical content hashes retain their original format.
+pub(crate) fn output_directory_key(identity: &str) -> String {
+    deepcode_kernel_tools::hash_bytes(identity.as_bytes()).replace(':', "-")
+}
+
+#[cfg(test)]
+mod output_directory_tests {
+    #[test]
+    fn output_names_are_windows_components_without_changing_logical_hashes() {
+        let identity = "session:record/with/path";
+        let logical = deepcode_kernel_tools::hash_bytes(identity.as_bytes());
+        let component = super::output_directory_key(identity);
+        assert!(logical.starts_with("sha256:"));
+        assert_eq!(component, logical.replacen(':', "-", 1));
+        assert!(!component
+            .chars()
+            .any(|character| r#"<>:\"/\|?*"#.contains(character)));
     }
 }

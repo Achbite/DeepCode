@@ -1,90 +1,86 @@
-import React, { memo, useEffect, useLayoutEffect, useState } from 'react';
-import ReactMarkdown from 'react-markdown';
-import rehypeKatex from 'rehype-katex';
-import remarkGfm from 'remark-gfm';
-import remarkMath from 'remark-math';
+import React, { createContext, memo, useContext, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, jsx, jsxs } from 'react/jsx-runtime';
+import { toJsxRuntime } from 'hast-util-to-jsx-runtime';
+import { CodeContent, ImageContent, MermaidContent } from './RichContent';
+import { MarkdownTable } from './MarkdownTable';
+import { StreamingMarkdownParser, type MarkdownBlock } from './streamingMarkdown';
+import { StreamingTextBuffer } from './streamingText';
+import type { ElementContent, Root, RootContent } from 'hast';
+import './richContent.css';
 import 'katex/dist/katex.min.css';
-import {
-  bufferedTypewriterDelay,
-  bufferedTypewriterNextIndex,
-  type BufferedTypewriterSpeed,
-} from '../../utils/typewriterBuffer';
 
-const REMARK_PLUGINS = [remarkGfm, remarkMath];
-const REHYPE_PLUGINS = [rehypeKatex];
+const StreamingContext = createContext(false);
+const COMPONENTS = {
+  pre: function MarkdownCode({ children }: { children?: React.ReactNode }) {
+    const streaming = useContext(StreamingContext);
+    const child = React.Children.toArray(children)[0];
+    if (!React.isValidElement<{ className?: string; children?: React.ReactNode }>(child)) return <pre>{children}</pre>;
+    const language = /language-([^\s]+)/.exec(child.props.className ?? '')?.[1] ?? '';
+    const code = String(child.props.children ?? '');
+    return language === 'mermaid' && !streaming
+      ? <MermaidContent source={code} /> : <CodeContent code={code} language={language} streaming={streaming} />;
+  },
+  table: MarkdownTable,
+  img: function MarkdownImage({ src, alt }: { src?: string; alt?: string }) { return <ImageContent source={src ?? ''} alt={alt ?? ''} />; },
+};
 
-export const MarkdownContent = memo(function MarkdownContent({
-  children,
-}: {
-  children: string;
-}) {
-  return (
-    <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS}>
-      {children}
-    </ReactMarkdown>
-  );
+const RenderedBlock = memo(function RenderedBlock({ block }: { block: MarkdownBlock }) {
+  return <StreamingContext.Provider value={block.streaming}>{toJsxRuntime(block.tree, { Fragment, jsx, jsxs, components: COMPONENTS })}</StreamingContext.Provider>;
 });
 
-export const BufferedMarkdown = memo(function BufferedMarkdown({
-  text,
-  streamIdentity,
-  speed = 'normal',
-  initialVisibleLength = 0,
-  onVisibleLengthChange,
-  onCaughtUp,
-}: {
+export const MarkdownContent = memo(function MarkdownContent({ children, streaming = false }: { children: string; streaming?: boolean }) {
+  const parser = useRef(new StreamingMarkdownParser());
+  const blocks = useMemo(() => parser.current.update(children, streaming), [children, streaming]);
+  return <div className="conversation-markdown">{blocks.map((block) => <RenderedBlock key={block.key} block={block} />)}</div>;
+});
+
+/** Inline fields share the Markdown grammar, without nested links or block layout in buttons/headings. */
+export const MarkdownInline = memo(function MarkdownInline({ children }: { children: string }) {
+  const tree = useMemo(() => {
+    const blocks = new StreamingMarkdownParser().update(children, false);
+    const inline = (node: RootContent): ElementContent[] => {
+      if (node.type === 'text') return [node];
+      if (node.type !== 'element') return [];
+      const descendants = node.children.flatMap(inline);
+      return ['strong', 'em', 'del', 'code', 'br'].includes(node.tagName)
+        ? [{ ...node, children: descendants }] : descendants;
+    };
+    return { type: 'root', children: blocks.flatMap((block) => block.tree.children.flatMap(inline)) } as Root;
+  }, [children]);
+  return <span className="conversation-markdown-inline">{toJsxRuntime(tree, { Fragment, jsx, jsxs })}</span>;
+});
+
+/** Smooth snapshot-sized deltas over a short, bounded window without a character-rate backlog. */
+export const BufferedMarkdown = memo(function BufferedMarkdown({ text, streamIdentity, streaming = true, onDisplayed }: {
   text: string;
   streamIdentity: string;
-  speed?: BufferedTypewriterSpeed;
-  initialVisibleLength?: number;
-  onVisibleLengthChange?(streamIdentity: string, visibleLength: number): void;
-  onCaughtUp?(streamIdentity: string): void;
+  streaming?: boolean;
+  onDisplayed?(identity: string, text: string): void;
 }) {
-  const initialLength = boundedVisibleLength(initialVisibleLength, text.length);
-  const [cursor, setCursor] = useState(() => ({
-    streamIdentity,
-    visibleLength: initialLength,
-  }));
-  const visibleLength = cursor.streamIdentity === streamIdentity
-    ? Math.min(cursor.visibleLength, text.length)
-    : initialLength;
-
-  useEffect(() => {
-    if (
-      cursor.streamIdentity === streamIdentity
-      && cursor.visibleLength <= text.length
-    ) return;
-    setCursor({ streamIdentity, visibleLength });
-  }, [cursor.streamIdentity, cursor.visibleLength, streamIdentity, text.length, visibleLength]);
-
+  const playback = useRef({ identity: streamIdentity, buffer: new StreamingTextBuffer(streaming ? '' : text) });
+  const [visible, setVisible] = useState({ identity: streamIdentity, text: playback.current.buffer.text });
   useLayoutEffect(() => {
-    onVisibleLengthChange?.(streamIdentity, visibleLength);
-  }, [onVisibleLengthChange, streamIdentity, visibleLength]);
-
-  useEffect(() => {
-    if (visibleLength >= text.length) return;
-    const timer = window.setTimeout(() => {
-      setCursor((current) => {
-        const currentLength = current.streamIdentity === streamIdentity
-          ? Math.min(current.visibleLength, text.length)
-          : initialLength;
-        return {
-          streamIdentity,
-          visibleLength: bufferedTypewriterNextIndex(text, currentLength, speed),
-        };
-      });
-    }, bufferedTypewriterDelay(speed));
-    return () => window.clearTimeout(timer);
-  }, [initialLength, speed, streamIdentity, text, visibleLength]);
-
-  useEffect(() => {
-    if (visibleLength >= text.length) onCaughtUp?.(streamIdentity);
-  }, [onCaughtUp, streamIdentity, text.length, visibleLength]);
-
-  const visibleText = text.slice(0, visibleLength);
-  return <MarkdownContent>{visibleText}</MarkdownContent>;
+    if (playback.current.identity !== streamIdentity) {
+      playback.current = { identity: streamIdentity, buffer: new StreamingTextBuffer(streaming ? '' : text) };
+    }
+    const { buffer } = playback.current;
+    buffer.update(text, performance.now());
+    let frame: number | null = null;
+    const publish = () => setVisible((current) => current.identity === streamIdentity && current.text === buffer.text
+      ? current : { identity: streamIdentity, text: buffer.text });
+    const tick = (now: number) => {
+      buffer.advance(now);
+      publish();
+      frame = buffer.complete ? null : requestAnimationFrame(tick);
+    };
+    publish();
+    if (!buffer.complete) frame = requestAnimationFrame(tick);
+    return () => { if (frame !== null) cancelAnimationFrame(frame); };
+  }, [streamIdentity, text, streaming]);
+  const displayed = visible.identity === streamIdentity ? visible.text : streaming ? '' : text;
+  const caughtUp = displayed === text;
+  useLayoutEffect(() => {
+    if (!streaming && caughtUp) onDisplayed?.(streamIdentity, displayed);
+  }, [streaming, caughtUp, streamIdentity, displayed, onDisplayed]);
+  return <MarkdownContent streaming={streaming || !caughtUp}>{displayed}</MarkdownContent>;
 });
-
-function boundedVisibleLength(value: number, textLength: number): number {
-  return Math.max(0, Math.min(value, textLength));
-}

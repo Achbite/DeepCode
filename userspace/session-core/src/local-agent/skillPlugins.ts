@@ -74,7 +74,7 @@ export function runtimeInstructions(
 ): readonly InstructionContribution[] {
   const workspaceAutonomyInstruction = config.workspaceMutation === 'allow'
     ? `Workspace mutations do not require a Plan. Use ${controlNames.interactionRequest} only for a required user decision.`
-    : `Before workspace mutation, call ${controlNames.planPublish} and wait for confirmation. Then execute within its file and execution scope, reporting Todo progress through ${controlNames.planProgress}. Routine command or edit details do not require reconfirmation. Use ${controlNames.interactionRequest} only for a required decision. Revise the Plan for scope changes. Read-only workspace tools do not require a Plan.`;
+    : `Before workspace mutation, call ${controlNames.planPublish} and wait for confirmation. Then execute within its file and execution scope. Routine command or edit details do not require reconfirmation. Use ${controlNames.interactionRequest} only for a required decision. Read-only workspace tools do not require a Plan.`;
   const engineeringDecisionInstruction = config.engineeringDecisions === 'delegate'
     ? 'Choose the smallest sound engineering approach supported by workspace evidence.'
     : 'Ask the user before materially changing requirements, public contracts, fact ownership, or the engineering approach.';

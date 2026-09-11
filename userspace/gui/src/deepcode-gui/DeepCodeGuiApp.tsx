@@ -1,3 +1,5 @@
+import '../components/shared/focus.css';
+import { HostStartupDiagnostic } from '../components/shared/HostStartupDiagnostic';
 import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
 import useAppStatusStore from '../state/appStatusStore';
 import { useEditorStore, getTabId } from '../state/editorStore';
@@ -137,6 +139,7 @@ const DeepCodeGuiApp: React.FC = () => {
   const healthConnectionSequenceRef = useRef(0);
   const [connectedIncarnation, setConnectedIncarnation] = useState<string | null>(null);
   const [kernelStartBusy, setKernelStartBusy] = useState(false);
+  const [hostStartup, setHostStartup] = useState<HostStartupStatusV1 | null>(null);
   const [kernelStartMessage, setKernelStartMessage] = useState<string | null>(null);
   const dirtySignature = useEditorStore((s) =>
     s.tabs
@@ -180,6 +183,7 @@ const DeepCodeGuiApp: React.FC = () => {
       return;
     }
     const startupStatus = start.data?.status;
+    setHostStartup(startupStatus ?? null);
     if (start.data?.blocked || startupStatus?.phase === 'failed') {
       setApiStatus('error');
       const message = startupStatus
@@ -267,6 +271,7 @@ const DeepCodeGuiApp: React.FC = () => {
         getHostStartupStatus(),
       ]);
       if (cancelled) return;
+      setHostStartup(startup.ok ? startup.data ?? null : null);
       if (isRuntimeReady(result)) {
         const attemptId = startup.ok ? hostAttemptId(startup.data) : null;
         recordRuntimeReady(attemptId);
@@ -378,7 +383,8 @@ const DeepCodeGuiApp: React.FC = () => {
     return () => window.removeEventListener(APP_CLOSE_REQUEST_EVENT, close);
   }, []);
 
-  return (
+  return (<>
+    <HostStartupDiagnostic status={apiStatus === 'connected' ? null : hostStartup} language={language} />
     <Suspense fallback={<BootFallback language={language} />}>
       <DeepCodeWorkbenchLayout
         apiStatus={apiStatus}
@@ -390,7 +396,7 @@ const DeepCodeGuiApp: React.FC = () => {
         onRetryKernelStart={retryKernelStart}
       />
     </Suspense>
-  );
+  </>);
 };
 
 export default DeepCodeGuiApp;

@@ -329,6 +329,7 @@ pub(crate) fn default_user_settings() -> Value {
         "workbench.language": "zh-CN",
         "workbench.styleTokenOverrides": "{}",
         "agent.systemPrompt": "",
+        "agent.responseLanguage": "auto",
         "agent.permissions.workspaceMutation": "plan",
         "agent.permissions.engineeringDecisions": "ask",
         "agent.permissions.networkRead": "allow",
@@ -346,11 +347,13 @@ pub(crate) fn default_user_settings() -> Value {
         "gui.colorTheme": "light",
         "gui.accentColor": "blue",
         "gui.navigationDensity": "comfortable",
-        "gui.showContextRail": true
+        "gui.showContextRail": true,
+        "gui.showReasoning": false
     })
 }
 
 pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), String> {
+    crate::session_environment::response_language_setting(settings)?;
     if let Some(object) = settings.as_object() {
         for key in object
             .keys()
@@ -417,17 +420,16 @@ pub(crate) fn default_llm_profiles() -> Value {
         "profiles": [
             {
                 "id": "deepseek-v4-flash-openai",
-                "name": "DeepSeek V4 Flash",
+                "name": "DeepSeek Flash",
                 "kind": "responses",
                 "providerFlavor": "deepseek",
                 "baseUrl": "https://api.deepseek.com",
-                "model": "deepseek-v4-flash",
+                "model": "deepseek-flash",
                 "contextWindowTokens": 1000000,
                 "maxOutputTokens": 384000,
                 "temperature": 0.2,
                 "reasoningEffort": "high",
                 "thinking": "enabled",
-                "hostedWebSearch": "web_search",
                 "enabled": true
             },
             {
@@ -442,7 +444,6 @@ pub(crate) fn default_llm_profiles() -> Value {
                 "temperature": 0.2,
                 "reasoningEffort": "max",
                 "thinking": "enabled",
-                "hostedWebSearch": "web_search",
                 "enabled": true
             }
         ],

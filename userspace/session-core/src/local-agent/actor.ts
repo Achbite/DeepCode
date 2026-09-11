@@ -1,3 +1,6 @@
+import { LiveReasoning } from './reasoningRead.js';
+import { todoItemsForPlan } from './planStage.js';
+import { retainSessionEnvironment } from './sessionEnvironment.js';
 import type {
   AssistantDraftProjection,
   CommandJournalPort,
@@ -49,6 +52,7 @@ export class SessionActor {
   #loopFailure?: Error;
   #projectionState?: LoopSnapshot['state'];
   #assistantDraft: AssistantDraftProjection | null = null;
+  readonly liveReasoning = new LiveReasoning();
 
   constructor(
     readonly sessionId: string,
@@ -342,7 +346,8 @@ export class SessionActor {
         ? before.state.modelSettings.reasoningEffortOverride : null;
     const runWorkspaceBindings = mergeWorkspaceBindings(
       before.state.workspaceBindings,
-      (command.filesystemReferences ?? []).map((reference) => ({
+      [...before.state.messages.flatMap((message) => message.filesystemReferences.filter((reference) => reference.kind === 'file')),
+        ...(command.filesystemReferences ?? [])].map((reference) => ({
         workspaceId: reference.workspaceId,
         displayName: reference.displayName,
       })),
@@ -359,7 +364,7 @@ export class SessionActor {
         ? { pluginSelections: command.pluginSelections.map((selection) => ({ ...selection })) }
         : {}),
     });
-    const runtimeSnapshot = prepared.runtimeSnapshot;
+    const runtimeSnapshot = retainSessionEnvironment(prepared.runtimeSnapshot, before.events);
     const events: NewSessionEvent[] = [
       {
         type: 'session.model-settings.updated',
@@ -644,7 +649,11 @@ export class SessionActor {
           authorities,
         },
       });
-      const todoItems = todoItemsForPlan(plan, snapshot.state.todoList, this.#nextId);
+      const previousTodo = snapshot.state.todoList;
+      const previousPlan = previousTodo && snapshot.state.plans.find((candidate) => (
+        candidate.planId === previousTodo.sourcePlanId && candidate.revision === previousTodo.sourcePlanRevision
+      ));
+      const todoItems = todoItemsForPlan(plan, previousTodo, previousPlan ?? undefined, this.#nextId);
       events.push({
         type: snapshot.state.todoList?.sourcePlanId === plan.planId
           ? 'todo.reconciled'
@@ -819,6 +828,7 @@ export class SessionActor {
           this.#assistantDraft = draft ? structuredClone(draft) : null;
           if (!this.#projectionState) throw new Error('session_projection_state_missing');
         },
+        updateReasoning: (requestId, runId, text, kind) => this.liveReasoning.append(requestId, runId, text, kind),
         nextId: this.#nextId,
       },
       signal,
@@ -875,7 +885,7 @@ export class SessionActor {
       await this.settleRecoveryFailure(runId, error);
       return false;
     }
-    const restored = prepared.runtimeSnapshot;
+    const restored = retainSessionEnvironment(prepared.runtimeSnapshot, snapshot.events);
     if (canonicalJson(restored) !== canonicalJson(runtime)) {
       const mismatch = new Error('run_runtime_recovery_identity_mismatch');
       try {
@@ -1088,27 +1098,6 @@ function planToSupersede(
   return previousRevision
     ? { planId: previousRevision.planId, revision: previousRevision.revision }
     : null;
-}
-
-function todoItemsForPlan(
-  plan: NonNullable<SessionProjection['pendingPlan']>,
-  previous: SessionProjection['todoList'],
-  nextId: (kind: string) => string,
-): NonNullable<SessionProjection['todoList']>['items'] {
-  const previousByStep = new Map(
-    previous?.sourcePlanId === plan.planId
-      ? previous.items.map((item) => [item.sourceStepId, item] as const)
-      : [],
-  );
-  return plan.steps.map((step) => {
-    const existing = previousByStep.get(step.stepId);
-    return {
-      todoId: existing?.todoId ?? nextId('todo'),
-      sourceStepId: step.stepId,
-      label: step.title,
-      status: existing?.status ?? 'pending',
-    };
-  });
 }
 
 function validInteractionResponse(interaction: InteractionProjection, response: string): boolean {

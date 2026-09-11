@@ -6,6 +6,7 @@ import type {
   PendingPlanProjection,
   PlanProjection,
   ProviderOutputBlock,
+  ProviderToolCallInput,
   RunSettlement,
   RunRuntimeSnapshot,
   SessionEvent,
@@ -29,6 +30,7 @@ export interface SessionState {
   sessionDirectoryIndexes: WorkspaceBindingDisplay[];
   workspaceBindings: WorkspaceBindingDisplay[];
   messages: SessionProjection['messages'];
+  acceptedInputs: Record<string, { messageId: string; replyToInteraction?: { interactionId: string; prompt: string } }>;
   narratives: SessionProjection['narratives'];
   pendingInteraction: SessionProjection['pendingInteraction'];
   pendingApproval: SessionProjection['pendingApproval'];
@@ -66,6 +68,7 @@ export interface ProviderTurnState {
   reasoningSignature?: string;
   hostedWebSearchCalls?: Record<string, unknown>[];
   orderedOutputBlocks?: ProviderOutputBlock[];
+  toolCallInputs?: ProviderToolCallInput[];
   error?: { code: string; message: string };
   sequence: number;
 }
@@ -87,6 +90,7 @@ export function emptySessionState(sessionId: string): SessionState {
     sessionDirectoryIndexes: [],
     workspaceBindings: [],
     messages: [],
+    acceptedInputs: {},
     narratives: [],
     pendingInteraction: null,
     pendingApproval: null,
@@ -135,9 +139,13 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
     workspaceBindings: previous.workspaceBindings.map((binding) => ({ ...binding })),
     messages: previous.messages.map((message) => ({
       ...message,
+      ...(message.replyToInteraction ? { replyToInteraction: { ...message.replyToInteraction } } : {}),
       filesystemReferences: message.filesystemReferences.map((reference) => ({ ...reference })),
       pluginSelections: message.pluginSelections.map((selection) => ({ ...selection })),
     })),
+    acceptedInputs: Object.fromEntries(Object.entries(previous.acceptedInputs).map(([id, input]) => [id, {
+      ...input, ...(input.replyToInteraction ? { replyToInteraction: { ...input.replyToInteraction } } : {}),
+    }])),
     narratives: previous.narratives.map((narrative) => ({ ...narrative })),
     pendingInteraction: cloneInteraction(previous.pendingInteraction),
     pendingApproval: cloneApproval(previous.pendingApproval),
@@ -187,6 +195,9 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
   };
 
   switch (event.type) {
+    case 'input.accepted':
+      next.acceptedInputs[event.payload.commandId] = { messageId: event.payload.messageId };
+      break;
     case 'session.model-settings.updated':
       next.modelSettings = { ...event.payload.settings };
       break;
@@ -265,6 +276,10 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     case 'message.committed':
       {
+        const acceptedInput = Object.entries(next.acceptedInputs).find(([, input]) => input.messageId === event.payload.messageId);
+        const replyToInteraction = acceptedInput?.[1].replyToInteraction;
+        if (replyToInteraction && event.payload.role !== 'user') throw new Error('interaction_response_role_invalid');
+        if (acceptedInput) delete next.acceptedInputs[acceptedInput[0]];
         const common = {
           messageId: event.payload.messageId,
           content: event.payload.content,
@@ -277,6 +292,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
           feedback: null,
           sequence: event.sequence,
           createdAt: event.occurredAt,
+          ...(replyToInteraction ? { replyToInteraction: { ...replyToInteraction } } : {}),
         };
         if (event.payload.role === 'assistant') {
           if (!event.runId) throw new Error('assistant_message_run_identity_missing');
@@ -363,16 +379,22 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         sequence: event.sequence,
       };
       break;
-    case 'interaction.resolved':
+    case 'interaction.resolved': {
       if (
         !next.pendingInteraction
         || next.pendingInteraction.interactionId !== event.payload.interactionId
         || next.pendingInteraction.runId !== event.runId
       ) throw new Error('interaction_request_missing');
+      const input = next.acceptedInputs[event.payload.commandId];
+      if (!input) throw new Error('interaction_response_input_missing');
+      input.replyToInteraction = {
+        interactionId: next.pendingInteraction.interactionId, prompt: next.pendingInteraction.prompt,
+      };
       next.pendingInteraction = null;
       settleActivity(next, interactionActivityId(event.payload.interactionId), 'completed');
       resumeRun(next, event.runId);
       break;
+    }
     case 'plan.published': {
       if (findPlanIndex(next, event.payload.planId, event.payload.revision) >= 0) {
         throw new Error('plan_revision_duplicate');
@@ -768,6 +790,15 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         ) {
           throw new Error('provider_turn_call_order_mismatch');
         }
+        if (settlement.toolCallInputs) {
+          const accepted = settlement.toolCallInputs.filter((call) => !call.error);
+          if (settlement.orderedOutputBlocks || accepted.length !== currentTurnCallFacts.length
+            || accepted.some((call, index) => {
+              const fact = currentTurnCallFacts[index];
+              return !fact || fact[0] !== call.callId || fact[1].providerCallId !== call.providerCallId
+                || fact[1].toolName !== call.toolName;
+            })) throw new Error('provider_turn_call_identity_mismatch');
+        }
         if (settlement.orderedOutputBlocks !== undefined) {
           validateOrderedProviderOutputBlocks(
             settlement.orderedOutputBlocks,
@@ -807,6 +838,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         ...(event.payload.outcome === 'completed'
           ? {
               orderedCallIds: [...event.payload.orderedCallIds],
+              ...(event.payload.toolCallInputs ? { toolCallInputs: structuredClone(event.payload.toolCallInputs) } : {}),
               ...(event.payload.reasoningContent !== undefined
                 ? { reasoningContent: event.payload.reasoningContent }
                 : {}),
@@ -832,6 +864,17 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         sequence: event.sequence,
       };
       if (settlement.outcome === 'completed') {
+        for (const call of settlement.toolCallInputs ?? []) {
+          if (!call.error) continue;
+          if (next.providerCallFacts[call.callId] || next.activities[toolActivityId(call.callId)]) {
+            throw new Error('provider_turn_rejected_call_identity_duplicate');
+          }
+          next.activities[toolActivityId(call.callId)] = {
+            activityId: toolActivityId(call.callId), kind: 'tool', status: 'rejected',
+            label: call.toolName, runId: event.runId, callId: call.callId, sequence: event.sequence,
+            inputRejection: structuredClone(call.error),
+          };
+        }
         for (const block of settlement.orderedOutputBlocks ?? []) {
           if (block.kind === 'toolCallRejected') {
             if (next.providerCallFacts[block.callId] || next.activities[toolActivityId(block.callId)]) {
@@ -1053,8 +1096,15 @@ export function projectSession(
   state: SessionState,
   assistantDraft: AssistantDraftProjection | null = null,
 ): SessionProjection {
+  const rounds = new Map<string, string[]>();
+  for (const activity of Object.values(state.activities).sort((left, right) => left.sequence - right.sequence)) {
+    if (!activity.tool?.fileChanges?.length || !activity.tool.recordId) continue;
+    const records = rounds.get(activity.runId) ?? [];
+    records.push(activity.tool.recordId); rounds.set(activity.runId, records);
+  }
   return {
     schemaVersion: SESSION_PROJECTION_VERSION,
+    ...(rounds.size ? { fileChangeRounds: [...rounds].map(([runId, recordIds]) => ({ runId, recordIds })) } : {}),
     sessionId: state.sessionId,
     revision: state.revision,
     display: { ...state.display },
@@ -1063,6 +1113,7 @@ export function projectSession(
     sessionDirectoryIndexes: state.sessionDirectoryIndexes.map((binding) => ({ ...binding })),
     messages: state.messages.map((message) => ({
       ...message,
+      ...(message.replyToInteraction ? { replyToInteraction: { ...message.replyToInteraction } } : {}),
       filesystemReferences: message.filesystemReferences.map((reference) => ({ ...reference })),
       pluginSelections: message.pluginSelections.map((selection) => ({ ...selection })),
     })),
@@ -1163,6 +1214,7 @@ function cloneProviderTurn(turn: ProviderTurnState): ProviderTurnState {
   return {
     ...turn,
     ...(turn.orderedCallIds ? { orderedCallIds: [...turn.orderedCallIds] } : {}),
+    ...(turn.toolCallInputs ? { toolCallInputs: structuredClone(turn.toolCallInputs) } : {}),
     ...(turn.hostedWebSearchCalls
       ? { hostedWebSearchCalls: turn.hostedWebSearchCalls.map((item) => structuredClone(item)) }
       : {}),
@@ -1371,7 +1423,7 @@ function projectTimeline(state: SessionState): SessionProjection['timeline'] {
         streamId: providerTextStreamId(state.sessionId, turn.runId, turn.providerRequestId),
       });
     }
-    const orderedCallIds = turn.orderedCallIds ?? [];
+    const orderedCallIds = turn.toolCallInputs?.map((call) => call.callId) ?? turn.orderedCallIds ?? [];
     for (const callId of orderedCallIds) {
       const plan = state.plans.find((candidate) => candidate.callId === callId);
       if (!plan) continue;
@@ -1730,6 +1782,7 @@ function cloneActivity(activity: ActivityProjection): ActivityProjection {
           tool: {
             ...activity.tool,
             resources: activity.tool.resources.map((resource) => ({ ...resource })),
+            ...(activity.tool.fileChanges ? { fileChanges: structuredClone(activity.tool.fileChanges) } : {}),
             ...(activity.tool.shell
               ? {
                   shell: {
@@ -1799,6 +1852,7 @@ function settleActivity(
 function projectToolActivity(record: ToolExecutionRecord): NonNullable<ActivityProjection['tool']> {
   const { preparedEffect } = record;
   return {
+    recordId: record.recordId,
     operation: preparedEffect.operation,
     resources: preparedEffect.logicalTargets.map((target) => {
       if (preparedEffect.workspaceId) {
@@ -1815,6 +1869,7 @@ function projectToolActivity(record: ToolExecutionRecord): NonNullable<ActivityP
       return { kind: 'logicalTarget' as const, label: target };
     }),
     ...(record.toolName === 'bash' ? { shell: projectShellActivity(record) } : {}),
+    ...projectFileChanges(record),
   };
 }
 
@@ -2054,4 +2109,21 @@ function addTokenCount(left: number, right: number): number {
   const total = left + right;
   if (!Number.isSafeInteger(total)) throw new Error('token_usage_overflow');
   return total;
+}
+
+function projectFileChanges(record: ToolExecutionRecord): Pick<NonNullable<ActivityProjection['tool']>, 'fileChanges'> {
+  if (!('output' in record) || !record.output || typeof record.output !== 'object' || Array.isArray(record.output)) return {};
+  const changes = (record.output as Record<string, unknown>).fileChanges;
+  if (changes === undefined) return {};
+  if (!Array.isArray(changes) || changes.some((change) => {
+    if (!change || typeof change !== 'object' || Array.isArray(change)) return true;
+    return typeof change.workspaceId !== 'string' || change.workspaceId !== record.preparedEffect.workspaceId
+      || typeof change.path !== 'string' || !['create', 'modify', 'delete'].includes(String(change.kind))
+      || ![change.before, change.after].every((side) => side && typeof side === 'object' && !Array.isArray(side)
+        && typeof side.exists === 'boolean' && (!side.exists || typeof side.contentRef === 'string' || typeof side.error === 'string'))
+      || (change.kind === 'create' && (change.before?.exists !== false || change.after?.exists !== true))
+      || (change.kind === 'delete' && (change.before?.exists !== true || change.after?.exists !== false))
+      || (change.kind === 'modify' && (change.before?.exists !== true || change.after?.exists !== true));
+  })) throw new Error('kernel_file_changes_invalid');
+  return { fileChanges: structuredClone(changes) as unknown as NonNullable<ActivityProjection['tool']>['fileChanges'] };
 }

@@ -828,38 +828,12 @@ fail() {
   exit 1
 }
 
-port_is_free() {
-  ! /usr/bin/nc -z "\$HOST" "\$1" >/dev/null 2>&1
-}
-
-choose_port() {
-  if [ "\${DEEPCODE_PORT:-}" != "" ]; then
-    printf '%s\n' "\$DEEPCODE_PORT"
-    return
-  fi
-
-  local port=$DEFAULT_PORT
-  while [ "\$port" -le 31345 ]; do
-    if port_is_free "\$port"; then
-      printf '%s\n' "\$port"
-      return
-    fi
-    port=\$((port + 1))
-  done
-
-  fail "no free localhost port found in $DEFAULT_PORT-31345"
-}
-
+# Shared Host discovery and startup are owned by the TUI bootstrap.
 [ -x "\$KERNEL_BIN" ] || fail "missing executable: \$KERNEL_BIN"
 [ -x "\$TUI_BIN" ] || fail "missing executable: \$TUI_BIN"
 
-PORT="\$(choose_port)"
-API_URL="http://\$HOST:\$PORT"
-
 export DEEPCODE_HOST="\$HOST"
-export DEEPCODE_PORT="\$PORT"
 export DEEPCODE_CONFIG_DIR="\$CONFIG_ROOT"
-export DEEPCODE_API_URL="\$API_URL"
 export DEEPCODE_KERNEL_BIN="\$KERNEL_BIN"
 if [ -f "\$SCRIPT_DIR/session-core/$SESSION_BRIDGE_NAME" ]; then
   export DEEPCODE_SESSION_BRIDGE="\$SCRIPT_DIR/session-core/$SESSION_BRIDGE_NAME"
@@ -869,11 +843,10 @@ if [ -x "\$SCRIPT_DIR/node/bin/node" ]; then
 elif [ "\${DEEPCODE_NODE:-}" = "" ] && command -v node >/dev/null 2>&1; then
   export DEEPCODE_NODE="\$(command -v node)"
 fi
-TUI_ARGS=(--api "\$API_URL")
 if [ "\${DEEPCODE_WORKSPACE:-}" != "" ]; then
-  TUI_ARGS+=(--workspace "\$DEEPCODE_WORKSPACE")
+  set -- --workspace "\$DEEPCODE_WORKSPACE" "\$@"
 fi
-"\$TUI_BIN" "\${TUI_ARGS[@]}" "\$@"
+"\$TUI_BIN" "\$@"
 LAUNCHER
   chmod +x "$BIN_DIR/$TUI_COMMAND_NAME"
 }
@@ -889,7 +862,6 @@ CLI_BIN="\$SCRIPT_DIR/libexec/$CLI_EXEC_NAME"
 KERNEL_BIN="\$SCRIPT_DIR/deepcode-kernel"
 CONFIG_ROOT="\${DEEPCODE_CONFIG_DIR:-\$SCRIPT_DIR}"
 HOST="\${DEEPCODE_HOST:-127.0.0.1}"
-PORT="\${DEEPCODE_PORT:-$DEFAULT_PORT}"
 
 fail() {
   printf '$PRODUCT CLI launcher error: %s\n' "\$*" >&2
@@ -902,7 +874,6 @@ fail() {
 [ -x "\$KERNEL_BIN" ] || fail "missing executable: \$KERNEL_BIN"
 
 export DEEPCODE_HOST="\$HOST"
-export DEEPCODE_PORT="\$PORT"
 export DEEPCODE_CONFIG_DIR="\$CONFIG_ROOT"
 export DEEPCODE_KERNEL_BIN="\$KERNEL_BIN"
 if [ -f "\$SCRIPT_DIR/session-core/$SESSION_BRIDGE_NAME" ]; then
