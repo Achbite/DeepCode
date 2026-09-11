@@ -5,6 +5,15 @@
   "status": "active",
   "notes": "DeepCode UI localization pack. Translators can add messages/settings entries without changing frontend code.",
   "messages": {
+    "host.startup.failed": "核心服务启动失败",
+    "host.startup.log": "启动日志",
+    "agent.profile.disabled": "已停用",
+    "agent.profile.missing": "不可用",
+    "agent.profile.boundUnavailable": "当前绑定的模型已停用或不存在，请选择可用模型后发送。",
+    "settings.llm.defaultUnavailable": "默认模型不可用。请启用该模型或选择其他可用模型后保存。",
+    "agent.tool.detail.error": "错误详情",
+    "agent.tool.detail.loading": "读取详情中…",
+    "agent.tool.detail.truncated": "仅展示有界内容，完整记录保存在会话归档中。",
     "app.startingAria": "DeepCode 正在启动",
     "app.starting": "DeepCode 启动中...",
     "workbench.mode.aria": "编辑器模式",
@@ -181,7 +190,6 @@
     "settings.gui.preferences": "界面偏好",
     "settings.gui.scopeHint": "这些设置只改变 DeepCode-GUI 的呈现，不改变共享 SessionProjection 或 Kernel 工具事实。",
     "settings.agent.title": "Agent 设置",
-    "settings.agent.scopeHint": "这些设置由所有 UI 壳共享。UI 只负责编辑配置；系统提示词由 Session 组合，工具权限由 Kernel 在实际执行边界应用。",
     "settings.agent.nextRunActivationPending": "Agent 运行配置已保存；下一个 run 将从 Host 激活最新配置，当前 run 保持不变。",
     "settings.agent.instructions": "系统提示词",
     "settings.agent.permissions": "工具权限",
@@ -226,8 +234,8 @@
     "settings.llm.preset.deepseekFlash": "DeepSeek Flash",
     "settings.llm.preset.deepseekPro": "DeepSeek Pro",
     "settings.llm.preset.deepseekAnthropic": "DeepSeek Anthropic",
-    "settings.llm.preset.glm": "GLM 5.2",
-    "settings.llm.preset.kimi": "Kimi K2.6",
+    "settings.llm.preset.glm": "GLM 5.3",
+    "settings.llm.preset.kimi": "Kimi K3",
     "settings.llm.defaultProfile": "默认 profile",
     "settings.llm.empty": "尚未配置 LLM profile。可以添加通用 OpenAI 兼容 profile，或使用 DeepSeek 预设。",
     "settings.llm.replaceInvalidStore": "现有 Profile 文件不符合当前 schema。这里已加载当前版本的预设草稿，但尚未读取、迁移或改写旧配置，也不会自动关联旧密钥；请为启用的远程 Profile 重新输入 API Key，点击“保存”后才会用这些当前配置替换它。",
@@ -587,7 +595,7 @@
     "agent.plan.confirmQuestion": "采用“{title}”这份计划吗？",
     "agent.plan.requestRevisionLabel": "如需调整，直接在下方输入修改意见并发送",
     "agent.plan.adopt": "采用这份计划并继续",
-    "agent.plan.adoptTodoHint": "确认后同步生成 Todo List",
+    "agent.plan.adoptTodoHint": "确认执行范围，继续完成任务",
     "agent.plan.ignoreAndStop": "忽略并终止请求",
     "agent.interaction.inputNeeded": "需要你的决定",
     "agent.interaction.skip": "跳过",
@@ -770,7 +778,7 @@
     },
     "gui.accentColor": {
       "label": "强调色",
-      "description": "用于主要操作、活动状态、焦点和流式光标的统一颜色。",
+      "description": "用于主要操作、活动状态和流式光标的统一颜色。",
       "options": {
         "blue": "蓝色",
         "purple": "紫色",
@@ -784,6 +792,10 @@
         "comfortable": "舒适",
         "compact": "紧凑"
       }
+    },
+    "gui.showReasoning": {
+      "label": "推理详情",
+      "description": "允许点击推理状态查看模型提供的推理文本。默认关闭，仅影响显示，不改变模型推理强度。"
     },
     "gui.showContextRail": {
       "label": "显示上下文栏",
@@ -874,6 +886,15 @@
     "terminal.integrated.spawnTimeoutMs": {
       "label": "终端启动超时",
       "description": "终端后台启动超时，单位为毫秒。"
+    },
+    "agent.responseLanguage": {
+      "label": "回答语言",
+      "description": "应用于新对话",
+      "options": {
+        "auto": "自动检测",
+        "zh-CN": "简体中文",
+        "en-US": "English"
+      }
     },
     "agent.systemPrompt": {
       "label": "系统提示词",

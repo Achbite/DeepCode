@@ -105,6 +105,8 @@ pub enum KernelCanonicalInvocation {
     FsRead {
         path: String,
         start_line: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_byte: Option<u64>,
         max_lines: u32,
         max_bytes: u32,
     },
@@ -161,9 +163,13 @@ impl KernelCanonicalInvocation {
             Self::FsRead {
                 path,
                 start_line,
+                start_byte,
                 max_lines,
                 max_bytes,
             } => {
+                if start_byte.is_some_and(|value| value > 9_007_199_254_740_991) {
+                    return Err(invalid_value("startByte", "must be a safe byte offset"));
+                }
                 validate_path(path, false)?;
                 validate_u32("startLine", *start_line, 1, u32::MAX)?;
                 validate_u32("maxLines", *max_lines, 1, 5_000)?;
@@ -233,14 +239,16 @@ impl KernelCanonicalInvocation {
             Self::FsRead {
                 path,
                 start_line,
+                start_byte,
                 max_lines,
                 max_bytes,
-            } => json!({
-                "path": path,
-                "startLine": start_line,
-                "maxLines": max_lines,
-                "maxBytes": max_bytes,
-            }),
+            } => {
+                let mut value = json!({ "path": path, "startLine": start_line, "maxLines": max_lines, "maxBytes": max_bytes });
+                if let Some(start_byte) = start_byte {
+                    value["startByte"] = json!(start_byte);
+                }
+                value
+            }
             Self::FsWrite {
                 path,
                 content,

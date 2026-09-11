@@ -205,7 +205,12 @@ fn capture_binding(
             _ => return Err("LLM Profile kind 无法映射到 Provider API surface。".to_string()),
         },
         hosted_web_search: match profile.hosted_web_search.as_deref() {
-            Some("web_search") => "web_search",
+            Some("web_search") if profile.provider_flavor.as_deref() == Some("openai") => {
+                "web_search"
+            }
+            // DeepSeek Responses ignores this built-in tool. GLM and Kimi also
+            // use their own search APIs, selected by the run's Kernel adapter.
+            Some("web_search") => "none",
             None => "none",
             Some(_) => return Err("LLM Profile hostedWebSearch 无法映射。".to_string()),
         },

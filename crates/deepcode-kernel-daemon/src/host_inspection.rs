@@ -206,7 +206,7 @@ fn validate_folder_id(folder_id: Option<&str>) -> Result<(), KernelErrorEnvelope
     Ok(())
 }
 
-fn resolve_workspace_read_path(
+pub(crate) fn resolve_workspace_read_path(
     root: &Path,
     relative: &str,
 ) -> Result<PathBuf, KernelErrorEnvelope> {

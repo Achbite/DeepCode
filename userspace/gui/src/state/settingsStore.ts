@@ -96,6 +96,7 @@ interface SettingsActions {
 type SettingsStore = SettingsStateData & SettingsActions;
 
 const SETTING_DEFINITION_SCHEMAS: SettingDefinitionSchema[] = [
+  { key: 'gui.showReasoning', group: 'gui', control: 'boolean' },
   {
     key: 'workbench.language',
     group: 'workbench',
@@ -248,6 +249,12 @@ const SETTING_DEFINITION_SCHEMAS: SettingDefinitionSchema[] = [
     key: 'terminal.integrated.spawnTimeoutMs',
     group: 'terminal',
     control: 'number',
+  },
+  {
+    key: 'agent.responseLanguage',
+    group: 'agent',
+    control: 'select',
+    options: ['auto', 'zh-CN', 'en-US'],
   },
   {
     key: 'agent.systemPrompt',

@@ -62,6 +62,8 @@ export async function buildAgentProviderRequest(input: {
   providerRequestId: string;
 }): Promise<PreparedProviderRequest> {
   const hasWorkspaceBindings = input.workspaceBindings.length > 0;
+  const firstRun = input.events.find((event) => event.type === 'run.started');
+  const prefixBindings = firstRun?.type === 'run.started' ? firstRun.payload.workspaceBindings : input.workspaceBindings;
   const controlNames = {
     interactionRequest: providerWireName(input.runtime, SESSION_CONTROL_INTERACTION_REQUEST),
     planPublish: providerWireName(input.runtime, SESSION_CONTROL_PLAN_PUBLISH),
@@ -74,6 +76,20 @@ export async function buildAgentProviderRequest(input: {
       || effect === 'workspaceMutation'
       || effect === 'process'
     )));
+  const hostedTools: ProviderRequest['hostedTools'] = input.runtime.webSearch.owner === 'providerHosted'
+    ? [{ type: 'webSearch', providerToolType: input.runtime.webSearch.providerToolType }]
+    : [];
+  const controlTools = hasWorkspaceBindings
+    ? sessionControlToolDefinitions()
+    : sessionControlToolDefinitions().filter((tool) => (
+      tool.name === SESSION_CONTROL_INTERACTION_REQUEST
+    ));
+  const toolCodec = createProviderToolCodec(
+    runtimeTools,
+    controlTools,
+    input.runtime.providerToolAliases,
+    input.workspaceBindings,
+  );
   const journalMessages = messagesFromJournal(input.events, input.runId, input.workspaceBindings);
   const contextMessages = (
     await Promise.all(input.contextProviders.map(async (provider) => (
@@ -95,8 +111,9 @@ export async function buildAgentProviderRequest(input: {
     }));
   const toolGuidance = renderActiveToolGuidance(
     input.runtime.toolPromptContributions,
-    input.runtime.providerToolAliases,
+    toolCodec.receiptTools,
     runtimeTools,
+    hostedTools,
   );
   if (toolGuidance) {
     const stableCoreIndex = instructions.findIndex((instruction) => (
@@ -132,7 +149,7 @@ export async function buildAgentProviderRequest(input: {
       role: 'system',
       content: hasWorkspaceBindings
         ? `Current Session workspace bindings (logical handles only): ${JSON.stringify(
-          providerWorkspaceBindings(input.workspaceBindings),
+          providerWorkspaceBindings(prefixBindings),
         )}`
         : 'Current Session workspace bindings: []. Workspace-scoped filesystem and Bash tools are unavailable for this run.',
     },
@@ -142,17 +159,6 @@ export async function buildAgentProviderRequest(input: {
     messages: [...instructions, ...contextMessages, ...journalMessages],
   });
   assertContextContributions(selected);
-  const controlTools = hasWorkspaceBindings
-    ? sessionControlToolDefinitions()
-    : sessionControlToolDefinitions().filter((tool) => (
-      tool.name === SESSION_CONTROL_INTERACTION_REQUEST
-    ));
-  const toolCodec = createProviderToolCodec(
-    runtimeTools,
-    controlTools,
-    input.runtime.providerToolAliases,
-    input.workspaceBindings,
-  );
   const journalCodecsByCallId = providerMessageCodecsByCallId(input.events);
   const providerSelected = selected.map<ContextMessageContribution>((contribution) => ({
     ...contribution,
@@ -171,9 +177,7 @@ export async function buildAgentProviderRequest(input: {
     workspaceBindings: input.workspaceBindings.map((binding) => ({ ...binding })),
     messages: providerSelected.map((item) => cloneModelMessage(item.message)),
     tools: toolCodec.definitions,
-    hostedTools: input.runtime.webSearch.owner === 'providerHosted'
-      ? [{ type: 'webSearch', providerToolType: input.runtime.webSearch.providerToolType }]
-      : [],
+    hostedTools,
   };
   const hostedReceiptTools: ContextCompositionTool[] = request.hostedTools.map((tool) => ({
     itemId: 'web.search',
@@ -217,9 +221,16 @@ export function messagesFromJournal(
       ? [[event.payload.providerRequestId, event.payload.orderedOutputBlocks] as const]
       : []
   )));
+  const aggregateProviderTurns = new Map(events.flatMap((event) => (
+    event.type === 'provider.turn.settled' && event.payload.outcome === 'completed' && event.payload.toolCallInputs
+      ? [[event.payload.providerRequestId, event.payload.toolCallInputs] as const] : []
+  )));
   const orderedProviderCallIds = new Set([...orderedProviderTurns.values()].flatMap((blocks) => (
     blocks.flatMap((block) => block.kind === 'toolCall' ? [block.callId] : [])
   )));
+  for (const calls of aggregateProviderTurns.values()) {
+    for (const call of calls) orderedProviderCallIds.add(call.callId);
+  }
   const providerCallIdByLogicalCallId = providerCallIdsFromEvents(events);
   const interactionCallIds = new Map(events.flatMap((event) => (
     event.type === 'interaction.requested'
@@ -227,6 +238,8 @@ export function messagesFromJournal(
       : []
   )));
   const retainedRunInputId = runInputMessageEvent(events, runId)?.payload.messageId;
+  const runs = events.filter((event): event is Extract<SessionEvent, { type: 'run.started' }> => event.type === 'run.started');
+  const runForInput = new Map(runs.map((event) => [event.payload.inputMessageId, event]));
   const checkpoint = [...events]
     .reverse()
     .find((event): event is Extract<SessionEvent, { type: 'context.compacted' }> => (
@@ -256,13 +269,23 @@ export function messagesFromJournal(
       const reasoning = event.payload.role === 'assistant'
         ? providerReasoning(events, event.payload.providerRequestId)
         : {};
+      const inputRun = runForInput.get(event.payload.messageId);
+      const messageBindings = inputRun?.payload.workspaceBindings ?? workspaceBindings;
+      const previousRun = inputRun ? runs[runs.indexOf(inputRun) - 1] : undefined;
+      if (inputRun && previousRun && JSON.stringify(inputRun.payload.workspaceBindings) !== JSON.stringify(previousRun.payload.workspaceBindings)) {
+        messages.push({
+          contributionId: `workspace-snapshot:${inputRun.runId}`, contributionKind: 'workspaceBindings',
+          label: '本轮目录与资源引用', message: { role: 'system',
+            content: `Current Session workspace bindings (logical handles only; supersedes earlier binding snapshots): ${JSON.stringify(providerWorkspaceBindings(messageBindings))}` },
+        });
+      }
       messages.push({
         contributionId: `message:${event.payload.messageId}`,
         contributionKind: 'journalMessages',
         label: event.payload.role === 'user' ? '用户消息' : 'Assistant 消息',
         message: {
           role: event.payload.role,
-          content: messageContentForModel(event.payload, workspaceBindings),
+          content: messageContentForModel(event.payload, messageBindings),
           ...reasoning,
         },
       });
@@ -423,6 +446,18 @@ export function messagesFromJournal(
           }),
         },
       });
+    } else if (event.type === 'plan.completed') {
+      messages.push({
+        contributionId: `plan-completed:${event.eventId}`,
+        contributionKind: 'journalMessages', label: 'Plan phase completed',
+        message: {
+          role: 'user',
+          content: JSON.stringify({
+            type: 'plan.completed', ...event.payload,
+            nextAction: 'All current Todo steps are completed. Plan progress is closed. Provide the final explanation; publish a complete revision only if new scope is required.',
+          }),
+        },
+      });
     } else if (event.type === 'session.control.rejected') {
       if (!orderedProviderCallIds.has(event.callId)) {
         attachToolCall(messages, {
@@ -476,6 +511,39 @@ export function messagesFromJournal(
         },
       });
     } else if (event.type === 'provider.turn.settled' && event.payload.outcome === 'completed') {
+      if (event.payload.toolCallInputs) {
+        messages.push({
+          contributionId: `provider-inputs:${event.payload.providerRequestId}`,
+          contributionKind: 'journalMessages',
+          label: 'Provider calls',
+          message: {
+            role: 'assistant',
+            content: '',
+            ...providerReasoning(events, event.payload.providerRequestId),
+            toolCalls: event.payload.toolCallInputs.map((call) => ({
+              callId: call.callId,
+              providerCallId: call.providerCallId,
+              name: call.toolName,
+              input: call.arguments,
+            })),
+          },
+        });
+        for (const call of event.payload.toolCallInputs) {
+          if (!call.error) continue;
+          messages.push({
+            contributionId: `provider-input-rejection:${call.callId}`,
+            contributionKind: 'journalMessages',
+            label: `${call.toolName} input rejected`,
+            message: {
+              role: 'tool',
+              toolCallId: call.callId,
+              providerCallId: call.providerCallId,
+              content: JSON.stringify({ status: 'inputRejected', executed: false, error: call.error }),
+            },
+          });
+        }
+      }
+
       if (event.payload.orderedOutputBlocks !== undefined) {
         messages.push({
           contributionId: `provider-output:${event.payload.providerRequestId}`,
@@ -838,8 +906,8 @@ function mergeNarrativeIntoProviderCall(
       `Provider narrative 缺少完成事实：${narrative.payload.providerRequestId}`,
     );
   }
-  if (completion.payload.orderedCallIds.length === 0) return false;
-  const callIds = new Set(completion.payload.orderedCallIds);
+  const callIds = new Set(completion.payload.toolCallInputs?.map((call) => call.callId) ?? completion.payload.orderedCallIds);
+  if (callIds.size === 0) return false;
   const targets = messages.filter((contribution) => (
     contribution.message.toolCalls?.some((call) => callIds.has(call.callId))
   ));
@@ -1082,12 +1150,12 @@ function messageContentForModel(
 function toolResultForModel(record: ToolExecutionRecord): Record<string, unknown> {
   if (record.outcome === 'completed') {
     const output = structuredClone(record.output);
-    if (isRecord(output)) delete output.workspaceId;
+    if (isRecord(output)) { delete output.workspaceId; delete output.fileChanges; }
     return { recordId: record.recordId, outcome: record.outcome, output };
   }
   if (record.outcome === 'failed') {
     const output = record.output === undefined ? undefined : structuredClone(record.output);
-    if (isRecord(output)) delete output.workspaceId;
+    if (isRecord(output)) { delete output.workspaceId; delete output.fileChanges; }
     return {
       recordId: record.recordId,
       outcome: record.outcome,

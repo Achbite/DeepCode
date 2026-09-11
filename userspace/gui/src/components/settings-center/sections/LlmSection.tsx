@@ -48,17 +48,16 @@ const PROFILE_PRESETS: Array<{
   {
     labelKey: 'settings.llm.preset.deepseekFlash',
     profile: {
-      name: 'DeepSeek V4 Flash',
+      name: 'DeepSeek Flash',
       kind: 'responses',
       providerFlavor: 'deepseek',
       baseUrl: DEEPSEEK_OPENAI_BASE_URL,
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-flash',
       contextWindowTokens: 1000000,
       maxOutputTokens: 384000,
       temperature: 0.2,
       reasoningEffort: 'high',
       thinking: 'enabled',
-      hostedWebSearch: 'web_search',
       enabled: true,
     },
   },
@@ -75,18 +74,17 @@ const PROFILE_PRESETS: Array<{
       temperature: 0.2,
       reasoningEffort: 'max',
       thinking: 'enabled',
-      hostedWebSearch: 'web_search',
       enabled: true,
     },
   },
   {
     labelKey: 'settings.llm.preset.deepseekAnthropic',
     profile: {
-      name: 'DeepSeek V4 Flash (Anthropic)',
+      name: 'DeepSeek Flash (Anthropic)',
       kind: 'anthropic',
       providerFlavor: 'deepseek',
       baseUrl: DEEPSEEK_ANTHROPIC_BASE_URL,
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-flash',
       contextWindowTokens: 1000000,
       maxOutputTokens: 384000,
       temperature: 0.2,
@@ -98,25 +96,29 @@ const PROFILE_PRESETS: Array<{
   {
     labelKey: 'settings.llm.preset.glm',
     profile: {
-      name: 'GLM 5.2',
+      name: 'GLM 5.3',
       kind: 'openaiCompatible',
       providerFlavor: 'zhipu',
       baseUrl: GLM_OPENAI_BASE_URL,
-      model: 'glm-5.2',
+      model: 'glm-5.3',
+      contextWindowTokens: 1000000,
+      maxOutputTokens: 131072,
+      thinking: 'enabled',
+      reasoningEffort: 'max',
       enabled: true,
     },
   },
   {
     labelKey: 'settings.llm.preset.kimi',
     profile: {
-      name: 'Kimi K2.6',
+      name: 'Kimi K3',
       kind: 'openaiCompatible',
       providerFlavor: 'moonshot',
       baseUrl: KIMI_OPENAI_BASE_URL,
-      model: 'kimi-k2.6',
-      contextWindowTokens: 256000,
+      model: 'kimi-k3',
+      contextWindowTokens: 1000000,
       maxOutputTokens: 32768,
-      thinking: 'enabled',
+      reasoningEffort: 'max',
       enabled: true,
     },
   },
@@ -131,12 +133,15 @@ function createProfile(
   }
   return {
     id,
-    name: 'OpenAI Compatible',
-    kind: 'openaiCompatible',
+    name: 'OpenAI GPT-6 Astra',
+    kind: 'responses',
     providerFlavor: 'openai',
     baseUrl: 'https://api.openai.com/v1',
-    model: 'gpt-4o-mini',
-    thinking: 'enabled',
+    model: 'gpt-6-astra',
+    contextWindowTokens: 1050000,
+    maxOutputTokens: 128000,
+    reasoningEffort: 'high',
+    hostedWebSearch: 'web_search',
     enabled: false,
   };
 }
@@ -256,12 +261,11 @@ const LlmSection: React.FC = () => {
       delete next[id];
       return next;
     });
-    setDefaultProfileId((prev) =>
-      prev === id ? profiles.find((profile) => profile.id !== id)?.id : prev
-    );
+
   };
 
   const save = async () => {
+    if (!profiles.some((profile) => profile.id === defaultProfileId && profile.enabled)) return;
     setLoading(true);
     setMessage(null);
     const savableProfiles = profiles;
@@ -329,6 +333,9 @@ const LlmSection: React.FC = () => {
     [profiles]
   );
 
+  const defaultValid = defaultOptions.some((profile) => profile.id === defaultProfileId);
+  const selectedDefault = profiles.find((profile) => profile.id === defaultProfileId);
+
   return (
     <div>
       <h2 className="settings-title">{t(language, 'settings.llm.title')}</h2>
@@ -366,7 +373,7 @@ const LlmSection: React.FC = () => {
           <button
             className="settings-action-button"
             onClick={() => void save()}
-            disabled={loading || !hasProfiles}
+            disabled={loading || !hasProfiles || !defaultValid}
           >
             {t(language, 'settings.common.save')}
           </button>
@@ -379,7 +386,7 @@ const LlmSection: React.FC = () => {
           </button>
         </div>
 
-        {defaultOptions.length > 0 && (
+        {(hasProfiles || defaultProfileId) && (
           <label className="llm-default-row">
             <span>{t(language, 'settings.llm.defaultProfile')}</span>
             <select
@@ -387,6 +394,10 @@ const LlmSection: React.FC = () => {
               value={defaultProfileId ?? ''}
               onChange={(e) => setDefaultProfileId(e.target.value)}
             >
+              {!defaultValid && <option value={defaultProfileId ?? ''} disabled>
+                {selectedDefault?.name ?? defaultProfileId ?? t(language, 'agent.profile.selectionRequired')}
+                {defaultProfileId ? ` · ${t(language, selectedDefault ? 'agent.profile.disabled' : 'agent.profile.missing')}` : ''}
+              </option>}
               {defaultOptions.map((profile) => (
                 <option key={profile.id} value={profile.id}>
                   {profile.name}
@@ -395,6 +406,10 @@ const LlmSection: React.FC = () => {
             </select>
           </label>
         )}
+
+        {(hasProfiles || defaultProfileId) && !defaultValid && <p className="settings-card__hint" role="alert">
+          {t(language, 'settings.llm.defaultUnavailable')}
+        </p>}
 
         {profiles.length === 0 && (
           <div className="settings-card__hint">

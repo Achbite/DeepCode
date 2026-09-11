@@ -371,10 +371,22 @@ async fn proxy_api(
             .into_response();
     }
     let url = format!("{}{}", state.daemon_base_url, path_and_query);
-    let body_bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+    let body_limit = if uri.path().contains("/input-resources/") {
+        32 * 1024 * 1024
+    } else {
+        16 * 1024 * 1024
+    };
+    let body_bytes = match axum::body::to_bytes(body, body_limit).await {
         Ok(bytes) => bytes,
         Err(error) => {
-            return ApiResponse::error("proxy_body_read_failed", error.to_string()).into_response();
+            return ApiResponse::error(
+                "proxy_body_read_failed",
+                format!(
+                    "请求读取失败（单次限额 {} MiB）：{error}",
+                    body_limit / 1024 / 1024
+                ),
+            )
+            .into_response();
         }
     };
     let reqwest_method =
@@ -460,6 +472,8 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("DELETE", ["api", "conversation", "sessions", _])
         | ("POST", ["api", "conversation", "sessions", _, "directory-indexes"])
         | ("POST", ["api", "conversation", "sessions", _, "filesystem-references", "resolve"])
+        | ("POST", ["api", "conversation", "sessions", _, "input-resources", _])
+        | ("POST", ["api", "conversation", "sessions", _, "changes", "read"])
         | ("DELETE", ["api", "conversation", "sessions", _, "directory-indexes", _])
         | ("GET", ["api", "conversation", "sessions", _, "projection"])
         | ("GET", ["api", "conversation", "sessions", _, "context-compositions", _])

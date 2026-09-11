@@ -1,8 +1,9 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import { monacoHostWorkers } from './vite.monaco';
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), monacoHostWorkers()],
   base: './',
   build: {
     chunkSizeWarningLimit: 650,

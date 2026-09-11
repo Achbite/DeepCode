@@ -1,3 +1,4 @@
+import '../components/shared/focus.css';
 /**
  * App entry.
  *
@@ -16,6 +17,8 @@ import {
   APP_CLOSE_REQUEST_EVENT,
   closeAppWindow,
   getHealth,
+  getHostStartupStatus,
+  type HostStartupStatusV1,
   healthVersion,
   isRuntimeReady,
   warmupTerminalRuntime,
@@ -24,6 +27,7 @@ import { getTabId, useEditorStore } from '../state/editorStore';
 import WindowControls from '../components/window-controls/WindowControls';
 import type { ConfirmDialogAction, ConfirmDialogData } from '../types/ui';
 import { activeT, getActiveUiLanguage, normalizeUiLanguage, setActiveUiLanguage, t } from '../i18n';
+import { HostStartupDiagnostic } from '../components/shared/HostStartupDiagnostic';
 import './app.css';
 
 const WorkbenchLayout = lazy(() => import('./layout/WorkbenchLayout'));
@@ -145,6 +149,7 @@ const App: React.FC = () => {
       .join('|')
   );
 
+  const [hostStartup, setHostStartup] = useState<HostStartupStatusV1 | null>(null);
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogData>(CLOSED_CONFIRM_DIALOG);
   const loadedIncarnationRef = useRef<string | null>(null);
   const healthWasReadyRef = useRef(false);
@@ -264,11 +269,16 @@ const App: React.FC = () => {
       if (isRuntimeReady(result)) {
         recordRuntimeReady();
         setApiStatus('connected');
+        setHostStartup(null);
         setServerVersion(healthVersion(result.data));
       } else {
         healthWasReadyRef.current = false;
         setApiStatus('error');
-        setErrorMessage(result.message || t(language, 'app.apiUnavailable'));
+        const startup = await getHostStartupStatus();
+        if (cancelled) return;
+        setHostStartup(startup.ok ? startup.data ?? null : null);
+        setErrorMessage(startup.ok && startup.data?.phase === 'failed'
+          ? startup.data.message : result.message || t(language, 'app.apiUnavailable'));
       }
     };
 
@@ -400,6 +410,7 @@ const App: React.FC = () => {
           lastHeartbeatAt={lastHeartbeatAt}
         />
       </Suspense>
+      <HostStartupDiagnostic status={hostStartup} language={language} />
       {confirmDialog.open && (
         <div className="app-dialog-backdrop" role="presentation">
           <div

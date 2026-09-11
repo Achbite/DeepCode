@@ -1,0 +1,10 @@
+/* Focus keeps the normal control border; keyboard navigation stays native. */
+:root :is(button, input, select, textarea, summary, a, [tabindex], [contenteditable]):focus-visible {
+  outline: none;
+}
+
+/* Monaco supplies its own focus colors when the editor loads. */
+:root :is(.monaco-editor, .monaco-diff-editor, .monaco-component, .monaco-hover) {
+  --vscode-focusBorder: transparent !important;
+  --vscode-list-focusOutline: transparent !important;
+}

@@ -55,7 +55,7 @@ impl LocalAgentJournal {
             })?;
         }
         let existed = path.exists();
-        let mut connection = Connection::open(path).map_err(sql_open_error)?;
+        let connection = Connection::open(path).map_err(sql_open_error)?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(sql_error("session_store_busy_timeout_failed"))?;
@@ -76,7 +76,7 @@ impl LocalAgentJournal {
             SESSION_STORE_VERSION => {
                 verify_session_store(&connection)?;
                 verify_session_store_version(&connection)?;
-                repair_current_event_constraint(&mut connection)?;
+                verify_current_event_constraint(&connection)?;
             }
             other => {
                 return Err(LocalAgentStoreError::new(
@@ -1393,6 +1393,7 @@ fn validate_new_event(
                             "reasoningSignature",
                             "hostedWebSearchCalls",
                             "orderedOutputBlocks",
+                            "toolCallInputs",
                         ],
                     )?;
                     let ordered_call_ids = payload
@@ -1479,6 +1480,60 @@ fn validate_new_event(
                                     "Provider hosted search call id 不能重复。",
                                 ));
                             }
+                        }
+                    }
+                    if let Some(calls) = payload.get("toolCallInputs") {
+                        if required_string(payload, "purpose")? != "agent"
+                            || payload.get("orderedOutputBlocks").is_some()
+                        {
+                            return Err(LocalAgentStoreError::new(
+                                "session_event_invalid",
+                                "聚合工具输入只能属于普通 Agent turn，不能与有序原生项混用。",
+                            ));
+                        }
+                        let calls = calls
+                            .as_array()
+                            .filter(|calls| !calls.is_empty())
+                            .ok_or_else(|| {
+                                LocalAgentStoreError::new(
+                                    "session_event_invalid",
+                                    "toolCallInputs 必须是非空数组。",
+                                )
+                            })?;
+                        let mut ids = std::collections::HashSet::new();
+                        let mut provider_ids = std::collections::HashSet::new();
+                        let mut accepted = Vec::new();
+                        for call in calls {
+                            exact_object(
+                                call,
+                                &["callId", "providerCallId", "toolName", "arguments"],
+                                &["error"],
+                            )?;
+                            let id = required_string(call, "callId")?;
+                            let provider_id = required_string(call, "providerCallId")?;
+                            validate_id("callId", id)?;
+                            validate_runtime_identity("providerCallId", provider_id)?;
+                            required_string(call, "toolName")?;
+                            if !call["arguments"].is_string()
+                                || !ids.insert(id)
+                                || !provider_ids.insert(provider_id)
+                            {
+                                return Err(LocalAgentStoreError::new(
+                                    "session_event_invalid",
+                                    "toolCallInputs 参数类型或调用身份无效。",
+                                ));
+                            }
+                            if let Some(error) = call.get("error") {
+                                validate_input_rejection_error(error)?;
+                            } else {
+                                accepted.push(json!(id));
+                            }
+                        }
+                        if accepted != *ordered_call_ids {
+                            return Err(LocalAgentStoreError::new(
+                                "provider_turn_call_order_mismatch",
+                                "通过校验的输入必须与调用事实同序一致。",
+                            ));
                         }
                     }
                     if let Some(blocks) = payload.get("orderedOutputBlocks") {
@@ -2331,6 +2386,21 @@ fn validate_event_facts(
                         "provider_turn_call_fact_invalid",
                         "provider.turn.settled orderedCallIds 必须与本次 composition 后写入的 call facts 完整同序一致。",
                     ));
+                }
+                if let Some(calls) = payload.get("toolCallInputs").and_then(Value::as_array) {
+                    let accepted = calls.iter().filter(|call| call.get("error").is_none());
+                    if !accepted.zip(actual_call_facts.iter()).all(
+                        |(call, (id, provider_id, name))| {
+                            call["callId"] == *id
+                                && call["providerCallId"] == *provider_id
+                                && call["toolName"] == *name
+                        },
+                    ) {
+                        return Err(LocalAgentStoreError::new(
+                            "provider_turn_call_identity_mismatch",
+                            "聚合输入与已写入的调用身份不一致。",
+                        ));
+                    }
                 }
                 if let Some(blocks) = payload.get("orderedOutputBlocks").and_then(Value::as_array) {
                     let ordered_tool_calls = blocks
@@ -4900,11 +4970,7 @@ fn strip_null_object_fields(mut value: Value) -> Value {
     value
 }
 
-// The current schema-7 release omitted two declared events from its SQL CHECK.
-// Repair only that exact defect; preserve every stored event and command.
-fn repair_current_event_constraint(
-    connection: &mut Connection,
-) -> Result<(), LocalAgentStoreError> {
+fn verify_current_event_constraint(connection: &Connection) -> Result<(), LocalAgentStoreError> {
     let table_sql = SESSION_STORE_SCHEMA
         .split(';')
         .map(str::trim)
@@ -4916,10 +4982,7 @@ fn repair_current_event_constraint(
             .collect::<Vec<_>>()
             .join(" ")
     };
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(sql_error("session_store_constraint_repair_failed"))?;
-    let stored_sql: String = transaction
+    let stored_sql: String = connection
         .query_row(
             "SELECT sql FROM sqlite_schema WHERE type='table' AND name='session_events'",
             [],
@@ -4929,44 +4992,10 @@ fn repair_current_event_constraint(
     if normalize(&stored_sql) == normalize(table_sql) {
         return Ok(());
     }
-    let omitted_events_sql = table_sql
-        .replace("        'session.model-settings.updated',\n", "")
-        .replace("        'tool.input-rejected',\n", "");
-    if normalize(&stored_sql) != normalize(&omitted_events_sql) {
-        return Err(LocalAgentStoreError::new(
-            "session_store_event_schema_mismatch",
-            "Session event 表与当前合同不一致，无法应用事件白名单修复。",
-        ));
-    }
-    transaction
-        .execute_batch(
-            "ALTER TABLE session_events RENAME TO session_events_before_constraint_repair;",
-        )
-        .map_err(sql_error("session_store_constraint_repair_failed"))?;
-    transaction
-        .execute_batch(table_sql)
-        .map_err(sql_error("session_store_constraint_repair_failed"))?;
-    transaction
-        .execute_batch(
-            "INSERT INTO session_events (
-                 session_id, sequence, event_id, event_type, run_id, call_id, payload_json, occurred_at
-             ) SELECT session_id, sequence, event_id, event_type, run_id, call_id, payload_json, occurred_at
-               FROM session_events_before_constraint_repair;
-             DROP TABLE session_events_before_constraint_repair;",
-        )
-        .map_err(sql_error("session_store_constraint_repair_failed"))?;
-    for index_sql in SESSION_STORE_SCHEMA
-        .split(';')
-        .map(str::trim)
-        .filter(|sql| sql.starts_with("CREATE ") && sql.contains("ON session_events("))
-    {
-        transaction
-            .execute_batch(index_sql)
-            .map_err(sql_error("session_store_constraint_repair_failed"))?;
-    }
-    transaction
-        .commit()
-        .map_err(sql_error("session_store_constraint_repair_failed"))
+    Err(LocalAgentStoreError::new(
+        "session_store_event_schema_mismatch",
+        "Session event 表与当前合同不一致；未修改数据库结构或历史记录。",
+    ))
 }
 
 fn verify_session_store(connection: &Connection) -> Result<(), LocalAgentStoreError> {
@@ -5285,7 +5314,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_repairs_the_current_event_constraint_without_rewriting_history() {
+    fn journal_rejects_incorrect_event_constraint_without_rewriting_history() {
         let path = std::env::temp_dir().join(format!(
             "deepcode-session-constraint-{}.sqlite3",
             random_id("test").unwrap().replace(':', "-")
@@ -5336,63 +5365,62 @@ mod tests {
                 .unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
                 .unwrap().collect::<rusqlite::Result<_>>().unwrap()
         };
+        let read_table =
+            |journal: &LocalAgentJournal| -> String {
+                journal.lock().unwrap().query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='session_events'",
+                [], |row| row.get(0),
+            ).unwrap()
+            };
+        let read_schema_revision = |journal: &LocalAgentJournal| -> u32 {
+            journal
+                .lock()
+                .unwrap()
+                .query_row("PRAGMA schema_version", [], |row| row.get(0))
+                .unwrap()
+        };
         let before_indexes = read_indexes(&journal);
+        let before_table = read_table(&journal);
+        let before_schema_revision = read_schema_revision(&journal);
         drop(journal);
-        let repaired =
-            LocalAgentJournal::open(&path).expect("open and repair the affected current store");
+        let error = LocalAgentJournal::open(&path)
+            .err()
+            .expect("invalid event table must fail open");
+        assert_eq!(error.code, "session_store_event_schema_mismatch");
+        // Inspect the original database directly after the rejected open.
+        let unchanged = LocalAgentJournal {
+            connection: Arc::new(Mutex::new(Connection::open(&path).unwrap())),
+        };
         assert_eq!(
-            repaired.read_events("session:loop", 0).unwrap(),
+            unchanged.read_events("session:loop", 0).unwrap(),
             before_events
         );
         assert_eq!(
-            repaired
+            unchanged
                 .read_command("session:loop", "command:before-repair")
                 .unwrap(),
             before_command
         );
-        assert_eq!(read_indexes(&repaired), before_indexes);
-        assert_eq!(repaired.lock().unwrap().query_row(
+        assert_eq!(read_indexes(&unchanged), before_indexes);
+        assert_eq!(read_table(&unchanged), before_table);
+        assert_eq!(read_schema_revision(&unchanged), before_schema_revision);
+        assert_eq!(unchanged.lock().unwrap().query_row(
             "SELECT display_name FROM session_workspace_bindings WHERE session_id='session:loop'", [],
             |row| row.get::<_, String>(0)
         ).unwrap(), "Test");
-        append_model_settings_and_rejected_call(&repaired);
-        let after_events = repaired.read_events("session:loop", 0).unwrap();
-        assert_eq!(
-            &after_events[..before_events.len()],
-            before_events.as_slice()
-        );
-        let schema_revision: u32 = repaired
-            .lock()
-            .unwrap()
-            .query_row("PRAGMA schema_version", [], |row| row.get(0))
-            .unwrap();
-        assert!(repaired.lock().unwrap().execute(
+        assert!(unchanged.lock().unwrap().execute(
             "INSERT INTO session_events(session_id,sequence,event_id,event_type,payload_json,occurred_at)
              VALUES ('session:loop',999,'event:invalid','undeclared.event','{}','2026-09-07T00:00:00Z')", []
         ).is_err(), "undeclared events must still fail the database CHECK");
-        drop(repaired);
-        let reopened = LocalAgentJournal::open(&path).unwrap();
         assert_eq!(
-            reopened.read_events("session:loop", 0).unwrap(),
-            after_events
-        );
-        assert_eq!(
-            reopened
-                .lock()
-                .unwrap()
-                .query_row("PRAGMA schema_version", [], |row| row.get::<_, u32>(0))
-                .unwrap(),
-            schema_revision
-        );
-        assert_eq!(
-            reopened
+            unchanged
                 .lock()
                 .unwrap()
                 .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
                 .unwrap(),
             "ok"
         );
-        drop(reopened);
+        drop(unchanged);
         std::fs::remove_file(path).unwrap();
     }
 

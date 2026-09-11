@@ -1660,7 +1660,6 @@ package_distribution() {
 setlocal
 set "SCRIPT_DIR=%~dp0"
 if not defined DEEPCODE_HOST set "DEEPCODE_HOST=127.0.0.1"
-if not defined DEEPCODE_PORT set "DEEPCODE_PORT=31245"
 "%SCRIPT_DIR%deepcode-cli.exe" %*
 LAUNCHER
 
@@ -1669,7 +1668,6 @@ LAUNCHER
 setlocal
 set "SCRIPT_DIR=%~dp0"
 if not defined DEEPCODE_HOST set "DEEPCODE_HOST=127.0.0.1"
-if not defined DEEPCODE_PORT set "DEEPCODE_PORT=31245"
 "%SCRIPT_DIR%deepcode-tui.exe" %*
 LAUNCHER
 
@@ -1678,7 +1676,6 @@ LAUNCHER
 setlocal
 set "SCRIPT_DIR=%~dp0"
 if not defined DEEPCODE_HOST set "DEEPCODE_HOST=127.0.0.1"
-if not defined DEEPCODE_PORT set "DEEPCODE_PORT=31245"
 "%SCRIPT_DIR%deepcode-cli.exe" %*
 LAUNCHER
 

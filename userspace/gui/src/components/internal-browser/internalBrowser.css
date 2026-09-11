@@ -66,7 +66,7 @@
 }
 
 .internal-browser-panel__toolbar input:focus {
-  border-color: rgba(10, 132, 255, 0.72);
+  border-color: var(--dc-border-strong, var(--line, #666));
 }
 
 .internal-browser-panel__toolbar button {

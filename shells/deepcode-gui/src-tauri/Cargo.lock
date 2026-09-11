@@ -502,8 +502,9 @@ dependencies = [
 
 [[package]]
 name = "deepcode-gui-tauri-shell"
-version = "0.5.50"
+version = "0.5.51"
 dependencies = [
+ "deepcode-host-connection",
  "deepcode-kernel-abi",
  "getrandom 0.3.4",
  "libc",
@@ -515,8 +516,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "deepcode-host-connection"
+version = "0.5.51"
+dependencies = [
+ "deepcode-kernel-abi",
+ "libc",
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "deepcode-kernel-abi"
-version = "0.5.50"
+version = "0.5.51"
 dependencies = [
  "serde",
  "serde_json",

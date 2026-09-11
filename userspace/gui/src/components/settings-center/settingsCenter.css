@@ -65,8 +65,8 @@
 }
 
 .settings-search input:focus {
-  border-color: var(--accent, #0a84ff);
-  box-shadow: 0 0 0 3px var(--accent-soft, rgba(10, 132, 255, 0.15));
+  border-color: var(--dc-border-strong, var(--line, #666));
+  box-shadow: none;
 }
 
 .settings-nav-item {
@@ -450,7 +450,7 @@
 
 .settings-accent-option[aria-pressed='true']:hover,
 .settings-accent-option[aria-pressed='true']:focus-visible {
-  border-color: var(--accent, #0a84ff);
+  border-color: var(--dc-border-strong, var(--line, #666));
   background: var(--accent-soft, rgba(10, 132, 255, 0.15));
   color: var(--accent, #0a84ff);
 }
@@ -856,6 +856,11 @@
   font-weight: 650;
 }
 
+.settings-field--compact .settings-field__label,
+.settings-field--compact .settings-field__select {
+  font-size: 14px;
+}
+
 .settings-field__source,
 .settings-source-note,
 .doctor-pill {
@@ -939,8 +944,8 @@
 .settings-field__input:focus,
 .settings-field__select:focus,
 .settings-textarea:focus {
-  border-color: var(--accent, #0a84ff);
-  box-shadow: 0 0 0 3px var(--accent-soft, rgba(10, 132, 255, 0.15)), var(--shadow-inset);
+  border-color: var(--dc-border-strong, var(--line, #666));
+  box-shadow: none;
 }
 
 .settings-field__checkbox {

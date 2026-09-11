@@ -9,6 +9,7 @@ interface SettingsFieldProps {
   source: SettingSource;
   language: UiLanguage;
   disabled?: boolean;
+  compact?: boolean;
   onChange: (key: string, value: UserSettingValue) => void;
   onReset?: (key: string) => void;
 }
@@ -30,6 +31,7 @@ const SettingsField: React.FC<SettingsFieldProps> = ({
   source,
   language,
   disabled = false,
+  compact = false,
   onChange,
   onReset,
 }) => {
@@ -64,6 +66,7 @@ const SettingsField: React.FC<SettingsFieldProps> = ({
       return (
         <select
           className="settings-field__select"
+          aria-label={definition.label}
           value={String(value ?? defaultValue ?? '')}
           disabled={disabled}
           onChange={(event) => onChange(definition.key, event.target.value)}
@@ -101,23 +104,23 @@ const SettingsField: React.FC<SettingsFieldProps> = ({
   };
 
   return (
-    <div className="settings-field">
+    <div className={`settings-field${compact ? ' settings-field--compact' : ''}`}>
       <div className="settings-field__main">
         <div className="settings-field__title-row">
           <span className="settings-field__label">{definition.label}</span>
-          <span className={`settings-field__source settings-field__source--${source}`}>
+          {!compact && <span className={`settings-field__source settings-field__source--${source}`}>
             {sourceLabel(source, language)}
-          </span>
+          </span>}
         </div>
-        <div className="settings-field__key">{definition.key}</div>
+        {!compact && <div className="settings-field__key">{definition.key}</div>}
         <div className="settings-field__description">{definition.description}</div>
-        <div className="settings-field__default">
+        {!compact && <div className="settings-field__default">
           {t(language, 'settings.defaultValuePrefix')}<code>{JSON.stringify(defaultValue)}</code>
-        </div>
+        </div>}
       </div>
       <div className="settings-field__control">
         {renderControl()}
-        {onReset && source === 'user' && (
+        {!compact && onReset && source === 'user' && (
           <button
             className="settings-field__reset"
             type="button"

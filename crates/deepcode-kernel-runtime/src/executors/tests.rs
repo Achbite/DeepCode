@@ -537,3 +537,62 @@ fn bash_limits_preview_and_preserves_complete_output_for_bounded_reads() {
         );
     }
 }
+
+#[test]
+fn file_changes_retain_each_operations_before_and_after_and_deleted_tree_files() {
+    let workspace = TempWorkspace::new("stable-changes");
+    fs::create_dir_all(workspace.0.join("docs")).unwrap();
+    fs::write(workspace.0.join("docs/readme.txt"), "before\n").unwrap();
+    let registry = KernelExecutorRegistry::from_executors(builtin_executors(
+        &KernelToolRegistry::default(),
+        KernelExecutorConfig::default(),
+        Arc::new(EmptySecretProvider),
+    ));
+    let invoke = |tool: &str, input: Value| {
+        registry
+            .invoke(
+                tool,
+                KernelToolInvocation {
+                    id: format!("invocation:{tool}"),
+                    tool_id: tool.into(),
+                    input: input.clone(),
+                },
+                context_with_target(&workspace.0, input["path"].as_str().unwrap()),
+            )
+            .unwrap()
+    };
+    let write = invoke(
+        "fs.write",
+        serde_json::json!({ "path": "docs/readme.txt", "content": "after\n" }),
+    );
+    let change = &write.output["fileChanges"][0];
+    assert_eq!(change["kind"], "modify");
+    assert_eq!(
+        fs::read_to_string(change["before"]["contentRef"].as_str().unwrap()).unwrap(),
+        "before\n"
+    );
+    let edit = invoke(
+        "fs.edit",
+        serde_json::json!({ "path": "docs/readme.txt", "edits": [{ "oldText": "after", "newText": "later" }] }),
+    );
+    assert_eq!(edit.output["fileChanges"][0]["kind"], "modify");
+    let unchanged = invoke(
+        "fs.write",
+        serde_json::json!({ "path": "docs/readme.txt", "content": "later\n" }),
+    );
+    assert_eq!(unchanged.output["fileChanges"], serde_json::json!([]));
+    fs::write(workspace.0.join("docs/empty.txt"), "").unwrap();
+    let delete = invoke(
+        "fs.delete",
+        serde_json::json!({ "path": "docs", "targetKind": "directoryTree" }),
+    );
+    let deleted = delete.output["fileChanges"].as_array().unwrap();
+    assert_eq!(deleted.len(), 2);
+    assert!(deleted.iter().all(|change| change["kind"] == "delete"
+        && change["before"]["exists"] == true
+        && change["after"]["exists"] == false));
+    assert_eq!(
+        fs::read_to_string(change["after"]["contentRef"].as_str().unwrap()).unwrap(),
+        "after\n"
+    );
+}

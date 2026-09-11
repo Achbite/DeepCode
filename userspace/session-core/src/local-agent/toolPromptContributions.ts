@@ -2,6 +2,7 @@ import type {
   PluginUri,
   PreparedToolDescriptor,
   PreparedToolPromptContribution,
+  ProviderRequest,
   ProviderToolAlias,
   SelectedPluginSnapshot,
   ToolPromptContribution,
@@ -137,6 +138,7 @@ export function renderActiveToolGuidance(
   contributions: readonly PreparedToolPromptContribution[],
   aliases: readonly ProviderToolAlias[],
   effectiveTools: readonly PreparedToolDescriptor[],
+  hostedTools: ProviderRequest['hostedTools'],
 ): string | null {
   const toolsByName = new Map(effectiveTools
     .filter((tool) => tool.availability === 'callable')
@@ -167,6 +169,10 @@ export function renderActiveToolGuidance(
     for (const guideline of contribution.usageGuidelines) {
       guidelines.push(`- ${wireName}: ${guideline}`);
     }
+  }
+
+  for (const tool of hostedTools) {
+    snippets.push(`- ${tool.providerToolType}: Search by keyword; fetch reads known URLs. Cite sources and report search errors.`);
   }
 
   const sections: string[] = [];

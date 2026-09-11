@@ -1,3 +1,4 @@
+use super::file_changes::{capture_side, change_fact, delete_tree};
 use super::*;
 
 pub(super) struct FsReadExecutor;
@@ -16,73 +17,28 @@ impl KernelToolExecutor for FsReadExecutor {
         if !target.is_file() {
             return Err(KernelError::InvalidCommand(format!("{path} is not a file")));
         }
-        let read = read_text_file_for_llm(&target).map_err(|skip| {
-            KernelError::InvalidCommand(format!(
-                "unsupported_file_content: {} ({})",
-                skip.message, skip.reason
-            ))
-        })?;
-        let full_content = read.content;
-        let start_line = invocation
-            .input
-            .get("startLine")
-            .and_then(Value::as_u64)
-            .unwrap_or(1) as usize;
-        let max_lines = invocation
-            .input
-            .get("maxLines")
-            .and_then(Value::as_u64)
-            .unwrap_or(2_000) as usize;
-        let max_bytes = invocation
-            .input
-            .get("maxBytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(262_144) as usize;
-        if start_line == 0
-            || max_lines == 0
-            || max_lines > 5_000
-            || !(1_024..=1_048_576).contains(&max_bytes)
-        {
-            return Err(KernelError::InvalidCommand(
-                "fs.read requires startLine >= 1, 1 <= maxLines <= 5000, and 1024 <= maxBytes <= 1048576"
-                    .to_string(),
-            ));
-        }
-        let lines = full_content.split_inclusive('\n').collect::<Vec<_>>();
-        if !lines.is_empty() && start_line > lines.len() {
-            return Err(KernelError::InvalidCommand(format!(
-                "fs.read startLine {start_line} is beyond end of file at line {}",
-                lines.len()
-            )));
-        }
-        let start = start_line.saturating_sub(1).min(lines.len());
-        let requested_end = start.saturating_add(max_lines).min(lines.len());
-        let selected = lines[start..requested_end].concat();
-        let (content, byte_truncated) = truncate_utf8_bytes(&selected, max_bytes);
-        let returned_line_breaks = content.bytes().filter(|byte| *byte == b'\n').count();
-        let returned_lines =
-            returned_line_breaks + usize::from(!content.is_empty() && !content.ends_with('\n'));
-        let end_line = start.saturating_add(returned_lines);
-        let truncated = requested_end < lines.len() || byte_truncated;
-        let mut output = serde_json::json!({
-            "workspaceId": workspace_id(&context)?,
-            "path": normalize_relative_path(&path),
-            "content": content,
-            "sizeBytes": content.len(),
-            "fileSizeBytes": full_content.len(),
-            "startLine": start_line,
-            "endLine": end_line,
-            "maxLines": max_lines,
-            "maxBytes": max_bytes,
-            "truncated": truncated,
-            "byteTruncated": byte_truncated,
-            "contentHash": deepcode_kernel_tools::hash_bytes(full_content.as_bytes()),
-            "binary": false,
-            "fileClassification": read.classification
-        });
-        if truncated && !byte_truncated {
-            output["nextStartLine"] = serde_json::json!(requested_end + 1);
-        }
+        let mut output = deepcode_kernel_tools::text_range::read_text_range(
+            &target,
+            invocation
+                .input
+                .get("startLine")
+                .and_then(Value::as_u64)
+                .unwrap_or(1),
+            invocation.input.get("startByte").and_then(Value::as_u64),
+            invocation
+                .input
+                .get("maxLines")
+                .and_then(Value::as_u64)
+                .unwrap_or(2000) as usize,
+            invocation
+                .input
+                .get("maxBytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(262144) as usize,
+        )
+        .map_err(KernelError::InvalidCommand)?;
+        output["workspaceId"] = serde_json::json!(workspace_id(&context)?);
+        output["path"] = serde_json::json!(normalize_relative_path(&path));
         Ok(ok(invocation.id, output))
     }
 }
@@ -108,27 +64,34 @@ impl KernelToolExecutor for FsWriteExecutor {
             .map_err(|error| KernelError::Other(format!("create fs.write parent: {error}")))?;
         let content = get_string_allow_empty(&invocation.input, "content").unwrap_or_default();
         let executable = invocation.input.get("executable").and_then(Value::as_bool);
-        if existed {
+        let content_changed = !existed || !file_matches_content(&target, content.as_bytes())?;
+        let before = capture_side(&target, &context, 0, "before");
+        let attributes = if existed {
             atomic_write_text(&target, &content)?;
-            if let Some(executable) = executable {
-                set_executable_state(&target, executable)?;
-            }
+            executable.map_or(Ok(()), |value| set_executable_state(&target, value))
         } else {
             atomic_create_text(&target, &content, executable.unwrap_or(false))?;
-        }
-        let mode = file_mode(&target)?;
-        Ok(ok(
+            Ok(())
+        };
+        let after = capture_side(&target, &context, 0, "after");
+        let changes = if content_changed {
+            vec![change_fact(&context, &path, before, after)?]
+        } else {
+            Vec::new()
+        };
+        let mode = attributes.and_then(|()| file_mode(&target));
+        Ok(finish_file_mutation(
             invocation.id,
             serde_json::json!({
                 "workspaceId": workspace_id(&context)?,
                 "path": normalize_relative_path(&path),
+                "fileChanges": changes,
                 "created": !existed,
                 "saved": true,
                 "sizeBytes": content.len(),
-                "contentHash": deepcode_kernel_tools::hash_bytes(content.as_bytes()),
-                "mode": mode,
-                "executable": mode.is_some_and(|value| value & 0o111 != 0)
+                "contentHash": deepcode_kernel_tools::hash_bytes(content.as_bytes())
             }),
+            mode,
         ))
     }
 }
@@ -157,23 +120,30 @@ impl KernelToolExecutor for FsEditExecutor {
             .get("edits")
             .ok_or_else(|| KernelError::InvalidCommand("fs.edit requires edits".to_string()))?;
         let patch = apply_exact_text_edits(&original, edits)?;
+        let before = capture_side(&target, &context, 0, "before");
         atomic_write_text(&target, &patch.updated)?;
-        let mode = file_mode(&target)?;
-        Ok(ok(
+        let after = capture_side(&target, &context, 0, "after");
+        let changes = if original == patch.updated {
+            Vec::new()
+        } else {
+            vec![change_fact(&context, &path, before, after)?]
+        };
+        let mode = file_mode(&target);
+        Ok(finish_file_mutation(
             invocation.id,
             serde_json::json!({
                 "workspaceId": workspace_id(&context)?,
                 "path": normalize_relative_path(&path),
+                "fileChanges": changes,
                 "patched": true,
                 "oldContentHash": deepcode_kernel_tools::hash_bytes(original.as_bytes()),
                 "newContentHash": deepcode_kernel_tools::hash_bytes(patch.updated.as_bytes()),
                 "oldContentBytes": original.len(),
                 "newContentBytes": patch.updated.len(),
                 "changedRanges": patch.changed_ranges,
-                "editCount": edits.as_array().map_or(0, Vec::len),
-                "mode": mode,
-                "executable": mode.is_some_and(|value| value & 0o111 != 0)
+                "editCount": edits.as_array().map_or(0, Vec::len)
             }),
+            mode,
         ))
     }
 }
@@ -206,17 +176,22 @@ impl KernelToolExecutor for FsDeleteExecutor {
                     "fs.delete directory target requires targetKind=directoryTree".to_string(),
                 ));
             }
-            fs::remove_dir_all(&target)
-                .map_err(|error| KernelError::Other(format!("delete directory {path}: {error}")))?;
-            return Ok(ok(
-                invocation.id,
-                serde_json::json!({
-                    "workspaceId": workspace_id(&context)?,
-                    "path": normalize_relative_path(&path),
-                    "deleted": true,
-                    "kind": "directoryTree"
-                }),
-            ));
+            let mut changes = Vec::new();
+            let result = delete_tree(&target, &path, &context, &mut changes);
+            let output = serde_json::json!({ "workspaceId": workspace_id(&context)?, "path": normalize_relative_path(&path),
+                "deleted": result.is_ok(), "kind": "directoryTree", "fileChanges": changes });
+            return Ok(match result {
+                Ok(()) => ok(invocation.id, output),
+                Err(error) => KernelToolExecutionResult {
+                    invocation_id: invocation.id,
+                    outcome: KernelToolExecutionOutcome::Failed,
+                    output,
+                    error: Some(KernelToolExecutionFailure {
+                        code: "file_delete_failed".into(),
+                        message: error.to_string(),
+                    }),
+                },
+            });
         }
         if target_kind == "directoryTree" {
             return Err(KernelError::PermissionDenied(
@@ -224,6 +199,7 @@ impl KernelToolExecutor for FsDeleteExecutor {
                     .to_string(),
             ));
         }
+        let before = capture_side(&target, &context, 0, "before");
         fs::remove_file(&target)
             .map_err(|error| KernelError::Other(format!("delete {path}: {error}")))?;
         Ok(ok(
@@ -231,6 +207,7 @@ impl KernelToolExecutor for FsDeleteExecutor {
             serde_json::json!({
                 "workspaceId": workspace_id(&context)?,
                 "path": normalize_relative_path(&path),
+                "fileChanges": [change_fact(&context, &path, before, serde_json::json!({ "exists": false }))?],
                 "deleted": true,
                 "kind": "file"
             }),
@@ -238,15 +215,50 @@ impl KernelToolExecutor for FsDeleteExecutor {
     }
 }
 
-fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> (String, bool) {
-    if value.len() <= max_bytes {
-        return (value.to_string(), false);
+fn file_matches_content(target: &Path, content: &[u8]) -> KernelResult<bool> {
+    let mut file = fs::File::open(target).map_err(|error| KernelError::Other(error.to_string()))?;
+    if file
+        .metadata()
+        .map_err(|error| KernelError::Other(error.to_string()))?
+        .len()
+        != content.len() as u64
+    {
+        return Ok(false);
     }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
+    let mut buffer = [0_u8; 8192];
+    for part in content.chunks(buffer.len()) {
+        file.read_exact(&mut buffer[..part.len()])
+            .map_err(|error| KernelError::Other(error.to_string()))?;
+        if &buffer[..part.len()] != part {
+            return Ok(false);
+        }
     }
-    (value[..end].to_string(), true)
+    Ok(true)
+}
+
+// Once content has changed, preserve the change facts even if a later attribute
+// operation fails. The failed outcome remains distinct from the saved content.
+fn finish_file_mutation(
+    invocation_id: String,
+    mut output: Value,
+    mode: KernelResult<Option<u32>>,
+) -> KernelToolExecutionResult {
+    match mode {
+        Ok(mode) => {
+            output["mode"] = serde_json::json!(mode);
+            output["executable"] = serde_json::json!(mode.is_some_and(|value| value & 0o111 != 0));
+            ok(invocation_id, output)
+        }
+        Err(error) => KernelToolExecutionResult {
+            invocation_id,
+            outcome: KernelToolExecutionOutcome::Failed,
+            output,
+            error: Some(KernelToolExecutionFailure {
+                code: "file_attributes_failed".into(),
+                message: error.to_string(),
+            }),
+        },
+    }
 }
 
 fn set_executable_state(_target: &Path, executable: bool) -> KernelResult<()> {

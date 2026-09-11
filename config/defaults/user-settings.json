@@ -19,6 +19,7 @@
   "terminal.integrated.prewarm": "afterStartup",
   "terminal.integrated.spawnTimeoutMs": 8000,
   "agent.permissions.workspaceMutation": "plan",
+  "agent.responseLanguage": "auto",
   "agent.permissions.engineeringDecisions": "ask",
   "agent.permissions.networkRead": "allow",
   "agent.web.search.endpointTemplate": "",

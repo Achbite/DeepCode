@@ -35,7 +35,7 @@ pub(crate) fn configure_host_process_identity(address: SocketAddr) -> Result<(),
         .map_err(|_| "Host process identity is already configured")
 }
 
-fn host_process_identity() -> &'static HostProcessIdentity {
+pub(crate) fn host_process_identity() -> &'static HostProcessIdentity {
     HOST_PROCESS_IDENTITY
         .get()
         .expect("Host process identity must be configured before serving")

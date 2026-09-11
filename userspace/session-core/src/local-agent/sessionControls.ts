@@ -20,7 +20,7 @@ export interface SessionControlWireNames {
 }
 
 export function confirmedPlanExecutionInstruction(): string {
-  return 'The Plan is confirmed. Execute it now. Report step progress using the Plan progress tool, referencing a tool result recordId. Request user input only for a required decision. Publish a revised Plan only for changes to goals, targets, destructive operations or execution scope, not for routine implementation details.';
+  return 'The Plan is confirmed. Execute it now. Use the current Todo state and report progress from observed tool results.';
 }
 
 export function sessionControlInstructions(
@@ -107,12 +107,18 @@ const PLAN_OPERATION_SCHEMA: JsonObject = {
   ],
 };
 
+const PLAN_TITLE_SCHEMA: JsonObject = {
+  type: 'string', minLength: 1, maxLength: 240,
+  pattern: '^[^\\s\\u0000-\\u001f\\u007f](?:[^\\u0000-\\u001f\\u007f]*[^\\s\\u0000-\\u001f\\u007f])?$(?![\\s\\S])',
+  description: 'Single-line inline Markdown title, at most 240 characters. No leading/trailing whitespace, line breaks or control characters. Put paragraphs in summary/details.',
+};
+
 const PLAN_SCHEMA: JsonObject = {
   type: 'object',
   additionalProperties: false,
   required: ['title', 'summary', 'steps', 'mutationManifest'],
   properties: {
-    title: { type: 'string', minLength: 1, maxLength: 240 },
+    title: PLAN_TITLE_SCHEMA,
     summary: { type: 'string', minLength: 1 },
     steps: {
       type: 'array',
@@ -124,7 +130,7 @@ const PLAN_SCHEMA: JsonObject = {
         required: ['stepId', 'title', 'details'],
         properties: {
           stepId: { type: 'string', minLength: 1, maxLength: 128 },
-          title: { type: 'string', minLength: 1, maxLength: 240 },
+          title: PLAN_TITLE_SCHEMA,
           details: { type: 'string', minLength: 1 },
           verification: {
             type: 'array',
@@ -176,7 +182,7 @@ export function sessionControlToolDefinitions(): readonly ProviderToolDefinition
     },
     {
       name: SESSION_CONTROL_PLAN_PUBLISH,
-      description: 'Publish goals, affected files, steps, build environment and verification for user confirmation. mutationManifest declares file targets, explicit deletions and Bash workspace/execution scope. fs.edit and fs.write cover the same declared file. Bash command and terminal input are optional examples, not an exact script lock; prefer project build/test entrypoints. Continue routine fixes, log handling and verification adjustments within the confirmed scope. Revise only when goals, targets, destructive actions or execution scope change. Preserve successful work. Confirmation creates the Todo list; report progress with plan.progress.',
+      description: 'Publish a complete Plan for user confirmation. Titles use inline Markdown; summary, details and verification use Markdown. Format code names and paths with backticks. mutationManifest declares file targets, explicit deletions and Bash execution/workspace scope; fs.edit and fs.write cover the same declared file. Bash command is an optional example, not an exact script lock. Revise for changes to goals, file targets, destructive actions or execution scope; routine fixes within confirmed scope need no reconfirmation. Retain the current Plan when revising: retain all existing stepIds (including completed steps), add new steps and submit the full effective manifest. Unchanged steps retain Todo identity and progress; changed steps become pending. Nothing is merged or authorized automatically.',
       inputSchema: structuredClone(PLAN_SCHEMA) as JsonObject,
     },
     {
@@ -272,7 +278,7 @@ function decodeInteraction(value: Record<string, unknown>): ModelInteractionRequ
 }
 
 function decodePlan(value: Record<string, unknown>): PlanPublicationDraft {
-  assertExactKeys(value, ['title', 'summary', 'steps', 'mutationManifest']);
+  assertExactKeys(value, ['title', 'summary', 'steps', 'mutationManifest'], [], 'plan');
   if (!Array.isArray(value.steps) || value.steps.length < 1 || value.steps.length > 12) {
     throw new SessionControlError(
       'session_control_plan_steps_invalid',
@@ -286,19 +292,31 @@ function decodePlan(value: Record<string, unknown>): PlanPublicationDraft {
     );
   }
   const stepIds = new Set<string>();
+  const title = requiredDisplayText(value.title, 'title', 240);
+  const summary = requiredText(value.summary, 'summary');
+  const steps = value.steps.map((candidate, index) => decodePlanStep(candidate, stepIds, index));
+  const mutationManifest: PlanOperation[] = [];
+  const shapeErrors: string[] = [];
+  for (const [index, candidate] of value.mutationManifest.entries()) {
+    try { mutationManifest.push(decodePlanOperation(candidate, index)); }
+    catch (error) {
+      if (!(error instanceof SessionControlError) || error.code !== 'session_control_shape_invalid') throw error;
+      shapeErrors.push(error.message);
+    }
+  }
+  // Return every invalid manifest shape in the same correction result.
+  // No partially decoded plan is published.
+  if (shapeErrors.length) throw new SessionControlError('session_control_shape_invalid', shapeErrors.join('\n'));
   return {
-    title: requiredDisplayText(value.title, 'title', 240),
-    summary: requiredText(value.summary, 'summary'),
-    steps: value.steps.map((candidate) => decodePlanStep(candidate, stepIds)),
-    mutationManifest: value.mutationManifest.map(decodePlanOperation),
+    title, summary, steps, mutationManifest,
   };
 }
 
-function decodePlanStep(value: unknown, seen: Set<string>): ExecutionPlanStep {
+function decodePlanStep(value: unknown, seen: Set<string>, index: number): ExecutionPlanStep {
   if (!isRecord(value)) {
     throw new SessionControlError('session_control_plan_step_invalid', 'Plan step 必须是对象。');
   }
-  assertExactKeys(value, ['stepId', 'title', 'details', 'verification'], ['verification']);
+  assertExactKeys(value, ['stepId', 'title', 'details', 'verification'], ['verification'], `steps[${index}]`);
   const stepId = requiredIdentifier(value.stepId, 'stepId');
   if (seen.has(stepId)) {
     throw new SessionControlError(
@@ -330,7 +348,7 @@ function decodePlanStep(value: unknown, seen: Set<string>): ExecutionPlanStep {
   };
 }
 
-function decodePlanOperation(value: unknown): PlanOperation {
+function decodePlanOperation(value: unknown, index: number): PlanOperation {
   if (!isRecord(value)) {
     throw new SessionControlError(
       'session_control_plan_operation_invalid',
@@ -344,6 +362,7 @@ function decodePlanOperation(value: unknown): PlanOperation {
       value,
       ['workspaceId', 'operation', 'command', 'workspaceMode', 'executionScope', 'terminal'],
       ['command', 'terminal'],
+      `mutationManifest[${index}]`,
     );
     const command = value.command === undefined ? undefined : requiredText(value.command, 'command');
     if (
@@ -370,7 +389,7 @@ function decodePlanOperation(value: unknown): PlanOperation {
   }
   const target = normalizedTarget(value.target);
   if (operation === 'fs.delete') {
-    assertExactKeys(value, ['workspaceId', 'operation', 'target', 'targetKind']);
+    assertExactKeys(value, ['workspaceId', 'operation', 'target', 'targetKind'], [], `mutationManifest[${index}]`);
     if (value.targetKind !== 'file' && value.targetKind !== 'directoryTree') {
       throw new SessionControlError(
         'session_control_plan_target_kind_invalid',
@@ -379,7 +398,7 @@ function decodePlanOperation(value: unknown): PlanOperation {
     }
     return { workspaceId, operation, target, targetKind: value.targetKind };
   }
-  assertExactKeys(value, ['workspaceId', 'operation', 'target']);
+  assertExactKeys(value, ['workspaceId', 'operation', 'target'], [], `mutationManifest[${index}]`);
   if (!['fs.write', 'fs.edit'].includes(String(operation))) {
     throw new SessionControlError(
       'session_control_plan_operation_unknown',
@@ -495,7 +514,7 @@ function requiredDisplayText(value: unknown, field: string, maxLength: number): 
   ) {
     throw new SessionControlError(
       'session_control_display_text_invalid',
-      `Session control 字段 ${field} 必须是最多 ${maxLength} 个可显示字符。`,
+      `Session control 字段 ${field} 必须是单行标题，最多 ${maxLength} 个字符，首尾不能有空白，不能包含换行或控制字符。段落请写入 summary/details。`,
     );
   }
   return text;
@@ -505,16 +524,21 @@ function assertExactKeys(
   value: Record<string, unknown>,
   allowed: readonly string[],
   optional: readonly string[] = [],
+  location = 'call',
 ): void {
   const allowedSet = new Set(allowed);
   const optionalSet = new Set(optional);
-  if (
-    Object.keys(value).some((key) => !allowedSet.has(key))
-    || allowed.some((key) => !optionalSet.has(key) && value[key] === undefined)
-  ) {
+  const unexpected = Object.keys(value).filter((key) => !allowedSet.has(key));
+  const missing = allowed.filter((key) => !optionalSet.has(key) && value[key] === undefined);
+  if (unexpected.length || missing.length) {
+    const wireField = (key: string) => key === 'workspaceId' ? 'workspace' : key;
+    const details = [
+      ...(unexpected.length ? [`不支持字段 ${unexpected.map(wireField).join(', ')}`] : []),
+      ...(missing.length ? [`缺少字段 ${missing.map(wireField).join(', ')}`] : []),
+    ].join('；');
     throw new SessionControlError(
       'session_control_shape_invalid',
-      'Session control call 字段与当前闭合 schema 不一致。',
+      `Session control ${location} 字段与当前 schema 不一致：${details}。允许字段：${allowed.map(wireField).join(', ')}。`,
     );
   }
 }

@@ -2,7 +2,7 @@
 
 [package]
 name = "deepcode-tauri-shell"
-version = "0.5.50"
+version = "0.5.51"
 edition = "2021"
 license = "MIT"
 rust-version = "1.86"
@@ -16,6 +16,7 @@ tauri-build = { version = "2.5", features = [] }
 
 [dependencies]
 deepcode-kernel-abi = { path = "../../../crates/deepcode-kernel-abi" }
+deepcode-host-connection = { path = "../../../crates/deepcode-host-connection" }
 getrandom = "0.3"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

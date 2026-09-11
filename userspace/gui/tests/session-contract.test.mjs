@@ -6,6 +6,7 @@ import {
   inputCacheMetric,
   lastCallInputCacheMetric,
   loadGuiModelStore,
+  loadGuiModule,
   installGuiFetch,
 } from './gui-projection-contract.mjs';
 import {
@@ -299,7 +300,7 @@ test('snapshot-scoped wire tool resolves to exact Kernel bindings, durable ToolR
         .flatMap((entry) => entry.toolCalls ?? [])
         .find((call) => call.name === wireToolName);
       assert.ok(assistantToolCall, 'continuation must include the previous tool call');
-      assert.deepEqual(assistantToolCall.input, { workspace: 'primary', path: 'README.md' });
+      assert.equal(assistantToolCall.input, '{"workspace":"primary","path":"README.md"}');
       assert.notEqual(assistantToolCall.callId, 'provider-call:read');
       assert.equal(assistantToolCall.providerCallId, 'provider-call:read');
       assert.ok(request.messages.some((entry) => (
@@ -566,7 +567,7 @@ test('completed malformed arguments are durable unexecuted results; valid peers 
   await reopened.dispose();
 });
 
-test('control input can be corrected into a confirmed Plan; a second rejection fails after actor reopen', async () => {
+test('Plan input rejections survive actor reopen and do not suppress the final explanation', async () => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:correction-budget';
   await createSession(journal, sessionId, [workspaceBinding]);
@@ -574,7 +575,13 @@ test('control input can be corrected into a confirmed Plan; a second rejection f
   let turns = 0;
   const provider = { async *stream(request) {
     turns += 1;
-    assert.ok(turns <= 3, 'a second rejected turn must not trigger another correction');
+    assert.ok(turns <= 4, 'the final explanation must end this continuation');
+    if (turns === 4) {
+      assert.ok(request.messages.some((message) => jsonMessagePayload(message)?.error?.code === 'provider_tool_call_arguments_invalid'));
+      yield providerEvent(request.requestId, 'output.item.completed', { outputIndex: 0, item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Verification remains unfinished. The rejected call was not executed.' }] } });
+      yield providerEvent(request.requestId, 'completed', {});
+      return;
+    }
     const name = request.tools.find((tool) => tool.inputSchema.properties?.mutationManifest).name;
     if (turns === 2) {
       const result = request.messages.find((message) => message.role === 'tool' && jsonMessagePayload(message)?.accepted === false);
@@ -602,9 +609,10 @@ test('control input can be corrected into a confirmed Plan; a second rejection f
   await reopened.submit({ schemaVersion: 'deepcode.command.v3', type: 'plan.respond', commandId: 'command:budget-confirm', sessionId,
     runId: waiting.run.runId, planId: waiting.pendingPlan.planId, revision: waiting.pendingPlan.revision, response: { kind: 'confirm' } });
   const failed = await waitForProjection(reopened, (value) => value.run?.status === 'failed');
-  assert.equal(failed.terminalError.code, 'tool_input_correction_exhausted');
-  assert.match(failed.terminalError.message, /provider_tool_call_arguments_invalid/);
-  assert.equal(turns, 3);
+  assert.equal(failed.terminalError.code, 'plan_incomplete');
+  assert.equal(failed.todoList.items[0].status, 'pending');
+  assert.ok(failed.messages.some((message) => message.role === 'assistant' && message.content === 'Verification remains unfinished. The rejected call was not executed.'));
+  assert.equal(turns, 4);
   const events = await readEvents(journal, sessionId);
   assert.equal(events.filter((event) => event.type === 'plan.confirmed').length, 1);
   assert.equal(events.some((event) => event.type === 'tool.requested'), false);
@@ -755,4 +763,509 @@ test('starting a draft during initialization preserves navigation and still load
   assert.deepEqual(state.profiles, [profile]);
   assert.equal(state.defaultProfileId, profile.id);
   assert.equal(state.selectedProfileId, profile.id);
+});
+
+
+test('independent views own navigation, errors and pending commands separately', async (t) => {
+  const { createLocalAgentStore } = await loadGuiModule(t, '/src/state/localAgentStore.ts');
+  const first = createLocalAgentStore('view:one');
+  const second = createLocalAgentStore('view:two');
+  first.setState({ sessionId: 'session:one', error: 'old failure', submitting: true });
+  second.setState({ sessionId: 'session:two', error: null, submitting: false });
+  first.getState().startNewSession();
+  assert.equal(first.getState().sessionId, null);
+  assert.equal(first.getState().submitting, false);
+  assert.equal(second.getState().sessionId, 'session:two');
+  assert.equal(second.getState().error, null);
+  second.setState({ submitting: true });
+  assert.equal(first.getState().submitting, false);
+});
+
+test('large GUI input uploads the complete text and submits only the resulting resource reference', async (t) => {
+  const api = await loadGuiModule(t, '/src/services/localAgentApi.ts');
+  const content = '  完整输入🙂\n'.repeat(10000);
+  const reference = { referenceId: 'input:one', workspaceId: 'workspace:input', logicalPath: 'user-input.txt', displayName: 'user-input.txt', kind: 'file', mediaType: 'text/plain', byteLength: Buffer.byteLength(content) };
+  const seen = [];
+  installGuiFetch(t, (url, init) => {
+    seen.push(url.pathname);
+    if (url.pathname.includes('/input-resources/')) {
+      assert.equal(init.body, content);
+      return Response.json({ ok: true, data: { text: 'Read the original user input.', reference } });
+    }
+    const command = JSON.parse(init.body);
+    assert.equal(command.text, 'Read the original user input.');
+    assert.deepEqual(command.filesystemReferences, [reference]);
+    assert.ok(Buffer.byteLength(init.body) < 2000);
+    return Response.json({ ok: true, data: { schemaVersion: 'deepcode.command-reply.v3', commandId: command.commandId, sessionId: command.sessionId, status: 'accepted', revision: 1 } });
+  });
+  await api.submitLocalAgentCommand({ schemaVersion: 'deepcode.command.v3', type: 'message.submit', commandId: 'command:upload', sessionId: 'session:upload', text: content });
+  assert.equal(seen.length, 2);
+});
+
+test('tool rows accumulate across adjacent requests without crossing message or run boundaries', async (t) => {
+  const { projectionItems } = await loadGuiModule(t, '/src/components/local-agent/conversationItems.ts');
+  const activities = [1, 2, 3, 4].map((id) => ({ activityId: `a${id}`, runId: id === 4 ? 'run:two' : 'run:one' }));
+  const group = (id) => ({ kind: 'toolGroup', timelineId: `group:${id}`, sequence: id, activityIds: [`a${id}`] });
+  const projection = { activities, messages: [{ messageId: 'message:boundary', runId: 'run:one', role: 'user' }], timeline: [group(1), group(2), { kind: 'message', sequence: 3, messageId: 'message:boundary' }, group(3), group(4)] };
+  const items = projectionItems(projection);
+  assert.deepEqual(items.map((item) => item.type), ['toolGroup', 'message', 'toolGroup', 'toolGroup']);
+  assert.equal(items[0].groupId, 'group:1');
+  assert.deepEqual(items[0].values.map((activity) => activity.activityId), ['a1', 'a2']);
+  assert.equal(projection.timeline.length, 5, 'presentation grouping leaves the canonical timeline intact');
+});
+
+test('plan preview occupies its native output position and has no confirmation identity', async (t) => {
+  const { assistantDraftItems } = await loadGuiModule(t, '/src/components/local-agent/conversationItems.ts');
+  const preview = { callIndex: 1, providerCallId: 'call:plan', outputIndex: 1, title: 'Plan', summary: '', steps: ['Inspect'], truncated: false };
+  const draft = { runId: 'run:one', turnId: 'request:one', planPreview: preview, blocks: [
+    { kind: 'narrative', streamId: 'stream:before', outputIndex: 0, content: 'Before' },
+    { kind: 'message', streamId: 'stream:after', outputIndex: 2, content: 'After' },
+  ] };
+  const items = assistantDraftItems(draft);
+  assert.deepEqual(items.map((item) => item.type), ['text', 'planPreview', 'text']);
+  assert.deepEqual(items[1].value, preview);
+  assert.equal(items[1].value.planId, undefined);
+  assert.equal(items[1].value.revision, undefined);
+});
+
+test('Plan documents and previews render Markdown entities, code names and verification consistently', async (t) => {
+  const previousSelf = globalThis.self;
+  globalThis.self = {};
+  t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { default: PlanCard, PlanCardContent } = await loadGuiModule(t, '/src/components/local-agent/PlanCard.tsx');
+  const { PlanPreviewCard, PlanPreviewContent } = await loadGuiModule(t, '/src/components/local-agent/PlanPreviewCard.tsx');
+  const { MarkdownInline } = await loadGuiModule(t, '/src/components/local-agent/BufferedMarkdown.tsx');
+  const { ComposerDecisionPanels } = await loadGuiModule(t, '/src/components/local-agent/ComposerDecisionPanels.tsx');
+  const { InteractionReplyQuote } = await loadGuiModule(t, '/src/components/local-agent/ConversationTranscript.tsx');
+  const plan = {
+    planId: 'plan:document', revision: 1, runId: 'run:document', callId: 'call:document', status: 'published',
+    title: '对象池 ObjectPool&lt;T,N&gt; 升级', summary: '保留 **互斥访问** 与 `C++17`。',
+    steps: [{ stepId: 'write', title: '实现 `ObjectPool<T,N>`', details: '修改 `src/pool.hpp`。\n\n- 构造对象\n- 归还对象', verification: ['编译 **通过**；`exit 0`。'] }],
+    mutationManifest: [{ workspaceId: 'workspace:private-id', operation: 'bash', workspaceMode: 'write', executionScope: 'workspace' }],
+  };
+  const published = renderToStaticMarkup(createElement(PlanCard, { plan, active: false, language: 'zh-CN' }));
+  assert.ok(published.includes('aria-expanded="false"'), 'published plans wait for the reader to expand');
+  assert.equal(published.includes('conversation-plan-document-body'), false, 'collapsed plans do not mount their long document');
+  assert.ok(published.includes('ObjectPool&lt;T,N&gt;'));
+  const html = renderToStaticMarkup(createElement(PlanCardContent, { plan, language: 'zh-CN' }));
+  assert.ok(html.includes('ObjectPool&lt;T,N&gt;'));
+  assert.equal(html.includes('&amp;lt;'), false, 'entities must be interpreted once by the Markdown parser');
+  assert.match(html, /<code>ObjectPool&lt;T,N&gt;<\/code>/);
+  assert.match(html, /<strong>通过<\/strong>/);
+  assert.match(html, /<code>exit 0<\/code>/);
+  assert.equal(html.includes('undefined'), false, 'optional command examples must not leak undefined');
+  assert.equal(html.includes('workspace:private-id'), false, 'single-workspace review does not need internal IDs');
+  assert.ok(html.includes('允许修改'));
+  const previewProps = { language: 'zh-CN', preview: {
+    callIndex: 0, providerCallId: 'call:preview', title: plan.title, summary: plan.summary, steps: plan.steps.map((step) => step.title), truncated: false,
+  } };
+  const previewCard = renderToStaticMarkup(createElement(PlanPreviewCard, previewProps));
+  assert.ok(previewCard.includes('aria-expanded="false"'));
+  assert.equal(previewCard.includes('conversation-plan-document-body'), false);
+  assert.equal(previewCard.includes('确认执行'), false);
+  const preview = renderToStaticMarkup(createElement(PlanPreviewContent, previewProps));
+  for (const rendered of [html, preview]) {
+    assert.ok(rendered.includes('conversation-plan-document-body'));
+    assert.ok(rendered.includes('conversation-plan-document-content'));
+    assert.match(rendered, /<code>ObjectPool&lt;T,N&gt;<\/code>/);
+  }
+  assert.equal(preview.includes('确认执行'), false, 'a display-only preview cannot authorize execution');
+  const inline = renderToStaticMarkup(createElement(MarkdownInline, { children: '**对象池** [文档](https://example.com) `T<N>`' }));
+  assert.match(inline, /<strong>对象池<\/strong>/);
+  assert.equal(inline.includes('<a '), false, 'summary buttons cannot contain nested interactive links');
+  const collapsed = renderToStaticMarkup(createElement(PlanCard, { plan: { ...plan, status: 'confirmed' }, active: true, language: 'zh-CN' }));
+  assert.equal(collapsed.includes('&amp;lt;'), false);
+  assert.ok(collapsed.includes('aria-expanded="false"'));
+  const prompt = '保留 **容器环境** 吗？\n\n- 保留 `Dockerfile`\n- 删除演示产物';
+  const question = renderToStaticMarkup(createElement(ComposerDecisionPanels, { language: 'zh-CN', composer: {
+    pendingInteraction: { prompt, allowFreeform: true, options: [{ id: 'keep', label: '**保留**环境', description: '保留 `Makefile`。' }] },
+    textareaRef: { current: null }, draft: '',
+  } }));
+  assert.match(question, /<strong>容器环境<\/strong>/);
+  assert.match(question, /<code>Dockerfile<\/code>/);
+  assert.match(question, /<code>Makefile<\/code>/);
+  assert.ok(question.includes('local-agent__interaction-document-scroll'));
+  const reply = renderToStaticMarkup(createElement(InteractionReplyQuote, { prompt }));
+  assert.match(reply, /<details class="conversation-answered-question">/);
+  assert.match(reply, /<code>Dockerfile<\/code>/, 'the full question remains available after answering');
+});
+
+test('reasoning details are a default-off shell preference in the real Settings catalog', async (t) => {
+  const { SETTING_DEFINITIONS } = await loadGuiModule(t, '/src/state/settingsStore.ts');
+  const definition = SETTING_DEFINITIONS.find((definition) => definition.key === 'gui.showReasoning');
+  assert.ok(definition);
+  const { DEFAULT_USER_SETTINGS } = await import('../../protocol/dist/index.js');
+  assert.equal(DEFAULT_USER_SETTINGS['gui.showReasoning'], false);
+  assert.equal(definition.control, 'boolean');
+  assert.equal(definition.group, 'gui');
+});
+
+test('response language uses the shared Settings catalog and a compact labelled control', async (t) => {
+  const { SETTING_DEFINITIONS, agentSettingDefinitions } = await loadGuiModule(t, '/src/state/settingsStore.ts');
+  const { DEFAULT_USER_SETTINGS, shellPreferenceSettingsIndex } = await import('../../protocol/dist/index.js');
+  const definition = SETTING_DEFINITIONS.find((item) => item.key === 'agent.responseLanguage');
+  const registered = agentSettingDefinitions().find((item) => item.key === definition.key);
+  assert.ok(registered);
+  const { catalog, ...registeredDefinition } = registered;
+  assert.equal(catalog.domain, 'agent');
+  assert.deepEqual(registeredDefinition, definition);
+  assert.equal(DEFAULT_USER_SETTINGS[definition.key], 'auto');
+  assert.equal(shellPreferenceSettingsIndex('gui').some((item) => item.key === definition.key), false);
+  assert.deepEqual(definition.options.map((option) => option.value), ['auto', 'zh-CN', 'en-US']);
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { default: SettingsField } = await loadGuiModule(t, '/src/components/settings-center/SettingsField.tsx');
+  const html = renderToStaticMarkup(createElement(SettingsField, {
+    definition, value: 'zh-CN', source: 'user', language: 'en-US', compact: true, onChange() {},
+  }));
+  assert.match(html, /<select[^>]+aria-label="Response language"/);
+  assert.match(html, /<option value="zh-CN" selected="">简体中文<\/option>/);
+  assert.equal(html.includes('agent.responseLanguage'), false, 'the user control does not expose the internal setting key');
+  assert.equal(html.includes('settings-field__default'), false);
+});
+
+test('GUI refresh accepts plan preview changes without a new journal revision or activity timestamp', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:gui-plan-preview';
+  await createSession(journal, sessionId);
+  const provider = { async *stream(_request, signal) {
+    if (!signal.aborted) await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+  } };
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), fakeRunPreparation().port, 'gui-plan-preview');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:gui-preview', 'Plan the work.'));
+  const base = structuredClone(await waitForProjection(actor, (value) => Boolean(value.assistantDraft)));
+  base.assistantDraft.activity.phase = 'generatingOutput';
+  let incoming = structuredClone(base);
+  installGuiFetch(t, async (url) => {
+    if (url.pathname === '/api/conversation/statuses') return Response.json({ ok: true, data: [] });
+    assert.equal(url.pathname, `/api/conversation/sessions/${encodeURIComponent(sessionId)}/projection`);
+    return Response.json({ ok: true, data: incoming });
+  });
+  const store = await loadGuiModelStore(t);
+  store.setState({ sessionId, projection: base });
+  incoming.assistantDraft.planPreview = { callIndex: 0, providerCallId: 'call:plan-preview', title: 'Inspect source', summary: '', steps: [], truncated: false };
+  await store.getState().refresh();
+  assert.equal(store.getState().error, null);
+  assert.equal(store.getState().projection.assistantDraft.planPreview.title, 'Inspect source');
+  incoming.assistantDraft.planPreview.steps.push('Read the current implementation');
+  await store.getState().refresh();
+  assert.deepEqual(store.getState().projection.assistantDraft.planPreview.steps, ['Read the current implementation']);
+  assert.equal(store.getState().projection.pendingPlan, null);
+  assert.equal(store.getState().projection.revision, base.revision);
+  delete incoming.assistantDraft.planPreview;
+  await store.getState().refresh();
+  assert.equal(store.getState().projection.assistantDraft.planPreview, undefined);
+});
+
+test('streaming Markdown retains stable blocks and reconciles GFM and references on completion', async (t) => {
+  const { StreamingMarkdownParser } = await loadGuiModule(t, '/src/components/local-agent/streamingMarkdown.ts');
+  const parser = new StreamingMarkdownParser();
+  const prefix = '# Result\n\nFirst paragraph.\n\nSecond paragraph.\n\n';
+  const first = parser.update(prefix + 'Last', true);
+  const next = parser.update(prefix + 'Last paragraph.\n\n```cpp\nint value', true);
+  assert.equal(next[0], first[0], 'already displayed heading must retain its render block');
+  const text = prefix + 'Last paragraph.\n\n```cpp\nint value = 1;\n```\n\n[Guide][guide]\n\n[guide]: https://example.com\n';
+  const complete = parser.update(text, false);
+  assert.equal(complete[0].key, first[0].key, 'completion must retain source keys');
+  assert.deepEqual(complete, new StreamingMarkdownParser().update(text, false));
+  assert.match(JSON.stringify(complete), /https:\/\/example.com/);
+  const replacement = parser.update('Replacement\n\n| A | B |\n| - | - |\n| 1 | 2 |', true);
+  assert.doesNotMatch(JSON.stringify(replacement), /First paragraph/);
+  assert.match(JSON.stringify(replacement), /"tagName":"table"/);
+});
+
+test('Markdown table reading preserves streaming cells, source links and GFM alignment', async (t) => {
+  const previousSelf = globalThis.self;
+  globalThis.self = {};
+  t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
+  const { StreamingMarkdownParser } = await loadGuiModule(t, '/src/components/local-agent/streamingMarkdown.ts');
+  const { MarkdownContent } = await loadGuiModule(t, '/src/components/local-agent/BufferedMarkdown.tsx');
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const prefix = '# 参考实现\n\n第一段说明。\n\n第二段说明。\n\n';
+  const header = '| 项目 | 许可 | 机制 | 对齐 |\n| :--- | --- | --- | ---: |\n';
+  const row = '| [ObjectPool](https://example.com/pool) | BSD | `create/validate/destroy`，**原始语义** | 12 |\n';
+  const end = '| Recycler | Apache-2.0 | `Recycler<T,Size,Align>` | 23 |\n\n公式 $i$ 与 [完整来源](https://example.com/reference)。';
+  const parser = new StreamingMarkdownParser();
+  const start = parser.update(prefix + header, true);
+  const partial = parser.update(prefix + header + row.slice(0, row.indexOf('destroy') + 3), true);
+  const streamed = parser.update(prefix + header + row + end, true);
+  assert.equal(partial[0], start[0], 'table growth must retain the frozen heading');
+  assert.equal(streamed[0], start[0], 'later prose must retain the frozen heading');
+  const tableKey = (blocks) => blocks.find((block) => block.tree.children.some((node) => node.type === 'element' && node.tagName === 'table')).key;
+  assert.equal(tableKey(start), tableKey(partial));
+  assert.equal(tableKey(start), tableKey(streamed));
+  const text = prefix + header + row + end;
+  const final = parser.update(text, false);
+  assert.equal(tableKey(final), tableKey(start));
+  assert.deepEqual(final, new StreamingMarkdownParser().update(text, false));
+  const settled = renderToStaticMarkup(createElement(MarkdownContent, { children: text }));
+  const received = renderToStaticMarkup(createElement(MarkdownContent, { children: text, streaming: true }));
+  const tableHtml = (html) => html.match(/<table>[\s\S]*?<\/table>/)[0];
+  assert.equal(tableHtml(received), tableHtml(settled), 'a complete streamed table and its settled view contain identical cells');
+  assert.equal((settled.match(/<table>/g) ?? []).length, 1, 'a closed expanded view must not duplicate the table');
+  assert.equal((settled.match(/<tr>/g) ?? []).length, 3);
+  assert.equal((settled.match(/<td[ >]/g) ?? []).length, 8);
+  assert.match(settled, /style="text-align:right"/);
+  assert.match(settled, /href="https:\/\/example.com\/pool"/);
+  assert.match(settled, /<code>create\/<wbr\/>validate\/<wbr\/>destroy<\/code>/);
+  assert.match(settled.replaceAll('<wbr/>', ''), /<code>create\/validate\/destroy<\/code>/);
+  assert.match(settled, /<code>Recycler&lt;T,Size,Align&gt;<\/code>/);
+  assert.match(settled, /<strong>原始语义<\/strong>/);
+  assert.match(settled, /class="katex"/);
+  assert.match(settled, /class="conversation-table-scroll"[^>]*tabindex="0"/);
+});
+
+test('draft and committed provider text occupy the same round and row identity', async (t) => {
+  const { conversationRounds } = await loadGuiModule(t, '/src/components/local-agent/conversationItems.ts');
+  const user = { type: 'message', sequence: 1, value: { messageId: 'user:1', role: 'user', content: 'Continue' } };
+  const draft = { type: 'text', block: { streamId: 'stream:answer', kind: 'message', content: 'Answer', outputIndex: 0 } };
+  const before = conversationRounds([user], [draft], 'run:1');
+  const answer = { type: 'message', sequence: 5, streamId: 'stream:answer', value: { messageId: 'answer:1', role: 'assistant', runId: 'run:1', content: 'Answer' } };
+  const after = conversationRounds([user, answer], [draft], 'run:1');
+  assert.equal(after.at(-1).key, before.at(-1).key);
+  assert.equal(after.at(-1).rows[0].key, before.at(-1).rows[0].key);
+  assert.equal(after.at(-1).rows.length, 1, 'commit and residual draft must not duplicate text');
+});
+
+test('streamed text advances between snapshots and catches up without a character-rate backlog', async (t) => {
+  const { StreamingTextBuffer } = await loadGuiModule(t, '/src/components/local-agent/streamingText.ts');
+  const buffer = new StreamingTextBuffer();
+  let source = 'A received paragraph. '.repeat(80);
+  buffer.update(source, 0);
+  let previous = '';
+  for (const time of [16, 32, 48, 64, 80, 96]) {
+    if (time === 64) { source += 'More received text. '.repeat(40); buffer.update(source, time); }
+    const shown = buffer.advance(time);
+    assert.ok(shown.startsWith(previous) && shown.length > previous.length);
+    assert.ok(source.startsWith(shown) && shown.length < source.length);
+    previous = shown;
+  }
+  assert.equal(buffer.advance(120), source, 'new arrivals must not extend the pending display deadline');
+  assert.equal(buffer.complete, true);
+  buffer.update(source + ' Next chunk.', 200);
+  assert.equal(buffer.advance(320), source + ' Next chunk.');
+  buffer.update('Authoritative replacement.', 330);
+  assert.equal(buffer.text, 'Authoritative replacement.');
+  assert.equal(buffer.advance(400), 'Authoritative replacement.', 'replacement must discard the previous tail');
+});
+
+test('streamed text keeps Unicode pairs intact and settled history displays immediately', async (t) => {
+  const { StreamingTextBuffer } = await loadGuiModule(t, '/src/components/local-agent/streamingText.ts');
+  const text = '中文🙂🚀，代码与公式。';
+  const buffer = new StreamingTextBuffer();
+  buffer.update(text, 0);
+  for (let time = 1; time <= 120; time += 1) {
+    const shown = buffer.advance(time);
+    assert.equal(shown, [...shown].filter((character) => !/^[\uD800-\uDFFF]$/u.test(character)).join(''));
+    assert.ok(text.startsWith(shown));
+  }
+  assert.equal(buffer.text, text);
+  const history = new StreamingTextBuffer(text);
+  assert.equal(history.text, text);
+  assert.equal(history.complete, true);
+});
+
+test('projection polling stays serial through visibility changes and stops after unmount', async (t) => {
+  const { startProjectionPolling } = await loadGuiModule(t, '/src/components/local-agent/useProjectionPolling.ts');
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const timers = new Map();
+  const listeners = new Set();
+  let nextId = 0;
+  globalThis.window = { setTimeout(callback, delay) { const id = ++nextId; timers.set(id, { callback, delay }); return id; }, clearTimeout(id) { timers.delete(id); } };
+  globalThis.document = { visibilityState: 'visible', addEventListener(_event, callback) { listeners.add(callback); }, removeEventListener(_event, callback) { listeners.delete(callback); } };
+  let stop = () => {};
+  let stopIdle = () => {};
+  t.after(() => { stop(); stopIdle(); globalThis.window = previousWindow; globalThis.document = previousDocument; });
+  const fire = () => { assert.equal(timers.size, 1); const [id, timer] = timers.entries().next().value; timers.delete(id); timer.callback(); };
+  const visibility = (state) => { document.visibilityState = state; for (const listener of listeners) listener(); };
+  let calls = 0;
+  let release;
+  stop = startProjectionPolling(true, () => { calls += 1; return new Promise((resolve) => { release = resolve; }); });
+  assert.equal(timers.values().next().value.delay, 120);
+  fire();
+  visibility('hidden'); visibility('visible');
+  assert.equal(calls, 1);
+  assert.equal(timers.size, 0, 'a slow refresh must not accumulate polling timers');
+  release(); await Promise.resolve();
+  assert.equal(timers.size, 1);
+  visibility('hidden');
+  assert.equal(timers.values().next().value.delay, 10_000);
+  visibility('visible');
+  assert.equal(calls, 2);
+  stop(); release(); await Promise.resolve();
+  assert.equal(timers.size, 0);
+  assert.equal(listeners.size, 0);
+  stopIdle = startProjectionPolling(false, async () => {});
+  assert.equal(timers.values().next().value.delay, 4_000);
+  stopIdle();
+});
+
+test('unchanged status snapshots do not publish redundant GUI state updates', async (t) => {
+  installGuiFetch(t, async (url) => {
+    assert.equal(url.pathname, '/api/conversation/statuses');
+    return Response.json({ ok: true, data: [] });
+  });
+  const store = await loadGuiModelStore(t);
+  let publications = 0;
+  const unsubscribe = store.subscribe(() => { publications += 1; });
+  t.after(unsubscribe);
+  await store.getState().refresh();
+  await store.getState().refresh();
+  assert.equal(publications, 0);
+  store.setState({ error: 'Status request failed', errorSource: 'statuses' });
+  await store.getState().refresh();
+  assert.equal(store.getState().error, null, 'a successful refresh must still clear its previous error');
+  assert.equal(publications, 2);
+});
+
+test('round change totals use first before and final after, without summing repeated edits', async (t) => {
+  const { changedFiles, readRoundChange } = await loadGuiModule(t, '/src/components/local-agent/fileChangeSummary.ts');
+  const { calculateChangedLines: countChangedLines } = await loadGuiModule(t, '/src/components/local-agent/fileChangeLineCounts.ts');
+  const change = { workspaceId: 'workspace:1', path: 'src/pool.cpp', kind: 'modify', before: { exists: true }, after: { exists: true } };
+  const activity = (recordId) => ({ tool: { recordId, fileChanges: [change] } });
+  const files = changedFiles([activity('edit:1'), activity('edit:2'), activity('edit:2')]);
+  assert.equal(files.length, 1);
+  assert.equal(files[0].changes.length, 2);
+  const read = async (_session, recordId) => ({ workspaceId: change.workspaceId, path: change.path,
+    before: recordId === 'edit:1' ? 'original\n' : 'temporary\n',
+    after: recordId === 'edit:1' ? 'temporary\n' : 'original\nadded\n',
+  });
+  const round = await readRoundChange(read, 'session:1', files[0], new AbortController().signal);
+  assert.deepEqual(await countChangedLines(round.before, round.after), { added: 1, removed: 0 });
+  assert.deepEqual(await countChangedLines(null, 'new\nfile\n'), { added: 2, removed: 0 });
+  assert.deepEqual(await countChangedLines('removed\n', null), { added: 0, removed: 1 });
+});
+
+test('binary changes do not interrupt text totals and immutable line statistics are cached per revision', async (t) => {
+  const { readFileChange } = await loadGuiModule(t, '/src/services/localAgentApi.ts');
+  const { changedFiles, readChangeStatistics } = await loadGuiModule(t, '/src/components/local-agent/fileChangeSummary.ts');
+  const { calculateChangedLines } = await loadGuiModule(t, '/src/components/local-agent/fileChangeLineCounts.ts');
+  const calls = [];
+  let unavailable = true;
+  installGuiFetch(t, (_url, init) => {
+    const { recordId } = JSON.parse(init.body);
+    calls.push(recordId);
+    if (recordId === 'binary') return Response.json({ ok: false, error: 'file_change_binary_content', message: 'bin/demo 是二进制文件。' });
+    if (recordId === 'missing' && unavailable) return Response.json({ ok: false, error: 'file_change_content_unavailable', message: 'snapshot missing' });
+    return Response.json({ ok: true, data: { workspaceId: 'workspace:1', path: `${recordId}.txt`, before: null, after: 'one\ntwo\n' } });
+  });
+  const files = changedFiles(['first', 'binary', 'last', 'missing'].map((recordId) => ({ tool: { recordId, fileChanges: [{ workspaceId: 'workspace:1', path: `${recordId}.txt`, kind: 'create', before: { exists: false }, after: { exists: true } }] } })));
+  const count = async (before, after) => calculateChangedLines(before, after);
+  const signal = new AbortController().signal;
+  const values = [];
+  for (const file of files.slice(0, 3)) values.push(await readChangeStatistics(readFileChange, 'session:counts', file, signal, count));
+  assert.deepEqual(values, [{ kind: 'text', counts: { added: 2, removed: 0 } }, { kind: 'binary' }, { kind: 'text', counts: { added: 2, removed: 0 } }]);
+  for (const file of files.slice(0, 3)) await readChangeStatistics(readFileChange, 'session:counts', file, signal, count);
+  assert.deepEqual(calls, ['first', 'binary', 'last'], 'switching cards reuses classifications without reading or diffing again');
+  await assert.rejects(readChangeStatistics(readFileChange, 'session:counts', files[3], signal, count), /snapshot missing/);
+  unavailable = false;
+  assert.equal((await readChangeStatistics(readFileChange, 'session:counts', files[3], signal, count)).kind, 'text', 'failed reads are not cached as success');
+  await readChangeStatistics(readFileChange, 'session:other', files[0], signal, count);
+  assert.equal(calls.at(-1), 'first', 'separate sessions do not share results');
+});
+
+test('line statistics compute full-file creation, deletion and replacement without per-edit timers', async (t) => {
+  const { calculateChangedLines } = await loadGuiModule(t, '/src/components/local-agent/fileChangeLineCounts.ts');
+  const source = Array.from({ length: 1200 }, (_, index) => `line ${index}\n`).join('');
+  const replacement = Array.from({ length: 400 }, (_, index) => `replacement ${index}\n`).join('');
+  assert.deepEqual(calculateChangedLines(null, source), { added: 1200, removed: 0 });
+  assert.deepEqual(calculateChangedLines(source, null), { added: 0, removed: 1200 });
+  assert.deepEqual(calculateChangedLines(source, source), { added: 0, removed: 0 });
+  assert.deepEqual(calculateChangedLines(source, replacement), { added: 400, removed: 1200 });
+  assert.deepEqual(calculateChangedLines(null, ''), { added: 0, removed: 0 });
+  assert.deepEqual(calculateChangedLines(null, 'first\r\nsecond'), { added: 2, removed: 0 });
+  assert.deepEqual(calculateChangedLines('first\r\nsecond\r\n', null), { added: 0, removed: 2 });
+  assert.deepEqual(calculateChangedLines('unchanged', 'unchanged\n'), { added: 1, removed: 1 });
+});
+
+
+test('disabled model bindings survive catalog refresh and cannot submit a new run', async (t) => {
+  const profiles = [
+    { id: 'profile:bound', name: 'Bound model', enabled: false, thinking: 'enabled' },
+    { id: 'profile:available', name: 'Available model', enabled: true, thinking: 'enabled' },
+  ];
+  installGuiFetch(t, async (url) => {
+    assert.equal(url.pathname, '/api/llm/profiles');
+    return Response.json({ ok: true, data: { profiles, defaultProfileId: profiles[0].id } });
+  });
+  const store = await loadGuiModelStore(t);
+  store.setState({ sessionId: 'session:bound', selectedProfileId: profiles[0].id });
+  await store.getState().refreshProfiles();
+  assert.equal(store.getState().selectedProfileId, profiles[0].id);
+  assert.equal(store.getState().defaultProfileId, profiles[0].id);
+  assert.deepEqual(store.getState().profiles, profiles);
+  await assert.rejects(store.getState().sendMessage('Continue.'), /llm_profile_unavailable/);
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { default: Selector } = await loadGuiModule(t, '/src/components/local-agent/SessionModelSelector.tsx');
+  const html = renderToStaticMarkup(createElement(Selector, {
+    language: 'zh-CN', profiles, selectedProfileId: profiles[0].id,
+    contextUsage: null, contextCompositions: [], reasoningEffortOverride: null,
+  }));
+  assert.match(html, /Bound model · 已停用/);
+  store.getState().startNewSession();
+  assert.equal(store.getState().selectedProfileId, profiles[0].id, 'an invalid configured default remains visible');
+});
+
+test('polling and command reconciliation read draft snapshots in order at the same revision', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:ordered-draft';
+  await createSession(journal, sessionId);
+  const provider = { async *stream(_request, signal) {
+    if (!signal.aborted) await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+  } };
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), fakeRunPreparation().port, 'ordered-draft');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:ordered-start', 'Plan the work.'));
+  const base = structuredClone(await waitForProjection(actor, (value) => Boolean(value.assistantDraft)));
+  base.assistantDraft.planPreview = { callIndex: 0, providerCallId: 'call:ordered-plan', title: 'Plan', summary: '', steps: ['Read source'], truncated: false };
+  const latest = structuredClone(base);
+  latest.assistantDraft.planPreview.steps.push('Verify behavior');
+  let releaseOld;
+  const held = new Promise((resolve) => { releaseOld = resolve; });
+  let reads = 0;
+  let commands = 0;
+  installGuiFetch(t, async (url) => {
+    if (url.pathname === '/api/conversation/statuses') return Response.json({ ok: true, data: [] });
+    if (url.pathname.endsWith('/commands')) {
+      commands += 1;
+      return Response.json({ ok: true, data: { schemaVersion: 'deepcode.command-reply.v3', sessionId, commandId: 'command:setting', status: 'accepted', revision: base.revision } });
+    }
+    assert.ok(url.pathname.endsWith('/projection'));
+    reads += 1;
+    if (reads === 1) { await held; return Response.json({ ok: true, data: base }); }
+    return Response.json({ ok: true, data: latest });
+  });
+  const store = await loadGuiModelStore(t);
+  store.setState({ sessionId, projection: base, selectedProfileId: 'profile:test', profiles: [
+    { id: 'profile:test', enabled: true, thinking: 'enabled' },
+  ] });
+  const polling = store.getState().refresh();
+  await waitUntil(() => reads === 1);
+  const saving = store.getState().selectReasoningEffort('low');
+  await waitUntil(() => commands === 1);
+  assert.equal(reads, 1, 'the post-command read waits for the earlier in-flight read');
+  releaseOld();
+  await Promise.all([polling, saving]);
+  assert.equal(store.getState().error, null);
+  assert.equal(reads, 2);
+  assert.deepEqual(store.getState().projection.assistantDraft.planPreview.steps, ['Read source', 'Verify behavior']);
+  assert.equal(store.getState().projection.revision, base.revision);
+});
+
+test('desktop startup diagnostics render the Host failure and log reference verbatim', async (t) => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { HostStartupDiagnostic } = await loadGuiModule(t, '/src/components/shared/HostStartupDiagnostic.tsx');
+  const status = { phase: 'failed', code: 'host_startup_process_exited',
+    message: 'Kernel exited: exit status: 71', diagnosticRef: '/runtime/logs/startup.log' };
+  const html = renderToStaticMarkup(createElement(HostStartupDiagnostic, { status, language: 'zh-CN' }));
+  assert.match(html, /Kernel exited: exit status: 71/);
+  assert.match(html, /\/runtime\/logs\/startup.log/);
+  assert.equal(renderToStaticMarkup(createElement(HostStartupDiagnostic, { status: { ...status, phase: 'ready' }, language: 'zh-CN' })), '');
 });
