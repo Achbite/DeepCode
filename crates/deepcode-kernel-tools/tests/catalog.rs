@@ -173,3 +173,43 @@ fn file_names_keep_distinct_unicode_spelling_through_invocation_and_identity() {
             .arguments
     );
 }
+
+#[test]
+fn rejected_arguments_expose_field_paths_for_extra_fields_and_bounds() {
+    use deepcode_kernel_tools::KernelToolCatalogError;
+    let registry = KernelToolRegistry::new();
+    let error = registry
+        .canonicalize(
+            "fs.edit",
+            json!({
+                "path": "README.md",
+                "edits": [{"oldText": "a", "newText": "b"}],
+                "workspaceMode": "write"
+            }),
+        )
+        .unwrap_err();
+    let KernelToolCatalogError::InvalidArguments { issues, .. } = error else {
+        panic!("expected typed input rejection")
+    };
+    assert!(issues
+        .iter()
+        .any(|issue| issue.path == "$.workspaceMode" && issue.rule == "additionalProperties"));
+
+    let error = registry
+        .canonicalize(
+            "bash",
+            json!({
+                "command": "pwd",
+                "workspaceMode": "read",
+                "executionScope": "workspace",
+                "timeout": 900
+            }),
+        )
+        .unwrap_err();
+    let KernelToolCatalogError::InvalidArguments { issues, .. } = error else {
+        panic!("expected typed input rejection")
+    };
+    assert!(issues.iter().any(|issue| issue.path == "$.timeout"
+        && issue.rule == "maximum"
+        && issue.expected == Some(json!(600))));
+}
