@@ -392,6 +392,12 @@ function providerWorkspaceSchema(toolName: string, schema: JsonObject): JsonObje
   return copy;
 }
 
+/** Lists the logical handles the current run bound; the model needs them to correct its input. */
+function availableWorkspaceHandles(codec: ProviderToolCodec): string {
+  const handles = [...codec.workspaceIdByHandle.keys()];
+  return handles.length > 0 ? handles.join('、') : '(当前 run 没有可用的 workspace 绑定)';
+}
+
 function decodeWorkspaceHandle(
   codec: ProviderToolCodec,
   input: JsonObject,
@@ -406,14 +412,14 @@ function decodeWorkspaceHandle(
   if (typeof handle !== 'string' || !handle) {
     throw new LoopFailure(
       'provider_workspace_handle_required',
-      'Workspace 工具必须携带当前 Session 的逻辑 workspace handle。',
+      `Workspace 工具必须携带当前 Session 的逻辑 workspace handle。可用句柄：${availableWorkspaceHandles(codec)}。`,
     );
   }
   const workspaceId = codec.workspaceIdByHandle.get(handle);
   if (!workspaceId) {
     throw new LoopFailure(
       'provider_workspace_handle_not_bound',
-      `逻辑 workspace handle 不属于当前 run：${handle}`,
+      `逻辑 workspace handle 不属于当前 run：${handle}。可用句柄：${availableWorkspaceHandles(codec)}。`,
     );
   }
   delete input.workspace;
