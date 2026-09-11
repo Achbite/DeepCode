@@ -17,7 +17,7 @@ exclude = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.50"
+version = "0.5.51"
 edition = "2021"
 rust-version = "1.86"
 license = "MIT"
@@ -48,7 +48,6 @@ rusqlite = { version = "=0.39.0", default-features = false, features = ["bundled
 regex = "1"
 pdf-extract = "0.9"
 sha2 = "0.10"
-unicode-normalization = "=0.1.25"
 ratatui = "0.29"
 crossterm = "0.28"
 portable-pty = "0.8"

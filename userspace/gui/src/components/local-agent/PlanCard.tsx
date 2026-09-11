@@ -11,6 +11,7 @@ interface PlanCardProps {
   previousPlan?: PlanProjection;
   workspaceBindings?: readonly WorkspaceBindingDisplay[];
   language: UiLanguage;
+  onToggle?: (card: HTMLElement, expanded: boolean) => void;
 }
 
 const PlanCard: React.FC<PlanCardProps> = ({
@@ -19,14 +20,19 @@ const PlanCard: React.FC<PlanCardProps> = ({
   previousPlan,
   workspaceBindings = [],
   language,
+  onToggle,
 }) => {
+  const cardRef = useRef<HTMLElement>(null);
   const previousStatus = useRef(plan.status);
-  const [expanded, setExpanded] = useState(() => plan.status === 'published');
+  const [expanded, setExpanded] = useState(false);
+  const toggle = (next: boolean) => {
+    if (cardRef.current) onToggle?.(cardRef.current, next);
+    setExpanded(next);
+  };
 
   useEffect(() => {
     if (previousStatus.current !== plan.status) {
       if (plan.status === 'confirmed') setExpanded(false);
-      if (plan.status === 'published') setExpanded(true);
       previousStatus.current = plan.status;
     }
   }, [plan.status]);
@@ -35,7 +41,7 @@ const PlanCard: React.FC<PlanCardProps> = ({
   const stepCount = t(language, 'agent.plan.stepCount', { count: plan.steps.length });
 
   return (
-    <article className={`local-agent__plan-card local-agent__plan-card--${plan.status}`}>
+    <article ref={cardRef} className={`local-agent__plan-card local-agent__plan-card--${plan.status}`}>
       {expanded ? (
         <div className="local-agent__plan-document">
           <button
@@ -43,7 +49,7 @@ const PlanCard: React.FC<PlanCardProps> = ({
             className="local-agent__plan-document-meta"
             aria-expanded="true"
             aria-label={t(language, 'agent.plan.collapse')}
-            onClick={() => setExpanded(false)}
+            onClick={() => toggle(false)}
           >
             <DeepCodeShellIcon name="activity" />
             <span>
@@ -55,30 +61,7 @@ const PlanCard: React.FC<PlanCardProps> = ({
             <span className="local-agent__plan-card-status">{status}</span>
             <DeepCodeShellIcon name="chevronDown" />
           </button>
-          {previousPlan && <p className="conversation-plan-revision-note">
-            {planRevisionSummary(previousPlan, plan, language)}
-          </p>}
-          <PlanDocument title={plan.title} summary={plan.summary} steps={plan.steps} language={language}>
-            {plan.mutationManifest.length > 0 && (
-              <details className="local-agent__plan-manifest">
-                <summary>
-                  {t(language, 'agent.plan.mutationManifest', {
-                    count: plan.mutationManifest.length,
-                  })}
-                </summary>
-                <ul>
-                  {plan.mutationManifest.map((operation, index) => (
-                    <li key={`${operation.workspaceId}:${operation.operation}:${planOperationDetail(operation)}:${index}`}>
-                      <code>
-                        {workspaceBindings.length > 1 ? `${workspaceBindings.find((binding) => binding.workspaceId === operation.workspaceId)?.displayName ?? operation.workspaceId} · ` : ''}
-                        {planOperationDetail(operation, language)}
-                      </code>
-                    </li>
-                  ))}
-                </ul>
-              </details>
-            )}
-          </PlanDocument>
+          <PlanCardContent plan={plan} previousPlan={previousPlan} workspaceBindings={workspaceBindings} language={language} />
         </div>
       ) : (
         <button
@@ -86,7 +69,7 @@ const PlanCard: React.FC<PlanCardProps> = ({
           className="local-agent__plan-card-summary"
           aria-expanded="false"
           aria-label={t(language, 'agent.plan.expand')}
-          onClick={() => setExpanded(true)}
+          onClick={() => toggle(true)}
         >
           <DeepCodeShellIcon name="activity" />
           <strong><MarkdownInline>{plan.title}</MarkdownInline></strong>
@@ -99,6 +82,29 @@ const PlanCard: React.FC<PlanCardProps> = ({
     </article>
   );
 };
+
+export function PlanCardContent({ plan, previousPlan, workspaceBindings = [], language }: Omit<PlanCardProps, 'active' | 'onToggle'>) {
+  return <>
+    {previousPlan && <p className="conversation-plan-revision-note">
+      {planRevisionSummary(previousPlan, plan, language)}
+    </p>}
+    <PlanDocument title={plan.title} summary={plan.summary} steps={plan.steps} language={language}>
+      {plan.mutationManifest.length > 0 && (
+        <details className="local-agent__plan-manifest">
+          <summary>{t(language, 'agent.plan.mutationManifest', { count: plan.mutationManifest.length })}</summary>
+          <ul>{plan.mutationManifest.map((operation, index) => (
+            <li key={`${operation.workspaceId}:${operation.operation}:${planOperationDetail(operation)}:${index}`}>
+              <code>
+                {workspaceBindings.length > 1 ? `${workspaceBindings.find((binding) => binding.workspaceId === operation.workspaceId)?.displayName ?? operation.workspaceId} · ` : ''}
+                {planOperationDetail(operation, language)}
+              </code>
+            </li>
+          ))}</ul>
+        </details>
+      )}
+    </PlanDocument>
+  </>;
+}
 
 function planOperationDetail(operation: PlanOperation, language: UiLanguage = 'zh-CN'): string {
   const chinese = language === 'zh-CN';

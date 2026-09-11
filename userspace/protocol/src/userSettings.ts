@@ -49,6 +49,7 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'terminal.integrated.prewarm': 'afterStartup',
   'terminal.integrated.spawnTimeoutMs': 8000,
   'agent.systemPrompt': '',
+  'agent.responseLanguage': 'auto',
   'agent.permissions.workspaceMutation': 'plan',
   'agent.permissions.engineeringDecisions': 'ask',
   'agent.permissions.networkRead': 'allow',

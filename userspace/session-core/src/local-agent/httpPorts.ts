@@ -34,6 +34,7 @@ import {
 } from '@deepcode/protocol';
 import { createProviderToolAliases } from './providerToolCodec.js';
 import { sessionControlToolDefinitions } from './sessionControls.js';
+import { environmentInstruction } from './sessionEnvironment.js';
 import {
   decodeRunPluginConfig,
   runtimeInstructions,
@@ -278,6 +279,7 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
       'toolPromptProviders',
       'pluginConfig',
       'selectedPlugins',
+      'environment',
     ])) throw new Error('run_runtime_prepared_invalid');
     if (
       value.schemaVersion !== LOCAL_AGENT_PROTOCOL_VERSION
@@ -337,7 +339,10 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
           kernelCatalogSnapshotRef: value.kernelCatalogSnapshotRef,
           provider,
           webSearch,
-          instructions: [...runtimeInstructions(this.#stableCoreInstructions, pluginConfig, {
+          instructions: [...runtimeInstructions([
+            ...this.#stableCoreInstructions,
+            environmentInstruction(value.environment),
+          ], pluginConfig, {
             interactionRequest: wireName(SESSION_CONTROL_INTERACTION_REQUEST),
             planPublish: wireName(SESSION_CONTROL_PLAN_PUBLISH),
             planProgress: wireName(SESSION_CONTROL_PLAN_PROGRESS),
@@ -634,10 +639,10 @@ function decodeProviderFrame(frame: string): ProviderEvent {
       }
     case 'tool.call':
       if (
-        !isExactRecord(value.data, ['callId', 'name', 'input'])
+        !(isExactRecord(value.data, ['callId', 'name', 'input']) && isRecord(value.data.input)
+          || isExactRecord(value.data, ['callId', 'name', 'arguments']) && typeof value.data.arguments === 'string')
         || !isNonEmptyText(value.data.callId)
         || !isNonEmptyText(value.data.name)
-        || !isRecord(value.data.input)
       ) throw new Error('provider_event_invalid');
       break;
     case 'hosted.web-search.completed':

@@ -51,6 +51,15 @@ export function ConversationTranscript({
 }: ConversationTranscriptProps) {
   const host = useConversationHost();
   const { transcriptRef, messageEndRef, setLatestFollowMode } = viewport;
+  const onPlanToggle = (card: HTMLElement, expanded: boolean) => {
+    const body = viewport.bodyRef.current;
+    if (body && !expanded) {
+      // Bring the summary back into view before removing the long document.
+      const cardTop = body.scrollTop + card.getBoundingClientRect().top - body.getBoundingClientRect().top;
+      body.scrollTop = Math.min(body.scrollTop, Math.max(0, cardTop));
+    }
+    setLatestFollowMode(false);
+  };
   const assistantDraft = projection?.assistantDraft ?? null;
   const submitting = useLocalAgentStore((state) => state.submitting);
   const setMessageFeedback = useLocalAgentStore((state) => state.setMessageFeedback);
@@ -225,9 +234,11 @@ export function ConversationTranscript({
           workspaceBindings={projection?.workspaceBindings}
           active={samePlanReference(projection?.activePlanRef, item.value)}
           language={language}
+          onToggle={onPlanToggle}
         />
       ) : (
         <ToolActivityGroup
+          sessionId={projection!.sessionId}
           activities={item.values}
           key={item.groupId}
           language={language}
@@ -251,7 +262,7 @@ export function ConversationTranscript({
             />
           </div>
         </article>
-      ) : item.type === 'planPreview' ? <PlanPreviewCard preview={item.value} key={item.key} language={language} /> : (
+      ) : item.type === 'planPreview' ? <PlanPreviewCard preview={item.value} key={item.key} language={language} onToggle={onPlanToggle} /> : (
         <ProviderHostedDraftGroup
           blocks={item.blocks}
           key={item.groupId}
@@ -338,7 +349,7 @@ function ConversationRoundView({ completed, followingLatest, rows, children }: {
       {completed && row.key === firstProcess && <button className="conversation-process-toggle" type="button" aria-expanded={expanded} onClick={() => setDisclosure({ completed, open: !expanded })}>
         <DeepCodeShellIcon name="tool" /><span>{expanded ? '执行过程' : '查看执行过程'}</span><DeepCodeShellIcon name="chevronDown" className="conversation-disclosure-chevron" />
       </button>}
-      <div data-conversation-anchor={row.key} hidden={row.process && !expanded && !row.required}>{row.content}</div>
+      <div data-conversation-anchor={row.key} hidden={row.process && !expanded && !row.required}>{(!row.process || expanded || row.required) && row.content}</div>
     </React.Fragment>)}
     {children}
   </section>;

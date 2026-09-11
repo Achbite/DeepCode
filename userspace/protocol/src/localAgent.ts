@@ -312,6 +312,15 @@ export type ProviderOutputBlock = {
     }
 );
 
+/** Original aggregate Provider calls; rejected inputs never request a Kernel effect. */
+export interface ProviderToolCallInput {
+  callId: string;
+  providerCallId: string;
+  toolName: string;
+  arguments: string;
+  error?: LocalAgentError & { issues: ToolInputIssue[] };
+}
+
 export type ProviderTurnSettlement = {
   providerRequestId: string;
   purpose: 'agent' | 'contextCompaction';
@@ -324,6 +333,7 @@ export type ProviderTurnSettlement = {
       reasoningSignature?: string;
       hostedWebSearchCalls?: JsonObject[];
       orderedOutputBlocks?: ProviderOutputBlock[];
+      toolCallInputs?: ProviderToolCallInput[];
     }
   | {
       outcome: 'failed' | 'indeterminate';
@@ -1182,7 +1192,7 @@ export interface ModelToolCall {
   callId: string;
   providerCallId: string;
   name: string;
-  input: JsonObject;
+  input: JsonObject | string;
 }
 
 export interface ProviderToolDefinition {
@@ -1269,7 +1279,7 @@ export type ProviderEvent =
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
       requestId: string;
       type: 'tool.call';
-      data: { callId: string; name: string; input: JsonObject };
+      data: { callId: string; name: string } & ({ input: JsonObject; arguments?: never } | { arguments: string; input?: never });
     }
   | {
       schemaVersion: typeof PROVIDER_EVENT_VERSION;

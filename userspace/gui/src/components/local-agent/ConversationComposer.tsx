@@ -147,6 +147,9 @@ export function ConversationComposer({
             </button>
           </div>
         )}
+        {selectedProfileId && !profiles.some((profile) => profile.id === selectedProfileId && profile.enabled) && (
+          <p className="local-agent__profile-notice" role="status">{t(language, 'agent.profile.boundUnavailable')}</p>
+        )}
         <textarea
           ref={textareaRef}
           value={draft}

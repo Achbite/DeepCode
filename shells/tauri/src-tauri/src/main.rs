@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use deepcode_host_connection::{HostStartupStatusV1, HOST_STARTUP_STATUS_SCHEMA};
 use deepcode_kernel_abi::{
     is_valid_host_instance_id, is_valid_host_shell_token, is_valid_host_ui_token,
     HostProcessIdentity, HostShutdownReceipt, HostShutdownRequest, HOST_INSTANCE_ID_ENV,
@@ -86,7 +87,9 @@ impl HostProcessGroup {
 
     fn detach(&self) {
         if let Ok(mut children) = self.children.lock() {
-            drop(children.take());
+            if let Some(mut children) = children.take() {
+                children.shutdown();
+            }
         }
     }
 }
@@ -123,6 +126,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             deepcode_boot_target,
+            deepcode_host_startup_status,
             deepcode_start_kernel_after_permission,
             deepcode_window_minimize,
             deepcode_window_toggle_maximize,
@@ -135,10 +139,16 @@ fn main() {
             app.manage(target.clone());
             app.manage(host_tokens.clone());
             app.manage(HostProcessGroup::new(None));
+            app.manage(EditorStartupStatus::new());
             create_main_window(app, &target, &host_tokens)?;
-            if startup_permission_preflight(APP_ASSET_DIR) {
-                let children = spawn_host_processes_if_available(&target, &host_tokens);
-                app.state::<HostProcessGroup>().replace(children);
+            let result = deepcode_start_kernel_after_permission(
+                app.state::<LaunchTarget>(),
+                app.state::<HostConnectionTokens>(),
+                app.state::<HostProcessGroup>(),
+                app.state::<EditorStartupStatus>(),
+            );
+            if result.status.phase == "failed" {
+                eprintln!("host_startup_failed: {}", result.message);
             }
             Ok(())
         })
@@ -265,6 +275,76 @@ struct KernelStartResult {
     started: bool,
     blocked: bool,
     message: String,
+    status: HostStartupStatusV1,
+}
+
+struct EditorStartupStatus(Mutex<HostStartupStatusV1>);
+
+impl EditorStartupStatus {
+    fn new() -> Self {
+        Self(Mutex::new(HostStartupStatusV1 {
+            schema_version: HOST_STARTUP_STATUS_SCHEMA,
+            revision: 0,
+            attempt_id: "not-started".into(),
+            mode: "managed",
+            phase: "idle",
+            stage: "permissionPreflight",
+            code: "host_startup_idle".into(),
+            reason_code: None,
+            message: "Host startup has not started.".into(),
+            retryable: true,
+            owns_processes: false,
+            diagnostic_ref: None,
+            updated_at: String::new(),
+        }))
+    }
+
+    fn finish(&self, started: bool, blocked: bool, message: String) -> KernelStartResult {
+        let mut status = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.revision += 1;
+        status.attempt_id = format!("editor-startup:{}:{}", std::process::id(), status.revision);
+        status.phase = if blocked {
+            "blocked"
+        } else if started {
+            "ready"
+        } else {
+            "failed"
+        };
+        status.stage = "ready";
+        status.code = if blocked {
+            "host_startup_permission_blocked"
+        } else if started {
+            "host_startup_ready"
+        } else {
+            "host_startup_failed"
+        }
+        .into();
+        status.message = message.clone();
+        status.owns_processes = started;
+        status.updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .to_string();
+        KernelStartResult {
+            started,
+            blocked,
+            message,
+            status: status.clone(),
+        }
+    }
+}
+
+#[tauri::command]
+fn deepcode_host_startup_status(status: State<'_, EditorStartupStatus>) -> HostStartupStatusV1 {
+    status
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 #[tauri::command]
@@ -277,37 +357,35 @@ fn deepcode_start_kernel_after_permission(
     target: State<'_, LaunchTarget>,
     host_tokens: State<'_, HostConnectionTokens>,
     processes: State<'_, HostProcessGroup>,
+    status: State<'_, EditorStartupStatus>,
 ) -> KernelStartResult {
     if !startup_permission_preflight(APP_ASSET_DIR) {
-        return KernelStartResult {
-            started: false,
-            blocked: true,
-            message: "startup permission preflight did not complete".to_string(),
-        };
+        return status.finish(
+            false,
+            true,
+            "startup permission preflight did not complete".into(),
+        );
     }
-
     if local_port_has_listener(&target.host, &target.port)
         || local_port_has_listener(&target.host, &target.daemon_port)
     {
-        return KernelStartResult {
-            started: false,
-            blocked: false,
-            message: "a required private Host port is already in use".to_string(),
-        };
+        return status.finish(
+            false,
+            false,
+            "a required private Host port is already in use".into(),
+        );
     }
-    let children = spawn_host_processes_if_available(&target, &host_tokens);
-    let started = children.is_some();
-    if started {
-        processes.replace(children);
-    }
-    KernelStartResult {
-        started,
-        blocked: false,
-        message: if started {
-            "kernel start requested".to_string()
-        } else {
-            "kernel binary was not found or could not be started".to_string()
-        },
+    match spawn_host_processes_if_available(&target, &host_tokens) {
+        Ok(Some(children)) => {
+            processes.replace(Some(children));
+            status.finish(true, false, "Host is ready.".into())
+        }
+        Ok(None) => status.finish(
+            false,
+            false,
+            "kernel binary was not found or could not be started".into(),
+        ),
+        Err(message) => status.finish(false, false, message),
     }
 }
 
@@ -549,23 +627,24 @@ fn content_type_for_path(path: &Path) -> &'static str {
 fn spawn_host_processes_if_available(
     target: &LaunchTarget,
     host_tokens: &HostConnectionTokens,
-) -> Option<OwnedHostChildren> {
+) -> Result<Option<OwnedHostChildren>, String> {
     if env_truthy("DEEPCODE_SHELL_CONNECT_ONLY") {
-        return None;
+        return Ok(None);
     }
     if local_port_has_listener(&target.host, &target.port)
         || local_port_has_listener(&target.host, &target.daemon_port)
     {
-        return None;
+        return Ok(None);
     }
-    let _start_lock = acquire_kernel_start_lock(&target.host, &target.port)?;
+    let _start_lock = acquire_kernel_start_lock(&target.host, &target.port)
+        .ok_or("无法取得本地 Host 启动锁。")?;
     if local_port_has_listener(&target.host, &target.port)
         || local_port_has_listener(&target.host, &target.daemon_port)
     {
-        return None;
+        return Ok(None);
     }
 
-    let exe_dir = current_exe_dir()?;
+    let exe_dir = current_exe_dir().ok_or("无法定位壳可执行文件目录。")?;
     let daemon_path =
         configured_or_bundled_file("DEEPCODE_KERNEL_DAEMON_BIN", &exe_dir, kernel_binary_name())?;
     let proxy_path =
@@ -577,15 +656,12 @@ fn spawn_host_processes_if_available(
         .unwrap_or_else(|| package_root(&exe_dir).unwrap_or_else(|| daemon_dir.clone()));
 
     let shared_start_guard = deepcode_host_connection::HostStartGuard::acquire(&config_root)
-        .inspect_err(|error| eprintln!("host_connection_start_failed: {error}"))
-        .ok()?;
+        .map_err(|error| format!("host_connection_start_failed: {error}"))?;
     let config_root = config_root
         .canonicalize()
-        .inspect_err(|error| eprintln!("host_config_root_invalid: {error}"))
-        .ok()?;
+        .map_err(|error| format!("host_config_root_invalid: {error}"))?;
     let shared = deepcode_host_connection::LocalHostConnection::discover(&config_root)
-        .inspect_err(|error| eprintln!("host_connection_discovery_failed: {error}"))
-        .ok()?;
+        .map_err(|error| format!("host_connection_discovery_failed: {error}"))?;
     let proxy_host = target.host.clone();
     let mut target = target.clone();
     let mut host_tokens = host_tokens.clone();
@@ -603,6 +679,11 @@ fn spawn_host_processes_if_available(
             find_bundled_dir(&exe_dir, "web").unwrap_or_else(|| proxy_dir.join("web"))
         });
 
+    let log_dir = std::env::var_os("DEEPCODE_LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config_root.join("runtime/logs"));
+    std::fs::create_dir_all(&log_dir).map_err(|error| format!("创建启动日志目录失败：{error}"))?;
+    let log_path = log_dir.join(format!("editor-{}.log", std::process::id()));
     let (mut daemon, daemon_identity) = if let Some(connection) = shared {
         if !authenticated_health_ready(
             &target.host,
@@ -610,8 +691,7 @@ fn spawn_host_processes_if_available(
             HOST_SHELL_TOKEN_HEADER,
             host_tokens.daemon_token(),
         ) {
-            eprintln!("host_connection_health_failed: shared Host is not ready");
-            return None;
+            return Err("host_connection_health_failed: shared Host is not ready".into());
         }
         (None, connection.identity)
     } else {
@@ -624,11 +704,11 @@ fn spawn_host_processes_if_available(
             .env_remove(HOST_UI_TOKEN_ENV)
             .env(HOST_SHELL_TOKEN_ENV, host_tokens.daemon_token())
             .env(HOST_INSTANCE_ID_ENV, host_tokens.instance_id())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdin(Stdio::null());
+        capture_startup_log(&mut daemon_command, &log_path)?;
 
-        let mut daemon = spawn_owned_host_process(&mut daemon_command).ok()?;
+        let mut daemon = spawn_owned_host_process(&mut daemon_command)
+            .map_err(|error| format!("无法启动 Kernel：{error}；日志：{}", log_path.display()))?;
         let Some(daemon_identity) = wait_for_public_identity(
             &mut daemon,
             &target.host,
@@ -637,8 +717,9 @@ fn spawn_host_processes_if_available(
             host_tokens.instance_id(),
             40,
         ) else {
+            let error = startup_process_error(&mut daemon, "Kernel", &log_path);
             terminate_owned_process_tree(&mut daemon);
-            return None;
+            return Err(error);
         };
         if !wait_for_authenticated_health(
             &mut daemon,
@@ -648,8 +729,9 @@ fn spawn_host_processes_if_available(
             host_tokens.daemon_token(),
             40,
         ) {
+            let error = startup_process_error(&mut daemon, "Kernel", &log_path);
             terminate_owned_process_tree(&mut daemon);
-            return None;
+            return Err(error);
         }
 
         (Some(daemon), daemon_identity)
@@ -667,13 +749,21 @@ fn spawn_host_processes_if_available(
         .env(HOST_UI_TOKEN_ENV, host_tokens.ui_token())
         .env(HOST_SHELL_TOKEN_ENV, host_tokens.daemon_token())
         .env(HOST_INSTANCE_ID_ENV, host_tokens.instance_id())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdin(Stdio::null());
+    if let Err(error) = capture_startup_log(&mut proxy_command, &log_path) {
+        shutdown_daemon_process(
+            &mut daemon,
+            &target.host,
+            &target.daemon_port,
+            host_tokens.daemon_token(),
+            &daemon_identity,
+        );
+        return Err(error);
+    }
 
     let mut proxy = match spawn_owned_host_process(&mut proxy_command) {
         Ok(proxy) => proxy,
-        Err(_) => {
+        Err(error) => {
             shutdown_daemon_process(
                 &mut daemon,
                 &target.host,
@@ -681,7 +771,10 @@ fn spawn_host_processes_if_available(
                 host_tokens.daemon_token(),
                 &daemon_identity,
             );
-            return None;
+            return Err(format!(
+                "无法启动私有代理：{error}；日志：{}",
+                log_path.display()
+            ));
         }
     };
     if wait_for_public_identity(
@@ -702,6 +795,7 @@ fn spawn_host_processes_if_available(
             40,
         )
     {
+        let error = startup_process_error(&mut proxy, "私有代理", &log_path);
         terminate_owned_process_tree(&mut proxy);
         shutdown_daemon_process(
             &mut daemon,
@@ -710,7 +804,7 @@ fn spawn_host_processes_if_available(
             host_tokens.daemon_token(),
             &daemon_identity,
         );
-        return None;
+        return Err(error);
     }
     #[cfg(windows)]
     if let Err(error) = daemon
@@ -727,10 +821,9 @@ fn spawn_host_processes_if_available(
             host_tokens.daemon_token(),
             &daemon_identity,
         );
-        eprintln!("host_lifetime_transfer_failed: {error}");
-        return None;
+        return Err(format!("host_lifetime_transfer_failed: {error}"));
     }
-    Some(OwnedHostChildren {
+    Ok(Some(OwnedHostChildren {
         daemon,
         start_guard: Some(shared_start_guard),
         proxy,
@@ -738,21 +831,52 @@ fn spawn_host_processes_if_available(
         daemon_port: target.daemon_port.clone(),
         daemon_token: host_tokens.daemon_token().to_string(),
         daemon_identity,
-    })
+    }))
 }
 
 fn configured_or_bundled_file(
     environment_key: &str,
     exe_dir: &Path,
     bundled_name: &str,
-) -> Option<PathBuf> {
+) -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os(environment_key).map(PathBuf::from) {
-        return path
-            .is_absolute()
-            .then_some(path)
-            .filter(|path| path.is_file());
+        if path.is_absolute() && path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "{environment_key} 指定的文件无效：{}",
+            path.display()
+        ));
     }
     find_bundled_file(exe_dir, bundled_name)
+        .ok_or_else(|| format!("未找到包内文件：{bundled_name}"))
+}
+
+fn capture_startup_log(command: &mut Command, path: &Path) -> Result<(), String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let log = options
+        .open(path)
+        .map_err(|error| format!("打开启动日志失败：{error}"))?;
+    let stderr = log
+        .try_clone()
+        .map_err(|error| format!("复制启动日志句柄失败：{error}"))?;
+    command.stdout(Stdio::from(log)).stderr(Stdio::from(stderr));
+    Ok(())
+}
+
+fn startup_process_error(process: &mut OwnedHostProcess, name: &str, log_path: &Path) -> String {
+    let state = match process.child.try_wait() {
+        Ok(Some(status)) => format!("已退出：{status}"),
+        Ok(None) => "未在启动期限内通过身份或健康检查".into(),
+        Err(error) => format!("无法读取进程状态：{error}"),
+    };
+    format!("{name} {state}；原始输出日志：{}", log_path.display())
 }
 
 struct KernelStartLock {
@@ -1303,4 +1427,28 @@ fn env_truthy(name: &str) -> bool {
             matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
         })
         .unwrap_or(false)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_error_keeps_the_child_exit_and_original_stderr() {
+        let directory =
+            std::env::temp_dir().join(format!("deepcode-editor-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("startup.log");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'startup child diagnostic\\n' >&2; exit 71"]);
+        capture_startup_log(&mut command, &path).unwrap();
+        let mut child = spawn_owned_host_process(&mut command).unwrap();
+        child.child.wait().unwrap();
+        let error = startup_process_error(&mut child, "Kernel", &path);
+        let log = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(error.contains("71"));
+        assert!(error.contains(&path.display().to_string()));
+        assert!(log.contains("startup child diagnostic"));
+    }
 }

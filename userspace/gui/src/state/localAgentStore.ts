@@ -120,6 +120,14 @@ export function createLocalAgentStore(viewId = 'main') {
 const SESSION_STORAGE_KEY = `deepcode.local-agent.active-session:${viewId}`;
 let initialization: Promise<void> | null = null;
 let generation = 0;
+// Draft deltas do not advance the journal revision. Serialize reads across
+// polling, navigation and command reconciliation so responses cannot rewind them.
+let projectionReadQueue: Promise<void> = Promise.resolve();
+function readProjection(sessionId: string): Promise<SessionProjection> {
+  const read = projectionReadQueue.then(() => getLocalAgentProjection(sessionId));
+  projectionReadQueue = read.then(() => undefined, () => undefined);
+  return read;
+}
 let activeSubmissionCount = 0;
 const decisionSubmissions = new Map<string, Promise<CommandReply>>();
 let projectionRefreshFlight: {
@@ -158,9 +166,9 @@ const store = create<LocalAgentState>((set, get) => ({
           getLlmProfiles(),
         ]);
         const profiles = profileResult.ok
-          ? (profileResult.data?.profiles ?? []).filter((profile) => profile.enabled)
+          ? (profileResult.data?.profiles ?? [])
           : [];
-        const defaultProfileId = enabledProfileId(
+        const defaultProfileId = initialProfileId(
           profiles,
           profileResult.data?.defaultProfileId,
         );
@@ -170,7 +178,7 @@ const store = create<LocalAgentState>((set, get) => ({
         void get().refresh();
         if (currentGeneration !== generation) {
           set({
-            selectedProfileId: resolveEnabledProfileId(profiles, get().selectedProfileId, defaultProfileId),
+            selectedProfileId: get().selectedProfileId ?? defaultProfileId,
           });
           if (!profileResult.ok) {
             set({
@@ -186,7 +194,7 @@ const store = create<LocalAgentState>((set, get) => ({
         let projectionError: string | null = null;
         if (candidate) {
           try {
-            projection = await getLocalAgentProjection(candidate.id);
+            projection = await readProjection(candidate.id);
           } catch (error) {
             projectionError = errorMessage(error);
           }
@@ -197,11 +205,7 @@ const store = create<LocalAgentState>((set, get) => ({
           pluginCatalog,
           profiles,
           defaultProfileId,
-          selectedProfileId: projection?.modelSettings?.profileId ?? resolveEnabledProfileId(
-            profiles,
-            candidate?.profileId,
-            defaultProfileId,
-          ),
+          selectedProfileId: projection?.modelSettings?.profileId ?? candidate?.profileId ?? defaultProfileId,
           reasoningEffortOverride: projection?.modelSettings?.reasoningEffortOverride ?? null,
           sessionId: projection?.sessionId ?? candidate?.id ?? null,
           projection,
@@ -237,8 +241,8 @@ const store = create<LocalAgentState>((set, get) => ({
       });
       return;
     }
-    const profiles = (profileResult.data?.profiles ?? []).filter((profile) => profile.enabled);
-    const defaultProfileId = enabledProfileId(
+    const profiles = (profileResult.data?.profiles ?? []);
+    const defaultProfileId = initialProfileId(
       profiles,
       profileResult.data?.defaultProfileId,
     );
@@ -249,11 +253,7 @@ const store = create<LocalAgentState>((set, get) => ({
       return {
         profiles,
         defaultProfileId,
-        selectedProfileId: resolveEnabledProfileId(
-          profiles,
-          state.selectedProfileId ?? summary?.profileId,
-          defaultProfileId,
-        ),
+        selectedProfileId: state.selectedProfileId ?? summary?.profileId ?? defaultProfileId,
         ...(state.errorSource === 'profiles' ? { error: null, errorSource: null } : {}),
       };
     });
@@ -317,20 +317,17 @@ const store = create<LocalAgentState>((set, get) => ({
       error: null,
       errorSource: null,
       sessionId,
+      selectedProfileId: summary.profileId ?? null,
       projection: null,
       draftProjectId: null,
     });
     try {
-      const projection = await getLocalAgentProjection(sessionId);
+      const projection = await readProjection(sessionId);
       if (currentGeneration !== generation) return;
       rememberSession(sessionId);
       set({
         sessionId,
-        selectedProfileId: projection.modelSettings?.profileId ?? resolveEnabledProfileId(
-          get().profiles,
-          summary.profileId,
-          get().defaultProfileId,
-        ),
+        selectedProfileId: projection.modelSettings?.profileId ?? summary.profileId ?? null,
         reasoningEffortOverride: projection.modelSettings?.reasoningEffortOverride ?? null,
         projection,
         loading: false,
@@ -388,7 +385,7 @@ const store = create<LocalAgentState>((set, get) => ({
       })();
       try {
         if (!sessionId) return;
-        const projection = await getLocalAgentProjection(sessionId);
+        const projection = await readProjection(sessionId);
         if (generation !== refreshGeneration || get().sessionId !== sessionId) return;
         set((state) => {
           const nextProjection = shouldApplyProjection(state.projection, projection)
@@ -686,7 +683,7 @@ async function submitNewRun(
   try {
     const messageProfileId = get().selectedProfileId;
     const reasoningEffortOverride = get().reasoningEffortOverride;
-    if (!messageProfileId) throw new Error('llm_profile_unavailable');
+    if (!messageProfileId || !get().profiles.some((profile) => profile.id === messageProfileId && profile.enabled)) throw new Error('llm_profile_unavailable');
     const pluginCatalog = get().pluginCatalog;
     const effectivePluginSelections = requiredFilesystemPluginSelections(
       pluginCatalog,
@@ -814,7 +811,7 @@ async function reconcileProjectionAfterReply(
   replyRevision: number,
   commandGeneration: number,
 ): Promise<void> {
-  const projection = await getLocalAgentProjection(sessionId);
+  const projection = await readProjection(sessionId);
   if (projection.revision < replyRevision) {
     throw new Error(
       `conversation_projection_behind_command_reply:${projection.revision}:${replyRevision}`,
@@ -909,22 +906,11 @@ function requiredSummary(catalog: ConversationCatalog, sessionId: string) {
   return summary;
 }
 
-function enabledProfileId(
+function initialProfileId(
   profiles: readonly LlmProviderProfile[],
   preferred: string | undefined,
 ): string | null {
-  return profiles.find((profile) => profile.id === preferred)?.id ?? profiles[0]?.id ?? null;
-}
-
-function resolveEnabledProfileId(
-  profiles: readonly LlmProviderProfile[],
-  preferred: string | null | undefined,
-  configuredDefault: string | null,
-): string | null {
-  return profiles.find((profile) => profile.id === preferred)?.id
-    ?? profiles.find((profile) => profile.id === configuredDefault)?.id
-    ?? profiles[0]?.id
-    ?? null;
+  return preferred ?? profiles.find((profile) => profile.enabled)?.id ?? null;
 }
 
 function shouldApplyProjection(

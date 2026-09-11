@@ -1,5 +1,6 @@
 import { LiveReasoning } from './reasoningRead.js';
 import { todoItemsForPlan } from './planStage.js';
+import { retainSessionEnvironment } from './sessionEnvironment.js';
 import type {
   AssistantDraftProjection,
   CommandJournalPort,
@@ -363,7 +364,7 @@ export class SessionActor {
         ? { pluginSelections: command.pluginSelections.map((selection) => ({ ...selection })) }
         : {}),
     });
-    const runtimeSnapshot = prepared.runtimeSnapshot;
+    const runtimeSnapshot = retainSessionEnvironment(prepared.runtimeSnapshot, before.events);
     const events: NewSessionEvent[] = [
       {
         type: 'session.model-settings.updated',
@@ -884,7 +885,7 @@ export class SessionActor {
       await this.settleRecoveryFailure(runId, error);
       return false;
     }
-    const restored = prepared.runtimeSnapshot;
+    const restored = retainSessionEnvironment(prepared.runtimeSnapshot, snapshot.events);
     if (canonicalJson(restored) !== canonicalJson(runtime)) {
       const mismatch = new Error('run_runtime_recovery_identity_mismatch');
       try {

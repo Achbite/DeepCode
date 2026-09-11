@@ -6,9 +6,9 @@ pub(crate) fn anthropic_stream_request_body(
     messages: Vec<Value>,
     tools: &[LlmToolDefinition],
     require_tool_call: bool,
-) -> Value {
+) -> Result<Value, ProviderTransportError> {
     let (system, chat_messages) = split_system_messages(messages);
-    let chat_messages = anthropic_messages(chat_messages);
+    let chat_messages = anthropic_messages(chat_messages)?;
     let max_tokens = profile
         .max_output_tokens
         .expect("resolved Provider runtime has maxOutputTokens");
@@ -49,17 +49,17 @@ pub(crate) fn anthropic_stream_request_body(
             body["tool_choice"] = json!({ "type": "any" });
         }
     }
-    body
+    Ok(body)
 }
 
-fn anthropic_messages(messages: Vec<Value>) -> Vec<Value> {
+fn anthropic_messages(messages: Vec<Value>) -> Result<Vec<Value>, ProviderTransportError> {
     let mut output = Vec::with_capacity(messages.len());
     for message in messages {
         let Some(record) = message.as_object() else {
             continue;
         };
         match record.get("role").and_then(Value::as_str).unwrap_or("user") {
-            "assistant" => output.push(anthropic_assistant_message(record)),
+            "assistant" => output.push(anthropic_assistant_message(record)?),
             "tool" => append_anthropic_tool_result(&mut output, record),
             "user" => output.push(json!({
                 "role": "user",
@@ -68,10 +68,12 @@ fn anthropic_messages(messages: Vec<Value>) -> Vec<Value> {
             _ => {}
         }
     }
-    output
+    Ok(output)
 }
 
-fn anthropic_assistant_message(record: &serde_json::Map<String, Value>) -> Value {
+fn anthropic_assistant_message(
+    record: &serde_json::Map<String, Value>,
+) -> Result<Value, ProviderTransportError> {
     let mut content = Vec::new();
     if let Some(reasoning) = record
         .get("reasoningContent")
@@ -117,11 +119,27 @@ fn anthropic_assistant_message(record: &serde_json::Map<String, Value>) -> Value
             .or_else(|| call.get("input"))
             .or_else(|| call.get("arguments"))
             .cloned()
-            .unwrap_or_else(|| json!({}));
+            .ok_or_else(|| {
+                ProviderTransportError::message(
+                    "provider_envelope_invalid",
+                    "Anthropic tool_use 缺少原始参数。",
+                )
+            })?;
         let input = match input {
-            Value::String(text) => serde_json::from_str(&text).unwrap_or_else(|_| json!({})),
+            Value::String(text) => serde_json::from_str(&text).map_err(|error| {
+                ProviderTransportError::message(
+                    "provider_tool_arguments_unrepresentable",
+                    format!("Anthropic tool_use 要求 input 对象，原始参数无法编码：{error}"),
+                )
+            })?,
             value => value,
         };
+        if !input.is_object() {
+            return Err(ProviderTransportError::message(
+                "provider_tool_arguments_unrepresentable",
+                "Anthropic tool_use 要求 input 对象，原始参数不是对象。",
+            ));
+        }
         content.push(json!({
             "type": "tool_use",
             "id": call
@@ -132,7 +150,7 @@ fn anthropic_assistant_message(record: &serde_json::Map<String, Value>) -> Value
             "input": input
         }));
     }
-    json!({ "role": "assistant", "content": content })
+    Ok(json!({ "role": "assistant", "content": content }))
 }
 
 fn append_anthropic_tool_result(

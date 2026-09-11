@@ -329,6 +329,7 @@ pub(crate) fn default_user_settings() -> Value {
         "workbench.language": "zh-CN",
         "workbench.styleTokenOverrides": "{}",
         "agent.systemPrompt": "",
+        "agent.responseLanguage": "auto",
         "agent.permissions.workspaceMutation": "plan",
         "agent.permissions.engineeringDecisions": "ask",
         "agent.permissions.networkRead": "allow",
@@ -352,6 +353,7 @@ pub(crate) fn default_user_settings() -> Value {
 }
 
 pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), String> {
+    crate::session_environment::response_language_setting(settings)?;
     if let Some(object) = settings.as_object() {
         for key in object
             .keys()

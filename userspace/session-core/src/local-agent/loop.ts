@@ -11,6 +11,7 @@ import type {
   ProviderActivityProjection,
   ProviderEvent,
   ProviderOutputBlock,
+  ProviderToolCallInput,
   ProviderRequest,
   RunSettlement,
   RunRuntimeSnapshot,
@@ -113,6 +114,7 @@ interface ProviderTurnCompletion {
   reasoningSignature?: string;
   hostedWebSearchCalls?: JsonObject[];
   orderedOutputBlocks?: ProviderOutputBlock[];
+  toolCallInputs?: ProviderToolCallInput[];
 }
 
 type DecodedProviderOutputBlock = {
@@ -195,8 +197,7 @@ type ProviderTurn =
       kind: 'controlRejected';
       rejection: ProviderControlRejection;
       narrative?: string;
-    } & ProviderTurnCommon)
-  | ({ kind: 'continue'; narrative?: string } & ProviderTurnCommon);
+    } & ProviderTurnCommon);
 
 export async function runAgentLoop(
   initial: LoopSnapshot,
@@ -593,13 +594,6 @@ export async function runAgentLoop(
           ]);
           break;
         }
-        case 'continue':
-          await commit([
-            ...orderedProviderCallFacts(turn.completion, providerCallFacts),
-            providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
-            ...completionDerivedFacts,
-          ]);
-          break;
       }
     }
   } catch (error) {
@@ -922,6 +916,7 @@ async function consumeProviderOutput(
     name: string;
     input: Record<string, unknown>;
   }> = [];
+  const aggregateCalls: Array<Extract<ProviderEvent, { type: 'tool.call' }>['data']> = [];
   const hostedWebSearchCalls: JsonObject[] = [];
   const orderedOutputItems: Array<{ outputIndex: number; item: JsonObject }> = [];
   const streamedTextByOutputIndex = new Map<number, string>();
@@ -1013,21 +1008,9 @@ async function consumeProviderOutput(
         }
         completeMessage = event.data;
         break;
-      case 'tool.call': {
-        const canonicalName = toolCodec.canonicalByWire.get(event.data.name);
-        if (!canonicalName) {
-          throw new LoopFailure(
-            'provider_tool_alias_unknown',
-            `Provider 返回了当前 run 未声明的工具别名：${event.data.name}`,
-          );
-        }
-        providerCalls.push({
-          providerCallId: event.data.callId,
-          name: canonicalName,
-          input: decodeProviderToolInput(toolCodec, canonicalName, event.data.input),
-        });
+      case 'tool.call':
+        aggregateCalls.push(event.data);
         break;
-      }
       case 'hosted.web-search.completed':
         hostedWebSearchCalls.push(structuredClone(event.data.item));
         break;
@@ -1043,7 +1026,7 @@ async function consumeProviderOutput(
   if (!completed) throw new LoopFailure('provider_stream_incomplete', 'Provider 流未产生完成事件。');
   if (
     orderedOutputItems.length > 0
-    && (completeMessage !== undefined || providerCalls.length > 0 || hostedWebSearchCalls.length > 0)
+    && (completeMessage !== undefined || aggregateCalls.length > 0 || hostedWebSearchCalls.length > 0)
   ) {
     throw new LoopFailure(
       'provider_output_contract_mixed',
@@ -1105,6 +1088,56 @@ async function consumeProviderOutput(
   const decodedOutputBlocks = orderedOutputItems.map((output) => (
     decodeProviderOutputBlock(output, toolCodec)
   ));
+  const aggregateBlocks = aggregateCalls.map((call, outputIndex) => (
+    decodeProviderOutputBlock({
+      outputIndex,
+      item: {
+        type: 'function_call',
+        call_id: call.callId,
+        name: call.name,
+        arguments: call.arguments ?? JSON.stringify(call.input),
+      },
+    }, toolCodec)
+  ));
+  // A conflicting control batch is rejected as a whole, before requesting any effect.
+  const inputBlocks = [...decodedOutputBlocks, ...aggregateBlocks].filter((block) => (
+    block.kind === 'toolCall' || block.kind === 'toolCallRejected'
+  ));
+  const conflict = inputBlocks.some((block) => (
+    block.name === SESSION_CONTROL_INTERACTION_REQUEST || block.name === SESSION_CONTROL_PLAN_PUBLISH
+  )) && inputBlocks.length > 1
+    ? 'interaction.request 与 plan.publish 必须独占 Provider turn；本批次未执行，请单独提交。'
+    : inputBlocks.filter((block) => block.name === SESSION_CONTROL_PLAN_PROGRESS).length > 1
+      ? '每个 Provider turn 最多包含一个 plan.progress；本批次未执行，请合并步骤更新。'
+      : undefined;
+  if (conflict) {
+    for (const blocks of [decodedOutputBlocks, aggregateBlocks]) {
+      for (const [index, block] of blocks.entries()) {
+        if (block.kind !== 'toolCall') continue;
+        blocks[index] = {
+          outputIndex: block.outputIndex,
+          item: block.item,
+          kind: 'toolCallRejected',
+          providerCallId: block.providerCallId,
+          name: block.name,
+          error: {
+            code: 'session_control_turn_conflict',
+            message: conflict,
+            issues: [{ path: '$', rule: 'control_turn', message: conflict }],
+          },
+        };
+      }
+    }
+  }
+  for (const block of aggregateBlocks) {
+    if (block.kind === 'toolCall') {
+      providerCalls.push({
+        providerCallId: block.providerCallId,
+        name: block.name,
+        input: block.input,
+      });
+    }
+  }
   if (decodedOutputBlocks.length > 0) {
     const outputText = decodedOutputBlocks
       .filter((block): block is Extract<DecodedProviderOutputBlock, { kind: 'message' }> => (
@@ -1151,7 +1184,7 @@ async function consumeProviderOutput(
       }
     : {};
   const narrative = decodedOutputBlocks.length === 0 && deltas.trim() ? deltas : undefined;
-  const rejectedCalls = decodedOutputBlocks.filter(
+  const rejectedCalls = [...decodedOutputBlocks, ...aggregateBlocks].filter(
     (block): block is Extract<DecodedProviderOutputBlock, { kind: 'toolCallRejected' }> => (
       block.kind === 'toolCallRejected'
     ),
@@ -1294,6 +1327,20 @@ async function consumeProviderOutput(
     purpose: 'agent',
     providerRuntimeRef: request.providerRuntimeRef,
     orderedCallIds: calls.map((call) => call.callId),
+    ...(aggregateBlocks.length > 0 ? {
+      toolCallInputs: aggregateBlocks.map((block): ProviderToolCallInput => {
+        if (block.kind !== 'toolCall' && block.kind !== 'toolCallRejected') {
+          throw new LoopFailure('provider_tool_call_invalid', '聚合工具调用类型无效。');
+        }
+        return {
+          callId: logicalCallByProviderCallId.get(block.providerCallId)!,
+          providerCallId: block.providerCallId,
+          toolName: block.name,
+          arguments: block.item.arguments as string,
+          ...(block.kind === 'toolCallRejected' ? { error: structuredClone(block.error) } : {}),
+        };
+      }),
+    } : {}),
     ...(reasoningContent !== undefined
       ? { reasoningContent }
       : {}),
@@ -1311,21 +1358,6 @@ async function consumeProviderOutput(
   const controlCalls: Array<SessionControlCall & { providerCallId: string }> = [];
   const kernelCalls: typeof calls = [];
   let progress: Extract<ProviderTurn, { kind: 'tools' }>['progress'];
-  const allCalls = [...calls, ...rejectedCalls];
-  if (allCalls.some((call) => (
-    call.name === SESSION_CONTROL_INTERACTION_REQUEST || call.name === SESSION_CONTROL_PLAN_PUBLISH
-  )) && allCalls.length > 1) {
-    throw new LoopFailure(
-      'session_control_turn_conflict',
-      'interaction.request 与 plan.publish 必须独占 Provider turn。',
-    );
-  }
-  if (allCalls.filter((call) => call.name === SESSION_CONTROL_PLAN_PROGRESS).length > 1) {
-    throw new LoopFailure(
-      'session_control_turn_conflict',
-      '每个 Provider turn 最多包含一个 plan.progress 调用；请合并步骤更新。',
-    );
-  }
   for (const call of calls) {
     try {
       const control = decodeSessionControlCall(call.callId, call.name, call.input);
@@ -2039,6 +2071,7 @@ function providerTurnSettledEvent(
               .map((item) => structuredClone(item)),
           }
         : {}),
+      ...(completion.toolCallInputs ? { toolCallInputs: structuredClone(completion.toolCallInputs) } : {}),
       ...(completion.orderedOutputBlocks !== undefined
         ? {
             orderedOutputBlocks: completion.orderedOutputBlocks.map((block) => ({

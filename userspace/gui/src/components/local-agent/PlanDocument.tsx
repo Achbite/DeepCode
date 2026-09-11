@@ -14,7 +14,7 @@ interface PlanDocumentProps {
 
 /** One reading layout for real parameter previews and validated, confirmed Plan revisions. */
 export function PlanDocument({ title, summary, steps, language, streaming = false, children }: PlanDocumentProps) {
-  return <div className="conversation-plan-document-body" tabIndex={0}>
+  return <div className="conversation-plan-document-body">
     <div className="conversation-markdown conversation-plan-document-content">
       {title && <h2 className="conversation-plan-title"><MarkdownInline>{title}</MarkdownInline></h2>}
       {summary && <MarkdownContent streaming={streaming}>{summary}</MarkdownContent>}

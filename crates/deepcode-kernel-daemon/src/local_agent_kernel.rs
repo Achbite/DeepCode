@@ -1332,9 +1332,8 @@ impl LocalAgentKernel {
                 prepared.canonical_arguments.clone(),
                 KernelToolExecutionContext {
                     output_directory: Some(
-                        self.session_output_directory(&request.session_id).join(
-                            deepcode_kernel_tools::hash_bytes(request.attempt_id.as_bytes()),
-                        ),
+                        self.session_output_directory(&request.session_id)
+                            .join(output_directory_key(&request.attempt_id)),
                     ),
                     workspace_root: prepared.workspace_root.clone(),
                     workspace_id: prepared.workspace_id.clone(),
@@ -1348,8 +1347,7 @@ impl LocalAgentKernel {
     }
 
     pub(crate) fn session_output_directory(&self, session_id: &str) -> PathBuf {
-        self.output_root
-            .join(deepcode_kernel_tools::hash_bytes(session_id.as_bytes()))
+        self.output_root.join(output_directory_key(session_id))
     }
 
     pub(crate) fn delete_session_outputs(
@@ -2388,5 +2386,25 @@ mod attempt_control_tests {
         assert!(!control.is_cancelled());
         control.finish();
         assert!(control.wait_complete(Duration::ZERO));
+    }
+}
+
+/// Storage names are portable; logical content hashes retain their original format.
+pub(crate) fn output_directory_key(identity: &str) -> String {
+    deepcode_kernel_tools::hash_bytes(identity.as_bytes()).replace(':', "-")
+}
+
+#[cfg(test)]
+mod output_directory_tests {
+    #[test]
+    fn output_names_are_windows_components_without_changing_logical_hashes() {
+        let identity = "session:record/with/path";
+        let logical = deepcode_kernel_tools::hash_bytes(identity.as_bytes());
+        let component = super::output_directory_key(identity);
+        assert!(logical.starts_with("sha256:"));
+        assert_eq!(component, logical.replacen(':', "-", 1));
+        assert!(!component
+            .chars()
+            .any(|character| r#"<>:\"/\|?*"#.contains(character)));
     }
 }

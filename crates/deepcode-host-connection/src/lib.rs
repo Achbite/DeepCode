@@ -10,6 +10,29 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+// Presentation DTO for both desktop Host shells; contains no Session facts.
+pub const HOST_STARTUP_STATUS_SCHEMA: &str = "deepcode.host-shell.startup-status";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStartupStatusV1 {
+    pub schema_version: &'static str,
+    pub revision: u64,
+    pub attempt_id: String,
+    pub mode: &'static str,
+    pub phase: &'static str,
+    pub stage: &'static str,
+    pub code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    pub message: String,
+    pub retryable: bool,
+    pub owns_processes: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_ref: Option<String>,
+    pub updated_at: String,
+}
+
 const CONNECTION_FILE: &str = "runtime/agent-runtime/host-connection.json";
 
 #[derive(Clone, Serialize, Deserialize)]

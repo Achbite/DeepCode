@@ -593,19 +593,22 @@ fn responses_input(messages: Vec<Value>) -> Result<Vec<Value>, ProviderTransport
                 })?;
             let arguments = call
                 .get("input")
-                .filter(|input| input.is_object())
+                .filter(|input| input.is_object() || input.is_string())
                 .ok_or_else(|| {
                     ProviderTransportError::message(
                         "provider_envelope_invalid",
-                        "Responses function_call 参数不是对象。",
+                        "Responses function_call 参数不是对象或原始 JSON 字符串。",
                     )
                 })?;
-            let arguments = serde_json::to_string(arguments).map_err(|error| {
-                ProviderTransportError::message(
-                    "provider_request_encode_failed",
-                    format!("无法编码 Responses function_call 参数：{error}"),
-                )
-            })?;
+            let arguments = match arguments {
+                Value::String(text) => text.clone(),
+                value => serde_json::to_string(value).map_err(|error| {
+                    ProviderTransportError::message(
+                        "provider_request_encode_failed",
+                        format!("无法编码 Responses function_call 参数：{error}"),
+                    )
+                })?,
+            };
             input.push(json!({
                 "type": "function_call",
                 "call_id": call_id,
@@ -802,7 +805,7 @@ impl ProviderTransportError {
         }
     }
 
-    fn message(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn message(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             http_status: None,
@@ -895,7 +898,7 @@ fn prepare_provider_request(
             require_tool_call,
         )?,
         ProviderStreamKind::Anthropic => {
-            anthropic_stream_request_body(profile, messages, &tools, require_tool_call)
+            anthropic_stream_request_body(profile, messages, &tools, require_tool_call)?
         }
         ProviderStreamKind::Ollama => {
             ollama_stream_request_body(profile, messages, &tools, require_tool_call)
@@ -1559,7 +1562,7 @@ pub(crate) fn local_agent_provider_stream_response(
                     json!({
                         "callId": call.id,
                         "name": call.name,
-                        "input": call.arguments,
+                        "arguments": call.arguments,
                     }),
                 );
                 yield Ok::<Bytes, Infallible>(Bytes::from(packet));
@@ -2091,7 +2094,7 @@ mod tests {
         deepseek.provider_flavor = Some("deepseek".into());
         deepseek.thinking = Some("enabled".into());
         deepseek.reasoning_effort = Some("high".into());
-        let body = anthropic_stream_request_body(&deepseek, vec![], &[], false);
+        let body = anthropic_stream_request_body(&deepseek, vec![], &[], false).unwrap();
         assert_eq!(body["thinking"], json!({"type":"enabled"}));
         assert_eq!(body["output_config"], json!({"effort":"high"}));
         let glm = openai_compatible_message(
@@ -2099,6 +2102,46 @@ mod tests {
             ProviderThinkingCompatibility::Glm,
         );
         assert_eq!(glm["reasoning_content"], "reasoning");
+    }
+
+    #[test]
+    fn replay_preserves_raw_arguments_and_rejects_unrepresentable_anthropic_input() {
+        let message = |input: Value| {
+            json!({
+                "role": "assistant", "content": "", "toolCalls": [{
+                    "callId": "call:1", "providerCallId": "native:1", "name": "fs_read", "input": input,
+                }],
+            })
+        };
+        for raw in [r#"{"path":"a.txt"}"#, r#"{"path":"a.txt"#, "[]", ""] {
+            let body = responses_request_body(
+                &test_profile("responses"),
+                vec![message(json!(raw))],
+                &[],
+                &[],
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(body["input"][0]["arguments"], raw);
+            let result = anthropic_stream_request_body(
+                &test_profile("anthropic"),
+                vec![message(json!(raw))],
+                &[],
+                false,
+            );
+            if raw == r#"{"path":"a.txt"}"# {
+                assert_eq!(
+                    result.unwrap()["messages"][0]["content"][0]["input"],
+                    json!({"path":"a.txt"})
+                );
+            } else {
+                assert_eq!(
+                    result.unwrap_err().code,
+                    "provider_tool_arguments_unrepresentable"
+                );
+            }
+        }
     }
 
     #[tokio::test]

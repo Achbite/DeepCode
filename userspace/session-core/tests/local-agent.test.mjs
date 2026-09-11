@@ -20,6 +20,7 @@ import { messagesFromJournal } from '../dist/local-agent/contextComposer.js';
 import { decodeSessionControlCall } from '../dist/local-agent/sessionControls.js';
 import { HttpProviderPort } from '../dist/local-agent/httpPorts.js';
 import { responseFrames } from '../dist/responseFrames.js';
+import { environmentInstruction } from '../dist/local-agent/sessionEnvironment.js';
 import { createProviderToolAliases } from '../dist/local-agent/providerToolCodec.js';
 import {
   workspaceBinding,
@@ -169,6 +170,84 @@ test('message uses one prepared runtime through composition, completion, cache p
   }]);
 
   await actor.dispose();
+});
+
+test('Session environment survives new runs, restart and compaction without changing the Provider prefix', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:environment';
+  await createSession(journal, sessionId);
+  let observed = { os: 'linux', arch: 'aarch64', locale: 'zh-CN', responseLanguage: 'zh-CN', userShell: '/bin/bash' };
+  const saved = environmentInstruction(observed);
+  const preparation = fakeRunPreparation();
+  const port = {
+    ...preparation.port,
+    async prepare(request) {
+      const prepared = await preparation.port.prepare(request);
+      prepared.runtimeSnapshot.instructions.push(environmentInstruction(observed));
+      return prepared;
+    },
+  };
+  const requests = [];
+  const provider = { async *stream(request) {
+    requests.push(structuredClone(request));
+    yield providerEvent(request.requestId, 'assistant.message', {
+      messageId: `provider-message:${request.requestId}`,
+      content: request.purpose === 'contextCompaction' ? 'Saved task facts only.' : 'Task result.',
+    });
+    yield providerEvent(request.requestId, 'completed', {});
+  } };
+  let actor = actorWith(journal, sessionId, provider, emptyKernel(), port, 'environment');
+  t.after(() => actor.dispose());
+  let runCount = 0;
+  const submit = async (text) => {
+    runCount += 1;
+    await actor.submit(messageCommand(sessionId, `command:environment:${runCount}`, text));
+    await waitForProjection(actor, (value) => value.run?.status === 'completed'
+      && preparation.prepared.length === runCount);
+    await waitUntil(() => preparation.released.length === runCount, 'environment runtime release');
+  };
+  await submit('First task.');
+  observed = { ...observed, locale: 'en-US', responseLanguage: 'en-US', userShell: '/bin/zsh' };
+  await submit('Another task.');
+  await actor.dispose();
+  actor = actorWith(journal, sessionId, provider, emptyKernel(), port, 'environment-reopened');
+  await actor.recover();
+  await submit('Continue after restart.');
+  await actor.submit({
+    schemaVersion: 'deepcode.command.v3', type: 'context.focus',
+    commandId: 'command:environment-focus', sessionId, task: 'Continue with the saved facts.',
+  });
+  await waitForProjection(actor, (value) => value.run?.status === 'completed'
+    && preparation.prepared.length === 4);
+  await waitUntil(() => preparation.released.length === 4, 'environment focus release');
+
+  const agentRequests = requests.filter((request) => request.purpose === 'agent');
+  assert.equal(agentRequests.length, 4);
+  const prefix = agentRequests[0].messages.slice(0, 2);
+  assert.deepEqual(prefix, [
+    { role: 'system', content: 'Stable core instruction.' },
+    { role: 'system', content: saved.text },
+  ]);
+  for (const request of agentRequests) {
+    assert.deepEqual(request.messages.slice(0, prefix.length), prefix);
+    assert.deepEqual(request.tools, agentRequests[0].tools);
+    assert.equal(request.messages.filter((message) => message.content === saved.text).length, 1);
+  }
+  assert.ok(agentRequests[3].messages.some((message) => message.content?.includes('Saved task facts only.')));
+  assert.equal(requests.filter((request) => request.purpose === 'contextCompaction').length, 1);
+  const runs = (await readEvents(journal, sessionId)).filter((event) => event.type === 'run.started');
+  assert.equal(runs.length, 4);
+  for (const run of runs) {
+    assert.deepEqual(run.payload.runtimeSnapshot.instructions.find((item) => item.id === saved.id), saved);
+  }
+
+  const newSession = 'session:environment-new';
+  await createSession(journal, newSession);
+  const fresh = actorWith(journal, newSession, provider, emptyKernel(), port, 'environment-new');
+  t.after(() => fresh.dispose());
+  await fresh.submit(messageCommand(newSession, 'command:environment-new', 'A new conversation.'));
+  await waitForProjection(fresh, (value) => value.run?.status === 'completed');
+  assert.equal(requests.at(-1).messages[1].content, environmentInstruction(observed).text);
 });
 
 test('run binding exposes hosted search once and replays its Provider item unchanged', async () => {
@@ -3558,4 +3637,112 @@ test('plan preview reads complete JSON fields and keeps its display buffer bound
   const bounded = delta('x'.repeat(100_000));
   assert.equal(bounded.truncated, true);
   assert.ok(JSON.stringify(bounded).length < 9000);
+});
+
+test('aggregate input admission preserves raw errors, permits correction, and never replays an executed peer', async (t) => {
+  for (const [suffix, invalid, code] of [
+    ['json', '{"workspace":"primary","path":', 'provider_tool_call_arguments_invalid'],
+    ['workspace', '{"workspace":"unknown","path":"probe.txt"}', 'provider_workspace_handle_not_bound'],
+  ]) {
+    const journal = new InMemoryCommandJournal();
+    const sessionId = `session:aggregate-input-${suffix}`;
+    await createSession(journal, sessionId, [workspaceBinding]);
+    const tool = { toolBindingRef: 'tool-binding:read:g1', name: 'fs.read', description: 'Read a file.',
+      inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } },
+      possibleEffects: ['workspaceRead'], availability: 'callable', origin: 'coreBuiltin' };
+    const executions = [];
+    const kernel = emptyKernel({ async execute(request) {
+      executions.push(request); return completedExecutionReply(request, { content: 'Read result.' });
+    } });
+    const requests = [];
+    const provider = { async *stream(request) {
+      requests.push(structuredClone(request));
+      assert.ok(requests.length <= 4);
+      const name = request.tools.find((candidate) => candidate.inputSchema.properties?.path).name;
+      if (requests.length === 1) {
+        yield providerEvent(request.requestId, 'tool.call', { callId: 'native:ok', name, arguments: '{"workspace":"primary","path":"first.txt"}' });
+        yield providerEvent(request.requestId, 'tool.call', { callId: 'native:bad', name, arguments: invalid });
+      } else if (requests.length === 2) {
+        assert.equal(executions.length, 1);
+        const raw = request.messages.flatMap((message) => message.toolCalls ?? []).find((call) => call.providerCallId === 'native:bad');
+        assert.equal(raw.input, invalid, 'the model sees its exact original arguments');
+        const rejected = request.messages.map(jsonMessagePayload).find((value) => value?.status === 'inputRejected');
+        assert.equal(rejected.executed, false);
+        assert.equal(rejected.error.code, code);
+        assert.deepEqual(request.tools, requests[0].tools);
+        assert.deepEqual(request.messages.slice(0, requests[0].messages.length), requests[0].messages);
+        yield providerEvent(request.requestId, 'tool.call', { callId: 'native:corrected', name, arguments: '{"workspace":"primary","path":"probe.txt"}' });
+      } else {
+        if (requests.length === 4) {
+          assert.equal(name, 'read_current_run');
+          const historical = request.messages.flatMap((message) => message.toolCalls ?? []).find((call) => call.providerCallId === 'native:bad');
+          assert.equal(historical.name, requests[0].tools.find((candidate) => candidate.inputSchema.properties?.path).name);
+          assert.equal(historical.input, invalid, 'rejected history keeps the original owner alias and arguments');
+        }
+        yield providerEvent(request.requestId, 'assistant.message', { messageId: `native:answer:${requests.length}`, content: 'Both files read.' });
+      }
+      yield providerEvent(request.requestId, 'completed', {});
+    } };
+    const preparation = fakeRunPreparation({ tools: [tool] });
+    const actor = actorWith(journal, sessionId, provider, kernel, {
+      ...preparation.port,
+      async prepare(request) {
+        const result = await preparation.port.prepare(request);
+        if (preparation.prepared.length > 1) {
+          result.runtimeSnapshot.providerToolAliases.find((alias) => alias.canonicalName === 'fs.read').wireName = 'read_current_run';
+        }
+        return result;
+      },
+    }, `aggregate-${suffix}`);
+    t.after(() => actor.dispose());
+    await actor.submit(messageCommand(sessionId, 'command:start', 'Read both files.'));
+    const projection = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+    assert.deepEqual(executions.map((request) => request.input.path), ['first.txt', 'probe.txt']);
+    const rejected = Object.values(projection.activities).filter((activity) => activity.status === 'rejected');
+    assert.equal(rejected.length, 1);
+    assert.equal(rejected[0].inputRejection.code, code);
+    const timelineActivities = projection.timeline.flatMap((item) => item.kind === 'toolGroup' ? item.activityIds : []);
+    assert.ok(timelineActivities.includes(rejected[0].activityId), 'a rejected activity must appear in the shared timeline');
+    await actor.submit(messageCommand(sessionId, 'command:followup', 'Summarize the earlier result.'));
+    await waitForProjection(actor, (value) => value.run?.runId !== projection.run.runId && value.run?.status === 'completed');
+    assert.equal(executions.length, 2, 'a new run must not execute rejected historical calls');
+  }
+});
+
+test('mixed Plan batches are rejected before any effect and can be corrected to an independently confirmed plan', async (t) => {
+  for (const surface of ['aggregate', 'responses']) {
+    const journal = new InMemoryCommandJournal();
+    const sessionId = `session:plan-batch-${surface}`;
+    await createSession(journal, sessionId, [workspaceBinding]);
+    const plan = { title: 'Read a file', summary: 'Verify the file.', steps: [{ stepId: 'read', title: 'Read', details: 'Read the file.' }], mutationManifest: [] };
+    const tool = { toolBindingRef: 'tool-binding:read:g1', name: 'fs.read', description: 'Read a file.',
+      inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } },
+      possibleEffects: ['workspaceRead'], availability: 'callable', origin: 'coreBuiltin' };
+    let turns = 0;
+    const provider = { async *stream(request) {
+      assert.ok(++turns <= 2);
+      const name = request.tools.find((candidate) => candidate.inputSchema.properties?.mutationManifest).name;
+      const emit = (id, name, input, outputIndex) => surface === 'aggregate'
+        ? providerEvent(request.requestId, 'tool.call', { callId: id, name, arguments: JSON.stringify(input) })
+        : providerEvent(request.requestId, 'output.item.completed', { outputIndex, item: {
+          type: 'function_call', call_id: id, name, arguments: JSON.stringify(input), status: 'completed' } });
+      if (turns === 2) {
+        const errors = request.messages.map(jsonMessagePayload).filter((value) => value?.status === 'inputRejected');
+        assert.equal(errors.length, 2);
+        assert.ok(errors.every((value) => value.executed === false && value.error.code === 'session_control_turn_conflict'));
+      }
+      yield emit(`native:plan-${turns}`, name, plan, 0);
+      if (turns === 1) yield emit('native:read', request.tools.find((candidate) => candidate.inputSchema.properties?.path).name,
+        { workspace: 'primary', path: 'probe.txt' }, 1);
+      yield providerEvent(request.requestId, 'completed', {});
+    } };
+    const actor = actorWith(journal, sessionId, provider, emptyKernel(), fakeRunPreparation({ tools: [tool] }).port, `mixed-${surface}`);
+    t.after(() => actor.dispose());
+    await actor.submit(messageCommand(sessionId, 'command:start', 'Prepare a plan.'));
+    const projection = await waitForProjection(actor, (value) => value.pendingPlan !== null);
+    assert.equal(projection.activePlanRef, null);
+    const events = await readEvents(journal, sessionId);
+    assert.equal(events.filter((event) => event.type === 'plan.published').length, 1);
+    assert.equal(events.some((event) => event.type === 'tool.requested' || event.type === 'plan.confirmed'), false);
+  }
 });

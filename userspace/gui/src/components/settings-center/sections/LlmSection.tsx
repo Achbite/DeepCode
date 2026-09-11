@@ -261,12 +261,11 @@ const LlmSection: React.FC = () => {
       delete next[id];
       return next;
     });
-    setDefaultProfileId((prev) =>
-      prev === id ? profiles.find((profile) => profile.id !== id)?.id : prev
-    );
+
   };
 
   const save = async () => {
+    if (!profiles.some((profile) => profile.id === defaultProfileId && profile.enabled)) return;
     setLoading(true);
     setMessage(null);
     const savableProfiles = profiles;
@@ -334,6 +333,9 @@ const LlmSection: React.FC = () => {
     [profiles]
   );
 
+  const defaultValid = defaultOptions.some((profile) => profile.id === defaultProfileId);
+  const selectedDefault = profiles.find((profile) => profile.id === defaultProfileId);
+
   return (
     <div>
       <h2 className="settings-title">{t(language, 'settings.llm.title')}</h2>
@@ -371,7 +373,7 @@ const LlmSection: React.FC = () => {
           <button
             className="settings-action-button"
             onClick={() => void save()}
-            disabled={loading || !hasProfiles}
+            disabled={loading || !hasProfiles || !defaultValid}
           >
             {t(language, 'settings.common.save')}
           </button>
@@ -384,7 +386,7 @@ const LlmSection: React.FC = () => {
           </button>
         </div>
 
-        {defaultOptions.length > 0 && (
+        {(hasProfiles || defaultProfileId) && (
           <label className="llm-default-row">
             <span>{t(language, 'settings.llm.defaultProfile')}</span>
             <select
@@ -392,6 +394,10 @@ const LlmSection: React.FC = () => {
               value={defaultProfileId ?? ''}
               onChange={(e) => setDefaultProfileId(e.target.value)}
             >
+              {!defaultValid && <option value={defaultProfileId ?? ''} disabled>
+                {selectedDefault?.name ?? defaultProfileId ?? t(language, 'agent.profile.selectionRequired')}
+                {defaultProfileId ? ` · ${t(language, selectedDefault ? 'agent.profile.disabled' : 'agent.profile.missing')}` : ''}
+              </option>}
               {defaultOptions.map((profile) => (
                 <option key={profile.id} value={profile.id}>
                   {profile.name}
@@ -400,6 +406,10 @@ const LlmSection: React.FC = () => {
             </select>
           </label>
         )}
+
+        {(hasProfiles || defaultProfileId) && !defaultValid && <p className="settings-card__hint" role="alert">
+          {t(language, 'settings.llm.defaultUnavailable')}
+        </p>}
 
         {profiles.length === 0 && (
           <div className="settings-card__hint">

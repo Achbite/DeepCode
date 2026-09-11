@@ -1,14 +1,19 @@
+mod render;
+
 use deepcode_kernel_client::{
     approval_response_command, cancel_command, focus_command, interaction_response_command,
     is_terminal_run_status, message_command_with_profile_and_plugins, plan_cancel_command,
-    plan_confirm_command, plan_revision_command, ActivityProjection, ApprovalProjection,
-    CreateConversationSessionRequest, FilesystemReference, FilesystemReferencePathInput,
-    HttpKernelClient, InteractionProjection, KernelBootstrap, KernelBootstrapOptions,
-    NarrativeProjection, PendingPlanProjection, PlanProjection, PluginCatalogProjection,
-    PluginSelectionInput, ProjectionMessage, SessionProjection, SessionTimelineItem,
+    plan_confirm_command, plan_revision_command, CreateConversationSessionRequest,
+    FilesystemReference, FilesystemReferencePathInput, HttpKernelClient, InteractionProjection,
+    KernelBootstrap, KernelBootstrapOptions, PluginCatalogProjection, PluginSelectionInput,
+    SessionProjection,
+};
+use render::{
+    render_action_required_if_any, render_projection, render_run_state, render_terminal_error,
+    CliRenderState,
 };
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -494,7 +499,8 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
                 .conversation_projection(session_id)
                 .await
                 .map_err(|error| error.to_string())?;
-            render_projection(&projection, true);
+            render_projection(&mut io::stdout().lock(), &projection)
+                .map_err(|error| error.to_string())?;
             Ok(outcome_for_projection(&projection).unwrap_or(Outcome::Done))
         }
         Command::CancelPlan => {
@@ -509,16 +515,7 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
                 .ok_or_else(|| "当前没有待处理 Plan。".to_string())?;
             let command = plan_cancel_command(session_id, &new_id("command"), plan);
             submit_checked(client, session_id, &command).await?;
-            wait_for_projection(
-                client,
-                session_id,
-                before.revision,
-                last_timeline_sequence(&before),
-                todo_sequence(&before),
-                before.messages.len(),
-                args.plain,
-            )
-            .await
+            wait_for_projection(client, &before, args.plain).await
         }
         Command::Cancel { run_id } => {
             let session_id = require_session(args.session_id.as_deref())?;
@@ -528,7 +525,8 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
                 .conversation_projection(session_id)
                 .await
                 .map_err(|error| error.to_string())?;
-            render_run_state(&projection);
+            render_run_state(&mut io::stdout().lock(), &projection)
+                .map_err(|error| error.to_string())?;
             Ok(outcome_for_projection(&projection).unwrap_or(Outcome::Done))
         }
         Command::AttachDirectory { path } => {
@@ -644,16 +642,7 @@ async fn submit_input_and_wait(
         plugin_binding,
     )?;
     submit_checked(client, &before.session_id, &command).await?;
-    wait_for_projection(
-        client,
-        &before.session_id,
-        before.revision,
-        last_timeline_sequence(before),
-        todo_sequence(before),
-        before.messages.len(),
-        plain,
-    )
-    .await
+    wait_for_projection(client, before, plain).await
 }
 
 fn contextual_input_command(
@@ -788,11 +777,7 @@ async fn submit_checked(
 
 async fn wait_for_projection(
     client: &HttpKernelClient,
-    session_id: &str,
-    start_revision: u64,
-    start_timeline_sequence: u64,
-    start_todo_sequence: u64,
-    start_message_count: usize,
+    before: &SessionProjection,
     plain: bool,
 ) -> Result<Outcome, String> {
     let timeout = env::var("DEEPCODE_CLI_RUN_TIMEOUT_MS")
@@ -801,109 +786,56 @@ async fn wait_for_projection(
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_RUN_TIMEOUT);
     let deadline = Instant::now() + timeout;
-    let mut last_revision = start_revision;
-    let mut rendered_sequence = start_timeline_sequence;
-    let mut rendered_todo_sequence = start_todo_sequence;
-    let mut live_text = HashMap::<String, String>::new();
-    let mut live_stream: Option<String> = None;
-    let mut live_open = false;
+    let session_id = &before.session_id;
+    let mut output = if plain {
+        CliRenderState::default()
+    } else {
+        CliRenderState::after(before)
+    };
     loop {
         if Instant::now() >= deadline {
+            output
+                .finish_text(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
             return Err("等待 Agent 运行结束超时。".to_string());
         }
-        let projection = client
-            .conversation_projection(session_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        if projection.revision > last_revision {
-            if !plain {
-                let live_stream_visible =
-                    projection.assistant_draft.as_ref().is_some_and(|draft| {
-                        draft.blocks.iter().any(|block| {
-                            block.text().is_some_and(|(stream_id, _)| {
-                                live_stream.as_deref() == Some(stream_id)
-                            })
-                        })
-                    });
-                if !live_stream_visible && live_open {
-                    eprintln!();
-                    live_open = false;
-                }
-                render_increment_except(&projection, rendered_sequence, Some(&mut live_text));
-                if projection
-                    .todo_list
-                    .as_ref()
-                    .is_some_and(|todo| todo.sequence > rendered_todo_sequence)
-                {
-                    render_todo(&projection);
-                }
+        let projection = match client.conversation_projection(session_id).await {
+            Ok(projection) => projection,
+            Err(error) => {
+                output
+                    .finish_text(&mut io::stdout().lock())
+                    .map_err(|error| error.to_string())?;
+                return Err(error.to_string());
             }
-            rendered_sequence = last_timeline_sequence(&projection);
-            rendered_todo_sequence = todo_sequence(&projection);
-            last_revision = projection.revision;
-        }
+        };
         if !plain {
-            if let Some(draft) = projection.assistant_draft.as_ref() {
-                if let Some(preview) = draft.plan_preview.as_ref() {
-                    let key = format!(
-                        "plan-preview:{}:{}",
-                        draft.turn_id, preview.provider_call_id
-                    );
-                    let status = format!(
-                        "正在生成计划 · {} · {} 个步骤",
-                        preview.title,
-                        preview.steps.len()
-                    );
-                    if live_text.get(&key) != Some(&status) {
-                        if live_open {
-                            eprintln!();
-                            live_open = false;
-                        }
-                        eprintln!("{status}");
-                        live_text.insert(key, status);
-                    }
-                }
-                for block in &draft.blocks {
-                    let Some((stream_id, content)) = block.text() else {
-                        continue;
-                    };
-                    let previous = live_text.get(stream_id).map(String::as_str).unwrap_or("");
-                    if content == previous {
-                        continue;
-                    }
-                    if live_stream.as_deref() != Some(stream_id) && live_open {
-                        eprintln!();
-                        live_open = false;
-                    }
-                    if let Some(delta) = content.strip_prefix(previous) {
-                        eprint!("{delta}");
-                    } else {
-                        if live_open {
-                            eprintln!();
-                        }
-                        eprint!("{content}");
-                    }
-                    io::stderr().flush().map_err(|error| error.to_string())?;
-                    live_open = true;
-                    live_stream = Some(stream_id.to_string());
-                    live_text.insert(stream_id.to_string(), content.to_string());
-                }
-            }
+            output
+                .render(&mut io::stdout().lock(), &projection)
+                .map_err(|error| error.to_string())?;
         }
         if let Some(run) = projection.run.as_ref() {
             if run.status == "waiting" {
-                render_action_required(&projection);
+                output
+                    .render_action_required(&mut io::stdout().lock(), &projection)
+                    .map_err(|error| error.to_string())?;
                 return Ok(Outcome::ActionRequired);
             }
             if is_terminal_run_status(&run.status) {
                 if plain && run.status == "completed" {
-                    if let Some(text) = projection.last_assistant_text(start_message_count) {
+                    if let Some(text) = projection.last_assistant_text(before.messages.len()) {
                         println!("{text}");
                     }
                 } else if !plain {
-                    render_run_state(&projection);
+                    let mut stdout = io::stdout().lock();
+                    output
+                        .finish_run(&mut stdout, &projection)
+                        .map_err(|error| error.to_string())?;
+                    render_run_state(&mut stdout, &projection)
+                        .map_err(|error| error.to_string())?;
+                    stdout.flush().map_err(|error| error.to_string())?;
                 }
-                render_terminal_error(&projection);
+                render_terminal_error(&mut io::stderr().lock(), &projection)
+                    .map_err(|error| error.to_string())?;
                 return Ok(outcome_for_projection(&projection).unwrap_or(Outcome::Done));
             }
         }
@@ -911,6 +843,7 @@ async fn wait_for_projection(
             _ = tokio::time::sleep(POLL_INTERVAL) => {}
             interrupted = tokio::signal::ctrl_c() => {
                 interrupted.map_err(|error| error.to_string())?;
+                output.finish_text(&mut io::stdout().lock()).map_err(|error| error.to_string())?;
                 if let Some(run) = projection.run.as_ref() {
                     let command = cancel_command(session_id, &new_id("command"), &run.run_id);
                     submit_checked(client, session_id, &command).await?;
@@ -943,7 +876,8 @@ async fn run_chat(
     };
     println!("session: {}", projection.session_id);
     println!("普通文本用于消息、交互回应或 Plan 修订；Plan 输入 1/确认后执行；effect 审批输入 1/允许或 2/拒绝；@ 显示插件，@<名称或 URI> 为下一次请求选择插件；/focus <task> 启动聚焦上下文；/attach <path> 与 /detach <workspace-id> 管理对话目录索引；/cancel-plan；/model <profile> 设置后续消息草稿；/cancel；/quit。");
-    render_action_required_if_any(&projection);
+    render_action_required_if_any(&mut io::stdout().lock(), &projection)
+        .map_err(|error| error.to_string())?;
     let mut line = String::new();
     let mut next_message_profile_id: Option<String> = None;
     loop {
@@ -972,7 +906,8 @@ async fn run_chat(
         }
         match input {
             "/quit" | "/exit" => return Ok(Outcome::Done),
-            "/show" => render_projection(&projection, true),
+            "/show" => render_projection(&mut io::stdout().lock(), &projection)
+                .map_err(|error| error.to_string())?,
             "/cancel-plan" => {
                 let plan = projection
                     .pending_plan
@@ -980,16 +915,7 @@ async fn run_chat(
                     .ok_or_else(|| "当前没有待处理 Plan。".to_string())?;
                 let command = plan_cancel_command(&projection.session_id, &new_id("command"), plan);
                 submit_checked(client, &projection.session_id, &command).await?;
-                let outcome = wait_for_projection(
-                    client,
-                    &projection.session_id,
-                    projection.revision,
-                    last_timeline_sequence(&projection),
-                    todo_sequence(&projection),
-                    projection.messages.len(),
-                    false,
-                )
-                .await?;
+                let outcome = wait_for_projection(client, &projection, false).await?;
                 projection = refresh_projection(client, &projection.session_id).await?;
                 if matches!(
                     outcome,
@@ -1004,7 +930,8 @@ async fn run_chat(
                         cancel_command(&projection.session_id, &new_id("command"), &run.run_id);
                     submit_checked(client, &projection.session_id, &command).await?;
                     projection = refresh_projection(client, &projection.session_id).await?;
-                    render_run_state(&projection);
+                    render_run_state(&mut io::stdout().lock(), &projection)
+                        .map_err(|error| error.to_string())?;
                 }
             }
             value if value.starts_with("/model ") => {
@@ -1151,494 +1078,11 @@ async fn refresh_projection(
         .map_err(|error| error.to_string())
 }
 
-fn render_projection(projection: &SessionProjection, include_messages: bool) {
-    println!(
-        "session={} revision={} run={}",
-        projection.session_id,
-        projection.revision,
-        projection
-            .run
-            .as_ref()
-            .map(|run| format!("{}:{}", run.run_id, run.status))
-            .unwrap_or_else(|| "-".to_string()),
-    );
-    if !projection.session_directory_indexes.is_empty() {
-        println!("对话目录索引：");
-        for binding in &projection.session_directory_indexes {
-            println!("  {} ({})", binding.display_name, binding.workspace_id);
-        }
-    }
-    if include_messages {
-        render_increment(projection, 0);
-    }
-    for activity in projection
-        .activities
-        .iter()
-        .filter(|activity| activity.kind != "tool")
-    {
-        eprintln!(
-            "{} [{}]: {}",
-            activity.kind, activity.status, activity.label
-        );
-    }
-    render_todo(projection);
-    render_usage(projection);
-    render_action_required_if_any(projection);
-    render_terminal_error(projection);
-}
-
-fn render_increment(projection: &SessionProjection, after_sequence: u64) {
-    render_increment_except(projection, after_sequence, None);
-}
-
-fn render_increment_except(
-    projection: &SessionProjection,
-    after_sequence: u64,
-    mut streamed_text: Option<&mut HashMap<String, String>>,
-) {
-    let items = timeline_items(projection);
-    let last_by_run: HashMap<_, _> = items
-        .iter()
-        .filter_map(|item| item.run_id().map(|run| (run.to_string(), item.sequence())))
-        .collect();
-    for item in items
-        .into_iter()
-        .filter(|item| item.sequence() > after_sequence)
-    {
-        let last_run = item
-            .run_id()
-            .filter(|run| last_by_run.get(*run) == Some(&item.sequence()))
-            .map(str::to_string);
-        match item {
-            TimelineItem::Message {
-                value: message,
-                stream_id,
-                ..
-            } => {
-                if !render_stream_remainder(
-                    &message.content,
-                    stream_id,
-                    streamed_text.as_deref_mut(),
-                ) {
-                    println!("{}: {}", message.role, message.content);
-                    render_attachments(message);
-                }
-            }
-            TimelineItem::Narrative {
-                value: narrative,
-                stream_id,
-                ..
-            } => {
-                if !render_stream_remainder(
-                    &narrative.content,
-                    Some(stream_id),
-                    streamed_text.as_deref_mut(),
-                ) {
-                    println!("{}", narrative.content);
-                }
-            }
-            TimelineItem::Plan { value: plan, .. } => render_timeline_plan(plan),
-            TimelineItem::ToolGroup { activities, .. } => {
-                for activity in activities {
-                    render_tool_activity(projection, activity);
-                }
-            }
-        }
-        if let Some(run_id) = last_run {
-            let changes = projection.file_changes_for_run(&run_id);
-            if !changes.is_empty() {
-                println!("本轮修改 · {run_id}");
-                for (record, index, change) in changes {
-                    println!(
-                        "  {} {} · deepcode-cli diff --session {} {} {}",
-                        change.kind, change.path, projection.session_id, record, index
-                    );
-                }
-            }
-        }
-    }
-}
-
-fn render_stream_remainder(
-    content: &str,
-    stream_id: Option<&str>,
-    streamed_text: Option<&mut HashMap<String, String>>,
-) -> bool {
-    let (Some(stream_id), Some(streamed_text)) = (stream_id, streamed_text) else {
-        return false;
-    };
-    let Some(previous) = streamed_text.insert(stream_id.to_string(), content.to_string()) else {
-        return false;
-    };
-    let Some(remaining) = content.strip_prefix(previous.as_str()) else {
-        return false;
-    };
-    if !remaining.is_empty() {
-        eprintln!("{remaining}");
-    }
-    true
-}
-
-fn render_tool_activity(projection: &SessionProjection, activity: &ActivityProjection) {
-    let operation = activity
-        .tool
-        .as_ref()
-        .map(|tool| tool.operation.as_str())
-        .unwrap_or(activity.label.as_str());
-    println!("工具 {operation} [{}]", activity.status);
-    if let Some(tool) = activity.tool.as_ref() {
-        if let Some(shell) = tool.shell.as_ref() {
-            println!("  $ {}", shell.command);
-            println!("  cwd: {}", shell.cwd);
-            if let Some(result) = shell.result.as_ref() {
-                println!(
-                    "  environment: shell={} · interactive={} · pathSource={} · writeScope={} · homeWritable={}",
-                    result.environment.shell,
-                    result.environment.interactive,
-                    result.environment.path_source,
-                    result.environment.write_scope,
-                    result.environment.home_writable,
-                );
-                let exit = result
-                    .exit_code
-                    .map_or_else(|| "signal/timeout".to_string(), |code| code.to_string());
-                println!(
-                    "  exit: {exit} · {} ms · {} bytes{}{}",
-                    result.duration_ms,
-                    result.captured_bytes,
-                    if result.timed_out {
-                        " · timed out"
-                    } else {
-                        ""
-                    },
-                    if result.truncated {
-                        " · truncated"
-                    } else {
-                        ""
-                    },
-                );
-                print_tool_stream("stdout", &result.stdout);
-                print_tool_stream("stderr", &result.stderr);
-            }
-        }
-        for (index, change) in tool.file_changes.iter().enumerate() {
-            if let Some(record) = &tool.record_id {
-                println!(
-                    "  {} {} -> deepcode-cli diff --session {} {} {}",
-                    change.kind, change.path, projection.session_id, record, index
-                );
-            }
-        }
-        for resource in &tool.resources {
-            match (
-                resource.kind.as_str(),
-                resource.workspace_id.as_deref(),
-                resource.logical_path.as_deref(),
-                resource.uri.as_deref(),
-            ) {
-                ("workspacePath", Some(workspace_id), Some(logical_path), _) => println!(
-                    "  {} -> deepcode-cli open-resource --session {} {} {:?}",
-                    resource.label, projection.session_id, workspace_id, logical_path,
-                ),
-                ("url", _, _, Some(uri)) => println!("  {} -> {uri}", resource.label),
-                _ => println!("  {}", resource.label),
-            }
-        }
-    }
-}
-
-fn print_tool_stream(label: &str, output: &str) {
-    if output.is_empty() {
-        return;
-    }
-    println!("  {label}:");
-    for line in output.lines() {
-        println!("    {line}");
-    }
-}
-
-fn render_todo(projection: &SessionProjection) {
-    let Some(todo) = projection.todo_list.as_ref() else {
-        return;
-    };
-    println!("Todo");
-    if todo.items.is_empty() {
-        println!("  （空）");
-        return;
-    }
-    for item in &todo.items {
-        let marker = match item.status.as_str() {
-            "completed" => "[x]",
-            "inProgress" => "[>]",
-            _ => "[ ]",
-        };
-        println!("  {marker} {}", item.label);
-    }
-}
-
-fn render_usage(projection: &SessionProjection) {
-    let usage = &projection.token_usage;
-    let cache = match (usage.cache_available, usage.cache_hit_ratio) {
-        (true, Some(ratio)) => format!("{:.0}%", ratio * 100.0),
-        _ => "--%".to_string(),
-    };
-    let coverage = if usage.cache_complete {
-        "complete"
-    } else if usage.cache_available {
-        "partial"
-    } else {
-        "unavailable"
-    };
-    eprintln!(
-        "Provider 调用 {} · 输入 {} · 输出 {} · 缓存命中 {} · 缓存读取 {} · 缓存未命中 {} · 缓存报告 {}/{} ({})",
-        usage.provider_call_count,
-        usage.input_tokens,
-        usage.output_tokens,
-        cache,
-        usage.cache_read_input_tokens,
-        usage.cache_miss_input_tokens,
-        usage.reported_call_count,
-        usage.provider_call_count,
-        coverage,
-    );
-}
-
-fn render_attachments(message: &ProjectionMessage) {
-    if !message.filesystem_references.is_empty() {
-        println!(
-            "  文件系统引用：{}",
-            message
-                .filesystem_references
-                .iter()
-                .map(|reference| reference.display_name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-}
-
-fn render_action_required_if_any(projection: &SessionProjection) {
-    if projection.pending_plan.is_some()
-        || projection.pending_interaction.is_some()
-        || projection.pending_approval.is_some()
-    {
-        render_action_required(projection);
-    }
-}
-
-fn render_action_required(projection: &SessionProjection) {
-    if let Some(plan) = projection.pending_plan.as_ref() {
-        render_plan(plan);
-        eprintln!(
-            "输入 1/确认；输入其他非空文本请求修订；显式运行 `deepcode-cli cancel-plan --session {}` 取消。",
-            projection.session_id,
-        );
-    }
-    if let Some(interaction) = projection.pending_interaction.as_ref() {
-        render_interaction(interaction);
-        eprintln!(
-            "继续：deepcode-cli ask --session {} <response>",
-            projection.session_id
-        );
-    }
-    if let Some(approval) = projection.pending_approval.as_ref() {
-        render_approval(approval);
-        eprintln!("继续：输入 1/允许 或 2/拒绝。");
-    }
-}
-
-fn render_approval(approval: &ApprovalProjection) {
-    println!("需要你批准：{}", approval.preview.summary);
-    for target in &approval.preview.logical_targets {
-        println!("  - {target}");
-    }
-}
-
-fn render_plan(plan: &PendingPlanProjection) {
-    println!("Plan · revision {}", plan.revision);
-    println!("{}", plan.title);
-    println!("{}", plan.summary);
-    for (index, step) in plan.steps.iter().enumerate() {
-        println!("{}. {}", index + 1, step.title);
-        println!("   {}", step.details);
-        if let Some(verification) = step.verification.as_ref() {
-            for item in verification {
-                println!("   验证：{item}");
-            }
-        }
-    }
-}
-
-fn render_timeline_plan(plan: &PlanProjection) {
-    println!("Plan · revision {} · {}", plan.revision, plan.status);
-    println!("{}", plan.title);
-    println!("{}", plan.summary);
-    for (index, step) in plan.steps.iter().enumerate() {
-        println!("{}. {}", index + 1, step.title);
-        println!("   {}", step.details);
-        if let Some(verification) = step.verification.as_ref() {
-            for item in verification {
-                println!("   验证：{item}");
-            }
-        }
-    }
-}
-
 fn is_plan_confirmation_input(input: &str) -> bool {
     matches!(
         input.trim().to_ascii_lowercase().as_str(),
         "1" | "y" | "yes" | "confirm"
     ) || matches!(input.trim(), "确认" | "同意")
-}
-
-fn render_interaction(interaction: &InteractionProjection) {
-    println!("需要你回答：{}", interaction.prompt);
-    if let Some(options) = interaction.options.as_ref() {
-        for (index, option) in options.iter().enumerate() {
-            match option.description.as_deref() {
-                Some(description) => println!("  {}. {}: {}", index + 1, option.label, description),
-                None => println!("  {}. {}", index + 1, option.label),
-            }
-        }
-    }
-}
-
-enum TimelineItem<'a> {
-    Message {
-        sequence: u64,
-        value: &'a ProjectionMessage,
-        stream_id: Option<&'a str>,
-    },
-    Narrative {
-        sequence: u64,
-        value: &'a NarrativeProjection,
-        stream_id: &'a str,
-    },
-    Plan {
-        sequence: u64,
-        value: &'a PlanProjection,
-    },
-    ToolGroup {
-        sequence: u64,
-        activities: Vec<&'a ActivityProjection>,
-    },
-}
-
-impl TimelineItem<'_> {
-    fn run_id(&self) -> Option<&str> {
-        match self {
-            Self::Message { value, .. } => value.run_id.as_deref(),
-            Self::Narrative { value, .. } => Some(&value.run_id),
-            Self::Plan { value, .. } => Some(&value.run_id),
-            Self::ToolGroup { activities, .. } => {
-                activities.first().map(|activity| activity.run_id.as_str())
-            }
-        }
-    }
-
-    fn sequence(&self) -> u64 {
-        match self {
-            Self::Message { sequence, .. }
-            | Self::Narrative { sequence, .. }
-            | Self::Plan { sequence, .. }
-            | Self::ToolGroup { sequence, .. } => *sequence,
-        }
-    }
-}
-
-fn timeline_items(projection: &SessionProjection) -> Vec<TimelineItem<'_>> {
-    projection
-        .timeline
-        .iter()
-        .map(|item| match item {
-            SessionTimelineItem::Message {
-                sequence,
-                message_id,
-                stream_id,
-                ..
-            } => TimelineItem::Message {
-                sequence: *sequence,
-                stream_id: stream_id.as_deref(),
-                value: projection
-                    .messages
-                    .iter()
-                    .find(|message| message.message_id == *message_id)
-                    .expect("validated Session timeline message reference"),
-            },
-            SessionTimelineItem::Narrative {
-                sequence,
-                narrative_id,
-                stream_id,
-                ..
-            } => TimelineItem::Narrative {
-                sequence: *sequence,
-                stream_id,
-                value: projection
-                    .narratives
-                    .iter()
-                    .find(|narrative| narrative.narrative_id == *narrative_id)
-                    .expect("validated Session timeline narrative reference"),
-            },
-            SessionTimelineItem::Plan {
-                sequence,
-                plan_id,
-                revision,
-                ..
-            } => TimelineItem::Plan {
-                sequence: *sequence,
-                value: projection
-                    .plans
-                    .iter()
-                    .find(|plan| plan.plan_id == *plan_id && plan.revision == *revision)
-                    .expect("validated Session timeline plan reference"),
-            },
-            SessionTimelineItem::ToolGroup {
-                sequence,
-                activity_ids,
-                ..
-            } => TimelineItem::ToolGroup {
-                sequence: *sequence,
-                activities: activity_ids
-                    .iter()
-                    .map(|activity_id| {
-                        projection
-                            .activities
-                            .iter()
-                            .find(|activity| activity.activity_id == *activity_id)
-                            .expect("validated Session timeline activity reference")
-                    })
-                    .collect(),
-            },
-        })
-        .collect()
-}
-
-fn todo_sequence(projection: &SessionProjection) -> u64 {
-    projection
-        .todo_list
-        .as_ref()
-        .map(|todo| todo.sequence)
-        .unwrap_or(0)
-}
-
-fn last_timeline_sequence(projection: &SessionProjection) -> u64 {
-    timeline_items(projection)
-        .last()
-        .map(TimelineItem::sequence)
-        .unwrap_or(0)
-}
-
-fn render_run_state(projection: &SessionProjection) {
-    if let Some(run) = projection.run.as_ref() {
-        eprintln!("run {}: {}", run.run_id, run.status);
-        render_usage(projection);
-    }
-}
-
-fn render_terminal_error(projection: &SessionProjection) {
-    if let Some(error) = projection.terminal_error.as_ref() {
-        eprintln!("{}: {}", error.code, error.message);
-    }
 }
 
 fn outcome_for_projection(projection: &SessionProjection) -> Option<Outcome> {

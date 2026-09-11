@@ -2,7 +2,6 @@ use crate::invocation_types::{KernelCanonicalInvocation, KernelDeleteTarget, Ker
 use crate::types::{Platform, ToolValidationError};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
-use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Error)]
 pub enum InvocationNormalizationError {
@@ -191,7 +190,7 @@ pub fn normalize_workspace_path(
             return Err(invalid_arguments("workspace-path"));
         }
         if part != "." {
-            parts.push(part.nfc().collect::<String>());
+            parts.push(part.to_owned());
         }
     }
     let normalized = if parts.is_empty() {
@@ -208,7 +207,7 @@ pub fn normalize_workspace_path(
 /// Normalizes a resolver-produced absolute path for Kernel-private digesting.
 ///
 /// The caller must first obtain the value from the platform filesystem
-/// resolver; this helper only materializes separators and NFC.
+/// resolver; this helper only materializes separators and preserves filename spelling.
 pub fn normalize_canonical_platform_path(
     platform: Platform,
     value: &str,
@@ -243,7 +242,7 @@ pub fn normalize_canonical_platform_path(
         if component == "." || component == ".." {
             return Err(invalid_arguments("canonical-platform-path"));
         }
-        components.push(component.nfc().collect::<String>());
+        components.push(component.to_owned());
     }
     let prefix = &materialized[..prefix_len];
     let normalized = if components.is_empty() {

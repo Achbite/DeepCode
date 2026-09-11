@@ -20,7 +20,7 @@ export interface SessionControlWireNames {
 }
 
 export function confirmedPlanExecutionInstruction(): string {
-  return 'The Plan is confirmed. Execute it now. Report step progress from observed tool result recordIds. For scope changes, publish the complete revised Plan with existing stepIds and additional steps; unchanged steps retain progress. If execution cannot continue, explain completed work and blockers in the final answer without marking unfinished Todo completed. Request user input only for a required decision.';
+  return 'The Plan is confirmed. Execute it now. Use the current Todo state and report progress from observed tool results.';
 }
 
 export function sessionControlInstructions(
@@ -182,7 +182,7 @@ export function sessionControlToolDefinitions(): readonly ProviderToolDefinition
     },
     {
       name: SESSION_CONTROL_PLAN_PUBLISH,
-      description: 'Publish a complete Plan for user confirmation. Titles use inline Markdown; summary, details and verification use Markdown. Format code names and paths with backticks. mutationManifest declares file targets, explicit deletions and Bash execution/workspace scope; fs.edit and fs.write cover the same declared file. Bash command is an optional example, not an exact script lock. Continue routine fixes within confirmed scope. Execution-time changes revise the current Plan: retain all existing stepIds (including completed steps), add new steps and submit the full effective manifest. Unchanged steps retain Todo identity and progress; changed steps become pending. Nothing is merged or authorized automatically.',
+      description: 'Publish a complete Plan for user confirmation. Titles use inline Markdown; summary, details and verification use Markdown. Format code names and paths with backticks. mutationManifest declares file targets, explicit deletions and Bash execution/workspace scope; fs.edit and fs.write cover the same declared file. Bash command is an optional example, not an exact script lock. Revise for changes to goals, file targets, destructive actions or execution scope; routine fixes within confirmed scope need no reconfirmation. Retain the current Plan when revising: retain all existing stepIds (including completed steps), add new steps and submit the full effective manifest. Unchanged steps retain Todo identity and progress; changed steps become pending. Nothing is merged or authorized automatically.',
       inputSchema: structuredClone(PLAN_SCHEMA) as JsonObject,
     },
     {

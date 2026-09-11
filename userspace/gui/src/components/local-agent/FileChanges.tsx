@@ -114,6 +114,7 @@ function FileChangePreview({ sessionId, file, statistic, close }: { sessionId: s
             'diffEditorGutter.removedLineBackground': dark ? '#402627' : '#fbe9e7',
             'diffEditor.unchangedRegionBackground': dark ? '#252830' : '#f4f4f5',
             'diffEditor.unchangedRegionForeground': dark ? '#a8acb5' : '#65676c',
+            'diffEditor.unchangedCodeBackground': '#00000000',
           },
         });
         const editor = monaco.editor.createDiffEditor(container.current, {

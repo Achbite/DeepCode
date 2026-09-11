@@ -169,6 +169,8 @@ impl LocalAgentRuntime {
             RunPreparationError::new("gui_state_lock_failed", "GUI state 锁已损坏。")
         })?;
         let settings = &gui.user_settings;
+        let environment = crate::session_environment::capture(settings)
+            .map_err(|message| RunPreparationError::new("session_environment_invalid", message))?;
         // Validate and freeze the requested Provider before starting any new
         // out-of-process plugin generation. A bad Profile must not replace the
         // currently usable tool generation or leave an unused MCP process set.
@@ -301,6 +303,7 @@ impl LocalAgentRuntime {
             ),
             "pluginConfig": plugin_config,
             "selectedPlugins": selected_plugins,
+            "environment": environment,
         });
         prepared_runs.insert(
             key,
@@ -895,7 +898,7 @@ pub(crate) async fn local_agent_provider_stream(
         .session_output_directory(&body.session_id)
         .join(format!(
             "provider-{}",
-            deepcode_kernel_tools::hash_bytes(request_id.as_bytes())
+            crate::local_agent_kernel::output_directory_key(&request_id)
         ));
     let archive_identity = json!({
         "sessionId": body.session_id,
@@ -1069,7 +1072,7 @@ fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), St
             if !valid_provider_text(&call.call_id)
                 || !valid_provider_text(&call.provider_call_id)
                 || !valid_provider_tool_name(&call.name)
-                || !call.input.is_object()
+                || !(call.input.is_object() || call.input.is_string())
                 || !call_ids.insert(call.call_id.as_str())
             {
                 return Err("Provider 请求的 toolCalls 无效或重复。".to_string());

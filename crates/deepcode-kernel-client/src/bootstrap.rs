@@ -88,7 +88,7 @@ impl KernelBootstrap {
             && std::env::var_os("DEEPCODE_PORT").is_none();
         let _shared_start_guard;
         let shared_connection = if implicit_endpoint {
-            let distribution = find_kernel_binary()
+            let distribution = find_kernel_binary()?
                 .and_then(|path| path.parent().map(Path::to_path_buf))
                 .or_else(|| {
                     std::env::current_exe()
@@ -244,7 +244,7 @@ impl KernelBootstrap {
                 });
             }
         }
-        let kernel_bin = find_kernel_binary().ok_or_else(|| {
+        let kernel_bin = find_kernel_binary()?.ok_or_else(|| {
             KernelClientError::Bootstrap(
                 "cannot find deepcode-kernel or deepcode-kernel-daemon; set DEEPCODE_KERNEL_BIN"
                     .to_string(),
@@ -301,14 +301,16 @@ impl KernelBootstrap {
             match process.child.try_wait() {
                 Ok(Some(status)) => {
                     return Err(KernelClientError::Bootstrap(format!(
-                        "owned Kernel process exited before authenticated health became ready: {status}"
+                        "owned Kernel process exited before authenticated health became ready: {status}; log: {}",
+                        process.log_path.display()
                     )));
                 }
                 Ok(None) => {}
                 Err(error) => {
                     terminate_owned_kernel_process(&mut process);
                     return Err(KernelClientError::Bootstrap(format!(
-                        "failed to observe the owned Kernel process: {error}"
+                        "failed to observe the owned Kernel process: {error}; log: {}",
+                        process.log_path.display()
                     )));
                 }
             }
@@ -320,8 +322,9 @@ impl KernelBootstrap {
 
         terminate_owned_kernel_process(&mut process);
         Err(KernelClientError::Bootstrap(format!(
-            "kernel did not become healthy at {}",
-            owned_config.base_url
+            "kernel did not become healthy at {}; log: {}",
+            owned_config.base_url,
+            process.log_path.display()
         )))
     }
 
@@ -355,6 +358,7 @@ impl Drop for KernelBootstrapGuard {
 
 struct OwnedKernelProcess {
     child: Child,
+    log_path: PathBuf,
     shutdown_target: OwnedKernelShutdownTarget,
     #[cfg(unix)]
     process_group_id: libc::pid_t,
@@ -515,11 +519,15 @@ fn is_local_kernel_url(base_url: &str) -> bool {
     )
 }
 
-fn find_kernel_binary() -> Option<PathBuf> {
+fn find_kernel_binary() -> KernelClientResult<Option<PathBuf>> {
     if let Some(path) = std::env::var_os("DEEPCODE_KERNEL_BIN").map(PathBuf::from) {
         if path.is_file() {
-            return Some(path);
+            return Ok(Some(path));
         }
+        return Err(KernelClientError::Bootstrap(format!(
+            "DEEPCODE_KERNEL_BIN points to a missing file: {}",
+            path.display()
+        )));
     }
 
     let mut search_dirs = Vec::new();
@@ -546,7 +554,7 @@ fn find_kernel_binary() -> Option<PathBuf> {
     for root in &search_dirs {
         for candidate in kernel_binary_candidates(root) {
             if candidate.is_file() {
-                return Some(candidate);
+                return Ok(Some(candidate));
             }
         }
     }
@@ -562,7 +570,7 @@ fn find_kernel_binary() -> Option<PathBuf> {
                             .join(profile)
                             .join(name);
                         if direct.is_file() {
-                            return Some(direct);
+                            return Ok(Some(direct));
                         }
                         let nested = ancestor
                             .join("DeepCode")
@@ -571,7 +579,7 @@ fn find_kernel_binary() -> Option<PathBuf> {
                             .join(profile)
                             .join(name);
                         if nested.is_file() {
-                            return Some(nested);
+                            return Ok(Some(nested));
                         }
                     }
                 }
@@ -580,7 +588,7 @@ fn find_kernel_binary() -> Option<PathBuf> {
                 for name in kernel_binary_names() {
                     let direct = ancestor.join("bin").join(platform_dir).join(name);
                     if direct.is_file() {
-                        return Some(direct);
+                        return Ok(Some(direct));
                     }
                     let nested = ancestor
                         .join("DeepCode")
@@ -588,7 +596,7 @@ fn find_kernel_binary() -> Option<PathBuf> {
                         .join(platform_dir)
                         .join(name);
                     if nested.is_file() {
-                        return Some(nested);
+                        return Ok(Some(nested));
                     }
                 }
             }
@@ -596,7 +604,7 @@ fn find_kernel_binary() -> Option<PathBuf> {
                 for name in kernel_binary_names() {
                     let direct = ancestor.join("target").join(profile).join(name);
                     if direct.is_file() {
-                        return Some(direct);
+                        return Ok(Some(direct));
                     }
                     let nested = ancestor
                         .join("DeepCode")
@@ -604,13 +612,13 @@ fn find_kernel_binary() -> Option<PathBuf> {
                         .join(profile)
                         .join(name);
                     if nested.is_file() {
-                        return Some(nested);
+                        return Ok(Some(nested));
                     }
                 }
             }
         }
     }
-    None
+    Ok(None)
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -699,7 +707,7 @@ fn spawn_kernel_binary(
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    let log_file = open_kernel_log_file(&kernel_dir)?;
+    let (log_file, log_path) = open_kernel_log_file(&kernel_dir)?;
     let stderr = log_file.try_clone().map_err(|error| {
         KernelClientError::Bootstrap(format!("failed to clone kernel log handle: {error}"))
     })?;
@@ -745,6 +753,7 @@ fn spawn_kernel_binary(
         );
         return Ok(OwnedKernelProcess {
             child,
+            log_path,
             shutdown_target,
             process_group_id,
         });
@@ -781,6 +790,7 @@ fn spawn_kernel_binary(
         );
         return Ok(OwnedKernelProcess {
             child,
+            log_path,
             shutdown_target,
             job,
         });
@@ -1080,7 +1090,7 @@ fn sanitize_lock_component(value: &str) -> String {
         .collect()
 }
 
-fn open_kernel_log_file(kernel_dir: &Path) -> KernelClientResult<File> {
+fn open_kernel_log_file(kernel_dir: &Path) -> KernelClientResult<(File, PathBuf)> {
     let log_dir = std::env::var_os("DEEPCODE_LOG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| kernel_dir.join("logs"));
@@ -1101,12 +1111,11 @@ fn open_kernel_log_file(kernel_dir: &Path) -> KernelClientResult<File> {
     }
 }
 
-fn open_log_in_dir(log_dir: &Path) -> std::io::Result<File> {
+fn open_log_in_dir(log_dir: &Path) -> std::io::Result<(File, PathBuf)> {
     std::fs::create_dir_all(log_dir)?;
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_dir.join("deepcode-kernel.log"))
+    let path = log_dir.join("deepcode-kernel.log");
+    let file = OpenOptions::new().create(true).append(true).open(&path)?;
+    Ok((file, path))
 }
 
 #[cfg(all(test, unix))]
@@ -1126,6 +1135,7 @@ mod ownership_tests {
         let pid = child.id() as libc::pid_t;
         let guard = KernelBootstrapGuard::owned(OwnedKernelProcess {
             child,
+            log_path: PathBuf::from("unused-test-log"),
             process_group_id: pid,
             shutdown_target: OwnedKernelShutdownTarget {
                 host: "127.0.0.1".into(),

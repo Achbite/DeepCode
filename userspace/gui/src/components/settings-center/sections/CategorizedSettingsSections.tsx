@@ -26,6 +26,7 @@ const INTERFACE_KEYS = [
   'gui.showReasoning',
 ] as const;
 const AGENT_INSTRUCTION_KEYS = ['agent.systemPrompt'] as const;
+const AGENT_RESPONSE_KEYS = ['agent.responseLanguage'] as const;
 const AGENT_PERMISSION_KEYS = [
   'agent.permissions.workspaceMutation',
   'agent.permissions.engineeringDecisions',
@@ -158,6 +159,10 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
   const resetUserSetting = useSettingsStore((state) => state.resetUserSetting);
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
   const available = useMemo(() => agentSettingDefinitions(), []);
+  const response = useMemo(
+    () => definitionsFor(AGENT_RESPONSE_KEYS, available, language, query),
+    [available, language, query],
+  );
   const instructions = useMemo(
     () => definitionsFor(AGENT_INSTRUCTION_KEYS, available, language, query),
     [available, language, query],
@@ -173,11 +178,11 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
   const onChange = (key: string, value: UserSettingValue) => {
     void patchUserSetting(key, value);
   };
-  const renderCard = (title: string, definitions: readonly SettingDefinition[]) => {
+  const renderCard = (title: string | null, definitions: readonly SettingDefinition[]) => {
     if (definitions.length === 0) return null;
     return (
       <div className="settings-card">
-        <h3 className="settings-card__title">{title}</h3>
+        {title && <h3 className="settings-card__title">{title}</h3>}
         <div className="settings-card__body">
           {definitions.map((definition) => (
             <SettingsField
@@ -187,6 +192,7 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
               source={sources[definition.key] ?? 'default'}
               language={language}
               disabled={loading}
+              compact={definition.key === 'agent.responseLanguage'}
               onChange={onChange}
               onReset={(key) => void resetUserSetting(key)}
             />
@@ -199,19 +205,17 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
   return (
     <div>
       <h2 className="settings-title">{t(language, 'settings.agent.title')}</h2>
-      <div className="settings-boundary-notice">
-        {t(language, 'settings.agent.scopeHint')}
-      </div>
       {pendingNextRunActivation && (
         <div className="settings-activation-notice">
           {t(language, 'settings.agent.nextRunActivationPending')}
         </div>
       )}
+      {renderCard(null, response)}
       {renderCard(t(language, 'settings.agent.instructions'), instructions)}
       {renderCard(t(language, 'settings.agent.permissions'), permissions)}
       {renderCard(t(language, 'settings.agent.webTools'), web)}
       {errorMessage && <div className="settings-error">{errorMessage}</div>}
-      {instructions.length + permissions.length + web.length === 0 && (
+      {response.length + instructions.length + permissions.length + web.length === 0 && (
         <div className="settings-card">
           <div className="settings-card__body">{t(language, 'settings.noSearchMatch')}</div>
         </div>

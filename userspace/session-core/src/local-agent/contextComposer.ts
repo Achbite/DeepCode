@@ -221,9 +221,16 @@ export function messagesFromJournal(
       ? [[event.payload.providerRequestId, event.payload.orderedOutputBlocks] as const]
       : []
   )));
+  const aggregateProviderTurns = new Map(events.flatMap((event) => (
+    event.type === 'provider.turn.settled' && event.payload.outcome === 'completed' && event.payload.toolCallInputs
+      ? [[event.payload.providerRequestId, event.payload.toolCallInputs] as const] : []
+  )));
   const orderedProviderCallIds = new Set([...orderedProviderTurns.values()].flatMap((blocks) => (
     blocks.flatMap((block) => block.kind === 'toolCall' ? [block.callId] : [])
   )));
+  for (const calls of aggregateProviderTurns.values()) {
+    for (const call of calls) orderedProviderCallIds.add(call.callId);
+  }
   const providerCallIdByLogicalCallId = providerCallIdsFromEvents(events);
   const interactionCallIds = new Map(events.flatMap((event) => (
     event.type === 'interaction.requested'
@@ -504,6 +511,39 @@ export function messagesFromJournal(
         },
       });
     } else if (event.type === 'provider.turn.settled' && event.payload.outcome === 'completed') {
+      if (event.payload.toolCallInputs) {
+        messages.push({
+          contributionId: `provider-inputs:${event.payload.providerRequestId}`,
+          contributionKind: 'journalMessages',
+          label: 'Provider calls',
+          message: {
+            role: 'assistant',
+            content: '',
+            ...providerReasoning(events, event.payload.providerRequestId),
+            toolCalls: event.payload.toolCallInputs.map((call) => ({
+              callId: call.callId,
+              providerCallId: call.providerCallId,
+              name: call.toolName,
+              input: call.arguments,
+            })),
+          },
+        });
+        for (const call of event.payload.toolCallInputs) {
+          if (!call.error) continue;
+          messages.push({
+            contributionId: `provider-input-rejection:${call.callId}`,
+            contributionKind: 'journalMessages',
+            label: `${call.toolName} input rejected`,
+            message: {
+              role: 'tool',
+              toolCallId: call.callId,
+              providerCallId: call.providerCallId,
+              content: JSON.stringify({ status: 'inputRejected', executed: false, error: call.error }),
+            },
+          });
+        }
+      }
+
       if (event.payload.orderedOutputBlocks !== undefined) {
         messages.push({
           contributionId: `provider-output:${event.payload.providerRequestId}`,
@@ -866,8 +906,8 @@ function mergeNarrativeIntoProviderCall(
       `Provider narrative 缺少完成事实：${narrative.payload.providerRequestId}`,
     );
   }
-  if (completion.payload.orderedCallIds.length === 0) return false;
-  const callIds = new Set(completion.payload.orderedCallIds);
+  const callIds = new Set(completion.payload.toolCallInputs?.map((call) => call.callId) ?? completion.payload.orderedCallIds);
+  if (callIds.size === 0) return false;
   const targets = messages.filter((contribution) => (
     contribution.message.toolCalls?.some((call) => callIds.has(call.callId))
   ));

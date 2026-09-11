@@ -54,27 +54,7 @@ struct HostStartupLease<'a> {
     processes: &'a HostProcessGroup,
 }
 
-const HOST_STARTUP_STATUS_SCHEMA: &str = "deepcode.host-shell.startup-status";
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct HostStartupStatusV1 {
-    schema_version: &'static str,
-    revision: u64,
-    attempt_id: String,
-    mode: &'static str,
-    phase: &'static str,
-    stage: &'static str,
-    code: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason_code: Option<String>,
-    message: String,
-    retryable: bool,
-    owns_processes: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    diagnostic_ref: Option<String>,
-    updated_at: String,
-}
+use deepcode_host_connection::{HostStartupStatusV1, HOST_STARTUP_STATUS_SCHEMA};
 
 struct HostStartupStatusStore {
     status: Mutex<HostStartupStatusV1>,
@@ -256,7 +236,9 @@ impl HostProcessGroup {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.shutting_down = true;
-        drop(state.children.take());
+        if let Some(mut children) = state.children.take() {
+            children.shutdown();
+        }
         while state.active_startups > 0 {
             state = self
                 .startup_idle
@@ -2128,6 +2110,37 @@ mod tests {
     #[cfg(unix)]
     fn process_exists(pid: u32) -> bool {
         unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_shell_reclaims_private_proxy_and_leaves_shared_daemon_alive() {
+        let mut shared_daemon = sleeping_owned_host_process();
+        let daemon_pid = shared_daemon.child.id();
+        let proxy = sleeping_owned_host_process();
+        let proxy_pid = proxy.child.id();
+        let processes = HostProcessGroup::new(None);
+        let installed = processes.install(OwnedHostChildren {
+            daemon: None,
+            start_guard: None,
+            proxy,
+            daemon_host: "127.0.0.1".into(),
+            daemon_port: "0".into(),
+            daemon_token: "test-token".into(),
+            daemon_identity: HostProcessIdentity {
+                service: KERNEL_DAEMON_SERVICE.into(),
+                instance_id: format!("{HOST_INSTANCE_ID_PREFIX}test"),
+                pid: daemon_pid,
+                address: "127.0.0.1:0".into(),
+            },
+        });
+        processes.detach();
+        let proxy_alive = process_exists(proxy_pid);
+        let shared_alive = process_exists(daemon_pid);
+        terminate_owned_process_tree(&mut shared_daemon);
+        assert!(installed);
+        assert!(!proxy_alive);
+        assert!(shared_alive);
     }
 
     #[test]

@@ -5,6 +5,15 @@
   "status": "active",
   "notes": "DeepCode UI localization pack. Translators can add messages/settings entries without changing frontend code.",
   "messages": {
+    "host.startup.failed": "Core service failed to start",
+    "host.startup.log": "Startup log",
+    "agent.profile.disabled": "Disabled",
+    "agent.profile.missing": "Unavailable",
+    "agent.profile.boundUnavailable": "The bound model is disabled or missing. Select an available model to send.",
+    "settings.llm.defaultUnavailable": "The default model is unavailable. Enable it or select another model before saving.",
+    "agent.tool.detail.error": "Error details",
+    "agent.tool.detail.loading": "Loading details…",
+    "agent.tool.detail.truncated": "Showing bounded content. The full record is retained in the session archive.",
     "app.startingAria": "DeepCode is starting",
     "app.starting": "Starting DeepCode...",
     "workbench.mode.aria": "Editor mode",
@@ -181,7 +190,6 @@
     "settings.gui.preferences": "Interface Preferences",
     "settings.gui.scopeHint": "These settings affect only DeepCode-GUI presentation, not the shared SessionProjection or Kernel tool facts.",
     "settings.agent.title": "Agent Settings",
-    "settings.agent.scopeHint": "These settings are shared by every UI shell. The UI edits configuration; Session composes the system prompt and Kernel applies tool permissions at the execution boundary.",
     "settings.agent.nextRunActivationPending": "Agent runtime settings were saved. The Host activates them for the next run while the current run stays unchanged.",
     "settings.agent.instructions": "System Prompt",
     "settings.agent.permissions": "Tool Permissions",
@@ -770,7 +778,7 @@
     },
     "gui.accentColor": {
       "label": "Accent color",
-      "description": "The shared color used for primary actions, active states, focus, and streaming cursors.",
+      "description": "The shared color used for primary actions, active states, and streaming cursors.",
       "options": {
         "blue": "Blue",
         "purple": "Purple",
@@ -878,6 +886,15 @@
     "terminal.integrated.spawnTimeoutMs": {
       "label": "Terminal Spawn Timeout",
       "description": "Terminal background spawn timeout in milliseconds."
+    },
+    "agent.responseLanguage": {
+      "label": "Response language",
+      "description": "Applies to new conversations",
+      "options": {
+        "auto": "Auto-detect",
+        "zh-CN": "简体中文",
+        "en-US": "English"
+      }
     },
     "agent.systemPrompt": {
       "label": "System prompt",

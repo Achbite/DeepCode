@@ -251,6 +251,12 @@ const SETTING_DEFINITION_SCHEMAS: SettingDefinitionSchema[] = [
     control: 'number',
   },
   {
+    key: 'agent.responseLanguage',
+    group: 'agent',
+    control: 'select',
+    options: ['auto', 'zh-CN', 'en-US'],
+  },
+  {
     key: 'agent.systemPrompt',
     group: 'agent',
     control: 'textarea',

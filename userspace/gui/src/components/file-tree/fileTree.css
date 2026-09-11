@@ -207,13 +207,13 @@
   min-width: 0;
   height: 22px;
   padding: 0 6px;
-  border: 1px solid var(--ft-accent);
+  border: 1px solid var(--line, #666);
   border-radius: var(--radius-sm, 4px);
   outline: none;
   background: rgba(0, 0, 0, 0.22);
   color: var(--ft-fg);
   font-size: 12px;
-  box-shadow: 0 0 0 3px var(--accent-soft, rgba(10, 132, 255, 0.15));
+  box-shadow: none;
 }
 
 .file-tree__new-error {

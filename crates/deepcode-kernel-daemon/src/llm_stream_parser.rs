@@ -206,6 +206,15 @@ impl ProviderStreamAccumulator {
                 "Provider 流结束前没有完成标记。",
             ));
         }
+        if matches!(self.finish_reason.as_deref(), Some("length" | "max_tokens")) {
+            return Err(ProviderStreamError::new(
+                "provider_output_truncated",
+                format!(
+                    "Provider 输出因 {} 截断，本轮工具未执行。",
+                    self.finish_reason.as_deref().unwrap()
+                ),
+            ));
+        }
         if !self.reasoning_signature.trim().is_empty() && self.reasoning.trim().is_empty() {
             return Err(ProviderStreamError::new(
                 "provider_reasoning_signature_without_content",
@@ -278,8 +287,9 @@ impl ProviderStreamAccumulator {
                 )
             })?;
             let arguments = match call.complete_arguments {
+                Some(value) if request_id.is_some() => Value::String(value.to_string()),
+                None if request_id.is_some() => Value::String(call.arguments),
                 Some(value) => value,
-                None if call.arguments.trim().is_empty() => json!({}),
                 None => serde_json::from_str(&call.arguments).map_err(|error| {
                     ProviderStreamError::new(
                         "provider_tool_call_arguments_invalid",
@@ -287,7 +297,7 @@ impl ProviderStreamAccumulator {
                     )
                 })?,
             };
-            if !arguments.is_object() {
+            if request_id.is_none() && !arguments.is_object() {
                 return Err(ProviderStreamError::new(
                     "provider_tool_call_arguments_invalid",
                     format!("Provider 工具调用 {index} 参数必须是 JSON 对象。"),
@@ -1187,6 +1197,45 @@ pub(crate) fn provider_tools_from_values(values: Vec<Value>) -> Vec<LlmToolDefin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncated_chat_and_anthropic_turns_cannot_finalize_even_with_complete_tool_json() {
+        for reason in ["length", "max_tokens"] {
+            let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
+            parser.ingest_payload(json!({"choices":[{"delta":{"content":"unfinished", "tool_calls":[{"index":0,"id":"call-1","function":{"name":"fs_read","arguments":"{}"}}]},"finish_reason":reason}]}).to_string().as_bytes()).unwrap();
+            parser.ingest_payload(b"[DONE]").unwrap();
+            let error = parser
+                .finalize_for_request("request:truncated")
+                .unwrap_err();
+            assert_eq!(error.code, "provider_output_truncated");
+            assert!(error.message.contains(reason));
+        }
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Anthropic);
+        parser
+            .ingest_payload(br#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#)
+            .unwrap();
+        parser
+            .ingest_payload(br#"{"type":"message_stop"}"#)
+            .unwrap();
+        assert_eq!(
+            parser
+                .finalize_for_request("request:anthropic")
+                .unwrap_err()
+                .code,
+            "provider_output_truncated"
+        );
+    }
+
+    #[test]
+    fn aggregate_session_stream_preserves_raw_arguments_for_session_admission() {
+        for arguments in ["{\"path\":", "", "[]", "{\"path\":\"probe.txt\"}"] {
+            let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::OpenAiCompatible);
+            parser.ingest_payload(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-raw","function":{"name":"fs_read","arguments":arguments}}]},"finish_reason":"tool_calls"}]}).to_string().as_bytes()).unwrap();
+            parser.ingest_payload(b"[DONE]").unwrap();
+            let output = parser.finalize_for_request("request:raw").unwrap().output;
+            assert_eq!(output.tool_calls[0].arguments, arguments);
+        }
+    }
 
     #[test]
     fn responses_summary_stays_distinct_from_native_reasoning_text() {

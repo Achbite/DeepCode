@@ -300,7 +300,7 @@ test('snapshot-scoped wire tool resolves to exact Kernel bindings, durable ToolR
         .flatMap((entry) => entry.toolCalls ?? [])
         .find((call) => call.name === wireToolName);
       assert.ok(assistantToolCall, 'continuation must include the previous tool call');
-      assert.deepEqual(assistantToolCall.input, { workspace: 'primary', path: 'README.md' });
+      assert.equal(assistantToolCall.input, '{"workspace":"primary","path":"README.md"}');
       assert.notEqual(assistantToolCall.callId, 'provider-call:read');
       assert.equal(assistantToolCall.providerCallId, 'provider-call:read');
       assert.ok(request.messages.some((entry) => (
@@ -834,8 +834,8 @@ test('Plan documents and previews render Markdown entities, code names and verif
   t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
   const { createElement } = await import('react');
   const { renderToStaticMarkup } = await import('react-dom/server');
-  const { default: PlanCard } = await loadGuiModule(t, '/src/components/local-agent/PlanCard.tsx');
-  const { PlanPreviewCard } = await loadGuiModule(t, '/src/components/local-agent/PlanPreviewCard.tsx');
+  const { default: PlanCard, PlanCardContent } = await loadGuiModule(t, '/src/components/local-agent/PlanCard.tsx');
+  const { PlanPreviewCard, PlanPreviewContent } = await loadGuiModule(t, '/src/components/local-agent/PlanPreviewCard.tsx');
   const { MarkdownInline } = await loadGuiModule(t, '/src/components/local-agent/BufferedMarkdown.tsx');
   const { ComposerDecisionPanels } = await loadGuiModule(t, '/src/components/local-agent/ComposerDecisionPanels.tsx');
   const { InteractionReplyQuote } = await loadGuiModule(t, '/src/components/local-agent/ConversationTranscript.tsx');
@@ -845,7 +845,11 @@ test('Plan documents and previews render Markdown entities, code names and verif
     steps: [{ stepId: 'write', title: '实现 `ObjectPool<T,N>`', details: '修改 `src/pool.hpp`。\n\n- 构造对象\n- 归还对象', verification: ['编译 **通过**；`exit 0`。'] }],
     mutationManifest: [{ workspaceId: 'workspace:private-id', operation: 'bash', workspaceMode: 'write', executionScope: 'workspace' }],
   };
-  const html = renderToStaticMarkup(createElement(PlanCard, { plan, active: false, language: 'zh-CN' }));
+  const published = renderToStaticMarkup(createElement(PlanCard, { plan, active: false, language: 'zh-CN' }));
+  assert.ok(published.includes('aria-expanded="false"'), 'published plans wait for the reader to expand');
+  assert.equal(published.includes('conversation-plan-document-body'), false, 'collapsed plans do not mount their long document');
+  assert.ok(published.includes('ObjectPool&lt;T,N&gt;'));
+  const html = renderToStaticMarkup(createElement(PlanCardContent, { plan, language: 'zh-CN' }));
   assert.ok(html.includes('ObjectPool&lt;T,N&gt;'));
   assert.equal(html.includes('&amp;lt;'), false, 'entities must be interpreted once by the Markdown parser');
   assert.match(html, /<code>ObjectPool&lt;T,N&gt;<\/code>/);
@@ -854,9 +858,14 @@ test('Plan documents and previews render Markdown entities, code names and verif
   assert.equal(html.includes('undefined'), false, 'optional command examples must not leak undefined');
   assert.equal(html.includes('workspace:private-id'), false, 'single-workspace review does not need internal IDs');
   assert.ok(html.includes('允许修改'));
-  const preview = renderToStaticMarkup(createElement(PlanPreviewCard, { language: 'zh-CN', preview: {
+  const previewProps = { language: 'zh-CN', preview: {
     callIndex: 0, providerCallId: 'call:preview', title: plan.title, summary: plan.summary, steps: plan.steps.map((step) => step.title), truncated: false,
-  } }));
+  } };
+  const previewCard = renderToStaticMarkup(createElement(PlanPreviewCard, previewProps));
+  assert.ok(previewCard.includes('aria-expanded="false"'));
+  assert.equal(previewCard.includes('conversation-plan-document-body'), false);
+  assert.equal(previewCard.includes('确认执行'), false);
+  const preview = renderToStaticMarkup(createElement(PlanPreviewContent, previewProps));
   for (const rendered of [html, preview]) {
     assert.ok(rendered.includes('conversation-plan-document-body'));
     assert.ok(rendered.includes('conversation-plan-document-content'));
@@ -891,6 +900,30 @@ test('reasoning details are a default-off shell preference in the real Settings 
   assert.equal(DEFAULT_USER_SETTINGS['gui.showReasoning'], false);
   assert.equal(definition.control, 'boolean');
   assert.equal(definition.group, 'gui');
+});
+
+test('response language uses the shared Settings catalog and a compact labelled control', async (t) => {
+  const { SETTING_DEFINITIONS, agentSettingDefinitions } = await loadGuiModule(t, '/src/state/settingsStore.ts');
+  const { DEFAULT_USER_SETTINGS, shellPreferenceSettingsIndex } = await import('../../protocol/dist/index.js');
+  const definition = SETTING_DEFINITIONS.find((item) => item.key === 'agent.responseLanguage');
+  const registered = agentSettingDefinitions().find((item) => item.key === definition.key);
+  assert.ok(registered);
+  const { catalog, ...registeredDefinition } = registered;
+  assert.equal(catalog.domain, 'agent');
+  assert.deepEqual(registeredDefinition, definition);
+  assert.equal(DEFAULT_USER_SETTINGS[definition.key], 'auto');
+  assert.equal(shellPreferenceSettingsIndex('gui').some((item) => item.key === definition.key), false);
+  assert.deepEqual(definition.options.map((option) => option.value), ['auto', 'zh-CN', 'en-US']);
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { default: SettingsField } = await loadGuiModule(t, '/src/components/settings-center/SettingsField.tsx');
+  const html = renderToStaticMarkup(createElement(SettingsField, {
+    definition, value: 'zh-CN', source: 'user', language: 'en-US', compact: true, onChange() {},
+  }));
+  assert.match(html, /<select[^>]+aria-label="Response language"/);
+  assert.match(html, /<option value="zh-CN" selected="">简体中文<\/option>/);
+  assert.equal(html.includes('agent.responseLanguage'), false, 'the user control does not expose the internal setting key');
+  assert.equal(html.includes('settings-field__default'), false);
 });
 
 test('GUI refresh accepts plan preview changes without a new journal revision or activity timestamp', async (t) => {
@@ -1148,4 +1181,91 @@ test('line statistics compute full-file creation, deletion and replacement witho
   assert.deepEqual(calculateChangedLines(null, 'first\r\nsecond'), { added: 2, removed: 0 });
   assert.deepEqual(calculateChangedLines('first\r\nsecond\r\n', null), { added: 0, removed: 2 });
   assert.deepEqual(calculateChangedLines('unchanged', 'unchanged\n'), { added: 1, removed: 1 });
+});
+
+
+test('disabled model bindings survive catalog refresh and cannot submit a new run', async (t) => {
+  const profiles = [
+    { id: 'profile:bound', name: 'Bound model', enabled: false, thinking: 'enabled' },
+    { id: 'profile:available', name: 'Available model', enabled: true, thinking: 'enabled' },
+  ];
+  installGuiFetch(t, async (url) => {
+    assert.equal(url.pathname, '/api/llm/profiles');
+    return Response.json({ ok: true, data: { profiles, defaultProfileId: profiles[0].id } });
+  });
+  const store = await loadGuiModelStore(t);
+  store.setState({ sessionId: 'session:bound', selectedProfileId: profiles[0].id });
+  await store.getState().refreshProfiles();
+  assert.equal(store.getState().selectedProfileId, profiles[0].id);
+  assert.equal(store.getState().defaultProfileId, profiles[0].id);
+  assert.deepEqual(store.getState().profiles, profiles);
+  await assert.rejects(store.getState().sendMessage('Continue.'), /llm_profile_unavailable/);
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { default: Selector } = await loadGuiModule(t, '/src/components/local-agent/SessionModelSelector.tsx');
+  const html = renderToStaticMarkup(createElement(Selector, {
+    language: 'zh-CN', profiles, selectedProfileId: profiles[0].id,
+    contextUsage: null, contextCompositions: [], reasoningEffortOverride: null,
+  }));
+  assert.match(html, /Bound model · 已停用/);
+  store.getState().startNewSession();
+  assert.equal(store.getState().selectedProfileId, profiles[0].id, 'an invalid configured default remains visible');
+});
+
+test('polling and command reconciliation read draft snapshots in order at the same revision', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:ordered-draft';
+  await createSession(journal, sessionId);
+  const provider = { async *stream(_request, signal) {
+    if (!signal.aborted) await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+  } };
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), fakeRunPreparation().port, 'ordered-draft');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:ordered-start', 'Plan the work.'));
+  const base = structuredClone(await waitForProjection(actor, (value) => Boolean(value.assistantDraft)));
+  base.assistantDraft.planPreview = { callIndex: 0, providerCallId: 'call:ordered-plan', title: 'Plan', summary: '', steps: ['Read source'], truncated: false };
+  const latest = structuredClone(base);
+  latest.assistantDraft.planPreview.steps.push('Verify behavior');
+  let releaseOld;
+  const held = new Promise((resolve) => { releaseOld = resolve; });
+  let reads = 0;
+  let commands = 0;
+  installGuiFetch(t, async (url) => {
+    if (url.pathname === '/api/conversation/statuses') return Response.json({ ok: true, data: [] });
+    if (url.pathname.endsWith('/commands')) {
+      commands += 1;
+      return Response.json({ ok: true, data: { schemaVersion: 'deepcode.command-reply.v3', sessionId, commandId: 'command:setting', status: 'accepted', revision: base.revision } });
+    }
+    assert.ok(url.pathname.endsWith('/projection'));
+    reads += 1;
+    if (reads === 1) { await held; return Response.json({ ok: true, data: base }); }
+    return Response.json({ ok: true, data: latest });
+  });
+  const store = await loadGuiModelStore(t);
+  store.setState({ sessionId, projection: base, selectedProfileId: 'profile:test', profiles: [
+    { id: 'profile:test', enabled: true, thinking: 'enabled' },
+  ] });
+  const polling = store.getState().refresh();
+  await waitUntil(() => reads === 1);
+  const saving = store.getState().selectReasoningEffort('low');
+  await waitUntil(() => commands === 1);
+  assert.equal(reads, 1, 'the post-command read waits for the earlier in-flight read');
+  releaseOld();
+  await Promise.all([polling, saving]);
+  assert.equal(store.getState().error, null);
+  assert.equal(reads, 2);
+  assert.deepEqual(store.getState().projection.assistantDraft.planPreview.steps, ['Read source', 'Verify behavior']);
+  assert.equal(store.getState().projection.revision, base.revision);
+});
+
+test('desktop startup diagnostics render the Host failure and log reference verbatim', async (t) => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { HostStartupDiagnostic } = await loadGuiModule(t, '/src/components/shared/HostStartupDiagnostic.tsx');
+  const status = { phase: 'failed', code: 'host_startup_process_exited',
+    message: 'Kernel exited: exit status: 71', diagnosticRef: '/runtime/logs/startup.log' };
+  const html = renderToStaticMarkup(createElement(HostStartupDiagnostic, { status, language: 'zh-CN' }));
+  assert.match(html, /Kernel exited: exit status: 71/);
+  assert.match(html, /\/runtime\/logs\/startup.log/);
+  assert.equal(renderToStaticMarkup(createElement(HostStartupDiagnostic, { status: { ...status, phase: 'ready' }, language: 'zh-CN' })), '');
 });
