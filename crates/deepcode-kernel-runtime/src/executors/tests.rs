@@ -596,3 +596,40 @@ fn file_changes_retain_each_operations_before_and_after_and_deleted_tree_files()
         "after\n"
     );
 }
+
+#[test]
+fn fs_edit_rejections_name_the_failing_edit_index_and_shape() {
+    let not_found = serde_json::json!([
+        {"oldText": "alpha", "newText": "ALPHA"},
+        {"oldText": "gamma", "newText": "GAMMA"},
+    ]);
+    let error = apply_exact_text_edits("alpha beta", &not_found).unwrap_err();
+    let KernelError::Structured {
+        code,
+        message,
+        details,
+        ..
+    } = error
+    else {
+        panic!("expected a structured patch rejection");
+    };
+    assert_eq!(code, "patch_match_not_found");
+    assert!(message.contains("edits[1]"), "{message}");
+    assert_eq!(details["editIndex"], 1);
+    assert_eq!(details["oldTextBytes"], 5);
+
+    let ambiguous = serde_json::json!([{"oldText": "dup", "newText": "x"}]);
+    let error = apply_exact_text_edits("dup dup", &ambiguous).unwrap_err();
+    let KernelError::Structured {
+        code,
+        message,
+        details,
+        ..
+    } = error
+    else {
+        panic!("expected a structured patch rejection");
+    };
+    assert_eq!(code, "patch_match_ambiguous");
+    assert!(message.contains("edits[0]"), "{message}");
+    assert_eq!(details["editIndex"], 0);
+}

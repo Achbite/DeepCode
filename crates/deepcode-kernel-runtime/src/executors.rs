@@ -341,12 +341,12 @@ fn apply_exact_text_edits(original: &str, edits: &Value) -> KernelResult<Applied
     }
 
     let mut ranges = Vec::with_capacity(edits.len());
-    for edit in edits {
+    for (edit_index, edit) in edits.iter().enumerate() {
         let old_text = required_string(edit, "oldText")?;
         let new_text = get_string_allow_empty(edit, "newText").ok_or_else(|| {
             KernelError::InvalidCommand("fs.edit edit.newText is required".to_string())
         })?;
-        let (start, end) = unique_match_range(original, &old_text)?;
+        let (start, end) = unique_match_range(original, &old_text, edit_index)?;
         ranges.push(TextEditRange {
             start,
             end,
@@ -379,30 +379,52 @@ fn apply_exact_text_edits(original: &str, edits: &Value) -> KernelResult<Applied
     })
 }
 
-fn unique_match_range(haystack: &str, needle: &str) -> KernelResult<(usize, usize)> {
+fn unique_match_range(
+    haystack: &str,
+    needle: &str,
+    edit_index: usize,
+) -> KernelResult<(usize, usize)> {
     if needle.is_empty() {
         return Err(KernelError::Structured {
             code: "patch_match_empty",
             stage: "execution",
-            message: "patch match text must not be empty".to_string(),
-            details: serde_json::json!({ "classification": "invalid_patch_match" }),
+            message: format!("fs.edit edits[{edit_index}] oldText must not be empty"),
+            details: serde_json::json!({
+                "classification": "invalid_patch_match",
+                "editIndex": edit_index,
+            }),
         });
     }
+    let needle_lines = needle.lines().count();
     let mut matches = haystack.match_indices(needle);
     let Some((start, _)) = matches.next() else {
         return Err(KernelError::Structured {
             code: "patch_match_not_found",
             stage: "execution",
-            message: "patch match did not occur in target file".to_string(),
-            details: serde_json::json!({ "classification": "stale_or_mismatched_evidence" }),
+            message: format!(
+                "fs.edit edits[{edit_index}] oldText was not found in the target file ({} bytes, {} lines)",
+                needle.len(),
+                needle_lines,
+            ),
+            details: serde_json::json!({
+                "classification": "stale_or_mismatched_evidence",
+                "editIndex": edit_index,
+                "oldTextBytes": needle.len(),
+                "oldTextLines": needle_lines,
+            }),
         });
     };
     if matches.next().is_some() {
         return Err(KernelError::Structured {
             code: "patch_match_ambiguous",
             stage: "execution",
-            message: "patch match is ambiguous; expected exactly one match".to_string(),
-            details: serde_json::json!({ "classification": "ambiguous_patch_match" }),
+            message: format!(
+                "fs.edit edits[{edit_index}] oldText matches the target file more than once; expected exactly one match"
+            ),
+            details: serde_json::json!({
+                "classification": "ambiguous_patch_match",
+                "editIndex": edit_index,
+            }),
         });
     }
     Ok((start, start + needle.len()))
