@@ -352,20 +352,26 @@ build_started_at() {
   fi
 }
 
-echo "==[build]== DeepCode cross-platform build started at $(build_started_at)"
-echo "==[build]== ROOT_DIR=$ROOT_DIR"
-echo "==[build]== host platform: $BUILD_HOST_OS"
-echo "==[build]== CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
-echo "==[build]== TMPDIR=$TMPDIR"
-echo "==[build]== PNPM_STORE_DIR=$PNPM_STORE_DIR"
-echo "==[build]== PNPM_REGISTRY=$PNPM_REGISTRY"
-echo "==[build]== DEEPCODE_BUILD_LINUX_TAURI_SHELL=$BUILD_LINUX_TAURI_SHELL"
-echo "==[build]== clean-cache=$clean_cache"
-echo "==[build]== stages: deps=$run_deps gui=$run_gui deepcode-gui=$run_deepcode_gui deepcode-gui-tauri=$run_deepcode_gui_tauri package-macos=$run_package_macos package-macos-deepcode-gui=$run_package_macos_deepcode_gui macos-package-service=$run_macos_package_service daemon=$run_daemon cli=$run_cli tui=$run_tui tauri=$run_tauri package=$run_package verify-package-runtime=$run_verify_package_runtime"
+build_start_seconds=$SECONDS
+report_build_finished() {
+  local status="$1"
+  local elapsed=$((SECONDS - build_start_seconds))
+  if [ "$status" -eq 0 ]; then
+    printf '\n==[build][SUCCESS]== completed at %s; elapsed=%ss\n' "$(build_started_at)" "$elapsed"
+  else
+    printf '\n==[build][FAILED]== stopped at %s; exit_code=%s; elapsed=%ss. See the error above.\n' \
+      "$(build_started_at)" "$status" "$elapsed" >&2
+  fi
+  return "$status"
+}
+trap 'report_build_finished "$?"' EXIT
+
+echo "==[build][START]== $(build_started_at)"
+echo "==[build]== source: $ROOT_DIR"
+echo "==[build]== host=$BUILD_HOST_OS; requested stages: ${requested_stages[*]}; clean-cache=$clean_cache"
 
 run_macos_package_products_from_host() {
   local products_csv
-  local product
   if is_docker_environment; then
     echo "==[build][error]== macOS package stages must run on the macOS host, not inside Docker." >&2
     exit 3
@@ -382,11 +388,6 @@ run_macos_package_products_from_host() {
   else
     env DEEPCODE_MACOS_KILL_RUNNING="$kill_running" DEEPCODE_MACOS_PRODUCTS="$products_csv" bash ./scripts/package-macos.sh
   fi
-  echo ""
-  echo "==[build]== DONE"
-  for product in "$@"; do
-    echo "$BIN_ROOT/macos-arm64/$product.app"
-  done
 }
 
 declare -a resolved_macos_products=()
@@ -469,6 +470,7 @@ submit_macos_package_request() {
   fi
 
   echo "==[build][package-macos]== submit product set to macOS package service: $products_csv"
+  echo "==[build][package-macos]== waiting for current-source frontend build, native packaging and runtime assembly; detailed log follows in the service receipt"
   bash ./scripts/macos-package-service.sh "${args[@]}"
 }
 
@@ -512,6 +514,10 @@ if [ "$host_macos_stage_count" -gt 0 ]; then
       run_macos_package_products_from_host "${resolved_macos_products[@]}"
     fi
   fi
+  echo "==[build][outputs]== $BIN_ROOT/macos-arm64"
+  for product in "${resolved_macos_products[@]}"; do
+    echo "==[build][app]== $BIN_ROOT/macos-arm64/$product.app"
+  done
   exit 0
 fi
 
@@ -1748,12 +1754,9 @@ if [ "$run_verify_package_runtime" = "1" ]; then
   verify_package_runtime
 fi
 
-echo ""
-echo "==[build]== DONE"
 if [ "$run_package" = "1" ]; then
-  echo "==[build]== updated distributions: $LINUX_DIR, $WIN_DIR"
-  find "$LINUX_DIR" "$WIN_DIR" -maxdepth 2 -type f 2>/dev/null | sort || true
+  printf '==[build][outputs]== %s\n' "$LINUX_DIR" "$WIN_DIR"
 else
-  [ "$run_gui" != "1" ] || printf '%s\n' "$CLIENT_DIR/dist"
-  [ "$run_deepcode_gui" != "1" ] || printf '%s\n' "$CLIENT_DIR/dist-deepcode-gui"
+  [ "$run_gui" != "1" ] || printf '==[build][outputs]== %s\n' "$CLIENT_DIR/dist"
+  [ "$run_deepcode_gui" != "1" ] || printf '==[build][outputs]== %s\n' "$CLIENT_DIR/dist-deepcode-gui"
 fi
