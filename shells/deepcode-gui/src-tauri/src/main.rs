@@ -10,7 +10,7 @@ use deepcode_kernel_abi::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -1125,7 +1125,7 @@ fn spawn_host_processes_if_available(
             true,
             diagnostic.map(|value| value.reference.clone()),
         );
-        let Some(daemon_identity) = wait_for_public_identity(
+        let daemon_identity = match wait_for_public_identity(
             &mut daemon,
             &target.host,
             &target.daemon_port,
@@ -1133,15 +1133,13 @@ fn spawn_host_processes_if_available(
             host_tokens.instance_id(),
             processes,
             40,
-        ) else {
-            terminate_owned_process_tree(&mut daemon);
-            return Err(startup_failure(
-                "daemonIdentity",
-                "host_startup_daemon_identity_failed",
-                None,
-                "The Kernel daemon did not publish the expected process identity.",
-                true,
-            ));
+            diagnostic,
+        ) {
+            Ok(identity) => identity,
+            Err(failure) => {
+                terminate_owned_process_tree(&mut daemon);
+                return Err(failure);
+            }
         };
         status.update(
             attempt_id,
@@ -1262,7 +1260,7 @@ fn spawn_host_processes_if_available(
         true,
         diagnostic.map(|value| value.reference.clone()),
     );
-    if wait_for_public_identity(
+    if let Err(failure) = wait_for_public_identity(
         &mut proxy,
         &proxy_host,
         &target.port,
@@ -1270,9 +1268,8 @@ fn spawn_host_processes_if_available(
         host_tokens.instance_id(),
         processes,
         40,
-    )
-    .is_none()
-    {
+        diagnostic,
+    ) {
         terminate_owned_process_tree(&mut proxy);
         shutdown_daemon_process(
             &mut daemon,
@@ -1281,13 +1278,7 @@ fn spawn_host_processes_if_available(
             host_tokens.daemon_token(),
             &daemon_identity,
         );
-        return Err(startup_failure(
-            "proxyIdentity",
-            "host_startup_proxy_identity_failed",
-            None,
-            "The Host UI proxy did not publish the expected process identity.",
-            true,
-        ));
+        return Err(failure);
     }
     status.update(
         attempt_id,
@@ -1625,14 +1616,67 @@ fn wait_for_public_identity(
     expected_instance_id: &str,
     processes: &HostProcessGroup,
     attempts: usize,
-) -> Option<HostProcessIdentity> {
+    diagnostic: Option<&HostDiagnosticAttempt>,
+) -> Result<HostProcessIdentity, HostStartupFailure> {
+    let (stage, identity_failure, process_name) = if expected_service == KERNEL_DAEMON_SERVICE {
+        (
+            "daemonIdentity",
+            "host_startup_daemon_identity_failed",
+            "daemon",
+        )
+    } else {
+        (
+            "proxyIdentity",
+            "host_startup_proxy_identity_failed",
+            "proxy",
+        )
+    };
     let expected_pid = process.child.id();
     for _ in 0..attempts {
         if processes.is_shutting_down() {
-            return None;
+            return Err(startup_stopped_failure());
         }
         match process.child.try_wait() {
-            Ok(Some(_)) | Err(_) => return None,
+            Ok(Some(exit_status)) => {
+                let mut message = format!(
+                    "{expected_service} exited during initialization ({exit_status}), before publishing its process identity."
+                );
+                if let Some(diagnostic) = diagnostic {
+                    let path = diagnostic
+                        .directory
+                        .join(format!("{process_name}.stderr.log"));
+                    message.push_str(&format!(
+                        "\nStartup log: {}/{process_name}.stderr.log",
+                        diagnostic.reference
+                    ));
+                    match read_startup_log_tail(&path) {
+                        Ok(tail) if !tail.trim().is_empty() => {
+                            message.push_str("\n\n");
+                            message.push_str(tail.trim());
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            message.push_str(&format!("\nCould not read startup log: {error}"))
+                        }
+                    }
+                }
+                return Err(startup_failure(
+                    stage,
+                    "host_startup_process_exited",
+                    None,
+                    message,
+                    true,
+                ));
+            }
+            Err(error) => {
+                return Err(startup_failure(
+                    stage,
+                    "host_startup_process_status_failed",
+                    None,
+                    format!("Could not read {expected_service} process status: {error}"),
+                    true,
+                ));
+            }
             Ok(None) => {}
         }
         if let Some(identity) = matching_public_identity(
@@ -1642,11 +1686,29 @@ fn wait_for_public_identity(
             expected_instance_id,
             expected_pid,
         ) {
-            return Some(identity);
+            return Ok(identity);
         }
         std::thread::sleep(Duration::from_millis(75));
     }
-    None
+    Err(startup_failure(
+        stage, identity_failure, None,
+        format!("{expected_service} did not publish the expected process identity before the startup deadline."), true,
+    ))
+}
+
+fn read_startup_log_tail(path: &Path) -> std::io::Result<String> {
+    const LIMIT: u64 = 4096;
+    let mut file = File::open(path)?;
+    let offset = file.metadata()?.len().saturating_sub(LIMIT);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.take(LIMIT).read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(if offset > 0 {
+        format!("…\n{text}")
+    } else {
+        text.into_owned()
+    })
 }
 
 fn matching_public_identity(
@@ -2099,6 +2161,53 @@ fn env_truthy(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_wait_preserves_process_exit_and_original_startup_error() {
+        let directory = std::env::temp_dir().join(format!(
+            "deepcode-startup-diagnostic-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let diagnostic = HostDiagnosticAttempt {
+            directory: directory.clone(),
+            reference: "host-startup/test-attempt".into(),
+        };
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf '%s\\n' 'session_store_event_schema_mismatch: original error' >&2; exit 17",
+        ]);
+        configure_process_capture(&mut command, Some(&directory), "daemon").unwrap();
+        let mut daemon = spawn_owned_host_process(&mut command).unwrap();
+        let status = daemon.child.wait().unwrap();
+        let failure = wait_for_public_identity(
+            &mut daemon,
+            "127.0.0.1",
+            "0",
+            KERNEL_DAEMON_SERVICE,
+            "test-instance",
+            &HostProcessGroup::new(None),
+            1,
+            Some(&diagnostic),
+        )
+        .unwrap_err();
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert_eq!(failure.stage, "daemonIdentity");
+        assert_eq!(failure.code, "host_startup_process_exited");
+        assert!(failure.message.contains(&status.to_string()));
+        assert!(failure
+            .message
+            .contains("session_store_event_schema_mismatch: original error"));
+        assert!(failure
+            .message
+            .contains("host-startup/test-attempt/daemon.stderr.log"));
+    }
 
     #[cfg(unix)]
     fn sleeping_owned_host_process() -> OwnedHostProcess {

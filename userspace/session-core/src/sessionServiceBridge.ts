@@ -326,8 +326,8 @@ function isFilesystemReferenceArray(value: unknown): boolean {
       ? [...commonKeys, 'mediaType', 'byteLength']
       : commonKeys;
     if (
-      Object.keys(reference).some((key) => !allowedKeys.includes(key))
-      || !allowedKeys.every((key) => key in reference)
+      !hasExactKeys(reference, allowedKeys, reference.kind === 'file' ? ['source'] : [])
+      || (reference.source !== undefined && reference.source !== 'pastedText')
       || !validId(reference.referenceId)
       || referenceIds.has(reference.referenceId)
       || !isWorkspaceBinding({

@@ -68,8 +68,15 @@ export function assistantDraftItems(
   return items;
 }
 
+const projectionItemCache = new WeakMap<SessionProjection, ProjectionItem[]>();
 export function projectionItems(projection: SessionProjection | null): ProjectionItem[] {
   if (!projection) return [];
+  const cached = projectionItemCache.get(projection);
+  if (cached) return cached;
+  const messages = new Map(projection.messages.map((value) => [value.messageId, value]));
+  const narratives = new Map(projection.narratives.map((value) => [value.narrativeId, value]));
+  const plans = new Map(projection.plans.map((value) => [`${value.planId}:${value.revision}`, value]));
+  const activities = new Map(projection.activities.map((value) => [value.activityId, value]));
   const items = projection.timeline.map((item): ProjectionItem => {
     switch (item.kind) {
       case 'message':
@@ -78,8 +85,7 @@ export function projectionItems(projection: SessionProjection | null): Projectio
           sequence: item.sequence,
           ...(item.streamId !== undefined ? { streamId: item.streamId } : {}),
           value: requiredProjectionValue(
-            projection.messages,
-            (message) => message.messageId === item.messageId,
+            messages.get(item.messageId),
             'conversation_timeline_message_missing',
           ),
         };
@@ -89,8 +95,7 @@ export function projectionItems(projection: SessionProjection | null): Projectio
           sequence: item.sequence,
           streamId: item.streamId,
           value: requiredProjectionValue(
-            projection.narratives,
-            (narrative) => narrative.narrativeId === item.narrativeId,
+            narratives.get(item.narrativeId),
             'conversation_timeline_narrative_missing',
           ),
         };
@@ -99,8 +104,7 @@ export function projectionItems(projection: SessionProjection | null): Projectio
           type: 'plan',
           sequence: item.sequence,
           value: requiredProjectionValue(
-            projection.plans,
-            (plan) => plan.planId === item.planId && plan.revision === item.revision,
+            plans.get(`${item.planId}:${item.revision}`),
             'conversation_timeline_plan_missing',
           ),
         };
@@ -110,8 +114,7 @@ export function projectionItems(projection: SessionProjection | null): Projectio
           sequence: item.sequence,
           groupId: item.timelineId,
           values: item.activityIds.map((activityId) => requiredProjectionValue(
-            projection.activities,
-            (activity) => activity.activityId === activityId,
+            activities.get(activityId),
             'conversation_timeline_activity_missing',
           )),
         };
@@ -125,15 +128,14 @@ export function projectionItems(projection: SessionProjection | null): Projectio
       previous.values.push(...item.values);
     } else grouped.push(item);
   }
+  projectionItemCache.set(projection, grouped);
   return grouped;
 }
 
 function requiredProjectionValue<Value>(
-  values: readonly Value[],
-  predicate: (value: Value) => boolean,
+  value: Value | undefined,
   error: string,
 ): Value {
-  const value = values.find(predicate);
   if (!value) throw new Error(error);
   return value;
 }

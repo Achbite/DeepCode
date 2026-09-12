@@ -494,6 +494,13 @@ impl SessionProjection {
                 || (activity.kind == "tool" && activity.status == "rejected")
                     != activity.input_rejection.is_some()
                 || activity.status == "rejected" && activity.tool.is_some()
+                || activity.interruption.as_ref().is_some_and(|error| {
+                    activity.kind != "tool"
+                        || activity.status != "indeterminate"
+                        || activity.tool.is_some()
+                        || error.code.is_empty()
+                        || error.message.is_empty()
+                })
                 || activity.input_rejection.as_ref().is_some_and(|error| {
                     error.code.is_empty()
                         || error.message.is_empty()
@@ -903,6 +910,7 @@ pub(crate) fn invalid_filesystem_references(references: &[FilesystemReference]) 
                     reference.logical_path != "."
                         || reference.media_type.is_some()
                         || reference.byte_length.is_some()
+                        || reference.source.is_some()
                 }
                 "file" => {
                     reference.logical_path == "."
@@ -911,6 +919,10 @@ pub(crate) fn invalid_filesystem_references(references: &[FilesystemReference]) 
                             .as_deref()
                             .is_none_or(|media_type| !valid_media_type(media_type))
                         || reference.byte_length.is_none()
+                        || reference
+                            .source
+                            .as_deref()
+                            .is_some_and(|source| source != "pastedText")
                 }
                 _ => true,
             }
@@ -1006,6 +1018,8 @@ pub struct FilesystemReference {
     pub media_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub byte_length: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for FilesystemReference {
@@ -1028,6 +1042,7 @@ impl<'de> Deserialize<'de> for FilesystemReference {
                 display_name: String,
                 media_type: String,
                 byte_length: u64,
+                source: Option<String>,
             },
             Directory {
                 reference_id: String,
@@ -1045,6 +1060,7 @@ impl<'de> Deserialize<'de> for FilesystemReference {
                 display_name,
                 media_type,
                 byte_length,
+                source,
             } => Self {
                 reference_id,
                 workspace_id,
@@ -1053,6 +1069,7 @@ impl<'de> Deserialize<'de> for FilesystemReference {
                 kind: "file".to_string(),
                 media_type: Some(media_type),
                 byte_length: Some(byte_length),
+                source,
             },
             WireReference::Directory {
                 reference_id,
@@ -1067,6 +1084,7 @@ impl<'de> Deserialize<'de> for FilesystemReference {
                 kind: "directory".to_string(),
                 media_type: None,
                 byte_length: None,
+                source: None,
             },
         })
     }
@@ -1269,6 +1287,14 @@ pub struct PlanOperation {
     pub workspace_mode: Option<String>,
     pub execution_scope: Option<String>,
     pub terminal: Option<PlanTerminalInput>,
+    pub writable_paths: Option<Vec<PlanWritePath>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanWritePath {
+    pub path: String,
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1512,6 +1538,7 @@ pub struct ActivityProjection {
     pub sequence: u64,
     pub tool: Option<ToolActivityProjection>,
     pub input_rejection: Option<ToolInputRejectionProjection>,
+    pub interruption: Option<ConversationError>,
     pub provider_hosted: Option<ProviderHostedActivityProjection>,
 }
 
@@ -1931,6 +1958,7 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                             && operation.workspace_mode.is_none()
                             && operation.execution_scope.is_none()
                             && operation.terminal.is_none()
+                            && operation.writable_paths.is_none()
                     }
                     "fs.write" | "fs.edit" => {
                         operation
@@ -1942,6 +1970,7 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                             && operation.workspace_mode.is_none()
                             && operation.execution_scope.is_none()
                             && operation.terminal.is_none()
+                            && operation.writable_paths.is_none()
                     }
                     "bash" => {
                         operation.target.is_none()
@@ -1955,6 +1984,21 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                                 operation.execution_scope.as_deref(),
                                 Some("workspace" | "host")
                             )
+                            && match &operation.writable_paths {
+                                None => operation.execution_scope.as_deref() == Some("host"),
+                                Some(paths) => {
+                                    !paths.is_empty()
+                                        && paths.len() <= 128
+                                        && paths.iter().all(|target| {
+                                            target.path != "."
+                                                && is_normalized_logical_path(&target.path)
+                                                && matches!(
+                                                    target.kind.as_str(),
+                                                    "file" | "directory"
+                                                )
+                                        })
+                                }
+                            }
                             && operation
                                 .terminal
                                 .as_ref()
@@ -2366,6 +2410,7 @@ mod tests {
             kind: "directory".to_string(),
             media_type: None,
             byte_length: None,
+            source: None,
         };
         let command = message_command_with_profile_and_plugins(
             "session:test",

@@ -79,6 +79,7 @@ export type FilesystemReference = {
       kind: 'file';
       mediaType: string;
       byteLength: number;
+      source?: 'pastedText';
     }
   | {
       kind: 'directory';
@@ -146,6 +147,8 @@ export type PlanOperation =
       command?: string;
       workspaceMode: 'write';
       executionScope: 'workspace' | 'host';
+      /** Required for workspace execution. Source paths and build output directories. */
+      writablePaths?: Array<{ path: string; kind: 'file' | 'directory' }>;
       terminal?: { stdin: string };
     };
 
@@ -750,6 +753,13 @@ export type SessionEvent =
       payload: { rejection: ToolInputRejection };
     })
   | (SessionEventBase & {
+      type: 'tool.interrupted';
+      runId: string;
+      callId: string;
+      /** Session disposition after runtime release; it does not assert a Kernel effect outcome. */
+      payload: { attemptId: string; error: LocalAgentError };
+    })
+  | (SessionEventBase & {
       type: 'tool.completed';
       runId: string;
       callId: string;
@@ -1028,6 +1038,7 @@ export interface ActivityProjection {
   sequence: number;
   tool?: ToolActivityProjection;
   inputRejection?: ToolInputRejection['error'];
+  interruption?: LocalAgentError;
   providerHosted?: ProviderHostedActivityProjection;
 }
 
@@ -1474,6 +1485,7 @@ export type WorkspaceAuthorityDecision =
       planId: string;
       revision: number;
       decisionId: string;
+      writablePaths?: Array<{ path: string; kind: 'file' | 'directory' }>;
     }
   | {
       decision: 'allow';

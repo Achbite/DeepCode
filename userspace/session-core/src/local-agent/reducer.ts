@@ -154,7 +154,8 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
     pendingPlan: previous.pendingPlan ? clonePlanProjection(previous.pendingPlan) : null,
     todoList: cloneTodoList(previous.todoList),
     contextUsage: previous.contextUsage ? { ...previous.contextUsage } : null,
-    contextCompositions: previous.contextCompositions.map(cloneContextComposition),
+    // Receipts are immutable after insertion. Clone only at the public projection boundary.
+    contextCompositions: [...previous.contextCompositions],
     tokenUsage: { ...previous.tokenUsage },
     tokenUsageHistory: Object.fromEntries(
       Object.entries(previous.tokenUsageHistory).map(([runId, usage]) => [runId, { ...usage }]),
@@ -238,7 +239,8 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         next.tokenUsageHistory[event.runId] = {
           runId: event.runId,
           inputMessageId: event.payload.inputMessageId,
-          title: inputMessage.content,
+          title: inputMessage.content.trim() ? inputMessage.content
+            : inputMessage.filesystemReferences.map((reference) => reference.displayName).join(', '),
           sequence: event.sequence,
           startedAt: event.occurredAt,
           providerCallCount: 0,
@@ -686,6 +688,17 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         next.artifacts[artifact.artifactId] = artifact;
       }
       break;
+    case 'tool.interrupted':
+      if (!next.runRuntimeReleases[event.runId]
+        || next.activities[toolActivityId(event.callId)]?.status !== 'requested') {
+        throw new Error('tool_interruption_state_invalid');
+      }
+      settleActivity(next, toolActivityId(event.callId), 'indeterminate');
+      next.activities[toolActivityId(event.callId)] = {
+        ...next.activities[toolActivityId(event.callId)],
+        interruption: { ...event.payload.error },
+      };
+      break;
     case 'session.control.rejected':
       assertRunningRun(next, event.runId, 'session_control_rejection_run_not_active');
       recordProviderCallFact(
@@ -1050,6 +1063,8 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     }
     case 'run.settled':
+      // Journal admission enforces tool closure for new settlements. Replaying
+      // stored failures must preserve unfinished calls, not hide the entire run.
       if (
         !next.pendingRunSettlements[event.runId]
         || !next.runRuntimeReleases[event.runId]
@@ -1777,6 +1792,7 @@ function cloneActivity(activity: ActivityProjection): ActivityProjection {
   return {
     ...activity,
     ...(activity.inputRejection ? { inputRejection: structuredClone(activity.inputRejection) } : {}),
+    ...(activity.interruption ? { interruption: { ...activity.interruption } } : {}),
     ...(activity.tool
       ? {
           tool: {

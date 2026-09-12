@@ -210,6 +210,17 @@ export async function detachConversationDirectoryIndex(
   return decodeProjection(projection);
 }
 
+export async function uploadConversationPastedText(
+  sessionId: string, inputId: string, text: string, signal?: AbortSignal,
+): Promise<FilesystemReference> {
+  const saved = await request<{ reference: unknown }>(
+    `${API_BASE}/conversation/sessions/${encodeURIComponent(sessionId)}/input-resources/${encodeURIComponent(inputId)}`,
+    { method: 'POST', body: text, headers: { 'Content-Type': 'text/plain; charset=utf-8' }, signal },
+  );
+  if (!isFilesystemReference(saved.reference)) throw new Error('conversation_input_resource_invalid');
+  return saved.reference as FilesystemReference;
+}
+
 export async function submitLocalAgentCommand(
   command: ConversationCommand,
   signal?: AbortSignal,
@@ -217,13 +228,10 @@ export async function submitLocalAgentCommand(
   if (command.type === 'message.submit' || command.type === 'context.focus') {
     const content = command.type === 'message.submit' ? command.text : command.task;
     if (new TextEncoder().encode(content).byteLength > 32 * 1024) {
-      const saved = await request<{ text: string; reference: FilesystemReference }>(
-        `${API_BASE}/conversation/sessions/${encodeURIComponent(command.sessionId)}/input-resources/${encodeURIComponent(command.commandId)}`,
-        { method: 'POST', body: content, headers: { 'Content-Type': 'text/plain; charset=utf-8' }, signal },
-      );
-      const filesystemReferences = [...(command.filesystemReferences ?? []), saved.reference];
-      command = command.type === 'message.submit' ? { ...command, text: saved.text, filesystemReferences }
-        : { ...command, task: saved.text, filesystemReferences };
+      const reference = await uploadConversationPastedText(command.sessionId, command.commandId, content, signal);
+      const filesystemReferences = [...(command.filesystemReferences ?? []), reference];
+      command = command.type === 'message.submit' ? { ...command, text: '', filesystemReferences }
+        : { ...command, task: '请依据本条消息的粘贴文本聚焦上下文。', filesystemReferences };
     }
   }
   const reply = await request<unknown>(
@@ -677,7 +685,8 @@ function isFilesystemReference(value: unknown): boolean {
   if (!isRecord(value)) return false;
   const common = ['referenceId', 'workspaceId', 'logicalPath', 'displayName', 'kind'];
   const keys = value.kind === 'file' ? [...common, 'mediaType', 'byteLength'] : common;
-  if (!isExactRecord(value, keys)) return false;
+  if (!isExactRecord(value, keys, value.kind === 'file' ? ['source'] : [])) return false;
+  if (value.source !== undefined && value.source !== 'pastedText') return false;
   const commonValid = isIdentifier(value.referenceId)
     && isIdentifier(value.workspaceId)
     && isNonEmptyText(value.logicalPath)
@@ -902,11 +911,16 @@ function isPlanOperation(value: unknown): boolean {
     return isExactRecord(
       value,
       ['workspaceId', 'operation', 'workspaceMode', 'executionScope'],
-      ['command', 'terminal'],
+      ['command', 'terminal', 'writablePaths'],
     )
       && (value.command === undefined || isNonEmptyText(value.command))
       && value.workspaceMode === 'write'
       && (value.executionScope === 'workspace' || value.executionScope === 'host')
+      // Read stored Plan facts as declared. Required execution scope is enforced
+      // at Plan admission and execution, not while displaying historical plans.
+      && (value.writablePaths === undefined || isArrayOf(value.writablePaths, (entry) => (
+        isExactRecord(entry, ['path', 'kind']) && isNonEmptyText(entry.path) && ['file', 'directory'].includes(String(entry.kind))
+      )) && value.writablePaths.length > 0)
       && (value.terminal === undefined || (
         isExactRecord(value.terminal, ['stdin'])
         && typeof value.terminal.stdin === 'string'
@@ -1259,7 +1273,7 @@ function isActivity(value: unknown): boolean {
   return isExactRecord(
     value,
     ['activityId', 'kind', 'status', 'label', 'runId', 'sequence'],
-    ['callId', 'tool', 'providerHosted', 'inputRejection'],
+    ['callId', 'tool', 'providerHosted', 'inputRejection', 'interruption'],
   )
     && isIdentifier(value.activityId)
     && ['run', 'tool', 'providerHosted', 'approval', 'plan', 'interaction']
@@ -1273,9 +1287,12 @@ function isActivity(value: unknown): boolean {
     && (value.tool === undefined || isToolActivity(value.tool, String(value.status)))
     && (value.providerHosted === undefined || isProviderHostedActivity(value.providerHosted))
     && (value.kind === 'tool'
-      ? value.status === 'rejected' ? value.tool === undefined && isInputRejection(value.inputRejection) : value.status === 'requested' || value.tool !== undefined
+      ? value.status === 'rejected' ? value.tool === undefined && isInputRejection(value.inputRejection)
+        : value.status === 'requested' || value.tool !== undefined
+          || value.status === 'indeterminate' && isLocalAgentError(value.interruption)
       : value.tool === undefined)
     && (value.status === 'rejected' && value.kind === 'tool') === (value.inputRejection !== undefined)
+    && (value.interruption === undefined || value.kind === 'tool' && value.status === 'indeterminate' && value.tool === undefined && isLocalAgentError(value.interruption))
     && (value.kind === 'providerHosted') === (value.providerHosted !== undefined);
 }
 

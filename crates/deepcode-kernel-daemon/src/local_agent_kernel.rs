@@ -698,8 +698,9 @@ impl LocalAgentKernel {
                         _ => false,
                     }
                 };
-                let result = start_execution
-                    .then(|| self.execute_prepared(&prepared, &request, control.cancellation()));
+                let result = start_execution.then(|| {
+                    self.execute_prepared(&prepared, &request, &authority, control.cancellation())
+                });
                 let cancel_phase = control.claim_outcome();
                 let completed_at = crate::now_text();
                 let record_result = match (cancel_phase, result) {
@@ -1300,6 +1301,24 @@ impl LocalAgentKernel {
                 continue;
             }
             if authority_covers(authority, prepared) {
+                let writable_paths: Vec<Value> = authority["coveredOperations"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|operation| {
+                        operation["operation"] == "bash"
+                            && operation["workspaceId"].as_str() == prepared.workspace_id.as_deref()
+                            && operation["executionScope"].as_str()
+                                == prepared.process_execution_scope.as_deref()
+                    })
+                    .flat_map(|operation| {
+                        operation["writablePaths"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .cloned()
+                    })
+                    .collect();
                 return Ok(Admission::Allowed(json!({
                     "decision": "allow",
                     "source": "plan",
@@ -1308,6 +1327,7 @@ impl LocalAgentKernel {
                     "planId": authority.get("planId"),
                     "revision": authority.get("revision"),
                     "decisionId": authority.get("decisionId"),
+                    "writablePaths": writable_paths,
                 })));
             }
         }
@@ -1321,9 +1341,44 @@ impl LocalAgentKernel {
         &self,
         prepared: &PreparedEffect,
         request: &LocalToolExecutionRequest,
+        authority: &Value,
         cancellation: KernelCancellationToken,
     ) -> Result<KernelToolExecutionResult, String> {
         let _private_targets = &prepared.private_resolved_targets;
+        let workspace_write_targets = if prepared.operation == "bash"
+            && prepared.process_execution_scope.as_deref() == Some("workspace")
+            && authority["source"] == "plan"
+        {
+            let root = prepared
+                .workspace_root
+                .as_deref()
+                .ok_or("workspace root missing")?;
+            let boundary = WorkspaceBoundary::new(root);
+            let paths = authority["writablePaths"]
+                .as_array()
+                .ok_or("Plan writablePaths missing")?;
+            if paths.is_empty() {
+                return Err("Plan writablePaths is empty".into());
+            }
+            Some(
+                paths
+                    .iter()
+                    .map(|target| {
+                        let path = target["path"]
+                            .as_str()
+                            .ok_or("Plan writable path missing")?;
+                        Ok(deepcode_kernel_runtime::executors::WorkspaceWriteTarget {
+                            path: boundary
+                                .resolve_mutation(path)
+                                .map_err(|error| error.to_string())?,
+                            directory: target["kind"] == "directory",
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            )
+        } else {
+            None
+        };
         let lease = prepared.binding.begin_attempt();
         let result = prepared
             .binding
@@ -1338,6 +1393,7 @@ impl LocalAgentKernel {
                     workspace_root: prepared.workspace_root.clone(),
                     workspace_id: prepared.workspace_id.clone(),
                     private_resolved_targets: prepared.private_resolved_targets.clone(),
+                    workspace_write_targets,
                     cancellation,
                 },
             )
@@ -2273,7 +2329,8 @@ mod attempt_control_tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|issue| issue["path"] == "$.workspaceMode" && issue["rule"] == "required"));
+            .any(|issue| issue["path"] == "$.executionMode"
+                && issue["rule"] == "additionalProperties"));
         assert!(kernel.records.read(&request.call_id).unwrap().is_none());
         let mut wrong_binding = request;
         wrong_binding.tool_binding_ref = "binding:unknown".into();

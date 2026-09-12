@@ -1,4 +1,4 @@
-import React, { useLayoutEffect, useRef, useState } from 'react';
+import React, { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { MessageFeedback, SessionProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { useConversationHost } from './ConversationHost';
@@ -15,6 +15,8 @@ import { ToolActivityGroup, ProviderHostedDraftGroup } from './ToolActivityDetai
 import { conversationRounds, type ProjectionItem, type AssistantDraftItem } from './conversationItems';
 import type { ConversationViewport } from './useConversationViewport';
 import { formatBytes } from './conversationFormatting';
+import { ConversationNavigation } from './ConversationNavigation';
+import { conversationNavigation, conversationRange, windowConversationRounds, type ConversationRange } from './conversationWindow';
 
 interface ConversationTranscriptProps {
   language: UiLanguage;
@@ -64,6 +66,8 @@ export function ConversationTranscript({
   const submitting = useLocalAgentStore((state) => state.submitting);
   const setMessageFeedback = useLocalAgentStore((state) => state.setMessageFeedback);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [windows, setWindows] = useState<Record<string, ConversationRange | null>>({});
+  const [pendingJump, setPendingJump] = useState<{ sessionId: string; key: string } | null>(null);
   const currentSessionRef = useRef({ sessionId: projection?.sessionId });
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   if (currentSessionRef.current.sessionId !== projection?.sessionId) currentSessionRef.current = { sessionId: projection?.sessionId };
@@ -136,15 +140,19 @@ export function ConversationTranscript({
           className={`local-agent__message local-agent__message--${item.value.role}`}
         >
           <div className="local-agent__message-content">
-            {item.value.replyToInteraction && <InteractionReplyQuote prompt={item.value.replyToInteraction.prompt} />}
-            {item.value.role === 'assistant'
-              ? committedProviderContent(
-                  item.streamId,
-                  item.value.content,
-                  presentation.content(`message:${item.value.messageId}:content`),
-                )
-              : item.value.replyToInteraction ? <MarkdownContent>{item.value.content}</MarkdownContent>
-              : presentation.content(`message:${item.value.messageId}:content`)}
+            {(item.value.content.trim() || item.value.replyToInteraction) && (
+              <div className="local-agent__message-text">
+                {item.value.replyToInteraction && <InteractionReplyQuote prompt={item.value.replyToInteraction.prompt} />}
+                {item.value.role === 'assistant'
+                  ? committedProviderContent(
+                      item.streamId,
+                      item.value.content,
+                      presentation.content(`message:${item.value.messageId}:content`),
+                    )
+                  : item.value.replyToInteraction ? <MarkdownContent>{item.value.content}</MarkdownContent>
+                  : presentation.content(`message:${item.value.messageId}:content`)}
+              </div>
+            )}
             {item.value.filesystemReferences.length > 0 && (
               <div className="local-agent__message-attachments">
                 {item.value.filesystemReferences.map((reference) => (
@@ -160,7 +168,7 @@ export function ConversationTranscript({
                       : 'artifact'} />
                     {reference.displayName}
                     {reference.kind === 'file' && (
-                      <small>{formatBytes(reference.byteLength, language)}</small>
+                      <small>{reference.source === 'pastedText' ? 'TXT · ' : ''}{formatBytes(reference.byteLength, language)}</small>
                     )}
                   </button>
                 ))}
@@ -280,9 +288,32 @@ export function ConversationTranscript({
             && activity.kind === 'tool' && ['requested', 'active', 'waiting'].includes(activity.status))} />
       )}
 </>;
-  const rounds = conversationRounds(conversationItems, draftItems, projection?.run?.runId);
+  const rounds = useMemo(() => conversationRounds(conversationItems, draftItems, projection?.run?.runId), [conversationItems, draftItems, projection?.run?.runId]);
+  const totalRows = rounds.reduce((total, round) => total + round.rows.length, 0);
+  const sessionKey = projection?.sessionId ?? '';
+  const range = conversationRange(totalRows, windows[sessionKey]?.start);
+  const navigation = useMemo(() => conversationNavigation(rounds), [rounds, range.start, range.end]);
+  const visible = windowConversationRounds(rounds, range);
+  const showWindow = (start: number, key?: string) => {
+    const next = conversationRange(totalRows, start);
+    setLatestFollowMode(false);
+    setWindows((current) => ({ ...current, [sessionKey]: next.end === totalRows ? null : next }));
+    const target = key ?? rounds.flatMap((round) => round.rows)[next.start]?.key;
+    if (target) setPendingJump({ sessionId: sessionKey, key: target });
+  };
+  useLayoutEffect(() => {
+    if (pendingJump?.sessionId !== sessionKey) return;
+    viewport.scrollToAnchor(pendingJump.key);
+    setPendingJump(null);
+  }, [pendingJump, sessionKey, viewport.scrollToAnchor]);
+  useLayoutEffect(() => {
+    setWindows((current) => current[sessionKey] ? { ...current, [sessionKey]: null } : current);
+  }, [viewport.latestRequest]);
 
   return (
+    <>
+    <ConversationNavigation key={sessionKey} entries={navigation} viewport={viewport} language={language} windowStart={range.start}
+      onNavigate={(entry) => showWindow(entry.rowIndex, entry.key)} />
     <div
       ref={transcriptRef}
       className="local-agent__transcript"
@@ -301,7 +332,10 @@ export function ConversationTranscript({
           </strong>
         </div>
       )}
-      {rounds.map((round) => {
+      {range.start > 0 && <button type="button" className="local-agent__older-messages" onClick={() => showWindow(range.start - 40)}>
+        {language === 'zh-CN' ? '查看较早的内容' : 'Show earlier content'}（{range.start}）
+      </button>}
+      {visible.map((round) => {
         const current = projection?.run?.runId === round.runId;
         const completed = completedRuns.has(round.runId);
         const terminal = current && ['failed', 'cancelled', 'indeterminate'].includes(projection!.run!.status);
@@ -309,15 +343,18 @@ export function ConversationTranscript({
           key: row.key,
           process: row.item ? row.item.type !== 'message' : row.draft?.type !== 'text' || row.draft.block.kind === 'narrative',
           required: row.item?.type === 'plan' && samePlanReference(projection?.pendingPlan, row.item.value),
-          content: row.item ? renderItem(row.item) : renderDraft(row.draft!),
+          content: () => row.item ? renderItem(row.item) : renderDraft(row.draft!),
         }));
-        if (current && !completed) rows.push({ key: 'provider-status', process: true, required: false, content: providerStatus });
-        if (showReasoning && projection && completed) rows.push({ key: 'reasoning-history', process: true, required: false, content: <ReasoningHistory sessionId={projection.sessionId} runId={round.runId} /> });
+        if (current && !completed && range.end === totalRows) rows.push({ key: 'provider-status', process: true, required: false, content: () => providerStatus });
+        if (showReasoning && projection && completed) rows.push({ key: 'reasoning-history', process: true, required: false, content: () => <ReasoningHistory sessionId={projection.sessionId} runId={round.runId} /> });
         return <ConversationRoundView key={`${projection?.sessionId}:${round.key}`} completed={completed} followingLatest={viewport.followingLatest} rows={rows}>
           {(completed || terminal) && <FileChanges activities={roundChangeActivities(projection, round.runId)} />}
         </ConversationRoundView>;
       })}
-      {projection?.terminalError && (
+      {range.end < totalRows && <button type="button" className="local-agent__older-messages" onClick={() => showWindow(range.start + 40)}>
+        {language === 'zh-CN' ? '查看较新的内容' : 'Show later content'}（{totalRows - range.end}）
+      </button>}
+      {range.end === totalRows && projection?.terminalError && (
         <article className="local-agent__terminal-error">
           <strong>{projection.terminalError.code}</strong>
           <span>{projection.terminalError.message}</span>
@@ -325,6 +362,7 @@ export function ConversationTranscript({
       )}
       <div ref={messageEndRef} />
     </div>
+    </>
   );
 }
 
@@ -337,7 +375,7 @@ function samePlanReference(
 
 function ConversationRoundView({ completed, followingLatest, rows, children }: {
   completed: boolean; followingLatest: boolean;
-  rows: Array<{ key: string; process: boolean; required: boolean; content: React.ReactNode }>;
+  rows: Array<{ key: string; process: boolean; required: boolean; content(): React.ReactNode }>;
   children: React.ReactNode;
 }) {
   const [disclosure, setDisclosure] = useState({ completed, open: false });
@@ -349,7 +387,7 @@ function ConversationRoundView({ completed, followingLatest, rows, children }: {
       {completed && row.key === firstProcess && <button className="conversation-process-toggle" type="button" aria-expanded={expanded} onClick={() => setDisclosure({ completed, open: !expanded })}>
         <DeepCodeShellIcon name="tool" /><span>{expanded ? '执行过程' : '查看执行过程'}</span><DeepCodeShellIcon name="chevronDown" className="conversation-disclosure-chevron" />
       </button>}
-      <div data-conversation-anchor={row.key} hidden={row.process && !expanded && !row.required}>{(!row.process || expanded || row.required) && row.content}</div>
+      <div data-conversation-anchor={row.key} hidden={row.process && !expanded && !row.required}>{(!row.process || expanded || row.required) && row.content()}</div>
     </React.Fragment>)}
     {children}
   </section>;

@@ -35,6 +35,7 @@ fn context_with_target(root: &Path, relative_path: &str) -> KernelToolExecutionC
             ))),
         workspace_root: Some(canonical_root.to_string_lossy().to_string()),
         workspace_id: Some("workspace:test".to_string()),
+        workspace_write_targets: None,
         private_resolved_targets: vec![canonical_root
             .join(relative_path)
             .to_string_lossy()

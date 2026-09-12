@@ -714,6 +714,7 @@ fn validate_new_event(
         "approval.resolved",
         "tool.completed",
         "tool.input-rejected",
+        "tool.interrupted",
         "session.control.rejected",
         "context.compaction.requested",
         "context.compacted",
@@ -754,6 +755,7 @@ fn validate_new_event(
             | "approval.resolved"
             | "tool.completed"
             | "tool.input-rejected"
+            | "tool.interrupted"
             | "session.control.rejected"
     );
     if needs_run {
@@ -817,6 +819,14 @@ fn validate_new_event(
         }
     }
     match event_type {
+        "tool.interrupted" => {
+            let payload = &event["payload"];
+            exact_object(payload, &["attemptId", "error"], &[])?;
+            validate_id("attemptId", required_string(payload, "attemptId")?)?;
+            exact_object(&payload["error"], &["code", "message"], &[])?;
+            required_string(&payload["error"], "code")?;
+            required_string(&payload["error"], "message")?;
+        }
         "session.model-settings.updated" => {
             let payload = event.get("payload").expect("validated payload");
             exact_object(payload, &["commandId", "settings"], &[])?;
@@ -879,10 +889,10 @@ fn validate_new_event(
             )?;
             validate_id("commandId", required_string(payload, "commandId")?)?;
             validate_id("messageId", required_string(payload, "messageId")?)?;
-            if required_string(payload, "text")?.trim().is_empty() {
+            if !payload.get("text").is_some_and(Value::is_string) {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
-                    "input.accepted text 不能为空。",
+                    "input.accepted text 必须是字符串；附件消息正文可以为空。",
                 ));
             }
             if let Some(selections) = payload.get("pluginSelections") {
@@ -2614,8 +2624,40 @@ fn validate_event_facts(
                 }
             }
         }
+        "tool.interrupted" => {
+            let run_id = required_string(event, "runId")?;
+            let call_id = required_string(event, "callId")?;
+            let valid: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2
+                    AND call_id=?3 AND event_type='tool.requested' AND json_extract(payload_json, '$.attemptId')=?4)
+                 AND EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2 AND event_type='run.runtime.released')
+                 AND NOT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2 AND call_id=?3
+                    AND event_type IN ('tool.completed','tool.input-rejected','tool.interrupted'))
+                 AND NOT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2 AND event_type='run.settled')",
+                params![session_id, run_id, call_id, required_string(&event["payload"], "attemptId")?],
+                |row| row.get(0),
+            ).map_err(sql_error("session_event_fact_read_failed"))?;
+            if !valid {
+                return Err(LocalAgentStoreError::new(
+                    "tool_interruption_state_invalid",
+                    "工具中断必须关联释放后的未完成调用。",
+                ));
+            }
+        }
         "run.settled" => {
             let run_id = required_string(event, "runId")?;
+            let pending: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_events r WHERE r.session_id=?1 AND r.run_id=?2 AND r.event_type='tool.requested'
+                 AND NOT EXISTS(SELECT 1 FROM session_events t WHERE t.session_id=r.session_id AND t.run_id=r.run_id AND t.call_id=r.call_id
+                    AND t.event_type IN ('tool.completed','tool.input-rejected','tool.interrupted')))",
+                params![session_id, run_id], |row| row.get(0),
+            ).map_err(sql_error("session_event_fact_read_failed"))?;
+            if pending {
+                return Err(LocalAgentStoreError::new(
+                    "run_tool_result_missing",
+                    "Run 结算前必须关闭全部工具调用。",
+                ));
+            }
             let finishing_payload: Option<String> = transaction
                 .query_row(
                     "SELECT payload_json FROM session_events
@@ -2966,7 +3008,17 @@ fn validate_command(command: &Value) -> Result<(), LocalAgentStoreError> {
                 "pluginSelections",
             ],
         )?;
-        if required_string(command, text_field)?.trim().is_empty() {
+        let text = command
+            .get(text_field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LocalAgentStoreError::new("session_command_invalid", "消息正文必须是字符串。")
+            })?;
+        let has_references = command
+            .get("filesystemReferences")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty());
+        if text.trim().is_empty() && (command_type == "context.focus" || !has_references) {
             return Err(LocalAgentStoreError::new(
                 "session_command_invalid",
                 format!("{command_type} {text_field} 不能为空。"),
@@ -3168,9 +3220,34 @@ fn validate_plan_operations(value: &Value) -> Result<(), LocalAgentStoreError> {
                     "workspaceMode",
                     "executionScope",
                 ],
-                &["command", "terminal"],
+                &["command", "terminal", "writablePaths"],
             )?;
             let execution_scope = required_string(operation, "executionScope")?;
+            if execution_scope == "workspace" || operation.get("writablePaths").is_some() {
+                let paths = operation
+                    .get("writablePaths")
+                    .and_then(Value::as_array)
+                    .filter(|paths| !paths.is_empty() && paths.len() <= 128)
+                    .ok_or_else(|| {
+                        LocalAgentStoreError::new(
+                            "session_event_invalid",
+                            "workspace Bash 必须声明 writablePaths。",
+                        )
+                    })?;
+                for target in paths {
+                    exact_object(target, &["path", "kind"], &[])?;
+                    let path = required_string(target, "path")?;
+                    if !valid_logical_path(path)
+                        || path == "."
+                        || !matches!(required_string(target, "kind")?, "file" | "directory")
+                    {
+                        return Err(LocalAgentStoreError::new(
+                            "session_event_invalid",
+                            "Bash 可写范围必须是工作区内的文件或目录。",
+                        ));
+                    }
+                }
+            }
             let valid_command = operation.get("command").is_none_or(|value| {
                 value.as_str().is_some_and(|command| {
                     !command.is_empty() && command.len() <= 16_384 && !command.contains('\0')
@@ -3923,7 +4000,16 @@ fn validate_filesystem_references(
         ];
         match kind {
             "file" => {
-                exact_object(reference, &required, &["mediaType", "byteLength"])?;
+                exact_object(reference, &required, &["mediaType", "byteLength", "source"])?;
+                if reference
+                    .get("source")
+                    .is_some_and(|source| source != "pastedText")
+                {
+                    return Err(LocalAgentStoreError::new(
+                        error_code,
+                        "文件引用 source 无效。",
+                    ));
+                }
                 let media_type = required_string(reference, "mediaType")?;
                 if !valid_media_type(media_type) {
                     return Err(LocalAgentStoreError::new(
@@ -5306,6 +5392,88 @@ mod tests {
             saved.last().unwrap()["payload"]["orderedOutputBlocks"][0],
             block
         );
+        drop(journal);
+        let reopened = LocalAgentJournal::open(&path).unwrap();
+        assert_eq!(reopened.read_events("session:loop", 0).unwrap(), saved);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn journal_closes_unknown_tool_result_after_release_before_settlement() {
+        let path = std::env::temp_dir().join(format!(
+            "deepcode-tool-interrupted-{}.sqlite3",
+            random_id("test").unwrap().replace(':', "-")
+        ));
+        let journal = LocalAgentJournal::open(&path).unwrap();
+        journal
+            .create_session("session:loop", "Loop", &json!([]), Some("profile:test"))
+            .unwrap();
+        append_model_settings_and_rejected_call(&journal);
+        let events = journal.read_events("session:loop", 0).unwrap();
+        for kind in [
+            "context.composed",
+            "tool.requested",
+            "provider.turn.settled",
+        ] {
+            let mut event = events
+                .iter()
+                .find(|event| event["type"] == kind)
+                .unwrap()
+                .clone();
+            let object = event.as_object_mut().unwrap();
+            for key in ["schemaVersion", "eventId", "sequence", "occurredAt"] {
+                object.remove(key);
+            }
+            if kind == "tool.requested" {
+                event["callId"] = json!("call:unknown");
+                event["payload"]["attemptId"] = json!("attempt:unknown");
+                event["payload"]["providerCallId"] = json!("provider-call:unknown");
+            } else {
+                event["payload"]["providerRequestId"] = json!("provider-request:unknown");
+                if kind == "provider.turn.settled" {
+                    event["payload"]["orderedCallIds"] = json!(["call:unknown"]);
+                }
+            }
+            journal.append(&event).unwrap();
+        }
+        let interrupted = json!({
+            "type":"tool.interrupted", "sessionId":"session:loop", "runId":"run:loop", "callId":"call:unknown",
+            "payload":{"attemptId":"attempt:unknown", "error":{"code":"tool_result_unknown", "message":"Kernel result unavailable after runtime release; original fetch failed."}}
+        });
+        assert_eq!(
+            journal.append(&interrupted).unwrap_err().code,
+            "tool_interruption_state_invalid"
+        );
+        let outcome = json!({"outcome":"failed", "error":{"code":"local_agent_transport_failed", "message":"fetch failed"}});
+        journal.append(&json!({"type":"run.finishing", "sessionId":"session:loop", "runId":"run:loop", "payload":outcome})).unwrap();
+        journal.append(&json!({
+            "type":"run.runtime.released", "sessionId":"session:loop", "runId":"run:loop",
+            "payload":{"runRuntimeSnapshotRef":"run-runtime:test", "extensionGenerationRef":"extension-generation:test", "kernelCatalogSnapshotRef":"kernel-catalog:test", "providerRuntimeRef":"provider-runtime:test", "pluginInstanceRefs":[], "alreadyReleased":false}
+        })).unwrap();
+        let settled = json!({"type":"run.settled", "sessionId":"session:loop", "runId":"run:loop", "payload":outcome});
+        assert_eq!(
+            journal.append(&settled).unwrap_err().code,
+            "run_tool_result_missing"
+        );
+        let mut wrong_attempt = interrupted.clone();
+        wrong_attempt["payload"]["attemptId"] = json!("attempt:other");
+        assert_eq!(
+            journal.append(&wrong_attempt).unwrap_err().code,
+            "tool_interruption_state_invalid"
+        );
+        journal.append_batch(&[interrupted, settled]).unwrap();
+        let saved = journal.read_events("session:loop", 0).unwrap();
+        let last = &saved[saved.len() - 3..];
+        assert_eq!(
+            last.iter()
+                .map(|event| event["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["run.runtime.released", "tool.interrupted", "run.settled"]
+        );
+        assert!(last[1]["payload"].get("record").is_none());
+        assert!(last[1]["payload"].get("executed").is_none());
+        assert_eq!(last[2]["payload"]["error"]["message"], "fetch failed");
         drop(journal);
         let reopened = LocalAgentJournal::open(&path).unwrap();
         assert_eq!(reopened.read_events("session:loop", 0).unwrap(), saved);

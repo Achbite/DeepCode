@@ -386,9 +386,8 @@ function providerWorkspaceSchema(toolName: string, schema: JsonObject): JsonObje
   copy.properties.workspace = {
     type: 'string',
     minLength: 1,
-    description: 'Logical workspace handle from the current Session binding list, such as primary.',
+    description: 'Logical workspace handle from the current Session binding list. Omit to use primary.',
   };
-  copy.required = [...copy.required, 'workspace'];
   return copy;
 }
 
@@ -408,7 +407,7 @@ function decodeWorkspaceHandle(
       'Provider 工具输入不能直接携带 canonical workspaceId。',
     );
   }
-  const handle = input.workspace;
+  const handle = input.workspace === undefined ? 'primary' : input.workspace;
   if (typeof handle !== 'string' || !handle) {
     throw new LoopFailure(
       'provider_workspace_handle_required',

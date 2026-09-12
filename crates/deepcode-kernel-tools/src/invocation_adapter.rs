@@ -37,6 +37,8 @@ pub fn canonicalize_invocation(
         }
         Tool::ProcessShell => {
             materialize("timeout", json!(120));
+            materialize("workspaceMode", json!("read"));
+            materialize("executionScope", json!("workspace"));
         }
         Tool::WebSearch => materialize("limit", json!(5)),
         Tool::WebFetch => materialize("maxBytes", json!(98_304)),

@@ -664,7 +664,29 @@ impl PreparedCatalogBinding {
                     },
                     context,
                 )
-                .map_err(|error| ToolCatalogError::new("tool_execution_failed", error.to_string())),
+                .or_else(|error| {
+                    let (code, output) = match &error {
+                        deepcode_kernel_abi::KernelError::Structured {
+                            code,
+                            stage,
+                            details,
+                            ..
+                        } => (
+                            (*code).to_string(),
+                            json!({"stage": stage, "details": details}),
+                        ),
+                        _ => ("tool_execution_failed".to_string(), Value::Null),
+                    };
+                    Ok(KernelToolExecutionResult {
+                        invocation_id: invocation_id.to_string(),
+                        outcome: KernelToolExecutionOutcome::Failed,
+                        output,
+                        error: Some(KernelToolExecutionFailure {
+                            code,
+                            message: error.to_string(),
+                        }),
+                    })
+                }),
             ToolExecutorBinding::Product(product) => {
                 let result = product.call(self.tool_name(), input);
                 Ok(match result {

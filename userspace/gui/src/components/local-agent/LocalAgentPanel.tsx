@@ -43,7 +43,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const title = activeSummary?.title.trim()
     || projection?.display.creationTitle.trim()
     || t(language, 'agent.session.newTitle');
-  const conversationItems = useMemo(() => projectionItems(projection), [projection]);
+  const conversationItems = useMemo(() => projectionItems(projection), [projection?.sessionId, projection?.revision]);
   const assistantDraft = projection?.assistantDraft ?? null;
   const display = useConversationDisplay(projection);
   const showChangeBar = projection?.run && !display.completedRuns.has(projection.run.runId)
@@ -108,6 +108,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
         </div>
       </header>
 
+      <div className="local-agent__viewport">
       <div ref={bodyRef} className="local-agent__body" aria-live="polite" {...bodyHandlers}>
         <ConversationTranscript
           completedRuns={display.completedRuns}
@@ -136,6 +137,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
             <DeepCodeShellIcon name="chevronDown" />
           </button>
         )}
+      </div>
       </div>
 
       <ConversationComposer

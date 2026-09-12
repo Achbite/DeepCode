@@ -94,6 +94,13 @@ const PLAN_OPERATION_SCHEMA: JsonObject = {
         command: { type: 'string', minLength: 1, maxLength: 16_384 },
         workspaceMode: { type: 'string', enum: ['write'] },
         executionScope: { type: 'string', enum: ['workspace', 'host'] },
+        writablePaths: {
+          type: 'array', minItems: 1, maxItems: 128,
+          description: 'Required for workspace Bash writes: list the source files or directories and build/output/cache directories that may be modified. A directory includes its descendants. Command text is not an authorization lock.',
+          items: { type: 'object', additionalProperties: false, required: ['path', 'kind'], properties: {
+            path: { type: 'string', minLength: 1 }, kind: { type: 'string', enum: ['file', 'directory'] },
+          } },
+        },
         terminal: {
           type: 'object',
           additionalProperties: false,
@@ -360,8 +367,8 @@ function decodePlanOperation(value: unknown, index: number): PlanOperation {
   if (operation === 'bash') {
     assertExactKeys(
       value,
-      ['workspaceId', 'operation', 'command', 'workspaceMode', 'executionScope', 'terminal'],
-      ['command', 'terminal'],
+      ['workspaceId', 'operation', 'command', 'workspaceMode', 'executionScope', 'terminal', 'writablePaths'],
+      ['command', 'terminal', 'writablePaths'],
       `mutationManifest[${index}]`,
     );
     const command = value.command === undefined ? undefined : requiredText(value.command, 'command');
@@ -378,12 +385,29 @@ function decodePlanOperation(value: unknown, index: number): PlanOperation {
     const terminal = value.terminal === undefined
       ? undefined
       : decodeTerminalInput(value.terminal);
+    const writablePaths = value.writablePaths;
+    if (value.executionScope === 'workspace' && (!Array.isArray(writablePaths) || !writablePaths.length)) {
+      throw new SessionControlError('session_control_plan_shell_invalid', 'workspace Bash 必须在 writablePaths 中声明可写文件/目录，包含构建产出目录。');
+    }
+    const paths = writablePaths === undefined ? undefined : (() => {
+      if (!Array.isArray(writablePaths) || !writablePaths.length || writablePaths.length > 128) {
+        throw new SessionControlError('session_control_plan_shell_invalid', 'writablePaths 必须包含 1 到 128 个文件或目录。');
+      }
+      return writablePaths.map((entry) => {
+        if (!isRecord(entry) || entry.kind !== 'file' && entry.kind !== 'directory') {
+          throw new SessionControlError('session_control_plan_shell_invalid', 'writablePaths 项必须包含 path 和 kind=file|directory。');
+        }
+        assertExactKeys(entry, ['path', 'kind'], [], 'writablePaths');
+        return { path: normalizedTarget(entry.path), kind: entry.kind as 'file' | 'directory' };
+      });
+    })();
     return {
       workspaceId,
       operation,
       ...(command === undefined ? {} : { command }),
       workspaceMode: 'write',
       executionScope: value.executionScope,
+      ...(paths ? { writablePaths: paths } : {}),
       ...(terminal ? { terminal } : {}),
     };
   }

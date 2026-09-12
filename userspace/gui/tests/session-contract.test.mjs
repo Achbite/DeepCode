@@ -269,7 +269,7 @@ test('snapshot-scoped wire tool resolves to exact Kernel bindings, durable ToolR
         wireToolName = definition.name;
         assert.notEqual(wireToolName, preparedTool.name);
         assert.match(wireToolName, /^[A-Za-z0-9_-]{1,64}$/u);
-        assert.deepEqual(definition.inputSchema.required, ['path', 'workspace']);
+        assert.deepEqual(definition.inputSchema.required, ['path']);
         assert.ok(definition.inputSchema.properties.workspace);
         assert.equal(definition.inputSchema.properties.workspaceId, undefined);
         yield providerEvent(request.requestId, 'text.delta', {
@@ -618,6 +618,22 @@ test('Plan input rejections survive actor reopen and do not suppress the final e
   assert.equal(events.some((event) => event.type === 'tool.requested'), false);
   assert.ok(events.filter((event) => event.type === 'provider.turn.settled').every((event) => event.payload.outcome === 'completed'));
   assert.deepEqual(await decodeGuiProjection(failed), failed);
+  const historical = structuredClone(failed);
+  const historicalBash = {
+    workspaceId: workspaceBinding.workspaceId, operation: 'bash', command: 'make build',
+    workspaceMode: 'write', executionScope: 'workspace',
+  };
+  historical.plans[0].mutationManifest.push(historicalBash);
+  assert.equal(historical.plans[0].status, 'confirmed');
+  assert.deepEqual(await decodeGuiProjection(historical), historical,
+    'displaying a stored Plan must not require newly introduced execution fields');
+  assert.equal(Object.hasOwn(historicalBash, 'writablePaths'), false,
+    'the GUI must not fabricate a write scope for historical operations');
+  for (const writablePaths of [[], [{ path: 'build', kind: 'invalid' }]]) {
+    const malformed = structuredClone(historical);
+    malformed.plans[0].mutationManifest.at(-1).writablePaths = writablePaths;
+    await assert.rejects(decodeGuiProjection(malformed), /conversation_projection_invalid/u);
+  }
   await reopened.dispose();
 });
 
@@ -781,19 +797,127 @@ test('independent views own navigation, errors and pending commands separately',
   assert.equal(first.getState().submitting, false);
 });
 
+test('cached navigation displays immediately and another session read cannot block it', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const actors = [];
+  const projections = {};
+  for (const id of ['one', 'two']) {
+    const sessionId = `session:${id}`;
+    await createSession(journal, sessionId, [workspaceBinding]);
+    const actor = actorWith(journal, sessionId, { async *stream() {} }, emptyKernel(), fakeRunPreparation().port, id);
+    actors.push(actor);
+    projections[sessionId] = await actor.snapshot();
+  }
+  t.after(() => Promise.all(actors.map((actor) => actor.dispose())));
+  const store = await loadGuiModelStore(t);
+  store.setState({ catalog: { projects: [], sessions: Object.keys(projections).map((id) => ({ id })) } });
+  let releaseSlow;
+  let slowId;
+  const slow = new Promise((resolve) => { releaseSlow = resolve; });
+  let requests = 0;
+  let readSignal;
+  installGuiFetch(t, async (url, init) => {
+    if (url.pathname === '/api/conversation/statuses') return Response.json({ ok: true, data: Object.values(projections).map((p) => ({ sessionId: p.sessionId, revision: p.revision, run: p.run })) });
+    const id = decodeURIComponent(url.pathname.split('/')[4]);
+    assert.ok(projections[id]);
+    requests += 1;
+    if (id === slowId) { readSignal = init.signal; await slow; }
+    return Response.json({ ok: true, data: projections[id] });
+  });
+  await store.getState().activateSession('session:one');
+  const cached = store.getState().projection;
+  slowId = 'session:two';
+  const openingTwo = store.getState().activateSession('session:two');
+  await waitUntil(() => readSignal !== undefined);
+  const openingOne = store.getState().activateSession('session:one');
+  assert.equal(store.getState().projection, cached);
+  assert.equal(store.getState().loading, false);
+  assert.equal(readSignal.aborted, true, 'only the previous view read is cancelled');
+  await openingOne;
+  assert.equal(requests, 2, 'cached idle history is not fetched again when its revision is unchanged');
+  await store.getState().refresh();
+  assert.equal(requests, 2, 'idle polling reads status, not full history');
+  const count = requests;
+  await store.getState().activateSession('session:one');
+  assert.equal(requests, count, 'selecting the active session does not reopen it');
+  releaseSlow();
+  await openingTwo;
+  assert.equal(store.getState().sessionId, 'session:one');
+  assert.equal(store.getState().projection.sessionId, 'session:one');
+  const changed = await actors[0].submit({ schemaVersion: 'deepcode.command.v3', type: 'session.model-settings.set', commandId: 'command:cache-profile', sessionId: 'session:one', settings: { profileId: 'profile:test', reasoningEffortOverride: 'low' } });
+  assert.equal(changed.status, 'accepted');
+  projections['session:one'] = await actors[0].snapshot();
+  await store.getState().refresh();
+  assert.equal(requests, 3, 'a newer server revision invalidates the cached snapshot');
+  assert.equal(store.getState().projection.modelSettings.reasoningEffortOverride, 'low');
+  await store.getState().activateSession('session:two');
+  assert.equal(requests, 4, 'an aborted late response was not installed in the recent-session cache');
+});
+
+test('conversation navigation windows a long run by rows and preserves earlier message identities', async (t) => {
+  const { conversationNavigation, conversationRange, windowConversationRounds, CONVERSATION_WINDOW_ROWS } = await loadGuiModule(t, '/src/components/local-agent/conversationWindow.ts');
+  const rows = Array.from({ length: CONVERSATION_WINDOW_ROWS + 15 }, (_, index) => ({
+    key: `row:${index}`,
+    item: { type: 'message', value: { role: index === 0 || index === 65 ? 'user' : 'assistant', content: `Message ${index}`, filesystemReferences: [] } },
+  }));
+  const rounds = [{ key: 'run:long', runId: 'run:long', rows }];
+  const navigation = conversationNavigation(rounds);
+  assert.deepEqual(navigation.map((entry) => entry.key), ['row:0', 'row:65']);
+  const recent = windowConversationRounds(rounds, conversationRange(rows.length));
+  assert.equal(recent[0].rows.length, CONVERSATION_WINDOW_ROWS);
+  assert.equal(recent[0].rows[0], rows[15]);
+  const earlier = windowConversationRounds(rounds, conversationRange(rows.length, navigation[0].rowIndex));
+  assert.equal(earlier[0].rows[0], rows[0]);
+  assert.equal(earlier[0].rows.length, CONVERSATION_WINDOW_ROWS);
+  assert.equal(earlier[0].runId, 'run:long');
+  const split = [{ ...rounds[0], rows: rows.slice(0, 30) }, { key: 'run:next', runId: 'run:next', rows: rows.slice(30) }];
+  assert.deepEqual(windowConversationRounds(split, conversationRange(rows.length)).flatMap((round) => round.rows), rows.slice(15));
+  const empty = [{ key: 'run:starting', runId: 'run:starting', rows: [] }];
+  assert.deepEqual(windowConversationRounds(empty, conversationRange(0)), empty, 'a starting run retains its live status slot');
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { ConversationNavigation } = await loadGuiModule(t, '/src/components/local-agent/ConversationNavigation.tsx');
+  const html = renderToStaticMarkup(createElement(ConversationNavigation, { entries: navigation, viewport: { bodyRef: { current: null } }, onNavigate() {}, language: 'zh-CN' }));
+  assert.match(html, /aria-label="对话导航"/);
+  assert.match(html, /跳至消息 1: Message 0/);
+  assert.equal((html.match(/<button/g) ?? []).length, 2);
+});
+
+test('completed Markdown is reused across remounts while changed and streaming text stay current', async (t) => {
+  const { StreamingMarkdownParser } = await loadGuiModule(t, '/src/components/local-agent/streamingMarkdown.ts');
+  const text = '# Cached answer\n\nA **completed** paragraph.';
+  const first = new StreamingMarkdownParser().update(text, false);
+  assert.equal(new StreamingMarkdownParser().update(text, false), first);
+  const changed = new StreamingMarkdownParser().update(text + '\n\nNew evidence.', false);
+  assert.notEqual(changed, first);
+  assert.ok(JSON.stringify(changed).includes('New evidence.'));
+  const live = new StreamingMarkdownParser();
+  assert.ok(live.update(text, true).some((block) => block.streaming));
+  assert.equal(live.update(text, false), first);
+});
+
+test('paste detection preserves Unicode text and derives only a display title', async (t) => {
+  const { isLongPastedText, pastedTextTitle } = await loadGuiModule(t, '/src/services/pastedText.ts');
+  assert.equal(isLongPastedText('ordinary question'), false);
+  const text = '文档标题\n' + '原文🙂\n'.repeat(5000);
+  assert.equal(isLongPastedText(text), true);
+  assert.equal(pastedTextTitle(text), '文档标题');
+  assert.ok(text.endsWith('原文🙂\n'));
+});
+
 test('large GUI input uploads the complete text and submits only the resulting resource reference', async (t) => {
   const api = await loadGuiModule(t, '/src/services/localAgentApi.ts');
   const content = '  完整输入🙂\n'.repeat(10000);
-  const reference = { referenceId: 'input:one', workspaceId: 'workspace:input', logicalPath: 'user-input.txt', displayName: 'user-input.txt', kind: 'file', mediaType: 'text/plain', byteLength: Buffer.byteLength(content) };
+  const reference = { referenceId: 'input:one', workspaceId: 'workspace:input', logicalPath: 'user-input.txt', displayName: '完整输入🙂', kind: 'file', mediaType: 'text/plain', byteLength: Buffer.byteLength(content), source: 'pastedText' };
   const seen = [];
   installGuiFetch(t, (url, init) => {
     seen.push(url.pathname);
     if (url.pathname.includes('/input-resources/')) {
       assert.equal(init.body, content);
-      return Response.json({ ok: true, data: { text: 'Read the original user input.', reference } });
+      return Response.json({ ok: true, data: { text: '', reference } });
     }
     const command = JSON.parse(init.body);
-    assert.equal(command.text, 'Read the original user input.');
+    assert.equal(command.text, '', 'transport guidance must not replace the displayed user message');
     assert.deepEqual(command.filesystemReferences, [reference]);
     assert.ok(Buffer.byteLength(init.body) < 2000);
     return Response.json({ ok: true, data: { schemaVersion: 'deepcode.command-reply.v3', commandId: command.commandId, sessionId: command.sessionId, status: 'accepted', revision: 1 } });
@@ -802,16 +926,59 @@ test('large GUI input uploads the complete text and submits only the resulting r
   assert.equal(seen.length, 2);
 });
 
+test('GUI submission keeps the ordinary message separate from pasted text references', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:pasted-message';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    yield providerEvent(request.requestId, 'assistant.message', { messageId: 'answer:pasted', content: 'Received.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel(), fakeRunPreparation().port, 'pasted');
+  t.after(() => actor.dispose());
+  const reference = { referenceId: 'reference:pasted', workspaceId: 'workspace:pasted', logicalPath: 'user-input.txt',
+    displayName: '长文标题', kind: 'file', mediaType: 'text/plain', byteLength: 40000, source: 'pastedText' };
+  const content = '长文内容'.repeat(10000);
+  const commands = [];
+  const catalog = { projects: [], sessions: [] };
+  installGuiFetch(t, async (url, init) => {
+    if (url.pathname.includes('/input-resources/')) {
+      assert.equal(init.body, content);
+      return Response.json({ ok: true, data: { text: '', reference } });
+    }
+    if (url.pathname.endsWith('/commands')) {
+      const command = JSON.parse(init.body);
+      commands.push(command);
+      return Response.json({ ok: true, data: await actor.submit(command) });
+    }
+    if (url.pathname.endsWith('/projection')) return Response.json({ ok: true, data: await actor.snapshot() });
+    if (url.pathname.endsWith('/catalog')) return Response.json({ ok: true, data: catalog });
+    if (url.pathname.endsWith('/plugins')) return Response.json({ ok: true, data: { revision: 'plugins:pasted', plugins: [] } });
+    throw new Error(`unexpected_gui_request:${url.pathname}`);
+  });
+  const store = await loadGuiModelStore(t);
+  store.setState({ sessionId, projection: await actor.snapshot(), catalog,
+    selectedProfileId: 'profile:test', profiles: [{ id: 'profile:test', enabled: true }] });
+  await store.getState().sendMessage('这份协议说了什么', [], [], [{ inputId: 'paste:one', text: content }]);
+  const command = commands.find((command) => command.type === 'message.submit');
+  assert.equal(command.text, '这份协议说了什么');
+  assert.deepEqual(command.filesystemReferences, [reference]);
+  const projection = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  const message = projection.messages.find((message) => message.role === 'user');
+  assert.equal(message.content, '这份协议说了什么');
+  assert.deepEqual(message.filesystemReferences, [reference]);
+});
+
 test('tool rows accumulate across adjacent requests without crossing message or run boundaries', async (t) => {
   const { projectionItems } = await loadGuiModule(t, '/src/components/local-agent/conversationItems.ts');
   const activities = [1, 2, 3, 4].map((id) => ({ activityId: `a${id}`, runId: id === 4 ? 'run:two' : 'run:one' }));
   const group = (id) => ({ kind: 'toolGroup', timelineId: `group:${id}`, sequence: id, activityIds: [`a${id}`] });
-  const projection = { activities, messages: [{ messageId: 'message:boundary', runId: 'run:one', role: 'user' }], timeline: [group(1), group(2), { kind: 'message', sequence: 3, messageId: 'message:boundary' }, group(3), group(4)] };
+  const projection = { activities, narratives: [], plans: [], messages: [{ messageId: 'message:boundary', runId: 'run:one', role: 'user' }], timeline: [group(1), group(2), { kind: 'message', sequence: 3, messageId: 'message:boundary' }, group(3), group(4)] };
   const items = projectionItems(projection);
   assert.deepEqual(items.map((item) => item.type), ['toolGroup', 'message', 'toolGroup', 'toolGroup']);
   assert.equal(items[0].groupId, 'group:1');
   assert.deepEqual(items[0].values.map((activity) => activity.activityId), ['a1', 'a2']);
   assert.equal(projection.timeline.length, 5, 'presentation grouping leaves the canonical timeline intact');
+  assert.equal(projectionItems(projection), items, 'revisiting the same snapshot reuses display rows');
 });
 
 test('plan preview occupies its native output position and has no confirmation identity', async (t) => {
@@ -1228,12 +1395,19 @@ test('polling and command reconciliation read draft snapshots in order at the sa
   latest.assistantDraft.planPreview.steps.push('Verify behavior');
   let releaseOld;
   const held = new Promise((resolve) => { releaseOld = resolve; });
+  let releaseCommand;
+  const commandHeld = new Promise((resolve) => { releaseCommand = resolve; });
+  t.after(releaseCommand);
   let reads = 0;
   let commands = 0;
-  installGuiFetch(t, async (url) => {
-    if (url.pathname === '/api/conversation/statuses') return Response.json({ ok: true, data: [] });
+  installGuiFetch(t, async (url, init) => {
+    if (url.pathname === '/api/conversation/statuses') return Response.json({ ok: true, data: [
+      { sessionId, revision: base.revision, run: { runId: base.run.runId, status: base.run.status } },
+    ] });
     if (url.pathname.endsWith('/commands')) {
+      assert.equal(init.signal, undefined, 'view navigation does not own command cancellation');
       commands += 1;
+      if (commands === 2) await commandHeld;
       return Response.json({ ok: true, data: { schemaVersion: 'deepcode.command-reply.v3', sessionId, commandId: 'command:setting', status: 'accepted', revision: base.revision } });
     }
     assert.ok(url.pathname.endsWith('/projection'));
@@ -1256,6 +1430,16 @@ test('polling and command reconciliation read draft snapshots in order at the sa
   assert.equal(reads, 2);
   assert.deepEqual(store.getState().projection.assistantDraft.planPreview.steps, ['Read source', 'Verify behavior']);
   assert.equal(store.getState().projection.revision, base.revision);
+  await store.getState().refresh();
+  assert.equal(reads, 3, 'running drafts are read even when the status revision matches the cache');
+  const savingWhileLeaving = store.getState().selectReasoningEffort('high');
+  await waitUntil(() => commands === 2);
+  store.getState().startNewSession();
+  releaseCommand();
+  await savingWhileLeaving;
+  assert.equal(reads, 4, 'the command finishes its own reconciliation after the view leaves');
+  assert.equal(store.getState().sessionId, null);
+  assert.equal(store.getState().projection, null, 'the command reply cannot restore the departed view');
 });
 
 test('desktop startup diagnostics render the Host failure and log reference verbatim', async (t) => {

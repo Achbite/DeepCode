@@ -989,7 +989,6 @@ pub(crate) async fn conversation_session_delete(
 }
 
 const INPUT_FILE_THRESHOLD: usize = 32 * 1024;
-const FILE_INPUT_MESSAGE: &str = "本条用户消息的完整原文已保存到 user-input.txt 文件引用。原文包含用户的任务指令、约束和资料，具有本条用户输入的原始语义。请先用 fs.read 按 nextByte 分段读取并完整接纳原文，再继续任务；不要把它当作可忽略的普通附件。";
 
 fn save_input_resource(
     state: &AppState,
@@ -1036,6 +1035,18 @@ fn save_input_resource(
             return Err(error.to_string());
         }
     }
+    let mut display_name: String = content
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("粘贴的文本")
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(80)
+        .collect();
+    if display_name.is_empty() {
+        display_name = "粘贴的文本".to_string();
+    }
     if gui.conversation_catalog.workspace(&workspace_id).is_none() {
         let previous = gui.conversation_catalog.clone();
         let canonical_root = fs::canonicalize(&root)
@@ -1045,7 +1056,7 @@ fn save_input_resource(
         gui.conversation_catalog
             .register_workspace(ConversationWorkspaceRecord {
                 workspace_id: workspace_id.clone(),
-                display_name: "user-input.txt".into(),
+                display_name: display_name.clone(),
                 canonical_root,
                 owner_session_id: Some(session_id.to_string()),
                 created_at: crate::now_text(),
@@ -1055,9 +1066,9 @@ fn save_input_resource(
             return Err(error);
         }
     }
-    Ok(json!({ "text": FILE_INPUT_MESSAGE, "reference": {
+    Ok(json!({ "text": "", "reference": {
         "referenceId": reference_id, "workspaceId": workspace_id, "logicalPath": "user-input.txt",
-        "displayName": "user-input.txt", "kind": "file", "mediaType": "text/plain", "byteLength": content.len(),
+        "displayName": display_name, "kind": "file", "mediaType": "text/plain", "byteLength": content.len(), "source": "pastedText",
     } }))
 }
 
@@ -1123,7 +1134,11 @@ pub(crate) async fn conversation_command_submit(
                 Ok(value) => value,
                 Err(error) => return ApiResponse::error("input_resource_save_failed", &error),
             };
-            command[field] = saved["text"].clone();
+            command[field] = if field == "task" {
+                json!("请依据本条消息的粘贴文本聚焦上下文。")
+            } else {
+                json!("")
+            };
             let mut references = command["filesystemReferences"]
                 .as_array()
                 .cloned()
@@ -1187,6 +1202,8 @@ pub(crate) async fn conversation_command_submit(
                         "task"
                     })
                     .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .or_else(|| command["filesystemReferences"][0]["displayName"].as_str())
             })
             .map(automatic_conversation_title);
         let active_profile_id = command
@@ -1690,7 +1707,9 @@ fn validate_message_filesystem_references(
                         format!("读取 Host 文件快照失败：{error}"),
                     )
                 })?;
-                if object.len() != 7
+                let pasted = reference.get("source").is_some();
+                if (pasted && reference["source"] != "pastedText")
+                    || object.len() != if pasted { 8 } else { 7 }
                     || logical_path == "."
                     || workspace.owner_session_id.as_deref() != Some(session_id)
                     || !metadata.is_file()

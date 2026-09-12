@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS session_events (
         'approval.resolved',
         'tool.completed',
         'tool.input-rejected',
+        'tool.interrupted',
         'session.control.rejected',
         'context.compaction.requested',
         'context.compacted',

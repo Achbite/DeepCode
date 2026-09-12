@@ -23,6 +23,7 @@ import type { AgentComposition } from './plugins.js';
 import {
   loopSnapshot,
   runAgentLoop,
+  terminalToolEvents,
   type LoopCommand,
   type LoopSnapshot,
 } from './loop.js';
@@ -30,6 +31,7 @@ import { projectSession, reduceSession } from './reducer.js';
 
 export interface SessionActorOptions {
   profileId?: string;
+  initialEvents?: readonly SessionEvent[];
   nextId?(kind: string): string;
 }
 
@@ -51,6 +53,9 @@ export class SessionActor {
   #disposed = false;
   #loopFailure?: Error;
   #projectionState?: LoopSnapshot['state'];
+  #snapshot?: LoopSnapshot;
+  #initialEvents?: readonly SessionEvent[];
+  #snapshotReads: Promise<void> = Promise.resolve();
   #assistantDraft: AssistantDraftProjection | null = null;
   readonly liveReasoning = new LiveReasoning();
 
@@ -64,6 +69,7 @@ export class SessionActor {
     this.#composition = composition;
     this.#profileId = options.profileId;
     this.#nextId = options.nextId ?? defaultIdFactory(sessionId);
+    this.#initialEvents = options.initialEvents;
   }
 
   async recover(): Promise<void> {
@@ -290,7 +296,7 @@ export class SessionActor {
     submittedText: string,
     focusTask: string | null,
   ): Promise<CommandReply> {
-    if (!submittedText.trim()) {
+    if (!submittedText.trim() && (command.type === 'context.focus' || !command.filesystemReferences?.length)) {
       if (command.type === 'context.focus') {
         return await this.recordRejection(
           command,
@@ -927,7 +933,8 @@ export class SessionActor {
     const runtime = snapshot.state.runRuntimeSnapshots[runId];
     if (!runtime) throw new Error('run_runtime_snapshot_missing');
     if (snapshot.state.runRuntimeReleases[runId]) {
-      await this.appendLifecycleEvents([{
+      const tools = await terminalToolEvents(snapshot, runId, this.#composition.kernel, settlement);
+      await this.appendLifecycleEvents([...tools, {
         type: 'run.settled',
         sessionId: this.sessionId,
         runId,
@@ -958,6 +965,9 @@ export class SessionActor {
       }]);
       return false;
     }
+    const tools = await terminalToolEvents(
+      await this.loadSnapshot(), runId, this.#composition.kernel, settlement,
+    );
     await this.appendLifecycleEvents([
       {
         type: 'run.runtime.released',
@@ -974,6 +984,7 @@ export class SessionActor {
           alreadyReleased: released.alreadyReleased,
         },
       },
+      ...tools,
       {
         type: 'run.settled',
         sessionId: this.sessionId,
@@ -1003,11 +1014,22 @@ export class SessionActor {
   }
 
   private async loadSnapshot(): Promise<LoopSnapshot> {
-    const events: SessionEvent[] = [];
-    for await (const event of this.#journal.read(this.sessionId)) events.push(event);
-    const snapshot = loopSnapshot(this.sessionId, events);
-    this.#projectionState = snapshot.state;
-    return snapshot;
+    const read = this.#snapshotReads.then(async () => {
+      const current = this.#snapshot ?? loopSnapshot(this.sessionId, this.#initialEvents ?? []);
+      const added: SessionEvent[] = [];
+      let state = current.state;
+      for await (const event of this.#journal.read(this.sessionId, state.revision)) {
+        state = reduceSession(state, event);
+        added.push(event);
+      }
+      const snapshot = added.length ? { events: [...current.events, ...added], state } : current;
+      this.#snapshot = snapshot;
+      this.#initialEvents = undefined;
+      this.#projectionState = snapshot.state;
+      return snapshot;
+    });
+    this.#snapshotReads = read.then(() => undefined, () => undefined);
+    return await read;
   }
 
   private async observe(event: SessionEvent): Promise<void> {

@@ -638,6 +638,7 @@ mod tests {
             workspace_root: None,
             workspace_id: None,
             private_resolved_targets: vec![],
+            workspace_write_targets: None,
             cancellation: KernelCancellationToken::default(),
         }
     }
@@ -760,6 +761,7 @@ mod tests {
                 workspace_root: None,
                 workspace_id: None,
                 private_resolved_targets: vec![],
+                workspace_write_targets: None,
                 cancellation: KernelCancellationToken::default(),
             },
         )

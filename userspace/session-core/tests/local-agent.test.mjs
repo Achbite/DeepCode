@@ -46,6 +46,121 @@ import {
   waitForAbort,
 } from './local-agent-fixtures.mjs';
 
+for (const lateRecord of [false, true]) test(`lost Kernel reply closes tool history after release (late record: ${lateRecord})`, async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = `session:lost-reply-${lateRecord}`;
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const tool = { toolBindingRef: 'tool-binding:read:g1', name: 'fs.read', description: 'Read a file.',
+    inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } },
+    possibleEffects: ['workspaceRead'], availability: 'callable', origin: 'coreBuiltin' };
+  const preparation = fakeRunPreparation({ tools: [tool], apiSurface: 'responses' });
+  const executions = [];
+  const records = new Map();
+  let released = false;
+  const kernel = emptyKernel({
+    async execute(request) {
+      executions.push(request);
+      assert.equal(request.input.workspaceId, workspaceBinding.workspaceId, 'omitted workspace means primary');
+      if (executions.length === 1) {
+        const reply = completedExecutionReply(request, { content: 'first result' });
+        records.set(request.callId, reply.record);
+        return reply;
+      }
+      throw new Error('fetch failed: execution response disconnected');
+    },
+    async readRecord(callId) {
+      if (released && lateRecord && executions.at(-1)?.callId === callId) {
+        return completedExecutionReply(executions.at(-1), { content: 'late result' }).record;
+      }
+      return records.get(callId) ?? null;
+    },
+  });
+  const requests = [];
+  const provider = { async *stream(request) {
+    requests.push(structuredClone(request));
+    if (requests.length === 1) {
+      const read = request.tools.find((item) => item.name === 'fs_read');
+      assert.equal(read.inputSchema.required.includes('workspace'), false);
+      for (const outputIndex of [0, 1]) yield providerEvent(request.requestId, 'output.item.completed', {
+        outputIndex, item: { type: 'function_call', call_id: `native:read-${outputIndex}`, name: read.name,
+          arguments: JSON.stringify({ path: `${outputIndex}.txt` }), status: 'completed' },
+      });
+    } else {
+      assert.equal(executions.length, 2, 'unknown effects and completed peers must not be replayed');
+      assert.deepEqual(request.tools, requests[0].tools);
+      assert.deepEqual(request.messages.slice(0, requests[0].messages.length), requests[0].messages);
+      const results = request.messages.filter((message) => message.role === 'tool');
+      assert.deepEqual(results.map((message) => message.providerCallId), ['native:read-0', 'native:read-1']);
+      const last = JSON.parse(results.at(-1).content);
+      if (lateRecord) assert.equal(last.output.content, 'late result');
+      else {
+        assert.equal(last.status, 'indeterminate');
+        assert.match(last.error.message, /fetch failed: execution response disconnected/);
+        assert.equal(Object.hasOwn(last, 'executed'), false, 'absence of a record is not proof of nonexecution');
+      }
+      yield providerEvent(request.requestId, 'assistant.message', { messageId: 'native:next', content: 'History is complete.' });
+    }
+    yield providerEvent(request.requestId, 'completed', {});
+  } };
+  const actor = actorWith(journal, sessionId, provider, kernel, {
+    ...preparation.port,
+    async release(request) { released = true; return preparation.port.release(request); },
+  }, `lost-${lateRecord}`);
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:first', 'Read two files.'));
+  const failed = await waitForProjection(actor, (value) => value.run?.status === 'failed');
+  assert.match(failed.terminalError.message, /fetch failed/);
+  const events = await readEvents(journal, sessionId);
+  const terminal = events.find((event) => event.callId === executions[1].callId && event.type === (lateRecord ? 'tool.completed' : 'tool.interrupted'));
+  assert.ok(terminal);
+  assertEventOrder(singleEvent(events, 'run.runtime.released'), terminal, singleEvent(events, 'run.settled'));
+  assert.equal(failed.activities.find((item) => item.callId === executions[1].callId).status, lateRecord ? 'completed' : 'indeterminate');
+  if (!lateRecord) {
+    // Reproduce the stored failure that predates a tool terminal event. Reading
+    // it must expose both original facts without appending a synthetic result.
+    const history = events.filter((event) => event !== terminal)
+      .map((event, index) => ({ ...event, sequence: index + 1 }));
+    const beforeRead = structuredClone(history);
+    const { recoverSession, projectSession } = await import('../dist/local-agent/reducer.js');
+    const { readConversation } = await import('../dist/local-agent/conversationRead.js');
+    const projection = projectSession(recoverSession(sessionId, history));
+    assert.equal(projection.run.status, 'failed');
+    assert.match(projection.terminalError.message, /fetch failed/);
+    const unfinished = projection.activities.find((item) => item.callId === executions[1].callId);
+    assert.equal(unfinished.status, 'requested');
+    assert.equal(unfinished.interruption, undefined);
+    assert.equal(unfinished.tool, undefined);
+    const read = await readConversation({ async *read() { yield* history; } }, { sessionId, view: 'summary' });
+    assert.equal(read.sessionId, sessionId);
+    assert.equal(read.revision, history.length);
+    assert.deepEqual(history, beforeRead);
+  }
+  await actor.submit(messageCommand(sessionId, 'command:next', 'Continue with the known state.'));
+  await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.equal(requests.length, 2);
+});
+
+test('snapshot reads only new journal events and matches full replay', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:incremental';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const reads = [];
+  const read = journal.read.bind(journal);
+  journal.read = async function* (id, after = 0) { reads.push(after); yield* read(id, after); };
+  const actor = actorWith(journal, sessionId, { async *stream() {} }, emptyKernel(), fakeRunPreparation().port, 'incremental');
+  t.after(() => actor.dispose());
+  const first = await actor.snapshot();
+  const second = await actor.snapshot();
+  assert.deepEqual(second, first);
+  assert.deepEqual(reads, [0, first.revision]);
+  await journal.append({ type: 'session.model-settings.updated', sessionId,
+    payload: { commandId: 'command:settings', settings: { profileId: 'profile:new', reasoningEffortOverride: null } } });
+  const updated = await actor.snapshot();
+  const { projectSession } = await import('../dist/local-agent/reducer.js');
+  assert.deepEqual(updated, projectSession(loopSnapshot(sessionId, await readEvents(journal, sessionId)).state, null));
+  assert.equal(updated.modelSettings.profileId, 'profile:new');
+});
+
 test('transport: oversized Unicode replies preserve content within bounded frames', () => {
   const value = { protocolVersion: 'deepcode.local-agent.v1', requestId: 'large', ok: true,
     data: { text: '中文🙂\n\"\\'.repeat(180_000) } };
@@ -3465,9 +3580,9 @@ test('new file inputs preserve the existing Provider prefix and keep historical 
   const preparation = fakeRunPreparation({ contextWindowTokens: 64000 });
   const actor = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'input-cache');
   for (let index = 0; index < 3; index += 1) {
-    const command = messageCommand(sessionId, `command:cache-${index}`, `Original input ${index}`);
+    const command = messageCommand(sessionId, `command:cache-${index}`, index === 1 ? '' : `Original input ${index}`);
     if (index < 2) command.filesystemReferences = [{ referenceId: `reference:${index}`, workspaceId: `file-workspace:${index}`,
-      logicalPath: 'user-input.txt', displayName: 'user-input.txt', kind: 'file', mediaType: 'text/plain', byteLength: 100000 }];
+      logicalPath: 'user-input.txt', displayName: 'Pasted document', kind: 'file', mediaType: 'text/plain', byteLength: 100000, source: 'pastedText' }];
     await actor.submit(command);
     await waitForProjection(actor, (projection) => projection.run?.status === 'completed');
   }
@@ -3476,7 +3591,25 @@ test('new file inputs preserve the existing Provider prefix and keep historical 
     assert.deepEqual(requests[index].messages.slice(0, requests[index - 1].messages.length), requests[index - 1].messages);
   }
   assert.deepEqual(requests[2].workspaceBindings.map((binding) => binding.workspaceId), ['workspace:test', 'file-workspace:0', 'file-workspace:1']);
+  const pastedMessage = (await actor.snapshot()).messages.find((message) => message.role === 'user' && message.content === '');
+  assert.equal(pastedMessage.filesystemReferences[0].source, 'pastedText');
+  assert.match(requests[1].messages.at(-1).content, /Read its full contents with fs.read using nextByte/);
   await actor.dispose();
+});
+
+test('workspace Bash Plan declares paths without locking its command text', () => {
+  const definition = sessionControlToolDefinitions().find((tool) => tool.inputSchema.properties?.mutationManifest);
+  const input = { title: 'Build project', summary: 'Build in the allowed directory.',
+    steps: [{ stepId: 'build', title: 'Build', details: 'Compile the project.' }],
+    mutationManifest: [{ workspaceId: 'workspace:test', operation: 'bash', command: 'make build', workspaceMode: 'write', executionScope: 'workspace', writablePaths: [{ path: 'build', kind: 'directory' }, { path: 'src/main.cpp', kind: 'file' }] }] };
+  const decoded = decodeSessionControlCall('call:plan-paths', definition.name, input);
+  assert.deepEqual(decoded.draft.mutationManifest, input.mutationManifest);
+  const absentPaths = structuredClone(input);
+  delete absentPaths.mutationManifest[0].writablePaths;
+  assert.throws(() => decodeSessionControlCall('call:missing-paths', definition.name, absentPaths), /writablePaths/);
+  const outside = structuredClone(input);
+  outside.mutationManifest[0].writablePaths[0].path = '../outside';
+  assert.throws(() => decodeSessionControlCall('call:outside', definition.name, outside), (error) => error.code === 'session_control_plan_target_invalid');
 });
 
 test('reasoning display bounds real text and summary independently without changing replay data', async () => {
@@ -3644,7 +3777,7 @@ test('aggregate input admission preserves raw errors, permits correction, and ne
   for (const [suffix, invalid, code] of [
     ['json', '{"workspace":"primary","path":', 'provider_tool_call_arguments_invalid'],
     ['workspace', '{"workspace":"unknown","path":"probe.txt"}', 'provider_workspace_handle_not_bound'],
-    ['missing', '{"path":"probe.txt"}', 'provider_workspace_handle_required'],
+    ['empty', '{"workspace":"","path":"probe.txt"}', 'provider_workspace_handle_required'],
   ]) {
     const journal = new InMemoryCommandJournal();
     const sessionId = `session:aggregate-input-${suffix}`;

@@ -138,11 +138,117 @@
   }
 }
 
+.local-agent__viewport {
+  position: relative;
+  min-height: 0;
+}
+
 .local-agent__body {
+  height: 100%;
   min-height: 0;
   overflow: auto;
   scrollbar-gutter: stable;
   overflow-anchor: none;
+}
+
+.conversation-navigation {
+  position: absolute;
+  z-index: 5;
+  left: 3px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 28px;
+  transition: width 160ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.conversation-navigation:is(:hover, :has(:focus-visible)) {
+  width: 36px;
+}
+
+.conversation-navigation__ticks {
+  display: flex;
+  flex-direction: column;
+  max-height: min(360px, 55vh);
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.conversation-navigation__ticks::-webkit-scrollbar {
+  display: none;
+}
+
+/* Override the shared .local-agent button surface without changing other controls. */
+.local-agent .conversation-navigation__ticks button {
+  flex: 0 0 14px;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 14px;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  appearance: none;
+  cursor: pointer;
+}
+
+.conversation-navigation__ticks button span {
+  width: 8px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--dc-muted);
+  opacity: .4;
+  transition:
+    width 160ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 110ms ease,
+    transform 160ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.conversation-navigation__ticks button[aria-current] span {
+  width: 12px;
+  opacity: .85;
+  background: var(--dc-foreground-strong);
+}
+
+.conversation-navigation:is(:hover, :has(:focus-visible)) .conversation-navigation__ticks button span {
+  width: 14px;
+  opacity: .55;
+}
+
+.conversation-navigation:is(:hover, :has(:focus-visible)) .conversation-navigation__ticks button:is(:hover, :focus-visible, [aria-current]) span {
+  width: 22px;
+  opacity: 1;
+  background: var(--dc-foreground-strong);
+}
+
+.conversation-navigation__ticks button:is(:hover, :focus-visible) span {
+  transform: scaleY(1.35);
+}
+
+.conversation-navigation__preview {
+  position: absolute;
+  top: 50%;
+  left: 40px;
+  width: min(360px, 60vw);
+  transform: translateY(-50%);
+  padding: 12px 14px;
+  border: 1px solid var(--dc-border);
+  border-radius: 12px;
+  background: var(--dc-surface);
+  color: var(--dc-foreground-strong);
+  box-shadow: 0 4px 20px #0002;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .conversation-navigation,
+  .conversation-navigation__ticks button span {
+    transition: none;
+  }
 }
 
 .local-agent__transcript {
@@ -259,10 +365,39 @@
   width: fit-content;
   min-width: 0;
   max-width: min(620px, 88%);
+  display: flex;
+  flex-direction: column-reverse;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.local-agent__message--user .local-agent__message-text {
   padding: 10px 14px;
   border-radius: 17px 17px 5px 17px;
   background: var(--dc-surface-subtle);
 }
+
+.local-agent__message-text:empty { display: none; }
+.local-agent__message--user .local-agent__message-attachments { margin: 0; justify-content: flex-end; }
+.local-agent__message-attachments > button {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  max-width: 100%; padding: 12px 16px; border: 1px solid var(--dc-border);
+  border-radius: 14px; background: var(--dc-surface-raised); color: var(--dc-foreground);
+  text-align: left; overflow-wrap: anywhere; cursor: pointer;
+}
+.local-agent__pasted-text {
+  margin: 6px 0 12px; padding: 12px; border: 1px solid var(--dc-border);
+  border-radius: 14px; background: var(--dc-surface-raised);
+}
+.local-agent__pasted-text-header { display: flex; gap: 10px; align-items: center; }
+.local-agent__pasted-text-header > svg { width: 24px; height: 24px; flex-shrink: 0; }
+.local-agent__pasted-text-header > span { min-width: 0; flex: 1; }
+.local-agent__pasted-text-header strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.local-agent__pasted-text-header small { color: var(--dc-muted); }
+.local-agent__pasted-text-header button { border: 0; background: none; font-size: 22px; color: var(--dc-muted); cursor: pointer; }
+.local-agent__paste-toggle, .local-agent__older-messages { border: 0; background: none; color: var(--dc-muted); padding: 8px 0; cursor: pointer; }
+.local-agent__paste-toggle { text-decoration: underline; }
+.local-agent__pasted-text textarea { max-height: 260px; overflow: auto; font-family: monospace; }
 
 .local-agent__message--tool .local-agent__message-content,
 .local-agent__message--system .local-agent__message-content {

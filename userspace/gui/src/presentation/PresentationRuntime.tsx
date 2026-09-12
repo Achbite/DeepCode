@@ -162,6 +162,8 @@ export interface PresentedCommittedContent {
   content(blockId: string): React.ReactNode;
 }
 
+const committedBlockCache = new WeakMap<SessionProjection, Map<string, PresentationBlock>>();
+
 export function usePresentedCommittedContent(
   projection: SessionProjection | null,
   locale: string,
@@ -175,24 +177,26 @@ export function usePresentedCommittedContent(
   }, [registry]);
 
   const inputBlocks = useMemo(() => {
-    if (!projection) return [];
-    return committedContentBlocks(projectSessionPresentation(projection));
+    if (!projection) return new Map<string, PresentationBlock>();
+    let blocks = committedBlockCache.get(projection);
+    if (!blocks) {
+      blocks = new Map(committedContentBlocks(projectSessionPresentation(projection)).map((block) => [block.blockId, block]));
+      committedBlockCache.set(projection, blocks);
+    }
+    return blocks;
   }, [projection?.revision, projection?.sessionId]);
   const renderKey = projection
     ? `${projection.sessionId}:${projection.revision}:${snapshot.revision}:${locale}`
     : `empty:${snapshot.revision}:${locale}`;
-  const rendered = useMemo(() => {
-    const nodes = new Map<string, React.ReactNode>();
-    for (const block of inputBlocks) {
-      const output = registry.render([block], { locale }).at(-1);
-      if (output !== undefined) nodes.set(block.blockId, output);
-    }
-    return nodes;
-  }, [inputBlocks, locale, registry, renderKey]);
+  const rendered = useMemo(() => new Map<string, React.ReactNode>(), [inputBlocks, locale, registry, renderKey]);
 
   const content = useCallback((blockId: string) => {
+    if (!rendered.has(blockId)) {
+      const block = inputBlocks.get(blockId);
+      if (block) rendered.set(blockId, registry.render([block], { locale }).at(-1));
+    }
     return rendered.get(blockId);
-  }, [rendered]);
+  }, [inputBlocks, locale, registry, rendered]);
 
   return { registry, snapshot, layoutKey: renderKey, content };
 }

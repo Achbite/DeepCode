@@ -1915,12 +1915,56 @@ function assertToolRecordIdentity(
   }
 }
 
-function pendingToolRequests(
+/** Called only after Kernel runtime release has drained owned attempts. */
+export async function terminalToolEvents(
+  snapshot: LoopSnapshot,
+  runId: string,
+  kernel: AgentComposition['kernel'],
+  settlement: RunSettlement,
+): Promise<NewSessionEvent[]> {
+  const events: NewSessionEvent[] = [];
+  for (const request of pendingToolRequests(snapshot.events, runId)) {
+    let record: ToolExecutionRecord | null = null;
+    let lookupError: LocalAgentError | undefined;
+    try {
+      record = await kernel.readRecord(request.callId);
+    } catch (error) {
+      lookupError = localAgentError(error);
+    }
+    if (record) {
+      assertToolRecordIdentity(record, expectedToolRecordIdentity(
+        snapshot, runRuntimeSnapshot(snapshot, runId), request,
+      ));
+      events.push({
+        type: 'tool.completed', sessionId: snapshot.state.sessionId, runId,
+        callId: request.callId, payload: { record },
+      });
+    } else {
+      const cause = 'error' in settlement ? settlement.error : undefined;
+      events.push({
+        type: 'tool.interrupted', sessionId: snapshot.state.sessionId, runId,
+        callId: request.callId,
+        payload: {
+          attemptId: request.payload.attemptId,
+          error: {
+            code: 'tool_result_unknown',
+            message: `Runtime 已释放；调用 ${request.callId}（attempt ${request.payload.attemptId}）没有可确认的 Kernel 结果。执行与副作用未知，请先检查实际状态，勿自动重复执行。`
+              + (cause ? ` 原始错误 ${cause.code}: ${cause.message}` : ` Run ${settlement.outcome}。`)
+              + (lookupError ? ` 结果读取失败 ${lookupError.code}: ${lookupError.message}` : ''),
+          },
+        },
+      });
+    }
+  }
+  return events;
+}
+
+export function pendingToolRequests(
   events: readonly SessionEvent[],
   runId: string,
 ): Array<Extract<SessionEvent, { type: 'tool.requested' }>> {
   const completed = new Set(events.flatMap((event) => (
-    (event.type === 'tool.completed' || event.type === 'tool.input-rejected')
+    (event.type === 'tool.completed' || event.type === 'tool.input-rejected' || event.type === 'tool.interrupted')
       && event.runId === runId ? [event.callId] : []
   )));
   return events.filter(

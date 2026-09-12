@@ -110,7 +110,8 @@ function planOperationDetail(operation: PlanOperation, language: UiLanguage = 'z
   const chinese = language === 'zh-CN';
   if (operation.operation === 'bash') {
     const scope = operation.executionScope === 'host' ? (chinese ? '宿主机' : 'Host') : (chinese ? '工作区' : 'Workspace');
-    const mode = chinese ? '允许修改' : 'May modify';
+    const paths = operation.writablePaths?.map((target) => target.path + (target.kind === 'directory' ? '/' : '')).join(', ');
+    const mode = (chinese ? '允许修改' : 'May modify') + (paths ? `: ${paths}` : '');
     return `${chinese ? '执行命令' : 'Run command'} · ${scope} · ${mode}${operation.command ? `\n${operation.command}` : ''}${operation.terminal ? (chinese ? ' · 交互终端' : ' · Interactive terminal') : ''}`;
   }
   const label = operation.operation === 'fs.delete' ? (chinese ? '删除' : 'Delete')

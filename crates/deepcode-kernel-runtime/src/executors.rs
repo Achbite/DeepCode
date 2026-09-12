@@ -77,12 +77,20 @@ impl KernelCancellationToken {
 }
 
 #[derive(Debug, Clone)]
+pub struct WorkspaceWriteTarget {
+    pub path: PathBuf,
+    pub directory: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct KernelToolExecutionContext {
     /// Kernel-owned per-attempt archive. Retained output belongs to the Session.
     pub output_directory: Option<PathBuf>,
     pub workspace_root: Option<String>,
     pub workspace_id: Option<String>,
     pub private_resolved_targets: Vec<String>,
+    /// None is an explicit unrestricted workspace-write grant; Some limits writes to Plan paths.
+    pub workspace_write_targets: Option<Vec<WorkspaceWriteTarget>>,
     pub cancellation: KernelCancellationToken,
 }
 

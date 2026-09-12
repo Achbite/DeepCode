@@ -289,6 +289,7 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
               ? <span>{t(language, 'agent.tool.detail.loading')}</span>
               : <><pre>{detail.error}</pre>{detail.truncated && <small>{t(language, 'agent.tool.detail.truncated')}</small>}</>}
           </section>}
+          {activity.interruption && <p role="status">{activity.interruption.message}</p>}
           {activity.inputRejection && (
             <div className="local-agent__input-rejection">
               <p>{activity.inputRejection.message}</p>

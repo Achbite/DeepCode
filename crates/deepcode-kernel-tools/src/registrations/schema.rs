@@ -65,8 +65,8 @@ pub(super) fn provider_schema_for_tool(tool: KernelToolKind) -> Value {
                         "type": "object",
                         "required": ["oldText", "newText"],
                         "properties": {
-                            "oldText": { "type": "string", "minLength": 1 },
-                            "newText": { "type": "string" }
+                            "oldText": { "type": "string", "minLength": 1, "description": "Copy a small, exact, unique region from the original file. Preserve whitespace. Include only enough context to distinguish this occurrence; do not copy large unchanged regions." },
+                            "newText": { "type": "string", "description": "Replacement for this region; use an empty string to delete it." }
                         },
                         "additionalProperties": false
                     }
@@ -89,23 +89,25 @@ pub(super) fn provider_schema_for_tool(tool: KernelToolKind) -> Value {
         }),
         KernelToolKind::ProcessShell => serde_json::json!({
             "type": "object",
-            "required": ["command", "workspaceMode", "executionScope"],
+            "required": ["command"],
             "properties": {
                 "command": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 16384,
-                    "description": "One bounded Bash command. Use cd within the command when a workspace subdirectory is required."
+                    "description": "Bash script, including newlines. Use cd for a subdirectory. Preserve quoting and use a quoted heredoc for literal multiline input. Use set -e and set -o pipefail when each step must succeed."
                 },
                 "workspaceMode": {
                     "type": "string",
                     "enum": ["read", "write"],
-                    "description": "Required workspace access declaration. read denies workspace writes; write requires mutation authority."
+                    "default": "read",
+                    "description": "Defaults to read. In workspace scope, read denies workspace writes; write requires Plan mutation authority. Host scope has its separate external-effect authority."
                 },
                 "executionScope": {
                     "type": "string",
                     "enum": ["workspace", "host"],
-                    "description": "Required execution boundary. workspace requires a registered platform workspace sandbox and fails explicitly when unavailable; host uses the host user environment and requires external-effect authority."
+                    "default": "workspace",
+                    "description": "Defaults to workspace, which requires a registered platform workspace sandbox and fails explicitly when unavailable. Explicit host uses the host user environment and requires external-effect authority."
                 },
                 "timeout": {
                     "type": "integer",
