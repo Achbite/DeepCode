@@ -42,10 +42,11 @@ fi
 run_static() {
   printf '[test] 源码身份与脚本语法\n'
   local script
-  for script in ./test.sh ./build.sh ./entrypoint.sh ./scripts/source-identity.sh ./scripts/branch-flow.sh ./scripts/package-macos.sh ./scripts/macos-package-service.sh ./scripts/check-architecture.sh; do
+  for script in ./test.sh ./build.sh ./entrypoint.sh ./scripts/source-identity.sh ./scripts/branch-flow.sh ./scripts/package-macos.sh ./scripts/macos-package-service.sh ./scripts/build-platforms.sh ./scripts/tests/build-platforms.sh ./scripts/check-architecture.sh; do
     bash -n "$script"
   done
   bash ./scripts/check-architecture.sh
+  bash ./scripts/tests/build-platforms.sh
   if deepcode_source_git_available "$ROOT_DIR"; then
     git -C "$ROOT_DIR" diff --check
   else
