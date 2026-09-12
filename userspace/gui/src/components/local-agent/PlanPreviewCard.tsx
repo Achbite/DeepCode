@@ -1,4 +1,5 @@
-import React, { useRef, useState } from 'react';
+import React, { useRef } from 'react';
+import { useConversationRowState } from './ConversationVirtualRow';
 import type { PlanPreviewProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
@@ -13,7 +14,7 @@ interface PlanPreviewCardProps {
 
 export function PlanPreviewCard({ preview, language, onToggle }: PlanPreviewCardProps) {
   const cardRef = useRef<HTMLElement>(null);
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useConversationRowState('plan-preview:expanded', false);
   const toggle = () => {
     if (cardRef.current) onToggle?.(cardRef.current, !expanded);
     setExpanded(!expanded);

@@ -30,11 +30,32 @@ function renderTree(root: MarkdownRoot): Root {
   return tree;
 }
 
-function fullBlocks(text: string): MarkdownBlock[] {
-  return renderTree(parser.parse(text)).children.flatMap((node, index) => {
+const completedDocuments = new Map<string, MarkdownBlock[]>();
+let completedCharacters = 0;
+
+function fullBlocks(text: string, cache = true): MarkdownBlock[] {
+  const cached = cache ? completedDocuments.get(text) : undefined;
+  if (cached) {
+    completedDocuments.delete(text);
+    completedDocuments.set(text, cached);
+    return cached;
+  }
+  const blocks = renderTree(parser.parse(text)).children.flatMap((node, index) => {
     if (node.type === 'text' && !node.value.trim()) return [];
     return [{ key: String(node.position?.start.offset ?? `generated:${index}`), tree: { type: 'root' as const, children: [node] }, streaming: false }];
   });
+  // Cache parsed display content across component remounts, with a bounded LRU.
+  // Live tails bypass this cache; reference-bearing streams reconcile separately.
+  if (cache && text.length <= 500_000) {
+    completedDocuments.set(text, blocks);
+    completedCharacters += text.length;
+    while (completedDocuments.size > 128 || completedCharacters > 500_000) {
+      const oldest = completedDocuments.keys().next().value!;
+      completedCharacters -= oldest.length;
+      completedDocuments.delete(oldest);
+    }
+  }
+  return blocks;
 }
 
 /** Only the parser-confirmed prefix freezes. Lists, tables and open fences stay in the tail. */
@@ -58,7 +79,7 @@ export class StreamingMarkdownParser {
     if (root.children.some((node) => node.type === 'definition' || node.type === 'footnoteDefinition')) this.documentReferences = true;
     if (this.documentReferences) {
       this.offset = 0; this.frozen = [];
-      this.blocks = fullBlocks(text).map((block) => ({ ...block, streaming: true }));
+      this.blocks = fullBlocks(text, false).map((block) => ({ ...block, streaming: true }));
       return this.blocks;
     }
     const base = this.offset;

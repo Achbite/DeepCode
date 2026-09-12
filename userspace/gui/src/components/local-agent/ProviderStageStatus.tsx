@@ -28,12 +28,18 @@ const ProviderStageStatus: React.FC<Props> = ({ run, activity, toolPending, lang
       : activity?.purpose === 'contextCompaction' ? 'compacting'
         : activity?.phase ?? (toolPending ? 'tools' : 'preparing');
   const elapsedSeconds = Math.max(0, Math.floor((now - startedAt) / 1000));
+  const lastContentAt = activity?.lastContentAt ? Date.parse(activity.lastContentAt) : NaN;
+  const activityDetail = Number.isFinite(lastContentAt)
+    ? t(language, 'agent.activity.lastContent', { seconds: Math.max(0, Math.floor((now - lastContentAt) / 1000)) })
+    : t(language, 'agent.activity.noContent');
   const status = (
     <span className={`local-agent__provider-stage local-agent__provider-stage--${run.status}`}>
       <span className={run.status === 'running' ? 'local-agent__run-spinner' : 'local-agent__stage-dot'} aria-hidden="true" />
       <span className="local-agent__stage-main">
         <span role="status" aria-live="polite">{t(language, `agent.activity.${phase}`)}</span>
-        {streaming && <span className="local-agent__stage-time">{t(language, 'agent.activity.elapsed', { seconds: elapsedSeconds })}</span>}
+        {streaming && <span className="local-agent__stage-time" title={activityDetail}>
+          {t(language, 'agent.activity.elapsed', { seconds: elapsedSeconds })}
+        </span>}
       </span>
     </span>
   );

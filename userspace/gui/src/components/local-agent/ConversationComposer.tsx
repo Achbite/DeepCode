@@ -6,6 +6,7 @@ import SessionModelSelector from './SessionModelSelector';
 import { ComposerDecisionPanels } from './ComposerDecisionPanels';
 import { ComposerPermissionControl } from './ComposerPermissionControl';
 import type { AgentComposer } from './useAgentComposer';
+import { pastedTextTitle } from '../../services/pastedText';
 
 interface ConversationComposerProps {
   changeBar?: React.ReactNode;
@@ -150,6 +151,19 @@ export function ConversationComposer({
         {selectedProfileId && !profiles.some((profile) => profile.id === selectedProfileId && profile.enabled) && (
           <p className="local-agent__profile-notice" role="status">{t(language, 'agent.profile.boundUnavailable')}</p>
         )}
+        {composer.pastedTexts.map((paste, index) => (
+          <div className="local-agent__pasted-text" key={index}>
+            <div className="local-agent__pasted-text-header">
+              <DeepCodeShellIcon name="artifact" />
+              <span><strong>{pastedTextTitle(paste.text)}</strong><small>TXT · {(new TextEncoder().encode(paste.text).byteLength / 1024).toFixed(1)} KiB</small></span>
+              <button type="button" aria-label="移除粘贴文本" onClick={() => composer.setPastedTexts((current) => current.filter((item) => item.inputId !== paste.inputId))}>×</button>
+            </div>
+            <button type="button" className="local-agent__paste-toggle" aria-expanded={paste.expanded} onClick={() => composer.setPastedTexts((current) => current.map((item) => item.inputId === paste.inputId ? { ...item, expanded: !item.expanded } : item))}>
+              {paste.expanded ? '收起原文' : '在文本框中显示'}
+            </button>
+            {paste.expanded && <textarea aria-label="粘贴文本原文" value={paste.text} onChange={(event) => composer.editPastedText(paste.inputId, event.target.value)} rows={8} />}
+          </div>
+        ))}
         <textarea
           ref={textareaRef}
           value={draft}
@@ -168,6 +182,7 @@ export function ConversationComposer({
           onCompositionStart={beginComposition}
           onCompositionEnd={endComposition}
           onKeyDown={submitOnComposerEnter}
+          onPaste={composer.pasteText}
         />
         {(pendingFilesystemPaths.length > 0 || pluginSelections.length > 0) && (
           <div className="local-agent__draft-attachments">

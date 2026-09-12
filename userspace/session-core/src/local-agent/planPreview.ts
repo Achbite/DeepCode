@@ -18,6 +18,7 @@ export class PlanPreviewBuffer {
     if (data.name !== this.wireName) return;
     const fields = readFields(call.text, 0);
     const steps: string[] = [];
+    let stepsTruncated = false;
     let cursor = fields.stepsStart;
     if (cursor !== undefined) {
       while (steps.length < 12) {
@@ -30,13 +31,14 @@ export class PlanPreviewBuffer {
         cursor = skipSpace(call.text, end);
         if (call.text[cursor] !== ',') break;
         cursor += 1;
+        if (steps.length === 12) stepsTruncated = true;
       }
     }
     return {
       callIndex: data.callIndex, providerCallId: data.callId,
       ...(data.outputIndex === undefined ? {} : { outputIndex: data.outputIndex }),
       title: (fields.title ?? '').slice(0, 256), summary: (fields.summary ?? '').slice(0, 4096),
-      steps, truncated: call.truncated || (fields.summary?.length ?? 0) > 4096 || (fields.title?.length ?? 0) > 256,
+      steps, truncated: call.truncated || stepsTruncated || (fields.summary?.length ?? 0) > 4096 || (fields.title?.length ?? 0) > 256,
     };
   }
 }

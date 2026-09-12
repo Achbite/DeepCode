@@ -94,7 +94,7 @@ function planBlock(plan: PlanProjection): PresentationBlock {
         entries: plan.mutationManifest.map((operation) => ({
           key: `${operation.workspaceId}:${operation.operation}`,
           value: operation.operation === 'bash'
-            ? `${operation.executionScope}/${operation.workspaceMode}${operation.command ? ` · ${operation.command}` : ''}`
+            ? `${operation.executionScope}/${operation.workspaceMode}${operation.writablePaths ? ` · ${operation.writablePaths.map((target) => target.path + (target.kind === 'directory' ? '/' : '')).join(', ')}` : ''}${operation.command ? ` · ${operation.command}` : ''}`
             : operation.target,
         })),
       }]

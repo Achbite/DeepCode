@@ -77,12 +77,20 @@ impl KernelCancellationToken {
 }
 
 #[derive(Debug, Clone)]
+pub struct WorkspaceWriteTarget {
+    pub path: PathBuf,
+    pub directory: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct KernelToolExecutionContext {
     /// Kernel-owned per-attempt archive. Retained output belongs to the Session.
     pub output_directory: Option<PathBuf>,
     pub workspace_root: Option<String>,
     pub workspace_id: Option<String>,
     pub private_resolved_targets: Vec<String>,
+    /// None is an explicit unrestricted workspace-write grant; Some limits writes to Plan paths.
+    pub workspace_write_targets: Option<Vec<WorkspaceWriteTarget>>,
     pub cancellation: KernelCancellationToken,
 }
 
@@ -328,6 +336,7 @@ struct TextEditRange {
 struct AppliedTextEdits {
     updated: String,
     changed_ranges: Value,
+    preview: Value,
 }
 
 fn apply_exact_text_edits(original: &str, edits: &Value) -> KernelResult<AppliedTextEdits> {
@@ -341,12 +350,12 @@ fn apply_exact_text_edits(original: &str, edits: &Value) -> KernelResult<Applied
     }
 
     let mut ranges = Vec::with_capacity(edits.len());
-    for edit in edits {
+    for (edit_index, edit) in edits.iter().enumerate() {
         let old_text = required_string(edit, "oldText")?;
         let new_text = get_string_allow_empty(edit, "newText").ok_or_else(|| {
             KernelError::InvalidCommand("fs.edit edit.newText is required".to_string())
         })?;
-        let (start, end) = unique_match_range(original, &old_text)?;
+        let (start, end) = unique_match_range(original, &old_text, edit_index)?;
         ranges.push(TextEditRange {
             start,
             end,
@@ -373,36 +382,100 @@ fn apply_exact_text_edits(original: &str, edits: &Value) -> KernelResult<Applied
     for range in ranges.iter().rev() {
         updated.replace_range(range.start..range.end, &range.new_text);
     }
+    let preview = edit_preview(original, &updated, &ranges);
     Ok(AppliedTextEdits {
         updated,
         changed_ranges,
+        preview,
     })
 }
 
-fn unique_match_range(haystack: &str, needle: &str) -> KernelResult<(usize, usize)> {
+// Show actual before/after line context, including joins caused by a replaced
+// newline. This bounded display result never changes matching or file content.
+fn edit_preview(original: &str, updated: &str, ranges: &[TextEditRange]) -> Value {
+    fn excerpt(text: &str, start: usize, end: usize, limit: usize) -> (String, bool, usize) {
+        let line_start = text[..start].rfind('\n').map_or(0, |index| index + 1);
+        let line_end = text[end..]
+            .find('\n')
+            .map_or(text.len(), |index| end + index + 1);
+        let mut chars = text[line_start..line_end].chars();
+        let content = chars.by_ref().take(limit).collect::<String>();
+        let truncated = chars.next().is_some();
+        let line = text[..line_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        (content, truncated, line)
+    }
+    let mut remaining = 4096;
+    let mut hunks = Vec::new();
+    let mut offset: isize = 0;
+    let mut truncated = false;
+    for range in ranges {
+        if remaining < 2 {
+            truncated = true;
+            break;
+        }
+        let start = (range.start as isize + offset) as usize;
+        let (before, before_cut, old_line) =
+            excerpt(original, range.start, range.end, remaining / 2);
+        let (after, after_cut, new_line) =
+            excerpt(updated, start, start + range.new_text.len(), remaining / 2);
+        remaining -= before.chars().count() + after.chars().count();
+        truncated |= before_cut || after_cut;
+        hunks.push(serde_json::json!({"oldStartLine":old_line, "newStartLine":new_line, "before":before, "after":after}));
+        offset += range.new_text.len() as isize - (range.end - range.start) as isize;
+    }
+    serde_json::json!({"hunks":hunks, "truncated":truncated})
+}
+
+fn unique_match_range(
+    haystack: &str,
+    needle: &str,
+    edit_index: usize,
+) -> KernelResult<(usize, usize)> {
     if needle.is_empty() {
         return Err(KernelError::Structured {
             code: "patch_match_empty",
             stage: "execution",
-            message: "patch match text must not be empty".to_string(),
-            details: serde_json::json!({ "classification": "invalid_patch_match" }),
+            message: format!("fs.edit edits[{edit_index}] oldText must not be empty"),
+            details: serde_json::json!({
+                "classification": "invalid_patch_match",
+                "editIndex": edit_index,
+            }),
         });
     }
+    let needle_lines = needle.lines().count();
     let mut matches = haystack.match_indices(needle);
     let Some((start, _)) = matches.next() else {
         return Err(KernelError::Structured {
             code: "patch_match_not_found",
             stage: "execution",
-            message: "patch match did not occur in target file".to_string(),
-            details: serde_json::json!({ "classification": "stale_or_mismatched_evidence" }),
+            message: format!(
+                "fs.edit edits[{edit_index}] oldText was not found in the target file ({} bytes, {} lines)",
+                needle.len(),
+                needle_lines,
+            ),
+            details: serde_json::json!({
+                "classification": "stale_or_mismatched_evidence",
+                "editIndex": edit_index,
+                "oldTextBytes": needle.len(),
+                "oldTextLines": needle_lines,
+            }),
         });
     };
     if matches.next().is_some() {
         return Err(KernelError::Structured {
             code: "patch_match_ambiguous",
             stage: "execution",
-            message: "patch match is ambiguous; expected exactly one match".to_string(),
-            details: serde_json::json!({ "classification": "ambiguous_patch_match" }),
+            message: format!(
+                "fs.edit edits[{edit_index}] oldText matches the target file more than once; expected exactly one match"
+            ),
+            details: serde_json::json!({
+                "classification": "ambiguous_patch_match",
+                "editIndex": edit_index,
+            }),
         });
     }
     Ok((start, start + needle.len()))

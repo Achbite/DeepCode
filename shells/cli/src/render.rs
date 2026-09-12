@@ -1,7 +1,7 @@
 use deepcode_kernel_client::{
     is_terminal_run_status, ActivityProjection, ApprovalProjection, ExecutionPlanStep,
-    InteractionProjection, ProjectionMessage, SessionProjection, SessionTimelineItem,
-    TodoListProjection,
+    InteractionProjection, PlanOperation, ProjectionMessage, SessionProjection,
+    SessionTimelineItem, TodoListProjection,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
@@ -133,6 +133,7 @@ impl CliRenderState {
                             &plan.title,
                             &plan.summary,
                             &plan.steps,
+                            &plan.mutation_manifest,
                         )?,
                         Some(status) if status != &plan.status => writeln!(
                             out,
@@ -251,6 +252,7 @@ impl CliRenderState {
                     &plan.title,
                     &plan.summary,
                     &plan.steps,
+                    &plan.mutation_manifest,
                 )?;
                 self.plans.insert(key, plan.status.clone());
             }
@@ -345,6 +347,7 @@ fn render_plan_document(
     title: &str,
     summary: &str,
     steps: &[ExecutionPlanStep],
+    operations: &[PlanOperation],
 ) -> io::Result<()> {
     writeln!(
         out,
@@ -359,6 +362,33 @@ fn render_plan_document(
             for item in verification {
                 writeln!(out, "   验证：{item}")?;
             }
+        }
+    }
+    if !operations.is_empty() {
+        writeln!(out, "修改范围：")?;
+        for operation in operations {
+            write!(
+                out,
+                "  [{}] {}",
+                operation.workspace_id, operation.operation
+            )?;
+            if let Some(target) = &operation.target {
+                write!(out, " {target}")?;
+            }
+            if let Some(scope) = &operation.execution_scope {
+                write!(out, " · {scope}")?;
+            }
+            if let Some(paths) = &operation.writable_paths {
+                for target in paths {
+                    write!(
+                        out,
+                        " · {}{}",
+                        target.path,
+                        if target.kind == "directory" { "/" } else { "" }
+                    )?;
+                }
+            }
+            writeln!(out)?;
         }
     }
     Ok(())
@@ -431,6 +461,9 @@ pub(crate) fn render_tool_activity(
         .map(|tool| tool.operation.as_str())
         .unwrap_or(activity.label.as_str());
     writeln!(out, "工具 {operation} [{}]", activity.status)?;
+    if let Some(error) = &activity.interruption {
+        writeln!(out, "  {}: {}", error.code, error.message)?;
+    }
     if let Some(tool) = activity.tool.as_ref() {
         if let Some(shell) = tool.shell.as_ref() {
             writeln!(out, "  $ {}", shell.command)?;

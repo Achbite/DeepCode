@@ -670,7 +670,6 @@
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  border-left: 1px solid var(--dc-border);
   background: var(--dc-surface);
 }
 
@@ -696,9 +695,9 @@
   gap: 0;
   padding: 16px;
   border: 1px solid var(--dc-border);
-  border-radius: 20px;
+  border-radius: 16px;
   background: var(--dc-surface-raised);
-  box-shadow: var(--dc-shadow-panel);
+  box-shadow: var(--dc-shadow-small);
 }
 
 .deepcode-gui-task-list-card__title {
@@ -719,11 +718,9 @@
 }
 
 .deepcode-gui-task-list-card__empty {
-  min-height: 76px;
+  min-height: 64px;
   display: grid;
   place-items: center;
-  border: 1px dashed var(--dc-border);
-  border-radius: 10px;
   color: var(--dc-faint);
   font-size: var(--dc-font-caption);
   text-align: center;
@@ -739,8 +736,7 @@
   grid-template-columns: 8px minmax(0, 1fr) auto;
   align-items: start;
   gap: 9px;
-  padding: 11px 0;
-  border-bottom: 1px solid var(--dc-border);
+  padding: 9px 0;
 }
 
 .deepcode-gui-task-item:last-child {
@@ -801,7 +797,6 @@
   display: grid;
   gap: 3px;
   padding: 9px 0;
-  border-bottom: 1px solid var(--dc-border);
 }
 
 .deepcode-gui-output-item:last-child {

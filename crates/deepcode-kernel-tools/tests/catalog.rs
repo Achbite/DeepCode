@@ -5,13 +5,18 @@ use serde_json::json;
 fn rejected_arguments_explain_required_unknown_enum_type_and_nested_bounds() {
     use deepcode_kernel_tools::KernelToolCatalogError;
     let registry = KernelToolRegistry::new();
-    let error = registry.canonicalize("bash", json!({"command":"pwd", "executionMode":"read", "executionScope":"outside", "timeout":"slow"})).unwrap_err();
+    let error = registry
+        .canonicalize(
+            "bash",
+            json!({"executionMode":"read", "executionScope":"outside", "timeout":"slow"}),
+        )
+        .unwrap_err();
     let KernelToolCatalogError::InvalidArguments { issues, .. } = error else {
         panic!("expected typed input rejection")
     };
     assert!(issues
         .iter()
-        .any(|issue| issue.path == "$.workspaceMode" && issue.rule == "required"));
+        .any(|issue| issue.path == "$.command" && issue.rule == "required"));
     assert!(issues
         .iter()
         .any(|issue| issue.path == "$.executionMode" && issue.rule == "additionalProperties"));
@@ -37,6 +42,18 @@ fn rejected_arguments_explain_required_unknown_enum_type_and_nested_bounds() {
         registry.canonicalize("missing.tool", json!({})),
         Err(KernelToolCatalogError::ToolNotRegistered(_))
     ));
+}
+
+#[test]
+fn bash_defaults_are_workspace_read_without_rewriting_the_script() {
+    let script = "set -o pipefail\nprintf '%s\\n' 'literal $HOME' | head -1";
+    let invocation = KernelToolRegistry::new()
+        .canonicalize("bash", json!({"command": script}))
+        .unwrap();
+    assert_eq!(invocation.arguments["command"], script);
+    assert_eq!(invocation.arguments["workspaceMode"], "read");
+    assert_eq!(invocation.arguments["executionScope"], "workspace");
+    assert_eq!(invocation.arguments["timeout"], 120);
 }
 
 #[test]
@@ -77,10 +94,7 @@ fn catalog_exposes_basic_callable_tools() {
         vec!["limit", "query"]
     );
     assert!(registry.descriptor("process.shell").is_none());
-    assert_eq!(
-        bash.input_schema["required"],
-        json!(["command", "workspaceMode", "executionScope"])
-    );
+    assert_eq!(bash.input_schema["required"], json!(["command"]));
     assert_eq!(
         bash.input_schema["properties"]
             .as_object()
@@ -172,4 +186,44 @@ fn file_names_keep_distinct_unicode_spelling_through_invocation_and_identity() {
             .unwrap()
             .arguments
     );
+}
+
+#[test]
+fn rejected_arguments_expose_field_paths_for_extra_fields_and_bounds() {
+    use deepcode_kernel_tools::KernelToolCatalogError;
+    let registry = KernelToolRegistry::new();
+    let error = registry
+        .canonicalize(
+            "fs.edit",
+            json!({
+                "path": "README.md",
+                "edits": [{"oldText": "a", "newText": "b"}],
+                "workspaceMode": "write"
+            }),
+        )
+        .unwrap_err();
+    let KernelToolCatalogError::InvalidArguments { issues, .. } = error else {
+        panic!("expected typed input rejection")
+    };
+    assert!(issues
+        .iter()
+        .any(|issue| issue.path == "$.workspaceMode" && issue.rule == "additionalProperties"));
+
+    let error = registry
+        .canonicalize(
+            "bash",
+            json!({
+                "command": "pwd",
+                "workspaceMode": "read",
+                "executionScope": "workspace",
+                "timeout": 900
+            }),
+        )
+        .unwrap_err();
+    let KernelToolCatalogError::InvalidArguments { issues, .. } = error else {
+        panic!("expected typed input rejection")
+    };
+    assert!(issues.iter().any(|issue| issue.path == "$.timeout"
+        && issue.rule == "maximum"
+        && issue.expected == Some(json!(600))));
 }

@@ -157,7 +157,9 @@ export class SessionService implements ConversationPort {
   }
 
   private async openActor(sessionId: string): Promise<SessionActor> {
-    const first = await firstEvent(this.journal, sessionId);
+    const events = await readSessionEvents(this.journal, sessionId);
+    const first = events[0];
+    if (!first) throw new Error('session_not_found');
     if (first.type !== 'session.created') throw new Error('session_creation_event_missing');
     const profileId = first.payload.profileId;
     const installed = await this.compositions.create({
@@ -165,6 +167,7 @@ export class SessionService implements ConversationPort {
       workspaceBindings: first.payload.workspaceBindings.map((binding) => ({ ...binding })),
     });
     const actor = new SessionActor(sessionId, this.journal, installed.composition, {
+      initialEvents: events,
       ...(profileId ? { profileId } : {}),
     });
     try {
@@ -186,9 +189,4 @@ export class SessionService implements ConversationPort {
 
 function isActorOpenRollbackFailure(error: unknown): boolean {
   return error instanceof AggregateError && error.message === 'session_actor_open_rollback_failed';
-}
-
-async function firstEvent(journal: CommandJournalPort, sessionId: string) {
-  for await (const event of journal.read(sessionId)) return event;
-  throw new Error('session_not_found');
 }

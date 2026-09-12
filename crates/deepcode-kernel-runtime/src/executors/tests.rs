@@ -1,5 +1,51 @@
 use super::*;
 
+#[test]
+fn edit_preview_exposes_line_joins_without_changing_requested_text() {
+    let original = "# script\necho ready\nif true; then\n  echo done\nfi\n";
+    let patch = apply_exact_text_edits(
+        original,
+        &serde_json::json!([
+            {"oldText":"echo ready\n", "newText":"echo ready"},
+            {"oldText":"echo done", "newText":"echo 完成"}
+        ]),
+    )
+    .unwrap();
+    assert_eq!(
+        patch.updated,
+        "# script\necho readyif true; then\n  echo 完成\nfi\n"
+    );
+    assert_eq!(
+        patch.preview["hunks"][0]["before"],
+        "echo ready\nif true; then\n"
+    );
+    assert_eq!(
+        patch.preview["hunks"][0]["after"],
+        "echo readyif true; then\n"
+    );
+    assert_eq!(patch.preview["hunks"][1]["newStartLine"], 3);
+    assert_eq!(patch.preview["hunks"][1]["after"], "  echo 完成\n");
+    assert_eq!(patch.preview["truncated"], false);
+    let long = "字".repeat(5000);
+    let patch = apply_exact_text_edits(
+        &long,
+        &serde_json::json!([
+            {"oldText":long, "newText":"replacement"}
+        ]),
+    )
+    .unwrap();
+    assert_eq!(patch.updated, "replacement");
+    assert_eq!(patch.preview["truncated"], true);
+    assert!(
+        patch.preview["hunks"][0]["before"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count()
+            <= 2048
+    );
+}
+
 struct TempWorkspace(PathBuf);
 
 impl TempWorkspace {
@@ -35,6 +81,7 @@ fn context_with_target(root: &Path, relative_path: &str) -> KernelToolExecutionC
             ))),
         workspace_root: Some(canonical_root.to_string_lossy().to_string()),
         workspace_id: Some("workspace:test".to_string()),
+        workspace_write_targets: None,
         private_resolved_targets: vec![canonical_root
             .join(relative_path)
             .to_string_lossy()
@@ -595,4 +642,41 @@ fn file_changes_retain_each_operations_before_and_after_and_deleted_tree_files()
         fs::read_to_string(change["after"]["contentRef"].as_str().unwrap()).unwrap(),
         "after\n"
     );
+}
+
+#[test]
+fn fs_edit_rejections_name_the_failing_edit_index_and_shape() {
+    let not_found = serde_json::json!([
+        {"oldText": "alpha", "newText": "ALPHA"},
+        {"oldText": "gamma", "newText": "GAMMA"},
+    ]);
+    let error = apply_exact_text_edits("alpha beta", &not_found).unwrap_err();
+    let KernelError::Structured {
+        code,
+        message,
+        details,
+        ..
+    } = error
+    else {
+        panic!("expected a structured patch rejection");
+    };
+    assert_eq!(code, "patch_match_not_found");
+    assert!(message.contains("edits[1]"), "{message}");
+    assert_eq!(details["editIndex"], 1);
+    assert_eq!(details["oldTextBytes"], 5);
+
+    let ambiguous = serde_json::json!([{"oldText": "dup", "newText": "x"}]);
+    let error = apply_exact_text_edits("dup dup", &ambiguous).unwrap_err();
+    let KernelError::Structured {
+        code,
+        message,
+        details,
+        ..
+    } = error
+    else {
+        panic!("expected a structured patch rejection");
+    };
+    assert_eq!(code, "patch_match_ambiguous");
+    assert!(message.contains("edits[0]"), "{message}");
+    assert_eq!(details["editIndex"], 0);
 }

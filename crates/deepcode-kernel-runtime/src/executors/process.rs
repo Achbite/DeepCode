@@ -142,6 +142,7 @@ impl KernelToolExecutor for ProcessShellExecutor {
             &workspace_root,
             &workspace_mode,
             &execution_scope,
+            context.workspace_write_targets.as_deref(),
             #[cfg(target_os = "macos")]
             process_temp.as_ref().map(AgentShellTempDir::path),
             #[cfg(target_os = "macos")]
@@ -372,6 +373,7 @@ fn invoke_terminal_shell(
         &workspace_root,
         &workspace_mode,
         &execution_scope,
+        context.workspace_write_targets.as_deref(),
         #[cfg(target_os = "macos")]
         process_temp.as_ref().map(AgentShellTempDir::path),
         #[cfg(target_os = "macos")]
@@ -899,6 +901,7 @@ fn platform_shell_command(
     workspace_root: &Path,
     workspace_mode: &str,
     execution_scope: &str,
+    writable_targets: Option<&[WorkspaceWriteTarget]>,
     #[cfg(target_os = "macos")] temporary_root: Option<&Path>,
     #[cfg(target_os = "macos")] process_scope_id: Option<&str>,
 ) -> KernelResult<Command> {
@@ -925,6 +928,7 @@ fn platform_shell_command(
                 temporary_root,
                 process_scope_id,
                 workspace_mode,
+                writable_targets,
             )?)
             .arg(bash_program)
             .arg("-c")
@@ -940,6 +944,7 @@ fn platform_shell_command(
             workspace_root,
             workspace_mode,
             execution_scope,
+            writable_targets,
         );
         Err(KernelError::Structured {
             code: "bash_workspace_sandbox_unavailable",
@@ -956,6 +961,7 @@ fn platform_terminal_command(
     workspace_root: &Path,
     workspace_mode: &str,
     execution_scope: &str,
+    writable_targets: Option<&[WorkspaceWriteTarget]>,
     #[cfg(target_os = "macos")] temporary_root: Option<&Path>,
     #[cfg(target_os = "macos")] process_scope_id: Option<&str>,
 ) -> KernelResult<CommandBuilder> {
@@ -980,6 +986,7 @@ fn platform_terminal_command(
             temporary_root,
             process_scope_id,
             workspace_mode,
+            writable_targets,
         )?);
         command.arg(bash_program);
         command.arg("-c");
@@ -994,6 +1001,7 @@ fn platform_terminal_command(
             workspace_root,
             workspace_mode,
             execution_scope,
+            writable_targets,
         );
         Err(KernelError::Structured {
             code: "bash_workspace_sandbox_unavailable",
@@ -1004,12 +1012,13 @@ fn platform_terminal_command(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn macos_workspace_profile(
     workspace_root: &Path,
     temporary_root: &Path,
     process_scope_id: &str,
     workspace_mode: &str,
+    writable_targets: Option<&[WorkspaceWriteTarget]>,
 ) -> KernelResult<String> {
     let escaped_workspace = macos_sandbox_path(workspace_root, "workspace")?;
     let escaped_temporary = macos_sandbox_path(temporary_root, "temporary directory")?;
@@ -1024,7 +1033,22 @@ fn macos_workspace_profile(
     }
     let workspace_write_rule = match workspace_mode {
         "read" => String::new(),
-        "write" => format!("\n(allow file-write* (subpath \"{escaped_workspace}\"))"),
+        "write" => match writable_targets {
+            None => format!("\n(allow file-write* (subpath \"{escaped_workspace}\"))"),
+            Some(targets) => {
+                let mut rules = String::new();
+                for target in targets {
+                    let path = macos_sandbox_path(&target.path, "Plan write target")?;
+                    let matcher = if target.directory {
+                        "subpath"
+                    } else {
+                        "literal"
+                    };
+                    rules.push_str(&format!("\n(allow file-write* ({matcher} \"{path}\"))"));
+                }
+                rules
+            }
+        },
         _ => {
             return Err(KernelError::InvalidCommand(
                 "bash workspaceMode must be read or write".to_string(),
@@ -1036,7 +1060,7 @@ fn macos_workspace_profile(
     ))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn macos_sandbox_path(path: &Path, label: &str) -> KernelResult<String> {
     let path = path.to_str().ok_or_else(|| {
         KernelError::InvalidCommand(format!("bash {label} path is not valid UTF-8"))
@@ -1047,6 +1071,42 @@ fn macos_sandbox_path(path: &Path, label: &str) -> KernelResult<String> {
         )));
     }
     Ok(path.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[cfg(test)]
+mod plan_scope_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_policy_grants_only_the_confirmed_plan_paths() {
+        let root = Path::new("/fixture/workspace");
+        let temporary = Path::new("/fixture/private-temp");
+        let targets = [
+            WorkspaceWriteTarget {
+                path: root.join("src/main.cpp"),
+                directory: false,
+            },
+            WorkspaceWriteTarget {
+                path: root.join("build"),
+                directory: true,
+            },
+        ];
+        let policy =
+            macos_workspace_profile(root, temporary, "scope-test", "write", Some(&targets))
+                .unwrap();
+        assert!(
+            policy.contains("(allow file-write* (literal \"/fixture/workspace/src/main.cpp\"))")
+        );
+        assert!(policy.contains("(allow file-write* (subpath \"/fixture/workspace/build\"))"));
+        assert!(!policy.contains("(allow file-write* (subpath \"/fixture/workspace\"))"));
+        let read =
+            macos_workspace_profile(root, temporary, "scope-test", "read", Some(&targets)).unwrap();
+        assert!(
+            !read.contains("/fixture/workspace"),
+            "read mode cannot gain Plan write authority"
+        );
+        assert!(read.contains("(allow file-write* (subpath \"/fixture/private-temp\"))"));
+    }
 }
 
 struct ShellOutputArchive {

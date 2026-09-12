@@ -28,9 +28,9 @@ export function sessionControlInstructions(
   hasWorkspaceBindings = true,
 ): string {
   if (!hasWorkspaceBindings) {
-    return `Text with calls is progress; text without calls is the final answer. ${names.interactionRequest} must be the only call in its turn. No workspace is bound to this run; do not invent a workspace handle or request workspace operations.`;
+    return `Explicit commentary is progress and may continue without calls; unphased text without calls is the final answer. ${names.interactionRequest} must be the only call in its turn. No workspace is bound to this run; do not invent a workspace handle or request workspace operations.`;
   }
-  return `Text with calls is progress; text without calls is the final answer. ${names.interactionRequest} and ${names.planPublish} must each be the only call in their turn. One ${names.planProgress} may accompany ordinary tool calls, reporting confirmed Todo progress from a tool result recordId already received before this turn; never anticipate results of calls in the same turn. Command counts do not determine step completion. Session Todo messages are chronological state updates; the latest update is current. Use a logical workspace handle from the Session binding list and workspace-relative paths; never invent or expose a workspaceId.`;
+  return `Explicit commentary is progress and may continue without calls; unphased text without calls is the final answer. ${names.interactionRequest} and ${names.planPublish} must each be the only call in their turn. One ${names.planProgress} may accompany ordinary tool calls, reporting confirmed Todo progress from a tool result recordId already received before this turn; never anticipate results of calls in the same turn. Command counts do not determine step completion. Session Todo messages are chronological state updates; the latest update is current. Use a logical workspace handle from the Session binding list and workspace-relative paths; never invent or expose a workspaceId.`;
 }
 
 const INTERACTION_SCHEMA: JsonObject = {
@@ -71,6 +71,7 @@ const PLAN_OPERATION_SCHEMA: JsonObject = {
           enum: ['fs.write', 'fs.edit'],
         },
         target: { type: 'string', minLength: 1 },
+        targetKind: { type: 'string', enum: ['file', 'directoryTree'], description: 'Omit or use file for one file. directoryTree explicitly permits creating and editing descendant files; it does not permit deletion.' },
       },
     },
     {
@@ -94,6 +95,13 @@ const PLAN_OPERATION_SCHEMA: JsonObject = {
         command: { type: 'string', minLength: 1, maxLength: 16_384 },
         workspaceMode: { type: 'string', enum: ['write'] },
         executionScope: { type: 'string', enum: ['workspace', 'host'] },
+        writablePaths: {
+          type: 'array', minItems: 1,
+          description: 'Required for workspace Bash writes: list the source files or directories and build/output/cache directories that may be modified. A directory includes its descendants. Command text is not an authorization lock.',
+          items: { type: 'object', additionalProperties: false, required: ['path', 'kind'], properties: {
+            path: { type: 'string', minLength: 1 }, kind: { type: 'string', enum: ['file', 'directory'] },
+          } },
+        },
         terminal: {
           type: 'object',
           additionalProperties: false,
@@ -116,14 +124,15 @@ const PLAN_TITLE_SCHEMA: JsonObject = {
 const PLAN_SCHEMA: JsonObject = {
   type: 'object',
   additionalProperties: false,
-  required: ['title', 'summary', 'steps', 'mutationManifest'],
+  required: ['summary', 'mutationManifest'],
+  anyOf: [{ required: ['title', 'steps'] }, { required: ['mode'] }],
   properties: {
+    mode: { type: 'string', enum: ['extendScope'], description: 'Only to add scope to the current confirmed Plan: submit summary (reason) and mutationManifest (additions), omitting title and steps. Existing phases and verification are preserved; user confirmation is still required.' },
     title: PLAN_TITLE_SCHEMA,
     summary: { type: 'string', minLength: 1 },
     steps: {
       type: 'array',
       minItems: 1,
-      maxItems: 12,
       items: {
         type: 'object',
         additionalProperties: false,
@@ -134,7 +143,6 @@ const PLAN_SCHEMA: JsonObject = {
           details: { type: 'string', minLength: 1 },
           verification: {
             type: 'array',
-            maxItems: 8,
             items: { type: 'string', minLength: 1 },
           },
         },
@@ -142,7 +150,6 @@ const PLAN_SCHEMA: JsonObject = {
     },
     mutationManifest: {
       type: 'array',
-      maxItems: 128,
       items: PLAN_OPERATION_SCHEMA,
     },
   },
@@ -163,13 +170,19 @@ export type SessionControlCall =
   | {
       kind: 'plan';
       callId: string;
-      draft: PlanPublicationDraft;
+      draft: PlanPublicationDraft | PlanScopeExtension;
     };
 
 export interface PlanPublicationDraft {
   title: string;
   summary: string;
   steps: ExecutionPlanStep[];
+  mutationManifest: PlanOperation[];
+}
+
+export interface PlanScopeExtension {
+  mode: 'extendScope';
+  summary: string;
   mutationManifest: PlanOperation[];
 }
 
@@ -182,17 +195,17 @@ export function sessionControlToolDefinitions(): readonly ProviderToolDefinition
     },
     {
       name: SESSION_CONTROL_PLAN_PUBLISH,
-      description: 'Publish a complete Plan for user confirmation. Titles use inline Markdown; summary, details and verification use Markdown. Format code names and paths with backticks. mutationManifest declares file targets, explicit deletions and Bash execution/workspace scope; fs.edit and fs.write cover the same declared file. Bash command is an optional example, not an exact script lock. Revise for changes to goals, file targets, destructive actions or execution scope; routine fixes within confirmed scope need no reconfirmation. Retain the current Plan when revising: retain all existing stepIds (including completed steps), add new steps and submit the full effective manifest. Unchanged steps retain Todo identity and progress; changed steps become pending. Nothing is merged or authorized automatically.',
+      description: 'Propose a Plan for user confirmation. Steps are stable outcome phases, not files, commands or implementation recipes; new tasks need not repeat completed history. For scope additions only, use mode=extendScope with summary explaining why and mutationManifest containing additions; Session preserves the current phases, verification and progress. If the task needs a rewritten Plan, omit mode, retain existing stepIds and submit title, summary, steps and the full effective manifest. Scope expansion and Plan rewrites take effect only after user confirmation. fs.edit/fs.write share file or explicit directoryTree scope; deletion is separate. Bash command is an optional example, not an exact script lock. Routine fixes within confirmed scope need no reconfirmation. Titles use inline Markdown; other text uses Markdown.',
       inputSchema: structuredClone(PLAN_SCHEMA) as JsonObject,
     },
     {
       name: SESSION_CONTROL_PLAN_PROGRESS,
-      description: 'Update confirmed Todo steps after examining a tool result. sourceFactRef is its recordId from this run, received before this turn, including investigation before Plan confirmation. Mark completed only when the step and its verification are done. Batch related updates into one call, optionally alongside ordinary tool calls; their future results cannot be evidence. This does not request user confirmation.',
+      description: 'Report confirmed phase progress when entering or finishing a phase, or when progress changes; no update is needed for every operation. sourceFactRef is its recordId from a tool result already received in this run, including investigation before Plan confirmation. Mark completed only when the phase and its verification are done. Batch related updates, optionally alongside ordinary tool calls whose future results cannot be evidence. This does not request user confirmation or change phase entries.',
       inputSchema: {
         type: 'object', additionalProperties: false, required: ['sourceFactRef', 'updates'],
         properties: {
           sourceFactRef: { type: 'string', minLength: 1 },
-          updates: { type: 'array', minItems: 1, maxItems: 12, items: {
+          updates: { type: 'array', minItems: 1, items: {
             type: 'object', additionalProperties: false, required: ['todoId', 'status'],
             properties: {
               todoId: { type: 'string', minLength: 1 },
@@ -218,8 +231,8 @@ export function decodeSessionControlCall(
   const canonicalCallId = requiredIdentifier(callId, 'callId');
   if (name === SESSION_CONTROL_PLAN_PROGRESS) {
     assertExactKeys(input, ['sourceFactRef', 'updates']);
-    if (!Array.isArray(input.updates) || input.updates.length < 1 || input.updates.length > 12) {
-      throw new SessionControlError('plan_progress_invalid', 'updates 必须包含一至十二个步骤更新。');
+    if (!Array.isArray(input.updates) || input.updates.length < 1) {
+      throw new SessionControlError('plan_progress_invalid', 'updates 必须包含至少一个阶段进度更新。');
     }
     const seen = new Set<string>();
     const updates = input.updates.map((item): TodoProgressUpdate => {
@@ -277,27 +290,32 @@ function decodeInteraction(value: Record<string, unknown>): ModelInteractionRequ
   return request;
 }
 
-function decodePlan(value: Record<string, unknown>): PlanPublicationDraft {
+function decodePlan(value: Record<string, unknown>): PlanPublicationDraft | PlanScopeExtension {
+  if (value.mode === 'extendScope') {
+    assertExactKeys(value, ['mode', 'summary', 'mutationManifest'], [], 'plan scope extension');
+    return { mode: 'extendScope', summary: requiredText(value.summary, 'summary'), mutationManifest: decodeManifest(value.mutationManifest) };
+  }
   assertExactKeys(value, ['title', 'summary', 'steps', 'mutationManifest'], [], 'plan');
-  if (!Array.isArray(value.steps) || value.steps.length < 1 || value.steps.length > 12) {
+  if (!Array.isArray(value.steps) || value.steps.length < 1) {
     throw new SessionControlError(
       'session_control_plan_steps_invalid',
-      'plan.publish steps 必须包含一至十二个步骤。',
-    );
-  }
-  if (!Array.isArray(value.mutationManifest) || value.mutationManifest.length > 128) {
-    throw new SessionControlError(
-      'session_control_plan_manifest_invalid',
-      'plan.publish mutationManifest 必须是最多 128 项的数组。',
+      'plan.publish steps 必须包含至少一个阶段。',
     );
   }
   const stepIds = new Set<string>();
   const title = requiredDisplayText(value.title, 'title', 240);
   const summary = requiredText(value.summary, 'summary');
   const steps = value.steps.map((candidate, index) => decodePlanStep(candidate, stepIds, index));
+  return { title, summary, steps, mutationManifest: decodeManifest(value.mutationManifest) };
+}
+
+function decodeManifest(value: unknown): PlanOperation[] {
+  if (!Array.isArray(value)) {
+    throw new SessionControlError('session_control_plan_manifest_invalid', 'plan.publish mutationManifest 必须是数组。');
+  }
   const mutationManifest: PlanOperation[] = [];
   const shapeErrors: string[] = [];
-  for (const [index, candidate] of value.mutationManifest.entries()) {
+  for (const [index, candidate] of value.entries()) {
     try { mutationManifest.push(decodePlanOperation(candidate, index)); }
     catch (error) {
       if (!(error instanceof SessionControlError) || error.code !== 'session_control_shape_invalid') throw error;
@@ -307,9 +325,7 @@ function decodePlan(value: Record<string, unknown>): PlanPublicationDraft {
   // Return every invalid manifest shape in the same correction result.
   // No partially decoded plan is published.
   if (shapeErrors.length) throw new SessionControlError('session_control_shape_invalid', shapeErrors.join('\n'));
-  return {
-    title, summary, steps, mutationManifest,
-  };
+  return mutationManifest;
 }
 
 function decodePlanStep(value: unknown, seen: Set<string>, index: number): ExecutionPlanStep {
@@ -327,11 +343,11 @@ function decodePlanStep(value: unknown, seen: Set<string>, index: number): Execu
   seen.add(stepId);
   if (
     value.verification !== undefined
-    && (!Array.isArray(value.verification) || value.verification.length > 8)
+    && !Array.isArray(value.verification)
   ) {
     throw new SessionControlError(
       'session_control_plan_verification_invalid',
-      'Plan step verification 必须是最多八项的字符串数组。',
+      'Plan step verification 必须是字符串数组。',
     );
   }
   return {
@@ -360,8 +376,8 @@ function decodePlanOperation(value: unknown, index: number): PlanOperation {
   if (operation === 'bash') {
     assertExactKeys(
       value,
-      ['workspaceId', 'operation', 'command', 'workspaceMode', 'executionScope', 'terminal'],
-      ['command', 'terminal'],
+      ['workspaceId', 'operation', 'command', 'workspaceMode', 'executionScope', 'terminal', 'writablePaths'],
+      ['command', 'terminal', 'writablePaths'],
       `mutationManifest[${index}]`,
     );
     const command = value.command === undefined ? undefined : requiredText(value.command, 'command');
@@ -378,12 +394,29 @@ function decodePlanOperation(value: unknown, index: number): PlanOperation {
     const terminal = value.terminal === undefined
       ? undefined
       : decodeTerminalInput(value.terminal);
+    const writablePaths = value.writablePaths;
+    if (value.executionScope === 'workspace' && (!Array.isArray(writablePaths) || !writablePaths.length)) {
+      throw new SessionControlError('session_control_plan_shell_invalid', 'workspace Bash 必须在 writablePaths 中声明可写文件/目录，包含构建产出目录。');
+    }
+    const paths = writablePaths === undefined ? undefined : (() => {
+      if (!Array.isArray(writablePaths) || !writablePaths.length) {
+        throw new SessionControlError('session_control_plan_shell_invalid', 'writablePaths 必须包含至少一个文件或目录。');
+      }
+      return writablePaths.map((entry) => {
+        if (!isRecord(entry) || entry.kind !== 'file' && entry.kind !== 'directory') {
+          throw new SessionControlError('session_control_plan_shell_invalid', 'writablePaths 项必须包含 path 和 kind=file|directory。');
+        }
+        assertExactKeys(entry, ['path', 'kind'], [], 'writablePaths');
+        return { path: normalizedTarget(entry.path), kind: entry.kind as 'file' | 'directory' };
+      });
+    })();
     return {
       workspaceId,
       operation,
       ...(command === undefined ? {} : { command }),
       workspaceMode: 'write',
       executionScope: value.executionScope,
+      ...(paths ? { writablePaths: paths } : {}),
       ...(terminal ? { terminal } : {}),
     };
   }
@@ -398,7 +431,10 @@ function decodePlanOperation(value: unknown, index: number): PlanOperation {
     }
     return { workspaceId, operation, target, targetKind: value.targetKind };
   }
-  assertExactKeys(value, ['workspaceId', 'operation', 'target'], [], `mutationManifest[${index}]`);
+  assertExactKeys(value, ['workspaceId', 'operation', 'target', 'targetKind'], ['targetKind'], `mutationManifest[${index}]`);
+  if (value.targetKind !== undefined && value.targetKind !== 'file' && value.targetKind !== 'directoryTree') {
+    throw new SessionControlError('session_control_plan_target_kind_invalid', '写入范围的 targetKind 必须是 file 或 directoryTree。');
+  }
   if (!['fs.write', 'fs.edit'].includes(String(operation))) {
     throw new SessionControlError(
       'session_control_plan_operation_unknown',
@@ -409,6 +445,7 @@ function decodePlanOperation(value: unknown, index: number): PlanOperation {
     workspaceId,
     operation: operation as Exclude<PlanOperation['operation'], 'fs.delete' | 'bash'>,
     target,
+    ...(value.targetKind === undefined ? {} : { targetKind: value.targetKind }),
   };
 }
 

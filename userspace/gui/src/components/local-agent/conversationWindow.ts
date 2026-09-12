@@ -1,0 +1,20 @@
+import type { ConversationRound } from './conversationItems';
+
+export interface ConversationNavigationEntry { key: string; rowIndex: number; label: string }
+
+export function conversationNavigation(rounds: ConversationRound[]): ConversationNavigationEntry[] {
+  const entries: ConversationNavigationEntry[] = [];
+  let rowIndex = 0;
+  for (const round of rounds) for (const row of round.rows) {
+    if (row.item?.type === 'message' && row.item.value.role === 'user') {
+      entries.push({
+        key: row.key,
+        rowIndex,
+        label: row.item.value.content.trim().slice(0, 180)
+          || row.item.value.filesystemReferences.map((reference) => reference.displayName).join(', ').slice(0, 180),
+      });
+    }
+    rowIndex += 1;
+  }
+  return entries;
+}
