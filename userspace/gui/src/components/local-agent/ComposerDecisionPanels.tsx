@@ -31,67 +31,68 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
             role="region"
             aria-label={t(language, 'agent.interaction.details')}
           >
-          <header className="local-agent__interaction-panel-heading">
-            {pendingPlan
-              ? <strong><MarkdownInline>{t(language, 'agent.plan.confirmQuestion', { title: pendingPlan.title })}</MarkdownInline></strong>
-              : <MarkdownContent>{pendingInteraction?.prompt ?? ''}</MarkdownContent>}
-            {pendingPlan && (
-              <button
-                type="button"
-                className="local-agent__interaction-close"
-                aria-label={t(language, 'agent.plan.ignoreAndStop')}
-                title={t(language, 'agent.plan.ignoreAndStop')}
-                disabled={submitting}
-                onClick={() => void submitPlanDecision({ kind: 'cancel' })}
-              >×</button>
-            )}
-          </header>
+            <header className="local-agent__interaction-panel-heading">
+              {pendingPlan
+                ? <strong><MarkdownInline>{t(language, 'agent.plan.confirmQuestion', { title: pendingPlan.title })}</MarkdownInline></strong>
+                : <MarkdownContent>{pendingInteraction?.prompt ?? ''}</MarkdownContent>}
+              {pendingPlan && (
+                <button
+                  type="button"
+                  className="local-agent__interaction-close"
+                  aria-label={t(language, 'agent.plan.ignoreAndStop')}
+                  title={t(language, 'agent.plan.ignoreAndStop')}
+                  disabled={submitting}
+                  onClick={() => void submitPlanDecision({ kind: 'cancel' })}
+                >×</button>
+              )}
+            </header>
+            <ol className="local-agent__interaction-options">
+              {pendingPlan ? (
+                <li>
+                  <button
+                    type="button"
+                    disabled={submitting}
+                    onClick={() => void submitPlanDecision({ kind: 'confirm' })}
+                  >
+                    <span className="local-agent__interaction-option-copy">
+                      <b>{t(language, 'agent.plan.adopt')}</b>
+                      <small>{t(language, 'agent.plan.adoptTodoHint')}</small>
+                    </span>
+                    <span className="local-agent__interaction-option-chevron" aria-hidden="true">
+                      <DeepCodeShellIcon name="chevronRight" />
+                    </span>
+                  </button>
+                </li>
+              ) : pendingInteraction?.options?.map((option, index) => (
+                <li key={option.id}>
+                  <button
+                    type="button"
+                    disabled={submitting}
+                    title={option.description ? `${option.label}\n\n${option.description}` : option.label}
+                    onClick={() => {
+                      setDraft('');
+                      void respondInteraction(option.label).catch(() => undefined);
+                    }}
+                  >
+                    <span className="local-agent__interaction-option-marker" aria-hidden="true">
+                      {index + 1}
+                    </span>
+                    <span className="local-agent__interaction-option-copy">
+                      <b><MarkdownInline>{option.label}</MarkdownInline></b>
+                      {option.description && (
+                        <span className="local-agent__interaction-option-description">
+                          <MarkdownInline>{option.description}</MarkdownInline>
+                        </span>
+                      )}
+                    </span>
+                    <span className="local-agent__interaction-option-chevron" aria-hidden="true">
+                      <DeepCodeShellIcon name="chevronRight" />
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ol>
           </div>
-          <ol className="local-agent__interaction-options">
-            {pendingPlan ? (
-              <li>
-                <button
-                  type="button"
-                  disabled={submitting}
-                  onClick={() => void submitPlanDecision({ kind: 'confirm' })}
-                >
-                  <span className="local-agent__interaction-option-copy">
-                    <b>{t(language, 'agent.plan.adopt')}</b>
-                    <small>{t(language, 'agent.plan.adoptTodoHint')}</small>
-                  </span>
-                  <span className="local-agent__interaction-option-chevron" aria-hidden="true">
-                    <DeepCodeShellIcon name="chevronRight" />
-                  </span>
-                </button>
-              </li>
-            ) : pendingInteraction?.options?.map((option, index) => (
-              <li key={option.id}>
-                <button
-                  type="button"
-                  disabled={submitting}
-                  onClick={() => {
-                    setDraft('');
-                    void respondInteraction(option.label).catch(() => undefined);
-                  }}
-                >
-                  <span className="local-agent__interaction-option-marker" aria-hidden="true">
-                    {index + 1}
-                  </span>
-                  <span className="local-agent__interaction-option-copy">
-                    <b><MarkdownInline>{option.label}</MarkdownInline></b>
-                    {option.description && (
-                      <span className="local-agent__interaction-option-description">
-                        <MarkdownInline>{option.description}</MarkdownInline>
-                      </span>
-                    )}
-                  </span>
-                  <span className="local-agent__interaction-option-chevron" aria-hidden="true">
-                    <DeepCodeShellIcon name="chevronRight" />
-                  </span>
-                </button>
-              </li>
-            ))}
-          </ol>
           {(pendingPlan || pendingInteraction?.allowFreeform) && (
             <div className="local-agent__interaction-composer">
               <span className="local-agent__interaction-compose-mark" aria-hidden="true">

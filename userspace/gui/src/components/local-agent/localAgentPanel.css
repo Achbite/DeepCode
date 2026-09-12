@@ -158,7 +158,6 @@
 :root[data-product='deepcode-gui'] :is(
   .local-agent__body,
   .local-agent__interaction-document-scroll,
-  .local-agent__interaction-options,
   .local-agent__interaction-composer textarea,
   .local-agent__composer textarea,
   .conversation-answered-question-body
@@ -169,7 +168,6 @@
 :root[data-product='deepcode-gui'] :is(
   .local-agent__body,
   .local-agent__interaction-document-scroll,
-  .local-agent__interaction-options,
   .local-agent__interaction-composer textarea,
   .local-agent__composer textarea,
   .conversation-answered-question-body
@@ -1221,9 +1219,8 @@
 
 .local-agent__interaction-panel {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
-  max-height: min(620px, 64dvh);
-  container-type: inline-size;
+  grid-template-rows: minmax(0, 1fr) auto;
+  max-height: min(560px, 60dvh);
   overflow: hidden;
   border: 1px solid var(--dc-border);
   border-radius: 18px;
@@ -1242,14 +1239,9 @@
 
 .local-agent__interaction-document-scroll {
   min-height: 0;
-  max-height: min(160px, 18dvh);
   overflow: auto;
   overscroll-behavior: contain;
   scrollbar-width: thin;
-}
-
-.local-agent__interaction-panel--plan .local-agent__interaction-document-scroll {
-  max-height: min(240px, 28dvh);
 }
 
 :root[data-product='deepcode-gui'] .local-agent__interaction-document-scroll:focus-visible {
@@ -1265,11 +1257,13 @@
 }
 
 .local-agent__interaction-option-description {
-  color: var(--dc-muted);
-  font-size: var(--dc-font-caption);
-  font-weight: var(--dc-weight-regular);
-  line-height: var(--dc-line-body);
-  overflow-wrap: anywhere;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .conversation-answered-question {
@@ -1327,11 +1321,9 @@
   min-height: 0;
   grid-template-columns: minmax(0, 1fr);
   align-content: start;
-  gap: 8px;
+  gap: 4px;
   margin: 0;
-  padding: 4px 12px 12px;
-  overflow: auto;
-  overscroll-behavior: contain;
+  padding: 0 12px 12px;
   list-style: none;
 }
 
@@ -1339,28 +1331,22 @@
   display: none;
 }
 
-@container (min-width: 560px) {
-  .local-agent__interaction-panel:not(.local-agent__interaction-panel--plan) .local-agent__interaction-options {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
 .local-agent__interaction-options > li {
   min-width: 0;
 }
 
 .local-agent .local-agent__interaction-options > li > button {
+  position: relative;
   display: grid;
   width: 100%;
-  height: 100%;
-  min-height: 64px;
-  grid-template-columns: 24px minmax(0, 1fr) 14px;
-  align-items: start;
-  gap: 10px;
-  padding: 12px;
+  min-height: 36px;
+  grid-template-columns: 20px minmax(0, 1fr) 14px;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
   border: 1px solid transparent;
-  border-radius: 12px;
-  background: var(--dc-surface-subtle);
+  border-radius: 8px;
+  background: transparent;
   text-align: left;
   transition: background-color 120ms ease, border-color 120ms ease;
 }
@@ -1372,11 +1358,11 @@
 
 .local-agent__interaction-option-marker {
   display: grid;
-  width: 24px;
-  height: 24px;
+  width: 20px;
+  height: 20px;
   place-items: center;
-  border-radius: 7px;
-  background: var(--dc-surface-active);
+  border-radius: 6px;
+  background: var(--dc-surface-subtle);
   color: var(--dc-muted);
   font-size: var(--dc-font-caption);
   font-variant-numeric: tabular-nums;
@@ -1385,7 +1371,7 @@
 .local-agent__interaction-option-copy {
   display: grid;
   min-width: 0;
-  gap: 5px;
+  gap: 0;
 }
 
 .local-agent .local-agent__interaction-panel--plan .local-agent__interaction-options > li > button {
@@ -1411,7 +1397,7 @@
 
 .local-agent__interaction-option-chevron {
   display: grid;
-  min-height: 24px;
+  min-height: 20px;
   place-items: center;
   color: var(--dc-faint);
 }
