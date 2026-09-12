@@ -26,6 +26,7 @@ export function useConversationViewport({
   timelineExtentKey,
 }: ConversationViewportInput) {
   const [followingLatest, setFollowingLatest] = useState(true);
+  const [latestRequest, setLatestRequest] = useState(0);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
@@ -93,6 +94,15 @@ export function useConversationViewport({
       }
     });
   }, [scrollToLatestNow]);
+
+  // Virtual rows and asynchronous media use the same anchor owner as user
+  // scrolling. Apply layout corrections even during a continuous wheel gesture.
+  const preserveReadingPosition = useCallback(() => {
+    if (pendingViewportRestoreRef.current !== null) return;
+    if (followingLatestRef.current) { scheduleScrollToLatest(); return; }
+    const saved = activeViewRef.current ? sessionViewportsRef.current.get(activeViewRef.current) : undefined;
+    if (saved?.mode === 'detached') restorePosition(saved);
+  }, [restorePosition, scheduleScrollToLatest]);
 
   const markTransientUserScroll = useCallback(() => {
     transientUserScrollRef.current = true;
@@ -260,9 +270,24 @@ export function useConversationViewport({
   }, [markTransientUserScroll]);
 
   const scrollToLatest = () => {
+    setLatestRequest((value) => value + 1);
     setLatestFollowMode(true);
     scheduleScrollToLatest('smooth');
   };
+
+  const scrollToAnchor = useCallback((key: string) => {
+    const body = bodyRef.current;
+    const node = body && [...body.querySelectorAll<HTMLElement>('[data-conversation-anchor]')]
+      .find((item) => item.dataset.conversationAnchor === key);
+    if (!body || !node) return;
+    applyLatestFollowMode(false);
+    const target = node.getClientRects().length ? node : node.closest('.conversation-round')!;
+    body.scrollTop += target.getBoundingClientRect().top - body.getBoundingClientRect().top - 12;
+    lastScrollTopRef.current = body.scrollTop;
+    if (activeViewRef.current) sessionViewportsRef.current.set(activeViewRef.current, {
+      mode: 'detached', ...capturePosition(),
+    });
+  }, [applyLatestFollowMode, capturePosition]);
 
   const bodyHandlers: React.HTMLAttributes<HTMLDivElement> = {
     onWheel: (event) => {
@@ -328,7 +353,7 @@ export function useConversationViewport({
     },
   };
 
-  return { bodyRef, transcriptRef, messageEndRef, bodyHandlers, followingLatest, setLatestFollowMode, scrollToLatest };
+  return { bodyRef, transcriptRef, messageEndRef, bodyHandlers, followingLatest, setLatestFollowMode, scrollToLatest, scrollToAnchor, latestRequest, preserveReadingPosition };
 }
 
 export type ConversationViewport = ReturnType<typeof useConversationViewport>;

@@ -698,8 +698,9 @@ impl LocalAgentKernel {
                         _ => false,
                     }
                 };
-                let result = start_execution
-                    .then(|| self.execute_prepared(&prepared, &request, control.cancellation()));
+                let result = start_execution.then(|| {
+                    self.execute_prepared(&prepared, &request, &authority, control.cancellation())
+                });
                 let cancel_phase = control.claim_outcome();
                 let completed_at = crate::now_text();
                 let record_result = match (cancel_phase, result) {
@@ -1289,6 +1290,7 @@ impl LocalAgentKernel {
                 "workspaceId": prepared.workspace_id,
             })));
         }
+        let mut confirmed_scope = Vec::new();
         for authority in &request.plan_authorities {
             if !authority_matches_identity(authority, request, prepared) {
                 continue;
@@ -1299,7 +1301,36 @@ impl LocalAgentKernel {
             {
                 continue;
             }
+            if let Some(operations) = authority["coveredOperations"].as_array() {
+                confirmed_scope.extend(operations.iter().filter(|operation| {
+                    operation["workspaceId"].as_str() == prepared.workspace_id.as_deref()
+                }).map(|operation| {
+                    if operation["operation"] == "bash" {
+                        json!({"operation":"bash", "executionScope":operation["executionScope"], "writablePaths":operation["writablePaths"]})
+                    } else {
+                        json!({"operation":operation["operation"], "target":operation["target"], "targetKind":operation.get("targetKind").cloned().unwrap_or(json!("file"))})
+                    }
+                }));
+            }
             if authority_covers(authority, prepared) {
+                let writable_paths: Vec<Value> = authority["coveredOperations"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|operation| {
+                        operation["operation"] == "bash"
+                            && operation["workspaceId"].as_str() == prepared.workspace_id.as_deref()
+                            && operation["executionScope"].as_str()
+                                == prepared.process_execution_scope.as_deref()
+                    })
+                    .flat_map(|operation| {
+                        operation["writablePaths"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .cloned()
+                    })
+                    .collect();
                 return Ok(Admission::Allowed(json!({
                     "decision": "allow",
                     "source": "plan",
@@ -1308,12 +1339,17 @@ impl LocalAgentKernel {
                     "planId": authority.get("planId"),
                     "revision": authority.get("revision"),
                     "decisionId": authority.get("decisionId"),
+                    "writablePaths": writable_paths,
                 })));
             }
         }
         Ok(Admission::denied(
             "workspace_mutation_plan_required",
-            "本调用未执行：目标文件、删除类型或 Bash 执行范围未被当前已确认 Plan 覆盖。只有扩大这些范围才需修订 Plan；同一文件的 edit/write 切换与同一执行范围内的命令细节调整无需重新确认。",
+            &format!(
+                "本调用未执行：请求 {} 未被已确认 Plan 覆盖。当前相关范围：{}。范围内的 edit/write 切换和命令细节无需重新确认；扩大授权范围需要用户确认，删除需独立授权。",
+                json!({"operation":prepared.operation, "targets":prepared.logical_targets, "targetKind":prepared.delete_target_kind, "executionScope":prepared.process_execution_scope}),
+                Value::Array(confirmed_scope),
+            ),
         ))
     }
 
@@ -1321,9 +1357,44 @@ impl LocalAgentKernel {
         &self,
         prepared: &PreparedEffect,
         request: &LocalToolExecutionRequest,
+        authority: &Value,
         cancellation: KernelCancellationToken,
     ) -> Result<KernelToolExecutionResult, String> {
         let _private_targets = &prepared.private_resolved_targets;
+        let workspace_write_targets = if prepared.operation == "bash"
+            && prepared.process_execution_scope.as_deref() == Some("workspace")
+            && authority["source"] == "plan"
+        {
+            let root = prepared
+                .workspace_root
+                .as_deref()
+                .ok_or("workspace root missing")?;
+            let boundary = WorkspaceBoundary::new(root);
+            let paths = authority["writablePaths"]
+                .as_array()
+                .ok_or("Plan writablePaths missing")?;
+            if paths.is_empty() {
+                return Err("Plan writablePaths is empty".into());
+            }
+            Some(
+                paths
+                    .iter()
+                    .map(|target| {
+                        let path = target["path"]
+                            .as_str()
+                            .ok_or("Plan writable path missing")?;
+                        Ok(deepcode_kernel_runtime::executors::WorkspaceWriteTarget {
+                            path: boundary
+                                .resolve_mutation(path)
+                                .map_err(|error| error.to_string())?,
+                            directory: target["kind"] == "directory",
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            )
+        } else {
+            None
+        };
         let lease = prepared.binding.begin_attempt();
         let result = prepared
             .binding
@@ -1338,6 +1409,7 @@ impl LocalAgentKernel {
                     workspace_root: prepared.workspace_root.clone(),
                     workspace_id: prepared.workspace_id.clone(),
                     private_resolved_targets: prepared.private_resolved_targets.clone(),
+                    workspace_write_targets,
                     cancellation,
                 },
             )
@@ -1878,17 +1950,29 @@ fn authority_covers(authority: &Value, prepared: &PreparedEffect) -> bool {
                             && matches!(
                                 object.get("operation").and_then(Value::as_str),
                                 Some("fs.write" | "fs.edit")
-                            ))
-                    && object.get("target").and_then(Value::as_str) == Some(target.as_str());
+                            ));
                 if !base {
                     return false;
                 }
                 if prepared.operation == "fs.delete" {
-                    object.len() == 4
+                    object.get("target").and_then(Value::as_str) == Some(target.as_str())
+                        && object.len() == 4
                         && object.get("targetKind").and_then(Value::as_str)
                             == prepared.delete_target_kind.as_deref()
                 } else {
-                    object.len() == 3 && object.get("targetKind").is_none()
+                    let Some(scope) = object.get("target").and_then(Value::as_str) else {
+                        return false;
+                    };
+                    match object.get("targetKind").and_then(Value::as_str) {
+                        Some("directoryTree") => {
+                            object.len() == 4
+                                && target != scope
+                                && Path::new(target).starts_with(Path::new(scope))
+                        }
+                        Some("file") => object.len() == 4 && target == scope,
+                        None => object.len() == 3 && target == scope,
+                        _ => false,
+                    }
                 }
             })
         })
@@ -2273,7 +2357,8 @@ mod attempt_control_tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|issue| issue["path"] == "$.workspaceMode" && issue["rule"] == "required"));
+            .any(|issue| issue["path"] == "$.executionMode"
+                && issue["rule"] == "additionalProperties"));
         assert!(kernel.records.read(&request.call_id).unwrap().is_none());
         let mut wrong_binding = request;
         wrong_binding.tool_binding_ref = "binding:unknown".into();
@@ -2354,10 +2439,21 @@ mod attempt_control_tests {
         assert!(authority_covers(&file, &effect));
         effect.logical_targets = vec!["src/other.hpp".into()];
         assert!(!authority_covers(&file, &effect));
+        let directory = json!({"coveredOperations":[{"workspaceId":"workspace:scope", "operation":"fs.edit", "target":"src", "targetKind":"directoryTree"}]});
+        assert!(authority_covers(&directory, &effect));
+        effect.logical_targets = vec!["src/nested/new.hpp".into()];
+        assert!(authority_covers(&directory, &effect));
+        effect.operation = "fs.edit".into();
+        assert!(authority_covers(&directory, &effect));
+        effect.logical_targets = vec!["src-other/new.hpp".into()];
+        assert!(!authority_covers(&directory, &effect));
+        effect.logical_targets = vec!["src".into()];
+        assert!(!authority_covers(&directory, &effect));
         effect.logical_targets = vec!["src/pool.hpp".into()];
         effect.operation = "fs.delete".into();
         effect.delete_target_kind = Some("file".into());
         assert!(!authority_covers(&file, &effect));
+        assert!(!authority_covers(&directory, &effect));
         let deletion = json!({"coveredOperations":[{"workspaceId":"workspace:scope", "operation":"fs.delete", "target":"src/pool.hpp", "targetKind":"file"}]});
         assert!(authority_covers(&deletion, &effect));
         effect.delete_target_kind = Some("directoryTree".into());

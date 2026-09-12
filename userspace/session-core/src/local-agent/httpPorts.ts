@@ -33,6 +33,7 @@ import {
   SESSION_CONTROL_PLAN_PROGRESS,
 } from '@deepcode/protocol';
 import { createProviderToolAliases } from './providerToolCodec.js';
+import { LoopFailure } from './loopFailure.js';
 import { sessionControlToolDefinitions } from './sessionControls.js';
 import { environmentInstruction } from './sessionEnvironment.js';
 import {
@@ -63,19 +64,26 @@ class LocalAgentHttpPort {
   }
 
   async json<T>(path: string, init: RequestInit = {}): Promise<T> {
-    const response = await this.fetchImpl(`${this.apiBase}${path}`, {
-      ...init,
-      headers: {
-        'x-deepcode-session-service-token': this.serviceToken,
-        ...(init.body === undefined ? {} : { 'content-type': 'application/json' }),
-        ...init.headers,
-      },
-    });
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.apiBase}${path}`, {
+        ...init,
+        headers: {
+          'x-deepcode-session-service-token': this.serviceToken,
+          ...(init.body === undefined ? {} : { 'content-type': 'application/json' }),
+          ...init.headers,
+        },
+      });
+    } catch (error) {
+      throw new LoopFailure('local_agent_transport_failed',
+        `${init.method ?? 'GET'} ${path} headers: ${transportErrorMessage(error)}`);
+    }
     let envelope: unknown;
     try {
       envelope = await response.json();
-    } catch {
-      throw new Error(`local_agent_http_json_invalid:${response.status}`);
+    } catch (error) {
+      throw new LoopFailure('local_agent_http_json_invalid',
+        `${init.method ?? 'GET'} ${path} body (HTTP ${response.status}): ${transportErrorMessage(error)}`);
     }
     if (!isRecord(envelope) || typeof envelope.ok !== 'boolean') {
       throw new Error('local_agent_http_envelope_invalid');
@@ -87,6 +95,14 @@ class LocalAgentHttpPort {
     }
     return envelope.data as T;
   }
+}
+
+function transportErrorMessage(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = error.cause;
+  return error.message + (cause instanceof Error
+    ? `; cause ${'code' in cause ? String(cause.code) + ': ' : ''}${cause.message}`
+    : cause === undefined ? '' : `; cause ${String(cause)}`);
 }
 
 export class HttpCommandJournal extends LocalAgentHttpPort implements CommandJournalPort {

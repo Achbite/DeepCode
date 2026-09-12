@@ -4,6 +4,7 @@ import { t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import { useConversationHost } from './ConversationHost';
 import { FileChanges } from './FileChanges';
+import { useConversationRowState } from './ConversationVirtualRow';
 
 interface ToolActivityGroupProps {
   sessionId: string;
@@ -24,7 +25,7 @@ export const ProviderHostedDraftGroup: React.FC<ProviderHostedDraftGroupProps> =
   language,
   onExpand,
 }) => {
-  const [expanded, setExpanded] = useState(true);
+  const [expanded, setExpanded] = useConversationRowState('hosted-group:expanded', true);
   const failed = blocks.some((block) => block.status === 'failed');
   const summary = failed
       ? t(language, 'agent.providerHosted.summary.didNotCompleteMany', { count: blocks.length })
@@ -71,7 +72,7 @@ export const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
   onExpand,
   onOpenWorkspaceResource,
 }) => {
-  const [expanded, setExpanded] = useState(true);
+  const [expanded, setExpanded] = useConversationRowState('tool-group:expanded', true);
   const hasFailure = activities.some((activity) => (
     ['failed', 'denied', 'rejected', 'indeterminate'].includes(activity.status)
   ));
@@ -127,7 +128,7 @@ interface ProviderHostedEntryProps {
 }
 
 const ProviderHostedEntry: React.FC<ProviderHostedEntryProps> = ({ hosted, status, language }) => {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useConversationRowState(`hosted:${hosted.providerCallId}:expanded`, false);
   const actionType = providerHostedActionType(hosted.action);
   const fieldLabels: Record<string, string> = {
     queries: 'agent.providerHosted.detail.queries',
@@ -193,11 +194,11 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
   language,
   onOpenWorkspaceResource,
 }) => {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useConversationRowState(`tool:${activity.activityId}:expanded`, false);
   const tool = activity.tool;
   const { readConversation } = useConversationHost();
   const recordId = tool?.recordId;
-  const [detail, setDetail] = useState<{ recordId: string; error: string; truncated: boolean } | null>(null);
+  const [detail, setDetail] = useConversationRowState<{ recordId: string; error: string; truncated: boolean } | null>(`tool:${activity.activityId}:detail`, null);
   const [readError, setReadError] = useState('');
   const needsError = ['failed', 'denied', 'indeterminate'].includes(activity.status) && Boolean(recordId);
   useEffect(() => {
@@ -289,6 +290,7 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
               ? <span>{t(language, 'agent.tool.detail.loading')}</span>
               : <><pre>{detail.error}</pre>{detail.truncated && <small>{t(language, 'agent.tool.detail.truncated')}</small>}</>}
           </section>}
+          {activity.interruption && <p role="status">{activity.interruption.message}</p>}
           {activity.inputRejection && (
             <div className="local-agent__input-rejection">
               <p>{activity.inputRejection.message}</p>

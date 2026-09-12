@@ -4,6 +4,9 @@ import type { PlanResponse, PluginSelectionInput } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import { shouldOfferFocusCommand, shouldSubmitComposerKey } from './composerKeyboard';
+import { isLongPastedText, type PastedTextInput } from '../../services/pastedText';
+
+interface PastedTextDraft extends PastedTextInput { expanded: boolean }
 
 interface PendingFilesystemPath {
   path: string;
@@ -12,6 +15,7 @@ interface PendingFilesystemPath {
 
 interface ComposerState {
   draft: string;
+  pastedTexts: PastedTextDraft[];
   filesystemPaths: PendingFilesystemPath[];
   pluginSelections: PluginSelectionInput[];
   selectionStart: number;
@@ -56,6 +60,7 @@ export function useAgentComposer(
   const reasoningEffortOverride = useLocalAgentStore((state) => state.reasoningEffortOverride);
   const modelSettingsBusy = useLocalAgentStore((state) => state.modelSettingsBusy);
   const [draft, setDraft] = useState('');
+  const [pastedTexts, setPastedTexts] = useState<PastedTextDraft[]>([]);
   const [pendingFilesystemPaths, setPendingFilesystemPaths] = useState<
     PendingFilesystemPath[]
   >([]);
@@ -87,6 +92,7 @@ export function useAgentComposer(
   ) => {
     composerStatesRef.current.set(activeComposerStateKeyRef.current, {
       draft: element.value,
+      pastedTexts: pastedTexts.map((item) => ({ ...item })),
       filesystemPaths: pendingFilesystemPaths.map((item) => ({ ...item })),
       pluginSelections: pluginSelections.map((item) => ({ ...item })),
       selectionStart: element.selectionStart ?? element.value.length,
@@ -100,6 +106,7 @@ export function useAgentComposer(
     composerStatesRef.current.set(key, copy);
     if (activeComposerStateKeyRef.current !== key) return;
     setDraft(copy.draft);
+    setPastedTexts(copy.pastedTexts);
     setPendingFilesystemPaths(copy.filesystemPaths);
     setPluginSelections(copy.pluginSelections);
     pendingComposerRestoreRef.current = { key, state: copy };
@@ -112,6 +119,7 @@ export function useAgentComposer(
     const previous = composerStatesRef.current.get(previousKey);
     const outgoing: ComposerState = {
       draft: textarea?.value ?? draft,
+      pastedTexts: pastedTexts.map((item) => ({ ...item })),
       filesystemPaths: pendingFilesystemPaths.map((item) => ({ ...item })),
       pluginSelections: pluginSelections.map((item) => ({ ...item })),
       selectionStart: textarea?.selectionStart ?? previous?.selectionStart ?? draft.length,
@@ -127,6 +135,7 @@ export function useAgentComposer(
     activeComposerStateKeyRef.current = composerStateKey;
     pendingComposerRestoreRef.current = { key: composerStateKey, state: incoming };
     setDraft(incoming.draft);
+    setPastedTexts(incoming.pastedTexts);
     setPendingFilesystemPaths(incoming.filesystemPaths);
     setPluginSelections(incoming.pluginSelections);
     setPluginPickerOpen(false);
@@ -193,7 +202,7 @@ export function useAgentComposer(
   const submitDraft = async () => {
     const submittedText = draft;
     if (
-      !submittedText.trim()
+      (!submittedText.trim() && !pastedTexts.length)
       || loading
       || submitting
       || catalogBusy
@@ -208,6 +217,7 @@ export function useAgentComposer(
     const submittedTextarea = textareaRef.current;
     const submittedComposerState: ComposerState = {
       draft: submittedText,
+      pastedTexts: pastedTexts.map((item) => ({ ...item })),
       filesystemPaths: submittedFilesystemPaths.map((item) => ({ ...item })),
       pluginSelections: submittedPluginSelections.map((item) => ({ ...item })),
       selectionStart: submittedTextarea?.selectionStart ?? submittedText.length,
@@ -224,17 +234,20 @@ export function useAgentComposer(
           focusMatch[1]!.trim(),
           submittedFilesystemPaths,
           submittedPluginSelections,
+          pastedTexts,
         );
       } else {
         await sendMessage(
           submittedText,
           submittedFilesystemPaths,
           submittedPluginSelections,
+          pastedTexts,
         );
       }
       setComposerStateForKey(submittedComposerKey, {
         ...submittedComposerState,
         draft: '',
+        pastedTexts: [],
         filesystemPaths: [],
         pluginSelections: [],
         selectionStart: 0,
@@ -465,7 +478,7 @@ export function useAgentComposer(
     setAttachmentDialogOpen(false);
     if (pendingPlan || pendingInteraction || pendingApproval) return;
     try {
-      if (pendingFilesystemPaths.length >= 8) {
+      if (pendingFilesystemPaths.length + pastedTexts.length >= 8) {
         throw new Error(t(language, 'agent.attachment.error.maxFiles'));
       }
       if (type === 'file' && mediaTypeForPath(absolutePath) === 'application/pdf') {
@@ -510,14 +523,32 @@ export function useAgentComposer(
   const canCancel = Boolean(
     projection?.run && ['running', 'waiting'].includes(projection.run.status),
   );
-  const canSend = Boolean(draft.trim())
+  const pasteText = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const text = event.clipboardData.getData('text/plain');
+    if (!isLongPastedText(text)) return;
+    event.preventDefault();
+    if (pendingFilesystemPaths.length + pastedTexts.length >= 8) {
+      setAttachmentError(t(language, 'agent.attachment.error.maxFiles'));
+      return;
+    }
+    const element = event.currentTarget;
+    const start = element.selectionStart;
+    const end = element.selectionEnd;
+    setDraft(element.value.slice(0, start) + element.value.slice(end));
+    setPastedTexts((current) => [...current, { inputId: nextPanelId('paste'), text, expanded: false }]);
+    setAttachmentError(null);
+  };
+  const editPastedText = (inputId: string, text: string) => setPastedTexts((current) => current.map((item) => (
+    item.inputId === inputId ? { ...item, inputId: nextPanelId('paste'), text } : item
+  )));
+  const canSend = Boolean(draft.trim() || pastedTexts.length)
     && !modelSettingsBusy
     && !loading
     && !submitting
     && !catalogBusy
     && !pendingApproval
     && Boolean(profiles.some((profile) => profile.id === selectedProfileId && profile.enabled) || pendingInteraction || pendingPlan);
-  const showStopAction = canCancel && !pendingPlan && !draft.trim();
+  const showStopAction = canCancel && !pendingPlan && !draft.trim() && !pastedTexts.length;
 
   return {
     pendingPlan,
@@ -538,6 +569,10 @@ export function useAgentComposer(
     selectProfile,
     selectReasoningEffort,
     draft,
+    pastedTexts,
+    setPastedTexts,
+    pasteText,
+    editPastedText,
     setDraft,
     pendingFilesystemPaths,
     setPendingFilesystemPaths,
@@ -581,6 +616,7 @@ export type AgentComposer = ReturnType<typeof useAgentComposer>;
 function emptyComposerState(): ComposerState {
   return {
     draft: '',
+    pastedTexts: [],
     filesystemPaths: [],
     pluginSelections: [],
     selectionStart: 0,
@@ -592,6 +628,7 @@ function emptyComposerState(): ComposerState {
 function cloneComposerState(state: ComposerState): ComposerState {
   return {
     ...state,
+    pastedTexts: state.pastedTexts.map((item) => ({ ...item })),
     filesystemPaths: state.filesystemPaths.map((item) => ({ ...item })),
     pluginSelections: state.pluginSelections.map((item) => ({ ...item })),
   };

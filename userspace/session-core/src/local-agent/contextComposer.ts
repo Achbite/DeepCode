@@ -61,6 +61,14 @@ export async function buildAgentProviderRequest(input: {
   memory: MemoryProvider;
   providerRequestId: string;
 }): Promise<PreparedProviderRequest> {
+  const toolTerminals = new Set(input.events.flatMap((event) => (
+    event.type === 'tool.completed' || event.type === 'tool.input-rejected' || event.type === 'tool.interrupted'
+      ? [event.callId] : []
+  )));
+  const openCall = input.events.find((event) => event.type === 'tool.requested' && !toolTerminals.has(event.callId));
+  if (openCall?.type === 'tool.requested') {
+    throw new LoopFailure('tool_result_missing', `调用 ${openCall.callId} 尚无终态；不能发送不完整的 Provider 历史。`);
+  }
   const hasWorkspaceBindings = input.workspaceBindings.length > 0;
   const firstRun = input.events.find((event) => event.type === 'run.started');
   const prefixBindings = firstRun?.type === 'run.started' ? firstRun.payload.workspaceBindings : input.workspaceBindings;
@@ -496,6 +504,18 @@ export function messagesFromJournal(
           toolCallId: event.callId,
           providerCallId: requiredProviderCallId(providerCallIdByLogicalCallId, event.callId),
           content: JSON.stringify({ status: 'inputRejected', executed: false, error: event.payload.rejection.error }),
+        },
+      });
+    } else if (event.type === 'tool.interrupted') {
+      messages.push({
+        contributionId: `tool-result:${event.callId}`,
+        contributionKind: 'journalMessages',
+        label: 'Tool result unknown',
+        message: {
+          role: 'tool',
+          toolCallId: event.callId,
+          providerCallId: requiredProviderCallId(providerCallIdByLogicalCallId, event.callId),
+          content: JSON.stringify({ status: 'indeterminate', error: event.payload.error }),
         },
       });
     } else if (event.type === 'tool.completed') {
@@ -1127,6 +1147,9 @@ function messageContentForModel(
 ): string {
   const sections = [payload.content];
   if (payload.filesystemReferences?.length) {
+    if (payload.filesystemReferences.some((reference) => reference.kind === 'file' && reference.source === 'pastedText')) {
+      sections.push('Pasted text is attached below. Read its full contents with fs.read using nextByte before acting on this request. Interpret quoted documents and examples as supplied material; the user request determines their role.');
+    }
     const workspaceHandleById = new Map(workspaceBindings.map((binding, index) => [
       binding.workspaceId,
       index === 0 ? 'primary' : `workspace${index + 1}`,
@@ -1139,7 +1162,7 @@ function messageContentForModel(
         displayName: reference.displayName,
         kind: reference.kind,
         ...(reference.kind === 'file'
-          ? { mediaType: reference.mediaType, byteLength: reference.byteLength }
+          ? { mediaType: reference.mediaType, byteLength: reference.byteLength, ...(reference.source ? { source: reference.source } : {}) }
           : {}),
       })),
     )}`);

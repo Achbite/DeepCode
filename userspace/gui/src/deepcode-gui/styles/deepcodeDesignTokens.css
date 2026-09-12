@@ -5,14 +5,14 @@
   --dc-theme-light-surface: #ffffff;
   --dc-theme-light-surface-subtle: #f7f7f8;
   --dc-theme-light-surface-raised: #ffffff;
-  --dc-theme-light-surface-hover: #ececef;
-  --dc-theme-light-surface-active: #e5e5e9;
+  --dc-theme-light-surface-hover: #f0f0f3;
+  --dc-theme-light-surface-active: #e8e8ed;
   --dc-theme-light-border: rgba(0, 0, 0, 0.07);
   --dc-theme-light-border-strong: rgba(0, 0, 0, 0.13);
   --dc-theme-light-foreground: #1c1c1e;
   --dc-theme-light-foreground-strong: #0f0f10;
   --dc-theme-light-muted: #636366;
-  --dc-theme-light-faint: #8e8e93;
+  --dc-theme-light-faint: #737379;
   --dc-theme-light-success: #16845b;
   --dc-theme-light-success-soft: rgba(22, 132, 91, 0.1);
   --dc-theme-light-warning: #a66308;
@@ -21,12 +21,11 @@
   --dc-theme-light-danger-soft: rgba(209, 60, 54, 0.1);
   --dc-theme-light-code-background: #f1f1f3;
   --dc-theme-light-shadow-small:
-    3px 5px 12px -8px rgba(15, 15, 16, 0.22),
-    1px 2px 5px -4px rgba(15, 15, 16, 0.12);
+    0 1px 3px rgba(15, 15, 16, 0.04),
+    0 3px 10px -5px rgba(15, 15, 16, 0.06);
   --dc-theme-light-shadow-panel:
-    8px 13px 28px -13px rgba(15, 15, 16, 0.28),
-    2px 5px 12px -7px rgba(15, 15, 16, 0.15),
-    inset 1px 1px 0 rgba(255, 255, 255, 0.72);
+    0 2px 5px rgba(15, 15, 16, 0.035),
+    0 8px 24px -12px rgba(15, 15, 16, 0.12);
   --dc-theme-light-shadow-inset: inset 0 1px 1px rgba(255, 255, 255, 0.68);
 
   /* Registered dark palette. */
