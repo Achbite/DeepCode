@@ -600,6 +600,7 @@
     "agent.plan.adoptTodoHint": "Confirm the execution scope and continue the task",
     "agent.plan.ignoreAndStop": "Ignore and stop this request",
     "agent.interaction.inputNeeded": "Your input is needed",
+    "agent.interaction.details": "Question details",
     "agent.interaction.skip": "Skip",
     "agent.approval.question": "Allow this action?",
     "agent.approval.required": "This action needs your approval",

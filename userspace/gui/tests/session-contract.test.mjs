@@ -1195,13 +1195,20 @@ test('Plan documents and previews render Markdown entities, code names and verif
   assert.ok(collapsed.includes('aria-expanded="false"'));
   const prompt = '保留 **容器环境** 吗？\n\n- 保留 `Dockerfile`\n- 删除演示产物';
   const question = renderToStaticMarkup(createElement(ComposerDecisionPanels, { language: 'zh-CN', composer: {
-    pendingInteraction: { prompt, allowFreeform: true, options: [{ id: 'keep', label: '**保留**环境', description: '保留 `Makefile`。' }] },
+    pendingInteraction: { prompt, allowFreeform: true, options: [{ id: 'keep', label: '**保留**环境', description: '保留 `Makefile`，参见[说明](https://example.com)。' }] },
     textareaRef: { current: null }, draft: '',
+    submitting: true,
   } }));
   assert.match(question, /<strong>容器环境<\/strong>/);
   assert.match(question, /<code>Dockerfile<\/code>/);
   assert.match(question, /<code>Makefile<\/code>/);
   assert.ok(question.includes('local-agent__interaction-document-scroll'));
+  const optionButton = question.match(/<button[^>]*>[\s\S]*?<\/button>/)?.[0];
+  assert.ok(optionButton, 'the option remains a native action button');
+  assert.match(optionButton, /disabled=""/);
+  assert.match(optionButton, /<code>Makefile<\/code>/, 'the description is part of the option hit target and accessible name');
+  assert.ok(optionButton.includes('说明'));
+  assert.equal(optionButton.includes('<a '), false, 'an option cannot contain a second interactive link');
   const reply = renderToStaticMarkup(createElement(InteractionReplyQuote, { prompt }));
   assert.match(reply, /<details class="conversation-answered-question">/);
   assert.match(reply, /<code>Dockerfile<\/code>/, 'the full question remains available after answering');

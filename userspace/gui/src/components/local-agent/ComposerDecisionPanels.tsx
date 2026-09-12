@@ -25,7 +25,12 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
     <>
       {(pendingPlan || pendingInteraction) && (
         <section className={`local-agent__interaction-panel${pendingPlan ? ' local-agent__interaction-panel--plan' : ''}`}>
-          <div className="local-agent__interaction-document-scroll">
+          <div
+            className="local-agent__interaction-document-scroll"
+            tabIndex={0}
+            role="region"
+            aria-label={t(language, 'agent.interaction.details')}
+          >
           <header className="local-agent__interaction-panel-heading">
             {pendingPlan
               ? <strong><MarkdownInline>{t(language, 'agent.plan.confirmQuestion', { title: pendingPlan.title })}</MarkdownInline></strong>
@@ -41,6 +46,7 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
               >×</button>
             )}
           </header>
+          </div>
           <ol className="local-agent__interaction-options">
             {pendingPlan ? (
               <li>
@@ -73,16 +79,19 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
                   </span>
                   <span className="local-agent__interaction-option-copy">
                     <b><MarkdownInline>{option.label}</MarkdownInline></b>
+                    {option.description && (
+                      <span className="local-agent__interaction-option-description">
+                        <MarkdownInline>{option.description}</MarkdownInline>
+                      </span>
+                    )}
                   </span>
                   <span className="local-agent__interaction-option-chevron" aria-hidden="true">
                     <DeepCodeShellIcon name="chevronRight" />
                   </span>
                 </button>
-                {option.description && <div className="local-agent__interaction-option-description"><MarkdownContent>{option.description}</MarkdownContent></div>}
               </li>
             ))}
           </ol>
-          </div>
           {(pendingPlan || pendingInteraction?.allowFreeform) && (
             <div className="local-agent__interaction-composer">
               <span className="local-agent__interaction-compose-mark" aria-hidden="true">
