@@ -2,7 +2,7 @@
 # DeepCode 开发容器入口 (Makefile)
 # 主要目标：
 #   make shell          -> 进入唯一开发容器（镜像与容器状态自动收敛）
-#   make build          -> 等同 bash ./build.sh，按宿主平台生成 macOS 或 Linux/Windows 产物
+#   make build          -> 等同 bash ./build.sh，尝试全平台打包，缺少支持环境时跳过
 #   make build-deepcode-gui -> 在 Docker 内构建 DeepCode-GUI dist
 #   make build-deepcode-gui-tauri -> 在 Docker 内构建 Windows DeepCode-GUI.exe
 #   make dev-deepcode-gui   -> 在 Docker 内启动当前配置端口的 DeepCode-GUI 调试服务
@@ -124,7 +124,7 @@ help:
 	@echo "DeepCode 开发容器入口"
 	@echo ""
 	@echo "  make shell          进入唯一开发容器（自动更新镜像并收敛容器）"
-	@echo "  make build          按宿主平台构建：Mac 生成 macOS 包，WSL/Linux 生成 Linux 和 Windows 包"
+	@echo "  make build          尝试 Linux、Windows、macOS 全平台打包；缺少支持环境时跳过"
 	@echo "  make build-deepcode-gui  在 Docker 内构建 DeepCode-GUI dist"
 	@echo "  make build-deepcode-gui-tauri  在 Docker 内构建 Windows DeepCode-GUI.exe"
 	@echo "  make docker-info    显示当前项目的容器、挂载、端口、工具链和 volume 配置"
@@ -139,7 +139,7 @@ help:
 	@echo "  make package-macos-deepcode-gui  刷新 DeepCode-GUI.app，并同步刷新共享同一运行时的现有 App"
 	@echo ""
 	@echo "进入容器后可手动执行："
-	@echo "  bash ./build.sh   按宿主平台编译并输出分发目录到 bin/"
+	@echo "  bash ./build.sh   尝试全平台打包到 bin/；缺少支持环境时明确跳过"
 	@echo "  bash ./test.sh --help  查看测试 profile"
 	@echo "  bash ./test.sh    运行默认 required 验证（宿主机不会降级为静态成功）"
 	@echo "  bash ./test.sh --profile static  显式运行宿主机安全静态检查"
