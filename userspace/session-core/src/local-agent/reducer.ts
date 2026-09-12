@@ -1314,11 +1314,13 @@ function validateOrderedProviderOutputBlocks(
         break;
     }
   }
+  const narratives = blocks.filter((block) => block.kind === 'narrative');
+  const commentaryOnly = narratives.length > 0 && narratives.every((block) => block.item.phase === 'commentary');
   if (
     finalMessageCount > 1
     || callIds.length !== orderedCallIds.length
     || callIds.some((callId, index) => callId !== orderedCallIds[index])
-    || allCallIds.size === 0 && finalMessageCount !== 1
+    || allCallIds.size === 0 && finalMessageCount !== 1 && !commentaryOnly
     || allCallIds.size > 0 && finalMessageCount !== 0
   ) throw new Error('provider_output_block_normalization_invalid');
 }

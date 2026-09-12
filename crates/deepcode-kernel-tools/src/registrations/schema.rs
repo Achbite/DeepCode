@@ -66,7 +66,7 @@ pub(super) fn provider_schema_for_tool(tool: KernelToolKind) -> Value {
                         "required": ["oldText", "newText"],
                         "properties": {
                             "oldText": { "type": "string", "minLength": 1, "description": "Copy a small, exact, unique region from the original file. Preserve whitespace. Include only enough context to distinguish this occurrence; do not copy large unchanged regions." },
-                            "newText": { "type": "string", "description": "Replacement for this region; use an empty string to delete it." }
+                            "newText": { "type": "string", "description": "Exact replacement, including any boundary newline that should remain. Empty text deletes the region. After editing shell syntax, bash -n each changed script before running it." }
                         },
                         "additionalProperties": false
                     }
@@ -95,7 +95,7 @@ pub(super) fn provider_schema_for_tool(tool: KernelToolKind) -> Value {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 16384,
-                    "description": "Bash script, including newlines. Use cd for a subdirectory. Preserve quoting and use a quoted heredoc for literal multiline input. Use set -e and set -o pipefail when each step must succeed."
+                    "description": "Bash script with newlines; use cd for subdirectories and quoted heredocs for literal input. Each-step success: set -e and pipefail in the shell owning the pipeline (including outside docker): set -o pipefail; command 2>&1 | tail -60. For expected nonzero: if command; then rc=0; else rc=$?; fi; inspect rc explicitly."
                 },
                 "workspaceMode": {
                     "type": "string",

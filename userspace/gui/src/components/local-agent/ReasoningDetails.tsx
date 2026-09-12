@@ -1,12 +1,13 @@
 import React, { useEffect, useState } from 'react';
 import { useConversationHost } from './ConversationHost';
 import type { JsonObject } from '@deepcode/protocol';
+import { useConversationRowState } from './ConversationVirtualRow';
 
 export function ReasoningDetails({ sessionId, requestId, live = false, summary }: { sessionId: string; requestId: string; live?: boolean; summary?: React.ReactNode }) {
   const { readConversation } = useConversationHost();
-  const [open, setOpen] = useState(false);
-  const [page, setPage] = useState<JsonObject | null>(null);
-  const [offset, setOffset] = useState(0);
+  const [open, setOpen] = useConversationRowState(`reasoning:${requestId}:open`, false);
+  const [page, setPage] = useConversationRowState<JsonObject | null>(`reasoning:${requestId}:page`, null);
+  const [offset, setOffset] = useConversationRowState(`reasoning:${requestId}:offset`, 0);
   const [error, setError] = useState('');
   useEffect(() => {
     if (!open) return;

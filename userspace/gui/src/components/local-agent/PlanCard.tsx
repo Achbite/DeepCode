@@ -1,9 +1,10 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef } from 'react';
 import type { PlanOperation, PlanProjection, WorkspaceBindingDisplay } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
-import { MarkdownInline } from './BufferedMarkdown';
+import { MarkdownContent, MarkdownInline } from './BufferedMarkdown';
 import { PlanDocument } from './PlanDocument';
+import { useConversationRowState } from './ConversationVirtualRow';
 
 interface PlanCardProps {
   plan: PlanProjection;
@@ -24,7 +25,7 @@ const PlanCard: React.FC<PlanCardProps> = ({
 }) => {
   const cardRef = useRef<HTMLElement>(null);
   const previousStatus = useRef(plan.status);
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useConversationRowState(`plan:${plan.revision}:${plan.status}:expanded`, false);
   const toggle = (next: boolean) => {
     if (cardRef.current) onToggle?.(cardRef.current, next);
     setExpanded(next);
@@ -85,9 +86,7 @@ const PlanCard: React.FC<PlanCardProps> = ({
 
 export function PlanCardContent({ plan, previousPlan, workspaceBindings = [], language }: Omit<PlanCardProps, 'active' | 'onToggle'>) {
   return <>
-    {previousPlan && <p className="conversation-plan-revision-note">
-      {planRevisionSummary(previousPlan, plan, language)}
-    </p>}
+    {previousPlan && <PlanRevisionDetails previous={previousPlan} current={plan} language={language} workspaceBindings={workspaceBindings} />}
     <PlanDocument title={plan.title} summary={plan.summary} steps={plan.steps} language={language}>
       {plan.mutationManifest.length > 0 && (
         <details className="local-agent__plan-manifest">
@@ -116,7 +115,47 @@ function planOperationDetail(operation: PlanOperation, language: UiLanguage = 'z
   }
   const label = operation.operation === 'fs.delete' ? (chinese ? '删除' : 'Delete')
     : operation.operation === 'fs.write' ? (chinese ? '写入' : 'Write') : (chinese ? '编辑' : 'Edit');
-  return `${label} · ${operation.target}${'targetKind' in operation && operation.targetKind === 'directoryTree' ? (chinese ? '（目录）' : ' (directory)') : ''}`;
+  const directory = operation.targetKind === 'directoryTree'
+    ? operation.operation === 'fs.delete' ? (chinese ? '（删除目录树）' : ' (delete directory tree)')
+      : (chinese ? '（目录内文件，含新建）' : ' (descendant files, including new files)') : '';
+  return `${label} · ${operation.target}${directory}`;
+}
+
+function PlanRevisionDetails({ previous, current, language, workspaceBindings }: {
+  previous: PlanProjection; current: PlanProjection; language: UiLanguage; workspaceBindings: readonly WorkspaceBindingDisplay[];
+}) {
+  const chinese = language === 'zh-CN';
+  const operationText = (operation: PlanOperation) => `${workspaceBindings.length > 1
+    ? `${workspaceBindings.find((binding) => binding.workspaceId === operation.workspaceId)?.displayName ?? operation.workspaceId} · ` : ''}${planOperationDetail(operation, language)}`;
+  const added = current.mutationManifest.filter((item) => !previous.mutationManifest.some((old) => JSON.stringify(old) === JSON.stringify(item)));
+  const removed = previous.mutationManifest.filter((item) => !current.mutationManifest.some((next) => JSON.stringify(next) === JSON.stringify(item)));
+  return <section className="conversation-plan-revision-note conversation-markdown">
+    <p>{planRevisionSummary(previous, current, language)}</p>
+    {(added.length > 0 || removed.length > 0) && <ul>
+      {added.map((operation, index) => <li key={`add:${index}`}>{chinese ? '新增范围：' : 'Added scope: '}<code>{operationText(operation)}</code></li>)}
+      {removed.map((operation, index) => <li key={`remove:${index}`}>{chinese ? '移除范围：' : 'Removed scope: '}<del><code>{operationText(operation)}</code></del></li>)}
+    </ul>}
+    {previous.steps.filter((step) => !current.steps.some((next) => next.stepId === step.stepId)).map((step) => <div key={`removed:${step.stepId}`}>
+      <p>{chinese ? '移除阶段：' : 'Removed phase: '}<del><MarkdownInline>{step.title}</MarkdownInline></del></p>
+      {(step.verification ?? []).map((item, index) => <div key={index}>{chinese ? '移除验收：' : 'Removed verification: '}<MarkdownContent>{item}</MarkdownContent></div>)}
+    </div>)}
+    {current.steps.map((step) => {
+      const old = previous.steps.find((item) => item.stepId === step.stepId);
+      const removedChecks = (old?.verification ?? []).filter((item) => !step.verification?.includes(item));
+      const addedChecks = (step.verification ?? []).filter((item) => !old?.verification?.includes(item));
+      const detailsChanged = old && (old.title !== step.title || old.details !== step.details);
+      if (old && !detailsChanged && !removedChecks.length && !addedChecks.length) return null;
+      return <div key={step.stepId}>
+        <p><strong>{chinese ? old ? '调整阶段：' : '新增阶段：' : old ? 'Changed phase: ' : 'Added phase: '}<MarkdownInline>{step.title}</MarkdownInline></strong></p>
+        {removedChecks.map((item, index) => <div key={`remove:${index}`}>{chinese ? '移除验收：' : 'Removed verification: '}<MarkdownContent>{item}</MarkdownContent></div>)}
+        {addedChecks.map((item, index) => <div key={`add:${index}`}>{chinese ? '新增验收：' : 'Added verification: '}<MarkdownContent>{item}</MarkdownContent></div>)}
+        {detailsChanged && <details><summary>{chinese ? '阶段正文变化' : 'Phase text changes'}</summary>
+          <p>{chinese ? '修订前' : 'Before'}</p><MarkdownContent>{`${old.title}\n\n${old.details}`}</MarkdownContent>
+          <p>{chinese ? '修订后' : 'After'}</p><MarkdownContent>{`${step.title}\n\n${step.details}`}</MarkdownContent>
+        </details>}
+      </div>;
+    })}
+  </section>;
 }
 
 function planRevisionSummary(previous: PlanProjection, current: PlanProjection, language: UiLanguage): string {

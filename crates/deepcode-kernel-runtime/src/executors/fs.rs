@@ -141,6 +141,7 @@ impl KernelToolExecutor for FsEditExecutor {
                 "oldContentBytes": original.len(),
                 "newContentBytes": patch.updated.len(),
                 "changedRanges": patch.changed_ranges,
+                "editPreview": patch.preview,
                 "editCount": edits.as_array().map_or(0, Vec::len)
             }),
             mode,

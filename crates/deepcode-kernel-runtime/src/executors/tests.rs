@@ -1,5 +1,51 @@
 use super::*;
 
+#[test]
+fn edit_preview_exposes_line_joins_without_changing_requested_text() {
+    let original = "# script\necho ready\nif true; then\n  echo done\nfi\n";
+    let patch = apply_exact_text_edits(
+        original,
+        &serde_json::json!([
+            {"oldText":"echo ready\n", "newText":"echo ready"},
+            {"oldText":"echo done", "newText":"echo 完成"}
+        ]),
+    )
+    .unwrap();
+    assert_eq!(
+        patch.updated,
+        "# script\necho readyif true; then\n  echo 完成\nfi\n"
+    );
+    assert_eq!(
+        patch.preview["hunks"][0]["before"],
+        "echo ready\nif true; then\n"
+    );
+    assert_eq!(
+        patch.preview["hunks"][0]["after"],
+        "echo readyif true; then\n"
+    );
+    assert_eq!(patch.preview["hunks"][1]["newStartLine"], 3);
+    assert_eq!(patch.preview["hunks"][1]["after"], "  echo 完成\n");
+    assert_eq!(patch.preview["truncated"], false);
+    let long = "字".repeat(5000);
+    let patch = apply_exact_text_edits(
+        &long,
+        &serde_json::json!([
+            {"oldText":long, "newText":"replacement"}
+        ]),
+    )
+    .unwrap();
+    assert_eq!(patch.updated, "replacement");
+    assert_eq!(patch.preview["truncated"], true);
+    assert!(
+        patch.preview["hunks"][0]["before"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count()
+            <= 2048
+    );
+}
+
 struct TempWorkspace(PathBuf);
 
 impl TempWorkspace {

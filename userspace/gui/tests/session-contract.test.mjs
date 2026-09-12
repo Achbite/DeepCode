@@ -224,6 +224,65 @@ test('reasoning-only streaming projects activity without raw reasoning or per-ch
   await actor.dispose();
 });
 
+test('GUI consumes complete phase plans and Todo beyond the former item count', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:many-phases';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  let finish;
+  const held = new Promise((resolve) => { finish = resolve; });
+  let calls = 0;
+  const provider = { async *stream(request) {
+    if (++calls === 1) {
+      const tool = request.tools.find((entry) => entry.inputSchema.properties?.mutationManifest);
+      yield providerEvent(request.requestId, 'tool.call', { callId: 'provider-call:phase-plan', name: tool.name, input: {
+        title: 'Current task phases', summary: 'Many file targets can belong to a phase.',
+        steps: Array.from({ length: 13 }, (_, index) => ({ stepId: `phase-${index}`, title: `Phase ${index}`, details: 'Deliver the outcome.' })),
+        mutationManifest: Array.from({ length: 129 }, (_, index) => ({ workspace: 'primary', operation: 'fs.write', target: `src/file-${index}.ts` })),
+      } });
+    } else {
+      await held;
+      yield providerEvent(request.requestId, 'assistant.message', { messageId: 'provider-message:stop', content: 'Work remains pending.' });
+    }
+    yield providerEvent(request.requestId, 'completed', {});
+  } };
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), fakeRunPreparation({ contextWindowTokens: 100_000 }).port, 'many-phases');
+  t.after(async () => { finish(); await actor.dispose(); });
+  await actor.submit(messageCommand(sessionId, 'command:phase-plan', 'Plan the requested work.'));
+  const waiting = await waitForProjection(actor, (value) => value.pendingPlan !== null);
+  assert.deepEqual(await decodeGuiProjection(waiting), waiting);
+  assert.equal(waiting.pendingPlan.steps.length, 13);
+  assert.equal(waiting.pendingPlan.mutationManifest.length, 129);
+  assert.equal(waiting.todoList, null, 'a proposal cannot seed the active Todo');
+  await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'plan.respond', commandId: 'command:phase-confirm', sessionId,
+    runId: waiting.run.runId, planId: waiting.pendingPlan.planId, revision: 1, response: { kind: 'confirm' } });
+  const confirmed = await waitForProjection(actor, (value) => value.todoList?.items.length === 13);
+  assert.deepEqual(await decodeGuiProjection(confirmed), confirmed);
+  assert.deepEqual(confirmed.todoList.items.map((item) => item.sourceStepId), waiting.pendingPlan.steps.map((step) => step.stepId));
+});
+
+test('Provider status separates request elapsed time from the last observed content', async (t) => {
+  const previousSelf = globalThis.self;
+  globalThis.self = {};
+  t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { default: Status } = await loadGuiModule(t, '/src/components/local-agent/ProviderStageStatus.tsx');
+  const now = Date.parse('2026-09-12T12:00:30Z');
+  t.mock.method(Date, 'now', () => now);
+  const props = { run: { runId: 'run:status', status: 'running' }, language: 'zh-CN', toolPending: false };
+  assert.ok(renderToStaticMarkup(createElement(Status, props)).includes('已接收，正在准备'));
+  const activity = { purpose: 'agent', phase: 'waitingResponse', startedAt: '2026-09-12T12:00:00Z' };
+  const waiting = renderToStaticMarkup(createElement(Status, { ...props, activity }));
+  assert.ok(waiting.includes('等待模型响应'));
+  assert.ok(waiting.includes('本次请求已用时 30 秒'));
+  assert.ok(waiting.includes('title="尚未收到模型内容"'));
+  const reasoning = renderToStaticMarkup(createElement(Status, { ...props, activity: {
+    ...activity, phase: 'reasoning', lastContentAt: '2026-09-12T12:00:28Z',
+  } }));
+  assert.ok(reasoning.includes('本次请求已用时 30 秒'));
+  assert.ok(reasoning.includes('title="最近内容输出距今 2 秒"'));
+});
+
 test('snapshot-scoped wire tool resolves to exact Kernel bindings, durable ToolRecord, and continuation', async (t) => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:tool-chain';
@@ -854,26 +913,15 @@ test('cached navigation displays immediately and another session read cannot blo
   assert.equal(requests, 4, 'an aborted late response was not installed in the recent-session cache');
 });
 
-test('conversation navigation windows a long run by rows and preserves earlier message identities', async (t) => {
-  const { conversationNavigation, conversationRange, windowConversationRounds, CONVERSATION_WINDOW_ROWS } = await loadGuiModule(t, '/src/components/local-agent/conversationWindow.ts');
-  const rows = Array.from({ length: CONVERSATION_WINDOW_ROWS + 15 }, (_, index) => ({
+test('continuous conversation keeps every message anchor while mounting nearby content', async (t) => {
+  const { conversationNavigation } = await loadGuiModule(t, '/src/components/local-agent/conversationWindow.ts');
+  const rows = Array.from({ length: 75 }, (_, index) => ({
     key: `row:${index}`,
     item: { type: 'message', value: { role: index === 0 || index === 65 ? 'user' : 'assistant', content: `Message ${index}`, filesystemReferences: [] } },
   }));
   const rounds = [{ key: 'run:long', runId: 'run:long', rows }];
   const navigation = conversationNavigation(rounds);
   assert.deepEqual(navigation.map((entry) => entry.key), ['row:0', 'row:65']);
-  const recent = windowConversationRounds(rounds, conversationRange(rows.length));
-  assert.equal(recent[0].rows.length, CONVERSATION_WINDOW_ROWS);
-  assert.equal(recent[0].rows[0], rows[15]);
-  const earlier = windowConversationRounds(rounds, conversationRange(rows.length, navigation[0].rowIndex));
-  assert.equal(earlier[0].rows[0], rows[0]);
-  assert.equal(earlier[0].rows.length, CONVERSATION_WINDOW_ROWS);
-  assert.equal(earlier[0].runId, 'run:long');
-  const split = [{ ...rounds[0], rows: rows.slice(0, 30) }, { key: 'run:next', runId: 'run:next', rows: rows.slice(30) }];
-  assert.deepEqual(windowConversationRounds(split, conversationRange(rows.length)).flatMap((round) => round.rows), rows.slice(15));
-  const empty = [{ key: 'run:starting', runId: 'run:starting', rows: [] }];
-  assert.deepEqual(windowConversationRounds(empty, conversationRange(0)), empty, 'a starting run retains its live status slot');
   const { createElement } = await import('react');
   const { renderToStaticMarkup } = await import('react-dom/server');
   const { ConversationNavigation } = await loadGuiModule(t, '/src/components/local-agent/ConversationNavigation.tsx');
@@ -881,6 +929,93 @@ test('conversation navigation windows a long run by rows and preserves earlier m
   assert.match(html, /aria-label="对话导航"/);
   assert.match(html, /跳至消息 1: Message 0/);
   assert.equal((html.match(/<button/g) ?? []).length, 2);
+
+  const previousSelf = globalThis.self;
+  globalThis.self = {};
+  t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
+  const { ConversationTranscript } = await loadGuiModule(t, '/src/components/local-agent/ConversationTranscript.tsx');
+  const props = {
+    language: 'zh-CN', loading: false, completedRuns: new Set(), onDisplayed() {},
+    projection: { sessionId: 'session:long', run: null, plans: [], activities: [], fileChangeRounds: [] },
+    hasConversationContent: true, draftItems: [],
+    conversationItems: rows.map((row, index) => ({ ...row.item, sequence: index, streamId: `stream:${index}`, value: { ...row.item.value, messageId: row.key, runId: 'run:long' } })),
+    presentation: { content: (id) => id },
+    viewport: { bodyRef: { current: null }, transcriptRef: { current: null }, messageEndRef: { current: null }, followingLatest: true, setLatestFollowMode() {}, preserveReadingPosition() {}, scrollToAnchor() {} },
+    openWorkspaceResource() {}, setUiActionError() {},
+  };
+  const transcript = renderToStaticMarkup(createElement(ConversationTranscript, props));
+  const anchors = [...transcript.matchAll(/data-conversation-anchor="([^"]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(anchors, rows.map((_, index) => `stream:${index}`), 'all earlier anchors remain in the continuous scroll surface in original order');
+  assert.equal(transcript.includes('查看较早的内容'), false);
+  assert.equal(transcript.includes('查看较新的内容'), false);
+  assert.ok((transcript.match(/data-virtual-rendered="false"/g) ?? []).length > 0, 'offscreen rows retain placeholders instead of mounting all content');
+  assert.ok((transcript.match(/data-virtual-rendered="true"/g) ?? []).length > 0, 'the recent tail is mounted immediately');
+  const starting = renderToStaticMarkup(createElement(ConversationTranscript, { ...props, conversationItems: [], projection: { ...props.projection, run: { runId: 'run:starting', status: 'running' } } }));
+  assert.match(starting, /data-conversation-anchor="run:starting:provider-status"/, 'a starting run retains its live status slot');
+});
+
+test('virtual rows preserve measured height, reading layout and per-session presentation state', async (t) => {
+  const { ConversationLayoutCache, ConversationVirtualizer } = await loadGuiModule(t, '/src/components/local-agent/conversationVirtualizer.ts');
+  const previousIntersection = globalThis.IntersectionObserver;
+  const previousResize = globalThis.ResizeObserver;
+  let intersections; let resizes;
+  class Observer {
+    observed = new Set();
+    observe(node) { this.observed.add(node); }
+    unobserve(node) { this.observed.delete(node); }
+    disconnect() { this.observed.clear(); }
+  }
+  globalThis.IntersectionObserver = class extends Observer { constructor(callback, options) { super(); this.callback = callback; this.options = options; intersections = this; } };
+  globalThis.ResizeObserver = class extends Observer { constructor(callback) { super(); this.callback = callback; resizes = this; } };
+  t.after(() => { globalThis.IntersectionObserver = previousIntersection; globalThis.ResizeObserver = previousResize; });
+  const cache = new ConversationLayoutCache();
+  let corrections = 0;
+  const virtual = new ConversationVirtualizer(cache.session('one'), () => corrections++);
+  const listeners = new Map();
+  const root = { addEventListener: (name, fn) => listeners.set(name, fn), removeEventListener: (name) => listeners.delete(name) };
+  root.ownerDocument = root;
+  let height = 285;
+  const node = { dataset: { conversationAnchor: 'row:old', virtualRendered: 'true' }, hidden: false, getBoundingClientRect: () => ({ height }), contains: () => false, ownerDocument: { activeElement: null, getSelection: () => null } };
+  const visibility = [];
+  const unregister = virtual.register('row:old', node, (value) => visibility.push(value));
+  virtual.connect(root);
+  assert.equal(intersections.options.root, root);
+  assert.ok(intersections.observed.has(node));
+  assert.equal(virtual.layout('row:old').height, 285);
+  intersections.callback([{ target: node, isIntersecting: false }]);
+  assert.deepEqual(visibility, [false]);
+  node.dataset.virtualRendered = 'false'; height = 120;
+  resizes.callback([{ target: node }]);
+  assert.equal(virtual.layout('row:old').height, 285, 'placeholder estimates never overwrite measured content height');
+  intersections.callback([{ target: node, isIntersecting: true }]);
+  assert.deepEqual(visibility, [false, true], 'scrolling back mounts history without a button');
+  node.dataset.virtualRendered = 'true'; height = 410;
+  resizes.callback([{ target: node }]);
+  assert.equal(virtual.layout('row:old').height, 410);
+  assert.equal(corrections, 2, 'initial measurement and later media layout notify the existing anchor owner');
+  virtual.layout('row:old').state.set('expanded', true);
+  unregister(); virtual.disconnect();
+  assert.equal(intersections.observed.size, 0); assert.equal(resizes.observed.size, 0);
+  assert.equal(listeners.size, 0);
+  intersections.callback([{ target: node, isIntersecting: true }]);
+  assert.equal(visibility.length, 2, 'late observer results cannot affect an unmounted session');
+  const other = new ConversationVirtualizer(cache.session('two'), () => {});
+  assert.equal(other.layout('row:old').state.has('expanded'), false);
+  const revisit = new ConversationVirtualizer(cache.session('one'), () => {});
+  assert.equal(revisit.layout('row:old').height, 410);
+  assert.equal(revisit.layout('row:old').state.get('expanded'), true);
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { ConversationVirtualRow, useConversationRowState } = await loadGuiModule(t, '/src/components/local-agent/ConversationVirtualRow.tsx');
+  const Disclosure = () => {
+    const [expanded] = useConversationRowState('expanded', false);
+    return createElement('span', null, expanded ? 'still open' : 'closed');
+  };
+  const markup = (owner) => renderToStaticMarkup(createElement(ConversationVirtualRow, {
+    rowKey: 'row:old', virtualizer: owner, eager: true, children: () => createElement(Disclosure),
+  }));
+  assert.match(markup(revisit), /still open/, 'the remounted component consumes its saved disclosure state');
+  assert.match(markup(other), /closed/, 'another session never inherits it');
 });
 
 test('completed Markdown is reused across remounts while changed and streaming text stay current', async (t) => {
@@ -1025,6 +1160,19 @@ test('Plan documents and previews render Markdown entities, code names and verif
   assert.equal(html.includes('undefined'), false, 'optional command examples must not leak undefined');
   assert.equal(html.includes('workspace:private-id'), false, 'single-workspace review does not need internal IDs');
   assert.ok(html.includes('允许修改'));
+  const revisedPlan = { ...plan, revision: 2,
+    steps: [{ ...plan.steps[0], verification: ['ctest 通过'] }],
+    mutationManifest: [{ workspaceId: 'workspace:private-id', operation: 'fs.edit', target: 'src', targetKind: 'directoryTree' }],
+  };
+  const beforeRevision = { ...plan, steps: [{ ...plan.steps[0], verification: ['`--werror` 通过'] }] };
+  const revisionHtml = renderToStaticMarkup(createElement(PlanCardContent, { plan: revisedPlan, previousPlan: beforeRevision, language: 'zh-CN' }));
+  assert.ok(revisionHtml.includes('新增范围：'));
+  assert.ok(revisionHtml.includes('移除范围：'));
+  assert.ok(revisionHtml.includes('目录内文件，含新建'));
+  assert.match(revisionHtml, /移除验收：[\s\S]*<code>--werror<\/code>/);
+  assert.match(revisionHtml, /新增验收：[\s\S]*ctest 通过/);
+  const englishRevision = renderToStaticMarkup(createElement(PlanCardContent, { plan: revisedPlan, previousPlan: beforeRevision, language: 'en-US' }));
+  assert.ok(englishRevision.includes('Removed verification:'));
   const previewProps = { language: 'zh-CN', preview: {
     callIndex: 0, providerCallId: 'call:preview', title: plan.title, summary: plan.summary, steps: plan.steps.map((step) => step.title), truncated: false,
   } };

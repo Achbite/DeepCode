@@ -53,6 +53,7 @@ import {
   decodeSessionControlCall,
   SessionControlError,
   type PlanPublicationDraft,
+  type PlanScopeExtension,
   type SessionControlCall,
 } from './sessionControls.js';
 
@@ -164,6 +165,7 @@ interface ProviderControlRejection {
 
 type ProviderTurn =
   | ({ kind: 'answer'; content: string; messageId?: string } & ProviderTurnCommon)
+  | ({ kind: 'continuation' } & ProviderTurnCommon)
   | {
       kind: 'interaction';
       interactionId: string;
@@ -175,7 +177,7 @@ type ProviderTurn =
   | ({
       kind: 'plan';
       callId: string;
-      draft: PlanPublicationDraft;
+      draft: PlanPublicationDraft | PlanScopeExtension;
       providerCallId: string;
       narrative?: string;
     } & ProviderTurnCommon)
@@ -465,6 +467,13 @@ export async function runAgentLoop(
         });
       }
       switch (turn.kind) {
+        case 'continuation': {
+          await commit([
+            providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
+            ...completionDerivedFacts,
+          ]);
+          break;
+        }
         case 'interaction': {
           const interactionFact: NewSessionEvent = {
             type: 'interaction.requested',
@@ -1254,8 +1263,22 @@ async function consumeProviderOutput(
     ),
   );
   const hasCalls = calls.length + rejectedCalls.length > 0;
-  const finalOrderedMessage = !hasCalls ? orderedMessageBlocks.at(-1) : undefined;
-  if (decodedOutputBlocks.length > 0 && !hasCalls && !finalOrderedMessage) {
+  const lastMessage = orderedMessageBlocks.at(-1);
+  const finalOrderedMessage = !hasCalls && lastMessage
+    && providerMessagePhase(lastMessage.item) !== 'commentary' ? lastMessage : undefined;
+  const declaredFinalMessages = orderedMessageBlocks.filter((block) => (
+    providerMessagePhase(block.item) === 'final_answer'
+  ));
+  if (declaredFinalMessages.some((block) => block !== finalOrderedMessage)) {
+    throw new LoopFailure(
+      'provider_output_message_phase_conflict',
+      'Provider 最终答复之后仍有消息或待处理调用。',
+    );
+  }
+  const isContinuation = request.purpose === 'agent' && !hasCalls
+    && orderedMessageBlocks.length > 0
+    && orderedMessageBlocks.every((block) => providerMessagePhase(block.item) === 'commentary');
+  if (decodedOutputBlocks.length > 0 && !hasCalls && !finalOrderedMessage && !isContinuation) {
     throw new LoopFailure(
       'provider_answer_empty',
       'Provider 有序 output items 没有产生最终答复消息。',
@@ -1430,6 +1453,7 @@ async function consumeProviderOutput(
       ...common,
     };
   }
+  if (isContinuation) return { kind: 'continuation', ...common };
   const answer = orderedFinalMessage ?? (narrative
     ? { content: narrative, messageId: completeMessage?.messageId }
     : undefined);
@@ -1599,6 +1623,22 @@ function decodeProviderOutputBlock(
 
 type NativeAssistantDraftBlock = AssistantDraftBlockProjection & { outputIndex: number };
 
+/** The native phase has the same meaning while streaming and after settlement. */
+function providerMessagePhase(item: JsonObject): 'commentary' | 'final_answer' | undefined {
+  const phase = item.phase;
+  if (phase === undefined || phase === null) return undefined;
+  if (typeof phase !== 'string') {
+    throw new LoopFailure('provider_output_message_phase_invalid', 'Provider output message 的 phase 不是字符串。');
+  }
+  if (phase !== 'commentary' && phase !== 'final_answer') {
+    throw new LoopFailure(
+      'provider_output_message_phase_unsupported',
+      `Provider output message 返回了当前合同未支持的 phase：${phase}`,
+    );
+  }
+  return phase;
+}
+
 function aggregateDraftBlocks(
   request: ProviderRequest,
   content: string,
@@ -1626,26 +1666,12 @@ function assistantDraftBlocks(
       case 'toolCallRejected':
         return [];
       case 'message': {
-        const phase = block.item.phase;
-        if (phase !== undefined && phase !== null && typeof phase !== 'string') {
-          throw new LoopFailure(
-            'provider_output_message_phase_invalid',
-            'Provider output message 的 phase 不是字符串。',
-          );
-        }
+        const phase = providerMessagePhase(block.item);
         const kind = phase === 'commentary'
           ? 'narrative'
           : phase === 'final_answer'
             ? 'finalMessage'
-            : phase === undefined || phase === null
-              ? 'message'
-              : undefined;
-        if (!kind) {
-          throw new LoopFailure(
-            'provider_output_message_phase_unsupported',
-            `Provider output message 返回了当前合同未支持的 phase：${phase}`,
-          );
-        }
+            : 'message';
         return [{
           outputIndex: block.outputIndex,
           kind,

@@ -887,9 +887,7 @@ function isPlanProjectionFields(value: Record<string, unknown>): boolean {
     || (value.decisionId !== undefined && !isIdentifier(value.decisionId))
     || !isArrayOf(value.steps, isPlanStep)
     || value.steps.length < 1
-    || value.steps.length > 12
     || !isArrayOf(value.mutationManifest, isPlanOperation)
-    || value.mutationManifest.length > 128
   ) return false;
   return new Set(value.steps.map((step) => step.stepId)).size === value.steps.length;
 }
@@ -932,7 +930,8 @@ function isPlanOperation(value: unknown): boolean {
     return isExactRecord(value, ['workspaceId', 'operation', 'target', 'targetKind'])
       && ['file', 'directoryTree'].includes(String(value.targetKind));
   }
-  return isExactRecord(value, ['workspaceId', 'operation', 'target'])
+  return isExactRecord(value, ['workspaceId', 'operation', 'target'], ['targetKind'])
+    && (value.targetKind === undefined || ['file', 'directoryTree'].includes(String(value.targetKind)))
     && ['fs.write', 'fs.edit']
       .includes(String(value.operation));
 }
@@ -961,7 +960,6 @@ function isTodoList(value: unknown): boolean {
     || !isNaturalNumber(value.sequence)
     || !isNonEmptyText(value.updatedAt)
     || !isArrayOf(value.items, isTodoItem)
-    || value.items.length > 12
   ) return false;
   return new Set(value.items.map((item) => item.todoId)).size === value.items.length;
 }

@@ -5,7 +5,7 @@ import { SESSION_CONTROL_PLAN_PROGRESS, SESSION_CONTROL_PLAN_PUBLISH } from '@de
 import { canonicalJsonValue } from './providerToolCodec.js';
 import { LoopFailure } from './loopFailure.js';
 import type { SessionState } from './reducer.js';
-import type { PlanPublicationDraft, SessionControlCall } from './sessionControls.js';
+import type { PlanPublicationDraft, PlanScopeExtension, SessionControlCall } from './sessionControls.js';
 
 /** Plan lifecycle is derived from the Session journal, never a second loop or store. */
 export function publishPlan(
@@ -13,7 +13,7 @@ export function publishPlan(
   runId: string,
   callId: string,
   providerCallId: string,
-  draft: PlanPublicationDraft,
+  input: PlanPublicationDraft | PlanScopeExtension,
   workspaceIds: readonly string[],
   nextId: (kind: string) => string,
 ): NewSessionEvent {
@@ -29,8 +29,27 @@ export function publishPlan(
   }
   const reject = (code: string, message: string): NewSessionEvent => ({
     type: 'session.control.rejected', sessionId: state.sessionId, runId, callId,
-    payload: { providerCallId, toolName: SESSION_CONTROL_PLAN_PUBLISH, input: { ...draft }, error: { code, message } },
+    payload: { providerCallId, toolName: SESSION_CONTROL_PLAN_PUBLISH, input: { ...input }, error: { code, message } },
   });
+  let draft: PlanPublicationDraft;
+  if ('mode' in input) {
+    if (previous?.status !== 'confirmed') return reject('plan_scope_extension_not_active',
+      'Scope additions need a confirmed Plan in this run. Publish a complete Plan for a new task.');
+    const manifest = structuredClone(previous.mutationManifest);
+    const keys = new Set(manifest.map((operation) => JSON.stringify(canonicalJsonValue(operation))));
+    for (const operation of input.mutationManifest) {
+      const key = JSON.stringify(canonicalJsonValue(operation));
+      if (!keys.has(key)) { manifest.push(structuredClone(operation)); keys.add(key); }
+    }
+    if (manifest.length === previous.mutationManifest.length) return reject('plan_scope_extension_unchanged',
+      'No new scope was proposed. Continue within the confirmed scope.');
+    draft = {
+      title: previous.title, summary: `${previous.summary}\n\n${input.summary}`,
+      steps: structuredClone(previous.steps), mutationManifest: manifest,
+    };
+  } else {
+    draft = input;
+  }
   const unknownWorkspace = draft.mutationManifest.find((operation) => !workspaceIds.includes(operation.workspaceId));
   if (unknownWorkspace) return reject('plan_workspace_binding_invalid', 'Plan 包含不属于当前运行的工作区。请使用当前 Session 目录索引。');
   if (previous) {

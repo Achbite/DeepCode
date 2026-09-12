@@ -16,7 +16,9 @@ import { conversationRounds, type ProjectionItem, type AssistantDraftItem } from
 import type { ConversationViewport } from './useConversationViewport';
 import { formatBytes } from './conversationFormatting';
 import { ConversationNavigation } from './ConversationNavigation';
-import { conversationNavigation, conversationRange, windowConversationRounds, type ConversationRange } from './conversationWindow';
+import { conversationNavigation } from './conversationWindow';
+import { ConversationLayoutCache, ConversationVirtualizer } from './conversationVirtualizer';
+import { ConversationVirtualRow } from './ConversationVirtualRow';
 
 interface ConversationTranscriptProps {
   language: UiLanguage;
@@ -66,8 +68,7 @@ export function ConversationTranscript({
   const submitting = useLocalAgentStore((state) => state.submitting);
   const setMessageFeedback = useLocalAgentStore((state) => state.setMessageFeedback);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
-  const [windows, setWindows] = useState<Record<string, ConversationRange | null>>({});
-  const [pendingJump, setPendingJump] = useState<{ sessionId: string; key: string } | null>(null);
+  const layouts = useRef(new ConversationLayoutCache());
   const currentSessionRef = useRef({ sessionId: projection?.sessionId });
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   if (currentSessionRef.current.sessionId !== projection?.sessionId) currentSessionRef.current = { sessionId: projection?.sessionId };
@@ -289,31 +290,19 @@ export function ConversationTranscript({
       )}
 </>;
   const rounds = useMemo(() => conversationRounds(conversationItems, draftItems, projection?.run?.runId), [conversationItems, draftItems, projection?.run?.runId]);
-  const totalRows = rounds.reduce((total, round) => total + round.rows.length, 0);
   const sessionKey = projection?.sessionId ?? '';
-  const range = conversationRange(totalRows, windows[sessionKey]?.start);
-  const navigation = useMemo(() => conversationNavigation(rounds), [rounds, range.start, range.end]);
-  const visible = windowConversationRounds(rounds, range);
-  const showWindow = (start: number, key?: string) => {
-    const next = conversationRange(totalRows, start);
-    setLatestFollowMode(false);
-    setWindows((current) => ({ ...current, [sessionKey]: next.end === totalRows ? null : next }));
-    const target = key ?? rounds.flatMap((round) => round.rows)[next.start]?.key;
-    if (target) setPendingJump({ sessionId: sessionKey, key: target });
-  };
+  const virtualizer = useMemo(() => new ConversationVirtualizer(layouts.current.session(sessionKey), viewport.preserveReadingPosition), [sessionKey, viewport.preserveReadingPosition]);
+  const navigation = useMemo(() => conversationNavigation(rounds), [rounds]);
+  const eagerRows = useMemo(() => new Set(rounds.flatMap((round) => round.rows).slice(-12).map((row) => row.key)), [rounds]);
   useLayoutEffect(() => {
-    if (pendingJump?.sessionId !== sessionKey) return;
-    viewport.scrollToAnchor(pendingJump.key);
-    setPendingJump(null);
-  }, [pendingJump, sessionKey, viewport.scrollToAnchor]);
-  useLayoutEffect(() => {
-    setWindows((current) => current[sessionKey] ? { ...current, [sessionKey]: null } : current);
-  }, [viewport.latestRequest]);
+    if (viewport.bodyRef.current) virtualizer.connect(viewport.bodyRef.current);
+    return () => virtualizer.disconnect();
+  }, [virtualizer, viewport.bodyRef]);
 
   return (
     <>
-    <ConversationNavigation key={sessionKey} entries={navigation} viewport={viewport} language={language} windowStart={range.start}
-      onNavigate={(entry) => showWindow(entry.rowIndex, entry.key)} />
+    <ConversationNavigation key={sessionKey} entries={navigation} viewport={viewport} language={language}
+      onNavigate={(entry) => viewport.scrollToAnchor(entry.key)} />
     <div
       ref={transcriptRef}
       className="local-agent__transcript"
@@ -332,10 +321,7 @@ export function ConversationTranscript({
           </strong>
         </div>
       )}
-      {range.start > 0 && <button type="button" className="local-agent__older-messages" onClick={() => showWindow(range.start - 40)}>
-        {language === 'zh-CN' ? '查看较早的内容' : 'Show earlier content'}（{range.start}）
-      </button>}
-      {visible.map((round) => {
+      {rounds.map((round) => {
         const current = projection?.run?.runId === round.runId;
         const completed = completedRuns.has(round.runId);
         const terminal = current && ['failed', 'cancelled', 'indeterminate'].includes(projection!.run!.status);
@@ -343,18 +329,16 @@ export function ConversationTranscript({
           key: row.key,
           process: row.item ? row.item.type !== 'message' : row.draft?.type !== 'text' || row.draft.block.kind === 'narrative',
           required: row.item?.type === 'plan' && samePlanReference(projection?.pendingPlan, row.item.value),
+          live: Boolean(row.draft) || (current && !completed && row.item?.type === 'message' && row.item.value.role === 'assistant'),
           content: () => row.item ? renderItem(row.item) : renderDraft(row.draft!),
         }));
-        if (current && !completed && range.end === totalRows) rows.push({ key: 'provider-status', process: true, required: false, content: () => providerStatus });
-        if (showReasoning && projection && completed) rows.push({ key: 'reasoning-history', process: true, required: false, content: () => <ReasoningHistory sessionId={projection.sessionId} runId={round.runId} /> });
-        return <ConversationRoundView key={`${projection?.sessionId}:${round.key}`} completed={completed} followingLatest={viewport.followingLatest} rows={rows}>
+        if (current && !completed) rows.push({ key: `${round.key}:provider-status`, process: true, required: false, live: true, content: () => providerStatus });
+        if (showReasoning && projection && completed) rows.push({ key: `${round.key}:reasoning-history`, process: true, required: false, live: false, content: () => <ReasoningHistory sessionId={projection.sessionId} runId={round.runId} /> });
+        return <ConversationRoundView key={`${projection?.sessionId}:${round.key}`} roundKey={round.key} virtualizer={virtualizer} eagerRows={eagerRows} completed={completed} followingLatest={viewport.followingLatest} rows={rows}>
           {(completed || terminal) && <FileChanges activities={roundChangeActivities(projection, round.runId)} />}
         </ConversationRoundView>;
       })}
-      {range.end < totalRows && <button type="button" className="local-agent__older-messages" onClick={() => showWindow(range.start + 40)}>
-        {language === 'zh-CN' ? '查看较新的内容' : 'Show later content'}（{totalRows - range.end}）
-      </button>}
-      {range.end === totalRows && projection?.terminalError && (
+      {projection?.terminalError && (
         <article className="local-agent__terminal-error">
           <strong>{projection.terminalError.code}</strong>
           <span>{projection.terminalError.message}</span>
@@ -373,12 +357,15 @@ function samePlanReference(
   return reference?.planId === plan.planId && reference.revision === plan.revision;
 }
 
-function ConversationRoundView({ completed, followingLatest, rows, children }: {
+function ConversationRoundView({ roundKey, virtualizer, eagerRows, completed, followingLatest, rows, children }: {
+  roundKey: string; virtualizer: ConversationVirtualizer; eagerRows: Set<string>;
   completed: boolean; followingLatest: boolean;
-  rows: Array<{ key: string; process: boolean; required: boolean; content(): React.ReactNode }>;
+  rows: Array<{ key: string; process: boolean; required: boolean; live: boolean; content(): React.ReactNode }>;
   children: React.ReactNode;
 }) {
-  const [disclosure, setDisclosure] = useState({ completed, open: false });
+  const state = virtualizer.layout(`${roundKey}:disclosure`).state;
+  const [disclosure, updateDisclosure] = useState(() => (state.get('process') as { completed: boolean; open: boolean } | undefined) ?? { completed, open: false });
+  const setDisclosure = (value: typeof disclosure) => { state.set('process', value); updateDisclosure(value); };
   if (disclosure.completed !== completed) setDisclosure({ completed, open: completed && !followingLatest });
   const expanded = !completed || disclosure.open;
   const firstProcess = rows.find((row) => row.process)?.key;
@@ -387,7 +374,8 @@ function ConversationRoundView({ completed, followingLatest, rows, children }: {
       {completed && row.key === firstProcess && <button className="conversation-process-toggle" type="button" aria-expanded={expanded} onClick={() => setDisclosure({ completed, open: !expanded })}>
         <DeepCodeShellIcon name="tool" /><span>{expanded ? '执行过程' : '查看执行过程'}</span><DeepCodeShellIcon name="chevronDown" className="conversation-disclosure-chevron" />
       </button>}
-      <div data-conversation-anchor={row.key} hidden={row.process && !expanded && !row.required}>{(!row.process || expanded || row.required) && row.content()}</div>
+      <ConversationVirtualRow rowKey={row.key} virtualizer={virtualizer} eager={eagerRows.has(row.key)} live={row.live || row.required}
+        hidden={row.process && !expanded && !row.required}>{row.content}</ConversationVirtualRow>
     </React.Fragment>)}
     {children}
   </section>;

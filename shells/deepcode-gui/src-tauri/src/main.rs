@@ -919,17 +919,6 @@ fn spawn_host_processes_if_available(
     if processes.is_shutting_down() {
         return Err(startup_stopped_failure());
     }
-    if local_port_has_listener(&target.host, &target.port)
-        || local_port_has_listener(&target.host, &target.daemon_port)
-    {
-        return Err(startup_failure(
-            "startAdmission",
-            "host_startup_port_in_use",
-            None,
-            "A required private Host port is already in use.",
-            true,
-        ));
-    }
     let _start_lock = acquire_kernel_start_lock(&target.host, &target.port).ok_or_else(|| {
         startup_failure(
             "startAdmission",
@@ -939,18 +928,6 @@ fn spawn_host_processes_if_available(
             true,
         )
     })?;
-    if local_port_has_listener(&target.host, &target.port)
-        || local_port_has_listener(&target.host, &target.daemon_port)
-    {
-        return Err(startup_failure(
-            "startAdmission",
-            "host_startup_port_in_use",
-            None,
-            "A required private Host port became unavailable during connection.",
-            true,
-        ));
-    }
-
     status.update(
         attempt_id,
         "starting",
@@ -1028,6 +1005,9 @@ fn spawn_host_processes_if_available(
                 true,
             )
         })?;
+    // A ready daemon outlives this shell. On retry its original port is still
+    // occupied by that shared service; only ports we will bind are private.
+    admit_private_host_ports(target, shared.is_some())?;
     let proxy_host = target.host.clone();
     let mut target = target.clone();
     let mut host_tokens = host_tokens.clone();
@@ -2051,6 +2031,32 @@ fn request_loopback_json<T: DeserializeOwned>(
     })
 }
 
+fn admit_private_host_ports(
+    target: &LaunchTarget,
+    reuse_daemon: bool,
+) -> Result<(), HostStartupFailure> {
+    let unavailable = if local_port_has_listener(&target.host, &target.port) {
+        Some(("Host proxy", &target.port))
+    } else if !reuse_daemon && local_port_has_listener(&target.host, &target.daemon_port) {
+        Some(("Kernel daemon", &target.daemon_port))
+    } else {
+        None
+    };
+    if let Some((service, port)) = unavailable {
+        return Err(startup_failure(
+            "startAdmission",
+            "host_startup_port_in_use",
+            None,
+            format!(
+                "The {service} port {}:{port} is already in use.",
+                target.host
+            ),
+            true,
+        ));
+    }
+    Ok(())
+}
+
 fn local_port_has_listener(host: &str, port: &str) -> bool {
     let Ok(port) = port.parse::<u16>() else {
         return false;
@@ -2161,6 +2167,26 @@ fn env_truthy(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_only_requires_ports_for_processes_it_will_start() {
+        let daemon = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let proxy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let target = LaunchTarget {
+            host: "127.0.0.1".into(),
+            port: proxy.local_addr().unwrap().port().to_string(),
+            daemon_port: daemon.local_addr().unwrap().port().to_string(),
+        };
+        let occupied_proxy = admit_private_host_ports(&target, true).unwrap_err();
+        assert_eq!(occupied_proxy.code, "host_startup_port_in_use");
+        assert!(occupied_proxy.message.contains("Host proxy"));
+        drop(proxy); // Retry has reclaimed its private proxy, not the daemon.
+        assert!(admit_private_host_ports(&target, true).is_ok());
+        let occupied_daemon = admit_private_host_ports(&target, false).unwrap_err();
+        assert_eq!(occupied_daemon.code, "host_startup_port_in_use");
+        assert!(occupied_daemon.message.contains("Kernel daemon"));
+        assert!(TcpStream::connect(daemon.local_addr().unwrap()).is_ok());
+    }
 
     #[cfg(unix)]
     #[test]

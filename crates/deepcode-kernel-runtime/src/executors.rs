@@ -336,6 +336,7 @@ struct TextEditRange {
 struct AppliedTextEdits {
     updated: String,
     changed_ranges: Value,
+    preview: Value,
 }
 
 fn apply_exact_text_edits(original: &str, edits: &Value) -> KernelResult<AppliedTextEdits> {
@@ -381,10 +382,52 @@ fn apply_exact_text_edits(original: &str, edits: &Value) -> KernelResult<Applied
     for range in ranges.iter().rev() {
         updated.replace_range(range.start..range.end, &range.new_text);
     }
+    let preview = edit_preview(original, &updated, &ranges);
     Ok(AppliedTextEdits {
         updated,
         changed_ranges,
+        preview,
     })
+}
+
+// Show actual before/after line context, including joins caused by a replaced
+// newline. This bounded display result never changes matching or file content.
+fn edit_preview(original: &str, updated: &str, ranges: &[TextEditRange]) -> Value {
+    fn excerpt(text: &str, start: usize, end: usize, limit: usize) -> (String, bool, usize) {
+        let line_start = text[..start].rfind('\n').map_or(0, |index| index + 1);
+        let line_end = text[end..]
+            .find('\n')
+            .map_or(text.len(), |index| end + index + 1);
+        let mut chars = text[line_start..line_end].chars();
+        let content = chars.by_ref().take(limit).collect::<String>();
+        let truncated = chars.next().is_some();
+        let line = text[..line_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        (content, truncated, line)
+    }
+    let mut remaining = 4096;
+    let mut hunks = Vec::new();
+    let mut offset: isize = 0;
+    let mut truncated = false;
+    for range in ranges {
+        if remaining < 2 {
+            truncated = true;
+            break;
+        }
+        let start = (range.start as isize + offset) as usize;
+        let (before, before_cut, old_line) =
+            excerpt(original, range.start, range.end, remaining / 2);
+        let (after, after_cut, new_line) =
+            excerpt(updated, start, start + range.new_text.len(), remaining / 2);
+        remaining -= before.chars().count() + after.chars().count();
+        truncated |= before_cut || after_cut;
+        hunks.push(serde_json::json!({"oldStartLine":old_line, "newStartLine":new_line, "before":before, "after":after}));
+        offset += range.new_text.len() as isize - (range.end - range.start) as isize;
+    }
+    serde_json::json!({"hunks":hunks, "truncated":truncated})
 }
 
 fn unique_match_range(

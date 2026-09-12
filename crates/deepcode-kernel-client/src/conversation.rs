@@ -344,7 +344,6 @@ impl SessionProjection {
             todo_list.source_plan_id.is_empty()
                 || todo_list.source_plan_revision == 0
                 || todo_list.items.is_empty()
-                || todo_list.items.len() > 12
                 || self.plans.iter().all(|plan| {
                     plan.plan_id != todo_list.source_plan_id
                         || plan.revision != todo_list.source_plan_revision
@@ -1897,7 +1896,6 @@ fn valid_plan_projection(plan: &PlanProjection) -> bool {
         && !plan.title.is_empty()
         && !plan.summary.is_empty()
         && !plan.steps.is_empty()
-        && plan.steps.len() <= 12
         && matches!(
             plan.status.as_str(),
             "published"
@@ -1933,15 +1931,15 @@ fn valid_pending_plan_projection(plan: &PendingPlanProjection) -> bool {
 fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) -> bool {
     let mut step_ids = HashSet::new();
     !steps.is_empty()
-        && steps.len() <= 12
         && steps.iter().all(|step| {
             !step.step_id.is_empty()
                 && !step.title.is_empty()
                 && !step.details.is_empty()
                 && step_ids.insert(step.step_id.as_str())
-                && step.verification.as_ref().is_none_or(|items| {
-                    items.len() <= 8 && items.iter().all(|item| !item.trim().is_empty())
-                })
+                && step
+                    .verification
+                    .as_ref()
+                    .is_none_or(|items| items.iter().all(|item| !item.trim().is_empty()))
         })
         && operations.iter().all(|operation| {
             !operation.workspace_id.is_empty()
@@ -1965,7 +1963,10 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                             .target
                             .as_deref()
                             .is_some_and(|target| !target.is_empty())
-                            && operation.target_kind.is_none()
+                            && matches!(
+                                operation.target_kind.as_deref(),
+                                None | Some("file" | "directoryTree")
+                            )
                             && operation.command.is_none()
                             && operation.workspace_mode.is_none()
                             && operation.execution_scope.is_none()
@@ -1988,7 +1989,6 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                                 None => operation.execution_scope.as_deref() == Some("host"),
                                 Some(paths) => {
                                     !paths.is_empty()
-                                        && paths.len() <= 128
                                         && paths.iter().all(|target| {
                                             target.path != "."
                                                 && is_normalized_logical_path(&target.path)

@@ -95,6 +95,15 @@ export function useConversationViewport({
     });
   }, [scrollToLatestNow]);
 
+  // Virtual rows and asynchronous media use the same anchor owner as user
+  // scrolling. Apply layout corrections even during a continuous wheel gesture.
+  const preserveReadingPosition = useCallback(() => {
+    if (pendingViewportRestoreRef.current !== null) return;
+    if (followingLatestRef.current) { scheduleScrollToLatest(); return; }
+    const saved = activeViewRef.current ? sessionViewportsRef.current.get(activeViewRef.current) : undefined;
+    if (saved?.mode === 'detached') restorePosition(saved);
+  }, [restorePosition, scheduleScrollToLatest]);
+
   const markTransientUserScroll = useCallback(() => {
     transientUserScrollRef.current = true;
     if (transientUserScrollFrameRef.current !== null) {
@@ -344,7 +353,7 @@ export function useConversationViewport({
     },
   };
 
-  return { bodyRef, transcriptRef, messageEndRef, bodyHandlers, followingLatest, setLatestFollowMode, scrollToLatest, scrollToAnchor, latestRequest };
+  return { bodyRef, transcriptRef, messageEndRef, bodyHandlers, followingLatest, setLatestFollowMode, scrollToLatest, scrollToAnchor, latestRequest, preserveReadingPosition };
 }
 
 export type ConversationViewport = ReturnType<typeof useConversationViewport>;

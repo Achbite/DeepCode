@@ -1290,6 +1290,7 @@ impl LocalAgentKernel {
                 "workspaceId": prepared.workspace_id,
             })));
         }
+        let mut confirmed_scope = Vec::new();
         for authority in &request.plan_authorities {
             if !authority_matches_identity(authority, request, prepared) {
                 continue;
@@ -1299,6 +1300,17 @@ impl LocalAgentKernel {
                 .plan_authority_is_committed(&request.session_id, authority)?
             {
                 continue;
+            }
+            if let Some(operations) = authority["coveredOperations"].as_array() {
+                confirmed_scope.extend(operations.iter().filter(|operation| {
+                    operation["workspaceId"].as_str() == prepared.workspace_id.as_deref()
+                }).map(|operation| {
+                    if operation["operation"] == "bash" {
+                        json!({"operation":"bash", "executionScope":operation["executionScope"], "writablePaths":operation["writablePaths"]})
+                    } else {
+                        json!({"operation":operation["operation"], "target":operation["target"], "targetKind":operation.get("targetKind").cloned().unwrap_or(json!("file"))})
+                    }
+                }));
             }
             if authority_covers(authority, prepared) {
                 let writable_paths: Vec<Value> = authority["coveredOperations"]
@@ -1333,7 +1345,11 @@ impl LocalAgentKernel {
         }
         Ok(Admission::denied(
             "workspace_mutation_plan_required",
-            "本调用未执行：目标文件、删除类型或 Bash 执行范围未被当前已确认 Plan 覆盖。只有扩大这些范围才需修订 Plan；同一文件的 edit/write 切换与同一执行范围内的命令细节调整无需重新确认。",
+            &format!(
+                "本调用未执行：请求 {} 未被已确认 Plan 覆盖。当前相关范围：{}。范围内的 edit/write 切换和命令细节无需重新确认；扩大授权范围需要用户确认，删除需独立授权。",
+                json!({"operation":prepared.operation, "targets":prepared.logical_targets, "targetKind":prepared.delete_target_kind, "executionScope":prepared.process_execution_scope}),
+                Value::Array(confirmed_scope),
+            ),
         ))
     }
 
@@ -1934,17 +1950,29 @@ fn authority_covers(authority: &Value, prepared: &PreparedEffect) -> bool {
                             && matches!(
                                 object.get("operation").and_then(Value::as_str),
                                 Some("fs.write" | "fs.edit")
-                            ))
-                    && object.get("target").and_then(Value::as_str) == Some(target.as_str());
+                            ));
                 if !base {
                     return false;
                 }
                 if prepared.operation == "fs.delete" {
-                    object.len() == 4
+                    object.get("target").and_then(Value::as_str) == Some(target.as_str())
+                        && object.len() == 4
                         && object.get("targetKind").and_then(Value::as_str)
                             == prepared.delete_target_kind.as_deref()
                 } else {
-                    object.len() == 3 && object.get("targetKind").is_none()
+                    let Some(scope) = object.get("target").and_then(Value::as_str) else {
+                        return false;
+                    };
+                    match object.get("targetKind").and_then(Value::as_str) {
+                        Some("directoryTree") => {
+                            object.len() == 4
+                                && target != scope
+                                && Path::new(target).starts_with(Path::new(scope))
+                        }
+                        Some("file") => object.len() == 4 && target == scope,
+                        None => object.len() == 3 && target == scope,
+                        _ => false,
+                    }
                 }
             })
         })
@@ -2411,10 +2439,21 @@ mod attempt_control_tests {
         assert!(authority_covers(&file, &effect));
         effect.logical_targets = vec!["src/other.hpp".into()];
         assert!(!authority_covers(&file, &effect));
+        let directory = json!({"coveredOperations":[{"workspaceId":"workspace:scope", "operation":"fs.edit", "target":"src", "targetKind":"directoryTree"}]});
+        assert!(authority_covers(&directory, &effect));
+        effect.logical_targets = vec!["src/nested/new.hpp".into()];
+        assert!(authority_covers(&directory, &effect));
+        effect.operation = "fs.edit".into();
+        assert!(authority_covers(&directory, &effect));
+        effect.logical_targets = vec!["src-other/new.hpp".into()];
+        assert!(!authority_covers(&directory, &effect));
+        effect.logical_targets = vec!["src".into()];
+        assert!(!authority_covers(&directory, &effect));
         effect.logical_targets = vec!["src/pool.hpp".into()];
         effect.operation = "fs.delete".into();
         effect.delete_target_kind = Some("file".into());
         assert!(!authority_covers(&file, &effect));
+        assert!(!authority_covers(&directory, &effect));
         let deletion = json!({"coveredOperations":[{"workspaceId":"workspace:scope", "operation":"fs.delete", "target":"src/pool.hpp", "targetKind":"file"}]});
         assert!(authority_covers(&deletion, &effect));
         effect.delete_target_kind = Some("directoryTree".into());

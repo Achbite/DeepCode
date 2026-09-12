@@ -133,6 +133,8 @@ export type PlanOperation =
       workspaceId: string;
       operation: Exclude<PlanOperationName, 'fs.delete' | 'bash'>;
       target: string;
+      /** Omitted/file covers this file; directoryTree covers files beneath this directory. */
+      targetKind?: 'file' | 'directoryTree';
     }
   | {
       workspaceId: string;

@@ -3,12 +3,11 @@ import type { ConversationNavigationEntry } from './conversationWindow';
 import type { ConversationViewport } from './useConversationViewport';
 import type { UiLanguage } from '../../i18n';
 
-export function ConversationNavigation({ entries, viewport, onNavigate, language, windowStart = 0 }: {
+export function ConversationNavigation({ entries, viewport, onNavigate, language }: {
   entries: ConversationNavigationEntry[];
   viewport: ConversationViewport;
   onNavigate(entry: ConversationNavigationEntry): void;
   language: UiLanguage;
-  windowStart?: number;
 }) {
   const [active, setActive] = useState<string>();
   const [preview, setPreview] = useState<ConversationNavigationEntry | null>(null);
@@ -20,7 +19,7 @@ export function ConversationNavigation({ entries, viewport, onNavigate, language
     const update = () => {
       frame = null;
       const top = body.getBoundingClientRect().top + 40;
-      let selected = entries.filter((entry) => entry.rowIndex <= windowStart).at(-1)?.key;
+      let selected: string | undefined = entries[0]?.key;
       for (const node of body.querySelectorAll<HTMLElement>('[data-conversation-anchor]')) {
         if (!keys.has(node.dataset.conversationAnchor!)) continue;
         if (node.getBoundingClientRect().top > top && selected) break;
@@ -35,7 +34,7 @@ export function ConversationNavigation({ entries, viewport, onNavigate, language
       body.removeEventListener('scroll', schedule);
       if (frame !== null) cancelAnimationFrame(frame);
     };
-  }, [entries, viewport.bodyRef, windowStart]);
+  }, [entries, viewport.bodyRef]);
   if (entries.length < 2) return null;
   const zh = language === 'zh-CN';
   return <nav className="conversation-navigation" aria-label={zh ? '对话导航' : 'Conversation navigation'}>

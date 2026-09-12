@@ -1143,10 +1143,10 @@ fn validate_new_event(
                         "todo.progressed updates 必须是数组。",
                     )
                 })?;
-            if updates.is_empty() || updates.len() > 12 {
+            if updates.is_empty() {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
-                    "todo.progressed 必须包含一至十二项更新。",
+                    "todo.progressed 必须包含至少一项更新。",
                 ));
             }
             let mut todo_ids = std::collections::HashSet::with_capacity(updates.len());
@@ -3158,10 +3158,10 @@ fn validate_plan_steps(value: &Value) -> Result<(), LocalAgentStoreError> {
     let steps = value.as_array().ok_or_else(|| {
         LocalAgentStoreError::new("session_event_invalid", "Plan steps 必须是数组。")
     })?;
-    if steps.is_empty() || steps.len() > 12 {
+    if steps.is_empty() {
         return Err(LocalAgentStoreError::new(
             "session_event_invalid",
-            "Plan 必须包含一至十二个步骤。",
+            "Plan 必须包含至少一个阶段。",
         ));
     }
     let mut step_ids = std::collections::HashSet::with_capacity(steps.len());
@@ -3181,10 +3181,9 @@ fn validate_plan_steps(value: &Value) -> Result<(), LocalAgentStoreError> {
             let items = verification.as_array().ok_or_else(|| {
                 LocalAgentStoreError::new("session_event_invalid", "Plan verification 必须是数组。")
             })?;
-            if items.len() > 8
-                || items
-                    .iter()
-                    .any(|item| item.as_str().is_none_or(|text| text.trim().is_empty()))
+            if items
+                .iter()
+                .any(|item| item.as_str().is_none_or(|text| text.trim().is_empty()))
             {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
@@ -3203,12 +3202,6 @@ fn validate_plan_operations(value: &Value) -> Result<(), LocalAgentStoreError> {
             "Plan mutationManifest 必须是数组。",
         )
     })?;
-    if operations.len() > 128 {
-        return Err(LocalAgentStoreError::new(
-            "session_event_invalid",
-            "Plan mutationManifest 最多包含 128 项。",
-        ));
-    }
     for operation in operations {
         let name = required_string(operation, "operation")?;
         if name == "bash" {
@@ -3227,7 +3220,7 @@ fn validate_plan_operations(value: &Value) -> Result<(), LocalAgentStoreError> {
                 let paths = operation
                     .get("writablePaths")
                     .and_then(Value::as_array)
-                    .filter(|paths| !paths.is_empty() && paths.len() <= 128)
+                    .filter(|paths| !paths.is_empty())
                     .ok_or_else(|| {
                         LocalAgentStoreError::new(
                             "session_event_invalid",
@@ -3296,7 +3289,20 @@ fn validate_plan_operations(value: &Value) -> Result<(), LocalAgentStoreError> {
                 ));
             }
         } else {
-            exact_object(operation, &["workspaceId", "operation", "target"], &[])?;
+            exact_object(
+                operation,
+                &["workspaceId", "operation", "target"],
+                &["targetKind"],
+            )?;
+            if operation
+                .get("targetKind")
+                .is_some_and(|value| !matches!(value.as_str(), Some("file" | "directoryTree")))
+            {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "文件写入范围的 targetKind 必须是 file 或 directoryTree。",
+                ));
+            }
             if !matches!(name, "fs.write" | "fs.edit") {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
@@ -3399,10 +3405,10 @@ fn validate_todo_items(value: &Value) -> Result<(), LocalAgentStoreError> {
     let items = value.as_array().ok_or_else(|| {
         LocalAgentStoreError::new("session_event_invalid", "Todo items 必须是数组。")
     })?;
-    if items.is_empty() || items.len() > 12 {
+    if items.is_empty() {
         return Err(LocalAgentStoreError::new(
             "session_event_invalid",
-            "Todo 必须包含一至十二项。",
+            "Todo 必须包含至少一个阶段。",
         ));
     }
     let mut todo_ids = std::collections::HashSet::with_capacity(items.len());
@@ -3775,9 +3781,21 @@ fn validate_provider_turn_output_blocks(
             }
         }
     }
+    let narratives = blocks
+        .iter()
+        .filter(|block| block.get("kind").and_then(Value::as_str) == Some("narrative"))
+        .collect::<Vec<_>>();
+    let commentary_only = !narratives.is_empty()
+        && narratives.iter().all(|block| {
+            block
+                .get("item")
+                .and_then(|item| item.get("phase"))
+                .and_then(Value::as_str)
+                == Some("commentary")
+        });
     if call_ids != expected_call_ids
         || final_message_count > 1
-        || all_call_ids.is_empty() && final_message_count != 1
+        || all_call_ids.is_empty() && final_message_count != 1 && !commentary_only
         || !all_call_ids.is_empty() && final_message_count != 0
     {
         return Err(LocalAgentStoreError::new(
