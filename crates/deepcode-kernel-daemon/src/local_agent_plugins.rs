@@ -39,6 +39,55 @@ struct PublicPluginCatalogItem {
     activation_media_types: Vec<String>,
     enabled: bool,
     available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<PluginCatalogError>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PluginCatalogError {
+    code: &'static str,
+    message: String,
+}
+
+#[derive(Debug, Clone)]
+enum PluginCatalogEntry {
+    Skill(SkillLocator),
+    Loaded(PluginSource),
+    Unavailable(PublicPluginCatalogItem),
+}
+
+#[derive(Debug, Clone)]
+struct SkillLocator {
+    public: PublicPluginCatalogItem,
+    id: String,
+    path: PathBuf,
+}
+
+impl PluginCatalogEntry {
+    fn public(&self) -> &PublicPluginCatalogItem {
+        match self {
+            Self::Skill(locator) => &locator.public,
+            Self::Loaded(source) => &source.public,
+            Self::Unavailable(public) => public,
+        }
+    }
+
+    fn into_public(self) -> PublicPluginCatalogItem {
+        match self {
+            Self::Skill(locator) => match skill_plugin(&locator) {
+                Ok(source) => source.public,
+                Err(message) => PublicPluginCatalogItem {
+                    error: Some(PluginCatalogError {
+                        code: "skill_load_failed",
+                        message,
+                    }),
+                    ..locator.public
+                },
+            },
+            Self::Loaded(source) => source.public,
+            Self::Unavailable(public) => public,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -82,7 +131,7 @@ pub(crate) fn plugin_catalog_projection(settings: &Value) -> Result<Value, Strin
     let (revision, sources) = plugin_catalog(settings)?;
     Ok(json!({
         "revision": revision,
-        "plugins": sources.values().map(|source| &source.public).collect::<Vec<_>>(),
+        "plugins": sources.into_values().map(PluginCatalogEntry::into_public).collect::<Vec<_>>(),
     }))
 }
 
@@ -90,11 +139,12 @@ pub(crate) fn plugin_catalog_projection(settings: &Value) -> Result<Value, Strin
 /// It does not activate an MCP server or a binary plugin while opening the page.
 pub(crate) fn skill_settings_projection(settings: &Value) -> Result<Value, String> {
     let mut skills = crate::local_agent_product_tools::bundled_skill_settings();
-    for source in skill_plugins(settings)? {
+    for entry in skill_catalog_entries(settings)? {
+        let source = entry.into_public();
         skills.push(json!({
-            "id": source.public.uri,
-            "displayName": source.public.display_name,
-            "description": source.public.short_description,
+            "id": source.uri,
+            "displayName": source.display_name,
+            "description": source.short_description,
             "source": "mounted",
         }));
     }
@@ -106,14 +156,22 @@ pub(crate) fn plugin_uri_for_activation_media_type(
     media_type: &str,
 ) -> Result<Option<String>, String> {
     let (_, sources) = plugin_catalog(settings)?;
-    Ok(sources.values().find_map(|source| {
-        source
-            .public
-            .activation_media_types
-            .iter()
-            .any(|candidate| candidate == media_type)
-            .then(|| source.public.uri.clone())
-    }))
+    for entry in sources.into_values() {
+        let source = entry.public();
+        if source.enabled
+            && source
+                .activation_media_types
+                .iter()
+                .any(|candidate| candidate == media_type)
+        {
+            let source = entry.into_public();
+            if let Some(error) = &source.error {
+                return Err(format!("{}: {}", error.code, error.message));
+            }
+            return Ok(Some(source.uri.clone()));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn resolve_plugin_selection(
@@ -124,10 +182,14 @@ pub(crate) fn resolve_plugin_selection(
     if selections.len() > 16 {
         return Err("plugin_selection_invalid: 单次请求最多选择 16 个插件。".to_string());
     }
-    let (revision, sources) = plugin_catalog(settings)?;
-    if !selections.is_empty() && catalog_revision != Some(revision.as_str()) {
-        return Err("plugin_selection_stale: 插件目录已经变化，请刷新后重新选择。".to_string());
+    if selections.is_empty() {
+        return Ok(ResolvedPluginSelection {
+            catalog_revision: "plugin-catalog:empty".into(),
+            plugins: Vec::new(),
+            mcp_plugin_instances: BTreeMap::new(),
+        });
     }
+    let (revision, sources) = plugin_catalog(settings)?;
     let mut selection_ids = BTreeSet::new();
     let mut uris = BTreeSet::new();
     let mut plugins = Vec::new();
@@ -141,23 +203,32 @@ pub(crate) fn resolve_plugin_selection(
         {
             return Err("plugin_selection_invalid: 插件选择字段无效或重复。".to_string());
         }
-        let mut source = sources.get(&selection.uri).cloned().ok_or_else(|| {
+        let entry = sources.get(&selection.uri).cloned().ok_or_else(|| {
             format!(
                 "plugin_selection_unavailable: 显式选择的插件不可用：{}",
                 selection.uri
             )
         })?;
-        if !source.public.available || !source.public.enabled {
-            return Err(format!(
-                "plugin_selection_unavailable: 显式选择的插件不可用：{}",
-                selection.uri
-            ));
-        }
+        let mut source = match entry {
+            PluginCatalogEntry::Skill(locator) => {
+                skill_plugin(&locator).map_err(|message| format!("skill_load_failed: {message}"))?
+            }
+            PluginCatalogEntry::Loaded(source) => source,
+            PluginCatalogEntry::Unavailable(public) => {
+                return Err(match public.error {
+                    Some(error) => format!("{}: {}", error.code, error.message),
+                    None => format!("plugin_selection_disabled: 插件未启用：{}", public.uri),
+                });
+            }
+        };
         source.plugin_instance_ref = new_plugin_instance_ref()?;
         if let PluginContribution::Mcp { plugin_uri } = &source.contribution {
             mcp_plugin_instances.insert(plugin_uri.clone(), source.plugin_instance_ref.clone());
         }
         plugins.push(source);
+    }
+    if catalog_revision != Some(revision.as_str()) {
+        return Err("plugin_selection_stale: 插件目录已经变化，请刷新后重新选择。".to_string());
     }
     plugins.sort_by(|left, right| left.public.uri.cmp(&right.public.uri));
     Ok(ResolvedPluginSelection {
@@ -253,26 +324,32 @@ pub(crate) fn kernel_runtime_generation_key(
     ))
 }
 
-fn plugin_catalog(settings: &Value) -> Result<(String, BTreeMap<String, PluginSource>), String> {
+fn plugin_catalog(
+    settings: &Value,
+) -> Result<(String, BTreeMap<String, PluginCatalogEntry>), String> {
     let mut sources = BTreeMap::new();
-    for source in skill_plugins(settings)? {
+    for source in skill_catalog_entries(settings)? {
         insert_plugin_source(&mut sources, source)?;
     }
     for descriptor in crate::local_agent_mcp::available_plugins(settings)
         .map_err(|error| format!("{}: {}", error.code, error.message))?
     {
-        insert_plugin_source(
-            &mut sources,
-            PluginSource {
-                public: PublicPluginCatalogItem {
-                    uri: descriptor.uri.clone(),
-                    display_name: descriptor.name.clone(),
-                    short_description: descriptor.short_description,
-                    icon_ref: None,
-                    activation_media_types: descriptor.activation_media_types,
-                    enabled: true,
-                    available: true,
-                },
+        let public = PublicPluginCatalogItem {
+            uri: descriptor.uri.clone(),
+            display_name: descriptor.name.clone(),
+            short_description: descriptor.short_description,
+            icon_ref: None,
+            activation_media_types: descriptor.activation_media_types,
+            enabled: descriptor.enabled,
+            available: descriptor.enabled && descriptor.error.is_none(),
+            error: descriptor.error.map(|error| PluginCatalogError {
+                code: error.code,
+                message: error.message,
+            }),
+        };
+        let entry = if public.available {
+            PluginCatalogEntry::Loaded(PluginSource {
+                public,
                 plugin_artifact_ref: descriptor.plugin_artifact_ref,
                 plugin_instance_ref: String::new(),
                 capability_refs: descriptor.capability_refs,
@@ -281,35 +358,57 @@ fn plugin_catalog(settings: &Value) -> Result<(String, BTreeMap<String, PluginSo
                 contribution: PluginContribution::Mcp {
                     plugin_uri: descriptor.uri,
                 },
-            },
-        )?;
+            })
+        } else {
+            PluginCatalogEntry::Unavailable(public)
+        };
+        insert_plugin_source(&mut sources, entry)?;
     }
     if sources.len() > MAX_PLUGINS {
         return Err(format!("Plugin 数量超过首版上限 {MAX_PLUGINS}"));
     }
     let mut activation_owners = BTreeMap::new();
-    for source in sources.values() {
-        for media_type in &source.public.activation_media_types {
-            if let Some(previous) = activation_owners.insert(media_type, &source.public.uri) {
+    for source in sources
+        .values()
+        .map(PluginCatalogEntry::public)
+        .filter(|source| source.enabled)
+    {
+        for media_type in &source.activation_media_types {
+            if let Some(previous) = activation_owners.insert(media_type, &source.uri) {
                 return Err(format!(
                     "Plugin activationMediaTypes 重复：{media_type} 同时属于 {previous} 和 {}",
-                    source.public.uri
+                    source.uri
                 ));
             }
         }
     }
     let identity = sources
         .values()
-        .map(|source| {
-            json!({
-                "public": source.public,
-                "pluginArtifactRef": source.plugin_artifact_ref,
-                "capabilityRefs": source.capability_refs,
-            })
+        .map(|entry| {
+            let public = entry.public();
+            let mut identity = json!({
+                "uri": public.uri,
+                "displayName": public.display_name,
+                "shortDescription": public.short_description,
+                "iconRef": public.icon_ref,
+                "activationMediaTypes": public.activation_media_types,
+                "enabled": public.enabled,
+            });
+            if let PluginCatalogEntry::Loaded(source) = entry {
+                identity["pluginArtifactRef"] = json!(source.plugin_artifact_ref);
+                identity["capabilityRefs"] = json!(source.capability_refs);
+            }
+            identity
         })
         .collect::<Vec<_>>();
-    let encoded = serde_json::to_vec(&identity)
-        .map_err(|error| format!("编码 PluginCatalog revision 失败：{error}"))?;
+    // The directory revision describes locators and configuration. Skill content
+    // belongs to the selected artifact and does not invalidate other selections.
+    let encoded = serde_json::to_vec(&json!({
+        "entries": identity,
+        "skillMounts": settings.get("skills.mounts"),
+        "mcpServers": settings.get("mcp.servers"),
+    }))
+    .map_err(|error| format!("编码 PluginCatalog revision 失败：{error}"))?;
     let revision = format!(
         "plugin-catalog:{}",
         deepcode_kernel_tools::hash_bytes(&encoded)
@@ -318,17 +417,17 @@ fn plugin_catalog(settings: &Value) -> Result<(String, BTreeMap<String, PluginSo
 }
 
 fn insert_plugin_source(
-    sources: &mut BTreeMap<String, PluginSource>,
-    source: PluginSource,
+    sources: &mut BTreeMap<String, PluginCatalogEntry>,
+    source: PluginCatalogEntry,
 ) -> Result<(), String> {
-    let uri = source.public.uri.clone();
+    let uri = source.public().uri.clone();
     if sources.insert(uri.clone(), source).is_some() {
         return Err(format!("Plugin URI 重复：{uri}"));
     }
     Ok(())
 }
 
-fn skill_plugins(settings: &Value) -> Result<Vec<PluginSource>, String> {
+fn skill_catalog_entries(settings: &Value) -> Result<Vec<PluginCatalogEntry>, String> {
     let encoded = settings
         .get("skills.mounts")
         .and_then(Value::as_str)
@@ -336,40 +435,76 @@ fn skill_plugins(settings: &Value) -> Result<Vec<PluginSource>, String> {
     let mounts: Vec<SkillMountSetting> = serde_json::from_str(encoded)
         .map_err(|error| format!("解析 skills.mounts 失败：{error}"))?;
     let mut files = BTreeMap::new();
-    for mount in mounts
-        .into_iter()
-        .filter(|mount| mount.enabled && !mount.path.trim().is_empty())
-    {
-        let activation_media_types =
-            normalize_activation_media_types(&mount.activation_media_types)?;
-        let root = fs::canonicalize(mount.path.trim())
-            .map_err(|error| format!("Skill 挂载 {} 不可用：{error}", mount.path))?;
-        let mut mounted_files = Vec::new();
-        collect_skill_files(&root, 0, &mut mounted_files)?;
-        for path in mounted_files {
-            files
-                .entry(path)
-                .or_insert_with(|| (mount.id.clone(), activation_media_types.clone()));
+    let mut entries = Vec::new();
+    for mount in mounts {
+        let mut public = PublicPluginCatalogItem {
+            uri: format!("plugin://{}@skill-mount", plugin_slug(&mount.id)),
+            display_name: format!("Skill 挂载：{}", mount.id),
+            short_description: format!("Skill mount {}", mount.path),
+            icon_ref: None,
+            activation_media_types: Vec::new(),
+            enabled: mount.enabled,
+            available: false,
+            error: None,
+        };
+        if !mount.enabled {
+            entries.push(PluginCatalogEntry::Unavailable(public));
+            continue;
         }
-        if files.len() > MAX_PLUGINS {
+        let loaded = (|| {
+            public.activation_media_types =
+                normalize_activation_media_types(&mount.activation_media_types)?;
+            if mount.path.trim().is_empty() {
+                return Err(format!("Skill 挂载 {} 的路径不能为空。", mount.id));
+            }
+            let root = fs::canonicalize(mount.path.trim())
+                .map_err(|error| format!("Skill 挂载 {} 不可用：{error}", mount.path))?;
+            let mut mounted_files = Vec::new();
+            collect_skill_files(&root, 0, &mut mounted_files)?;
+            Ok(mounted_files)
+        })();
+        match loaded {
+            Ok(mounted_files) => {
+                for path in mounted_files {
+                    files.entry(path).or_insert_with(|| {
+                        (mount.id.clone(), public.activation_media_types.clone())
+                    });
+                }
+            }
+            Err(message) => {
+                public.error = Some(PluginCatalogError {
+                    code: "skill_mount_unavailable",
+                    message,
+                });
+                entries.push(PluginCatalogEntry::Unavailable(public));
+            }
+        }
+        if files.len() + entries.len() > MAX_PLUGINS {
             return Err(format!("Skill 数量超过首版上限 {MAX_PLUGINS}"));
         }
     }
-    files
-        .into_iter()
-        .enumerate()
-        .map(|(index, (path, (mount_id, activation_media_types)))| {
-            skill_plugin(&mount_id, &path, index, activation_media_types)
-        })
-        .collect()
+    for (index, (path, (mount_id, activation_media_types))) in files.into_iter().enumerate() {
+        let id = skill_id(&mount_id, &path, index);
+        entries.push(PluginCatalogEntry::Skill(SkillLocator {
+            public: PublicPluginCatalogItem {
+                uri: format!("plugin://{}@skill", plugin_slug(&id)),
+                display_name: skill_display_name(&path, ""),
+                short_description: format!("Skill file {}", path.display()),
+                icon_ref: None,
+                activation_media_types,
+                enabled: true,
+                available: false,
+                error: None,
+            },
+            id,
+            path,
+        }));
+    }
+    Ok(entries)
 }
 
-fn skill_plugin(
-    mount_id: &str,
-    path: &Path,
-    index: usize,
-    activation_media_types: Vec<String>,
-) -> Result<PluginSource, String> {
+fn skill_plugin(locator: &SkillLocator) -> Result<PluginSource, String> {
+    let path = &locator.path;
     let metadata = fs::metadata(path)
         .map_err(|error| format!("读取 Skill 元数据 {} 失败：{error}", path.display()))?;
     if metadata.len() > MAX_SKILL_BYTES {
@@ -380,8 +515,6 @@ fn skill_plugin(
     if instructions.trim().is_empty() {
         return Err(format!("Skill 文件 {} 不能为空", path.display()));
     }
-    let id = skill_id(mount_id, path, index);
-    let uri = format!("plugin://{}@skill", plugin_slug(&id));
     let display_name = skill_display_name(path, &instructions);
     let short_description = skill_short_description(&instructions, &display_name);
     path.to_str()
@@ -392,17 +525,14 @@ fn skill_plugin(
     );
     Ok(PluginSource {
         public: PublicPluginCatalogItem {
-            uri,
             display_name,
             short_description,
-            icon_ref: None,
-            activation_media_types,
-            enabled: true,
             available: true,
+            ..locator.public.clone()
         },
         plugin_artifact_ref,
         plugin_instance_ref: String::new(),
-        capability_refs: vec![format!("skill:{id}")],
+        capability_refs: vec![format!("skill:{}", locator.id)],
         capability_summary: truncate_utf8(&instructions, MAX_DYNAMIC_PLUGIN_BYTES),
         tool_prompt_provider: None,
         contribution: PluginContribution::Skill,
@@ -566,4 +696,143 @@ fn new_plugin_instance_ref() -> Result<String, String> {
 
 const fn enabled_by_default() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_selection_does_not_load_the_plugin_catalog() {
+        let selected = resolve_plugin_selection(
+            &json!({"skills.mounts":"not JSON", "mcp.servers":"not JSON"}),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(selected.plugins.is_empty());
+        assert!(selected.mcp_plugin_instances.is_empty());
+        assert!(selected.extension_tool_prompt_providers().is_empty());
+    }
+
+    #[test]
+    fn unavailable_plugins_preserve_their_errors_without_blocking_selected_skills() {
+        struct TestDirectory(PathBuf);
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = std::env::temp_dir().join(new_plugin_instance_ref().unwrap().replace(':', "-"));
+        fs::create_dir(&root).unwrap();
+        let directory = TestDirectory(root);
+        fs::create_dir(directory.0.join("good")).unwrap();
+        fs::create_dir(directory.0.join("bad")).unwrap();
+        fs::write(
+            directory.0.join("good/SKILL.md"),
+            "# Good Skill\nRead the selected document.",
+        )
+        .unwrap();
+        let unreadable = directory.0.join("bad/SKILL.md");
+        fs::write(&unreadable, [0xff]).unwrap();
+        let original_error = fs::read_to_string(&unreadable).unwrap_err().to_string();
+        let settings = json!({
+            "skills.mounts": serde_json::to_string(&json!([
+                {"id":"fixtures", "path":directory.0, "enabled":true},
+                {"id":"missing", "path":directory.0.join("missing"), "enabled":true},
+                {"id":"disabled", "path":directory.0.join("disabled"), "enabled":false}
+            ])).unwrap(),
+            "mcp.servers": serde_json::to_string(&json!([
+                {"id":"broken", "name":"Broken MCP", "command":"", "enabled":true}
+            ])).unwrap(),
+        });
+        let catalog = plugin_catalog_projection(&settings).unwrap();
+        let plugins = catalog["plugins"].as_array().unwrap();
+        let good = plugins
+            .iter()
+            .find(|plugin| plugin["displayName"] == "Good Skill")
+            .unwrap();
+        assert_eq!(good["available"], true);
+        let selection = |plugin: &Value| PluginSelectionInput {
+            selection_id: "selection:test".into(),
+            uri: plugin["uri"].as_str().unwrap().into(),
+            label: plugin["displayName"].as_str().unwrap().into(),
+        };
+        let selected =
+            resolve_plugin_selection(&settings, catalog["revision"].as_str(), &[selection(good)])
+                .unwrap();
+        assert_eq!(selected.plugins.len(), 1);
+        assert_eq!(selected.plugins[0].public.uri, good["uri"]);
+
+        let bad = plugins
+            .iter()
+            .find(|plugin| plugin["error"]["code"] == "skill_load_failed")
+            .unwrap();
+        assert_eq!(bad["available"], false);
+        assert!(bad["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&original_error));
+        let rejected =
+            resolve_plugin_selection(&settings, catalog["revision"].as_str(), &[selection(bad)])
+                .unwrap_err();
+        assert!(rejected.contains(&original_error));
+
+        fs::write(&unreadable, "# Repaired Skill\nAn unrelated skill changed.").unwrap();
+        let changed_catalog = plugin_catalog_projection(&settings).unwrap();
+        assert_eq!(changed_catalog["revision"], catalog["revision"]);
+        let selected_after_unrelated_change =
+            resolve_plugin_selection(&settings, catalog["revision"].as_str(), &[selection(good)])
+                .unwrap();
+        assert_eq!(
+            selected_after_unrelated_change.plugins[0].plugin_artifact_ref,
+            selected.plugins[0].plugin_artifact_ref
+        );
+
+        fs::write(
+            directory.0.join("good/SKILL.md"),
+            "# Good Skill\nRead the newly selected document.",
+        )
+        .unwrap();
+        let selected_after_content_change =
+            resolve_plugin_selection(&settings, catalog["revision"].as_str(), &[selection(good)])
+                .unwrap();
+        assert_ne!(
+            selected_after_content_change.plugins[0].plugin_artifact_ref,
+            selected.plugins[0].plugin_artifact_ref
+        );
+        assert_eq!(
+            selected_after_content_change.plugins[0].capability_summary,
+            "# Good Skill\nRead the newly selected document."
+        );
+        assert!(plugins
+            .iter()
+            .any(|plugin| plugin["error"]["code"] == "skill_mount_unavailable"));
+        let disabled = plugins
+            .iter()
+            .find(|plugin| plugin["enabled"] == false)
+            .unwrap();
+        assert_eq!(disabled["available"], false);
+        assert!(disabled.get("error").is_none());
+        assert!(resolve_plugin_selection(
+            &settings,
+            catalog["revision"].as_str(),
+            &[selection(disabled)]
+        )
+        .unwrap_err()
+        .starts_with("plugin_selection_disabled:"));
+
+        let broken_mcp = plugins
+            .iter()
+            .find(|plugin| plugin["uri"] == "plugin://broken@mcp")
+            .unwrap();
+        assert_eq!(broken_mcp["available"], false);
+        assert_eq!(broken_mcp["error"]["code"], "mcp_server_command_missing");
+        let selected_mcp =
+            BTreeMap::from([("plugin://broken@mcp".into(), "plugin-instance:test".into())]);
+        match crate::local_agent_mcp::McpRuntime::from_selected_settings(&settings, &selected_mcp) {
+            Err(error) => assert_eq!(error.code, "mcp_server_command_missing"),
+            Ok(_) => panic!("selected invalid MCP server must fail before process startup"),
+        }
+    }
 }

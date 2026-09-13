@@ -36,13 +36,6 @@ pub struct ToolDescriptor {
     pub availability: ToolAvailability,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Platform {
-    Linux,
-    Macos,
-    Windows,
-}
-
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ToolValidationError {
     #[error("{field} must not be empty")]
