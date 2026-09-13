@@ -553,10 +553,9 @@ refresh_gui_dists_with_docker() {
   command -v docker >/dev/null 2>&1 || fail "Docker is required to build the frontend product set."
   local image
   image="$(make --no-print-directory -s -C "$ROOT_DIR" _print_image)"
-  make -C "$ROOT_DIR" _ensure_image
   local workspace_source="" container_status container_image current_image stages checkout_id node_modules_volume
   stages="$(requested_gui_stages)"
-  current_image="$(docker image inspect --format '{{.Id}}' "$image")"
+  current_image="$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null || true)"
   container_status="$(docker container inspect --format '{{.State.Status}}' deepcode-dev 2>/dev/null || true)"
   container_image="$(docker container inspect --format '{{.Image}}' deepcode-dev 2>/dev/null || true)"
   workspace_source="$(
@@ -565,10 +564,13 @@ refresh_gui_dists_with_docker() {
       deepcode-dev 2>/dev/null || true
   )"
   if [ "$container_status" = "running" ] \
+    && [ -n "$current_image" ] \
     && [ "$container_image" = "$current_image" ] \
     && [ -n "$workspace_source" ] \
     && [ "$(cd "$workspace_source" 2>/dev/null && pwd -P)" = "$ROOT_DIR" ]; then
-    log "ensure frontend product set in deepcode-dev: $stages"
+    # make shell prepares the development image. Reuse that environment without
+    # resolving Docker registry metadata again; still rebuild current source.
+    log "reuse deepcode-dev; rebuild frontend product set from current source: $stages"
     docker exec \
       -e PNPM_STORE_DIR=/root/.local/share/pnpm/store \
       deepcode-dev \
@@ -581,6 +583,7 @@ refresh_gui_dists_with_docker() {
   else
     log "ensure active-checkout frontends in one isolated container"
   fi
+  make -C "$ROOT_DIR" _ensure_image
   checkout_id="$(basename "$ROOT_DIR" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_.-' '-')"
   checkout_id="${checkout_id#-}"
   checkout_id="${checkout_id%-}"

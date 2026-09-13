@@ -133,6 +133,21 @@ pub(crate) async fn conversation_statuses_get(State(state): State<AppState>) -> 
     }
 }
 
+pub(crate) async fn conversation_skill_settings_get(
+    State(state): State<AppState>,
+) -> Json<ApiResponse> {
+    let settings = state
+        .gui
+        .lock()
+        .expect("gui state lock")
+        .user_settings
+        .clone();
+    match crate::local_agent_plugins::skill_settings_projection(&settings) {
+        Ok(projection) => ApiResponse::ok(projection),
+        Err(error) => ApiResponse::error("skill_catalog_unavailable", error),
+    }
+}
+
 pub(crate) async fn conversation_plugin_catalog_get(
     State(state): State<AppState>,
 ) -> Json<ApiResponse> {

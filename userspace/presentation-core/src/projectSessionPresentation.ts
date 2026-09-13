@@ -93,7 +93,7 @@ function planBlock(plan: PlanProjection): PresentationBlock {
         region: 'timeline' as const,
         entries: plan.mutationManifest.map((operation) => ({
           key: `${operation.workspaceId}:${operation.operation}`,
-          value: operation.operation === 'bash'
+          value: 'workspaceMode' in operation
             ? `${operation.executionScope}/${operation.workspaceMode}${operation.writablePaths ? ` · ${operation.writablePaths.map((target) => target.path + (target.kind === 'directory' ? '/' : '')).join(', ')}` : ''}${operation.command ? ` · ${operation.command}` : ''}`
             : operation.target,
         })),
@@ -146,6 +146,18 @@ function activityBlock(activity: ActivityProjection): PresentationBlock {
       } : {}),
     },
   ];
+  if (activity.startedAt) children.push({ kind: 'keyValue',
+    blockId: `activity:${activity.activityId}:started`, source: identity, region: 'timeline',
+    entries: [{ key: 'startedAt', value: activity.startedAt }],
+  });
+  if (activity.liveOutput) {
+    for (const stream of ['stdout', 'stderr'] as const) {
+      if (activity.liveOutput[stream]) children.push({ kind: 'code',
+        blockId: `activity:${activity.activityId}:live:${stream}`, source: identity, region: 'timeline',
+        label: stream, code: activity.liveOutput[stream],
+      });
+    }
+  }
   if (activity.tool) {
     children.push({
       kind: 'keyValue',

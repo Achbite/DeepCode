@@ -1232,6 +1232,7 @@ mod tests {
                     private_resolved_targets: Vec::new(),
                     workspace_write_targets: None,
                     cancellation: KernelCancellationToken::default(),
+                    progress: Default::default(),
                 },
             )
             .expect("call tool");
@@ -1300,6 +1301,7 @@ mod tests {
             private_resolved_targets: Vec::new(),
             workspace_write_targets: None,
             cancellation,
+            progress: Default::default(),
         };
 
         let error = tool

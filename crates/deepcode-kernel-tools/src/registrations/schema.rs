@@ -87,6 +87,11 @@ pub(super) fn provider_schema_for_tool(tool: KernelToolKind) -> Value {
             },
             "additionalProperties": false
         }),
+        KernelToolKind::ProcessPowerShell => {
+            let mut schema = provider_schema_for_tool(KernelToolKind::ProcessShell);
+            schema["properties"]["command"]["description"] = serde_json::json!("PowerShell script with newlines. Use literal single-quoted strings or here-strings. Native programs expose $LASTEXITCODE; preserve it explicitly when later commands print diagnostics. PowerShell 5.1 does not support && or ||.");
+            schema
+        }
         KernelToolKind::ProcessShell => serde_json::json!({
             "type": "object",
             "required": ["command"],

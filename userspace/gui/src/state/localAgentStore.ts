@@ -983,7 +983,12 @@ function shouldApplyProjection(
 ): boolean {
   if (!current || incoming.revision > current.revision) return true;
   if (incoming.revision < current.revision) return false;
-  return !sameAssistantDraft(current.assistantDraft, incoming.assistantDraft);
+  return !sameAssistantDraft(current.assistantDraft, incoming.assistantDraft)
+    || current.activities.some((activity, index) => {
+      const next = incoming.activities[index];
+      return activity.activityId !== next?.activityId
+        || JSON.stringify(activity.liveOutput) !== JSON.stringify(next.liveOutput);
+    });
 }
 
 function sameAssistantDraft(

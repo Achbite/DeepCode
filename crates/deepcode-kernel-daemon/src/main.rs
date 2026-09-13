@@ -5,9 +5,11 @@ mod conversation_api;
 mod conversation_catalog;
 mod host_connection;
 mod host_inspection;
+mod host_lifecycle;
 mod host_services;
 mod host_shutdown;
 mod kernel_api;
+mod kernel_tool_worker;
 mod llm_provider_transport;
 mod llm_stream_parser;
 mod llm_transport;
@@ -40,6 +42,7 @@ pub(crate) use browser_api::*;
 pub(crate) use config_root_lease::*;
 pub(crate) use conversation_api::*;
 pub(crate) use host_connection::*;
+pub(crate) use host_lifecycle::*;
 pub(crate) use host_services::*;
 pub(crate) use host_shutdown::*;
 pub(crate) use kernel_api::*;
@@ -56,6 +59,31 @@ pub(crate) use workspace_api::*;
 
 #[tokio::main]
 async fn main() {
+    #[cfg(windows)]
+    if let Some(result) = deepcode_kernel_runtime::workspace_sandbox::windows::entrypoint() {
+        match result {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if std::env::args().nth(1).as_deref() == Some("--workspace-sandbox-status") {
+        println!(
+            "{}",
+            serde_json::to_string(&deepcode_kernel_runtime::workspace_sandbox::probe())
+                .expect("Sandbox status")
+        );
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("--kernel-tool-worker") {
+        if let Err(error) = kernel_tool_worker::run() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let host = std::env::var("DEEPCODE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = std::env::var("DEEPCODE_PORT")
         .ok()
@@ -107,7 +135,9 @@ async fn main() {
         host_services: HostServices::new(),
         terminal_runtime: Arc::new(Mutex::new(TerminalRuntime::new())),
     };
+    configure_host_lifetime().expect("初始化 Host 生命周期");
     let app = routes::build_app(state.clone());
+    let lifetime_monitor = tokio::spawn(monitor_host_lifetime(state.clone()));
     // Host bootstrap publishes transport credentials while the config-root lease
     // is held. Shells attach to this instance; they never copy Session state.
     let _connection_publication = deepcode_host_connection::LocalHostConnection::new(
@@ -120,6 +150,7 @@ async fn main() {
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(wait_for_host_shutdown())
         .await;
+    lifetime_monitor.abort();
     let cleanup_complete = shutdown_owned_host_resources(&state).await;
     assert!(cleanup_complete, "DeepCode 本地资源未完整回收");
     if let Err(error) = result {

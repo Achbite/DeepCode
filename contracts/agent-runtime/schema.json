@@ -1758,7 +1758,7 @@
             "interaction.resolved", "plan.published", "plan.confirmed", "plan.revision.requested",
             "plan.superseded", "plan.cancelled", "plan.completed", "plan.invalidated",
             "todo.seeded", "todo.reconciled", "todo.progressed",
-            "tool.requested", "approval.requested", "approval.resolved", "tool.completed",
+            "tool.requested", "tool.started", "approval.requested", "approval.resolved", "tool.completed",
             "session.control.rejected",
             "context.compaction.requested", "context.compacted",
             "context.composed", "provider.turn.settled", "context.updated", "run.waiting",
@@ -1777,7 +1777,7 @@
                   "interaction.requested", "interaction.resolved", "plan.published", "plan.confirmed",
                   "plan.revision.requested", "plan.superseded", "plan.cancelled", "plan.completed",
                   "plan.invalidated", "todo.seeded", "todo.reconciled", "todo.progressed",
-                  "tool.requested", "approval.requested", "approval.resolved", "tool.completed",
+                  "tool.requested", "tool.started", "approval.requested", "approval.resolved", "tool.completed",
                   "session.control.rejected", "context.compaction.requested", "context.compacted",
                   "context.composed", "provider.turn.settled", "context.updated", "run.waiting",
                   "run.finishing", "run.runtime.released", "run.runtime.release_failed", "run.settled"
@@ -1826,7 +1826,7 @@
               "type": {
                 "enum": [
                   "interaction.requested", "plan.published", "plan.confirmed", "plan.revision.requested", "plan.cancelled",
-                  "tool.requested", "approval.requested", "approval.resolved", "tool.completed",
+                  "tool.requested", "tool.started", "approval.requested", "approval.resolved", "tool.completed",
                   "session.control.rejected"
                 ]
               }
@@ -1851,6 +1851,14 @@
         {
           "if": { "properties": { "type": { "const": "interaction.requested" } } },
           "then": { "properties": { "payload": { "$ref": "#/$defs/InteractionRequestedPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "tool.started" } } },
+          "then": { "properties": { "payload": {
+            "type": "object", "additionalProperties": false,
+            "required": ["attemptId", "startedAt"],
+            "properties": { "attemptId": { "$ref": "#/$defs/Id" }, "startedAt": { "type": "string", "pattern": "^[0-9]+$" } }
+          } } }
         },
         {
           "if": { "properties": { "type": { "const": "run.started" } } },

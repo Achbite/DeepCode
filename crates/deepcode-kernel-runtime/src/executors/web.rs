@@ -640,6 +640,7 @@ mod tests {
             private_resolved_targets: vec![],
             workspace_write_targets: None,
             cancellation: KernelCancellationToken::default(),
+            progress: Default::default(),
         }
     }
 
@@ -763,6 +764,7 @@ mod tests {
                 private_resolved_targets: vec![],
                 workspace_write_targets: None,
                 cancellation: KernelCancellationToken::default(),
+                progress: Default::default(),
             },
         )
         .expect_err("web.fetch must retain HTTP URL validation");

@@ -35,7 +35,7 @@ pub fn canonicalize_invocation(
             materialize("maxLines", json!(2_000));
             materialize("maxBytes", json!(262_144));
         }
-        Tool::ProcessShell => {
+        Tool::ProcessShell | Tool::ProcessPowerShell => {
             materialize("timeout", json!(120));
             materialize("workspaceMode", json!("read"));
             materialize("executionScope", json!("workspace"));
@@ -114,7 +114,7 @@ fn adapt_public_arguments(
         Tool::FsEdit => {
             ensure_allowed_fields(fields, &["path", "edits"], tool_id)?;
         }
-        Tool::ProcessShell => {
+        Tool::ProcessShell | Tool::ProcessPowerShell => {
             ensure_allowed_fields(
                 fields,
                 &[

@@ -7,9 +7,20 @@ export function environmentInstruction(value: unknown): RunRuntimeSnapshot['inst
     throw new Error('session_environment_invalid');
   }
   const data = value as Record<string, unknown>;
-  const fields = ['os', 'arch', 'locale', 'responseLanguage', 'userShell'];
-  if (Object.keys(data).length !== fields.length
-    || Object.keys(data).some((key) => !fields.includes(key))
+  if (data.executionTarget !== undefined) {
+    const shell = data.shell as Record<string, unknown> | null;
+    const target = data.executionTarget as Record<string, unknown> | null;
+    if (!target || !['native', 'wsl'].includes(String(target.kind))
+      || (target.kind === 'wsl' && ['distribution', 'worker'].some((key) => typeof target[key] !== 'string' || !target[key]))
+      || !shell || !['bash', 'powershell'].includes(String(shell.tool))
+      || typeof shell.executable !== 'string' || typeof shell.dialect !== 'string'
+      || typeof data.shellAvailable !== 'boolean' || typeof data.workspaceShellSupported !== 'boolean'
+      || !Array.isArray(data.developerCommands) || !data.developerCommands.every((item) => typeof item === 'string')) {
+      throw new Error('session_environment_invalid');
+    }
+  }
+  const fields = ['os', 'arch', 'locale', 'responseLanguage', 'userShell', 'configuration', 'executionTarget', 'shellAvailable', 'shell', 'developerCommands', 'workspaceShellSupported', 'workspaceSandbox'];
+  if (Object.keys(data).some((key) => !fields.includes(key))
     || ['os', 'arch'].some((key) => typeof data[key] !== 'string' || !data[key])
     || ['locale', 'responseLanguage', 'userShell'].some((key) => data[key] !== null && typeof data[key] !== 'string')) {
     throw new Error('session_environment_invalid');
@@ -21,7 +32,8 @@ export function environmentInstruction(value: unknown): RunRuntimeSnapshot['inst
       arch: data.arch,
       locale: data.locale,
       userShell: data.userShell,
-    })}\nDefault language for user-facing responses: ${data.responseLanguage ?? 'not specified'}.`,
+      ...(data.executionTarget ? { executionTarget: data.executionTarget, shell: data.shell, shellAvailable: data.shellAvailable, developerCommands: data.developerCommands, workspaceShellSupported: data.workspaceShellSupported, ...(data.workspaceSandbox ? { workspaceSandbox: data.workspaceSandbox } : {}) } : {}),
+    })}\nDefault language for user-facing responses: ${data.responseLanguage ?? 'not specified'}. Installed commands do not imply service readiness or permission.`,
   };
 }
 
@@ -30,6 +42,7 @@ export function retainSessionEnvironment(
   runtime: RunRuntimeSnapshot,
   events: readonly SessionEvent[],
 ): RunRuntimeSnapshot {
+  if (runtime.environment) return runtime;
   for (const event of events) {
     if (event.type !== 'run.started') continue;
     const saved = event.payload.runtimeSnapshot.instructions.find((item) => item.id === ENVIRONMENT_ID);
@@ -44,4 +57,14 @@ export function retainSessionEnvironment(
     }
   }
   return runtime;
+}
+
+export function savedSessionEnvironment(events: readonly SessionEvent[]): RunRuntimeSnapshot['environment'] {
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index];
+    if (event?.type === 'run.started' && event.payload.runtimeSnapshot.environment) {
+      return event.payload.runtimeSnapshot.environment;
+    }
+  }
+  return undefined;
 }

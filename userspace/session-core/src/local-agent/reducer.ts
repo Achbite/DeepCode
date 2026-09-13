@@ -633,6 +633,12 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         sequence: event.sequence,
       };
       break;
+    case 'tool.started': {
+      const activity = next.activities[toolActivityId(event.callId)];
+      if (!activity || activity.status !== 'requested') throw new Error('tool_started_without_request');
+      next.activities[activity.activityId] = { ...activity, status: 'active', startedAt: event.payload.startedAt };
+      break;
+    }
     case 'approval.requested':
       next.pendingApproval = {
         approvalId: event.payload.approvalId,
@@ -690,7 +696,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     case 'tool.interrupted':
       if (!next.runRuntimeReleases[event.runId]
-        || next.activities[toolActivityId(event.callId)]?.status !== 'requested') {
+        || !['requested', 'active'].includes(next.activities[toolActivityId(event.callId)]?.status ?? '')) {
         throw new Error('tool_interruption_state_invalid');
       }
       settleActivity(next, toolActivityId(event.callId), 'indeterminate');
@@ -1205,6 +1211,7 @@ function cloneRunRuntimeSnapshot(snapshot: RunRuntimeSnapshot): RunRuntimeSnapsh
   }));
   return {
     ...snapshot,
+    ...(snapshot.environment ? { environment: structuredClone(snapshot.environment) } : {}),
     provider: { ...snapshot.provider },
     webSearch: { ...snapshot.webSearch },
     instructions: snapshot.instructions.map((instruction) => ({ ...instruction })),
@@ -1886,7 +1893,7 @@ function projectToolActivity(record: ToolExecutionRecord): NonNullable<ActivityP
       }
       return { kind: 'logicalTarget' as const, label: target };
     }),
-    ...(record.toolName === 'bash' ? { shell: projectShellActivity(record) } : {}),
+    ...(['bash', 'powershell'].includes(record.toolName) ? { shell: projectShellActivity(record) } : {}),
     ...projectFileChanges(record),
   };
 }
@@ -1917,7 +1924,18 @@ function projectShellActivity(
     : record.outcome === 'failed'
       ? record.output
       : undefined;
-  if (output === undefined) return { command, cwd, executionScope, terminal };
+  // Kernel failures before a process result exists carry diagnostics (or null),
+  // not stdout/exit status. Keep the failed record intact without inventing a
+  // process result. Executed commands, including nonzero exits, still validate
+  // and project their complete output below.
+  if (record.outcome === 'failed' && (
+    output == null
+    || isRecord(output)
+      && typeof output.stage === 'string'
+      && Object.hasOwn(output, 'details')
+      && Object.keys(output).every((key) => key === 'stage' || key === 'details')
+  )) return { command, cwd, executionScope, terminal };
+  if (output === undefined && record.outcome !== 'completed') return { command, cwd, executionScope, terminal };
   if (!isRecord(output)) throw new Error('bash_projection_output_invalid');
   const {
     command: outputCommand,

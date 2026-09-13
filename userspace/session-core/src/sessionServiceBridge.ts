@@ -33,7 +33,7 @@ const MAX_REQUEST_BYTES = 1024 * 1024;
 type BridgeRequest = {
   protocolVersion: typeof LOCAL_AGENT_PROTOCOL_VERSION;
   requestId: string;
-  operation: 'health' | 'createSession' | 'deleteSession' | 'submit' | 'snapshot' | 'statuses' | 'contextComposition' | 'read' | 'shutdown';
+  operation: 'health' | 'activity' | 'createSession' | 'deleteSession' | 'submit' | 'snapshot' | 'statuses' | 'contextComposition' | 'read' | 'shutdown';
   data: Record<string, unknown>;
 };
 
@@ -124,6 +124,8 @@ async function dispatch(
   request: BridgeRequest,
 ): Promise<unknown> {
   switch (request.operation) {
+    case 'activity':
+      return await service.activity();
     case 'health':
       return { state: 'ready' };
     case 'createSession':
@@ -410,7 +412,7 @@ function decodeRequest(encoded: string): BridgeRequest {
     || value.protocolVersion !== LOCAL_AGENT_PROTOCOL_VERSION
     || typeof value.requestId !== 'string'
     || !value.requestId
-    || !['health', 'createSession', 'deleteSession', 'submit', 'snapshot', 'statuses', 'contextComposition', 'read', 'shutdown'].includes(String(value.operation))
+    || !['health', 'activity', 'createSession', 'deleteSession', 'submit', 'snapshot', 'statuses', 'contextComposition', 'read', 'shutdown'].includes(String(value.operation))
     || !isRecord(value.data)
   ) {
     throw new Error('session_service_request_invalid');

@@ -33,6 +33,8 @@ pub enum KernelToolKind {
     FsWrite,
     #[serde(rename = "bash")]
     ProcessShell,
+    #[serde(rename = "powershell")]
+    ProcessPowerShell,
     #[serde(rename = "web.fetch")]
     WebFetch,
     #[serde(rename = "web.search")]
@@ -47,6 +49,7 @@ impl KernelToolKind {
             Self::FsRead => "fs.read",
             Self::FsWrite => "fs.write",
             Self::ProcessShell => "bash",
+            Self::ProcessPowerShell => "powershell",
             Self::WebFetch => "web.fetch",
             Self::WebSearch => "web.search",
         }
@@ -131,6 +134,14 @@ pub enum KernelCanonicalInvocation {
         timeout: u32,
         terminal: Option<KernelTerminalInput>,
     },
+    #[serde(rename = "powershell")]
+    ProcessPowerShell {
+        command: String,
+        workspace_mode: KernelWorkspaceMode,
+        execution_scope: KernelExecutionScope,
+        timeout: u32,
+        terminal: Option<KernelTerminalInput>,
+    },
     #[serde(rename = "web.search")]
     WebSearch { query: String, limit: u32 },
     #[serde(rename = "web.fetch")]
@@ -145,6 +156,7 @@ impl KernelCanonicalInvocation {
             Self::FsEdit { .. } => KernelToolKind::FsEdit,
             Self::FsDelete(_) => KernelToolKind::FsDelete,
             Self::ProcessShell { .. } => KernelToolKind::ProcessShell,
+            Self::ProcessPowerShell { .. } => KernelToolKind::ProcessPowerShell,
             Self::WebSearch { .. } => KernelToolKind::WebSearch,
             Self::WebFetch { .. } => KernelToolKind::WebFetch,
         }
@@ -199,6 +211,13 @@ impl KernelCanonicalInvocation {
                 }
             },
             Self::ProcessShell {
+                command,
+                workspace_mode: _,
+                execution_scope: _,
+                timeout,
+                terminal,
+            }
+            | Self::ProcessPowerShell {
                 command,
                 workspace_mode: _,
                 execution_scope: _,
@@ -273,6 +292,13 @@ impl KernelCanonicalInvocation {
                 "targetKind": "directoryTree",
             }),
             Self::ProcessShell {
+                command,
+                workspace_mode,
+                execution_scope,
+                timeout,
+                terminal,
+            }
+            | Self::ProcessPowerShell {
                 command,
                 workspace_mode,
                 execution_scope,

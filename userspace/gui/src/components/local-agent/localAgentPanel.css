@@ -707,10 +707,6 @@
 .local-agent__tool-group-items {
   display: grid;
   padding: 0 0 3px 18px;
-  max-height: min(360px, 45vh);
-  overflow-y: auto;
-  scrollbar-width: thin;
-  overscroll-behavior: contain;
 }
 
 .local-agent__tool-entry {
@@ -881,6 +877,7 @@
   max-height: 220px;
   margin: 0;
   overflow: auto;
+  overscroll-behavior-y: auto;
   padding: 7px 8px;
   border: 1px solid var(--dc-border);
   border-radius: 6px;

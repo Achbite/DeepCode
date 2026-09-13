@@ -33,7 +33,7 @@ LONG_INPUT = "  原始任务约束与资料🙂\n" * 4000
 PDF_CONTENT = "DEEPCODE_FIRST_PARTY_PDF_BINDING_OK"
 CORE_TOOL_NAMES = [
     "fs.read", "fs.write", "fs.edit", "fs.delete",
-    "bash", "web.search", "web.fetch", "session.read", "skill.read",
+    "bash", "web.search", "web.fetch", "session.read", "skill.read", "doc.read",
 ]
 FIRST_PARTY_TOOL_OWNERS = {
     "github.search": "plugin://github@first-party",
@@ -309,7 +309,7 @@ class ProviderState:
         require(
             [tool["canonicalName"] for tool in receipt_tools if tool.get("origin") == "coreBuiltin"]
             == CORE_TOOL_NAMES,
-            "Provider 基础九工具没有保持精确集合与顺序",
+            "Provider 基础工具没有保持精确集合与顺序",
         )
         return tools_by_name
 

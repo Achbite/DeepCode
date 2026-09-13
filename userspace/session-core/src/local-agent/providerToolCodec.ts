@@ -21,10 +21,12 @@ export const CORE_TOOL_ORDER = [
   'fs.edit',
   'fs.delete',
   'bash',
+  'powershell',
   'web.search',
   'web.fetch',
   'session.read',
   'skill.read',
+  'doc.read',
 ] as const;
 
 export interface ProviderToolCodec {

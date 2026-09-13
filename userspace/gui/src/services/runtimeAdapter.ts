@@ -41,6 +41,48 @@ function tauriInvoke(): TauriCoreApi['invoke'] | null {
   return window.__TAURI__?.core?.invoke ?? null;
 }
 
+export interface NativePathOptions {
+  kind: 'file' | 'directory' | 'path';
+  title: string;
+  selectLabel?: string;
+  cancelLabel?: string;
+  defaultPath?: string;
+  filters?: { name: string; extensions: string[] }[];
+}
+
+export function hasNativePathPicker(): boolean {
+  return typeof window !== 'undefined' && tauriInvoke() !== null;
+}
+
+export interface NativePathSelection {
+  path: string;
+  kind: 'file' | 'directory';
+}
+
+export async function pickNativePath(options: NativePathOptions): Promise<NativePathSelection | null> {
+  if (!hasNativePathPicker()) throw new Error('native_path_picker_unavailable');
+  if (options.kind === 'path') {
+    return tauriInvoke()!<NativePathSelection | null>('deepcode_pick_path', { options: {
+      title: options.title,
+      selectLabel: options.selectLabel ?? 'Select',
+      cancelLabel: options.cancelLabel ?? 'Cancel',
+      defaultPath: options.defaultPath,
+      filters: options.filters ?? [],
+    } });
+  }
+  const { open } = await import('@tauri-apps/plugin-dialog');
+  // The OS owns path syntax (including Windows drive letters and UNC shares).
+  // Cancellation is null; errors remain errors and do not open a second picker.
+  const path = await open({
+    title: options.title,
+    directory: options.kind === 'directory',
+    multiple: false,
+    defaultPath: options.defaultPath,
+    filters: options.filters,
+  });
+  return path === null ? null : { path, kind: options.kind };
+}
+
 async function windowCommand(
   command: 'minimize' | 'toggleMaximize' | 'close',
   fallback?: () => void,

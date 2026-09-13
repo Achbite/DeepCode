@@ -1648,6 +1648,10 @@ package_platform_distribution() {
   prepare_distribution_tree "$dist_dir" "$platform"
 
   if [ "$target" = linux ]; then
+    local bwrap_bin
+    bwrap_bin="$(command -v bwrap || true)"
+    copy_required_file "$bwrap_bin" "$LINUX_DIR/bwrap" "install bubblewrap in the build container"
+    chmod +x "$LINUX_DIR/bwrap"
     copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-kernel-daemon" "$LINUX_DIR/deepcode-kernel" \
       "run bash ./build.sh --stage daemon --stage cli --stage tui first"
     copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-first-party-provider" "$LINUX_DIR/deepcode-first-party-provider" \

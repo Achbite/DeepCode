@@ -58,7 +58,11 @@ export async function decodeGuiProjection(projection) {
 }
 
 export async function loadGuiModule(t, path) {
+  return (await loadGuiModules(t, [path]))[0];
+}
+
+export async function loadGuiModules(t, paths) {
   const loader = await createGuiLoader();
   t.after(() => loader.close());
-  return await loader.ssrLoadModule(path);
+  return await Promise.all(paths.map((path) => loader.ssrLoadModule(path)));
 }

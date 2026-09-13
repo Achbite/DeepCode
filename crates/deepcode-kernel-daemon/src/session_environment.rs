@@ -1,16 +1,207 @@
+use deepcode_kernel_runtime::shell_environment::{self, ShellProgram};
 use serde_json::{json, Value};
+use std::path::PathBuf;
 
-/// Host observations only. Session owns the lifetime of the saved snapshot.
-pub(crate) fn capture(settings: &Value) -> Result<Value, String> {
+/// Capture once, or reuse the Session-owned snapshot passed by Session. A settings
+/// edit or explicit refresh changes the configuration key at a run boundary.
+pub(crate) fn prepare(
+    settings: &Value,
+    previous: Option<&Value>,
+    restoring: bool,
+) -> Result<Value, String> {
+    validate_settings(settings)?;
+    let configuration = json!({
+        "executionTarget": settings.get("_executionTarget").cloned().unwrap_or_else(|| json!({"kind":"native"})),
+        "responseLanguage": response_language_setting(settings)?,
+        "windowsShell": settings.get("agent.windows.shell").and_then(Value::as_str).unwrap_or("auto"),
+        "gitBashPath": settings.get("agent.windows.gitBashPath").and_then(Value::as_str).unwrap_or(""),
+        "revision": settings.get("agent.environmentRevision").and_then(Value::as_u64).unwrap_or(0),
+    });
+    if let Some(saved) = previous {
+        if restoring || saved.get("configuration") == Some(&configuration) {
+            validate_snapshot(saved)?;
+            return Ok(saved.clone());
+        }
+    }
+    if configuration["executionTarget"]["kind"] == "wsl" {
+        let target = &configuration["executionTarget"];
+        let wsl = deepcode_kernel_runtime::wsl_execution::WslExecution {
+            distribution: target["distribution"]
+                .as_str()
+                .ok_or("WSL distribution missing")?
+                .into(),
+            worker: target["worker"]
+                .as_str()
+                .ok_or("WSL worker missing")?
+                .into(),
+        };
+        let mut worker_settings = settings.clone();
+        worker_settings
+            .as_object_mut()
+            .ok_or("Settings must be an object")?
+            .remove("_executionTarget");
+        let mut environment = wsl
+            .describe(&worker_settings)
+            .map_err(|error| error.to_string())?;
+        validate_snapshot(&environment)?;
+        environment["executionTarget"] = target.clone();
+        environment["configuration"] = configuration;
+        return Ok(environment);
+    }
     let locale = system_locale();
     let preference = response_language_setting(settings)?;
+    let shell = selected_shell(settings);
+    let commands: Vec<_> = [
+        "git", "rg", "node", "npm", "pnpm", "python", "python3", "cargo", "rustc", "go", "java",
+        "dotnet", "cmake", "make", "ninja", "gcc", "clang", "cl", "docker", "podman",
+    ]
+    .into_iter()
+    .filter(|name| shell_environment::find_command(name).is_some())
+    .collect();
+    let sandbox = deepcode_kernel_runtime::workspace_sandbox::probe();
     Ok(json!({
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "locale": locale,
         "responseLanguage": if preference == "auto" { locale.as_deref() } else { Some(preference) },
         "userShell": std::env::var(if cfg!(windows) { "COMSPEC" } else { "SHELL" }).ok(),
+        "configuration": configuration,
+        "executionTarget": { "kind": "native" },
+        "shellAvailable": shell.executable.is_file(),
+        "shell": shell,
+        "developerCommands": commands,
+        "workspaceShellSupported": sandbox.available,
+        "workspaceSandbox": sandbox,
     }))
+}
+
+fn validate_snapshot(snapshot: &Value) -> Result<(), String> {
+    let shell: ShellProgram =
+        serde_json::from_value(snapshot["shell"].clone()).map_err(|error| error.to_string())?;
+    if !matches!(shell.tool.as_str(), "bash" | "powershell")
+        || !snapshot["os"].is_string()
+        || !snapshot["arch"].is_string()
+        || !snapshot["shellAvailable"].is_boolean()
+        || !snapshot["workspaceShellSupported"].is_boolean()
+        || !snapshot["developerCommands"]
+            .as_array()
+            .is_some_and(|items| items.iter().all(Value::is_string))
+    {
+        return Err("Saved execution environment is invalid.".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn capture(settings: &Value) -> Result<Value, String> {
+    prepare(settings, None, false)
+}
+
+fn selected_shell(settings: &Value) -> ShellProgram {
+    let choice = settings
+        .get("agent.windows.shell")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+    if cfg!(windows) && choice == "gitBash" {
+        if let Some(path) = settings
+            .get("agent.windows.gitBashPath")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            return ShellProgram {
+                tool: "bash".into(),
+                executable: PathBuf::from(path),
+                dialect: "bash".into(),
+            };
+        }
+    }
+    let tool = if cfg!(windows) && choice != "gitBash" {
+        "powershell"
+    } else {
+        "bash"
+    };
+    let selected = if cfg!(windows) && choice == "powershell7" {
+        shell_environment::find_powershell7().map(|executable| ShellProgram {
+            tool: tool.into(),
+            executable,
+            dialect: "powershell7".into(),
+        })
+    } else if cfg!(windows) && choice == "windowsPowerShell" {
+        shell_environment::find_windows_powershell().map(|executable| ShellProgram {
+            tool: tool.into(),
+            executable,
+            dialect: "windowsPowerShell".into(),
+        })
+    } else {
+        shell_environment::discover(tool).ok()
+    };
+    selected.unwrap_or_else(|| ShellProgram {
+        tool: tool.into(),
+        executable: PathBuf::new(),
+        dialect: choice.into(),
+    })
+}
+
+pub(crate) fn validate_settings(settings: &Value) -> Result<(), String> {
+    project_environments(settings)?;
+    if settings.get("agent.windows.shell").is_some_and(|value| {
+        !matches!(
+            value.as_str(),
+            Some("auto" | "powershell7" | "windowsPowerShell" | "gitBash")
+        )
+    }) {
+        return Err(
+            "agent.windows.shell 必须为 auto、powershell7、windowsPowerShell 或 gitBash。".into(),
+        );
+    }
+    if settings
+        .get("agent.windows.gitBashPath")
+        .is_some_and(|value| value.as_str().is_none_or(|s| s.contains('\0')))
+    {
+        return Err("Git Bash 路径必须是有效字符串。".into());
+    }
+    if settings
+        .get("agent.environmentRevision")
+        .is_some_and(|value| value.as_u64().is_none())
+    {
+        return Err("环境刷新版本必须是非负整数。".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn project_environments(settings: &Value) -> Result<Value, String> {
+    let value: Value = serde_json::from_str(
+        settings
+            .get("agent.projectEnvironments")
+            .and_then(Value::as_str)
+            .unwrap_or("{}"),
+    )
+    .map_err(|error| format!("Invalid project execution settings: {error}"))?;
+    let projects = value
+        .as_object()
+        .ok_or("Project execution settings must be an object")?;
+    for target in projects.values() {
+        let object = target
+            .as_object()
+            .ok_or("Project execution environment must be an object")?;
+        match target["kind"].as_str() {
+            Some("native") if object.len() == 1 => {}
+            Some("wsl")
+                if object.len() == 3
+                    && ["distribution", "worker"].iter().all(|key| {
+                        target[key]
+                            .as_str()
+                            .is_some_and(|value| !value.trim().is_empty() && !value.contains('\0'))
+                    }) => {}
+            _ => {
+                return Err(
+                    "Choose native, or WSL with a distribution and Linux Kernel worker path."
+                        .into(),
+                )
+            }
+        }
+    }
+    Ok(value)
 }
 
 pub(crate) fn response_language_setting(settings: &Value) -> Result<&str, String> {
@@ -123,5 +314,33 @@ mod tests {
         assert_eq!(explicit["responseLanguage"], "zh-CN");
         assert_eq!(explicit["locale"], automatic["locale"]);
         assert!(capture(&json!({"agent.responseLanguage": false})).is_err());
+    }
+
+    #[test]
+    fn saved_environment_changes_only_at_an_explicit_run_boundary() {
+        let mut saved = capture(&json!({})).unwrap();
+        saved["developerCommands"] = json!(["previously-observed-command"]);
+        assert_eq!(prepare(&json!({}), Some(&saved), false).unwrap(), saved);
+        let settings = json!({"agent.environmentRevision":1});
+        let refreshed = prepare(&settings, Some(&saved), false).unwrap();
+        assert_ne!(refreshed["developerCommands"], saved["developerCommands"]);
+        assert_eq!(refreshed["configuration"]["revision"], 1);
+        assert_eq!(prepare(&settings, Some(&saved), true).unwrap(), saved);
+        let changed_language = prepare(
+            &json!({"agent.responseLanguage":"en-US"}),
+            Some(&saved),
+            false,
+        )
+        .unwrap();
+        assert_eq!(changed_language["responseLanguage"], "en-US");
+    }
+
+    #[test]
+    fn project_environment_requires_an_explicit_distribution_and_worker() {
+        assert!(project_environments(&json!({"agent.projectEnvironments":r#"{"p":{"kind":"wsl","distribution":"Ubuntu","worker":"/opt/deepcode/kernel"}}"#})).is_ok());
+        assert!(project_environments(
+            &json!({"agent.projectEnvironments":r#"{"p":{"kind":"wsl","distribution":""}}"#})
+        )
+        .is_err());
     }
 }

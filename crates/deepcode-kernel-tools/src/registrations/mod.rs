@@ -18,6 +18,7 @@ pub enum KernelExecutorBinding {
     WebSearch,
     WebFetch,
     ProcessShell,
+    ProcessPowerShell,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +64,12 @@ pub(crate) fn builtin_tool_registrations() -> Vec<KernelToolRegistration> {
     use ToolEffectScope::{NetworkRead, Process, WorkspaceRead, WorkspaceWrite};
 
     [
+        tool(
+            Tool::ProcessPowerShell,
+            Executor::ProcessPowerShell,
+            Mutation,
+            Process,
+        ),
         tool(Tool::FsRead, Executor::FsRead, Read, WorkspaceRead),
         tool(Tool::FsWrite, Executor::FsWrite, Mutation, WorkspaceWrite),
         tool(Tool::FsEdit, Executor::FsEdit, Mutation, WorkspaceWrite),
@@ -124,6 +131,7 @@ invocation_canonicalizer!(canonicalize_fs_delete, KernelToolKind::FsDelete);
 invocation_canonicalizer!(canonicalize_web_search, KernelToolKind::WebSearch);
 invocation_canonicalizer!(canonicalize_web_fetch, KernelToolKind::WebFetch);
 invocation_canonicalizer!(canonicalize_process_shell, KernelToolKind::ProcessShell);
+invocation_canonicalizer!(canonicalize_powershell, KernelToolKind::ProcessPowerShell);
 
 fn canonicalizer_for(tool: KernelToolKind) -> KernelInvocationCanonicalizer {
     match tool {
@@ -134,6 +142,7 @@ fn canonicalizer_for(tool: KernelToolKind) -> KernelInvocationCanonicalizer {
         KernelToolKind::WebSearch => canonicalize_web_search,
         KernelToolKind::WebFetch => canonicalize_web_fetch,
         KernelToolKind::ProcessShell => canonicalize_process_shell,
+        KernelToolKind::ProcessPowerShell => canonicalize_powershell,
     }
 }
 
@@ -147,6 +156,7 @@ fn tool_description(tool: KernelToolKind) -> &'static str {
         KernelToolKind::WebSearch => {
             "Search the web by keyword and return sources."
         }
+        KernelToolKind::ProcessPowerShell => "Execute a bounded PowerShell script in the selected native Windows environment. Use PowerShell syntax. Each call starts a fresh noninteractive process with no user profile and UTF-8 output. Scope and Plan authority are the same as other process tools. Check $LASTEXITCODE for native programs and use exit to preserve a failed command status.",
         KernelToolKind::ProcessShell => {
             #[cfg(target_os = "macos")]
             {

@@ -7,6 +7,7 @@ import { MarkdownContent, MarkdownInline } from './BufferedMarkdown';
 export function ComposerDecisionPanels({ language, composer }: { language: UiLanguage; composer: AgentComposer }) {
   const {
     pendingPlan,
+    pendingScopeAddition,
     pendingInteraction,
     pendingApproval,
     submitting,
@@ -33,7 +34,9 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
           >
             <header className="local-agent__interaction-panel-heading">
               {pendingPlan
-                ? <strong><MarkdownInline>{t(language, 'agent.plan.confirmQuestion', { title: pendingPlan.title })}</MarkdownInline></strong>
+                ? <strong><MarkdownInline>{pendingScopeAddition
+                  ? (language === 'zh-CN' ? '确认新增执行范围' : 'Confirm additional execution scope')
+                  : t(language, 'agent.plan.confirmQuestion', { title: pendingPlan.title })}</MarkdownInline></strong>
                 : <MarkdownContent>{pendingInteraction?.prompt ?? ''}</MarkdownContent>}
               {pendingPlan && (
                 <button
@@ -55,8 +58,12 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
                     onClick={() => void submitPlanDecision({ kind: 'confirm' })}
                   >
                     <span className="local-agent__interaction-option-copy">
-                      <b>{t(language, 'agent.plan.adopt')}</b>
-                      <small>{t(language, 'agent.plan.adoptTodoHint')}</small>
+                      <b>{pendingScopeAddition
+                        ? (language === 'zh-CN' ? '确认新增范围' : 'Confirm added scope')
+                        : t(language, 'agent.plan.adopt')}</b>
+                      <small>{pendingScopeAddition
+                        ? (language === 'zh-CN' ? '继续当前阶段，保留已有进度' : 'Continue the current phases and preserve progress')
+                        : t(language, 'agent.plan.adoptTodoHint')}</small>
                     </span>
                     <span className="local-agent__interaction-option-chevron" aria-hidden="true">
                       <DeepCodeShellIcon name="chevronRight" />

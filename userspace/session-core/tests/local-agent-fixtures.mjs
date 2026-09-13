@@ -339,7 +339,7 @@ export async function waitForProjection(actor, predicate) {
 export async function waitUntil(predicate, label) {
   const deadline = Date.now() + 3_000;
   while (Date.now() < deadline) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   assert.fail(`timed out waiting for ${label}`);

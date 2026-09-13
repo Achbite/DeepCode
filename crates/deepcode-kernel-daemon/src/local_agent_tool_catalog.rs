@@ -116,6 +116,7 @@ struct BuiltinToolProvider {
     executors: Arc<KernelExecutorRegistry>,
     binding_identity: String,
     web_search_availability: ToolAvailability,
+    shell_tool: String,
 }
 
 impl BuiltinToolProvider {
@@ -130,6 +131,11 @@ impl BuiltinToolProvider {
         } else {
             ToolAvailability::Blocked
         };
+        let shell_tool = executor_config
+            .shell_program
+            .as_ref()
+            .map(|shell| shell.tool.clone())
+            .unwrap_or_else(|| if cfg!(windows) { "powershell" } else { "bash" }.into());
         let registry = Arc::new(KernelToolRegistry::new());
         let executors = Arc::new(KernelExecutorRegistry::from_executors(builtin_executors(
             registry.as_ref(),
@@ -141,6 +147,7 @@ impl BuiltinToolProvider {
             executors,
             binding_identity,
             web_search_availability,
+            shell_tool,
         })
     }
 }
@@ -169,6 +176,10 @@ impl ToolProvider for BuiltinToolProvider {
                 },
                 availability: if descriptor.name == "web.search" {
                     self.web_search_availability
+                } else if matches!(descriptor.name.as_str(), "bash" | "powershell")
+                    && descriptor.name != self.shell_tool
+                {
+                    ToolAvailability::Blocked
                 } else {
                     descriptor.availability
                 },
@@ -808,6 +819,8 @@ fn builtin_binding_identity(config: &KernelExecutorConfig) -> Result<String, Too
         "webSearchAuthHeaderName": config.web_search_auth_header_name,
         "webSearchAuthSecretRef": config.web_search_auth_secret_ref,
         "cloudWebSearch": config.cloud_web_search,
+        "shellProgram": config.shell_program,
+        "wsl": config.wsl,
     }))
     .map_err(|error| ToolCatalogError::new("builtin_binding_encode_failed", error.to_string()))?;
     Ok(format!("builtin-binding:{}", hash_bytes(&encoded)))
@@ -829,7 +842,7 @@ mod tests {
     use deepcode_kernel_runtime::executors::EmptySecretProvider;
 
     #[test]
-    fn default_builtin_provider_exposes_the_seven_basic_tools_and_blocks_web_search() {
+    fn default_builtin_provider_exposes_the_registered_basic_tools_and_blocks_web_search() {
         let provider = BuiltinToolProvider::prepare(
             KernelExecutorConfig::default(),
             Arc::new(EmptySecretProvider),
@@ -854,6 +867,7 @@ mod tests {
                 "fs.edit",
                 "fs.read",
                 "fs.write",
+                "powershell",
                 "web.fetch",
                 "web.search",
             ]
