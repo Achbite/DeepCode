@@ -92,7 +92,8 @@ export type LoopResult =
 
 export interface AgentLoopDeps {
   composition: AgentComposition;
-  commit(event: NewSessionEvent | readonly NewSessionEvent[]): Promise<LoopSnapshot>;
+  commit(event: NewSessionEvent | readonly NewSessionEvent[] | ((current: LoopSnapshot) => readonly NewSessionEvent[])): Promise<LoopSnapshot>;
+  takeQueuedInputs(runId: string): Promise<LoopSnapshot>;
   updateAssistantDraft(draft: AssistantDraftProjection | null): void;
   updateReasoning?(requestId: string, runId: string, text: string, kind: 'text' | 'summary'): void;
   updateToolProgress?(callId: string, progress: ToolExecutionProgress): void;
@@ -212,7 +213,7 @@ export async function runAgentLoop(
   let snapshot = initial;
   const runId = command.runId;
   const commit = async (
-    event: NewSessionEvent | readonly NewSessionEvent[],
+    event: NewSessionEvent | readonly NewSessionEvent[] | ((current: LoopSnapshot) => readonly NewSessionEvent[]),
   ): Promise<void> => {
     snapshot = await deps.commit(event);
   };
@@ -382,6 +383,8 @@ export async function runAgentLoop(
       }
 
       throwIfAborted(signal);
+      snapshot = await deps.takeQueuedInputs(runId);
+      throwIfAborted(signal);
       const completedPlan = completedPlanAwaitingLifecycle(snapshot.state, runId);
       if (completedPlan) {
         await commit({
@@ -398,8 +401,6 @@ export async function runAgentLoop(
         events: snapshot.events,
         responseConstraint: 'normal',
         workspaceBindings: runWorkspaceBindings(snapshot, runId),
-        contextProviders: deps.composition.contextProviders,
-        memory: deps.composition.memory,
         providerRequestId: deps.nextId('provider-request'),
       });
       const pressureCutoff = pressureCompactionCutoff(
@@ -531,7 +532,7 @@ export async function runAgentLoop(
         case 'answer': {
           const messageId = turn.messageId ?? deps.nextId('message');
           const settlement = planFinalSettlement(snapshot.state, runId, messageId);
-          await commit([
+          await commit((current) => [
             ...orderedProviderCallFacts(turn.completion, providerCallFacts),
             providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
             ...completionDerivedFacts,
@@ -546,13 +547,14 @@ export async function runAgentLoop(
                 providerRequestId: turn.completion.providerRequestId,
               },
             },
-            {
+            ...(current.state.queuedInputs.some((input) => input.runId === runId) ? [] : [{
               type: 'run.finishing',
               sessionId: snapshot.state.sessionId,
               runId,
               payload: settlement,
-            },
+            } as const]),
           ]);
+          if (!snapshot.state.pendingRunSettlements[runId]) break;
           return finishingResult(runId, settlement);
         }
         case 'tools': {
@@ -931,6 +933,7 @@ async function consumeProviderOutput(
   const hostedWebSearchCalls: JsonObject[] = [];
   const orderedOutputItems: Array<{ outputIndex: number; item: JsonObject }> = [];
   const streamedTextByOutputIndex = new Map<number, string>();
+  const completedDraftBlocks: NativeAssistantDraftBlock[] = [];
   const planPreview = new PlanPreviewBuffer(toolCodec.wireByCanonical.get(SESSION_CONTROL_PLAN_PUBLISH));
   let contextUsage: ProviderTokenUsage | undefined;
   let completed = false;
@@ -974,8 +977,7 @@ async function consumeProviderOutput(
             turnId: request.requestId,
             blocks: assistantDraftBlocks(
               request,
-              orderedOutputItems,
-              toolCodec,
+              completedDraftBlocks,
               streamedTextByOutputIndex,
             ),
           });
@@ -996,15 +998,17 @@ async function consumeProviderOutput(
             'Provider output item 没有按原生 output_index 递增返回。',
           );
         }
-        orderedOutputItems.push({
+        const output = {
           outputIndex: event.data.outputIndex,
           item: structuredClone(event.data.item),
-        });
+        };
+        orderedOutputItems.push(output);
+        const completedDraftBlock = completedAssistantDraftBlock(request, output, toolCodec);
+        if (completedDraftBlock) completedDraftBlocks.push(completedDraftBlock);
         streamedTextByOutputIndex.delete(event.data.outputIndex);
         const blocks = assistantDraftBlocks(
           request,
-          orderedOutputItems,
-          toolCodec,
+          completedDraftBlocks,
           streamedTextByOutputIndex,
         );
         deps.updateAssistantDraft({ runId, turnId: request.requestId, blocks });
@@ -1652,69 +1656,67 @@ function aggregateDraftBlocks(
   }] : [];
 }
 
+function completedAssistantDraftBlock(
+  request: ProviderRequest,
+  output: { outputIndex: number; item: JsonObject },
+  toolCodec: ProviderToolCodec,
+): NativeAssistantDraftBlock | null {
+  // Draft presentation must not admit tool inputs or interrupt their native stream.
+  if (output.item.type === 'function_call' || output.item.type === 'reasoning') return null;
+  const block = decodeProviderOutputBlock(output, toolCodec);
+  switch (block.kind) {
+    case 'reasoning':
+    case 'toolCall':
+    case 'toolCallRejected':
+      return null;
+    case 'message': {
+      const phase = providerMessagePhase(block.item);
+      const kind = phase === 'commentary'
+        ? 'narrative'
+        : phase === 'final_answer'
+          ? 'finalMessage'
+          : 'message';
+      return {
+        outputIndex: block.outputIndex,
+        kind,
+        content: block.content,
+        streamId: providerTextStreamId(
+          request.sessionId, request.runId, request.requestId, block.outputIndex,
+        ),
+      };
+    }
+    case 'providerHosted': {
+      const status = block.item.status;
+      const action = block.item.action;
+      if (
+        status !== 'completed'
+        && status !== 'failed'
+        || !isRecord(action)
+      ) {
+        throw new LoopFailure(
+          'provider_hosted_search_item_invalid',
+          'Provider hosted search 终态事实无效。',
+        );
+      }
+      return {
+        outputIndex: block.outputIndex,
+        kind: 'providerHosted',
+        providerCallId: block.providerCallId,
+        providerToolType: 'web_search',
+        status,
+        action: structuredClone(action),
+      };
+    }
+  }
+}
+
 function assistantDraftBlocks(
   request: ProviderRequest,
-  outputs: readonly { outputIndex: number; item: JsonObject }[],
-  toolCodec: ProviderToolCodec,
-  streamedTextByOutputIndex: ReadonlyMap<number, string> = new Map(),
+  completedBlocks: readonly NativeAssistantDraftBlock[],
+  streamedTextByOutputIndex: ReadonlyMap<number, string>,
 ): NativeAssistantDraftBlock[] {
-  const blocks = outputs.flatMap((output): NativeAssistantDraftBlock[] => {
-    // Draft presentation must not admit tool inputs or interrupt their native stream.
-    if (output.item.type === 'function_call' || output.item.type === 'reasoning') return [];
-    const block = decodeProviderOutputBlock(output, toolCodec);
-    switch (block.kind) {
-      case 'reasoning':
-      case 'toolCall':
-      case 'toolCallRejected':
-        return [];
-      case 'message': {
-        const phase = providerMessagePhase(block.item);
-        const kind = phase === 'commentary'
-          ? 'narrative'
-          : phase === 'final_answer'
-            ? 'finalMessage'
-            : 'message';
-        return [{
-          outputIndex: block.outputIndex,
-          kind,
-          content: block.content,
-          streamId: providerTextStreamId(
-            request.sessionId, request.runId, request.requestId, block.outputIndex,
-          ),
-        }];
-      }
-      case 'providerHosted': {
-        const status = block.item.status;
-        const action = block.item.action;
-        if (
-          status !== 'completed'
-          && status !== 'failed'
-          || !isRecord(action)
-        ) {
-          throw new LoopFailure(
-            'provider_hosted_search_item_invalid',
-            'Provider hosted search 终态事实无效。',
-          );
-        }
-        return [{
-          outputIndex: block.outputIndex,
-          kind: 'providerHosted',
-          providerCallId: block.providerCallId,
-          providerToolType: 'web_search',
-          status,
-          action: structuredClone(action),
-        }];
-      }
-    }
-  });
-  const completedOutputIndexes = new Set(outputs.map((output) => output.outputIndex));
+  const blocks = [...completedBlocks];
   for (const [outputIndex, content] of streamedTextByOutputIndex) {
-    if (completedOutputIndexes.has(outputIndex)) {
-      throw new LoopFailure(
-        'provider_output_delta_after_completion',
-        'Provider 在 output item 完成后继续发送该 item 的正文增量。',
-      );
-    }
     if (content) blocks.push({
       outputIndex, kind: 'message', content,
       streamId: providerTextStreamId(request.sessionId, request.runId, request.requestId, outputIndex),

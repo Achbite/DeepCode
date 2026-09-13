@@ -19,10 +19,7 @@ export function actorWith(
     sessionId,
     journal,
     {
-      contextProviders: [],
       provider,
-      memory: { id: 'memory.complete', select: ({ messages }) => messages },
-      observers: [],
       kernel,
       runPreparation,
       async dispose() { onDispose(); },

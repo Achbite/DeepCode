@@ -30,9 +30,9 @@ pub use conversation::{
     InteractionOption, InteractionProjection, NarrativeProjection, PendingPlanProjection,
     PlanOperation, PlanPreviewProjection, PlanProjection, PlanRef, PlanWritePath,
     PluginCatalogItem, PluginCatalogProjection, PluginSelectionInput, ProjectionMessage,
-    ResolveConversationFilesystemReferencesRequest, RunProjection, SessionDisplayProjection,
-    SessionProjection, SessionTimelineItem, TodoItem, TodoListProjection, TokenUsageProjection,
-    TokenUsageRoundProjection, ToolOutputProjection, WorkspaceBindingDisplay,
+    QueuedInputProjection, ResolveConversationFilesystemReferencesRequest, RunProjection,
+    SessionDisplayProjection, SessionProjection, SessionTimelineItem, TodoItem, TodoListProjection,
+    TokenUsageProjection, TokenUsageRoundProjection, ToolOutputProjection, WorkspaceBindingDisplay,
     CONVERSATION_COMMAND_VERSION, SESSION_PROJECTION_VERSION,
 };
 

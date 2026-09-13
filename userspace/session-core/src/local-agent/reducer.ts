@@ -30,6 +30,7 @@ export interface SessionState {
   sessionDirectoryIndexes: WorkspaceBindingDisplay[];
   workspaceBindings: WorkspaceBindingDisplay[];
   messages: SessionProjection['messages'];
+  queuedInputs: SessionProjection['queuedInputs'];
   acceptedInputs: Record<string, { messageId: string; replyToInteraction?: { interactionId: string; prompt: string } }>;
   narratives: SessionProjection['narratives'];
   pendingInteraction: SessionProjection['pendingInteraction'];
@@ -90,6 +91,7 @@ export function emptySessionState(sessionId: string): SessionState {
     sessionDirectoryIndexes: [],
     workspaceBindings: [],
     messages: [],
+    queuedInputs: [],
     acceptedInputs: {},
     narratives: [],
     pendingInteraction: null,
@@ -154,37 +156,9 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
     pendingPlan: previous.pendingPlan ? clonePlanProjection(previous.pendingPlan) : null,
     todoList: cloneTodoList(previous.todoList),
     contextUsage: previous.contextUsage ? { ...previous.contextUsage } : null,
-    // Receipts are immutable after insertion. Clone only at the public projection boundary.
-    contextCompositions: [...previous.contextCompositions],
+    // Historical runtime/Provider facts are immutable after insertion. Events
+    // copy their affected map; public projections still isolate returned values.
     tokenUsage: { ...previous.tokenUsage },
-    tokenUsageHistory: Object.fromEntries(
-      Object.entries(previous.tokenUsageHistory).map(([runId, usage]) => [runId, { ...usage }]),
-    ),
-    runRuntimeSnapshots: Object.fromEntries(
-      Object.entries(previous.runRuntimeSnapshots).map(([runId, snapshot]) => (
-        [runId, cloneRunRuntimeSnapshot(snapshot)]
-      )),
-    ),
-    pendingRunSettlements: Object.fromEntries(
-      Object.entries(previous.pendingRunSettlements).map(([runId, settlement]) => [
-        runId,
-        cloneRunSettlement(settlement),
-      ]),
-    ),
-    runRuntimeReleases: Object.fromEntries(
-      Object.entries(previous.runRuntimeReleases).map(([runId, receipt]) => [
-        runId,
-        { ...receipt, pluginInstanceRefs: [...receipt.pluginInstanceRefs] },
-      ]),
-    ),
-    providerTurns: Object.fromEntries(
-      Object.entries(previous.providerTurns).map(([requestId, turn]) => (
-        [requestId, cloneProviderTurn(turn)]
-      )),
-    ),
-    providerUsageRequestIds: { ...previous.providerUsageRequestIds },
-    providerCallFacts: Object.fromEntries(Object.entries(previous.providerCallFacts)
-      .map(([callId, fact]) => [callId, { ...fact }])),
     run: previous.run ? cloneRun(previous.run) : null,
     activities: Object.fromEntries(
       Object.entries(previous.activities).map(([id, activity]) => [id, cloneActivity(activity)]),
@@ -196,6 +170,22 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
   };
 
   switch (event.type) {
+    case 'input.queued':
+      assertCurrentRun(next, event.runId, 'queued_input_run_not_current');
+      if (!['running', 'waiting'].includes(next.run!.status)) throw new Error('queued_input_run_not_active');
+      if (next.queuedInputs.some((input) => input.messageId === event.payload.messageId)) {
+        throw new Error('queued_input_duplicate');
+      }
+      next.queuedInputs = [...next.queuedInputs, {
+        ...event.payload,
+        runId: event.runId,
+        filesystemReferences: (event.payload.filesystemReferences ?? []).map((reference) => ({ ...reference })),
+        pluginSelections: (event.payload.pluginSelections ?? []).map((selection) => ({ ...selection })),
+        sequence: event.sequence,
+        createdAt: event.occurredAt,
+        status: 'queued',
+      }];
+      break;
     case 'input.accepted':
       next.acceptedInputs[event.payload.commandId] = { messageId: event.payload.messageId };
       break;
@@ -228,9 +218,9 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       next.workspaceBindings = effectiveWorkspaceBindings(next);
       break;
     }
-    case 'input.accepted':
-      break;
     case 'run.started':
+      next.tokenUsageHistory = { ...next.tokenUsageHistory };
+      next.runRuntimeSnapshots = { ...next.runRuntimeSnapshots };
       {
         const inputMessage = next.messages.find((message) => (
           message.messageId === event.payload.inputMessageId && message.role === 'user'
@@ -278,6 +268,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     case 'message.committed':
       {
+        next.queuedInputs = next.queuedInputs.filter((input) => input.messageId !== event.payload.messageId);
         const acceptedInput = Object.entries(next.acceptedInputs).find(([, input]) => input.messageId === event.payload.messageId);
         const replyToInteraction = acceptedInput?.[1].replyToInteraction;
         if (replyToInteraction && event.payload.role !== 'user') throw new Error('interaction_response_role_invalid');
@@ -744,6 +735,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       );
       break;
     case 'context.composed':
+      next.contextCompositions = [...next.contextCompositions];
       assertRunningRun(next, event.runId, 'provider_request_run_not_active');
       if (next.contextCompositions.some((receipt) => (
         receipt.providerRequestId === event.payload.providerRequestId
@@ -773,6 +765,8 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       });
       break;
     case 'provider.turn.settled': {
+      next.providerTurns = { ...next.providerTurns };
+      next.tokenUsageHistory = { ...next.tokenUsageHistory };
       assertRunningRun(next, event.runId, 'provider_turn_run_not_active');
       const runtime = requiredRunRuntimeSnapshot(next, event.runId);
       if (event.payload.providerRuntimeRef !== runtime.provider.providerRuntimeRef) {
@@ -941,6 +935,9 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     }
     case 'context.updated': {
+      next.contextCompositions = [...next.contextCompositions];
+      next.providerUsageRequestIds = { ...next.providerUsageRequestIds };
+      next.tokenUsageHistory = { ...next.tokenUsageHistory };
       assertRunningRun(next, event.runId, 'provider_usage_run_not_active');
       const providerRequestId = event.payload.providerRequestId;
       requiredProviderTurn(next, event.runId, providerRequestId);
@@ -1000,6 +997,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       };
       break;
     case 'run.finishing':
+      next.pendingRunSettlements = { ...next.pendingRunSettlements };
       assertCurrentRun(next, event.runId, 'run_finishing_identity_mismatch');
       if (
         next.pendingRunSettlements[event.runId]
@@ -1038,6 +1036,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     }
     case 'run.runtime.released': {
+      next.runRuntimeReleases = { ...next.runRuntimeReleases };
       assertCurrentRun(next, event.runId, 'run_runtime_release_identity_mismatch');
       const runtime = requiredRunRuntimeSnapshot(next, event.runId);
       if (
@@ -1069,6 +1068,8 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     }
     case 'run.settled':
+      next.tokenUsageHistory = { ...next.tokenUsageHistory };
+      next.pendingRunSettlements = { ...next.pendingRunSettlements };
       // Journal admission enforces tool closure for new settlements. Replaying
       // stored failures must preserve unfinished calls, not hide the entire run.
       if (
@@ -1137,6 +1138,12 @@ export function projectSession(
       ...(message.replyToInteraction ? { replyToInteraction: { ...message.replyToInteraction } } : {}),
       filesystemReferences: message.filesystemReferences.map((reference) => ({ ...reference })),
       pluginSelections: message.pluginSelections.map((selection) => ({ ...selection })),
+    })),
+    queuedInputs: state.queuedInputs.map((input) => ({
+      ...input,
+      filesystemReferences: input.filesystemReferences.map((reference) => ({ ...reference })),
+      pluginSelections: input.pluginSelections.map((selection) => ({ ...selection })),
+      status: state.tokenUsageHistory[input.runId]?.outcome ? 'notApplied' : 'queued',
     })),
     narratives: state.narratives.map((narrative) => ({ ...narrative })),
     timeline: projectTimeline(state),
@@ -1229,26 +1236,6 @@ function cloneRunRuntimeSnapshot(snapshot: RunRuntimeSnapshot): RunRuntimeSnapsh
         capabilityRefs: [...plugin.capabilityRefs],
       })),
     },
-  };
-}
-
-function cloneProviderTurn(turn: ProviderTurnState): ProviderTurnState {
-  return {
-    ...turn,
-    ...(turn.orderedCallIds ? { orderedCallIds: [...turn.orderedCallIds] } : {}),
-    ...(turn.toolCallInputs ? { toolCallInputs: structuredClone(turn.toolCallInputs) } : {}),
-    ...(turn.hostedWebSearchCalls
-      ? { hostedWebSearchCalls: turn.hostedWebSearchCalls.map((item) => structuredClone(item)) }
-      : {}),
-    ...(turn.orderedOutputBlocks
-      ? {
-          orderedOutputBlocks: turn.orderedOutputBlocks.map((block) => ({
-            ...block,
-            item: structuredClone(block.item),
-          })),
-        }
-      : {}),
-    ...(turn.error ? { error: { ...turn.error } } : {}),
   };
 }
 
@@ -1806,6 +1793,7 @@ function cloneActivity(activity: ActivityProjection): ActivityProjection {
       ? {
           tool: {
             ...activity.tool,
+            ...(activity.tool.error ? { error: structuredClone(activity.tool.error) } : {}),
             resources: activity.tool.resources.map((resource) => ({ ...resource })),
             ...(activity.tool.fileChanges ? { fileChanges: structuredClone(activity.tool.fileChanges) } : {}),
             ...(activity.tool.shell
@@ -1845,7 +1833,10 @@ function recordProviderCallFact(
   sequence: number,
 ): void {
   if (state.providerCallFacts[callId] !== undefined) throw new Error('provider_call_fact_duplicate');
-  state.providerCallFacts[callId] = { runId, providerCallId, toolName, sequence };
+  state.providerCallFacts = {
+    ...state.providerCallFacts,
+    [callId]: { runId, providerCallId, toolName, sequence },
+  };
 }
 
 function assertRunningRun(state: SessionState, runId: string, code: string): void {
@@ -1894,6 +1885,7 @@ function projectToolActivity(record: ToolExecutionRecord): NonNullable<ActivityP
       return { kind: 'logicalTarget' as const, label: target };
     }),
     ...(['bash', 'powershell'].includes(record.toolName) ? { shell: projectShellActivity(record) } : {}),
+    ...('error' in record && record.error ? { error: structuredClone(record.error) } : {}),
     ...projectFileChanges(record),
   };
 }

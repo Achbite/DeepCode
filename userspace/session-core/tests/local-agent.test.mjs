@@ -12,6 +12,9 @@ import {
   prepareToolPromptContributions,
   renderActiveToolGuidance,
   SessionService,
+  emptySessionState,
+  reduceSession,
+  projectSession,
   loopSnapshot,
   runtimeInstructions,
   sessionControlToolDefinitions,
@@ -23,6 +26,158 @@ import { HttpProviderPort } from '../dist/local-agent/httpPorts.js';
 import { responseFrames } from '../dist/responseFrames.js';
 import { environmentInstruction } from '../dist/local-agent/sessionEnvironment.js';
 import { createProviderToolAliases } from '../dist/local-agent/providerToolCodec.js';
+
+test('queued input joins the same run after complete tool results and keeps late input before settlement', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:queued-turns';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation({ tools: [{
+    toolBindingRef: 'binding:queued-read', name: 'fs.read', description: 'Read a file.',
+    inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } },
+    possibleEffects: ['workspaceRead'], availability: 'callable', origin: 'coreBuiltin',
+  }] });
+  let releaseProvider, releaseTool, releaseAnswer;
+  const providerReady = new Promise((resolve) => { releaseProvider = resolve; });
+  const toolReady = new Promise((resolve) => { releaseTool = resolve; });
+  const answerReady = new Promise((resolve) => { releaseAnswer = resolve; });
+  const requests = [];
+  let toolStarted = false;
+  let cancellations = 0;
+  const originalError = { code: 'file_not_found', message: 'The requested file is missing.' };
+  const kernel = emptyKernel({
+    async execute(request) {
+      toolStarted = true;
+      await toolReady;
+      return failedExecutionReply(request, null, originalError);
+    },
+    async cancel() { cancellations += 1; throw new Error('queued_input_must_not_cancel'); },
+  });
+  const actor = actorWith(journal, sessionId, { async *stream(request, signal) {
+    requests.push(structuredClone(request));
+    if (requests.length === 1) {
+      await providerReady;
+      assert.equal(signal.aborted, false);
+      yield providerEvent(request.requestId, 'tool.call', {
+        callId: 'provider-call:queued-read', name: request.tools.find((tool) => tool.inputSchema.properties?.path).name,
+        input: { workspace: 'primary', path: 'missing.txt' },
+      });
+    } else {
+      if (requests.length === 2) {
+        const toolIndex = request.messages.findIndex((message) => message.role === 'tool');
+        const firstInput = request.messages.findIndex((message) => message.content === 'First supplement.');
+        const secondInput = request.messages.findIndex((message) => message.content === 'Second supplement.');
+        assert.ok(toolIndex >= 0 && firstInput > toolIndex && secondInput > firstInput);
+        assert.deepEqual(jsonMessagePayload(request.messages[toolIndex]).error, originalError);
+        await answerReady;
+      } else {
+        assert.equal(requests.length, 3);
+        assert.equal(request.messages.at(-1).content, 'Last supplement.');
+      }
+      yield providerEvent(request.requestId, 'assistant.message', {
+        messageId: `answer:${requests.length}`, content: `Answer ${requests.length}.`,
+      });
+    }
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, kernel, preparation.port, 'queued-turns');
+  t.after(async () => { releaseProvider(); releaseTool(); releaseAnswer(); await actor.dispose(); });
+  await actor.submit(messageCommand(sessionId, 'command:queue-start', 'Read the file.'));
+  await waitUntil(() => requests.length === 1, 'initial Provider turn');
+  const runId = (await actor.snapshot()).run.runId;
+  const first = messageCommand(sessionId, 'command:queue-first', 'First supplement.');
+  assert.equal((await actor.submit(first)).status, 'accepted');
+  assert.equal((await actor.submit(first)).status, 'replayed');
+  releaseProvider();
+  await waitUntil(() => toolStarted, 'executing tool');
+  await actor.submit(messageCommand(sessionId, 'command:queue-second', 'Second supplement.'));
+  const queued = await actor.snapshot();
+  assert.deepEqual(queued.queuedInputs.map((input) => input.text), ['First supplement.', 'Second supplement.']);
+  assert.equal(queued.messages.some((message) => message.content === first.text), false);
+  const changedRuntime = await actor.submit({ ...messageCommand(sessionId, 'command:queue-model', 'Keep my draft.'), profileId: 'profile:other' });
+  assert.equal(changedRuntime.status, 'rejected');
+  assert.equal(changedRuntime.error.code, 'queued_input_runtime_change');
+  releaseTool();
+  await waitUntil(() => requests.length === 2, 'next Provider sees complete tool and queued input');
+  await actor.submit(messageCommand(sessionId, 'command:queue-last', 'Last supplement.'));
+  releaseAnswer();
+  const completed = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.equal(completed.run.runId, runId);
+  assert.deepEqual(completed.queuedInputs, []);
+  assert.equal(preparation.prepared.length, 1);
+  assert.equal(cancellations, 0);
+  const tool = completed.activities.find((activity) => activity.kind === 'tool').tool;
+  assert.deepEqual(tool.error, originalError);
+  tool.error.message = 'Shell-local edit';
+  assert.deepEqual((await actor.snapshot()).activities.find((activity) => activity.kind === 'tool').tool.error, originalError);
+  const events = await readEvents(journal, sessionId);
+  assert.equal(events.filter((event) => event.type === 'run.started').length, 1);
+  assert.equal(events.filter((event) => event.type === 'input.queued').length, 3);
+  // Every event can advance from a frozen prior state. Sharing historical facts
+  // must never mutate an earlier replay result or leak through public projection.
+  const freeze = (value) => {
+    if (!value || typeof value !== 'object' || Object.isFrozen(value)) return;
+    Object.values(value).forEach(freeze);
+    Object.freeze(value);
+  };
+  let state = emptySessionState(sessionId);
+  for (const event of events) { freeze(state); state = reduceSession(state, event); }
+  assert.deepEqual(projectSession(state), await actor.snapshot());
+});
+
+test('waiting input stays separate from the decision and explicit cancel retains unconsumed text', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:queued-decision';
+  await createSession(journal, sessionId);
+  const preparation = fakeRunPreparation();
+  const requests = [];
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    requests.push(request);
+    yield providerEvent(request.requestId, 'tool.call', {
+      callId: `question:${requests.length}`, name: request.tools.find((tool) => tool.inputSchema.properties?.prompt).name,
+      input: { kind: 'question', prompt: 'Which option?', allowFreeform: true },
+    });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel(), preparation.port, 'queued-decision');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:decision-start', 'Ask a question.'));
+  const waiting = await waitForProjection(actor, (value) => value.pendingInteraction !== null);
+  await actor.submit(messageCommand(sessionId, 'command:decision-supplement', 'Additional context.'));
+  const pending = await actor.snapshot();
+  assert.deepEqual(pending.pendingInteraction, waiting.pendingInteraction);
+  assert.equal(pending.queuedInputs[0].status, 'queued');
+  assert.equal(requests.length, 1);
+  await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'interaction.respond',
+    commandId: 'command:decision-response', sessionId, runId: waiting.run.runId,
+    interactionId: waiting.pendingInteraction.interactionId, response: 'Option A.' });
+  const nextWaiting = await waitForProjection(actor, (value) => value.pendingInteraction?.interactionId !== waiting.pendingInteraction.interactionId && value.pendingInteraction !== null);
+  assert.equal(requests.length, 2);
+  const messages = requests[1].messages;
+  assert.ok(messages.findIndex((message) => message.role === 'tool') < messages.findIndex((message) => message.content === 'Additional context.'));
+  assert.deepEqual(nextWaiting.queuedInputs, []);
+  await actor.submit(messageCommand(sessionId, 'command:decision-cancelled-input', 'Do not lose this text.'));
+  await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'run.cancel',
+    commandId: 'command:decision-cancel', sessionId, runId: nextWaiting.run.runId });
+  const cancelled = await actor.snapshot();
+  assert.equal(cancelled.run.status, 'cancelled');
+  assert.deepEqual(cancelled.queuedInputs.map(({ text, status }) => ({ text, status })), [{ text: 'Do not lose this text.', status: 'notApplied' }]);
+  const events = await readEvents(journal, sessionId);
+  assert.equal(events.some((event) => event.type === 'input.accepted' && event.payload.commandId === 'command:decision-cancelled-input'), false);
+  assert.equal(requests.length, 2);
+  const delayed = await actor.submit({ ...messageCommand(sessionId, 'command:late-after-cancel', 'Delayed queued input.'), runId: nextWaiting.run.runId });
+  assert.equal(delayed.status, 'rejected');
+  assert.equal(delayed.error.code, 'queued_input_run_unavailable');
+  assert.equal((await actor.snapshot()).run.runId, nextWaiting.run.runId);
+  await actor.submit(messageCommand(sessionId, 'command:decision-new-run', 'Start a separate task.'));
+  const newRun = await waitForProjection(actor, (value) => value.pendingInteraction !== null);
+  assert.notEqual(newRun.run.runId, nextWaiting.run.runId);
+  assert.equal(requests[2].messages.some((message) => message.content === 'Do not lose this text.'), false);
+  assert.equal(newRun.queuedInputs[0].status, 'notApplied');
+  const stale = await actor.submit({ ...messageCommand(sessionId, 'command:late-during-new-run', 'Stale queued input.'), runId: nextWaiting.run.runId });
+  assert.equal(stale.status, 'rejected');
+  assert.equal(stale.error.code, 'queued_input_run_unavailable');
+  assert.equal((await actor.snapshot()).queuedInputs.length, 1);
+  await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'run.cancel',
+    commandId: 'command:decision-new-cancel', sessionId, runId: newRun.run.runId });
+});
 
 test('Kernel stream delivers progress before the terminal reply and rejects a missing reply', async () => {
   const { HttpKernelPort } = await import('../dist/local-agent/httpPorts.js');
@@ -1852,14 +2007,12 @@ test('Session service owns Host activity through background completion', async (
   const service = new SessionService(journal, {
     async create() {
       return { composition: {
-        contextProviders: [],
-        provider: { async *stream(request) {
+          provider: { async *stream(request) {
           await held;
           yield providerEvent(request.requestId, 'text.delta', { text: 'Background work completed.' });
           yield providerEvent(request.requestId, 'completed', {});
         } },
-        memory: { id: 'memory.complete', select: ({ messages }) => messages },
-        observers: [], kernel: emptyKernel(), runPreparation: preparation.port,
+          kernel: emptyKernel(), runPreparation: preparation.port,
         async dispose() {},
       } };
     },
@@ -1899,11 +2052,8 @@ test('deletion remains available while an unloadable actor rolls back cleanly', 
     async create() {
       return {
         composition: {
-          contextProviders: [],
-          provider: { async *stream() { throw new Error('unexpected_provider_turn'); } },
-          memory: { id: 'memory.complete', select: ({ messages }) => messages },
-          observers: [],
-          kernel: emptyKernel(),
+              provider: { async *stream() { throw new Error('unexpected_provider_turn'); } },
+                  kernel: emptyKernel(),
           runPreparation: preparation.port,
           async dispose() { disposeCount += 1; },
         },
@@ -3747,6 +3897,8 @@ test('Kernel infrastructure errors remain run failures rather than correctable i
 test('the real Session bridge persists model commands and passes effort through message and focus preparation', { timeout: 15_000 }, async (t) => {
   const journal = new InMemoryCommandJournal();
   const prepared = [];
+  let releaseHeldPreparation;
+  const heldPreparation = new Promise((resolve) => { releaseHeldPreparation = resolve; });
   const server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url, 'http://fixture');
@@ -3763,6 +3915,7 @@ test('the real Session bridge persists model commands and passes effort through 
       else if (url.pathname === '/api/local-agent/journal/commands') data = await journal.commitCommand(input.command, input.events, input.reply);
       else if (url.pathname === '/api/local-agent/runtime/prepare-run') {
         prepared.push(input);
+        if (input.sessionId === 'session:bridge-held') await heldPreparation;
         response.writeHead(422, { 'content-type': 'application/json' });
         response.end(JSON.stringify({ ok: false, error: 'fixture_prepare_boundary', message: 'Preparation reached; no Provider is started.' }));
         return;
@@ -3785,6 +3938,7 @@ test('the real Session bridge persists model commands and passes effort through 
   const lines = createInterface({ input: child.stdout });
   const frames = lines[Symbol.asyncIterator]();
   t.after(async () => {
+    releaseHeldPreparation();
     if (child.exitCode === null) child.kill();
     lines.close();
     server.closeAllConnections();
@@ -3800,6 +3954,16 @@ test('the real Session bridge persists model commands and passes effort through 
     assert.equal(reply.requestId, requestId);
     return reply;
   };
+  // A request at the frame limit and another valid request may share a pipe write.
+  // The limit belongs to each JSON line, not to an OS read or to the trailing LF.
+  const fullRequest = { protocolVersion: 'deepcode.local-agent', requestId: 'bridge-limit', operation: 'health', data: { padding: '' } };
+  fullRequest.data.padding = 'x'.repeat(1024 * 1024 - Buffer.byteLength(JSON.stringify(fullRequest)));
+  const encodedFull = JSON.stringify(fullRequest);
+  assert.equal(Buffer.byteLength(encodedFull), 1024 * 1024);
+  child.stdin.write(`${encodedFull}\n${JSON.stringify({ ...fullRequest, requestId: 'bridge-next', data: { padding: '下一个🙂' } })}\n`);
+  const healthReplies = [JSON.parse((await frames.next()).value), JSON.parse((await frames.next()).value)];
+  assert.deepEqual(new Set(healthReplies.map((reply) => reply.requestId)), new Set(['bridge-limit', 'bridge-next']));
+  assert.ok(healthReplies.every((reply) => reply.ok && reply.data.state === 'ready'));
   const sessionId = 'session:bridge-settings';
   assert.equal((await send('createSession', { sessionId, displayTitle: 'Bridge fixture', workspaceBindings: [] })).ok, true);
   const command = { schemaVersion: 'deepcode.command.v3', type: 'session.model-settings.set', commandId: 'command:wire-settings', sessionId, settings: { profileId: 'profile:wire', reasoningEffortOverride: 'medium' } };
@@ -3815,6 +3979,19 @@ test('the real Session bridge persists model commands and passes effort through 
     assert.match(JSON.stringify(reply.error), /fixture_prepare_boundary/);
   }
   assert.deepEqual(prepared.map((request) => [request.profileId, request.reasoningEffortOverride]), [['profile:wire', 'low'], ['profile:wire', 'low']]);
+  const heldSessionId = 'session:bridge-held';
+  assert.equal((await send('createSession', { sessionId: heldSessionId, displayTitle: 'Held preparation', workspaceBindings: [] })).ok, true);
+  child.stdin.write(`${JSON.stringify({ protocolVersion: 'deepcode.local-agent', requestId: 'bridge-held', operation: 'submit',
+    data: { command: messageCommand(heldSessionId, 'command:bridge-held', 'Prepare this run.') } })}\n`);
+  await waitUntil(() => prepared.some((request) => request.sessionId === heldSessionId), 'one Session holds its prepare request');
+  // Independent Session reads and commands must finish before that preparation.
+  assert.equal((await send('snapshot', { sessionId })).data.sessionId, sessionId);
+  assert.equal((await send('submit', { command: { ...command, commandId: 'command:wire-concurrent',
+    settings: { profileId: 'profile:wire', reasoningEffortOverride: 'high' } } })).ok, true);
+  releaseHeldPreparation();
+  const heldReply = JSON.parse((await frames.next()).value);
+  assert.equal(heldReply.requestId, 'bridge-held');
+  assert.match(JSON.stringify(heldReply.error), /fixture_prepare_boundary/);
   assert.equal((await send('shutdown', {})).ok, true);
   await once(child, 'exit');
   assert.equal(child.exitCode, 0, stderr);

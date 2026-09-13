@@ -20,8 +20,6 @@ import {
 import { LoopFailure } from './loopFailure.js';
 import type {
   ContextMessageContribution,
-  ContextProvider,
-  MemoryProvider,
 } from './plugins.js';
 import {
   canonicalJsonValue,
@@ -57,8 +55,6 @@ export async function buildAgentProviderRequest(input: {
   events: readonly SessionEvent[];
   responseConstraint: 'normal' | 'toolRequired';
   workspaceBindings: readonly WorkspaceBindingDisplay[];
-  contextProviders: readonly ContextProvider[];
-  memory: MemoryProvider;
   providerRequestId: string;
 }): Promise<PreparedProviderRequest> {
   const toolTerminals = new Set(input.events.flatMap((event) => (
@@ -99,16 +95,6 @@ export async function buildAgentProviderRequest(input: {
     input.workspaceBindings,
   );
   const journalMessages = messagesFromJournal(input.events, input.runId, input.workspaceBindings);
-  const contextMessages = (
-    await Promise.all(input.contextProviders.map(async (provider) => (
-      await provider.provide({ sessionId: input.sessionId, events: input.events })
-    ).map<ContextMessageContribution>((message, index) => ({
-      contributionId: `context-provider:${provider.id}:${index}`,
-      contributionKind: 'contextProviders',
-      label: provider.id,
-      message: cloneModelMessage(message),
-    }))))
-  ).flat();
   const instructions = [...input.runtime.instructions]
     .sort((left, right) => left.id.localeCompare(right.id, 'en'))
     .map<ContextMessageContribution>((instruction) => ({
@@ -162,10 +148,7 @@ export async function buildAgentProviderRequest(input: {
         : 'Current Session workspace bindings: []. Workspace-scoped filesystem and Bash tools are unavailable for this run.',
     },
   });
-  const selected = await input.memory.select({
-    events: input.events,
-    messages: [...instructions, ...contextMessages, ...journalMessages],
-  });
+  const selected = [...instructions, ...journalMessages];
   assertContextContributions(selected);
   const journalCodecsByCallId = providerMessageCodecsByCallId(input.events);
   const providerSelected = selected.map<ContextMessageContribution>((contribution) => ({

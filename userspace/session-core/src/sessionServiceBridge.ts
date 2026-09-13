@@ -10,11 +10,6 @@ import {
   HttpProviderPort,
   HttpRunPreparationPort,
 } from './local-agent/httpPorts.js';
-import {
-  completeMemoryProvider,
-  composeAgent,
-  type AgentPlugin,
-} from './local-agent/plugins.js';
 import { SessionService } from './local-agent/service.js';
 import { decodeConversationReadQuery } from './local-agent/conversationRead.js';
 
@@ -60,63 +55,48 @@ Be concise and use standard Markdown with clear file paths. Preserve technical t
     serviceToken,
     stableCoreInstructions,
   });
-  const serviceAbort = new AbortController();
-  const plugins: readonly AgentPlugin[] = [
-    {
-      id: 'deepcode.core.provider',
-      setup: () => ({
-        providerAdapters: [{ id: 'provider.configured', port: provider }],
-      }),
-    },
-    {
-      id: 'deepcode.core.memory',
-      setup: () => ({ memoryProviders: [completeMemoryProvider] }),
-    },
-  ];
   const service = new SessionService(journal, {
-    create: async ({ workspaceBindings }) => ({
-      composition: await composeAgent({
-        plugins,
-        workspaceBindings,
-        providerId: 'provider.configured',
-        memoryId: completeMemoryProvider.id,
-        kernel,
-        runPreparation,
-        signal: serviceAbort.signal,
-      }),
+    create: async () => ({
+      composition: { provider, kernel, runPreparation, async dispose() {} },
     }),
   });
 
-  let shutdownRequested = false;
+  let shutdownRequest: BridgeRequest | undefined;
+  const pending = new Set<Promise<void>>();
   try {
     for await (const line of readLines()) {
       const request = decodeRequest(line);
-      try {
-        const data = await dispatch(service, request);
-        await writeFrame({
-          protocolVersion: LOCAL_AGENT_PROTOCOL_VERSION,
-          requestId: request.requestId,
-          ok: true,
-          data,
-        });
-        if (request.operation === 'shutdown') {
-          shutdownRequested = true;
-          break;
-        }
-      } catch (error) {
-        await writeFrame({
-          protocolVersion: LOCAL_AGENT_PROTOCOL_VERSION,
-          requestId: request.requestId,
-          ok: false,
-          error: bridgeError(error),
-        });
+      if (request.operation === 'shutdown') {
+        shutdownRequest = request;
+        break;
       }
+      const task = (async () => {
+        try {
+          const data = await dispatch(service, request);
+          await writeFrame({
+            protocolVersion: LOCAL_AGENT_PROTOCOL_VERSION,
+            requestId: request.requestId, ok: true, data,
+          });
+        } catch (error) {
+          await writeFrame({
+            protocolVersion: LOCAL_AGENT_PROTOCOL_VERSION,
+            requestId: request.requestId, ok: false, error: bridgeError(error),
+          });
+        }
+      })();
+      pending.add(task);
+      void task.finally(() => pending.delete(task)).catch(() => undefined);
     }
   } finally {
-    serviceAbort.abort('session_service_stopped');
+    await Promise.allSettled(pending);
     await service.dispose();
+    await outputTail;
   }
-  if (!shutdownRequested) throw new Error('session_service_input_closed');
+  if (!shutdownRequest) throw new Error('session_service_input_closed');
+  await writeFrame({
+    protocolVersion: LOCAL_AGENT_PROTOCOL_VERSION,
+    requestId: shutdownRequest.requestId, ok: true, data: { stopped: true },
+  });
 }
 
 async function dispatch(
@@ -204,9 +184,10 @@ function decodeCommand(value: unknown): ConversationCommand {
           value,
           ['schemaVersion', 'type', 'commandId', 'sessionId', 'text'],
           [
-            'filesystemReferences', 'profileId', 'reasoningEffortOverride', 'pluginCatalogRevision', 'pluginSelections',
+            'runId', 'filesystemReferences', 'profileId', 'reasoningEffortOverride', 'pluginCatalogRevision', 'pluginSelections',
           ],
         )
+        || (value.runId !== undefined && !validId(value.runId))
         || typeof value.text !== 'string'
         || (value.filesystemReferences !== undefined
           && !isFilesystemReferenceArray(value.filesystemReferences))
@@ -427,17 +408,20 @@ async function* readLines(): AsyncGenerator<string> {
   for await (const chunk of process.stdin) {
     const value = chunkBytes(chunk);
     bytes += value.byteLength;
-    if (bytes > MAX_REQUEST_BYTES) throw new Error('session_service_request_too_large');
     buffered += decoder.decode(value, { stream: true });
     while (true) {
       const newline = buffered.indexOf('\n');
       if (newline < 0) break;
-      const line = buffered.slice(0, newline).replace(/\r$/u, '');
+      const raw = buffered.slice(0, newline);
+      const line = raw.replace(/\r$/u, '');
+      if (new TextEncoder().encode(line).byteLength > MAX_REQUEST_BYTES) throw new Error('session_service_request_too_large');
       buffered = buffered.slice(newline + 1);
-      bytes = new TextEncoder().encode(buffered).byteLength;
+      bytes -= new TextEncoder().encode(raw).byteLength + 1;
       if (!line) throw new Error('session_service_request_empty');
       yield line;
     }
+    // One optional CR may precede the next LF; incomplete UTF-8 bytes still count.
+    if (bytes > MAX_REQUEST_BYTES + (buffered.endsWith('\r') ? 1 : 0)) throw new Error('session_service_request_too_large');
   }
   buffered += decoder.decode();
   if (buffered) throw new Error('session_service_request_unterminated');
