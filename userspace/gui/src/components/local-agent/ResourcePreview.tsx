@@ -71,20 +71,23 @@ export function useResourcePreview(sessionId: string | null) {
 
 export function ResourcePreview({ language, preview }: { language: UiLanguage; preview: ReturnType<typeof useResourcePreview> }) {
   const { resourcePreview, closeResourcePreview } = preview;
-  return resourcePreview && (
-    <div
-      className="local-agent__resource-overlay"
-      role="presentation"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) closeResourcePreview();
-      }}
-    >
-      <section
+  const dialog = useRef<HTMLDialogElement>(null);
+  const open = resourcePreview !== null;
+  useEffect(() => {
+    const element = dialog.current;
+    if (!element || !open) return;
+    element.showModal();
+    return () => element.close();
+  }, [open]);
+  return (
+      <dialog
+        ref={dialog}
         className="local-agent__resource-dialog"
-        role="dialog"
-        aria-modal="true"
         aria-label={t(language, 'agent.resource.preview')}
+        onClose={() => { if (!dialog.current?.open) closeResourcePreview(); }}
+        onClick={(event) => { if (event.target === event.currentTarget) closeResourcePreview(); }}
       >
+        {resourcePreview && <>
         <header>
           <div>
             <strong>{resourcePreview.logicalPath}</strong>
@@ -118,7 +121,7 @@ export function ResourcePreview({ language, preview }: { language: UiLanguage; p
             </>
           )}
         </div>
-      </section>
-    </div>
+        </>}
+      </dialog>
   );
 }

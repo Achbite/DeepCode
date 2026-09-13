@@ -113,7 +113,16 @@ details:not([open]) > summary > .conversation-disclosure-chevron, .conversation-
 .conversation-changes--compact .conversation-change-list { display: none; position: absolute; left: 0; top: 100%; z-index: 12; width: min(440px, 65vw); max-height: 240px; overflow: auto; scrollbar-width: thin; background: var(--dc-surface); border: 1px solid var(--dc-border); border-radius: 10px; box-shadow: 0 6px 20px #0002; }
 .conversation-changes--compact:hover .conversation-change-list, .conversation-changes--compact:focus-within .conversation-change-list, .conversation-changes--compact.is-expanded .conversation-change-list { display: block; }
 .local-agent__tool-entry-details .conversation-changes--compact .conversation-change-list { position: static; max-width: 100%; }
-.local-agent__resource-overlay.conversation-diff-overlay { position: fixed; z-index: 1000; padding: 24px; }
+.conversation-diff-overlay {
+  position: fixed;
+  z-index: 1000;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--dc-background) 54%, transparent);
+  backdrop-filter: blur(3px);
+}
 .conversation-diff-dialog { display: flex; flex-direction: column; width: min(1040px, calc(100vw - 48px)); height: min(740px, 82vh); min-height: 200px; overflow: hidden; background: var(--dc-surface); color: var(--dc-foreground); border: 1px solid var(--dc-border); border-radius: 14px; box-shadow: 0 16px 56px #0003; }
 .conversation-diff-header { display: flex; align-items: center; gap: 12px; min-height: 54px; padding: 10px 14px; border-bottom: 1px solid var(--dc-border); flex: none; box-sizing: border-box; }
 .conversation-diff-header > svg { width: 17px; height: 17px; flex: none; color: var(--dc-muted); }

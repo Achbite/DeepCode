@@ -357,6 +357,7 @@ function decodeProjection(value: unknown): SessionProjection {
       'sessionDirectoryIndexes',
       'timeline',
       'messages',
+      'queuedInputs',
       'narratives',
       'assistantDraft',
       'pendingInteraction',
@@ -384,6 +385,7 @@ function decodeProjection(value: unknown): SessionProjection {
     || !isWorkspaceBindings(value.sessionDirectoryIndexes)
     || !isArrayOf(value.timeline, isTimelineItem)
     || !isArrayOf(value.messages, isProjectionMessage)
+    || !isArrayOf(value.queuedInputs, isQueuedInput)
     || !isArrayOf(value.narratives, isNarrative)
     || !isNullable(value.assistantDraft, isAssistantDraft)
     || !isNullable(value.pendingInteraction, isInteraction)
@@ -477,6 +479,16 @@ function isTimelineItem(value: unknown): boolean {
     default:
       return false;
   }
+}
+
+function isQueuedInput(value: unknown): boolean {
+  return isExactRecord(value, ['commandId', 'messageId', 'runId', 'text', 'filesystemReferences', 'pluginSelections', 'sequence', 'createdAt', 'status'])
+    && isIdentifier(value.commandId) && isIdentifier(value.messageId) && isIdentifier(value.runId)
+    && typeof value.text === 'string'
+    && isArrayOf(value.filesystemReferences, isFilesystemReference)
+    && isArrayOf(value.pluginSelections, isPluginSelection)
+    && isPositiveNaturalNumber(value.sequence) && isNonEmptyText(value.createdAt)
+    && (value.status === 'queued' || value.status === 'notApplied');
 }
 
 function timelineReferencesAreValid(
@@ -612,7 +624,7 @@ function decodePluginCatalog(value: unknown): PluginCatalogProjection {
           'uri', 'displayName', 'shortDescription', 'activationMediaTypes',
           'enabled', 'available',
         ],
-        ['iconRef'],
+        ['iconRef', 'error'],
       )
       || typeof plugin.uri !== 'string'
       || !/^plugin:\/\/[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(plugin.uri)
@@ -622,8 +634,9 @@ function decodePluginCatalog(value: unknown): PluginCatalogProjection {
       || (plugin.iconRef !== undefined && !isNonEmptyText(plugin.iconRef))
       || !isArrayOf(plugin.activationMediaTypes, isMediaType)
       || new Set(plugin.activationMediaTypes).size !== plugin.activationMediaTypes.length
-      || plugin.enabled !== true
-      || plugin.available !== true
+      || typeof plugin.enabled !== 'boolean'
+      || typeof plugin.available !== 'boolean'
+      || (plugin.error !== undefined && !isLocalAgentError(plugin.error))
     ) throw new Error('plugin_catalog_invalid');
     uris.add(plugin.uri);
   }
@@ -1333,7 +1346,8 @@ function isProviderHostedActivity(value: unknown): boolean {
 }
 
 function isToolActivity(value: unknown, activityStatus: string): boolean {
-  return isExactRecord(value, ['operation', 'resources'], ['shell', 'fileChanges', 'recordId'])
+  return isExactRecord(value, ['operation', 'resources'], ['shell', 'fileChanges', 'recordId', 'error'])
+    && (value.error === undefined || isLocalAgentError(value.error))
     && (value.recordId === undefined || isIdentifier(value.recordId))
     && isNonEmptyText(value.operation)
     && isArrayOf(value.resources, isActivityResource)

@@ -228,11 +228,6 @@
   letter-spacing: 0;
 }
 
-:root[data-product='deepcode-gui'] :is(button, input, select, textarea, [tabindex]):focus-visible {
-  outline: none;
-  outline-offset: 2px;
-}
-
 @media (prefers-reduced-motion: reduce) {
   :root[data-product='deepcode-gui'] *,
   :root[data-product='deepcode-gui'] *::before,

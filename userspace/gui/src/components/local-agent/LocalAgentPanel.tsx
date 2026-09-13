@@ -145,7 +145,6 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
         language={language}
         composer={composer}
         uiActionError={uiActionError}
-        presentationStatus={presentation.snapshot.status}
       />
       <ResourcePreview language={language} preview={resourcePreview} />
       {composer.attachmentDialogOpen && (

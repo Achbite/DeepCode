@@ -2,12 +2,10 @@ import React, { useEffect, useState } from 'react';
 import type { ActivityProjection, AssistantDraftBlockProjection, ProviderHostedActivityProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
-import { useConversationHost } from './ConversationHost';
 import { FileChanges } from './FileChanges';
 import { useConversationRowState } from './ConversationVirtualRow';
 
 interface ToolActivityGroupProps {
-  sessionId: string;
   activities: ActivityProjection[];
   language: UiLanguage;
   onExpand(): void;
@@ -67,7 +65,6 @@ export const ProviderHostedDraftGroup: React.FC<ProviderHostedDraftGroupProps> =
 };
 
 export const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
-  sessionId,
   activities,
   language,
   onExpand,
@@ -109,7 +106,6 @@ export const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
         <div className="local-agent__tool-group-items">
           {activities.map((activity) => (
             <ToolActivityEntry
-              sessionId={sessionId}
               activity={activity}
               key={activity.activityId}
               language={language}
@@ -188,7 +184,6 @@ const ProviderHostedEntry: React.FC<ProviderHostedEntryProps> = ({ hosted, statu
 };
 
 interface ToolActivityEntryProps {
-  sessionId: string;
   activity: ActivityProjection;
   language: UiLanguage;
   onExpand(): void;
@@ -196,7 +191,6 @@ interface ToolActivityEntryProps {
 }
 
 const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
-  sessionId,
   activity,
   language,
   onExpand,
@@ -204,26 +198,6 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
 }) => {
   const [expanded, setExpanded] = useConversationRowState(`tool:${activity.activityId}:expanded`, false);
   const tool = activity.tool;
-  const { readConversation } = useConversationHost();
-  const recordId = tool?.recordId;
-  const [detail, setDetail] = useConversationRowState<{ recordId: string; error: string; truncated: boolean } | null>(`tool:${activity.activityId}:detail`, null);
-  const [readError, setReadError] = useState('');
-  const needsError = ['failed', 'denied', 'indeterminate'].includes(activity.status) && Boolean(recordId);
-  useEffect(() => {
-    if (!expanded || !needsError || !recordId || detail?.recordId === recordId) return;
-    const controller = new AbortController();
-    setReadError('');
-    void readConversation(sessionId, { view: 'tools', recordId }, controller.signal).then((page) => {
-      if (controller.signal.aborted) return;
-      const record = page.items.find((item) => item.recordId === recordId);
-      if (!record) throw new Error('tool_record_not_found');
-      const error = record.error;
-      setDetail({ recordId, error: error && typeof error === 'object' && !Array.isArray(error)
-        && 'content' in error && typeof error.content === 'string' ? error.content : '',
-        truncated: Boolean(error && typeof error === 'object' && !Array.isArray(error) && 'truncated' in error && error.truncated) });
-    }).catch((error: unknown) => { if (!controller.signal.aborted) setReadError(String(error)); });
-    return () => controller.abort();
-  }, [expanded, needsError, recordId, detail?.recordId, sessionId, readConversation]);
   const shell = tool?.shell;
   const result = shell?.result;
   const resources = tool?.resources.filter((resource) => !(resource.kind === 'workspacePath'
@@ -261,6 +235,7 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
           <DeepCodeShellIcon name="chevronRight" />
         </span>
       </button>
+      {tool?.error && <p className="local-agent__tool-error" role="status"><code>{tool.error.code}</code>: {tool.error.message}</p>}
       {expanded && (
         <div className="local-agent__tool-entry-details">
           <FileChanges activities={[activity]} compact />
@@ -299,12 +274,6 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
               </>
             )}
           </dl>
-          {needsError && <section className="local-agent__tool-error">
-            <span>{t(language, 'agent.tool.detail.error')}</span>
-            {readError ? <pre role="alert">{readError}</pre> : !detail || detail.recordId !== recordId
-              ? <span>{t(language, 'agent.tool.detail.loading')}</span>
-              : <><pre>{detail.error}</pre>{detail.truncated && <small>{t(language, 'agent.tool.detail.truncated')}</small>}</>}
-          </section>}
           {activity.interruption && <p role="status">{activity.interruption.message}</p>}
           {activity.inputRejection && (
             <div className="local-agent__input-rejection">
