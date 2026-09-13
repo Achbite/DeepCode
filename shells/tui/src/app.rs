@@ -171,7 +171,7 @@ impl TuiApp {
                 self.tasks_open = false;
                 self.resource_preview = None;
                 self.detail_scroll = 0;
-                self.detail_preview = Some("DeepCode 命令\n\n@ 选择下一次请求的插件\n/tasks 查看任务\n/context 查看上下文\n/focus <task> 开始任务\n/model <profile> 选择后续请求的模型\n/attach <path> 附加目录\n/detach <workspace-id> 移除目录索引\n/open <workspace-id> <logical-path> 读取文件\n/next 继续读取\n/diff <record-id> <index> 查看修改\n/reasoning 开关推理详情\n/reasoning <request-id> 按需读取推理\n/cancel 取消运行\n/cancel-plan 取消计划\n/close 返回会话\n/clear 清空输入\n/show 查看会话信息\n/quit 退出\n\nPgUp / PgDn 滚动当前视图；计划输入 1/确认。".into());
+                self.detail_preview = Some("DeepCode 命令\n\n@ 选择下一次请求的插件\n/tasks 查看任务\n/context 查看上下文\n/focus <task> 开始任务\n/model <profile> 选择后续请求的模型\n/attach <path> 附加目录\n/detach <workspace-id> 移除目录索引\n/open <workspace-id> <logical-path> 读取文件\n/next 继续读取\n/diff <record-id> <index> 查看修改\n/reasoning 开关推理详情\n/reasoning <request-id> 按需读取推理\n/cancel 取消运行\n/cancel-plan 取消计划\n/close 返回会话\n/clear 清空输入\n/show 查看会话信息\n/quit 退出\n\nPgUp / PgDn 滚动当前视图；普通消息随时排队；/reply <答复> 回应交互或修订计划，/reply 1 确认计划。".into());
             }
             "/show" => self.status = self.projection_label(),
             "/clear" => {
@@ -217,7 +217,12 @@ impl TuiApp {
             value if value.starts_with("/model ") => {
                 self.select_model(value.trim_start_matches("/model ").trim())
             }
-            value if value == "/focus" || value.starts_with("/focus ") => {
+            value
+                if value == "/focus"
+                    || value.starts_with("/focus ")
+                    || value == "/reply"
+                    || value.starts_with("/reply ") =>
+            {
                 self.submit_contextual_input(value).await
             }
             value if value.starts_with('/') => self.status = format!("未知命令：{value}"),
@@ -233,27 +238,65 @@ impl TuiApp {
             return;
         };
         let session_id = projection.session_id.clone();
-        let mut consumes_plugins = false;
-        let command = if let Some(approval) = projection.pending_approval.as_ref() {
-            let decision = match approval_decision_for_input(text) {
-                Ok(decision) => decision,
-                Err(message) => {
-                    self.status = message;
-                    return;
-                }
-            };
-            approval_response_command(&session_id, &new_id("command"), approval, decision)
-        } else if let Some(plan) = projection.pending_plan.as_ref() {
-            if is_plan_confirmation_input(text) {
-                plan_confirm_command(&session_id, &new_id("command"), plan)
-            } else {
-                plan_revision_command(&session_id, &new_id("command"), plan, text)
+        let command = match self.contextual_input_command(projection, text) {
+            Ok(command) => command,
+            Err(error) => {
+                self.status = error;
+                return;
             }
-        } else if let Some(interaction) = projection.pending_interaction.as_ref() {
-            let response = interaction_response_for_input(interaction, text);
-            interaction_response_command(&session_id, &new_id("command"), interaction, &response)
+        };
+        if self
+            .submit_command(&session_id, command, "消息提交失败")
+            .await
+            && text != "/reply"
+            && !text.starts_with("/reply ")
+        {
+            self.clear_plugin_selections();
+        }
+    }
+
+    fn contextual_input_command(
+        &self,
+        projection: &SessionProjection,
+        text: &str,
+    ) -> Result<serde_json::Value, String> {
+        let session_id = projection.session_id.clone();
+        let is_reply = text == "/reply" || text.starts_with("/reply ");
+        let command = if is_reply {
+            let response = text.strip_prefix("/reply").unwrap().trim();
+            if response.is_empty() {
+                return Err("用法：/reply <答复、确认或修订说明>".into());
+            }
+            if let Some(approval) = projection.pending_approval.as_ref() {
+                let decision = approval_decision_for_input(response)?;
+                approval_response_command(&session_id, &new_id("command"), approval, decision)
+            } else if let Some(plan) = projection.pending_plan.as_ref() {
+                if is_plan_confirmation_input(response) {
+                    plan_confirm_command(&session_id, &new_id("command"), plan)
+                } else {
+                    plan_revision_command(&session_id, &new_id("command"), plan, response)
+                }
+            } else if let Some(interaction) = projection.pending_interaction.as_ref() {
+                let response = interaction_response_for_input(interaction, response);
+                interaction_response_command(
+                    &session_id,
+                    &new_id("command"),
+                    interaction,
+                    &response,
+                )
+            } else {
+                return Err("当前没有等待答复的 Plan、交互或 effect 审批。".into());
+            }
         } else {
-            consumes_plugins = true;
+            let active_run = projection
+                .run
+                .as_ref()
+                .filter(|run| matches!(run.status.as_str(), "running" | "waiting"));
+            let profile_id = if active_run.is_some() {
+                None
+            } else {
+                self.next_message_profile_id.as_deref()
+            };
             let catalog_revision = self
                 .plugin_catalog
                 .as_ref()
@@ -261,37 +304,34 @@ impl TuiApp {
                 .unwrap_or("");
             if let Some(task) = focus_task(text) {
                 let Some(task) = task else {
-                    self.status = "/focus 需要非空任务正文。".to_string();
-                    return;
+                    return Err("/focus 需要非空任务正文。".to_string());
                 };
                 focus_command(
                     &session_id,
                     &new_id("command"),
                     task,
-                    self.next_message_profile_id.as_deref(),
+                    profile_id,
                     &[],
                     catalog_revision,
                     &self.selected_plugins,
                 )
             } else {
-                message_command_with_profile_and_plugins(
+                let mut command = message_command_with_profile_and_plugins(
                     &session_id,
                     &new_id("command"),
                     text,
-                    self.next_message_profile_id.as_deref(),
+                    profile_id,
                     &[],
                     catalog_revision,
                     &self.selected_plugins,
-                )
+                );
+                if let Some(run) = active_run {
+                    command["runId"] = json!(run.run_id);
+                }
+                command
             }
         };
-        if self
-            .submit_command(&session_id, command, "消息提交失败")
-            .await
-            && consumes_plugins
-        {
-            self.clear_plugin_selections();
-        }
+        Ok(command)
     }
 
     pub async fn cancel_plan(&mut self) {
@@ -568,11 +608,14 @@ impl TuiApp {
     pub fn action_required(&self) -> Option<String> {
         self.projection.as_ref().and_then(|projection| {
             if projection.pending_plan.is_some() {
-                Some("Agent 正在等待 Plan 确认、修订说明或显式取消。".to_string())
+                Some(
+                    "Agent 正在等待 /reply 1 确认 Plan、/reply <修订说明> 或 /cancel-plan。"
+                        .to_string(),
+                )
             } else if projection.pending_interaction.is_some() {
-                Some("Agent 正在等待你回答中间问题。".to_string())
+                Some("Agent 正在等待 /reply <答复> 回答中间问题。".to_string())
             } else if projection.pending_approval.is_some() {
-                Some("Agent 正在等待 effect 允许或拒绝。".to_string())
+                Some("Agent 正在等待 /reply 1 允许或 /reply 2 拒绝 effect。".to_string())
             } else {
                 None
             }
@@ -730,6 +773,10 @@ impl TuiApp {
         else {
             return false;
         };
+        if let Some(error) = plugin_unavailable_reason(&plugin) {
+            self.status = error;
+            return true;
+        }
         self.input.truncate(picker.trigger_start);
         if self
             .selected_plugins
@@ -776,7 +823,8 @@ impl TuiApp {
                     .iter()
                     .any(|selection| selection.uri == plugin.uri),
                 display_name: plugin.display_name.clone(),
-                short_description: plugin.short_description.clone(),
+                short_description: plugin_unavailable_reason(plugin)
+                    .unwrap_or_else(|| plugin.short_description.clone()),
                 uri: plugin.uri.clone(),
                 highlighted: index == selected_index,
             })
@@ -794,12 +842,6 @@ impl TuiApp {
             .iter()
             .map(|selection| selection.label.as_str())
             .collect()
-    }
-
-    pub fn has_pending_plan(&self) -> bool {
-        self.projection
-            .as_ref()
-            .is_some_and(|projection| projection.pending_plan.is_some())
     }
 
     pub fn is_run_pending(&self) -> bool {
@@ -865,7 +907,11 @@ impl TuiApp {
                             catalog
                                 .plugins
                                 .iter()
-                                .map(|plugin| format!("{} ({})", plugin.display_name, plugin.uri))
+                                .map(|plugin| {
+                                    plugin_unavailable_reason(plugin).unwrap_or_else(|| {
+                                        format!("{} ({})", plugin.display_name, plugin.uri)
+                                    })
+                                })
                                 .collect::<Vec<_>>()
                                 .join("；")
                         })
@@ -873,7 +919,7 @@ impl TuiApp {
                     self.status = if labels.is_empty() {
                         "当前没有可用插件。".to_string()
                     } else {
-                        format!("可用插件：{labels}")
+                        format!("插件目录：{labels}")
                     };
                 }
                 Err(error) => self.status = format!("插件目录刷新失败：{error}"),
@@ -893,6 +939,10 @@ impl TuiApp {
             self.status = format!("未选择插件：没有精确匹配 {query}；输入 @ 查看候选。");
             return;
         };
+        if let Some(error) = plugin_unavailable_reason(&plugin) {
+            self.status = error;
+            return;
+        }
         if self
             .selected_plugins
             .iter()
@@ -965,7 +1015,7 @@ fn approval_decision_for_input(input: &str) -> Result<&'static str, String> {
     match input.trim().to_lowercase().as_str() {
         "1" | "allow" | "允许" | "同意" => Ok("allow"),
         "2" | "deny" | "拒绝" | "不同意" => Ok("deny"),
-        _ => Err("当前等待 effect 裁决：输入 1/允许 或 2/拒绝。".to_string()),
+        _ => Err("当前等待 effect 裁决：输入 /reply 1（允许）或 /reply 2（拒绝）。".to_string()),
     }
 }
 
@@ -1001,6 +1051,9 @@ fn plugin_selections_from_uris(
             .iter()
             .find(|plugin| plugin.uri == *uri)
             .ok_or_else(|| format!("插件不在当前目录中或不可用：{uri}"))?;
+        if let Some(error) = plugin_unavailable_reason(plugin) {
+            return Err(error);
+        }
         selections.push(PluginSelectionInput {
             selection_id: new_id("plugin-selection"),
             uri: plugin.uri.clone(),
@@ -1008,6 +1061,19 @@ fn plugin_selections_from_uris(
         });
     }
     Ok(selections)
+}
+
+fn plugin_unavailable_reason(plugin: &PluginCatalogItem) -> Option<String> {
+    if plugin.available && plugin.enabled {
+        return None;
+    }
+    Some(match &plugin.error {
+        Some(error) => format!(
+            "{}：{} ({})",
+            plugin.display_name, error.message, error.code
+        ),
+        None => format!("插件不可用：{}", plugin.display_name),
+    })
 }
 
 fn plugin_trigger(input: &str) -> Option<usize> {
@@ -1043,4 +1109,116 @@ fn new_id(kind: &str) -> String {
         .as_nanos();
     let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     format!("{kind}:{}:{clock:x}:{sequence:x}", std::process::id())
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+    fn test_app() -> TuiApp {
+        let client = HttpKernelClient::new(
+            deepcode_kernel_client::KernelClientConfig::new("http://127.0.0.1:1")
+                .with_host_shell_token(format!("dchost_{}", "01".repeat(32))),
+        )
+        .unwrap();
+        TuiApp::new(
+            client,
+            Renderer,
+            TuiHostOptions {
+                workspace_path: None,
+                session_id: None,
+                plugin_uris: vec![],
+            },
+        )
+    }
+    fn waiting_projection(field: &str, decision: serde_json::Value) -> SessionProjection {
+        let mut value = json!({
+            "schemaVersion": deepcode_kernel_client::SESSION_PROJECTION_VERSION,
+            "sessionId":"session:test", "revision":1, "display":{"creationTitle":"input"},
+            "workspaceBindings":[], "sessionDirectoryIndexes":[], "timeline":[], "messages":[],
+            "queuedInputs":[], "narratives":[], "plans":[], "contextCompositions":[],
+            "tokenUsageHistory":[], "activities":[], "artifacts":[],
+            "tokenUsage":{"providerCallCount":0,"reportedCallCount":0,"inputTokens":0,"outputTokens":0,
+              "cacheReadInputTokens":0,"cacheMissInputTokens":0,"cacheAvailable":false,"cacheComplete":false},
+            "run":{"runId":"run:test","profileId":"profile:current","workspaceBindings":[],"status":"waiting"}
+        });
+        value[field] = decision;
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn pending_decisions() -> [(
+        &'static str,
+        serde_json::Value,
+        &'static str,
+        &'static str,
+        serde_json::Value,
+    ); 3] {
+        [
+            (
+                "pendingPlan",
+                json!({"planId":"plan:test","revision":1,"runId":"run:test","callId":"call:plan",
+                "title":"Plan","summary":"Review","steps":[],"mutationManifest":[],"status":"published",
+                "responseMode":"confirmReviseOrCancel","sequence":1,"createdAt":"now","updatedAt":"now"}),
+                "plan.respond",
+                "response",
+                json!({"kind":"confirm"}),
+            ),
+            (
+                "pendingInteraction",
+                json!({"interactionId":"interaction:test","runId":"run:test","callId":"call:question",
+                "kind":"question","prompt":"Choose","options":[{"id":"a","label":"Option A"}],
+                "allowFreeform":true,"sequence":1,"createdAt":"now"}),
+                "interaction.respond",
+                "response",
+                json!("Option A"),
+            ),
+            (
+                "pendingApproval",
+                json!({"approvalId":"approval:test","runId":"run:test","callId":"call:effect",
+                "preview":{"summary":"Write","effects":[],"logicalTargets":[]},"sequence":1,"createdAt":"now"}),
+                "approval.respond",
+                "decision",
+                json!("allow"),
+            ),
+        ]
+    }
+    #[test]
+    fn pending_plain_input_queues_while_explicit_reply_keeps_decision_semantics() {
+        for (field, decision, command_type, response_field, expected) in pending_decisions() {
+            let projection = waiting_projection(field, decision);
+            let mut app = test_app();
+            app.next_message_profile_id = Some("profile:next".into());
+            let ordinary = app.contextual_input_command(&projection, "1").unwrap();
+            assert_eq!(ordinary["type"], "message.submit");
+            assert_eq!(ordinary["runId"], "run:test");
+            assert_eq!(ordinary["text"], "1");
+            assert!(ordinary.get("profileId").is_none());
+            let reply = app
+                .contextual_input_command(&projection, "/reply 1")
+                .unwrap();
+            assert_eq!(reply["type"], command_type);
+            assert_eq!(reply[response_field], expected);
+            if field == "pendingPlan" {
+                let revision = app
+                    .contextual_input_command(&projection, "/reply clarify scope")
+                    .unwrap();
+                assert_eq!(
+                    revision["response"],
+                    json!({"kind":"requestRevision","text":"clarify scope"})
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_plugin_selection_preserves_the_catalog_error() {
+        let catalog: PluginCatalogProjection = serde_json::from_value(json!({"revision":"catalog:test", "plugins":[{
+            "uri":"plugin://broken", "displayName":"Broken", "shortDescription":"Broken entry", "activationMediaTypes":[],
+            "enabled":false,"available":false,"error":{"code":"plugin_manifest_invalid","message":"manifest parse failed"}
+        }]})).unwrap();
+        let error = plugin_selections_from_uris(&catalog, &["plugin://broken".into()])
+            .err()
+            .unwrap();
+        assert!(error.contains("plugin_manifest_invalid"));
+        assert!(error.contains("manifest parse failed"));
+    }
 }

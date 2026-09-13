@@ -19,6 +19,7 @@ pub(crate) struct CliRenderState {
     line_open: bool,
     plan_preview: Option<(String, String)>,
     summarized_runs: HashSet<String>,
+    queued_inputs: HashMap<String, String>,
 }
 
 impl CliRenderState {
@@ -40,6 +41,11 @@ impl CliRenderState {
                 .map(|activity| (activity.activity_id.clone(), activity.clone()))
                 .collect(),
             todo: projection.todo_list.clone(),
+            queued_inputs: projection
+                .queued_inputs
+                .iter()
+                .map(|input| (input.message_id.clone(), input.status.clone()))
+                .collect(),
             ..Self::default()
         }
     }
@@ -49,6 +55,22 @@ impl CliRenderState {
         out: &mut impl Write,
         projection: &SessionProjection,
     ) -> io::Result<()> {
+        for input in &projection.queued_inputs {
+            if self.queued_inputs.get(&input.message_id) != Some(&input.status) {
+                self.finish_text(out)?;
+                let status = if input.status == "queued" {
+                    "已排队"
+                } else {
+                    "未执行"
+                };
+                writeln!(out, "{status}: {}", input.text)?;
+                for reference in &input.filesystem_references {
+                    writeln!(out, "  附件：{}", reference.display_name)?;
+                }
+                self.queued_inputs
+                    .insert(input.message_id.clone(), input.status.clone());
+            }
+        }
         // Finish a streamed block before any newly observed status can interrupt it.
         if let Some(active) = self.active_stream.clone() {
             let committed = projection.timeline.iter().find_map(|item| {
@@ -276,19 +298,19 @@ impl CliRenderState {
                 )?;
                 self.plans.insert(key, plan.status.clone());
             }
-            writeln!(out, "输入 1/确认；输入其他非空文本请求修订；显式运行 `deepcode-cli cancel-plan --session {}` 取消。", projection.session_id)?;
+            writeln!(out, "输入 /reply 1 或 /reply 确认；输入 /reply <意见> 请求修订；普通消息继续排队；显式运行 `deepcode-cli cancel-plan --session {}` 取消。", projection.session_id)?;
         }
         if let Some(interaction) = projection.pending_interaction.as_ref() {
             render_interaction(out, interaction)?;
             writeln!(
                 out,
-                "继续：deepcode-cli ask --session {} <response>",
+                "继续：deepcode-cli ask --session {} \"/reply <response>\"",
                 projection.session_id
             )?;
         }
         if let Some(approval) = projection.pending_approval.as_ref() {
             render_approval(out, approval)?;
-            writeln!(out, "继续：输入 1/允许 或 2/拒绝。")?;
+            writeln!(out, "继续：输入 /reply 1 允许或 /reply 2 拒绝。")?;
         }
         out.flush()
     }
@@ -499,7 +521,16 @@ pub(crate) fn render_tool_activity(
     if let Some(error) = &activity.interruption {
         writeln!(out, "  {}: {}", error.code, error.message)?;
     }
+    if let Some(error) = &activity.input_rejection {
+        writeln!(out, "  {}: {}", error.code, error.message)?;
+        for issue in &error.issues {
+            writeln!(out, "  {}: {}", issue.path, issue.message)?;
+        }
+    }
     if let Some(tool) = activity.tool.as_ref() {
+        if let Some(error) = &tool.error {
+            writeln!(out, "  {}: {}", error.code, error.message)?;
+        }
         if let Some(shell) = tool.shell.as_ref() {
             writeln!(out, "  $ {}", shell.command)?;
             writeln!(out, "  cwd: {}", shell.cwd)?;
@@ -746,7 +777,7 @@ mod tests {
             "sessionId": "session:test", "revision": 1,
             "display": {"creationTitle":"CLI display"},
             "workspaceBindings": [], "sessionDirectoryIndexes": [],
-            "timeline": [], "messages": [], "narratives": [], "plans": [],
+            "timeline": [], "messages": [], "queuedInputs": [], "narratives": [], "plans": [],
             "contextCompositions": [], "tokenUsageHistory": [], "activities": [], "artifacts": [],
             "tokenUsage": {"providerCallCount":0,"reportedCallCount":0,"inputTokens":0,"outputTokens":0,
                 "cacheReadInputTokens":0,"cacheMissInputTokens":0,"cacheAvailable":false,"cacheComplete":false},
@@ -818,6 +849,29 @@ mod tests {
             )
             .unwrap(),
         );
+    }
+
+    #[test]
+    fn queued_input_changes_and_tool_errors_remain_visible() {
+        let mut p = projection();
+        p.queued_inputs.push(serde_json::from_value(json!({
+            "commandId":"command:q", "messageId":"message:q", "runId":"run:test", "text":"补充🙂",
+            "filesystemReferences":[], "pluginSelections":[], "sequence":1, "createdAt":"now", "status":"queued"
+        })).unwrap());
+        let mut state = CliRenderState::default();
+        let mut out = Vec::new();
+        state.render(&mut out, &p).unwrap();
+        state.render(&mut out, &p).unwrap();
+        p.queued_inputs[0].status = "notApplied".into();
+        state.render(&mut out, &p).unwrap();
+        let activity = serde_json::from_value(json!({"activityId":"tool:error", "kind":"tool", "status":"failed",
+            "label":"fs.read", "runId":"run:test", "callId":"call:error", "sequence":2,
+            "tool":{"operation":"fs.read", "resources":[], "error":{"code":"fs_read_failed", "message":"original failure"}}})).unwrap();
+        render_tool_activity(&mut out, &p, &activity).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches("已排队: 补充🙂").count(), 1);
+        assert_eq!(text.matches("未执行: 补充🙂").count(), 1);
+        assert!(text.contains("fs_read_failed: original failure"));
     }
 
     #[test]
@@ -933,7 +987,7 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text.matches("审核方案 1").count(), 1);
         assert_eq!(text.matches("审核方案 2").count(), 1);
-        assert_eq!(text.matches("输入 1/确认").count(), 1);
+        assert_eq!(text.matches("输入 /reply 1 或 /reply 确认").count(), 1);
         assert!(text.contains("   第一行\n   第二行"));
         assert!(text.contains("Plan 状态 · revision 1 · revisionRequested"));
     }

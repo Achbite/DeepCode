@@ -5,8 +5,8 @@ use deepcode_kernel_client::{
     is_terminal_run_status, message_command_with_profile_and_plugins, plan_cancel_command,
     plan_confirm_command, plan_revision_command, CreateConversationSessionRequest,
     FilesystemReference, FilesystemReferencePathInput, HttpKernelClient, InteractionProjection,
-    KernelBootstrap, KernelBootstrapOptions, PluginCatalogProjection, PluginSelectionInput,
-    SessionProjection,
+    KernelBootstrap, KernelBootstrapOptions, PluginCatalogItem, PluginCatalogProjection,
+    PluginSelectionInput, SessionProjection,
 };
 use render::{
     render_action_required_if_any, render_projection, render_run_state, render_terminal_error,
@@ -397,6 +397,9 @@ fn plugin_binding_from_catalog(
             .iter()
             .find(|plugin| plugin.uri == *uri)
             .ok_or_else(|| format!("插件不在当前目录中或不可用：{uri}"))?;
+        if let Some(error) = plugin_unavailable_reason(plugin) {
+            return Err(error);
+        }
         selections.push(PluginSelectionInput {
             selection_id: new_id("plugin-selection"),
             uri: plugin.uri.clone(),
@@ -664,50 +667,60 @@ fn contextual_input_command(
     if text.is_empty() {
         return Err("输入不能为空。".to_string());
     }
-    let has_plugin_selection = plugin_binding.is_some_and(|binding| !binding.selections.is_empty());
-    let has_filesystem_references = !filesystem_references.is_empty();
-    if let Some(approval) = projection.pending_approval.as_ref() {
-        if has_plugin_selection || has_filesystem_references {
-            return Err("插件和文件系统引用不能用于已有 run 的 effect 回应。".to_string());
+    if text == "/reply" || text.starts_with("/reply ") {
+        let response = text.strip_prefix("/reply").unwrap().trim();
+        if response.is_empty() {
+            return Err("用法：/reply <答复、确认或修订说明>".to_string());
         }
-        let decision = approval_decision_for_input(text)?;
-        return Ok(approval_response_command(
-            &projection.session_id,
-            &new_id("command"),
-            approval,
-            decision,
-        ));
-    }
-    if let Some(plan) = projection.pending_plan.as_ref() {
-        if has_plugin_selection || has_filesystem_references {
-            return Err("插件和文件系统引用不能用于已有 run 的 Plan 回应。".to_string());
+        if plugin_binding.is_some_and(|binding| !binding.selections.is_empty())
+            || !filesystem_references.is_empty()
+        {
+            return Err("插件和文件系统引用不能用于已有 run 的决策回应。".to_string());
         }
-        if is_plan_confirmation_input(text) {
-            return Ok(plan_confirm_command(
+        if let Some(approval) = projection.pending_approval.as_ref() {
+            let decision = approval_decision_for_input(response)?;
+            return Ok(approval_response_command(
+                &projection.session_id,
+                &new_id("command"),
+                approval,
+                decision,
+            ));
+        }
+        if let Some(plan) = projection.pending_plan.as_ref() {
+            if is_plan_confirmation_input(response) {
+                return Ok(plan_confirm_command(
+                    &projection.session_id,
+                    &new_id("command"),
+                    plan,
+                ));
+            }
+            return Ok(plan_revision_command(
                 &projection.session_id,
                 &new_id("command"),
                 plan,
+                response,
             ));
         }
-        return Ok(plan_revision_command(
-            &projection.session_id,
-            &new_id("command"),
-            plan,
-            text,
-        ));
-    }
-    if let Some(interaction) = projection.pending_interaction.as_ref() {
-        if has_plugin_selection || has_filesystem_references {
-            return Err("插件和文件系统引用不能用于已有 run 的交互回应。".to_string());
+        if let Some(interaction) = projection.pending_interaction.as_ref() {
+            let response = interaction_response_for_input(interaction, response);
+            return Ok(interaction_response_command(
+                &projection.session_id,
+                &new_id("command"),
+                interaction,
+                &response,
+            ));
         }
-        let response = interaction_response_for_input(interaction, text);
-        return Ok(interaction_response_command(
-            &projection.session_id,
-            &new_id("command"),
-            interaction,
-            &response,
-        ));
+        return Err("当前没有等待答复的 Plan、交互或 effect 审批。".to_string());
     }
+    let profile_id = if projection
+        .run
+        .as_ref()
+        .is_some_and(|run| matches!(run.status.as_str(), "running" | "waiting"))
+    {
+        None
+    } else {
+        profile_id
+    };
     let empty = PluginBinding {
         catalog_revision: String::new(),
         selections: Vec::new(),
@@ -734,7 +747,7 @@ fn contextual_input_command(
     if text.starts_with('/') {
         return Err(format!("未知命令：{text}"));
     }
-    Ok(message_command_with_profile_and_plugins(
+    let mut command = message_command_with_profile_and_plugins(
         &projection.session_id,
         &new_id("command"),
         original_text,
@@ -742,14 +755,22 @@ fn contextual_input_command(
         filesystem_references,
         &plugins.catalog_revision,
         &plugins.selections,
-    ))
+    );
+    if let Some(run) = projection
+        .run
+        .as_ref()
+        .filter(|run| matches!(run.status.as_str(), "running" | "waiting"))
+    {
+        command["runId"] = json!(run.run_id);
+    }
+    Ok(command)
 }
 
 fn approval_decision_for_input(input: &str) -> Result<&'static str, String> {
     match input.trim().to_lowercase().as_str() {
         "1" | "allow" | "允许" | "同意" => Ok("allow"),
         "2" | "deny" | "拒绝" | "不同意" => Ok("deny"),
-        _ => Err("当前等待 effect 裁决：输入 1/允许 或 2/拒绝。".to_string()),
+        _ => Err("当前等待 effect 裁决：输入 /reply 1（允许）或 /reply 2（拒绝）。".to_string()),
     }
 }
 
@@ -882,20 +903,50 @@ async fn run_chat(
         plugin_binding_from_catalog(plugin_catalog.clone(), initial_plugin_uris)?.selections
     };
     println!("session: {}", projection.session_id);
-    println!("普通文本用于消息、交互回应或 Plan 修订；Plan 输入 1/确认后执行；effect 审批输入 1/允许或 2/拒绝；@ 显示插件，@<名称或 URI> 为下一次请求选择插件；/focus <task> 启动聚焦上下文；/attach <path> 与 /detach <workspace-id> 管理对话目录索引；/cancel-plan；/model <profile> 设置后续消息草稿；/cancel；/quit。");
+    println!("普通文本随时发送，运行中按序排队；/reply <答复> 回应交互或修订 Plan，/reply 1 确认 Plan 或允许 effect，/reply 2 拒绝 effect；@ 显示插件，@<名称或 URI> 选择插件；/focus <task> 启动聚焦上下文；/attach <path> 与 /detach <workspace-id> 管理对话目录索引；/cancel-plan；/model <profile> 设置下一次 run 的模型；/cancel；/quit。");
     render_action_required_if_any(&mut io::stdout().lock(), &projection)
         .map_err(|error| error.to_string())?;
-    let mut line = String::new();
+    let mut input_lines = chat_input_lines()?;
+    let mut refresh = tokio::time::interval(POLL_INTERVAL);
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut output = CliRenderState::after(&projection);
+    let mut rendered_revision = projection.revision;
     let mut next_message_profile_id: Option<String> = None;
+    let mut prompt_needed = true;
     loop {
-        print!("deepcode> ");
-        io::stdout().flush().map_err(|error| error.to_string())?;
-        line.clear();
-        if io::stdin()
-            .read_line(&mut line)
-            .map_err(|error| error.to_string())?
-            == 0
-        {
+        if prompt_needed {
+            print!("deepcode> ");
+            io::stdout().flush().map_err(|error| error.to_string())?;
+            prompt_needed = false;
+        }
+        let line = tokio::select! {
+            line = input_lines.recv() => line,
+            _ = refresh.tick() => {
+                let updated = refresh_projection(client, &projection.session_id).await?;
+                output.render(&mut io::stdout().lock(), &updated).map_err(|error| error.to_string())?;
+                if updated.revision != rendered_revision {
+                    if updated.run.as_ref().is_some_and(|run| is_terminal_run_status(&run.status)) {
+                        output.finish_run(&mut io::stdout().lock(), &updated).map_err(|error| error.to_string())?;
+                        render_run_state(&mut io::stdout().lock(), &updated).map_err(|error| error.to_string())?;
+                        render_terminal_error(&mut io::stderr().lock(), &updated).map_err(|error| error.to_string())?;
+                    } else {
+                        output.render_action_required(&mut io::stdout().lock(), &updated).map_err(|error| error.to_string())?;
+                    }
+                }
+                rendered_revision = updated.revision;
+                projection = updated;
+                continue;
+            }
+            interrupted = tokio::signal::ctrl_c() => {
+                interrupted.map_err(|error| error.to_string())?;
+                if let Some(run) = projection.run.as_ref().filter(|run| !is_terminal_run_status(&run.status)) {
+                    submit_checked(client, &projection.session_id, &cancel_command(&projection.session_id, &new_id("command"), &run.run_id)).await?;
+                }
+                output.finish_text(&mut io::stdout().lock()).map_err(|error| error.to_string())?;
+                return Ok(Outcome::Interrupted);
+            }
+        };
+        let Some(line) = line else {
             return Ok(
                 if projection.pending_plan.is_some()
                     || projection.pending_interaction.is_some()
@@ -906,7 +957,9 @@ async fn run_chat(
                     Outcome::Done
                 },
             );
-        }
+        };
+        let line = line.map_err(|error| error.to_string())?;
+        prompt_needed = true;
         let input = line.trim();
         if input.is_empty() {
             continue;
@@ -922,17 +975,14 @@ async fn run_chat(
                     .ok_or_else(|| "当前没有待处理 Plan。".to_string())?;
                 let command = plan_cancel_command(&projection.session_id, &new_id("command"), plan);
                 submit_checked(client, &projection.session_id, &command).await?;
-                let outcome = wait_for_projection(client, &projection, false).await?;
                 projection = refresh_projection(client, &projection.session_id).await?;
-                if matches!(
-                    outcome,
-                    Outcome::Failed | Outcome::Indeterminate | Outcome::Cancelled
-                ) {
-                    return Ok(outcome);
-                }
             }
             "/cancel" => {
-                if let Some(run) = projection.run.as_ref() {
+                if let Some(run) = projection
+                    .run
+                    .as_ref()
+                    .filter(|run| !is_terminal_run_status(&run.status))
+                {
                     let command =
                         cancel_command(&projection.session_id, &new_id("command"), &run.run_id);
                     submit_checked(client, &projection.session_id, &command).await?;
@@ -988,6 +1038,10 @@ async fn run_chat(
                     plugin.uri == query || plugin.display_name.eq_ignore_ascii_case(query)
                 });
                 if let Some(plugin) = exact {
+                    if let Some(error) = plugin_unavailable_reason(plugin) {
+                        println!("{error}");
+                        continue;
+                    }
                     if selected_plugins
                         .iter()
                         .any(|selection| selection.uri == plugin.uri)
@@ -1005,11 +1059,14 @@ async fn run_chat(
                     print_plugin_catalog(&plugin_catalog, &selected_plugins, query);
                 }
             }
-            text if !text.starts_with('/') || text == "/focus" || text.starts_with("/focus ") => {
-                let consumes_plugins = projection.pending_plan.is_none()
-                    && projection.pending_interaction.is_none()
-                    && projection.pending_approval.is_none();
-                let plugin_binding = if selected_plugins.is_empty() {
+            text if !text.starts_with('/')
+                || text == "/focus"
+                || text.starts_with("/focus ")
+                || text == "/reply"
+                || text.starts_with("/reply ") =>
+            {
+                let consumes_plugins = text != "/reply" && !text.starts_with("/reply ");
+                let plugin_binding = if selected_plugins.is_empty() || !consumes_plugins {
                     None
                 } else {
                     Some(PluginBinding {
@@ -1017,31 +1074,69 @@ async fn run_chat(
                         selections: selected_plugins.clone(),
                     })
                 };
-                let outcome = submit_input_and_wait(
-                    client,
+                let command = match contextual_input_command(
                     &projection,
                     line.trim_end_matches(['\r', '\n']),
                     next_message_profile_id.as_deref(),
                     &[],
                     plugin_binding.as_ref(),
-                    false,
-                )
-                .await?;
+                ) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        continue;
+                    }
+                };
+                if let Err(error) = submit_checked(client, &projection.session_id, &command).await {
+                    eprintln!("{error}");
+                    continue;
+                }
                 if consumes_plugins {
                     selected_plugins.clear();
                 }
                 projection = refresh_projection(client, &projection.session_id).await?;
-                if matches!(
-                    outcome,
-                    Outcome::Failed | Outcome::Indeterminate | Outcome::Cancelled
-                ) {
-                    return Ok(outcome);
-                }
             }
             value if value.starts_with('/') => println!("未知命令：{value}"),
             _ => unreachable!("all non-slash input is handled above"),
         }
     }
+}
+
+fn chat_input_lines() -> Result<tokio::sync::mpsc::Receiver<io::Result<String>>, String> {
+    let (sender, receiver) = tokio::sync::mpsc::channel(16);
+    // The chat process owns this blocking reader; process exit releases stdin.
+    std::thread::Builder::new()
+        .name("chat-stdin".into())
+        .spawn(move || loop {
+            let mut line = String::new();
+            match io::stdin().read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if sender.blocking_send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.blocking_send(Err(error));
+                    break;
+                }
+            }
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(receiver)
+}
+
+fn plugin_unavailable_reason(plugin: &PluginCatalogItem) -> Option<String> {
+    if plugin.available && plugin.enabled {
+        return None;
+    }
+    Some(match &plugin.error {
+        Some(error) => format!(
+            "{}：{} ({})",
+            plugin.display_name, error.message, error.code
+        ),
+        None => format!("插件不可用：{}", plugin.display_name),
+    })
 }
 
 fn print_plugin_catalog(
@@ -1067,6 +1162,9 @@ fn print_plugin_catalog(
             "{marker} {}\n    {}\n    {}",
             plugin.display_name, plugin.uri, plugin.short_description
         );
+        if let Some(error) = plugin_unavailable_reason(plugin) {
+            println!("    {error}");
+        }
     }
     if !found {
         println!("没有匹配的可用插件。");
@@ -1147,7 +1245,7 @@ fn print_help() {
   deepcode-cli status
 
 只有显式 -C/--workspace 会为新 Session 创建 creation binding；已有 Session 通过 attach-directory/detach-directory 管理对话目录索引。
-Plan 等待时，输入 1/确认，其他非空输入作为修订说明；cancel-plan 明确取消。
+chat 普通文本随时发送，运行中按序排队；/reply 1 确认 Plan，/reply <说明> 修订 Plan 或回答交互，/reply 1/2 允许/拒绝 effect；cancel-plan 明确取消 Plan。
 文件与目录引用只在 ask 中显式选择；--file 与 --directory 均可重复，文件内容不会嵌入首轮 Provider 请求。
 插件只在 ask/chat 中显式选择；--plugin 可重复。PDF 文件按 mediaType 要求一个已配置的 Skill 插件。交互 chat 使用 @ 查看并选择下一次请求的插件，/focus <task> 作为类型化命令提交。
 所有终端命令都通过 ConversationPort，并只读取共享 SessionProjection。"#,
@@ -1157,6 +1255,97 @@ Plan 等待时，输入 1/确认，其他非空输入作为修订说明；cancel
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn waiting_projection(field: &str, decision: serde_json::Value) -> SessionProjection {
+        let mut value = json!({
+            "schemaVersion": deepcode_kernel_client::SESSION_PROJECTION_VERSION,
+            "sessionId":"session:test", "revision":1, "display":{"creationTitle":"input"},
+            "workspaceBindings":[], "sessionDirectoryIndexes":[], "timeline":[], "messages":[],
+            "queuedInputs":[], "narratives":[], "plans":[], "contextCompositions":[],
+            "tokenUsageHistory":[], "activities":[], "artifacts":[],
+            "tokenUsage":{"providerCallCount":0,"reportedCallCount":0,"inputTokens":0,"outputTokens":0,
+              "cacheReadInputTokens":0,"cacheMissInputTokens":0,"cacheAvailable":false,"cacheComplete":false},
+            "run":{"runId":"run:test","profileId":"profile:current","workspaceBindings":[],"status":"waiting"}
+        });
+        value[field] = decision;
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn pending_decisions() -> [(
+        &'static str,
+        serde_json::Value,
+        &'static str,
+        &'static str,
+        serde_json::Value,
+    ); 3] {
+        [
+            (
+                "pendingPlan",
+                json!({"planId":"plan:test","revision":1,"runId":"run:test","callId":"call:plan",
+                "title":"Plan","summary":"Review","steps":[],"mutationManifest":[],"status":"published",
+                "responseMode":"confirmReviseOrCancel","sequence":1,"createdAt":"now","updatedAt":"now"}),
+                "plan.respond",
+                "response",
+                json!({"kind":"confirm"}),
+            ),
+            (
+                "pendingInteraction",
+                json!({"interactionId":"interaction:test","runId":"run:test","callId":"call:question",
+                "kind":"question","prompt":"Choose","options":[{"id":"a","label":"Option A"}],
+                "allowFreeform":true,"sequence":1,"createdAt":"now"}),
+                "interaction.respond",
+                "response",
+                json!("Option A"),
+            ),
+            (
+                "pendingApproval",
+                json!({"approvalId":"approval:test","runId":"run:test","callId":"call:effect",
+                "preview":{"summary":"Write","effects":[],"logicalTargets":[]},"sequence":1,"createdAt":"now"}),
+                "approval.respond",
+                "decision",
+                json!("allow"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn pending_plain_input_queues_while_explicit_reply_keeps_decision_semantics() {
+        for (field, decision, command_type, response_field, expected) in pending_decisions() {
+            let projection = waiting_projection(field, decision);
+            let ordinary =
+                contextual_input_command(&projection, "1", Some("profile:next"), &[], None)
+                    .unwrap();
+            assert_eq!(ordinary["type"], "message.submit");
+            assert_eq!(ordinary["runId"], "run:test");
+            assert_eq!(ordinary["text"], "1");
+            assert!(ordinary.get("profileId").is_none());
+            let reply = contextual_input_command(&projection, "/reply 1", None, &[], None).unwrap();
+            assert_eq!(reply["type"], command_type);
+            assert_eq!(reply[response_field], expected);
+            if field == "pendingPlan" {
+                let revision =
+                    contextual_input_command(&projection, "/reply clarify scope", None, &[], None)
+                        .unwrap();
+                assert_eq!(
+                    revision["response"],
+                    json!({"kind":"requestRevision","text":"clarify scope"})
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_plugin_selection_preserves_the_catalog_error() {
+        let catalog: PluginCatalogProjection = serde_json::from_value(json!({"revision":"catalog:test", "plugins":[{
+            "uri":"plugin://broken", "displayName":"Broken", "shortDescription":"Broken entry", "activationMediaTypes":[],
+            "enabled":false,"available":false,"error":{"code":"plugin_manifest_invalid","message":"manifest parse failed"}
+        }]})).unwrap();
+        let error = plugin_binding_from_catalog(catalog, &["plugin://broken".into()])
+            .err()
+            .unwrap();
+        assert!(error.contains("plugin_manifest_invalid"));
+        assert!(error.contains("manifest parse failed"));
+    }
 
     #[test]
     fn explicit_host_commands_parse_without_starting_a_conversation() {

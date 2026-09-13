@@ -176,8 +176,6 @@ async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
                     KeyCode::Esc => {
                         if app.plugin_picker_open() {
                             app.dismiss_plugin_picker();
-                        } else if app.has_pending_plan() {
-                            app.cancel_plan().await;
                         } else {
                             app.clear_input();
                         }
@@ -262,24 +260,60 @@ fn terminal_event_result(
 
 async fn run_plain(mut app: TuiApp) -> io::Result<Option<String>> {
     print!("{}", app.renderer().render_plain(&app));
-    let mut line = String::new();
+    let (sender, mut lines) = tokio::sync::mpsc::channel(16);
+    // This plain-shell process owns stdin; process exit releases a blocked reader.
+    std::thread::Builder::new()
+        .name("plain-stdin".into())
+        .spawn(move || loop {
+            let mut line = String::new();
+            match io::stdin().read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if sender.blocking_send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.blocking_send(Err(error));
+                    break;
+                }
+            }
+        })?;
+    let mut refresh = tokio::time::interval(Duration::from_millis(150));
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut input_closed = false;
+    let mut prompt_needed = true;
     loop {
-        print!("DeepCode TUI> ");
-        io::stdout().flush()?;
-        line.clear();
-        if io::stdin().read_line(&mut line)? == 0 {
+        if input_closed && !app.is_run_pending() {
+            print!("{}", app.renderer().render_plain(&app));
             return Ok(app.action_required());
         }
-        if !app.submit_line(line.trim_end_matches(['\r', '\n'])).await {
-            return Ok(None);
+        if prompt_needed && !input_closed {
+            print!("DeepCode TUI> ");
+            io::stdout().flush()?;
+            prompt_needed = false;
         }
-        while app.is_run_pending() {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            app.poll().await;
-        }
-        print!("{}", app.renderer().render_plain(&app));
-        if let Some(message) = app.action_required() {
-            return Ok(Some(message));
+        tokio::select! {
+            line = lines.recv(), if !input_closed => {
+                let Some(line) = line else { input_closed = true; continue; };
+                if !app.submit_line(line?.trim_end_matches(['\r', '\n'])).await {
+                    return Ok(None);
+                }
+                print!("{}", app.renderer().render_plain(&app));
+                prompt_needed = true;
+            }
+            _ = refresh.tick() => {
+                let was_pending = app.is_run_pending();
+                app.poll().await;
+                if was_pending && !app.is_run_pending() {
+                    print!("{}", app.renderer().render_plain(&app));
+                }
+            }
+            interrupted = tokio::signal::ctrl_c() => {
+                interrupted?;
+                app.interrupt().await;
+                return Ok(None);
+            }
         }
     }
 }
@@ -321,7 +355,7 @@ fn print_help() {
 
 只有显式 -C/--workspace 会给新 Session 创建 workspace binding。
 --plugin 可重复且只选择下一次请求的插件；交互输入 @ 打开同一插件目录。
-Plan 输入 1/确认，其他文本请求修订；Esc 明确取消当前 Plan，空输入、EOF 与 Ctrl-C 不会取消。
+普通文本随时发送，运行中按序排队；/reply 1 确认 Plan，/reply <说明> 修订 Plan 或回答交互；/reply 1/2 允许/拒绝 effect；/cancel-plan 取消 Plan，/cancel 或 Ctrl-C 取消运行；Esc 清空输入。
 普通文本、/focus <task>、/attach <path>、/detach <workspace-id>、/cancel-plan、/model <profile>、/cancel 都通过 ConversationPort。
 上下文视图：/context。"#,
     );

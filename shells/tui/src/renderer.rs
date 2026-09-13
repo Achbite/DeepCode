@@ -102,6 +102,44 @@ mod layout_tests {
     }
 
     #[test]
+    fn plain_and_terminal_tools_keep_original_error_details() {
+        for (status, fields, expected) in [
+            (
+                "failed",
+                serde_json::json!({"tool":{"operation":"fs.read", "resources":[], "error":{"code":"fs_read_failed", "message":"原始读取错误"}}}),
+                "fs_read_failed: 原始读取错误",
+            ),
+            (
+                "indeterminate",
+                serde_json::json!({"interruption":{"code":"result_unknown", "message":"原始传输错误"}}),
+                "result_unknown: 原始传输错误",
+            ),
+            (
+                "rejected",
+                serde_json::json!({"inputRejection":{"code":"workspace_target_invalid", "message":"Not a directory", "issues":[{"path":"$.path", "rule":"path", "message":"invalid path"}]}}),
+                "workspace_target_invalid: Not a directory",
+            ),
+        ] {
+            let mut value = serde_json::json!({"activityId":"tool:error", "kind":"tool", "status":status,
+                "label":"fs.read", "runId":"run:test", "callId":"call:error", "sequence":1});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let activity: ActivityProjection = serde_json::from_value(value).unwrap();
+            let mut plain = String::new();
+            render_tool_plain(&mut plain, &activity);
+            let mut lines = Vec::new();
+            push_tool_lines(&mut lines, &activity);
+            assert!(plain.contains(expected));
+            assert!(lines.iter().any(|line| line.to_string().contains(expected)));
+        }
+        let input = serde_json::from_value(serde_json::json!({"commandId":"command:q", "messageId":"message:q", "runId":"run:q",
+            "text":"保留原文🙂", "filesystemReferences":[], "pluginSelections":[], "sequence":1, "createdAt":"now", "status":"notApplied"})).unwrap();
+        assert_eq!(queued_input_lines(&input), vec!["未执行: 保留原文🙂"]);
+    }
+
+    #[test]
     fn single_column_layout_keeps_long_input_cursor_inside_editor() {
         let client = HttpKernelClient::new(
             KernelClientConfig::new("http://127.0.0.1:1")
@@ -263,11 +301,20 @@ impl Renderer {
                     }
                 }
             }
+            for input in &projection.queued_inputs {
+                for line in queued_input_lines(input) {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+            }
             if let Some(plan) = projection.pending_plan.as_ref() {
                 render_plan_plain(&mut output, plan);
             }
             if let Some(interaction) = projection.pending_interaction.as_ref() {
-                output.push_str(&format!("需要你回答：{}\n", interaction.prompt));
+                output.push_str(&format!(
+                    "需要你回答（/reply <内容>）：{}\n",
+                    interaction.prompt
+                ));
                 if let Some(options) = interaction.options.as_ref() {
                     for (index, option) in options.iter().enumerate() {
                         output.push_str(&format!("  {}. {}\n", index + 1, option.label));
@@ -275,11 +322,14 @@ impl Renderer {
                 }
             }
             if let Some(approval) = projection.pending_approval.as_ref() {
-                output.push_str(&format!("需要你批准：{}\n", approval.preview.summary));
+                output.push_str(&format!(
+                    "需要你批准（/reply 1 或 /reply 2）：{}\n",
+                    approval.preview.summary
+                ));
                 for target in &approval.preview.logical_targets {
                     output.push_str(&format!("  - {target}\n"));
                 }
-                output.push_str("输入 1/允许 或 2/拒绝。\n");
+                output.push_str("输入 /reply 1 允许或 /reply 2 拒绝。\n");
             }
             for activity in projection
                 .activities
@@ -556,6 +606,9 @@ impl Renderer {
                 }
                 lines.push(Line::from(""));
             }
+            for input in &projection.queued_inputs {
+                lines.extend(queued_input_lines(input).into_iter().map(Line::from));
+            }
             if app.reasoning_enabled() {
                 if let Some(draft) = projection.assistant_draft.as_ref() {
                     lines.push(Line::from(format!(
@@ -611,13 +664,13 @@ impl Renderer {
                     }
                 }
                 lines.push(Line::from(
-                    "输入 1/确认；其他文本用于修订；Esc 或 /cancel-plan 明确取消。",
+                    "输入 /reply 1 确认；/reply <意见> 修订；普通消息排队；/cancel-plan 明确取消。",
                 ));
                 lines.push(Line::from(""));
             }
             if let Some(interaction) = projection.pending_interaction.as_ref() {
                 lines.push(Line::from(Span::styled(
-                    format!("需要你回答：{}", interaction.prompt),
+                    format!("需要你回答（/reply <内容>）：{}", interaction.prompt),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -630,7 +683,10 @@ impl Renderer {
             }
             if let Some(approval) = projection.pending_approval.as_ref() {
                 lines.push(Line::from(Span::styled(
-                    format!("需要你批准：{}", approval.preview.summary),
+                    format!(
+                        "需要你批准（/reply 1 或 /reply 2）：{}",
+                        approval.preview.summary
+                    ),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -638,7 +694,7 @@ impl Renderer {
                 for target in &approval.preview.logical_targets {
                     lines.push(Line::from(format!("  - {target}")));
                 }
-                lines.push(Line::from("输入 1/允许 或 2/拒绝。"));
+                lines.push(Line::from("输入 /reply 1 允许或 /reply 2 拒绝。"));
                 lines.push(Line::from(""));
             }
             for activity in projection
@@ -690,13 +746,16 @@ impl Renderer {
 
     fn draw_input(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         let selected_plugins = app.selected_plugin_labels();
-        let title = if app.has_pending_plan() {
-            " 确认计划 · 输入 1/确认，其他文本用于修订 ".to_string()
+        let title = if app
+            .projection()
+            .is_some_and(|projection| projection.pending_plan.is_some())
+        {
+            " 确认计划 · /reply 1 确认，/reply <意见> 修订；普通消息排队 ".to_string()
         } else if app
             .projection()
             .is_some_and(|projection| projection.pending_approval.is_some())
         {
-            " 等待审批 · 1 允许 / 2 拒绝 ".to_string()
+            " 等待审批 · /reply 1 允许 / /reply 2 拒绝 ".to_string()
         } else if selected_plugins.is_empty() {
             " 输入消息 · @ 插件 ".to_string()
         } else {
@@ -1195,6 +1254,43 @@ fn timeline_items(projection: &SessionProjection) -> Vec<TimelineItem<'_>> {
         .collect()
 }
 
+fn queued_input_lines(input: &deepcode_kernel_client::QueuedInputProjection) -> Vec<String> {
+    let status = if input.status == "queued" {
+        "已排队"
+    } else {
+        "未执行"
+    };
+    let mut lines = vec![format!("{status}: {}", input.text)];
+    lines.extend(
+        input
+            .filesystem_references
+            .iter()
+            .map(|reference| format!("  附件：{}", reference.display_name)),
+    );
+    lines
+}
+
+fn tool_error_lines(activity: &ActivityProjection) -> Vec<String> {
+    let mut lines = Vec::new();
+    for error in activity
+        .interruption
+        .iter()
+        .chain(activity.tool.as_ref().and_then(|tool| tool.error.as_ref()))
+    {
+        lines.push(format!("  {}: {}", error.code, error.message));
+    }
+    if let Some(error) = &activity.input_rejection {
+        lines.push(format!("  {}: {}", error.code, error.message));
+        lines.extend(
+            error
+                .issues
+                .iter()
+                .map(|issue| format!("  {}: {}", issue.path, issue.message)),
+        );
+    }
+    lines
+}
+
 fn push_tool_lines(lines: &mut Vec<Line<'_>>, activity: &ActivityProjection) {
     let operation = activity
         .tool
@@ -1206,6 +1302,12 @@ fn push_tool_lines(lines: &mut Vec<Line<'_>>, activity: &ActivityProjection) {
         format!("🔧 {operation} [{}]", activity.status),
         Style::default().fg(color),
     )));
+    for error in tool_error_lines(activity) {
+        lines.push(Line::from(Span::styled(
+            error,
+            Style::default().fg(Color::Red),
+        )));
+    }
     for detail in tool_progress_details(activity) {
         lines.push(Line::from(Span::styled(
             detail,
@@ -1329,6 +1431,10 @@ fn render_tool_plain(output: &mut String, activity: &ActivityProjection) {
         .map(|tool| tool.operation.as_str())
         .unwrap_or(activity.label.as_str());
     output.push_str(&format!("工具 {operation} [{}]\n", activity.status));
+    for error in tool_error_lines(activity) {
+        output.push_str(&error);
+        output.push('\n');
+    }
     for detail in tool_progress_details(activity) {
         output.push_str(&detail);
         output.push('\n');
@@ -1522,7 +1628,9 @@ fn render_plan_plain(output: &mut String, plan: &PendingPlanProjection) {
             }
         }
     }
-    output.push_str("输入 1/确认；其他非空文本用于修订；/cancel-plan 明确取消。\n");
+    output.push_str(
+        "输入 /reply 1 确认；/reply <意见> 修订；普通消息排队；/cancel-plan 明确取消。\n",
+    );
 }
 
 fn render_timeline_plan_plain(output: &mut String, plan: &PlanProjection) {
