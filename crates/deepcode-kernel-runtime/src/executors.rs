@@ -22,6 +22,8 @@ pub struct KernelExecutorConfig {
     pub web_search_auth_header_name: String,
     pub web_search_auth_secret_ref: String,
     pub cloud_web_search: Option<CloudWebSearchConfig>,
+    pub shell_program: Option<crate::shell_environment::ShellProgram>,
+    pub wsl: Option<crate::wsl_execution::WslExecution>,
 }
 
 /// Frozen, secret-free search transport selected when preparing a run.
@@ -76,13 +78,63 @@ impl KernelCancellationToken {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceWriteTarget {
     pub path: PathBuf,
     pub directory: bool,
 }
 
-#[derive(Debug, Clone)]
+/// Live execution observations. Output remains in the Kernel archive; these
+/// bytes are transient delivery, not additional execution records.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum KernelToolProgress {
+    Started {
+        started_at: String,
+    },
+    Output {
+        stream: String,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Clone, Default)]
+pub struct KernelProgressSink(Option<Arc<dyn Fn(KernelToolProgress) + Send + Sync>>);
+
+impl std::fmt::Debug for KernelProgressSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KernelProgressSink")
+    }
+}
+
+impl KernelProgressSink {
+    pub fn new(send: impl Fn(KernelToolProgress) + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(send)))
+    }
+
+    pub fn emit(&self, progress: KernelToolProgress) {
+        if let Some(send) = &self.0 {
+            send(progress);
+        }
+    }
+
+    pub fn started(&self) {
+        self.emit(KernelToolProgress::Started {
+            started_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .to_string(),
+        });
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KernelToolExecutionContext {
     /// Kernel-owned per-attempt archive. Retained output belongs to the Session.
     pub output_directory: Option<PathBuf>,
@@ -91,7 +143,10 @@ pub struct KernelToolExecutionContext {
     pub private_resolved_targets: Vec<String>,
     /// None is an explicit unrestricted workspace-write grant; Some limits writes to Plan paths.
     pub workspace_write_targets: Option<Vec<WorkspaceWriteTarget>>,
+    #[serde(skip)]
     pub cancellation: KernelCancellationToken,
+    #[serde(skip)]
+    pub progress: KernelProgressSink,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -183,6 +238,19 @@ pub fn builtin_executors(
     let executors = registry
         .executor_bindings()
         .map(|(tool_id, binding)| {
+            if let Some(wsl) = config
+                .wsl
+                .as_ref()
+                .filter(|_| tool_id == "bash" || tool_id.starts_with("fs."))
+            {
+                return (
+                    tool_id,
+                    Box::new(crate::wsl_execution::WslExecutor {
+                        target: wsl.clone(),
+                        shell: config.shell_program.clone(),
+                    }) as Box<dyn KernelToolExecutor>,
+                );
+            }
             (
                 tool_id,
                 executor_for_binding(binding, config.clone(), Arc::clone(&secret_provider)),
@@ -238,7 +306,11 @@ fn executor_for_binding(
             secret_provider,
         }),
         KernelExecutorBinding::WebFetch => Box::new(WebFetchExecutor),
-        KernelExecutorBinding::ProcessShell => Box::new(ProcessShellExecutor),
+        KernelExecutorBinding::ProcessShell | KernelExecutorBinding::ProcessPowerShell => {
+            Box::new(process::ConfiguredShellExecutor {
+                program: config.shell_program,
+            })
+        }
     }
 }
 
@@ -284,6 +356,7 @@ mod process;
 pub(crate) mod web;
 
 use filesystem::*;
+#[cfg(test)]
 use process::*;
 use web::*;
 
@@ -655,3 +728,6 @@ fn normalize_relative_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(windows)]
+pub(crate) mod windows_job;

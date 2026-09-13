@@ -179,8 +179,8 @@ pub(crate) struct LocalToolExecutionRequest {
     extension_generation_ref: String,
     kernel_catalog_snapshot_ref: String,
     tool_binding_ref: String,
-    call_id: String,
-    attempt_id: String,
+    pub(crate) call_id: String,
+    pub(crate) attempt_id: String,
     tool_name: String,
     input: Value,
     workspace_bindings: Vec<String>,
@@ -598,9 +598,18 @@ impl LocalAgentKernel {
         Ok(catalog_release_reply(&request, already_released))
     }
 
+    #[cfg(test)]
     pub(crate) fn execute(
         &self,
         request: LocalToolExecutionRequest,
+    ) -> Result<Value, LocalAgentKernelError> {
+        self.execute_with_progress(request, Default::default())
+    }
+
+    pub(crate) fn execute_with_progress(
+        &self,
+        request: LocalToolExecutionRequest,
+        progress: deepcode_kernel_runtime::executors::KernelProgressSink,
     ) -> Result<Value, LocalAgentKernelError> {
         validate_request(&request)?;
         self.validate_session_snapshot(&request)?;
@@ -699,7 +708,16 @@ impl LocalAgentKernel {
                     }
                 };
                 let result = start_execution.then(|| {
-                    self.execute_prepared(&prepared, &request, &authority, control.cancellation())
+                    if !is_shell_tool(&prepared.operation) {
+                        progress.started();
+                    }
+                    self.execute_prepared(
+                        &prepared,
+                        &request,
+                        &authority,
+                        control.cancellation(),
+                        progress,
+                    )
                 });
                 let cancel_phase = control.claim_outcome();
                 let completed_at = crate::now_text();
@@ -1067,7 +1085,7 @@ impl LocalAgentKernel {
         } else {
             None
         };
-        let process_workspace_mode = if request.tool_name == "bash" {
+        let process_workspace_mode = if is_shell_tool(&request.tool_name) {
             match arguments.get("workspaceMode").and_then(Value::as_str) {
                 Some("read") => Some("read".to_string()),
                 Some("write") => Some("write".to_string()),
@@ -1081,7 +1099,7 @@ impl LocalAgentKernel {
         } else {
             None
         };
-        let process_execution_scope = if request.tool_name == "bash" {
+        let process_execution_scope = if is_shell_tool(&request.tool_name) {
             match arguments.get("executionScope").and_then(Value::as_str) {
                 Some("workspace") => Some("workspace".to_string()),
                 Some("host") => Some("host".to_string()),
@@ -1305,8 +1323,8 @@ impl LocalAgentKernel {
                 confirmed_scope.extend(operations.iter().filter(|operation| {
                     operation["workspaceId"].as_str() == prepared.workspace_id.as_deref()
                 }).map(|operation| {
-                    if operation["operation"] == "bash" {
-                        json!({"operation":"bash", "executionScope":operation["executionScope"], "writablePaths":operation["writablePaths"]})
+                    if operation["operation"].as_str().is_some_and(is_shell_tool) {
+                        json!({"operation":operation["operation"], "executionScope":operation["executionScope"], "writablePaths":operation["writablePaths"]})
                     } else {
                         json!({"operation":operation["operation"], "target":operation["target"], "targetKind":operation.get("targetKind").cloned().unwrap_or(json!("file"))})
                     }
@@ -1318,7 +1336,7 @@ impl LocalAgentKernel {
                     .into_iter()
                     .flatten()
                     .filter(|operation| {
-                        operation["operation"] == "bash"
+                        operation["operation"] == prepared.operation
                             && operation["workspaceId"].as_str() == prepared.workspace_id.as_deref()
                             && operation["executionScope"].as_str()
                                 == prepared.process_execution_scope.as_deref()
@@ -1359,9 +1377,10 @@ impl LocalAgentKernel {
         request: &LocalToolExecutionRequest,
         authority: &Value,
         cancellation: KernelCancellationToken,
+        progress: deepcode_kernel_runtime::executors::KernelProgressSink,
     ) -> Result<KernelToolExecutionResult, String> {
         let _private_targets = &prepared.private_resolved_targets;
-        let workspace_write_targets = if prepared.operation == "bash"
+        let workspace_write_targets = if is_shell_tool(&prepared.operation)
             && prepared.process_execution_scope.as_deref() == Some("workspace")
             && authority["source"] == "plan"
         {
@@ -1411,6 +1430,7 @@ impl LocalAgentKernel {
                     private_resolved_targets: prepared.private_resolved_targets.clone(),
                     workspace_write_targets,
                     cancellation,
+                    progress,
                 },
             )
             .map_err(|error| format!("{}: {}", error.code, error.message));
@@ -1846,7 +1866,7 @@ fn canonical_logical_targets(
     tool_name: &str,
     arguments: &Value,
 ) -> Result<Vec<String>, LocalAgentKernelError> {
-    if tool_name == "bash" {
+    if is_shell_tool(tool_name) {
         return Ok(vec![".".to_string()]);
     }
     let field = match tool_name {
@@ -1908,7 +1928,7 @@ fn authority_matches_identity(
 }
 
 fn authority_covers(authority: &Value, prepared: &PreparedEffect) -> bool {
-    if prepared.operation == "bash" {
+    if is_shell_tool(&prepared.operation) {
         let arguments = prepared
             .canonical_arguments
             .as_object()
@@ -1923,7 +1943,8 @@ fn authority_covers(authority: &Value, prepared: &PreparedEffect) -> bool {
                     };
                     object.get("workspaceId").and_then(Value::as_str)
                         == prepared.workspace_id.as_deref()
-                        && object.get("operation").and_then(Value::as_str) == Some("bash")
+                        && object.get("operation").and_then(Value::as_str)
+                            == Some(prepared.operation.as_str())
                         && object.get("workspaceMode").and_then(Value::as_str) == Some("write")
                         && object.get("executionScope").and_then(Value::as_str)
                             == arguments.get("executionScope").and_then(Value::as_str)
@@ -2053,12 +2074,12 @@ fn process_effect_names(prepared: &PreparedEffect) -> Vec<&'static str> {
 }
 
 fn effect_summary(tool_name: &str, targets: &[String], canonical_arguments: &Value) -> String {
-    if tool_name == "bash" {
+    if is_shell_tool(tool_name) {
         let command = canonical_arguments
             .get("command")
             .and_then(Value::as_str)
             .expect("canonical bash arguments include command");
-        return format!("执行 bash：{command}");
+        return format!("执行 {tool_name}：{command}");
     }
     if targets.is_empty() {
         format!("执行 {tool_name}")
@@ -2279,6 +2300,10 @@ fn sqlite_is_empty(connection: &Connection) -> Result<bool, LocalAgentKernelErro
         .map_err(|error| {
             LocalAgentKernelError::new("tool_record_store_empty_check_failed", error.to_string())
         })
+}
+
+fn is_shell_tool(name: &str) -> bool {
+    matches!(name, "bash" | "powershell")
 }
 
 #[cfg(test)]

@@ -32,8 +32,8 @@ pub use conversation::{
     PluginCatalogItem, PluginCatalogProjection, PluginSelectionInput, ProjectionMessage,
     ResolveConversationFilesystemReferencesRequest, RunProjection, SessionDisplayProjection,
     SessionProjection, SessionTimelineItem, TodoItem, TodoListProjection, TokenUsageProjection,
-    TokenUsageRoundProjection, WorkspaceBindingDisplay, CONVERSATION_COMMAND_VERSION,
-    SESSION_PROJECTION_VERSION,
+    TokenUsageRoundProjection, ToolOutputProjection, WorkspaceBindingDisplay,
+    CONVERSATION_COMMAND_VERSION, SESSION_PROJECTION_VERSION,
 };
 
 #[derive(Debug, Error)]

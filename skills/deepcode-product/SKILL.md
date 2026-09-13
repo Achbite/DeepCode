@@ -1,12 +1,14 @@
 ---
 name: deepcode-product
-description: 了解 DeepCode 的工具、Plan、运行环境、模型设置和缓存显示；处理 DeepCode 自身操作疑问时使用。
+description: Explain DeepCode tools, Plans, execution environments, settings and plugins; diagnose Windows shell, missing developer tools and product issues using the recorded facts.
 ---
 
-DeepCode 的 Session 负责唯一 Agent Loop、上下文、交互、Plan/Todo 和终态；Kernel 负责统一工具注册、权限、执行与工具记录；GUI、CLI、TUI 消费同一会话投影。
+Session owns the single Agent Loop, context, interactions, Plan/Todo and terminal state. Kernel owns tool registration, permissions, execution and tool records. GUI, CLI and TUI consume the same Session projection.
 
-工具以本轮目录中的实际名称、参数和可用状态为准。`session.read` 可直接读取已有对话事实，基础查询无需先读 Skill，也不恢复目标任务。需要产品说明时，使用 `skill.read` 仅读取与当前问题相关的正文或引用，无需预先读完所有文档。正文作为普通工具结果进入对话，不激活插件、不重建本轮目录。需要接续历史工作的查询指引时可读取 `deepcode-session`。
+Use the actual tool names, arguments and availability in the current run catalog. Basic session queries can call `session.read` directly; reading this Skill is not a prerequisite. When guidance is useful, use `skill.read` to load only the relevant entry or reference. Skill text enters history as an ordinary tool result; reading it does not activate a plugin or rebuild the current catalog. For querying or continuing existing work, see `deepcode-session`.
 
-Plan 用来向用户说明将做的修改、影响范围和验证方式。用户确认后，范围内的具体命令和同目标编辑方式可随实际情况调整；超出授权目标或删除范围才需要修订。只读调查不要求先建 Plan。当前 run 内已有的有效工具结果可以作为步骤进度证据，即使结果产生在确认 Plan 之前；完成步骤仍需要成功记录，工具调用必须通过真实权限检查。
+A Plan describes intended changes, scope and validation. Once confirmed, command details and edit methods for the same targets may change without another confirmation. Expanding authorized targets or deletion scope requires a user decision. Read-only investigation does not require a Plan. Existing successful ToolRecords in the current run may support step progress even when produced before Plan confirmation. Progress is not permission to execute a tool.
 
-需要 Shell 环境、验证、推理强度或缓存说明时，读取 [references/operations.md](references/operations.md)。
+For product behavior and configuration, use `doc.read` with `name="operations.md"` or `name="execution-environments.md"`. Product docs are English Markdown and are separate from this workflow Skill.
+
+For Windows shell selection, missing developer tools and platform differences, read [references/windows-environment.md](references/windows-environment.md).

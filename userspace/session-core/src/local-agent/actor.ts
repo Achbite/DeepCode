@@ -1,6 +1,7 @@
 import { LiveReasoning } from './reasoningRead.js';
+import { LiveToolOutput } from './liveToolOutput.js';
 import { todoItemsForPlan } from './planStage.js';
-import { retainSessionEnvironment } from './sessionEnvironment.js';
+import { retainSessionEnvironment, savedSessionEnvironment } from './sessionEnvironment.js';
 import type {
   AssistantDraftProjection,
   CommandJournalPort,
@@ -58,6 +59,7 @@ export class SessionActor {
   #snapshotReads: Promise<void> = Promise.resolve();
   #assistantDraft: AssistantDraftProjection | null = null;
   readonly liveReasoning = new LiveReasoning();
+  readonly #liveToolOutput = new LiveToolOutput();
 
   constructor(
     readonly sessionId: string,
@@ -100,7 +102,14 @@ export class SessionActor {
 
   async snapshot(): Promise<SessionProjection> {
     this.assertOperational();
-    return projectSession((await this.loadSnapshot()).state, this.#assistantDraft);
+    const projection = projectSession((await this.loadSnapshot()).state, this.#assistantDraft);
+    for (const activity of projection.activities) {
+      if (activity.status === 'active' && activity.callId) {
+        const output = this.#liveToolOutput.get(activity.callId);
+        if (output) activity.liveOutput = output;
+      }
+    }
+    return projection;
   }
 
   async contextComposition(providerRequestId: string): Promise<ContextCompositionProjection> {
@@ -114,6 +123,12 @@ export class SessionActor {
 
   hasLoopFailure(): boolean {
     return this.#loopFailure !== undefined;
+  }
+
+  async hasActiveWork(): Promise<boolean> {
+    const run = (await this.loadSnapshot()).state.run;
+    return this.#active !== undefined
+      || (run != null && run.status !== 'waiting' && !isTerminal(run.status));
   }
 
   async dispose(): Promise<void> {
@@ -361,6 +376,7 @@ export class SessionActor {
     const prepared = await this.#composition.runPreparation.prepare({
       sessionId: this.sessionId,
       runId,
+      environment: savedSessionEnvironment(before.events),
       ...(profileId ? { profileId } : {}),
       ...(reasoningEffortOverride ? { reasoningEffortOverride } : {}),
       ...(command.pluginCatalogRevision
@@ -835,6 +851,7 @@ export class SessionActor {
           if (!this.#projectionState) throw new Error('session_projection_state_missing');
         },
         updateReasoning: (requestId, runId, text, kind) => this.liveReasoning.append(requestId, runId, text, kind),
+        updateToolProgress: (callId, progress) => this.#liveToolOutput.update(callId, progress),
         nextId: this.#nextId,
       },
       signal,
@@ -884,6 +901,8 @@ export class SessionActor {
         sessionId: this.sessionId,
         runId,
         profileId: runtime.provider.profileId,
+        environment: runtime.environment,
+        restoreEnvironment: true,
         ...(runtime.provider.reasoningEffortOverride ? { reasoningEffortOverride: runtime.provider.reasoningEffortOverride } : {}),
         ...recoveryPluginSelection(snapshot, runId, runtime),
       });
@@ -1033,6 +1052,10 @@ export class SessionActor {
   }
 
   private async observe(event: SessionEvent): Promise<void> {
+    if (event.type === 'tool.completed' || event.type === 'tool.interrupted' || event.type === 'tool.input-rejected') {
+      this.#liveToolOutput.delete(event.callId);
+    }
+    if (event.type === 'run.settled') this.#liveToolOutput.clear();
     await Promise.all(this.#composition.observers.map((observer) => observer.observe(event)));
   }
 

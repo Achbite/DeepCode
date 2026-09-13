@@ -41,6 +41,17 @@ pub(crate) fn core_tool_prompt_providers() -> Value {
                 "usageGuidelines": [
                     "Cite returned sources and report search errors."
                 ]
+            },
+            {
+                "contributionRef": "tool-prompt-contribution:core:powershell",
+                "canonicalToolName": "powershell",
+                "promptSnippet": "Run native Windows commands using the selected PowerShell dialect.",
+                "usageGuidelines": [
+                    "Use PowerShell syntax directly. Each call starts without a profile and emits UTF-8. Windows PowerShell 5.1 does not support && or ||; use separate statements and explicit exit handling.",
+                    "After a native executable, capture $LASTEXITCODE before running another command and exit with that code when validating a build or test. Do not assume a pipeline preserves the original exit code.",
+                    "Use the declared project tools in the observed execution environment. A missing command or service is an environment fact; a nonzero test result is not evidence of shell incompatibility.",
+                    "Stay within the confirmed Plan targets and execution scope. If the selected environment cannot enforce workspace scope, report that limit and request a permitted host scope or another project environment; changing shell syntax does not grant permission."
+                ]
             }
         ]
     }])
@@ -74,7 +85,7 @@ mod tests {
                 .iter()
                 .map(|item| item["canonicalToolName"].as_str().expect("tool name"))
                 .collect::<Vec<_>>(),
-            vec!["fs.read", "bash", "web.fetch", "web.search"]
+            vec!["fs.read", "bash", "web.fetch", "web.search", "powershell"]
         );
         assert!(contributions
             .iter()

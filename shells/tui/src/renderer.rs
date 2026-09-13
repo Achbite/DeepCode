@@ -11,6 +11,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarState, Wrap},
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Default)]
 pub struct Renderer;
@@ -65,6 +66,40 @@ mod layout_tests {
     use crate::app::TuiHostOptions;
     use deepcode_kernel_client::{HttpKernelClient, KernelClientConfig};
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn tool_progress_is_visible_before_the_terminal_snapshot() {
+        let mut activity: ActivityProjection = serde_json::from_value(serde_json::json!({
+            "activityId":"tool:live", "kind":"tool", "status":"active", "label":"bash",
+            "runId":"run:test", "callId":"call:live", "sequence":1, "startedAt":"1",
+            "liveOutput":{"stdout":"执行中\n", "stderr":"诊断\n", "stdoutBytes":10, "stderrBytes":7, "truncated":true}
+        })).unwrap();
+        let mut plain = String::new();
+        render_tool_plain(&mut plain, &activity);
+        let mut lines = Vec::new();
+        push_tool_lines(&mut lines, &activity);
+        let styled = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for output in [&plain, &styled] {
+            assert!(output.contains("[active]"));
+            assert!(output.contains("执行中"));
+            assert!(output.contains("诊断"));
+            assert!(output.contains("stdout 10 bytes · stderr 7 bytes"));
+            assert!(output.contains("仅保留最新片段"));
+            assert!(output.contains("已执行"));
+        }
+        activity.status = "completed".into();
+        activity.live_output = None;
+        let mut terminal = String::new();
+        render_tool_plain(&mut terminal, &activity);
+        assert!(terminal.contains("[completed]"));
+        assert!(!terminal.contains("执行中"));
+        assert!(!terminal.contains("实时输出"));
+        assert!(!terminal.contains("已执行"));
+    }
 
     #[test]
     fn single_column_layout_keeps_long_input_cursor_inside_editor() {
@@ -1171,6 +1206,16 @@ fn push_tool_lines(lines: &mut Vec<Line<'_>>, activity: &ActivityProjection) {
         format!("🔧 {operation} [{}]", activity.status),
         Style::default().fg(color),
     )));
+    for detail in tool_progress_details(activity) {
+        lines.push(Line::from(Span::styled(
+            detail,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    if let Some(output) = activity.live_output.as_ref() {
+        push_tool_stream_lines(lines, "stdout", &output.stdout);
+        push_tool_stream_lines(lines, "stderr", &output.stderr);
+    }
     if let Some(tool) = activity.tool.as_ref() {
         if let Some(shell) = tool.shell.as_ref() {
             lines.push(Line::from(Span::styled(
@@ -1284,6 +1329,14 @@ fn render_tool_plain(output: &mut String, activity: &ActivityProjection) {
         .map(|tool| tool.operation.as_str())
         .unwrap_or(activity.label.as_str());
     output.push_str(&format!("工具 {operation} [{}]\n", activity.status));
+    for detail in tool_progress_details(activity) {
+        output.push_str(&detail);
+        output.push('\n');
+    }
+    if let Some(live) = activity.live_output.as_ref() {
+        push_tool_stream_plain(output, "stdout", &live.stdout);
+        push_tool_stream_plain(output, "stderr", &live.stderr);
+    }
     if let Some(tool) = activity.tool.as_ref() {
         if let Some(shell) = tool.shell.as_ref() {
             output.push_str(&format!("  $ {}\n", shell.command));
@@ -1357,6 +1410,35 @@ fn push_tool_stream_plain(output: &mut String, label: &str, stream: &str) {
     for line in stream.lines() {
         output.push_str(&format!("    {line}\n"));
     }
+}
+
+fn tool_progress_details(activity: &ActivityProjection) -> Vec<String> {
+    let mut lines = Vec::new();
+    if activity.status == "active" {
+        if let Some(elapsed) = activity.started_at.as_ref().and_then(|started| {
+            let started = started.parse::<u128>().ok()?;
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_millis()
+                .checked_sub(started)
+        }) {
+            lines.push(format!("  已执行 {:.1}s", elapsed as f64 / 1_000.0));
+        }
+        if let Some(output) = activity.live_output.as_ref() {
+            lines.push(format!(
+                "  实时输出 · stdout {} bytes · stderr {} bytes{}",
+                output.stdout_bytes,
+                output.stderr_bytes,
+                if output.truncated {
+                    " · 仅保留最新片段"
+                } else {
+                    ""
+                }
+            ));
+        }
+    }
+    lines
 }
 
 fn render_todo_plain(output: &mut String, projection: &SessionProjection) {

@@ -2,7 +2,9 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   browsePath,
   getInitialLocations,
+  hasNativePathPicker,
 } from '../../services/runtimeAdapter';
+import NativePathDialog from './NativePathDialog';
 import type {
   BrowseEntry,
   BrowsePathResult,
@@ -15,7 +17,7 @@ import { useSettingsStore } from '../../state/settingsStore';
 import { normalizeUiLanguage, t } from '../../i18n';
 import './workspaceOpenDialog.css';
 
-const WorkspaceOpenDialog: React.FC = () => {
+const BrowserWorkspaceOpenDialog: React.FC = () => {
   const visible = useUiStore((s) => s.workspaceOpenDialogVisible);
   const hide = useUiStore((s) => s.hideWorkspaceOpenDialog);
   const openWorkspace = useWorkspaceStore((s) => s.openWorkspace);
@@ -309,4 +311,45 @@ const WorkspaceOpenDialog: React.FC = () => {
   );
 };
 
-export default WorkspaceOpenDialog;
+function NativeWorkspaceOpenDialog() {
+  const hide = useUiStore((state) => state.hideWorkspaceOpenDialog);
+  const openWorkspace = useWorkspaceStore((state) => state.openWorkspace);
+  const closeAllFileTabs = useEditorStore((state) => state.closeAllFileTabs);
+  const language = normalizeUiLanguage(useSettingsStore((state) => state.effectiveSettings['workbench.language']));
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!error) return;
+    const dismiss = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { event.stopPropagation(); hide(); }
+    };
+    window.addEventListener('keydown', dismiss, true);
+    return () => window.removeEventListener('keydown', dismiss, true);
+  }, [error, hide]);
+  if (!error) return <NativePathDialog language={language} kind="path"
+    title={t(language, 'workspaceDialog.title')}
+    selectLabel={language === 'zh-CN' ? '打开' : 'Open'}
+    cancelLabel={t(language, 'workspaceDialog.cancel')}
+    filters={[{ name: 'Workspace', extensions: ['code-workspace'] }]}
+    onCancel={hide} onSelect={(path) => {
+      void openWorkspace(path).then((result) => {
+        if (result.ok) { closeAllFileTabs(); hide(); }
+        else setError(result.message ?? 'workspace_open_failed');
+      }).catch((reason: unknown) => { setError(String(reason)); });
+    }} />;
+  return <div className="ws-open-dialog__backdrop" onClick={hide}>
+    <div className="ws-open-dialog ws-open-dialog--native" role="dialog" aria-modal="true"
+      aria-label={t(language, 'workspaceDialog.title')} onClick={(event) => event.stopPropagation()}>
+      <div className="ws-open-dialog__header"><strong>{t(language, 'workspaceDialog.title')}</strong></div>
+      {error && <p className="ws-open-dialog__error" role="alert">{error}</p>}
+      <div className="ws-open-dialog__footer"><button type="button" className="ws-open-dialog__btn" onClick={hide}>
+        {t(language, 'workspaceDialog.cancel')}
+      </button></div>
+    </div>
+  </div>;
+}
+
+export default function WorkspaceOpenDialog() {
+  const visible = useUiStore((state) => state.workspaceOpenDialogVisible);
+  if (!visible) return null;
+  return hasNativePathPicker() ? <NativeWorkspaceOpenDialog /> : <BrowserWorkspaceOpenDialog />;
+}

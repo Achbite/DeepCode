@@ -4,6 +4,7 @@ import type { PlanResponse, PluginSelectionInput } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import { shouldOfferFocusCommand, shouldSubmitComposerKey } from './composerKeyboard';
+import { planScopeAddition } from './planReview';
 import { isLongPastedText, type PastedTextInput } from '../../services/pastedText';
 
 interface PastedTextDraft extends PastedTextInput { expanded: boolean }
@@ -36,6 +37,9 @@ export function useAgentComposer(
   const pendingInteraction = projection?.pendingInteraction ?? null;
   const pendingApproval = projection?.pendingApproval ?? null;
   const pendingPlan = projection?.pendingPlan ?? null;
+  const pendingScopeAddition = pendingPlan ? planScopeAddition(projection?.plans.find((plan) => (
+    plan.planId === pendingPlan.planId && plan.revision === pendingPlan.revision - 1
+  )), pendingPlan) : null;
   const composerViewKey = sessionId ?? `new:${draftProjectId ?? 'independent'}`;
   const composerModeKey = pendingPlan
     ? `plan:${pendingPlan.planId}:${pendingPlan.revision}`
@@ -552,6 +556,7 @@ export function useAgentComposer(
 
   return {
     pendingPlan,
+    pendingScopeAddition,
     pendingInteraction,
     pendingApproval,
     projection,

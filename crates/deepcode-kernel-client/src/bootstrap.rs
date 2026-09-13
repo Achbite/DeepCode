@@ -1,7 +1,6 @@
 use super::*;
 use deepcode_kernel_abi::{
-    HostProcessIdentity, HostShutdownReceipt, HostShutdownRequest, HOST_INSTANCE_ID_ENV,
-    HOST_INSTANCE_ID_PREFIX, HOST_SHELL_TOKEN_HEADER, HOST_SHELL_TOKEN_PREFIX,
+    HostProcessIdentity, HOST_INSTANCE_ID_ENV, HOST_INSTANCE_ID_PREFIX, HOST_SHELL_TOKEN_PREFIX,
     HOST_SHUTDOWN_RECEIPT_TIMEOUT_MILLIS, HOST_TOKEN_ENTROPY_BYTES, KERNEL_DAEMON_SERVICE,
 };
 use serde::{Deserialize, Serialize};
@@ -10,7 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const KERNEL_LISTENER_STARTUP_WAIT: Duration = Duration::from_secs(6);
@@ -20,25 +19,18 @@ const KERNEL_OWNED_SHUTDOWN_IO_WAIT: Duration =
     Duration::from_millis(HOST_SHUTDOWN_RECEIPT_TIMEOUT_MILLIS);
 const KERNEL_OWNED_SHUTDOWN_EXIT_ATTEMPTS: usize = 200;
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt as UnixCommandExt;
-#[cfg(windows)]
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt as WindowsCommandExt;
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::HANDLE;
-#[cfg(windows)]
-use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+use deepcode_host_connection::process::{
+    spawn_owned_host_process, terminate_owned_process_tree, OwnedHostProcess,
 };
+use deepcode_host_connection::{HostClientLease, HOST_LIFETIME_ENV};
+#[cfg(all(test, unix))]
+use std::os::unix::process::CommandExt;
 
 #[derive(Clone)]
 pub struct KernelBootstrapOptions {
     pub api: Option<String>,
     pub auto_start: bool,
+    pub persistent: bool,
     host_shell_token: Option<HostShellToken>,
 }
 
@@ -61,12 +53,18 @@ impl KernelBootstrapOptions {
         Self {
             api,
             auto_start: true,
+            persistent: false,
             host_shell_token: None,
         }
     }
 
     pub fn auto_start(mut self, auto_start: bool) -> Self {
         self.auto_start = auto_start;
+        self
+    }
+
+    pub fn persistent(mut self, persistent: bool) -> Self {
+        self.persistent = persistent;
         self
     }
 
@@ -79,9 +77,38 @@ impl KernelBootstrapOptions {
 pub struct KernelBootstrap {
     client: HttpKernelClient,
     _guard: KernelBootstrapGuard,
+    _client_lease: HostClientLease,
 }
 
 impl KernelBootstrap {
+    fn attached(
+        client: HttpKernelClient,
+        mut guard: KernelBootstrapGuard,
+        connection: &KernelClientConfig,
+        persistent: bool,
+    ) -> KernelClientResult<Self> {
+        let token = connection
+            .host_shell_token
+            .as_ref()
+            .ok_or(KernelClientError::HostConnectionTokenMissing)?;
+        let lease = HostClientLease::connect(
+            &client.config.base_url,
+            token.expose_to_transport(),
+            persistent,
+        )
+        .map_err(|error| {
+            if let Some(process) = guard.process.as_mut() {
+                terminate_owned_kernel_process(process);
+            }
+            KernelClientError::Bootstrap(format!("Host client registration failed: {error}"))
+        })?;
+        Ok(Self {
+            client,
+            _guard: guard,
+            _client_lease: lease,
+        })
+    }
+
     pub async fn connect(options: KernelBootstrapOptions) -> KernelClientResult<Self> {
         let implicit_endpoint = options.api.is_none()
             && std::env::var_os("DEEPCODE_API_URL").is_none()
@@ -148,10 +175,12 @@ impl KernelBootstrap {
         let initial_probe = probe_existing_kernel(&config).await?;
         match initial_probe {
             ExistingKernelProbe::Healthy(client) => {
-                return Ok(Self {
+                return Self::attached(
                     client,
-                    _guard: KernelBootstrapGuard::external(),
-                });
+                    KernelBootstrapGuard::external(),
+                    &config,
+                    options.persistent,
+                );
             }
             ExistingKernelProbe::NotListening => {}
             ExistingKernelProbe::TokenMissing => {
@@ -195,10 +224,12 @@ impl KernelBootstrap {
                 let probe = probe_existing_kernel(&config).await?;
                 match probe {
                     ExistingKernelProbe::Healthy(client) => {
-                        return Ok(Self {
+                        return Self::attached(
                             client,
-                            _guard: KernelBootstrapGuard::external(),
-                        });
+                            KernelBootstrapGuard::external(),
+                            &config,
+                            options.persistent,
+                        );
                     }
                     ExistingKernelProbe::TokenRejected => {
                         return Err(KernelClientError::HostConnectionRejected {
@@ -223,10 +254,12 @@ impl KernelBootstrap {
         let locked_probe = probe_existing_kernel(&config).await?;
         match locked_probe {
             ExistingKernelProbe::Healthy(client) => {
-                return Ok(Self {
+                return Self::attached(
                     client,
-                    _guard: KernelBootstrapGuard::external(),
-                });
+                    KernelBootstrapGuard::external(),
+                    &config,
+                    options.persistent,
+                );
             }
             ExistingKernelProbe::NotListening => {}
             ExistingKernelProbe::TokenMissing => {
@@ -281,10 +314,12 @@ impl KernelBootstrap {
                         terminate_owned_kernel_process(&mut process);
                         return Err(KernelClientError::Bootstrap(error.to_string()));
                     }
-                    return Ok(Self {
+                    return Self::attached(
                         client,
-                        _guard: KernelBootstrapGuard::owned(process),
-                    });
+                        KernelBootstrapGuard::owned(process),
+                        &owned_config,
+                        options.persistent,
+                    );
                 }
                 ExistingKernelProbe::TokenRejected => {
                     terminate_owned_kernel_process(&mut process);
@@ -351,19 +386,26 @@ impl KernelBootstrapGuard {
 
 impl Drop for KernelBootstrapGuard {
     fn drop(&mut self) {
-        // Dropping a client releases handles only. Host shutdown is an explicit command.
+        // The connection lease notifies the Host; only the Host decides whether work permits exit.
         drop(self.process.take());
     }
 }
 
 struct OwnedKernelProcess {
-    child: Child,
+    process: OwnedHostProcess,
     log_path: PathBuf,
     shutdown_target: OwnedKernelShutdownTarget,
-    #[cfg(unix)]
-    process_group_id: libc::pid_t,
-    #[cfg(windows)]
-    job: WindowsKillOnCloseJob,
+}
+impl std::ops::Deref for OwnedKernelProcess {
+    type Target = OwnedHostProcess;
+    fn deref(&self) -> &Self::Target {
+        &self.process
+    }
+}
+impl std::ops::DerefMut for OwnedKernelProcess {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.process
+    }
 }
 
 struct OwnedKernelShutdownTarget {
@@ -379,11 +421,6 @@ struct OwnedKernelShutdownTarget {
 struct HostApiEnvelope<T> {
     ok: bool,
     data: Option<T>,
-}
-
-#[cfg(windows)]
-struct WindowsKillOnCloseJob {
-    handle: Option<OwnedHandle>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -721,80 +758,26 @@ fn spawn_kernel_binary(
         .env("DEEPCODE_PORT", port)
         .env(HOST_SHELL_TOKEN_ENV, host_shell_token)
         .env(HOST_INSTANCE_ID_ENV, host_instance_id)
+        .env(HOST_LIFETIME_ENV, "automatic")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(stderr));
 
-    #[cfg(unix)]
-    {
-        command.process_group(0);
-        let mut child = command.spawn().map_err(|error| {
-            KernelClientError::Bootstrap(format!(
-                "failed to start {}: {error}",
-                kernel_bin.display()
-            ))
-        })?;
-        let pid = child.id() as libc::pid_t;
-        let process_group_id = unsafe { libc::getpgid(pid) };
-        if process_group_id <= 0 || process_group_id != pid {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(KernelClientError::Bootstrap(format!(
-                "{} did not enter its exact owned process group",
-                kernel_bin.display()
-            )));
-        }
-        let shutdown_target = owned_kernel_shutdown_target(
-            host,
-            port_number,
-            host_shell_token,
-            host_instance_id,
-            child.id(),
-        );
-        return Ok(OwnedKernelProcess {
-            child,
-            log_path,
-            shutdown_target,
-            process_group_id,
-        });
-    }
-
-    #[cfg(windows)]
-    {
-        let job = WindowsKillOnCloseJob::new().map_err(|error| {
-            KernelClientError::Bootstrap(format!(
-                "failed to create the Kernel process owner: {error}"
-            ))
-        })?;
-        command.creation_flags(0x0800_0200);
-        let mut child = command.spawn().map_err(|error| {
-            KernelClientError::Bootstrap(format!(
-                "failed to start {}: {error}",
-                kernel_bin.display()
-            ))
-        })?;
-        if let Err(error) = job.assign(&child) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(KernelClientError::Bootstrap(format!(
-                "failed to assign {} to its process owner: {error}",
-                kernel_bin.display()
-            )));
-        }
-        let shutdown_target = owned_kernel_shutdown_target(
-            host,
-            port_number,
-            host_shell_token,
-            host_instance_id,
-            child.id(),
-        );
-        return Ok(OwnedKernelProcess {
-            child,
-            log_path,
-            shutdown_target,
-            job,
-        });
-    }
+    let process = spawn_owned_host_process(&mut command).map_err(|error| {
+        KernelClientError::Bootstrap(format!("failed to start {}: {error}", kernel_bin.display()))
+    })?;
+    let shutdown_target = owned_kernel_shutdown_target(
+        host,
+        port_number,
+        host_shell_token,
+        host_instance_id,
+        process.child.id(),
+    );
+    Ok(OwnedKernelProcess {
+        process,
+        log_path,
+        shutdown_target,
+    })
 }
 
 fn owned_kernel_shutdown_target(
@@ -841,64 +824,19 @@ fn terminate_owned_kernel_process(process: &mut OwnedKernelProcess) {
         let _ = process.child.wait();
         return;
     }
-    #[cfg(unix)]
-    {
-        let pid = process.child.id() as libc::pid_t;
-        if unsafe { libc::getpgid(pid) } == process.process_group_id {
-            unsafe {
-                libc::kill(-process.process_group_id, libc::SIGTERM);
-            }
-        }
-        if !wait_for_kernel_exit(process, 20) {
-            if unsafe { libc::getpgid(pid) } == process.process_group_id {
-                unsafe {
-                    libc::kill(-process.process_group_id, libc::SIGKILL);
-                }
-            } else {
-                let _ = process.child.kill();
-            }
-        }
-    }
-    #[cfg(windows)]
-    {
-        process.job.close();
-        if !wait_for_kernel_exit(process, 20) {
-            let _ = process.child.kill();
-        }
-    }
-    let _ = process.child.wait();
+    terminate_owned_process_tree(&mut process.process);
 }
 
 fn request_owned_kernel_graceful_shutdown(target: &OwnedKernelShutdownTarget) -> bool {
-    let Some(expected_identity) = target.expected_identity.as_ref() else {
+    let Some(identity) = target.expected_identity.as_ref() else {
         return false;
     };
-    let host_header = if target.host.contains(':') {
-        format!("[{}]:{}", target.host, target.port)
-    } else {
-        format!("{}:{}", target.host, target.port)
-    };
-    let body = match serde_json::to_vec(&HostShutdownRequest {
-        expected_identity: expected_identity.clone(),
-    }) {
-        Ok(body) => body,
-        Err(_) => return false,
-    };
-    let request_head = format!(
-        "POST /api/host/shutdown HTTP/1.1\r\nHost: {host_header}\r\n{HOST_SHELL_TOKEN_HEADER}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        target.host_shell_token,
-        body.len()
-    );
-    let mut request = request_head.into_bytes();
-    request.extend_from_slice(&body);
-    let Some(envelope) = request_owned_kernel_api::<HostShutdownReceipt>(target, &request) else {
-        return false;
-    };
-    envelope
-        .ok
-        .then_some(envelope.data)
-        .flatten()
-        .is_some_and(|receipt| receipt.confirms_shutdown_of(expected_identity))
+    deepcode_host_connection::shell_lifecycle::request_daemon_shutdown(
+        &target.host,
+        &target.port.to_string(),
+        &target.host_shell_token,
+        identity,
+    )
 }
 
 fn request_owned_kernel_public_identity(
@@ -952,78 +890,6 @@ fn wait_for_kernel_exit(process: &mut OwnedKernelProcess, attempts: usize) -> bo
         }
     }
     false
-}
-
-#[cfg(windows)]
-impl WindowsKillOnCloseJob {
-    fn new() -> std::io::Result<Self> {
-        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if handle.is_null() {
-            return Err(std::io::Error::last_os_error());
-        }
-        let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-        let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let configured = unsafe {
-            SetInformationJobObject(
-                handle.as_raw_handle() as HANDLE,
-                JobObjectExtendedLimitInformation,
-                (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        if configured == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(Self {
-            handle: Some(handle),
-        })
-    }
-
-    fn release_on_close(&self) -> std::io::Result<()> {
-        let handle = self
-            .handle
-            .as_ref()
-            .ok_or_else(|| std::io::Error::other("Kernel Job Object is closed"))?;
-        let information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        let configured = unsafe {
-            SetInformationJobObject(
-                handle.as_raw_handle() as HANDLE,
-                JobObjectExtendedLimitInformation,
-                (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        if configured == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    fn assign(&self, child: &Child) -> std::io::Result<()> {
-        let Some(handle) = self.handle.as_ref() else {
-            return Err(std::io::Error::other("Kernel Job Object is closed"));
-        };
-        let process_handle = child.as_raw_handle() as HANDLE;
-        if unsafe { AssignProcessToJobObject(handle.as_raw_handle() as HANDLE, process_handle) }
-            == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    fn close(&mut self) {
-        if let Some(handle) = self.handle.as_ref() {
-            unsafe {
-                windows_sys::Win32::System::JobObjects::TerminateJobObject(
-                    handle.as_raw_handle() as HANDLE,
-                    1,
-                );
-            }
-        }
-        drop(self.handle.take());
-    }
 }
 
 struct KernelStartLock {
@@ -1134,9 +1000,11 @@ mod ownership_tests {
             .unwrap();
         let pid = child.id() as libc::pid_t;
         let guard = KernelBootstrapGuard::owned(OwnedKernelProcess {
-            child,
+            process: OwnedHostProcess {
+                child,
+                process_group_id: pid,
+            },
             log_path: PathBuf::from("unused-test-log"),
-            process_group_id: pid,
             shutdown_target: OwnedKernelShutdownTarget {
                 host: "127.0.0.1".into(),
                 port: 0,

@@ -107,6 +107,10 @@ async function getJson<T>(url: string, signal?: AbortSignal): Promise<ApiRespons
   }
 }
 
+export async function initializeWorkspaceSandbox(): Promise<ApiResponse<unknown>> {
+  return sendJson('/api/user-settings/workspace-sandbox', 'POST', {});
+}
+
 async function sendJson<T>(
   url: string,
   method: 'POST' | 'PATCH' | 'DELETE',

@@ -28,5 +28,9 @@
   "skills.autoLoad": true,
   "skills.mounts": "[]",
   "mcp.autoLoad": false,
-  "mcp.servers": "[]"
+  "mcp.servers": "[]",
+  "agent.windows.shell": "auto",
+  "agent.windows.gitBashPath": "",
+  "agent.environmentRevision": 0,
+  "agent.projectEnvironments": "{}"
 }

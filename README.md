@@ -1,5 +1,7 @@
 # DeepCode
 
+Current product version: **0.5.52**.
+
 > 中文说明：[README.zh-CN.md](README.zh-CN.md)
 
 DeepCode is a local-first coding-agent framework. The Editor, DeepCode-GUI, CLI, and TUI share one local Session Runtime, Kernel, and `SessionProjection`; their differences are limited to rendering and interaction.
@@ -27,7 +29,7 @@ user input
 
 DeepCode has no parallel Requirement, Plan, or Review workflow engine. Ordinary narrative and final answers are native LLM Markdown; Session classifies them only from the typed Provider turn lifecycle and projects the current run's text deltas as a disposable `assistantDraft` to every shell. Plan and interaction facts can only come from the LLM invoking reserved structured Session control tools—there is no JSONL body envelope, prose inference, or parse-failure fallback. `plan.publish` publishes one complete revision; `plan.respond(confirm)` commits session-scoped authority only for its exact workspace, operation, and normalized targets and atomically seeds the Todo list from the Plan steps. Revision requests retain the Plan identity and increment its revision, while cancellation creates no authority or Todo. Confirmed Plan/Todo state survives ordinary supplemental input and subsequent runs until an explicit Plan lifecycle fact supersedes, completes, cancels, or invalidates it.
 
-A Session binding always limits workspace tools to its immutable run snapshot. `agent.permissions.workspaceMutation` defaults to `plan`; setting it to `allow` removes the Plan admission gate for workspace mutations, including `bash` calls declared with `workspaceMode=write`. `bash` executes one bounded command from the bound workspace and requires both `workspaceMode` and `executionScope`. `executionScope=workspace` uses the workspace sandbox; read mode may write only to Kernel-owned temporary storage, while write mode requires exact workspace mutation authority. This sandbox is currently implemented on macOS and fails explicitly on unsupported platforms. `executionScope=host` uses the host user environment and additionally requires `agent.permissions.external`; a host command that mutates the workspace must declare write mode and therefore needs both workspace mutation and external authority. Optional `terminal.stdin` is written exactly once to a temporary PTY; without it stdin is closed, and no persistent terminal session is created. The working directory starts at the bound workspace root, PATH combines the host PATH with existing standard developer-tool directories, and every attempt owns and reclaims only its child process group, PTY, and temporary files. Exit zero produces a completed ToolRecord; nonzero exit or timeout produces a failed ToolRecord while retaining bounded output and exit facts. Network reads default to `allow`; host Bash and external-effect tools use the separate external permission. `web.search` and `web.fetch` remain the generic core network tools, while GitHub-, arXiv-, and PDF-specific workflows are activated through Skills or plugins. `agent.permissions.engineeringDecisions` independently chooses whether material engineering-route ambiguity is asked through `interaction.request` or delegated to the Agent.
+A Session binding always limits workspace tools to its immutable run snapshot. `agent.permissions.workspaceMutation` defaults to `plan`; setting it to `allow` removes the Plan admission gate for workspace mutations, including `bash` calls declared with `workspaceMode=write`. The selected shell tool (`bash` or `powershell`) executes one bounded command from the bound workspace and requires both `workspaceMode` and `executionScope`. `executionScope=workspace` uses the workspace sandbox; read mode may write only to Kernel-owned temporary storage, while write mode requires exact workspace mutation authority. The platform adapters use sandbox-exec on macOS, Bubblewrap on Linux/WSL2, and initialized native Windows workspace support. Missing prerequisites produce an explicit error; see [Execution environments](docs/product/execution-environments.md). `executionScope=host` uses the host user environment and additionally requires `agent.permissions.external`; a host command that mutates the workspace must declare write mode and therefore needs both workspace mutation and external authority. Optional `terminal.stdin` is written exactly once to a temporary PTY; without it stdin is closed, and no persistent terminal session is created. The working directory starts at the bound workspace root, PATH combines the host PATH with existing standard developer-tool directories, and every attempt owns and reclaims only its child process group, PTY, and temporary files. Exit zero produces a completed ToolRecord; nonzero exit or timeout produces a failed ToolRecord while retaining bounded output and exit facts. Network reads default to `allow`; host Bash and external-effect tools use the separate external permission. `web.search` and `web.fetch` remain the generic core network tools, while GitHub-, arXiv-, and PDF-specific workflows are activated through Skills or plugins. `agent.permissions.engineeringDecisions` independently chooses whether material engineering-route ambiguity is asked through `interaction.request` or delegated to the Agent.
 
 ## Interfaces
 
@@ -65,7 +67,7 @@ Build the local package from source:
 bash ./build.sh
 ```
 
-On Mac, the script selects macOS artifacts by default; `make build` uses the same entrypoint. Frontend and Session assets are built from source in Docker, while native Rust/Tauri packaging runs on the Darwin host.
+The script attempts Linux, Windows and macOS packaging by default, skipping targets whose support environment is unavailable; `make build` uses the same entrypoint. Frontend and Session assets are built from source in Docker, while native Rust/Tauri packaging runs on the Darwin host.
 
 Output is written to `bin/macos-arm64/` and includes both apps, the CLI/TUI launchers, Kernel, Session runtime, web assets, and a package-local writable data root. If a package still shows stale resources, quit every DeepCode app and run:
 
@@ -79,7 +81,7 @@ The macOS package service uses the request directory inside this repository and 
 
 ## Linux and Windows packages
 
-On WSL/Linux, run the same command to automatically build Linux and Windows artifacts in the single `deepcode-dev` container:
+Run the same command to build all supported platform packages. Linux and Windows builds use the single `deepcode-dev` container; macOS requires its native package worker:
 
 ```bash
 bash ./build.sh
@@ -96,7 +98,7 @@ make shell
 bash ./build.sh
 ```
 
-`make shell` passes the host platform into the container and prepares the native packaging service on Mac. Running `build.sh` inside that Mac development container therefore requests only macOS artifacts, even though its container kernel is Linux.
+`make shell` passes the host platform into the container and prepares the native packaging service on Mac. Running `build.sh` inside that container still attempts all three platforms; unavailable targets are reported as skipped. A target that starts and fails is reported as failed and makes the final build exit nonzero.
 
 Every entrypoint reevaluates `Dockerfile.dev` through Docker's build cache. If the source mount, image, or port changed, the tooling recreates only the fixed `deepcode-dev` container and preserves dependency/build caches. Branch-specific containers and `DEEPCODE_WORKTREE_ID` are no longer part of the development model. To recreate only the container, run:
 
@@ -114,7 +116,7 @@ bin/linux-arm64/
 bin/win64/
 ```
 
-For WSL/Linux builds, the Linux directory matches the development container architecture: `linux-x64` for amd64, or `linux-arm64` for arm64. A build emits one Linux architecture plus `win64`; Mac builds default to `macos-arm64` only.
+For WSL/Linux builds, the Linux directory matches the development container architecture: `linux-x64` for amd64, or `linux-arm64` for arm64. A supported build emits one Linux architecture plus `win64`, and adds `macos-arm64` when the macOS packaging environment is available. Use `--stage package-linux`, `--stage package-windows` or `--stage package-macos` to select one platform explicitly.
 
 On Linux:
 
@@ -127,11 +129,25 @@ Use `bin/linux-arm64` instead for an ARM64 Linux build.
 
 Then open [http://127.0.0.1:31245/](http://127.0.0.1:31245/). On Windows, use `DeepCode.exe` or `DeepCode-GUI.exe`; Microsoft Edge WebView2 Evergreen Runtime is required.
 
+## Execution, settings and extensions
+
+Native Windows defaults to automatic shell selection: PowerShell 7 is preferred, with Windows PowerShell 5.1 used when PowerShell 7 is absent. Git Bash is optional; WSL is an explicit project execution environment. The selected shell, platform and detected development commands form stable Session context, refreshed at an environment boundary rather than every model turn. Shell selection and workspace sandbox availability are separate capabilities.
+
+Settings groups configuration into Appearance, Agent behavior, Execution environment, Tool permissions, Models & services, and Plugins. Plugins can load text Skills from a directory or a `SKILL.md` file. Bundled English Markdown product documentation is available through `doc.read`; workflow Skills use `skill.read`. MCP and executable extensions remain part of the shared plugin architecture.
+
+Desktop attachments retain one **Files and folders** entry backed by the operating system's native picker. Skill sources and workspace opening also use one selection window. Windows includes a Select action for the highlighted file or directory. Cancellation leaves existing references unchanged.
+
+Todos describe stable development phases. Adding authorized file/directory scope uses a separate confirmation that preserves steps, verification and progress; a complete Plan revision remains available when the plan itself needs to change. Tool activities display real start and stdout/stderr progress, with final outcomes owned by Kernel records. Reading earlier messages keeps the viewport in place while the conversation runs.
+
+An application-started Host exits after its last client disconnects and active tasks finish. An explicitly started service remains running; use `deepcode-cli start-host` and `deepcode-cli stop-host` to manage it. The local Provider stream has no body idle timeout or total-duration cap; cancellation remains available and interrupted requests are not automatically replayed.
+
+See [Execution environments](docs/product/execution-environments.md) for platform setup and [Product operations](docs/product/operations.md) for tools, Host lifecycle, settings and extensions.
+
 ## Configure a model
 
 Before the first task:
 
-1. Open **Settings → LLM**.
+1. Open **Settings → Models & services**.
 2. Create an OpenAI-compatible, Anthropic, or Ollama profile.
 3. Enter the base URL, model, and any API key required by the provider.
 4. Enable the profile, select it as the default, and save.
@@ -154,7 +170,7 @@ For providers that require a reasoning field to be echoed across a tool continua
 9. Messages, Plan state, activities, artifacts, context usage, and run status all come from the shared projection.
 10. A committed Assistant answer can be copied, rated up or down, or have its rating cleared. Ratings are durable local Session facts, recover after restart, are not stored by the GUI, and are not sent to the Provider.
 11. Click the context ball in the composer to inspect the current Provider request partitions. Per-partition item counts and estimates come from Session; cache hit and miss counts come from Provider usage. Missing facts display `N/A`, and GUI/TUI do not attribute or recompute them. Settings shows Session-aggregated per-round token consumption newest first, 10 rows per page.
-12. For complex work, the LLM publishes a complete Plan through `plan.publish`; confirmation atomically seeds the Todo list from Plan steps, and later `todo.progress` calls may update only those generated item states. The right task panel consumes only that shared projection; it does not reinterpret tool calls or GUI state as tasks. Tool calls remain interleaved with narrative in the main Session timeline.
+12. For complex work, the LLM publishes a complete Plan through `plan.publish`; confirmation atomically seeds the Todo list from Plan steps, and later `plan.progress` calls may update only those generated item states. The right task panel consumes only that shared projection; it does not reinterpret tool calls or GUI state as tasks. Tool calls remain interleaved with narrative in the main Session timeline.
 
 Deleting a Session deletes the conversation catalog entry and its complete archive: Session events, command replay rows, binding relations, and Kernel tool records. An active run must be stopped first.
 
@@ -228,7 +244,7 @@ Within `contracts/agent-runtime/`, `catalog.sql`, `session.sql`, and `tool-recor
 
 ### No model is available
 
-Open **Settings → LLM**, enable and select a default profile, add the required API key, save, and probe it.
+Open **Settings → Models & services**, enable and select a default profile, add the required API key, save, and probe it.
 
 ### CLI/TUI cannot reach the local Daemon
 
@@ -264,7 +280,7 @@ bash ./test.sh full
 
 Run `required` and `full` inside `make shell`. They prepare the current TypeScript dependencies before running checks; host execution is rejected. `static` can run on the host and checks shell syntax, Git whitespace changes and the existing layer-dependency rules. `required` runs Rust workspace tests, TypeScript checks and the registered Session/GUI contract tests. `full` additionally builds CLI/TUI and GUI web resources and runs the existing local Provider fixture, tool execution and session lifecycle checks. It does not certify live Provider behavior, native GUI interaction or release packages.
 
-The four existing native GUI lifecycle tests belong to a separate Cargo workspace. Their explicit entrypoint in a supported native build environment is `cargo test --manifest-path shells/deepcode-gui/src-tauri/Cargo.toml`; they are not part of the default `required` or `full` profiles.
+The native GUI tests belong to a separate Cargo workspace. Their explicit entrypoint in a supported native build environment is `cargo test --manifest-path shells/deepcode-gui/src-tauri/Cargo.toml`; they are not part of the default `required` or `full` profiles.
 
 ## Notices and license
 

@@ -1,5 +1,67 @@
 use super::*;
 
+#[cfg(unix)]
+#[test]
+fn shell_progress_precedes_completion_and_keeps_full_archive() {
+    let workspace = TempWorkspace::new("shell-progress");
+    let mut context = context_with_target(&workspace.0, ".");
+    let cancel = context.cancellation.clone();
+    let (send, receive) = std::sync::mpsc::channel();
+    context.progress = KernelProgressSink::new(move |event| {
+        let _ = send.send(event);
+    });
+    let task = std::thread::spawn(move || {
+        ProcessShellExecutor.invoke(KernelToolInvocation {
+        id: "progress".into(), tool_id: "bash".into(),
+        input: serde_json::json!({"command":"printf 'before'; printf 'diagnostic' >&2; while [ ! -f finish ]; do sleep 0.05; done", "workspaceMode":"read", "executionScope":"host", "timeout":15}),
+    }, context)
+    });
+    let started = receive.recv_timeout(std::time::Duration::from_secs(5));
+    if !matches!(started, Ok(KernelToolProgress::Started { .. })) {
+        cancel.cancel();
+        let result = task.join();
+        panic!("missing started: {started:?}, {result:?}");
+    }
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    while stdout.is_empty() || stderr.is_empty() {
+        match receive.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(KernelToolProgress::Output {
+                stream,
+                offset,
+                bytes,
+            }) => {
+                let output = if stream == "stdout" {
+                    &mut stdout
+                } else {
+                    &mut stderr
+                };
+                assert_eq!(offset, output.len() as u64);
+                output.extend(bytes);
+            }
+            other => {
+                cancel.cancel();
+                let _ = task.join();
+                panic!("missing output: {other:?}");
+            }
+        }
+    }
+    assert!(
+        !task.is_finished(),
+        "output must arrive while the command is running"
+    );
+    fs::write(workspace.0.join("finish"), "release").unwrap();
+    let result = task.join().unwrap().unwrap();
+    assert_eq!(stdout, b"before");
+    assert_eq!(stderr, b"diagnostic");
+    for (stream, expected) in [("stdout", stdout), ("stderr", stderr)] {
+        let path = result.output["fullOutput"][stream]["path"]
+            .as_str()
+            .expect("complete archive reference");
+        assert_eq!(fs::read(path).unwrap(), expected);
+    }
+}
+
 #[test]
 fn edit_preview_exposes_line_joins_without_changing_requested_text() {
     let original = "# script\necho ready\nif true; then\n  echo done\nfi\n";
@@ -87,6 +149,7 @@ fn context_with_target(root: &Path, relative_path: &str) -> KernelToolExecutionC
             .to_string_lossy()
             .to_string()],
         cancellation: KernelCancellationToken::default(),
+        progress: Default::default(),
     }
 }
 

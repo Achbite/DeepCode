@@ -440,12 +440,14 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("POST", ["api", "host", "inspect"])
         | ("GET", ["api", "user-settings"])
         | ("PATCH", ["api", "user-settings"])
+        | ("POST", ["api", "user-settings", "workspace-sandbox"])
         | ("GET", ["api", "llm", "profiles"])
         | ("PATCH", ["api", "llm", "profiles"])
         | ("POST", ["api", "llm", "probe"])
         | ("GET", ["api", "conversation", "catalog"])
         | ("GET", ["api", "conversation", "statuses"])
         | ("GET", ["api", "conversation", "plugins"])
+        | ("GET", ["api", "conversation", "plugins", "skills"])
         | ("GET", ["api", "conversation", "catalog", "manage"])
         | ("POST", ["api", "conversation", "projects"])
         | ("POST", ["api", "conversation", "sessions"])
@@ -497,6 +499,18 @@ mod tests {
         assert!(!host_proxy_path_allowed(
             "GET",
             "/api/conversation/plugins/extra"
+        ));
+    }
+
+    #[test]
+    fn host_proxy_exposes_skill_settings_to_the_plugins_page() {
+        assert!(host_proxy_path_allowed(
+            "GET",
+            "/api/conversation/plugins/skills"
+        ));
+        assert!(!host_proxy_path_allowed(
+            "POST",
+            "/api/conversation/plugins/skills"
         ));
     }
 }

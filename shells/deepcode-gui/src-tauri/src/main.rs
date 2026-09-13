@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[path = "../../../shared/native_path_dialog/mod.rs"]
+mod native_path_dialog;
+
 use deepcode_kernel_abi::{
     is_valid_host_instance_id, is_valid_host_shell_token, is_valid_host_ui_token,
-    HostProcessIdentity, HostShutdownReceipt, HostShutdownRequest, HOST_INSTANCE_ID_ENV,
-    HOST_INSTANCE_ID_PREFIX, HOST_SHELL_TOKEN_ENV, HOST_SHELL_TOKEN_HEADER,
-    HOST_SHELL_TOKEN_PREFIX, HOST_SHUTDOWN_RECEIPT_TIMEOUT_MILLIS, HOST_TOKEN_ENTROPY_BYTES,
-    HOST_UI_TOKEN_ENV, HOST_UI_TOKEN_HEADER, HOST_UI_TOKEN_PREFIX, KERNEL_DAEMON_SERVICE,
+    HostProcessIdentity, HOST_INSTANCE_ID_ENV, HOST_INSTANCE_ID_PREFIX, HOST_SHELL_TOKEN_ENV,
+    HOST_SHELL_TOKEN_HEADER, HOST_SHELL_TOKEN_PREFIX, HOST_TOKEN_ENTROPY_BYTES, HOST_UI_TOKEN_ENV,
+    HOST_UI_TOKEN_HEADER, HOST_UI_TOKEN_PREFIX, KERNEL_DAEMON_SERVICE,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -13,26 +15,16 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::http::{header, Request, Response, StatusCode};
 use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent};
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-#[cfg(windows)]
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::HANDLE;
-#[cfg(windows)]
-use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+use deepcode_host_connection::process::{
+    spawn_owned_host_process, terminate_owned_process_tree, OwnedHostProcess,
 };
+use deepcode_host_connection::shell_lifecycle::{shutdown_daemon_process, OwnedHostChildren};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: &str = "31246";
@@ -45,6 +37,7 @@ struct HostProcessGroup {
 }
 
 struct HostProcessState {
+    external_client: Option<deepcode_host_connection::HostClientLease>,
     children: Option<OwnedHostChildren>,
     active_startups: usize,
     shutting_down: bool,
@@ -142,33 +135,11 @@ impl HostStartupStatusStore {
     }
 }
 
-struct OwnedHostChildren {
-    daemon: Option<OwnedHostProcess>,
-    start_guard: Option<deepcode_host_connection::HostStartGuard>,
-    proxy: OwnedHostProcess,
-    daemon_host: String,
-    daemon_port: String,
-    daemon_token: String,
-    daemon_identity: HostProcessIdentity,
-}
-
-struct OwnedHostProcess {
-    child: Child,
-    #[cfg(unix)]
-    process_group_id: libc::pid_t,
-    #[cfg(windows)]
-    job: WindowsKillOnCloseJob,
-}
-
-#[cfg(windows)]
-struct WindowsKillOnCloseJob {
-    handle: Option<OwnedHandle>,
-}
-
 impl HostProcessGroup {
     fn new(children: Option<OwnedHostChildren>) -> Self {
         Self {
             state: Mutex::new(HostProcessState {
+                external_client: None,
                 children,
                 active_startups: 0,
                 shutting_down: false,
@@ -236,6 +207,7 @@ impl HostProcessGroup {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.shutting_down = true;
+        drop(state.external_client.take());
         if let Some(mut children) = state.children.take() {
             children.shutdown();
         }
@@ -269,25 +241,6 @@ impl Drop for HostStartupLease<'_> {
     }
 }
 
-impl OwnedHostChildren {
-    fn share_ready_daemon(&mut self) {
-        // Authenticated startup succeeded. From here the service outlives shells.
-        drop(self.daemon.take());
-        drop(self.start_guard.take());
-    }
-
-    fn shutdown(&mut self) {
-        terminate_owned_process_tree(&mut self.proxy);
-        shutdown_daemon_process(
-            &mut self.daemon,
-            &self.daemon_host,
-            &self.daemon_port,
-            &self.daemon_token,
-            &self.daemon_identity,
-        );
-    }
-}
-
 impl Drop for HostProcessGroup {
     fn drop(&mut self) {
         self.detach();
@@ -296,10 +249,12 @@ impl Drop for HostProcessGroup {
 
 fn main() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .register_uri_scheme_protocol(APP_ASSET_SCHEME, |_ctx, request| {
             serve_bundled_asset(APP_ASSET_DIR, request)
         })
         .invoke_handler(tauri::generate_handler![
+            native_path_dialog::deepcode_pick_path,
             deepcode_boot_target,
             deepcode_default_workspace_path,
             deepcode_host_startup_status,
@@ -813,17 +768,57 @@ fn start_host_processes(
         );
     };
     if env_truthy("DEEPCODE_SHELL_CONNECT_ONLY") {
-        return status.update(
-            &attempt_id,
-            "external",
-            "connectOnly",
-            "host_startup_external",
-            None,
-            "Connect-only mode is waiting for an externally owned Host.",
-            true,
+        let result = deepcode_host_connection::HostClientLease::connect(
+            &format!("http://{}:{}", target.host, target.daemon_port),
+            host_tokens.daemon_token(),
             false,
-            None,
         );
+        return match result {
+            Ok(lease) => {
+                let mut state = processes
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.shutting_down {
+                    drop(lease);
+                    status.update(
+                        &attempt_id,
+                        "stopped",
+                        "shutdown",
+                        "host_startup_stopped",
+                        None,
+                        "Host connection was stopped because the application is closing.",
+                        false,
+                        false,
+                        None,
+                    )
+                } else {
+                    state.external_client = Some(lease);
+                    status.update(
+                        &attempt_id,
+                        "external",
+                        "connectOnly",
+                        "host_startup_external",
+                        None,
+                        "Connected to the externally owned Host.",
+                        false,
+                        false,
+                        None,
+                    )
+                }
+            }
+            Err(error) => status.update(
+                &attempt_id,
+                "failed",
+                "connectOnly",
+                "host_client_attach_failed",
+                None,
+                error.to_string(),
+                true,
+                false,
+                None,
+            ),
+        };
     }
 
     // Retry may be requested while this shell still owns a surviving proxy or
@@ -1068,6 +1063,7 @@ fn spawn_host_processes_if_available(
             .env("DEEPCODE_CONFIG_DIR", config_root)
             .env_remove(HOST_UI_TOKEN_ENV)
             .env(HOST_SHELL_TOKEN_ENV, host_tokens.daemon_token())
+            .env(deepcode_host_connection::HOST_LIFETIME_ENV, "automatic")
             .env(HOST_INSTANCE_ID_ENV, host_tokens.instance_id())
             .stdin(Stdio::null());
         if let Err(error) = configure_process_capture(
@@ -1186,6 +1182,7 @@ fn spawn_host_processes_if_available(
         .env("DEEPCODE_CLIENT_DIST", web_dir)
         .env(HOST_UI_TOKEN_ENV, host_tokens.ui_token())
         .env(HOST_SHELL_TOKEN_ENV, host_tokens.daemon_token())
+        .env(deepcode_host_connection::HOST_LIFETIME_ENV, "automatic")
         .env(HOST_INSTANCE_ID_ENV, host_tokens.instance_id())
         .stdin(Stdio::null());
     if let Err(error) = configure_process_capture(
@@ -1296,30 +1293,7 @@ fn spawn_host_processes_if_available(
             failure.retryable,
         ));
     }
-    #[cfg(windows)]
-    if let Err(error) = daemon
-        .as_ref()
-        .map(|process| process.job.release_on_close())
-        .unwrap_or(Ok(()))
-        .and_then(|_| proxy.job.release_on_close())
-    {
-        terminate_owned_process_tree(&mut proxy);
-        shutdown_daemon_process(
-            &mut daemon,
-            &target.host,
-            &target.daemon_port,
-            host_tokens.daemon_token(),
-            &daemon_identity,
-        );
-        return Err(startup_failure(
-            "sharedHost",
-            "host_lifetime_transfer_failed",
-            None,
-            error.to_string(),
-            true,
-        ));
-    }
-    Ok(OwnedHostChildren {
+    let mut children = OwnedHostChildren {
         daemon,
         start_guard: Some(shared_start_guard),
         proxy,
@@ -1327,7 +1301,19 @@ fn spawn_host_processes_if_available(
         daemon_port: target.daemon_port.clone(),
         daemon_token: host_tokens.daemon_token().to_string(),
         daemon_identity,
-    })
+        client_lease: None,
+    };
+    if let Err(error) = children.attach_client() {
+        children.shutdown();
+        return Err(startup_failure(
+            "sharedHost",
+            "host_client_attach_failed",
+            None,
+            error.to_string(),
+            true,
+        ));
+    }
+    Ok(children)
 }
 
 fn configured_or_bundled_file(
@@ -1740,217 +1726,6 @@ fn authenticated_health_status(
     AuthenticatedHealthStatus::Failed
 }
 
-fn request_daemon_shutdown(
-    host: &str,
-    port: &str,
-    token: &str,
-    expected_identity: &HostProcessIdentity,
-) -> bool {
-    let Ok(body) = serde_json::to_string(&HostShutdownRequest {
-        expected_identity: expected_identity.clone(),
-    }) else {
-        return false;
-    };
-    let request = http_request_with_json_body(
-        host,
-        port,
-        "POST",
-        "/api/host/shutdown",
-        &[(HOST_SHELL_TOKEN_HEADER, token)],
-        &body,
-    );
-    let Some(envelope) = request_loopback_json::<HostApiEnvelope<HostShutdownReceipt>>(
-        host,
-        port,
-        &request,
-        HOST_SHUTDOWN_RECEIPT_TIMEOUT_MILLIS,
-    ) else {
-        return false;
-    };
-    let Some(receipt) = envelope.ok.then_some(envelope.data).flatten() else {
-        return false;
-    };
-    receipt.confirms_shutdown_of(expected_identity)
-}
-
-fn shutdown_daemon_process(
-    process: &mut Option<OwnedHostProcess>,
-    host: &str,
-    port: &str,
-    token: &str,
-    expected_identity: &HostProcessIdentity,
-) {
-    let Some(process) = process.as_mut() else {
-        return;
-    };
-    if !request_daemon_shutdown(host, port, token, expected_identity)
-        || !wait_for_child_exit(process, 80)
-    {
-        terminate_owned_process_tree(process);
-    }
-}
-
-fn wait_for_child_exit(process: &mut OwnedHostProcess, attempts: usize) -> bool {
-    for _ in 0..attempts {
-        match process.child.try_wait() {
-            Ok(Some(_)) => {
-                return true;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(_) => return false,
-        }
-    }
-    false
-}
-
-#[cfg(unix)]
-fn owned_process_group_exists(process_group_id: libc::pid_t) -> bool {
-    if unsafe { libc::kill(-process_group_id, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-}
-
-#[cfg(unix)]
-fn wait_for_owned_process_group_exit(process: &mut OwnedHostProcess, attempts: usize) -> bool {
-    for _ in 0..attempts {
-        let _ = process.child.try_wait();
-        if !owned_process_group_exists(process.process_group_id) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    !owned_process_group_exists(process.process_group_id)
-}
-
-fn terminate_owned_process_tree(process: &mut OwnedHostProcess) {
-    #[cfg(unix)]
-    {
-        unsafe {
-            libc::kill(-process.process_group_id, libc::SIGTERM);
-        }
-        if !wait_for_owned_process_group_exit(process, 20) {
-            unsafe {
-                libc::kill(-process.process_group_id, libc::SIGKILL);
-            }
-            let _ = wait_for_owned_process_group_exit(process, 20);
-        }
-    }
-    #[cfg(windows)]
-    {
-        process.job.close();
-        if !wait_for_child_exit(process, 20) {
-            let _ = process.child.kill();
-        }
-    }
-    let _ = process.child.wait();
-}
-
-fn spawn_owned_host_process(command: &mut Command) -> std::io::Result<OwnedHostProcess> {
-    #[cfg(unix)]
-    {
-        command.process_group(0);
-        let mut child = command.spawn()?;
-        let pid = child.id() as libc::pid_t;
-        let process_group_id = unsafe { libc::getpgid(pid) };
-        if process_group_id <= 0 || process_group_id != pid {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(std::io::Error::other(
-                "spawned Host child did not enter its exact owned process group",
-            ));
-        }
-        return Ok(OwnedHostProcess {
-            child,
-            process_group_id,
-        });
-    }
-    #[cfg(windows)]
-    {
-        let job = WindowsKillOnCloseJob::new()?;
-        command.creation_flags(0x0800_0200);
-        let mut child = command.spawn()?;
-        if let Err(error) = job.assign(&child) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-        return Ok(OwnedHostProcess { child, job });
-    }
-}
-
-#[cfg(windows)]
-impl WindowsKillOnCloseJob {
-    fn new() -> std::io::Result<Self> {
-        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if handle.is_null() {
-            return Err(std::io::Error::last_os_error());
-        }
-        let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-        let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let configured = unsafe {
-            SetInformationJobObject(
-                handle.as_raw_handle() as HANDLE,
-                JobObjectExtendedLimitInformation,
-                (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        if configured == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(Self {
-            handle: Some(handle),
-        })
-    }
-
-    fn release_on_close(&self) -> std::io::Result<()> {
-        let handle = self
-            .handle
-            .as_ref()
-            .ok_or_else(|| std::io::Error::other("Kernel Job Object is closed"))?;
-        let information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        let configured = unsafe {
-            SetInformationJobObject(
-                handle.as_raw_handle() as HANDLE,
-                JobObjectExtendedLimitInformation,
-                (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        if configured == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    fn assign(&self, child: &Child) -> std::io::Result<()> {
-        let Some(handle) = self.handle.as_ref() else {
-            return Err(std::io::Error::other("Host Job Object is closed"));
-        };
-        let process_handle = child.as_raw_handle() as HANDLE;
-        if unsafe { AssignProcessToJobObject(handle.as_raw_handle() as HANDLE, process_handle) }
-            == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    fn close(&mut self) {
-        if let Some(handle) = self.handle.as_ref() {
-            unsafe {
-                windows_sys::Win32::System::JobObjects::TerminateJobObject(
-                    handle.as_raw_handle() as HANDLE,
-                    1,
-                );
-            }
-        }
-        drop(self.handle.take());
-    }
-}
-
 fn http_request(
     host: &str,
     port: &str,
@@ -1971,33 +1746,6 @@ fn http_request(
         request.push_str("\r\n");
     }
     request.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
-    request
-}
-
-fn http_request_with_json_body(
-    host: &str,
-    port: &str,
-    method: &str,
-    path: &str,
-    headers: &[(&str, &str)],
-    body: &str,
-) -> String {
-    let token = if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    };
-    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {token}\r\n");
-    for (name, value) in headers {
-        request.push_str(name);
-        request.push_str(": ");
-        request.push_str(value);
-        request.push_str("\r\n");
-    }
-    request.push_str("Content-Type: application/json\r\n");
-    request.push_str(&format!("Content-Length: {}\r\n", body.len()));
-    request.push_str("Connection: close\r\n\r\n");
-    request.push_str(body);
     request
 }
 
@@ -2256,6 +2004,7 @@ mod tests {
         let proxy_pid = proxy.child.id();
         let processes = HostProcessGroup::new(None);
         let installed = processes.install(OwnedHostChildren {
+            client_lease: None,
             daemon: None,
             start_guard: None,
             proxy,
@@ -2299,6 +2048,7 @@ mod tests {
         let daemon_pid = daemon.child.id();
         let proxy_pid = proxy.child.id();
         let children = OwnedHostChildren {
+            client_lease: None,
             daemon: Some(daemon),
             start_guard: None,
             proxy,

@@ -1,4 +1,5 @@
 import type {
+  JsonObject,
   CommandJournalPort,
   CommandReply,
   ConversationCommand,
@@ -24,6 +25,7 @@ import type {
   ToolExecutionRecord,
   ToolExecutionReply,
   ToolExecutionRequest,
+  ToolExecutionProgress,
 } from '@deepcode/protocol';
 import {
   KERNEL_REPLY_VERSION,
@@ -34,6 +36,7 @@ import {
 } from '@deepcode/protocol';
 import { createProviderToolAliases } from './providerToolCodec.js';
 import { LoopFailure } from './loopFailure.js';
+import { postLocalStream } from './localHttpStream.js';
 import { sessionControlToolDefinitions } from './sessionControls.js';
 import { environmentInstruction } from './sessionEnvironment.js';
 import {
@@ -98,11 +101,15 @@ class LocalAgentHttpPort {
 }
 
 function transportErrorMessage(error: unknown): string {
-  if (!(error instanceof Error)) return String(error);
-  const cause = error.cause;
-  return error.message + (cause instanceof Error
-    ? `; cause ${'code' in cause ? String(cause.code) + ': ' : ''}${cause.message}`
-    : cause === undefined ? '' : `; cause ${String(cause)}`);
+  const messages: string[] = [];
+  const seen = new Set<unknown>();
+  while (error !== undefined && !seen.has(error)) {
+    seen.add(error);
+    if (!(error instanceof Error)) { messages.push(String(error)); break; }
+    messages.push(`${'code' in error ? `${String(error.code)}: ` : ''}${error.message}`);
+    error = error.cause;
+  }
+  return messages.join('; cause ');
 }
 
 export class HttpCommandJournal extends LocalAgentHttpPort implements CommandJournalPort {
@@ -159,11 +166,65 @@ export class HttpCommandJournal extends LocalAgentHttpPort implements CommandJou
 }
 
 export class HttpKernelPort extends LocalAgentHttpPort implements KernelPort {
-  async execute(request: ToolExecutionRequest): Promise<ToolExecutionReply> {
-    return await this.json('/api/local-agent/kernel/execute', {
-      method: 'POST',
-      body: JSON.stringify(request),
-    });
+  readonly #streamFetch?: typeof fetch;
+
+  constructor(options: HttpPortOptions) {
+    super(options);
+    this.#streamFetch = options.fetchImpl;
+  }
+
+  async execute(request: ToolExecutionRequest, onProgress?: (progress: ToolExecutionProgress) => Promise<void>): Promise<ToolExecutionReply> {
+    const url = `${this.apiBase}/api/local-agent/kernel/execute`;
+    const headers = { 'x-deepcode-session-service-token': this.serviceToken, 'content-type': 'application/json' };
+    const body = JSON.stringify(request);
+    const controller = new AbortController();
+    const response = this.#streamFetch
+      ? await this.#streamFetch(url, { method: 'POST', headers, body, signal: controller.signal })
+      : await postLocalStream(url, headers, body, controller.signal);
+    if (!response.ok || !response.headers.get('content-type')?.includes('application/x-ndjson')) {
+      const envelope = await response.json() as { error?: string; message?: string };
+      throw new Error(`${envelope.error ?? 'kernel_execution_http_failed'}:${envelope.message ?? response.status}`);
+    }
+    if (!response.body) throw new Error('kernel_execution_stream_missing');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let pending = '';
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        pending += decoder.decode(value, { stream: !done });
+        let newline: number;
+        while ((newline = pending.indexOf('\n')) >= 0) {
+          const line = pending.slice(0, newline); pending = pending.slice(newline + 1);
+          if (!line.trim()) continue;
+          const frame: unknown = JSON.parse(line);
+          if (!isRecord(frame)) throw new Error('kernel_execution_frame_invalid');
+          if (frame.type === 'error') throw new Error(`${frame.code}:${frame.message}`);
+          if (frame.type === 'reply') {
+            const reply = frame.reply as ToolExecutionReply;
+            if (!reply || reply.callId !== request.callId || reply.requestId !== request.requestId) throw new Error('kernel_execution_reply_identity_invalid');
+            return reply;
+          }
+          if (frame.type !== 'progress' || frame.callId !== request.callId || frame.attemptId !== request.attemptId || !isRecord(frame.progress)) {
+            throw new Error('kernel_execution_progress_identity_invalid');
+          }
+          const progress = frame.progress;
+          if (progress.type === 'started') {
+            if (typeof progress.startedAt !== 'string' || !/^\d+$/u.test(progress.startedAt)) throw new Error('kernel_execution_started_invalid');
+          } else if (progress.type !== 'output' || !['stdout', 'stderr'].includes(String(progress.stream))
+            || !Number.isSafeInteger(progress.offset) || Number(progress.offset) < 0 || !Array.isArray(progress.bytes)
+            || !progress.bytes.every((byte) => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
+            throw new Error('kernel_execution_output_invalid');
+          }
+          await onProgress?.(progress as unknown as ToolExecutionProgress);
+        }
+        if (done) throw new Error('kernel_execution_reply_missing');
+      }
+    } finally {
+      await reader.cancel().catch(() => undefined);
+      reader.releaseLock();
+      controller.abort();
+    }
   }
 
   async cancel(callId: string, attemptId: string): Promise<ToolCancelReply> {
@@ -239,28 +300,41 @@ function decodePreparedToolDescriptors(value: unknown): readonly PreparedToolDes
 }
 
 export class HttpProviderPort extends LocalAgentHttpPort implements ProviderPort {
+  readonly #streamFetch?: typeof fetch;
+
+  constructor(options: HttpPortOptions) {
+    super(options);
+    this.#streamFetch = options.fetchImpl;
+  }
+
   async *stream(
     request: ProviderRequest,
     signal: AbortSignal,
   ): AsyncIterable<ProviderEvent> {
-    const response = await this.fetchImpl(`${this.apiBase}/api/local-agent/provider/stream`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-deepcode-session-service-token': this.serviceToken,
-      },
-      body: JSON.stringify(request),
-      signal,
-    });
-    if (!response.ok || !response.body) {
-      throw new Error(`provider_http_failed:${response.status}`);
+    const url = `${this.apiBase}/api/local-agent/provider/stream`;
+    const headers = {
+      'content-type': 'application/json',
+      'x-deepcode-session-service-token': this.serviceToken,
+    };
+    try {
+      const body = JSON.stringify(request);
+      const response = this.#streamFetch
+        ? await this.#streamFetch(url, { method: 'POST', headers, body, signal })
+        : await postLocalStream(url, headers, body, signal);
+      if (!response.ok || !response.body) {
+        await response.body?.cancel();
+        throw new Error(`provider_http_failed:${response.status}`);
+      }
+      if (!(response.headers.get('content-type') ?? '').startsWith('text/event-stream')) {
+        await response.body.cancel();
+        throw new Error('provider_content_type_invalid');
+      }
+      yield* decodeProviderEvents(response.body, request.requestId, signal);
+    } catch (error) {
+      if (signal.aborted) throw signal.reason ?? error;
+      if (error instanceof LoopFailure) throw error;
+      throw new LoopFailure('provider_stream_failed', transportErrorMessage(error));
     }
-    const contentType = response.headers.get('content-type') ?? '';
-    if (!contentType.startsWith('text/event-stream')) {
-      await response.body.cancel();
-      throw new Error('provider_content_type_invalid');
-    }
-    yield* decodeProviderEvents(response.body, request.requestId, signal);
   }
 }
 
@@ -355,6 +429,7 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
           kernelCatalogSnapshotRef: value.kernelCatalogSnapshotRef,
           provider,
           webSearch,
+          environment: value.environment as JsonObject,
           instructions: [...runtimeInstructions([
             ...this.#stableCoreInstructions,
             environmentInstruction(value.environment),

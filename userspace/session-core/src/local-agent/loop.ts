@@ -21,6 +21,7 @@ import type {
   ToolExecutionRecord,
   ToolInputRejection,
   ToolExecutionRequest,
+  ToolExecutionProgress,
   WorkspaceBindingDisplay,
 } from '@deepcode/protocol';
 import {
@@ -94,6 +95,7 @@ export interface AgentLoopDeps {
   commit(event: NewSessionEvent | readonly NewSessionEvent[]): Promise<LoopSnapshot>;
   updateAssistantDraft(draft: AssistantDraftProjection | null): void;
   updateReasoning?(requestId: string, runId: string, text: string, kind: 'text' | 'summary'): void;
+  updateToolProgress?(callId: string, progress: ToolExecutionProgress): void;
   nextId(kind: string): string;
 }
 
@@ -1841,7 +1843,15 @@ async function executeUntilAbort(
     await cancelExecutingAttempt(deps, request);
     throw signal.reason ?? new Error('run_cancelled');
   }
-  const execution = deps.composition.kernel.execute(request);
+  let observing = true;
+  const execution = deps.composition.kernel.execute(request, async (progress) => {
+    if (!observing) return;
+    if (progress.type === 'started') {
+      await deps.commit({ type: 'tool.started', sessionId: request.sessionId, runId: request.runId,
+        callId: request.callId, payload: { attemptId: request.attemptId, startedAt: progress.startedAt } });
+    }
+    if (observing) deps.updateToolProgress?.(request.callId, progress);
+  });
   void execution.catch(() => undefined);
   let onAbort: (() => void) | undefined;
   const aborted = new Promise<void>((resolve) => {
@@ -1867,6 +1877,7 @@ async function executeUntilAbort(
       record: cancelled.record,
     };
   } finally {
+    observing = false;
     if (onAbort) signal.removeEventListener('abort', onAbort);
   }
 }

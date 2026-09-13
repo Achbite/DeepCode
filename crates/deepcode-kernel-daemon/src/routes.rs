@@ -6,6 +6,7 @@ pub(crate) fn build_app(state: AppState) -> Router {
     let host_connection = state.host_connection.clone();
     Router::new()
         .route("/api/host/identity", get(host_identity))
+        .route("/api/host/client", get(host_client))
         .route("/api/health", get(health))
         .route("/api/host/shutdown", post(host_shutdown))
         .route("/api/workspaces/current", get(workspace_current))
@@ -22,6 +23,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/api/user-settings",
             get(user_settings_get).patch(user_settings_patch),
+        )
+        .route(
+            "/api/user-settings/workspace-sandbox",
+            post(workspace_sandbox_setup),
         )
         .route(
             "/api/llm/profiles",
@@ -90,6 +95,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/api/conversation/plugins",
             get(conversation_plugin_catalog_get),
+        )
+        .route(
+            "/api/conversation/plugins/skills",
+            get(conversation_skill_settings_get),
         )
         .route(
             "/api/conversation/catalog/manage",

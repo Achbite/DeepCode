@@ -27,6 +27,7 @@ impl ProductTools {
         match name {
             "session.read" => self.reader.read(input),
             "skill.read" => read_skill(input),
+            "doc.read" => read_doc(input),
             _ => Err(SessionServiceError::new("tool_not_found", name)),
         }
     }
@@ -52,6 +53,10 @@ impl ProductTools {
                     "name":{"type":"string","enum": SKILLS.iter().map(|skill| skill.id).collect::<Vec<_>>()},
                     "path":{"type":"string","description":"SKILL.md or a reference path linked by that Skill."}
                 }
+            })),
+            ("doc.read", "Read bundled DeepCode product documentation in English Markdown. Docs explain product behavior, configuration and known limitations; Skills describe task workflows. Available documents: operations.md, execution-environments.md.".into(), json!({
+                "type":"object", "additionalProperties":false, "required":["name"],
+                "properties":{"name":{"type":"string","enum":["operations.md","execution-environments.md"]}}
             })),
         ]
     }
@@ -84,12 +89,58 @@ const SKILLS: &[ProductSkill] = &[
     ProductSkill {
         id: "deepcode-product",
         entry: include_str!("../../../skills/deepcode-product/SKILL.md"),
-        references: &[(
-            "references/operations.md",
-            include_str!("../../../skills/deepcode-product/references/operations.md"),
-        )],
+        references: &[
+            (
+                "references/operations.md",
+                include_str!("../../../skills/deepcode-product/references/operations.md"),
+            ),
+            (
+                "references/windows-environment.md",
+                include_str!("../../../skills/deepcode-product/references/windows-environment.md"),
+            ),
+        ],
     },
 ];
+
+const DOCS: &[(&str, &str)] = &[
+    (
+        "operations.md",
+        include_str!("../../../docs/product/operations.md"),
+    ),
+    (
+        "execution-environments.md",
+        include_str!("../../../docs/product/execution-environments.md"),
+    ),
+];
+
+fn read_doc(input: Value) -> Result<Value, SessionServiceError> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Query {
+        name: String,
+    }
+    let query: Query = serde_json::from_value(input)
+        .map_err(|error| SessionServiceError::new("tool_input_invalid", error.to_string()))?;
+    let (_, content) = DOCS
+        .iter()
+        .find(|(name, _)| *name == query.name)
+        .ok_or_else(|| SessionServiceError::new("doc_not_found", &query.name))?;
+    Ok(json!({"name":query.name,"mediaType":"text/markdown","content":content}))
+}
+
+pub(crate) fn bundled_skill_settings() -> Vec<Value> {
+    SKILLS
+        .iter()
+        .map(|skill| {
+            json!({
+                "id": skill.id,
+                "displayName": skill.id,
+                "description": skill.description(),
+                "source": "builtin",
+            })
+        })
+        .collect()
+}
 
 fn read_skill(input: Value) -> Result<Value, SessionServiceError> {
     #[derive(serde::Deserialize)]
@@ -136,4 +187,35 @@ pub(crate) fn test_product_tools() -> Arc<ProductTools> {
         }
     }
     Arc::new(ProductTools::new(Arc::new(Reader)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn product_docs_and_skills_are_distinct_read_only_resources() {
+        let tools = test_product_tools();
+        let doc = tools
+            .call("doc.read", json!({"name":"execution-environments.md"}))
+            .unwrap();
+        assert_eq!(doc["mediaType"], "text/markdown");
+        assert!(doc["content"]
+            .as_str()
+            .unwrap()
+            .contains("## Native Windows"));
+        assert!(tools
+            .call("skill.read", json!({"name":"execution-environments.md"}))
+            .is_err());
+        let skill = tools
+            .call("skill.read", json!({"name":"deepcode-product"}))
+            .unwrap();
+        assert!(skill["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("---\nname: deepcode-product"));
+        assert!(tools
+            .call("doc.read", json!({"name":"../../private.md"}))
+            .is_err());
+        assert_eq!(bundled_skill_settings().len(), 2);
+    }
 }

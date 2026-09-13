@@ -1,0 +1,15 @@
+# Windows execution environment and troubleshooting
+
+First distinguish tool startup, shell syntax, the project toolchain, service availability and the executed program. A nonzero exit code may be a valid test failure; failure alone is not a reason to switch environments.
+
+- Native Windows automatic selection prefers PowerShell 7 (`pwsh.exe`), then Windows PowerShell 5.1 if PowerShell 7 is absent. An explicit PowerShell 7 choice reports absence instead of selecting a different shell. Git Bash is opt-in; System32 `bash.exe` is a WSL launcher, not Git Bash.
+- Write commands in the dialect recorded in the stable environment context. PowerShell 5.1 does not support `&&` or `||`. Capture `$LASTEXITCODE` immediately after a native program and explicitly `exit` with it when reporting that program's result. PowerShell and Bash scripts are not translated into one another.
+- `powershell_unavailable`: the selected shell is absent or its path is invalid. Suggest installing PowerShell 7 or choosing an installed shell in Settings > Execution environment, then refreshing the environment. Installation, PATH changes and environment selection require the user's decision.
+- A PowerShell 5.1 syntax error can often be corrected using valid 5.1 syntax. Recommend PowerShell 7 when the project requires newer features, rather than recommending an upgrade for every failure.
+- Projects requiring Linux commands, POSIX scripts or a Linux toolchain are candidates for an explicit WSL project environment. Confirm the distribution and project path; do not switch to WSL merely because a Bash command failed.
+- Finding Docker, Git or another command does not establish service readiness. Preserve the original Docker daemon connection error. PowerShell 7 and WSL do not automatically start services.
+- `*_workspace_sandbox_unavailable`: the selected backend is unavailable; inspect `workspaceSandbox.reason` in the stable environment context. Native Windows may require Initialize Windows support in Execution environment settings. Linux/WSL2 requires Bubblewrap and namespace support. This is not a syntax failure, and installing PowerShell 7 does not fix it. Preserve the error. If host scope is needed, obtain the existing external/Plan authorization for that scope. Filesystem tools retain their own workspace and Plan boundaries.
+
+Environment observations are reused within a session. An explicit refresh or settings change applies at the next run boundary; active invocations keep their selected shell. The developer-command list is an observation, not a service health check, and does not contain credentials.
+
+For DeepCode product issues, trace tool records, the Session journal and projection to the first incorrect fact. Missing UI output does not prove that a command never ran. A startup error must not produce invented stdout, exit codes or success state. Read the deepcode-session Skill when conversation queries are needed. Do not directly edit session databases, relax Plans, uninstall plugins or reinstall the product as a generic remedy.

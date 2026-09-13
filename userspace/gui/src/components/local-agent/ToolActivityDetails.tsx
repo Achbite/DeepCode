@@ -57,6 +57,7 @@ export const ProviderHostedDraftGroup: React.FC<ProviderHostedDraftGroupProps> =
               hosted={block}
               status={block.status}
               language={language}
+              onExpand={onExpand}
             />
           ))}
         </div>
@@ -112,6 +113,7 @@ export const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
               activity={activity}
               key={activity.activityId}
               language={language}
+              onExpand={onExpand}
               onOpenWorkspaceResource={onOpenWorkspaceResource}
             />
           ))}
@@ -125,9 +127,10 @@ interface ProviderHostedEntryProps {
   hosted: ProviderHostedActivityProjection;
   status: ActivityProjection['status'];
   language: UiLanguage;
+  onExpand(): void;
 }
 
-const ProviderHostedEntry: React.FC<ProviderHostedEntryProps> = ({ hosted, status, language }) => {
+const ProviderHostedEntry: React.FC<ProviderHostedEntryProps> = ({ hosted, status, language, onExpand }) => {
   const [expanded, setExpanded] = useConversationRowState(`hosted:${hosted.providerCallId}:expanded`, false);
   const actionType = providerHostedActionType(hosted.action);
   const fieldLabels: Record<string, string> = {
@@ -139,7 +142,10 @@ const ProviderHostedEntry: React.FC<ProviderHostedEntryProps> = ({ hosted, statu
   };
   return (
     <div className={`local-agent__tool-entry local-agent__tool-entry--${status}`}>
-      <button type="button" className="local-agent__tool-entry-heading" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
+      <button type="button" className="local-agent__tool-entry-heading" aria-expanded={expanded} onClick={() => {
+        if (!expanded) onExpand();
+        setExpanded((value) => !value);
+      }}>
         <span className="local-agent__tool-entry-icon"><DeepCodeShellIcon name="search" /></span>
         <strong>{providerHostedSummary(hosted, status, language)}</strong>
         {status !== 'completed' && <span>{toolActivityStatus(status, language)}</span>}
@@ -185,6 +191,7 @@ interface ToolActivityEntryProps {
   sessionId: string;
   activity: ActivityProjection;
   language: UiLanguage;
+  onExpand(): void;
   onOpenWorkspaceResource(workspaceId: string, logicalPath: string): void;
 }
 
@@ -192,6 +199,7 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
   sessionId,
   activity,
   language,
+  onExpand,
   onOpenWorkspaceResource,
 }) => {
   const [expanded, setExpanded] = useConversationRowState(`tool:${activity.activityId}:expanded`, false);
@@ -226,6 +234,7 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
         hosted={activity.providerHosted}
         status={activity.status}
         language={language}
+        onExpand={onExpand}
       />
     );
   }
@@ -235,12 +244,18 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
         type="button"
         className="local-agent__tool-entry-heading"
         aria-expanded={expanded}
-        onClick={() => setExpanded((current) => !current)}
+        onClick={() => {
+          if (!expanded) onExpand();
+          setExpanded((current) => !current);
+        }}
       >
         <span className="local-agent__tool-entry-icon"><DeepCodeShellIcon name={shell ? 'terminal' : isFileMutationOperation(tool?.operation) ? 'compose' : tool?.operation?.startsWith('fs.') ? 'artifact' : 'tool'} /></span>
         <strong>{toolActivitySummary(activity, language)}</strong>
         {activity.status !== 'completed' && (
           <span>{toolActivityStatus(activity.status, language)}</span>
+        )}
+        {activity.status === 'active' && activity.startedAt && (
+          <ToolElapsed startedAt={activity.startedAt} language={language} />
         )}
         <span className="local-agent__tool-entry-chevron" aria-hidden="true">
           <DeepCodeShellIcon name="chevronRight" />
@@ -363,11 +378,36 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
               )}
             </div>
           )}
+          {!result && activity.status === 'active' && activity.liveOutput && (
+            <div className="local-agent__shell-result">
+              {activity.liveOutput.truncated && <small>{t(language, 'agent.tool.shell.truncated')}</small>}
+              {(['stdout', 'stderr'] as const).map((stream) => activity.liveOutput![stream] && (
+                <section key={stream}>
+                  <span>{t(language, `agent.tool.shell.${stream}`)}</span>
+                  <pre>{activity.liveOutput![stream]}</pre>
+                </section>
+              ))}
+              {!activity.liveOutput.stdout && !activity.liveOutput.stderr && (
+                <small>{language === 'zh-CN' ? '尚无输出' : 'No output yet'}</small>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>
   );
 };
+
+function ToolElapsed({ startedAt, language }: { startedAt: string; language: UiLanguage }) {
+  const elapsed = () => Math.max(0, Math.floor((Date.now() - Number(startedAt)) / 1000));
+  const [seconds, setSeconds] = useState(elapsed);
+  useEffect(() => {
+    setSeconds(elapsed());
+    const timer = window.setInterval(() => setSeconds(elapsed()), 1000);
+    return () => window.clearInterval(timer);
+  }, [startedAt]);
+  return <span>{language === 'zh-CN' ? `${seconds} 秒` : `${seconds}s`}</span>;
+}
 
 function toolGroupSummary(
   activities: ActivityProjection[],
@@ -400,7 +440,7 @@ function toolGroupSummary(
   }
   if (status === 'completed') {
     const hasShell = activities.some((activity) => (
-      activity.tool?.operation === 'bash'
+      ['bash', 'powershell'].includes(activity.tool?.operation ?? '')
     ));
     const editCount = activities.filter((activity) => (
       isFileMutationOperation(activity.tool?.operation)
@@ -423,7 +463,7 @@ function toolActivitySummary(activity: ActivityProjection, language: UiLanguage)
   const target = activity.tool?.resources[0]?.label;
   const command = activity.tool?.shell?.command;
   if (activity.status === 'completed') {
-    if (operation === 'bash' && command) {
+    if ((operation === 'bash' || operation === 'powershell') && command) {
       return t(language, 'agent.tool.activity.ranCommand', { command });
     }
     if (operation === 'fs.delete' && target) {
@@ -438,7 +478,7 @@ function toolActivitySummary(activity: ActivityProjection, language: UiLanguage)
     return t(language, 'agent.tool.summary.usedOne', { operation });
   }
   if (['failed', 'denied', 'rejected', 'indeterminate', 'cancelled'].includes(activity.status)) {
-    if (operation === 'bash' && command) {
+    if ((operation === 'bash' || operation === 'powershell') && command) {
       return t(language, 'agent.tool.activity.commandDidNotComplete', { command });
     }
     return t(language, 'agent.tool.activity.didNotComplete', {
@@ -446,7 +486,7 @@ function toolActivitySummary(activity: ActivityProjection, language: UiLanguage)
       target: target ? ` · ${target}` : '',
     });
   }
-  if (operation === 'bash' && command) {
+  if ((operation === 'bash' || operation === 'powershell') && command) {
     return t(language, 'agent.tool.activity.runningCommand', { command });
   }
   return t(language, 'agent.tool.activity.runningOperation', {

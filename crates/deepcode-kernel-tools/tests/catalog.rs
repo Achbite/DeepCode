@@ -71,6 +71,7 @@ fn catalog_exposes_basic_callable_tools() {
             "fs.edit",
             "fs.read",
             "fs.write",
+            "powershell",
             "web.fetch",
             "web.search",
         ]
@@ -110,6 +111,21 @@ fn catalog_exposes_basic_callable_tools() {
             "workspaceMode"
         ]
     );
+}
+
+#[test]
+fn powershell_preserves_native_syntax_and_scope_in_its_canonical_invocation() {
+    let script =
+        "Get-Item -LiteralPath 'D:\\Repo Space\\file.txt'\n& git status -sb\nexit $LASTEXITCODE";
+    let invocation = KernelToolRegistry::new()
+        .canonicalize(
+            "powershell",
+            json!({"command":script,"executionScope":"host"}),
+        )
+        .unwrap();
+    assert_eq!(invocation.arguments["command"], script);
+    assert_eq!(invocation.arguments["executionScope"], "host");
+    assert_eq!(invocation.arguments["workspaceMode"], "read");
 }
 
 #[test]

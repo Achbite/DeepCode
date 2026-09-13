@@ -47,7 +47,8 @@ async fn main() {
     }
     let bootstrap = match KernelBootstrap::connect(
         KernelBootstrapOptions::new(args.api.clone())
-            .auto_start(!args.no_auto_start_kernel && !matches!(args.command, Command::StopHost)),
+            .auto_start(!args.no_auto_start_kernel && !matches!(args.command, Command::StopHost))
+            .persistent(matches!(args.command, Command::StartHost)),
     )
     .await
     {
@@ -78,6 +79,7 @@ enum Command {
     Help,
     Status,
     StopHost,
+    StartHost,
     Diff {
         record_id: String,
         index: usize,
@@ -203,6 +205,7 @@ impl Args {
             Some("help") => Command::Help,
             Some("status") => Command::Status,
             Some("stop-host") if positional.len() == 1 => Command::StopHost,
+            Some("start-host") if positional.len() == 1 => Command::StartHost,
             Some("diff") if positional.len() == 3 => Command::Diff {
                 record_id: positional[1].clone(),
                 index: positional[2]
@@ -417,6 +420,10 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
     }
     match args.command {
         Command::Help => Ok(Outcome::Done),
+        Command::StartHost => {
+            println!("共享 Host 已启动为常驻服务。");
+            Ok(Outcome::Done)
+        }
         Command::StopHost => {
             client
                 .stop_host()
@@ -1135,6 +1142,7 @@ fn print_help() {
   deepcode-cli detach-directory --session <id> <workspace-id>
   deepcode-cli open-resource --session <id> <workspace-id> <logical-path>
   deepcode-cli diff --session <id> <record-id> <file-index>
+  deepcode-cli start-host
   deepcode-cli stop-host
   deepcode-cli status
 
@@ -1149,6 +1157,18 @@ Plan 等待时，输入 1/确认，其他非空输入作为修订说明；cancel
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_host_commands_parse_without_starting_a_conversation() {
+        assert_eq!(
+            Args::parse(vec!["start-host".into()]).unwrap().command,
+            Command::StartHost
+        );
+        assert_eq!(
+            Args::parse(vec!["stop-host".into()]).unwrap().command,
+            Command::StopHost
+        );
+    }
 
     #[test]
     fn ask_parser_keeps_explicit_workspace_and_message() {

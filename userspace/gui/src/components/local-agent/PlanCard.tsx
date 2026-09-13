@@ -5,6 +5,7 @@ import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import { MarkdownContent, MarkdownInline } from './BufferedMarkdown';
 import { PlanDocument } from './PlanDocument';
 import { useConversationRowState } from './ConversationVirtualRow';
+import { planScopeAddition } from './planReview';
 
 interface PlanCardProps {
   plan: PlanProjection;
@@ -39,6 +40,8 @@ const PlanCard: React.FC<PlanCardProps> = ({
   }, [plan.status]);
 
   const status = t(language, `agent.plan.status.${plan.status}`);
+  const addition = planScopeAddition(previousPlan, plan);
+  const scopeLabel = language === 'zh-CN' ? '补充执行范围' : 'Additional execution scope';
   const stepCount = t(language, 'agent.plan.stepCount', { count: plan.steps.length });
 
   return (
@@ -54,7 +57,7 @@ const PlanCard: React.FC<PlanCardProps> = ({
           >
             <DeepCodeShellIcon name="activity" />
             <span>
-              {t(language, 'agent.plan.documentLabel')}
+              {addition ? scopeLabel : t(language, 'agent.plan.documentLabel')}
               {' · '}
               {t(language, 'agent.plan.revision', { revision: plan.revision })}
               {active ? ` · ${t(language, 'agent.plan.active')}` : ''}
@@ -73,8 +76,10 @@ const PlanCard: React.FC<PlanCardProps> = ({
           onClick={() => toggle(true)}
         >
           <DeepCodeShellIcon name="activity" />
-          <strong><MarkdownInline>{plan.title}</MarkdownInline></strong>
-          <span className="local-agent__plan-card-status">{status} · {stepCount}</span>
+          <strong><MarkdownInline>{addition ? `${scopeLabel} · ${plan.title}` : plan.title}</MarkdownInline></strong>
+          <span className="local-agent__plan-card-status">{status} · {addition
+            ? (language === 'zh-CN' ? `${addition.operations.length} 项新增范围` : `${addition.operations.length} scope additions`)
+            : stepCount}</span>
           <span className="local-agent__plan-card-chevron" aria-hidden="true">
             <DeepCodeShellIcon name="chevronRight" />
           </span>
@@ -85,9 +90,8 @@ const PlanCard: React.FC<PlanCardProps> = ({
 };
 
 export function PlanCardContent({ plan, previousPlan, workspaceBindings = [], language }: Omit<PlanCardProps, 'active' | 'onToggle'>) {
-  return <>
-    {previousPlan && <PlanRevisionDetails previous={previousPlan} current={plan} language={language} workspaceBindings={workspaceBindings} />}
-    <PlanDocument title={plan.title} summary={plan.summary} steps={plan.steps} language={language}>
+  const addition = planScopeAddition(previousPlan, plan);
+  const document = <PlanDocument title={plan.title} summary={plan.summary} steps={plan.steps} language={language}>
       {plan.mutationManifest.length > 0 && (
         <details className="local-agent__plan-manifest">
           <summary>{t(language, 'agent.plan.mutationManifest', { count: plan.mutationManifest.length })}</summary>
@@ -101,13 +105,30 @@ export function PlanCardContent({ plan, previousPlan, workspaceBindings = [], la
           ))}</ul>
         </details>
       )}
-    </PlanDocument>
+    </PlanDocument>;
+  if (addition) return <section className="conversation-plan-document-body conversation-plan-scope-addition">
+    <div className="conversation-markdown">
+      <p><strong>{language === 'zh-CN' ? '补充执行范围' : 'Additional execution scope'}</strong></p>
+      <MarkdownContent>{addition.reason}</MarkdownContent>
+      <ul>{addition.operations.map((operation, index) => <li key={index}>
+        <code>{workspaceBindings.length > 1 ? `${workspaceBindings.find((binding) => binding.workspaceId === operation.workspaceId)?.displayName ?? operation.workspaceId} · ` : ''}{planOperationDetail(operation, language)}</code>
+      </li>)}</ul>
+      <p>{language === 'zh-CN' ? '阶段与验收要求保持不变，确认后新增范围生效。' : 'Phases and verification are unchanged. Confirm to authorize the added scope.'}</p>
+    </div>
+    <details className="local-agent__plan-manifest">
+      <summary>{language === 'zh-CN' ? '查看完整方案与全部范围' : 'View the complete Plan and scope'}</summary>
+      {document}
+    </details>
+  </section>;
+  return <>
+    {previousPlan && <PlanRevisionDetails previous={previousPlan} current={plan} language={language} workspaceBindings={workspaceBindings} />}
+    {document}
   </>;
 }
 
 function planOperationDetail(operation: PlanOperation, language: UiLanguage = 'zh-CN'): string {
   const chinese = language === 'zh-CN';
-  if (operation.operation === 'bash') {
+  if ('workspaceMode' in operation) {
     const scope = operation.executionScope === 'host' ? (chinese ? '宿主机' : 'Host') : (chinese ? '工作区' : 'Workspace');
     const paths = operation.writablePaths?.map((target) => target.path + (target.kind === 'directory' ? '/' : '')).join(', ');
     const mode = (chinese ? '允许修改' : 'May modify') + (paths ? `: ${paths}` : '');

@@ -10,6 +10,8 @@ import {
 } from '../../../state/settingsStore';
 import GuiAppearanceSettings from '../GuiAppearanceSettings';
 import SettingsField from '../SettingsField';
+import ProjectEnvironmentSettings from './ProjectEnvironmentSettings';
+import WorkspaceSandboxSettings from './WorkspaceSandboxSettings';
 
 interface RuntimeProps {
   apiStatus: string;
@@ -27,6 +29,7 @@ const INTERFACE_KEYS = [
 ] as const;
 const AGENT_INSTRUCTION_KEYS = ['agent.systemPrompt'] as const;
 const AGENT_RESPONSE_KEYS = ['agent.responseLanguage'] as const;
+const AGENT_SHELL_KEYS = ['agent.windows.shell', 'agent.windows.gitBashPath'] as const;
 const AGENT_PERMISSION_KEYS = [
   'agent.permissions.workspaceMutation',
   'agent.permissions.engineeringDecisions',
@@ -112,6 +115,7 @@ export const GuiSettingsSection: React.FC<RuntimeProps> = ({
                 source={sources[definition.key] ?? 'default'}
                 language={language}
                 disabled={loading}
+                compact
                 onChange={onChange}
                 onReset={(key) => void resetUserSetting(key)}
               />
@@ -145,9 +149,10 @@ export const GuiSettingsSection: React.FC<RuntimeProps> = ({
 
 interface AgentSettingsSectionProps {
   query?: string;
+  category?: 'agent' | 'environment' | 'permissions' | 'services';
 }
 
-export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ query = '' }) => {
+export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ query = '', category = 'agent' }) => {
   const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
   const sources = useSettingsStore((state) => state.sources);
   const loading = useSettingsStore((state) => state.loading);
@@ -159,6 +164,11 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
   const resetUserSetting = useSettingsStore((state) => state.resetUserSetting);
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
   const available = useMemo(() => agentSettingDefinitions(), []);
+  const environment = useSettingsStore((state) => state.environment);
+  const shellSettings = useMemo(() => definitionsFor(AGENT_SHELL_KEYS, available, language, query), [available, language, query]);
+  const shell = environment?.shell as { executable?: string; dialect?: string } | undefined;
+  const commands = Array.isArray(environment?.developerCommands) ? environment.developerCommands.filter((item): item is string => typeof item === 'string') : [];
+  const chinese = language === 'zh-CN';
   const response = useMemo(
     () => definitionsFor(AGENT_RESPONSE_KEYS, available, language, query),
     [available, language, query],
@@ -175,15 +185,18 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
     () => definitionsFor(AGENT_WEB_KEYS, available, language, query),
     [available, language, query],
   );
+  const groups = category === 'agent' ? [response, instructions]
+    : category === 'environment' ? [shellSettings]
+      : category === 'permissions' ? [permissions] : [web];
   const onChange = (key: string, value: UserSettingValue) => {
     void patchUserSetting(key, value);
   };
   const renderCard = (title: string | null, definitions: readonly SettingDefinition[]) => {
     if (definitions.length === 0) return null;
     return (
-      <div className="settings-card">
+      <section className="settings-group">
         {title && <h3 className="settings-card__title">{title}</h3>}
-        <div className="settings-card__body">
+        <div className="settings-card settings-card__body">
           {definitions.map((definition) => (
             <SettingsField
               key={definition.key}
@@ -192,30 +205,51 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
               source={sources[definition.key] ?? 'default'}
               language={language}
               disabled={loading}
-              compact={definition.key === 'agent.responseLanguage'}
+              compact
               onChange={onChange}
               onReset={(key) => void resetUserSetting(key)}
             />
           ))}
         </div>
-      </div>
+      </section>
     );
   };
 
   return (
     <div>
-      <h2 className="settings-title">{t(language, 'settings.agent.title')}</h2>
+      <h2 className="settings-title">{t(language, category === 'services' ? 'settings.agent.webTools' : `settings.nav.${category}`)}</h2>
       {pendingNextRunActivation && (
         <div className="settings-activation-notice">
           {t(language, 'settings.agent.nextRunActivationPending')}
         </div>
       )}
-      {renderCard(null, response)}
-      {renderCard(t(language, 'settings.agent.instructions'), instructions)}
-      {renderCard(t(language, 'settings.agent.permissions'), permissions)}
-      {renderCard(t(language, 'settings.agent.webTools'), web)}
+      {category === 'agent' && renderCard(null, response)}
+      {category === 'environment' && renderCard('Windows Shell', shellSettings)}
+      {category === 'environment' && !query && <ProjectEnvironmentSettings chinese={chinese} />}
+      {category === 'environment' && !query && <WorkspaceSandboxSettings chinese={chinese} />}
+      {category === 'environment' && !query && <div className="settings-card">
+        <h3 className="settings-card__title">{chinese ? '环境上下文' : 'Environment context'}</h3>
+        <div className="settings-card__body">
+          <div className="settings-field settings-field--compact">
+            <div className="settings-field__main">
+              <div className="settings-field__label">{chinese ? '稳定的执行环境' : 'Stable execution environment'}</div>
+              <p className="settings-field__description">{chinese ? '会话复用已保存的环境。修改设置或刷新后，后续运行重新检测；当前任务保持原环境。' : 'Sessions reuse saved observations. Settings changes or refresh apply to subsequent runs; active work keeps its environment.'}</p>
+            </div>
+            <button className="settings-button" disabled={loading} onClick={() => void patchUserSetting('agent.environmentRevision', Number(effectiveSettings['agent.environmentRevision'] ?? 0) + 1)}>{chinese ? '刷新环境' : 'Refresh environment'}</button>
+          </div>
+          {environment && <div className="settings-field__description">
+            <p>{chinese ? '本机检测' : 'Local observation'}: {String(environment.os)} · {String(environment.arch)} · {shell?.dialect ?? '—'}</p>
+            <p style={{ overflowWrap: 'anywhere' }}>{shell?.executable || (chinese ? '未找到所选 Shell' : 'Selected shell not found')}</p>
+            <p>{chinese ? '可用开发命令' : 'Developer commands'}: {commands.join(' · ') || '—'}</p>
+          </div>}
+        </div>
+      </div>}
+
+      {category === 'agent' && renderCard(t(language, 'settings.agent.instructions'), instructions)}
+      {category === 'permissions' && renderCard(null, permissions)}
+      {category === 'services' && renderCard(null, web)}
       {errorMessage && <div className="settings-error">{errorMessage}</div>}
-      {response.length + instructions.length + permissions.length + web.length === 0 && (
+      {groups.every((group) => group.length === 0) && (
         <div className="settings-card">
           <div className="settings-card__body">{t(language, 'settings.noSearchMatch')}</div>
         </div>
