@@ -1,4 +1,8 @@
 //! Local Host transport discovery. This owns no Session or Kernel business state.
+mod client_lease;
+pub mod process;
+pub mod shell_lifecycle;
+pub use client_lease::{HostClientLease, HOST_LIFETIME_ENV};
 use deepcode_kernel_abi::{
     is_valid_host_instance_id, is_valid_host_shell_token, HostProcessIdentity,
     KERNEL_DAEMON_SERVICE,

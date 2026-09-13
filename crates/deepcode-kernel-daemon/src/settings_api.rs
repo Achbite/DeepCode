@@ -1,12 +1,50 @@
 use crate::prelude::*;
 use crate::*;
 
+pub(crate) async fn workspace_sandbox_setup(State(state): State<AppState>) -> Json<ApiResponse> {
+    #[cfg(windows)]
+    {
+        let result = tokio::task::spawn_blocking(
+            deepcode_kernel_runtime::workspace_sandbox::windows::request_setup,
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return ApiResponse::error("workspace_sandbox_setup_failed", error),
+            Err(error) => {
+                return ApiResponse::error("workspace_sandbox_setup_failed", error.to_string())
+            }
+        }
+        let revision = state.gui.lock().expect("gui state lock").user_settings
+            ["agent.environmentRevision"]
+            .as_u64()
+            .unwrap_or(0)
+            + 1;
+        user_settings_patch(
+            State(state),
+            Json(json!({"patches":{"agent.environmentRevision": revision}})),
+        )
+        .await
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        ApiResponse::error(
+            "workspace_sandbox_setup_not_applicable",
+            "Windows sandbox initialization is available on Windows hosts.",
+        )
+    }
+}
+
 fn setting_activates_at_next_run(key: &str) -> bool {
     key.starts_with("skills.")
         || key.starts_with("mcp.")
         || key.starts_with("agent.web.search.")
         || key == "agent.systemPrompt"
         || key.starts_with("agent.permissions.")
+        || key.starts_with("agent.windows.")
+        || key == "agent.environmentRevision"
+        || key == "agent.projectEnvironments"
 }
 
 pub(crate) async fn user_settings_get(State(state): State<AppState>) -> Json<ApiResponse> {
@@ -17,7 +55,12 @@ pub(crate) async fn user_settings_get(State(state): State<AppState>) -> Json<Api
         }
     };
     let gui = state.gui.lock().expect("gui state lock");
+    let environment = match crate::session_environment::prepare(&gui.user_settings, None, false) {
+        Ok(value) => value,
+        Err(message) => return ApiResponse::error("session_environment_invalid", message),
+    };
     ApiResponse::ok(json!({
+        "environment": environment,
         "settings": gui.user_settings,
         "runtimeSettings": runtime_settings,
         "overriddenKeys": [],
@@ -330,6 +373,10 @@ pub(crate) fn default_user_settings() -> Value {
         "workbench.styleTokenOverrides": "{}",
         "agent.systemPrompt": "",
         "agent.responseLanguage": "auto",
+        "agent.windows.shell": "auto",
+        "agent.windows.gitBashPath": "",
+        "agent.environmentRevision": 0,
+        "agent.projectEnvironments": "{}",
         "agent.permissions.workspaceMutation": "plan",
         "agent.permissions.engineeringDecisions": "ask",
         "agent.permissions.networkRead": "allow",
@@ -354,6 +401,7 @@ pub(crate) fn default_user_settings() -> Value {
 
 pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), String> {
     crate::session_environment::response_language_setting(settings)?;
+    crate::session_environment::validate_settings(settings)?;
     if let Some(object) = settings.as_object() {
         for key in object
             .keys()

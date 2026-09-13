@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS session_events (
         'todo.reconciled',
         'todo.progressed',
         'tool.requested',
+        'tool.started',
         'approval.requested',
         'approval.resolved',
         'tool.completed',

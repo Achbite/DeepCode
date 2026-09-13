@@ -7,6 +7,7 @@ import {
   lastCallInputCacheMetric,
   loadGuiModelStore,
   loadGuiModule,
+  loadGuiModules,
   installGuiFetch,
 } from './gui-projection-contract.mjs';
 import {
@@ -25,6 +26,202 @@ import {
   waitForProjection,
   waitUntil,
 } from '../../session-core/tests/local-agent-fixtures.mjs';
+
+test('native path selection preserves OS paths, cancellation and dialog errors', async (t) => {
+  const previousWindow = globalThis.window;
+  const [{ pickNativePath, hasNativePathPicker }] = await loadGuiModules(t, ['/src/services/runtimeAdapter.ts']);
+  t.after(() => { if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow; });
+  const calls = [];
+  let selected = null;
+  let failure = null;
+  const invoke = async (command, args) => {
+    calls.push({ command, args });
+    if (failure) throw failure;
+    return selected;
+  };
+  globalThis.window = { __TAURI__: { core: { invoke } }, __TAURI_INTERNALS__: { invoke } };
+  assert.equal(hasNativePathPicker(), true);
+  for (const path of [String.raw`C:\Users\开发者\My Skills`, String.raw`\\server\team share\Skills`]) {
+    selected = path;
+    assert.deepEqual(await pickNativePath({ kind: 'directory', title: 'Choose a Skill folder' }), { path, kind: 'directory' });
+    assert.equal(calls.at(-1).command, 'plugin:dialog|open');
+    assert.equal(calls.at(-1).args.options.directory, true);
+    assert.equal(calls.at(-1).args.options.multiple, false);
+  }
+  selected = '/Users/developer/My Skills/SKILL.md';
+  const filters = [{ name: 'Skill', extensions: ['md'] }];
+  assert.deepEqual(await pickNativePath({ kind: 'file', title: 'Choose SKILL.md', filters }), { path: selected, kind: 'file' });
+  assert.equal(calls.at(-1).args.options.directory, false);
+  assert.deepEqual(calls.at(-1).args.options.filters, filters);
+  selected = null;
+  assert.equal(await pickNativePath({ kind: 'directory', title: 'Choose folder' }), null);
+  failure = new Error('dialog could not open');
+  await assert.rejects(pickNativePath({ kind: 'file', title: 'Choose file' }), (error) => error === failure);
+  globalThis.window = {};
+  assert.equal(hasNativePathPicker(), false);
+  const callCount = calls.length;
+  await assert.rejects(pickNativePath({ kind: 'directory', title: 'Choose folder' }), /native_path_picker_unavailable/);
+  assert.equal(calls.length, callCount);
+});
+
+test('one native reference request returns the actual file or folder kind', async (t) => {
+  const previousWindow = globalThis.window;
+  t.after(() => { if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow; });
+  const [{ pickNativePath }] = await loadGuiModules(t, ['/src/services/runtimeAdapter.ts']);
+  const options = { kind: 'path', title: 'Files and folders', selectLabel: 'Attach', cancelLabel: 'Cancel' };
+  let selection;
+  let failure;
+  let calls = 0;
+  globalThis.window = { __TAURI__: { core: { invoke: async (command, args) => {
+    calls += 1;
+    assert.equal(command, 'deepcode_pick_path');
+    assert.equal(args.options.title, options.title);
+    assert.equal(args.options.selectLabel, 'Attach');
+    assert.equal(args.options.cancelLabel, 'Cancel');
+    if (failure) throw failure;
+    return selection;
+  } } } };
+  const references = [
+    { path: String.raw`C:\Users\开发者\project\README.md`, kind: 'file' },
+    // A dot in a directory name must not turn it into a file reference.
+    { path: String.raw`\\server\team share\source.v2`, kind: 'directory' },
+    { path: '/Users/developer/project/src', kind: 'directory' },
+    { path: '/Users/developer/project/Makefile', kind: 'file' },
+  ];
+  for (const reference of references) {
+    selection = reference;
+    assert.deepEqual(await pickNativePath(options), reference);
+  }
+  selection = null;
+  assert.equal(await pickNativePath(options), null);
+  failure = new Error('native selection failed');
+  await assert.rejects(pickNativePath(options), (error) => error === failure);
+  assert.equal(calls, references.length + 2);
+});
+
+test('Skill settings load the existing read-only catalog route', async (t) => {
+  const items = [{ id: 'skill:example', displayName: 'Example', description: 'A text Skill.', source: 'mounted' }];
+  installGuiFetch(t, async (url, init) => {
+    assert.equal(url.pathname, '/api/conversation/plugins/skills');
+    assert.equal(init.method ?? 'GET', 'GET');
+    return Response.json({ ok: true, data: { skills: items } });
+  });
+  const [{ getSkillSettings }] = await loadGuiModules(t, ['/src/services/localAgentApi.ts']);
+  assert.deepEqual(await getSkillSettings(), items);
+});
+
+test('GUI receives and renders live tool output at the same journal revision before completion', async (t) => {
+  const previousSelf = globalThis.self;
+  globalThis.self = {};
+  t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:live-output-gui';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const tool = { toolBindingRef: 'tool-binding:progress:g1', name: 'fs.read', description: 'Read tool output.',
+    inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } }, possibleEffects: ['workspaceRead'], availability: 'callable', origin: 'coreBuiltin' };
+  let finish;
+  const held = new Promise((resolve) => { finish = resolve; });
+  let publish;
+  let calls = 0;
+  const provider = { async *stream(request) {
+    if (calls++ === 0) yield providerEvent(request.requestId, 'tool.call', { callId: 'provider-call:progress', name: request.tools.find((entry) => entry.description === tool.description).name, input: { workspace: 'primary', path: 'output.log' } });
+    else yield providerEvent(request.requestId, 'assistant.message', { messageId: 'provider-message:done', content: 'Done.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } };
+  const kernel = emptyKernel({ execute: async (request, onProgress) => {
+    let offset = 0;
+    publish = async (text) => {
+      const bytes = [...new TextEncoder().encode(text)];
+      await onProgress({ type: 'output', stream: 'stdout', offset, bytes });
+      offset += bytes.length;
+    };
+    await onProgress({ type: 'started', startedAt: String(Date.now()) });
+    await publish('first line\n');
+    await held;
+    return completedExecutionReply(request, { value: 'finished' });
+  } });
+  const actor = actorWith(journal, sessionId, provider, kernel, fakeRunPreparation({ tools: [tool] }).port, 'live-output-gui');
+  t.after(async () => { finish(); await actor.dispose(); });
+  await actor.submit(messageCommand(sessionId, 'command:progress', 'Run the tool.'));
+  const base = await waitForProjection(actor, (value) => value.activities.some((entry) => entry.liveOutput?.stdout === 'first line\n'));
+  await publish('second line\n');
+  const latest = await actor.snapshot();
+  assert.equal(latest.revision, base.revision);
+  assert.deepEqual(await decodeGuiProjection(latest), latest);
+  installGuiFetch(t, async (url) => {
+    if (url.pathname === '/api/conversation/statuses') return Response.json({ ok: true, data: [{
+      sessionId, revision: latest.revision, run: { runId: latest.run.runId, status: latest.run.status },
+    }] });
+    assert.ok(url.pathname.endsWith('/projection'));
+    return Response.json({ ok: true, data: latest });
+  });
+  const store = await loadGuiModelStore(t);
+  store.setState({ sessionId, projection: base });
+  await store.getState().refresh();
+  assert.equal(store.getState().error, null);
+  const activity = store.getState().projection.activities.find((entry) => entry.liveOutput);
+  assert.equal(activity.liveOutput.stdout, 'first line\nsecond line\n');
+  assert.equal(activity.status, 'active');
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const [{ ToolActivityGroup }, { ConversationVirtualRow }] = await loadGuiModules(t, [
+    '/src/components/local-agent/ToolActivityDetails.tsx', '/src/components/local-agent/ConversationVirtualRow.tsx',
+  ]);
+  const layout = { state: new Map([[`tool:${activity.activityId}:expanded`, true]]) };
+  const html = renderToStaticMarkup(createElement(ConversationVirtualRow, {
+    rowKey: 'live-progress', eager: true, virtualizer: { layout: () => layout },
+    children: () => createElement(ToolActivityGroup, { sessionId, activities: [activity], language: 'zh-CN', onExpand() {}, onOpenWorkspaceResource() {} }),
+  }));
+  assert.match(html, /<pre>first line\nsecond line\n<\/pre>/);
+  assert.equal(html.includes('退出码'), false, 'active output does not fabricate a final result');
+  finish();
+  const final = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.equal(final.activities.some((entry) => entry.liveOutput), false);
+  assert.deepEqual(await decodeGuiProjection(final), final);
+  assert.deepEqual((await readEvents(journal, sessionId)).filter((event) => event.type.startsWith('tool.')).map((event) => event.type), ['tool.requested', 'tool.started', 'tool.completed']);
+});
+
+test('scope-only Plan review foregrounds additions and keeps the complete confirmed phases available', async (t) => {
+  const previousSelf = globalThis.self;
+  globalThis.self = {};
+  t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { PlanCardContent } = await loadGuiModule(t, '/src/components/local-agent/PlanCard.tsx');
+  const { planScopeAddition } = await loadGuiModule(t, '/src/components/local-agent/planReview.ts');
+  const { ComposerDecisionPanels } = await loadGuiModule(t, '/src/components/local-agent/ComposerDecisionPanels.tsx');
+  const previous = {
+    planId: 'plan:scope-review', revision: 1, runId: 'run:scope', callId: 'call:initial', status: 'confirmed',
+    title: 'Implement pool', summary: 'Build and verify the pool.',
+    steps: [{ stepId: 'core', title: 'Implement core', details: 'Maintain mutual exclusion.', verification: ['Run `--werror`'] }],
+    mutationManifest: [{ workspaceId: 'workspace:pool', operation: 'fs.write', target: 'src' , targetKind: 'directoryTree' }],
+  };
+  const current = { ...previous, revision: 2, status: 'published', callId: 'call:extra',
+    summary: `${previous.summary}\n\nExpose the shared options in \`include/pool/demo.hpp\`.`,
+    mutationManifest: [...previous.mutationManifest, { workspaceId: 'workspace:pool', operation: 'fs.write', target: 'include/pool/demo.hpp' }],
+  };
+  const addition = planScopeAddition(previous, current);
+  assert.equal(addition.operations.length, 1);
+  assert.equal(addition.reason, 'Expose the shared options in `include/pool/demo.hpp`.');
+  const html = renderToStaticMarkup(createElement(PlanCardContent, { plan: current, previousPlan: previous, language: 'zh-CN' }));
+  const disclosure = html.indexOf('<details');
+  assert.ok(disclosure > 0);
+  assert.ok(html.slice(0, disclosure).includes('include/pool/demo.hpp'));
+  assert.ok(html.slice(0, disclosure).includes('Expose the shared options'));
+  assert.equal(html.slice(0, disclosure).includes('Maintain mutual exclusion'), false);
+  assert.equal(html.includes('新增 0 步'), false);
+  assert.match(html.slice(disclosure), /^<details[^>]*><summary>查看完整方案与全部范围/);
+  assert.ok(html.slice(disclosure).includes('Maintain mutual exclusion'));
+  assert.ok(html.slice(disclosure).includes('--werror'));
+  assert.equal(planScopeAddition(previous, { ...current, steps: [{ ...current.steps[0], verification: [] }] }), null);
+  assert.equal(planScopeAddition(previous, { ...current, mutationManifest: current.mutationManifest.slice(1) }), null);
+  assert.equal(planScopeAddition(previous, { ...current, summary: 'A different objective.' }), null);
+  const decision = renderToStaticMarkup(createElement(ComposerDecisionPanels, { language: 'zh-CN', composer: {
+    pendingPlan: current, pendingScopeAddition: addition, textareaRef: { current: null }, draft: '', submitting: false,
+  } }));
+  assert.ok(decision.includes('确认新增范围'));
+  assert.ok(decision.includes('保留已有进度'));
+});
 
 test('last-call, per-run, and Session cache rates use their own input token totals', async (t) => {
   const journal = new InMemoryCommandJournal();
@@ -1607,4 +1804,94 @@ test('desktop startup diagnostics render the Host failure and log reference verb
   assert.match(html, /Kernel exited: exit status: 71/);
   assert.match(html, /\/runtime\/logs\/startup.log/);
   assert.equal(renderToStaticMarkup(createElement(HostStartupDiagnostic, { status: { ...status, phase: 'ready' }, language: 'zh-CN' })), '');
+});
+
+test('conversation reading survives native scroll deliveries and layout growth without device flags', async (t) => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { useConversationViewport } = await loadGuiModule(t, '/src/components/local-agent/useConversationViewport.ts');
+  const previousWindow = globalThis.window;
+  const frames = new Map();
+  let nextFrame = 0;
+  globalThis.window = {
+    requestAnimationFrame(callback) { frames.set(++nextFrame, callback); return nextFrame; },
+    cancelAnimationFrame(id) { frames.delete(id); },
+  };
+  t.after(() => { if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow; });
+  const flushFrames = () => {
+    const pending = [...frames.values()];
+    frames.clear();
+    for (const callback of pending) callback(0);
+  };
+  let viewport;
+  function Probe() {
+    viewport = useConversationViewport({ sessionId: 'session:reading', loading: false,
+      projection: { sessionId: 'session:reading' }, presentationLayoutKey: '', assistantDraftLayoutKey: '', timelineExtentKey: '' });
+    return null;
+  }
+  renderToStaticMarkup(createElement(Probe));
+  let top = 1_000;
+  let height = 1_500;
+  let anchorTop = 900;
+  const anchor = {
+    dataset: { conversationAnchor: 'plan:reading' },
+    getClientRects: () => [{}],
+    getBoundingClientRect: () => ({ top: anchorTop - top, bottom: anchorTop - top + 800 }),
+  };
+  const body = {
+    clientHeight: 500,
+    get scrollTop() { return top; },
+    set scrollTop(value) { top = Math.max(0, Math.min(value, height - this.clientHeight)); },
+    get scrollHeight() { return height; },
+    set scrollHeight(value) { height = value; this.scrollTop = top; },
+    getBoundingClientRect: () => ({ top: 0 }),
+    querySelectorAll: () => [anchor],
+  };
+  viewport.bodyRef.current = body;
+  const deliverScroll = () => viewport.bodyHandlers.onScroll({ target: body, currentTarget: body });
+  viewport.setLatestFollowMode(true);
+  viewport.preserveReadingPosition();
+  body.scrollTop = 860;
+  flushFrames();
+  assert.equal(top, 860, 'a pending follow frame yields to native movement even before its scroll callback arrives');
+
+  body.scrollTop = 790;
+  viewport.preserveReadingPosition();
+  assert.equal(top, 790, 'continued keyboard or inertial movement cannot be restored to the previous sample');
+  anchorTop += 160;
+  body.scrollHeight += 160;
+  viewport.preserveReadingPosition();
+  assert.equal(top, 950, 'growth above the reader compensates layout using the latest reader anchor');
+  assert.equal(anchor.getBoundingClientRect().top, 110);
+  deliverScroll();
+  viewport.preserveReadingPosition();
+  assert.equal(top, 950, 'a delayed callback from the programmatic correction does not become reader movement');
+
+  body.scrollTop = 990;
+  deliverScroll();
+  anchorTop += 80;
+  body.scrollHeight += 80;
+  viewport.preserveReadingPosition();
+  assert.equal(top, 1_070, 'a native scroll callback records the next reading position without wheel or touch flags');
+
+  body.scrollTop = body.scrollHeight - body.clientHeight;
+  deliverScroll();
+  body.scrollHeight += 100;
+  viewport.preserveReadingPosition();
+  flushFrames();
+  assert.equal(top, 1_340, 'reader arrival at the actual tail resumes following new content');
+  body.scrollHeight = 1_500;
+  deliverScroll();
+  body.scrollHeight += 60;
+  viewport.preserveReadingPosition();
+  flushFrames();
+  assert.equal(top, 1_060, 'browser shrink clamping preserves existing follow ownership');
+
+  viewport.setLatestFollowMode(false);
+  body.scrollTop = 800;
+  deliverScroll();
+  viewport.scrollToLatest();
+  flushFrames();
+  assert.equal(top, 1_060, 'the explicit latest action resumes following after detached reading');
+  assert.equal(frames.size, 0);
 });

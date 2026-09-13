@@ -23,6 +23,36 @@ import { HttpProviderPort } from '../dist/local-agent/httpPorts.js';
 import { responseFrames } from '../dist/responseFrames.js';
 import { environmentInstruction } from '../dist/local-agent/sessionEnvironment.js';
 import { createProviderToolAliases } from '../dist/local-agent/providerToolCodec.js';
+
+test('Kernel stream delivers progress before the terminal reply and rejects a missing reply', async () => {
+  const { HttpKernelPort } = await import('../dist/local-agent/httpPorts.js');
+  const { LiveToolOutput } = await import('../dist/local-agent/liveToolOutput.js');
+  const request = { requestId: 'request:progress', callId: 'call:progress', attemptId: 'attempt:progress' };
+  let stream;
+  const response = new Response(new ReadableStream({ start(controller) { stream = controller; } }), {
+    headers: { 'content-type': 'application/x-ndjson' },
+  });
+  const port = new HttpKernelPort({ apiBase: 'http://fixture', serviceToken: 'fixture', fetchImpl: async () => response });
+  const output = new LiveToolOutput();
+  let observed = 0; let settled = false;
+  const result = port.execute(request, async (progress) => { output.update(request.callId, progress); observed += 1; });
+  void result.then(() => { settled = true; });
+  const frame = (progress) => stream.enqueue(new TextEncoder().encode(JSON.stringify({ type: 'progress',
+    callId: request.callId, attemptId: request.attemptId, progress }) + '\n'));
+  frame({ type: 'started', startedAt: '1789298353986' });
+  const bytes = [...new TextEncoder().encode('中文🙂')];
+  frame({ type: 'output', stream: 'stdout', offset: 0, bytes: bytes.slice(0, 2) });
+  frame({ type: 'output', stream: 'stdout', offset: 2, bytes: bytes.slice(2) });
+  await waitUntil(() => observed === 3);
+  assert.equal(settled, false);
+  assert.equal(output.get(request.callId).stdout, '中文🙂');
+  assert.equal(output.get(request.callId).stdoutBytes, bytes.length);
+  stream.enqueue(new TextEncoder().encode(JSON.stringify({ type: 'reply', reply: { ...request, status: 'completed' } }) + '\n'));
+  await result;
+  const missing = new HttpKernelPort({ apiBase: 'http://fixture', serviceToken: 'fixture', fetchImpl: async () =>
+    new Response('', { headers: { 'content-type': 'application/x-ndjson' } }) });
+  await assert.rejects(missing.execute(request), /kernel_execution_reply_missing/u);
+});
 import {
   workspaceBinding,
   actorWith,
@@ -47,6 +77,78 @@ import {
   waitForAbort,
 } from './local-agent-fixtures.mjs';
 
+test('local Provider streams resume after silence, cancel immediately and close their connection', async (t) => {
+  let response;
+  let connectionClosed = false;
+  const server = createServer((request, outgoing) => {
+    request.resume();
+    response = outgoing;
+    outgoing.on('close', () => { connectionClosed = true; });
+    outgoing.writeHead(200, { 'content-type': 'text/event-stream' });
+    outgoing.write(`data: ${JSON.stringify(providerEvent('request:local-idle', 'text.delta', { text: 'Before silence' }))}\n\n`);
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const controller = new AbortController();
+  t.after(() => { controller.abort(); server.closeAllConnections(); server.close(); });
+  const port = new HttpProviderPort({ apiBase: `http://127.0.0.1:${server.address().port}`, serviceToken: 'fixture' });
+  const iterator = port.stream({ requestId: 'request:local-idle' }, controller.signal)[Symbol.asyncIterator]();
+  assert.equal((await iterator.next()).value.data.text, 'Before silence');
+  let received = false;
+  const next = iterator.next().then((value) => { received = true; return value; });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(received, false, 'no progress or completion is fabricated while the server is silent');
+  response.write(`data: ${JSON.stringify(providerEvent('request:local-idle', 'text.delta', { text: 'After silence' }))}\n\n`);
+  assert.equal((await next).value.data.text, 'After silence');
+  const pending = iterator.next();
+  controller.abort(new Error('user_cancelled_idle_stream'));
+  await assert.rejects(pending, /user_cancelled_idle_stream/);
+  await waitUntil(() => connectionClosed, 'cancelled Provider connection closes');
+});
+
+test('an interrupted local Provider response preserves its transport cause without retry', async (t) => {
+  let response;
+  let requests = 0;
+  const server = createServer((request, outgoing) => {
+    requests += 1;
+    request.resume();
+    response = outgoing;
+    outgoing.writeHead(200, { 'content-type': 'text/event-stream' });
+    outgoing.write(`data: ${JSON.stringify(providerEvent('request:broken-local', 'text.delta', { text: 'Partial' }))}\n\n`);
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const port = new HttpProviderPort({ apiBase: `http://127.0.0.1:${server.address().port}`, serviceToken: 'fixture' });
+  const iterator = port.stream({ requestId: 'request:broken-local' }, new AbortController().signal)[Symbol.asyncIterator]();
+  assert.equal((await iterator.next()).value.data.text, 'Partial');
+  const pending = iterator.next();
+  response.destroy();
+  await assert.rejects(pending, (error) => error.code === 'provider_stream_failed' && /ECONNRESET/.test(error.message));
+  assert.equal(requests, 1);
+});
+
+test('Provider error causes survive Session indeterminate settlement', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:provider-cause';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const cause = Object.assign(new Error('Body Timeout Error'), { code: 'UND_ERR_BODY_TIMEOUT' });
+  let requests = 0;
+  const provider = new HttpProviderPort({ apiBase: 'http://fixture', serviceToken: 'fixture', fetchImpl: async () => {
+    requests += 1;
+    throw new TypeError('terminated', { cause });
+  } });
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), fakeRunPreparation().port, 'provider-cause');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:provider-cause', 'Continue.'));
+  const projection = await waitForProjection(actor, (value) => value.run?.status === 'indeterminate');
+  assert.equal(requests, 1);
+  assert.equal(projection.terminalError.code, 'provider_turn_outcome_unknown');
+  assert.match(projection.terminalError.message, /provider_stream_failed/);
+  assert.match(projection.terminalError.message, /terminated; cause UND_ERR_BODY_TIMEOUT: Body Timeout Error/);
+  assert.equal(projection.messages.some((message) => message.role === 'assistant'), false);
+});
+
 for (const lateRecord of [false, true]) test(`lost Kernel reply closes tool history after release (late record: ${lateRecord})`, async (t) => {
   const journal = new InMemoryCommandJournal();
   const sessionId = `session:lost-reply-${lateRecord}`;
@@ -59,7 +161,7 @@ for (const lateRecord of [false, true]) test(`lost Kernel reply closes tool hist
   const records = new Map();
   let released = false;
   const kernel = emptyKernel({
-    async execute(request) {
+    async execute(request, onProgress) {
       executions.push(request);
       assert.equal(request.input.workspaceId, workspaceBinding.workspaceId, 'omitted workspace means primary');
       if (executions.length === 1) {
@@ -67,6 +169,7 @@ for (const lateRecord of [false, true]) test(`lost Kernel reply closes tool hist
         records.set(request.callId, reply.record);
         return reply;
       }
+      if (!lateRecord) await onProgress?.({ type: 'started', startedAt: '1789298353986' });
       throw new Error('fetch failed: execution response disconnected');
     },
     async readRecord(callId) {
@@ -128,7 +231,7 @@ for (const lateRecord of [false, true]) test(`lost Kernel reply closes tool hist
     assert.equal(projection.run.status, 'failed');
     assert.match(projection.terminalError.message, /fetch failed/);
     const unfinished = projection.activities.find((item) => item.callId === executions[1].callId);
-    assert.equal(unfinished.status, 'requested');
+    assert.equal(unfinished.status, 'active', 'a started call stays active until its interruption fact');
     assert.equal(unfinished.interruption, undefined);
     assert.equal(unfinished.tool, undefined);
     const read = await readConversation({ async *read() { yield* history; } }, { sessionId, view: 'summary' });
@@ -1553,6 +1656,64 @@ test('read-only bash result projects its real write scope and continues the Loop
   await actor.dispose();
 });
 
+for (const toolName of ['bash', 'powershell']) {
+for (const output of [null, { stage: 'execution', details: { toolId: toolName } }]) {
+  test(`pre-spawn shell failure settles and replays without invented process output (${toolName}, ${output === null ? 'null' : 'diagnostic'})`, async (t) => {
+    const journal = new InMemoryCommandJournal();
+    const sessionId = 'session:shell-unavailable';
+    await createSession(journal, sessionId, [workspaceBinding]);
+    const preparation = fakeRunPreparation({ tools: [{
+      toolBindingRef: `tool-binding:${toolName}:g1`, name: toolName, description: 'Run the selected shell.',
+      inputSchema: { type: 'object', required: ['command', 'workspaceMode', 'executionScope'], properties: {
+        command: { type: 'string' }, workspaceMode: { type: 'string' }, executionScope: { type: 'string' },
+      } }, possibleEffects: ['process', 'workspaceMutation', 'external'], availability: 'callable', origin: 'coreBuiltin',
+    }] });
+    const error = { code: `${toolName}_unavailable`, message: 'No Bash executable is available for the bound workspace.' };
+    let calls = 0;
+    const kernel = emptyKernel({ async execute(request) {
+      calls += 1;
+      const reply = failedExecutionReply(request, output, error);
+      reply.record.preparedEffect.logicalTargets = ['.'];
+      reply.record.preparedEffect.processWorkspaceMode = 'read';
+      reply.record.preparedEffect.processExecutionScope = 'workspace';
+      return reply;
+    } });
+    let turns = 0;
+    const provider = { async *stream(request) {
+      if (++turns === 1) {
+        yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:shell-unavailable', name: request.tools[0].name,
+          input: { workspace: 'primary', command: 'git status -sb', workspaceMode: 'read', executionScope: 'workspace' } });
+      } else {
+        const result = request.messages.map(jsonMessagePayload).find((item) => item?.outcome === 'failed');
+        assert.deepEqual(result?.error, error);
+        assert.deepEqual(result?.output, output);
+        yield providerEvent(request.requestId, 'assistant.message', { messageId: `provider:answer:${turns}`, content: 'The shell could not start.' });
+      }
+      yield providerEvent(request.requestId, 'completed', {});
+    } };
+    let actor = actorWith(journal, sessionId, provider, kernel, preparation.port, 'shell-unavailable');
+    t.after(() => actor.dispose());
+    await actor.submit(messageCommand(sessionId, 'command:shell-unavailable', 'Check the branch.'));
+    const projection = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+    const activity = projection.activities.find((item) => item.tool?.shell);
+    assert.equal(activity?.status, 'failed');
+    assert.equal(activity?.tool?.shell?.result, undefined);
+    assert.equal(activity?.tool?.shell?.command, 'git status -sb');
+    const events = await readEvents(journal, sessionId);
+    assert.equal(singleEvent(events, 'tool.completed').payload.record.error.code, `${toolName}_unavailable`);
+    singleEvent(events, 'run.runtime.released');
+    singleEvent(events, 'run.settled');
+    assert.equal(preparation.released.length, 1);
+    await actor.dispose();
+    actor = actorWith(journal, sessionId, provider, kernel, preparation.port, 'shell-reopened');
+    await actor.recover();
+    await actor.submit(messageCommand(sessionId, 'command:shell-after-restart', 'Explain the error.'));
+    await waitForProjection(actor, (value) => value.run?.status === 'completed' && preparation.released.length === 2);
+    assert.equal(calls, 1);
+  });
+}
+}
+
 test('a run without workspace bindings never exposes workspace-scoped tools', async () => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:no-workspace-tools';
@@ -1679,6 +1840,38 @@ test('cancel and service disposal close their owned runtime boundaries in order'
   await verifyWaitingCancelRelease();
   await verifyComposedDisposeRelease();
   await verifyExecutingToolDisposeCleanup();
+});
+
+test('Session service owns Host activity through background completion', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:host-background-activity';
+  await createSession(journal, sessionId);
+  let finish;
+  const held = new Promise((resolve) => { finish = resolve; });
+  const preparation = fakeRunPreparation();
+  const service = new SessionService(journal, {
+    async create() {
+      return { composition: {
+        contextProviders: [],
+        provider: { async *stream(request) {
+          await held;
+          yield providerEvent(request.requestId, 'text.delta', { text: 'Background work completed.' });
+          yield providerEvent(request.requestId, 'completed', {});
+        } },
+        memory: { id: 'memory.complete', select: ({ messages }) => messages },
+        observers: [], kernel: emptyKernel(), runPreparation: preparation.port,
+        async dispose() {},
+      } };
+    },
+  });
+  t.after(async () => { finish(); await service.dispose(); });
+  assert.deepEqual(await service.activity(), { active: false });
+  await service.submit(messageCommand(sessionId, 'command:host-background', 'Complete this work.'));
+  assert.deepEqual(await service.activity(), { active: true });
+  finish();
+  await waitUntil(async () => !(await service.activity()).active, 'background completion releases Host without a shell snapshot');
+  assert.deepEqual(await service.activity(), { active: false });
+  assert.equal(preparation.released.length, 1);
 });
 
 test('deletion remains available while an unloadable actor rolls back cleanly', async () => {
@@ -3328,6 +3521,7 @@ async function verifyWaitingCancelRelease() {
     value.run?.status === 'waiting' && value.pendingInteraction !== null
   ));
   assert.equal(preparation.released.length, 0);
+  await waitUntil(async () => !await actor.hasActiveWork(), 'waiting for a user decision permits idle Host shutdown');
   const cancelReply = await actor.submit({
     schemaVersion: 'deepcode.command.v3',
     type: 'run.cancel',
@@ -3339,6 +3533,7 @@ async function verifyWaitingCancelRelease() {
   const cancelled = await waitForProjection(actor, (value) => value.run?.status === 'cancelled');
   await waitUntil(() => preparation.released.length === 1, 'cancelled run release');
   assert.equal(cancelled.pendingInteraction, null);
+  await waitUntil(async () => !await actor.hasActiveWork(), 'settled Session releases Host activity');
 
   const events = await readEvents(journal, sessionId);
   const completion = singleEvent(events, 'provider.turn.settled');

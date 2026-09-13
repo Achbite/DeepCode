@@ -10,6 +10,7 @@ import type {
   FilesystemReference,
   PluginCatalogProjection,
   SessionProjection,
+  SkillSettingsItem,
 } from '@deepcode/protocol';
 import {
   COMMAND_REPLY_VERSION,
@@ -108,6 +109,17 @@ export async function getPluginCatalog(
     `${API_BASE}/conversation/plugins`,
     { signal },
   ));
+}
+
+export async function getSkillSettings(signal?: AbortSignal): Promise<SkillSettingsItem[]> {
+  const value = await request<unknown>(`${API_BASE}/conversation/plugins/skills`, { signal });
+  if (!isExactRecord(value, ['skills']) || !Array.isArray(value.skills)
+    || !value.skills.every((item) => isExactRecord(item, ['id', 'displayName', 'description', 'source'])
+      && isNonEmptyText(item.id) && isNonEmptyText(item.displayName)
+      && isNonEmptyText(item.description) && ['builtin', 'mounted'].includes(String(item.source)))) {
+    throw new Error('skill_settings_invalid');
+  }
+  return value.skills as SkillSettingsItem[];
 }
 
 export async function getConversationCatalogManagement(
@@ -905,7 +917,7 @@ function isPlanOperation(value: unknown): boolean {
   if (!isRecord(value) || !isIdentifier(value.workspaceId)) {
     return false;
   }
-  if (value.operation === 'bash') {
+  if ((value.operation === 'bash' || value.operation === 'powershell')) {
     return isExactRecord(
       value,
       ['workspaceId', 'operation', 'workspaceMode', 'executionScope'],
@@ -1271,7 +1283,7 @@ function isActivity(value: unknown): boolean {
   return isExactRecord(
     value,
     ['activityId', 'kind', 'status', 'label', 'runId', 'sequence'],
-    ['callId', 'tool', 'providerHosted', 'inputRejection', 'interruption'],
+    ['callId', 'tool', 'providerHosted', 'inputRejection', 'interruption', 'startedAt', 'liveOutput'],
   )
     && isIdentifier(value.activityId)
     && ['run', 'tool', 'providerHosted', 'approval', 'plan', 'interaction']
@@ -1282,16 +1294,27 @@ function isActivity(value: unknown): boolean {
     && isIdentifier(value.runId)
     && (value.callId === undefined || isIdentifier(value.callId))
     && isNaturalNumber(value.sequence)
+    && (value.startedAt === undefined || value.kind === 'tool' && isNonEmptyText(value.startedAt)
+      && /^\d+$/u.test(value.startedAt) && Number.isSafeInteger(Number(value.startedAt)))
+    && (value.liveOutput === undefined || value.kind === 'tool' && value.status === 'active'
+      && value.startedAt !== undefined && isLiveToolOutput(value.liveOutput))
     && (value.tool === undefined || isToolActivity(value.tool, String(value.status)))
     && (value.providerHosted === undefined || isProviderHostedActivity(value.providerHosted))
     && (value.kind === 'tool'
       ? value.status === 'rejected' ? value.tool === undefined && isInputRejection(value.inputRejection)
-        : value.status === 'requested' || value.tool !== undefined
+        : value.status === 'requested' || value.status === 'active' && value.startedAt !== undefined || value.tool !== undefined
           || value.status === 'indeterminate' && isLocalAgentError(value.interruption)
       : value.tool === undefined)
     && (value.status === 'rejected' && value.kind === 'tool') === (value.inputRejection !== undefined)
     && (value.interruption === undefined || value.kind === 'tool' && value.status === 'indeterminate' && value.tool === undefined && isLocalAgentError(value.interruption))
     && (value.kind === 'providerHosted') === (value.providerHosted !== undefined);
+}
+
+function isLiveToolOutput(value: unknown): boolean {
+  return isExactRecord(value, ['stdout', 'stderr', 'stdoutBytes', 'stderrBytes', 'truncated'])
+    && typeof value.stdout === 'string' && typeof value.stderr === 'string'
+    && isNaturalNumber(value.stdoutBytes) && isNaturalNumber(value.stderrBytes)
+    && typeof value.truncated === 'boolean';
 }
 
 function isInputRejection(value: unknown): boolean {
@@ -1319,7 +1342,7 @@ function isToolActivity(value: unknown, activityStatus: string): boolean {
       && ['create', 'modify', 'delete'].includes(String(change.kind))
       && [change.before, change.after].every((side) => isRecord(side) && typeof side.exists === 'boolean'
         && (!side.exists || typeof side.contentRef === 'string' || typeof side.error === 'string'))))
-    && (value.operation === 'bash'
+    && ((value.operation === 'bash' || value.operation === 'powershell')
       ? isShellActivity(value.shell, activityStatus)
       : value.shell === undefined);
 }

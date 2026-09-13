@@ -180,8 +180,8 @@
     "settings.nav.workspace": "工作区",
     "settings.nav.common": "通用设置",
     "settings.nav.gui": "外观",
-    "settings.nav.agent": "Agent",
-    "settings.nav.llm": "LLM 提供商",
+    "settings.nav.agent": "Agent 行为",
+    "settings.nav.llm": "模型与服务",
     "settings.nav.skill": "Skill 运行时",
     "settings.nav.mcp": "MCP 服务",
     "settings.common.title": "通用设置",
@@ -751,7 +751,10 @@
     "deepcodeGui.cache.unavailableTitle": "当前会话已完成 {calls} 次模型请求，尚无可计算的输入缓存统计。",
     "deepcodeGui.cache.emptyTitle": "当前会话尚无 Provider 用量。",
     "deepcodeGui.titlebar.api": "API",
-    "deepcodeGui.titlebar.agent": "Agent"
+    "deepcodeGui.titlebar.agent": "Agent",
+    "settings.nav.environment": "执行环境",
+    "settings.nav.permissions": "工具权限",
+    "settings.nav.plugins": "插件"
   },
   "settings": {
     "workbench.language": {
@@ -889,6 +892,20 @@
     "terminal.integrated.spawnTimeoutMs": {
       "label": "终端启动超时",
       "description": "终端后台启动超时，单位为毫秒。"
+    },
+    "agent.windows.shell": {
+      "label": "Windows Shell",
+      "description": "应用于后续运行。默认优先 PowerShell 7，未安装时使用系统 PowerShell；运行中不切换。",
+      "options": {
+        "auto": "自动 · 优先 PowerShell 7",
+        "powershell7": "PowerShell 7",
+        "windowsPowerShell": "Windows PowerShell 5.1",
+        "gitBash": "Git Bash"
+      }
+    },
+    "agent.windows.gitBashPath": {
+      "label": "Git Bash 路径",
+      "description": "可选的 bash.exe 完整路径。留空时检测 Git 安装目录。"
     },
     "agent.responseLanguage": {
       "label": "回答语言",

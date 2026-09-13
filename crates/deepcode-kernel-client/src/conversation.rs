@@ -489,6 +489,16 @@ impl SessionProjection {
                         | "indeterminate"
                 )
                 || activity.kind == "tool" && activity.call_id.as_deref().is_none_or(str::is_empty)
+                || activity.started_at.as_ref().is_some_and(|started| {
+                    activity.kind != "tool"
+                        || started.is_empty()
+                        || !started.bytes().all(|byte| byte.is_ascii_digit())
+                        || started.parse::<u64>().is_err()
+                })
+                || activity.live_output.is_some()
+                    && (activity.kind != "tool"
+                        || activity.status != "active"
+                        || activity.started_at.is_none())
                 || activity.kind != "tool" && activity.tool.is_some()
                 || (activity.kind == "tool" && activity.status == "rejected")
                     != activity.input_rejection.is_some()
@@ -520,7 +530,7 @@ impl SessionProjection {
                 || activity.tool.as_ref().is_some_and(|tool| {
                     tool.operation.is_empty()
                         || tool.shell.as_ref().is_some_and(|shell| {
-                            tool.operation != "bash"
+                            !matches!(tool.operation.as_str(), "bash" | "powershell")
                                 || shell.command.trim().is_empty()
                                 || !is_normalized_logical_path(&shell.cwd)
                                 || !matches!(shell.execution_scope.as_str(), "workspace" | "host")
@@ -533,7 +543,7 @@ impl SessionProjection {
                                             && (result.timed_out || result.exit_code != Some(0))
                                 })
                         })
-                        || tool.operation == "bash"
+                        || matches!(tool.operation.as_str(), "bash" | "powershell")
                             && (tool.shell.is_none()
                                 || tool.shell.as_ref().is_some_and(|shell| {
                                     match activity.status.as_str() {
@@ -1535,10 +1545,22 @@ pub struct ActivityProjection {
     pub run_id: String,
     pub call_id: Option<String>,
     pub sequence: u64,
+    pub started_at: Option<String>,
+    pub live_output: Option<ToolOutputProjection>,
     pub tool: Option<ToolActivityProjection>,
     pub input_rejection: Option<ToolInputRejectionProjection>,
     pub interruption: Option<ConversationError>,
     pub provider_hosted: Option<ProviderHostedActivityProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolOutputProjection {
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1973,7 +1995,7 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                             && operation.terminal.is_none()
                             && operation.writable_paths.is_none()
                     }
-                    "bash" => {
+                    "bash" | "powershell" => {
                         operation.target.is_none()
                             && operation.target_kind.is_none()
                             && operation
@@ -2365,6 +2387,48 @@ mod tests {
             projection.activities[0].call_id.as_deref(),
             Some("call:read")
         );
+    }
+
+    #[test]
+    fn tool_progress_decodes_at_the_same_revision_and_settlement_removes_live_output() {
+        let mut value = projection_value();
+        value["activities"][0]["status"] = json!("active");
+        value["activities"][0]["startedAt"] = json!("1789280000000");
+        value["activities"][0]["liveOutput"] = json!({
+            "stdout": "开始\n", "stderr": "", "stdoutBytes": 7, "stderrBytes": 0, "truncated": false
+        });
+        let active: SessionProjection = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(active.validate(), Ok(()));
+        assert_eq!(
+            active.activities[0].started_at.as_deref(),
+            Some("1789280000000")
+        );
+        assert_eq!(
+            active.activities[0].live_output.as_ref().unwrap().stdout,
+            "开始\n"
+        );
+        value["activities"][0]["liveOutput"]["stdout"] = json!("开始\n完成一项\n");
+        value["activities"][0]["liveOutput"]["stdoutBytes"] = json!(20);
+        let updated: SessionProjection = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(active.revision, updated.revision);
+        assert_ne!(active.activities[0], updated.activities[0]);
+        assert_eq!(updated.validate(), Ok(()));
+        value["activities"][0]["status"] = json!("completed");
+        let invalid: SessionProjection = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            invalid.validate().is_err(),
+            "terminal facts must not retain transient output"
+        );
+        value["activities"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("liveOutput");
+        let terminal: SessionProjection = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(terminal.validate(), Ok(()));
+        assert!(terminal.activities[0].live_output.is_none());
+        value["activities"][0]["startedAt"] = json!("unknown");
+        let invalid: SessionProjection = serde_json::from_value(value).unwrap();
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

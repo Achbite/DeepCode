@@ -65,6 +65,7 @@ export interface EditorEffectiveOptions {
 }
 
 interface SettingsStateData {
+  environment: Record<string, unknown> | null;
   userSettings: UserSettings;
   runtimeUserSettings: UserSettings;
   workspaceSettings: Record<string, unknown>;
@@ -250,6 +251,8 @@ const SETTING_DEFINITION_SCHEMAS: SettingDefinitionSchema[] = [
     group: 'terminal',
     control: 'number',
   },
+  { key: 'agent.windows.shell', group: 'agent', control: 'select', options: ['auto', 'powershell7', 'windowsPowerShell', 'gitBash'] },
+  { key: 'agent.windows.gitBashPath', group: 'agent', control: 'text' },
   {
     key: 'agent.responseLanguage',
     group: 'agent',
@@ -466,6 +469,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
       overriddenKeys,
     );
     set({
+      environment: snapshot.environment ?? null,
       userSettings: snapshot.settings,
       runtimeUserSettings: snapshot.runtimeSettings,
       overriddenKeys,
@@ -528,6 +532,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
   };
 
   return {
+    environment: null,
     userSettings: DEFAULT_USER_SETTINGS,
     runtimeUserSettings: DEFAULT_USER_SETTINGS,
     workspaceSettings: {},

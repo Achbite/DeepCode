@@ -126,12 +126,13 @@ export type PlanOperationName =
   | 'fs.write'
   | 'fs.edit'
   | 'fs.delete'
-  | 'bash';
+  | 'bash'
+  | 'powershell';
 
 export type PlanOperation =
   | {
       workspaceId: string;
-      operation: Exclude<PlanOperationName, 'fs.delete' | 'bash'>;
+      operation: Exclude<PlanOperationName, 'fs.delete' | 'bash' | 'powershell'>;
       target: string;
       /** Omitted/file covers this file; directoryTree covers files beneath this directory. */
       targetKind?: 'file' | 'directoryTree';
@@ -144,7 +145,7 @@ export type PlanOperation =
     }
   | {
       workspaceId: string;
-      operation: 'bash';
+      operation: 'bash' | 'powershell';
       /** Representative project entrypoint, for review; authorization uses the declared scope. */
       command?: string;
       workspaceMode: 'write';
@@ -732,6 +733,12 @@ export type SessionEvent =
       };
     })
   | (SessionEventBase & {
+      type: 'tool.started';
+      runId: string;
+      callId: string;
+      payload: { attemptId: string; startedAt: string };
+    })
+  | (SessionEventBase & {
       type: 'approval.requested';
       runId: string;
       callId: string;
@@ -1038,10 +1045,21 @@ export interface ActivityProjection {
   runId: string;
   callId?: string;
   sequence: number;
+  startedAt?: string;
+  /** Bounded live output, absent after settlement and never persisted in journal. */
+  liveOutput?: ToolOutputProjection;
   tool?: ToolActivityProjection;
   inputRejection?: ToolInputRejection['error'];
   interruption?: LocalAgentError;
   providerHosted?: ProviderHostedActivityProjection;
+}
+
+export interface ToolOutputProjection {
+  stdout: string;
+  stderr: string;
+  stdoutBytes: number;
+  stderrBytes: number;
+  truncated: boolean;
 }
 
 export interface ProviderHostedActivityProjection {
@@ -1379,6 +1397,7 @@ export interface ProviderToolAlias {
 }
 
 export interface RunRuntimeSnapshot {
+  environment?: JsonObject;
   runRuntimeSnapshotRef: string;
   extensionGenerationRef: string;
   kernelCatalogSnapshotRef: string;
@@ -1392,6 +1411,8 @@ export interface RunRuntimeSnapshot {
 }
 
 export interface PrepareRunRuntimeRequest {
+  environment?: JsonObject;
+  restoreEnvironment?: boolean;
   sessionId: string;
   runId: string;
   profileId?: string;
@@ -1595,8 +1616,12 @@ export type ToolCancelReply =
       record: ToolExecutionRecord;
     };
 
+export type ToolExecutionProgress =
+  | { type: 'started'; startedAt: string }
+  | { type: 'output'; stream: 'stdout' | 'stderr'; offset: number; bytes: number[] };
+
 export interface KernelPort {
-  execute(request: ToolExecutionRequest): Promise<ToolExecutionReply>;
+  execute(request: ToolExecutionRequest, onProgress?: (progress: ToolExecutionProgress) => Promise<void>): Promise<ToolExecutionReply>;
   cancel(callId: string, attemptId: string): Promise<ToolCancelReply>;
   readRecord(callId: string): Promise<ToolExecutionRecord | null>;
 }

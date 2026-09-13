@@ -710,6 +710,7 @@ fn validate_new_event(
         "todo.reconciled",
         "todo.progressed",
         "tool.requested",
+        "tool.started",
         "approval.requested",
         "approval.resolved",
         "tool.completed",
@@ -751,6 +752,7 @@ fn validate_new_event(
             | "plan.revision.requested"
             | "plan.cancelled"
             | "tool.requested"
+            | "tool.started"
             | "approval.requested"
             | "approval.resolved"
             | "tool.completed"
@@ -819,6 +821,19 @@ fn validate_new_event(
         }
     }
     match event_type {
+        "tool.started" => {
+            let payload = &event["payload"];
+            exact_object(payload, &["attemptId", "startedAt"], &[])?;
+            validate_id("attemptId", required_string(payload, "attemptId")?)?;
+            required_string(payload, "startedAt")?
+                .parse::<u64>()
+                .map_err(|_| {
+                    LocalAgentStoreError::new(
+                        "tool_started_invalid",
+                        "startedAt 必须是 Kernel epoch 毫秒。",
+                    )
+                })?;
+        }
         "tool.interrupted" => {
             let payload = &event["payload"];
             exact_object(payload, &["attemptId", "error"], &[])?;
@@ -2624,6 +2639,26 @@ fn validate_event_facts(
                 }
             }
         }
+        "tool.started" => {
+            let run_id = required_string(event, "runId")?;
+            let call_id = required_string(event, "callId")?;
+            let valid: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2
+                    AND call_id=?3 AND event_type='tool.requested' AND json_extract(payload_json, '$.attemptId')=?4)
+                 AND NOT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2 AND call_id=?3
+                    AND event_type IN ('tool.started','tool.completed','tool.input-rejected','tool.interrupted'))
+                 AND NOT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2
+                    AND event_type IN ('run.runtime.released','run.settled'))",
+                params![session_id, run_id, call_id, required_string(&event["payload"], "attemptId")?],
+                |row| row.get(0),
+            ).map_err(sql_error("session_event_fact_read_failed"))?;
+            if !valid {
+                return Err(LocalAgentStoreError::new(
+                    "tool_started_state_invalid",
+                    "工具开始必须关联当前未完成的同一次调用，并且只记录一次。",
+                ));
+            }
+        }
         "tool.interrupted" => {
             let run_id = required_string(event, "runId")?;
             let call_id = required_string(event, "callId")?;
@@ -3204,7 +3239,7 @@ fn validate_plan_operations(value: &Value) -> Result<(), LocalAgentStoreError> {
     })?;
     for operation in operations {
         let name = required_string(operation, "operation")?;
-        if name == "bash" {
+        if matches!(name, "bash" | "powershell") {
             exact_object(
                 operation,
                 &[
@@ -3311,7 +3346,7 @@ fn validate_plan_operations(value: &Value) -> Result<(), LocalAgentStoreError> {
             }
         }
         validate_id("workspaceId", required_string(operation, "workspaceId")?)?;
-        if name != "bash" {
+        if !matches!(name, "bash" | "powershell") {
             let target = required_string(operation, "target")?;
             if target.trim() != target
                 || target.starts_with('/')
@@ -4375,7 +4410,7 @@ fn validate_run_runtime_snapshot(
             "providerToolAliases",
             "selectedPlugins",
         ],
-        &[],
+        &["environment"],
     )?;
     let run_runtime_snapshot_ref = required_string(value, "runRuntimeSnapshotRef")?;
     let extension_generation_ref = required_string(value, "extensionGenerationRef")?;
@@ -5455,6 +5490,19 @@ mod tests {
             }
             journal.append(&event).unwrap();
         }
+        let started = json!({"type":"tool.started", "sessionId":"session:loop", "runId":"run:loop", "callId":"call:unknown",
+            "payload":{"attemptId":"attempt:unknown", "startedAt":"1789298353986"}});
+        let mut wrong_started = started.clone();
+        wrong_started["payload"]["attemptId"] = json!("attempt:other");
+        assert_eq!(
+            journal.append(&wrong_started).unwrap_err().code,
+            "tool_started_state_invalid"
+        );
+        journal.append(&started).unwrap();
+        assert_eq!(
+            journal.append(&started).unwrap_err().code,
+            "tool_started_state_invalid"
+        );
         let interrupted = json!({
             "type":"tool.interrupted", "sessionId":"session:loop", "runId":"run:loop", "callId":"call:unknown",
             "payload":{"attemptId":"attempt:unknown", "error":{"code":"tool_result_unknown", "message":"Kernel result unavailable after runtime release; original fetch failed."}}

@@ -50,6 +50,10 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'terminal.integrated.spawnTimeoutMs': 8000,
   'agent.systemPrompt': '',
   'agent.responseLanguage': 'auto',
+  'agent.windows.shell': 'auto',
+  'agent.windows.gitBashPath': '',
+  'agent.environmentRevision': 0,
+  'agent.projectEnvironments': '{}',
   'agent.permissions.workspaceMutation': 'plan',
   'agent.permissions.engineeringDecisions': 'ask',
   'agent.permissions.networkRead': 'allow',
@@ -128,10 +132,18 @@ function surfacesForKey(key: string): SettingsSurface[] {
 }
 
 export interface GetUserSettingsResult {
+  environment?: Record<string, unknown>;
   settings: UserSettings;
   runtimeSettings: UserSettings;
   overriddenKeys: string[];
   storePath: string;
+}
+
+export interface SkillSettingsItem {
+  id: string;
+  displayName: string;
+  description: string;
+  source: 'builtin' | 'mounted';
 }
 
 export interface PatchUserSettingsRequest {

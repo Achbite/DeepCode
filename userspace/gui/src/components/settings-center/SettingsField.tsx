@@ -42,6 +42,7 @@ const SettingsField: React.FC<SettingsFieldProps> = ({
       return (
         <input
           className="settings-field__checkbox"
+          aria-label={definition.label}
           type="checkbox"
           checked={Boolean(value)}
           disabled={disabled}
@@ -54,6 +55,7 @@ const SettingsField: React.FC<SettingsFieldProps> = ({
       return (
         <input
           className="settings-field__input"
+          aria-label={definition.label}
           type="number"
           value={typeof value === 'number' ? value : Number(value ?? defaultValue ?? 0)}
           disabled={disabled}
@@ -84,6 +86,7 @@ const SettingsField: React.FC<SettingsFieldProps> = ({
       return (
         <textarea
           className="settings-field__input settings-field__textarea"
+          aria-label={definition.label}
           value={String(value ?? '')}
           disabled={disabled}
           rows={6}
@@ -95,6 +98,7 @@ const SettingsField: React.FC<SettingsFieldProps> = ({
     return (
       <input
         className="settings-field__input"
+        aria-label={definition.label}
         type="text"
         value={String(value ?? '')}
         disabled={disabled}
@@ -104,7 +108,7 @@ const SettingsField: React.FC<SettingsFieldProps> = ({
   };
 
   return (
-    <div className={`settings-field${compact ? ' settings-field--compact' : ''}`}>
+    <div className={`settings-field${compact ? ' settings-field--compact' : ''}${definition.control === 'textarea' ? ' settings-field--multiline' : ''}`}>
       <div className="settings-field__main">
         <div className="settings-field__title-row">
           <span className="settings-field__label">{definition.label}</span>
@@ -120,7 +124,7 @@ const SettingsField: React.FC<SettingsFieldProps> = ({
       </div>
       <div className="settings-field__control">
         {renderControl()}
-        {!compact && onReset && source === 'user' && (
+        {onReset && source === 'user' && (
           <button
             className="settings-field__reset"
             type="button"

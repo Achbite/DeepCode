@@ -91,7 +91,7 @@ const PLAN_OPERATION_SCHEMA: JsonObject = {
       required: ['workspace', 'operation', 'workspaceMode', 'executionScope'],
       properties: {
         workspace: { type: 'string', minLength: 1 },
-        operation: { type: 'string', enum: ['bash'] },
+        operation: { type: 'string', enum: ['bash', 'powershell'] },
         command: { type: 'string', minLength: 1, maxLength: 16_384 },
         workspaceMode: { type: 'string', enum: ['write'] },
         executionScope: { type: 'string', enum: ['workspace', 'host'] },
@@ -195,7 +195,7 @@ export function sessionControlToolDefinitions(): readonly ProviderToolDefinition
     },
     {
       name: SESSION_CONTROL_PLAN_PUBLISH,
-      description: 'Propose a Plan for user confirmation. Steps are stable outcome phases, not files, commands or implementation recipes; new tasks need not repeat completed history. For scope additions only, use mode=extendScope with summary explaining why and mutationManifest containing additions; Session preserves the current phases, verification and progress. If the task needs a rewritten Plan, omit mode, retain existing stepIds and submit title, summary, steps and the full effective manifest. Scope expansion and Plan rewrites take effect only after user confirmation. fs.edit/fs.write share file or explicit directoryTree scope; deletion is separate. Bash command is an optional example, not an exact script lock. Routine fixes within confirmed scope need no reconfirmation. Titles use inline Markdown; other text uses Markdown.',
+      description: 'Propose a Plan for user confirmation. Steps are stable outcome phases, not files, commands or implementation recipes; new tasks need not repeat completed history. For scope additions only, use mode=extendScope with summary explaining why and mutationManifest containing additions; Session preserves the current phases, verification and progress. If the task needs a rewritten Plan, omit mode, retain existing stepIds and submit title, summary, steps and the full effective manifest. Scope expansion and Plan rewrites take effect only after user confirmation. fs.edit/fs.write share file or explicit directoryTree scope; deletion is separate. When creating a module, propose its specific directoryTree scope upfront so new implementation files within that approved directory need no extra confirmation; list unrelated root files separately. Bash command is an optional example, not an exact script lock. Routine fixes within confirmed scope need no reconfirmation. Titles use inline Markdown; other text uses Markdown.',
       inputSchema: structuredClone(PLAN_SCHEMA) as JsonObject,
     },
     {
@@ -373,7 +373,7 @@ function decodePlanOperation(value: unknown, index: number): PlanOperation {
   }
   const operation = value.operation;
   const workspaceId = requiredIdentifier(value.workspaceId, 'workspaceId');
-  if (operation === 'bash') {
+  if (operation === 'bash' || operation === 'powershell') {
     assertExactKeys(
       value,
       ['workspaceId', 'operation', 'command', 'workspaceMode', 'executionScope', 'terminal', 'writablePaths'],
@@ -443,7 +443,7 @@ function decodePlanOperation(value: unknown, index: number): PlanOperation {
   }
   return {
     workspaceId,
-    operation: operation as Exclude<PlanOperation['operation'], 'fs.delete' | 'bash'>,
+    operation: operation as Exclude<PlanOperation['operation'], 'fs.delete' | 'bash' | 'powershell'>,
     target,
     ...(value.targetKind === undefined ? {} : { targetKind: value.targetKind }),
   };

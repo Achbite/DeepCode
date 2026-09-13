@@ -1,10 +1,11 @@
 use deepcode_kernel_client::{
     is_terminal_run_status, ActivityProjection, ApprovalProjection, ExecutionPlanStep,
     InteractionProjection, PlanOperation, ProjectionMessage, SessionProjection,
-    SessionTimelineItem, TodoListProjection,
+    SessionTimelineItem, TodoListProjection, ToolOutputProjection,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Output-local bookkeeping; Session remains the owner of ordering and state.
 #[derive(Default)]
@@ -152,7 +153,26 @@ impl CliRenderState {
                             .find(|activity| activity.activity_id == *id)
                             .expect("validated Session timeline activity reference");
                         if self.activities.get(id) != Some(activity) {
-                            render_tool_activity(out, projection, activity)?;
+                            let previous = self.activities.get(id);
+                            if let Some(previous) = previous.filter(|previous| {
+                                activity.kind == "tool"
+                                    && activity.status == "active"
+                                    && previous.status == "active"
+                                    && previous.started_at == activity.started_at
+                                    && previous.sequence == activity.sequence
+                                    && previous.tool == activity.tool
+                                    && previous.label == activity.label
+                            }) {
+                                if let Some(output) = activity.live_output.as_ref() {
+                                    render_live_tool_output(
+                                        out,
+                                        output,
+                                        previous.live_output.as_ref(),
+                                    )?;
+                                }
+                            } else {
+                                render_tool_activity(out, projection, activity)?;
+                            }
                             self.activities.insert(id.clone(), activity.clone());
                         }
                     }
@@ -461,6 +481,21 @@ pub(crate) fn render_tool_activity(
         .map(|tool| tool.operation.as_str())
         .unwrap_or(activity.label.as_str());
     writeln!(out, "工具 {operation} [{}]", activity.status)?;
+    if activity.status == "active" {
+        if let Some(elapsed) = activity.started_at.as_ref().and_then(|started| {
+            let started = started.parse::<u128>().ok()?;
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_millis()
+                .checked_sub(started)
+        }) {
+            writeln!(out, "  已执行 {:.1}s", elapsed as f64 / 1_000.0)?;
+        }
+        if let Some(output) = activity.live_output.as_ref() {
+            render_live_tool_output(out, output, None)?;
+        }
+    }
     if let Some(error) = &activity.interruption {
         writeln!(out, "  {}: {}", error.code, error.message)?;
     }
@@ -536,6 +571,49 @@ pub(crate) fn print_tool_stream(out: &mut impl Write, label: &str, output: &str)
     writeln!(out, "  {label}:")?;
     for line in output.lines() {
         writeln!(out, "    {line}")?;
+    }
+    Ok(())
+}
+
+fn render_live_tool_output(
+    out: &mut impl Write,
+    output: &ToolOutputProjection,
+    previous: Option<&ToolOutputProjection>,
+) -> io::Result<()> {
+    writeln!(
+        out,
+        "  实时输出 · stdout {} bytes · stderr {} bytes{}",
+        output.stdout_bytes,
+        output.stderr_bytes,
+        if output.truncated {
+            " · 仅保留最新片段"
+        } else {
+            ""
+        }
+    )?;
+    for (label, text, total, before) in [
+        (
+            "stdout",
+            output.stdout.as_str(),
+            output.stdout_bytes,
+            previous.map(|value| (value.stdout.as_str(), value.stdout_bytes)),
+        ),
+        (
+            "stderr",
+            output.stderr.as_str(),
+            output.stderr_bytes,
+            previous.map(|value| (value.stderr.as_str(), value.stderr_bytes)),
+        ),
+    ] {
+        // Raw-byte totals can include an unfinished UTF-8 character. Compare
+        // decoded text rather than treating those totals as string offsets.
+        if before.is_some_and(|(old, bytes)| output.truncated && old == text && bytes != total) {
+            print_tool_stream(out, &format!("{label} 最新片段"), text)?;
+        } else if let Some(delta) = text.strip_prefix(before.map_or("", |(text, _)| text)) {
+            print_tool_stream(out, label, delta)?;
+        } else {
+            print_tool_stream(out, &format!("{label} 最新片段"), text)?;
+        }
     }
     Ok(())
 }
@@ -774,6 +852,66 @@ mod tests {
         assert_eq!(text.matches("工具 fs.write [running]").count(), 1);
         assert_eq!(text.matches("工具 fs.write [completed]").count(), 1);
         assert!(!text.contains("本轮修改"));
+    }
+
+    #[test]
+    fn live_tool_output_advances_without_a_revision_change_or_repeating_the_prefix() {
+        let mut p = projection();
+        p.activities.push(serde_json::from_value(json!({
+            "activityId":"tool:live", "kind":"tool", "status":"active", "label":"bash",
+            "runId":"run:test", "callId":"call:live", "sequence":1, "startedAt":"1789280000000",
+            "liveOutput":{"stdout":"开始\n", "stderr":"", "stdoutBytes":7, "stderrBytes":0, "truncated":false}
+        })).unwrap());
+        p.timeline.push(
+            serde_json::from_value(json!({"kind":"toolGroup", "timelineId":"tools:live",
+            "sequence":1, "providerRequestId":"request:live", "activityIds":["tool:live"]}))
+            .unwrap(),
+        );
+        let mut state = CliRenderState::default();
+        let mut out = Vec::new();
+        state.render(&mut out, &p).unwrap();
+        let initial_length = out.len();
+        state.render(&mut out, &p).unwrap();
+        assert_eq!(out.len(), initial_length);
+        let live = p.activities[0].live_output.as_mut().unwrap();
+        live.stdout.push_str("下一步\n");
+        live.stdout_bytes += 10;
+        live.stderr = "警告\n".into();
+        live.stderr_bytes = 7;
+        state.render(&mut out, &p).unwrap();
+        let text = String::from_utf8(out.clone()).unwrap();
+        assert_eq!(p.revision, 1);
+        assert_eq!(text.matches("工具 bash [active]").count(), 1);
+        assert_eq!(text.matches("开始").count(), 1);
+        assert_eq!(text.matches("下一步").count(), 1);
+        assert_eq!(text.matches("警告").count(), 1);
+        let live = p.activities[0].live_output.as_mut().unwrap();
+        live.stdout = "保留的尾部\n".into();
+        live.stdout_bytes = 100_000;
+        live.truncated = true;
+        state.render(&mut out, &p).unwrap();
+        assert!(String::from_utf8(out.clone())
+            .unwrap()
+            .contains("stdout 最新片段"));
+        let terminal_start = out.len();
+        p.activities[0].status = "completed".into();
+        p.activities[0].live_output = None;
+        p.activities[0].tool = Some(serde_json::from_value(json!({
+            "operation":"bash", "recordId":"record:live", "resources":[],
+            "shell":{"command":"build", "cwd":".", "executionScope":"workspace", "terminal":false,
+                "result":{"stdout":"正式结果\n", "stderr":"", "exitCode":0, "success":true,
+                    "timedOut":false, "truncated":false, "capturedBytes":13, "durationMs":100,
+                    "environment":{"shell":"/bin/bash", "interactive":false, "executionScope":"workspace",
+                        "terminal":false, "pathSource":"hostPlusStandardDeveloperPaths",
+                        "writeScope":"workspaceAndKernelTemporary", "homeWritable":false, "networkAccess":false}}}
+        })).unwrap());
+        state.render(&mut out, &p).unwrap();
+        state.render(&mut out, &p).unwrap();
+        let terminal = String::from_utf8(out[terminal_start..].to_vec()).unwrap();
+        assert_eq!(terminal.matches("[completed]").count(), 1);
+        assert!(!terminal.contains("实时输出"));
+        assert!(!terminal.contains("保留的尾部"));
+        assert_eq!(terminal.matches("正式结果").count(), 1);
     }
 
     #[test]

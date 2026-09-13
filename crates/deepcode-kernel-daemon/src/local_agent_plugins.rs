@@ -86,6 +86,21 @@ pub(crate) fn plugin_catalog_projection(settings: &Value) -> Result<Value, Strin
     }))
 }
 
+/// Settings inspects text Skills through the same loader used for run preparation.
+/// It does not activate an MCP server or a binary plugin while opening the page.
+pub(crate) fn skill_settings_projection(settings: &Value) -> Result<Value, String> {
+    let mut skills = crate::local_agent_product_tools::bundled_skill_settings();
+    for source in skill_plugins(settings)? {
+        skills.push(json!({
+            "id": source.public.uri,
+            "displayName": source.public.display_name,
+            "description": source.public.short_description,
+            "source": "mounted",
+        }));
+    }
+    Ok(json!({ "skills": skills }))
+}
+
 pub(crate) fn plugin_uri_for_activation_media_type(
     settings: &Value,
     media_type: &str,

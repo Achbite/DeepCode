@@ -9,9 +9,11 @@ import {
 } from './sections/CategorizedSettingsSections';
 import LlmSection from './sections/LlmSection';
 import WorkspaceSection from './sections/WorkspaceSection';
+import PluginsSection from './sections/PluginsSection';
+import DeepCodeShellIcon, { type DeepCodeShellIconName } from '../shared/DeepCodeShellIcon';
 import './settingsCenter.css';
 
-type SettingsKey = 'workspace' | 'common' | 'gui' | 'agent' | 'llm';
+type SettingsKey = 'workspace' | 'common' | 'gui' | 'agent' | 'environment' | 'permissions' | 'llm' | 'plugins';
 
 interface SettingsCenterProps {
   apiStatus: string;
@@ -33,17 +35,20 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
   const language = normalizeUiLanguage(
     useSettingsStore((state) => state.effectiveSettings['workbench.language']),
   );
-  const items: Array<{ key: SettingsKey; icon: string; label: string }> = [
+  const items: Array<{ key: SettingsKey; icon: DeepCodeShellIconName; label: string }> = [
     ...(surface === 'editor'
-      ? [{ key: 'workspace' as const, icon: 'WS', label: t(language, 'settings.nav.workspace') }]
+      ? [{ key: 'workspace' as const, icon: 'folder' as const, label: t(language, 'settings.nav.workspace') }]
       : []),
     {
       key: surface === 'gui' ? 'gui' : 'common',
-      icon: surface === 'gui' ? 'GU' : 'CM',
+      icon: 'settings',
       label: t(language, surface === 'gui' ? 'settings.nav.gui' : 'settings.nav.common'),
     },
-    { key: 'agent', icon: 'AG', label: t(language, 'settings.nav.agent') },
-    { key: 'llm', icon: 'AI', label: t(language, 'settings.nav.llm') },
+    { key: 'agent', icon: 'session', label: t(language, 'settings.nav.agent') },
+    { key: 'environment', icon: 'terminal', label: t(language, 'settings.nav.environment') },
+    { key: 'permissions', icon: 'tool', label: t(language, 'settings.nav.permissions') },
+    { key: 'llm', icon: 'activity', label: t(language, 'settings.nav.llm') },
+    { key: 'plugins', icon: 'extension', label: t(language, 'settings.nav.plugins') },
   ];
 
   const body = (() => {
@@ -70,15 +75,19 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
           />
         );
       case 'agent':
-        return <AgentSettingsSection query={searchQuery} />;
+      case 'environment':
+      case 'permissions':
+        return <AgentSettingsSection category={activeKey} query={searchQuery} />;
       case 'llm':
-        return <LlmSection />;
+        return <><LlmSection /><AgentSettingsSection category="services" query={searchQuery} /></>;
+      case 'plugins':
+        return <PluginsSection query={searchQuery} />;
     }
   })();
 
   return (
     <div className="settings-center">
-      <nav className="settings-nav">
+      <nav className="settings-nav" aria-label={t(language, 'settings.title')}>
         <div className="settings-nav__title">{t(language, 'settings.title')}</div>
         <label className="settings-search" aria-label={t(language, 'settings.search.placeholder')}>
           <span>{t(language, 'settings.search.label')}</span>
@@ -96,9 +105,10 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
                 activeKey === item.key ? 'settings-nav-item--active' : ''
               }`}
               onClick={() => setActiveKey(item.key)}
+              aria-current={activeKey === item.key ? 'page' : undefined}
               type="button"
             >
-              <span className="settings-nav-item__icon">{item.icon}</span>
+              <span className="settings-nav-item__icon"><DeepCodeShellIcon name={item.icon} /></span>
               <span>{item.label}</span>
             </button>
           ))}

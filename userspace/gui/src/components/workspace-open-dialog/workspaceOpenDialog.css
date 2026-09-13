@@ -443,3 +443,13 @@
 :root[data-product='deepcode-gui'] .ws-open-dialog__footer {
   padding: 10px 13px;
 }
+
+.ws-open-dialog.ws-open-dialog--native,
+:root[data-product='deepcode-gui'] .ws-open-dialog.ws-open-dialog--native {
+  width: min(440px, 90vw);
+  height: auto;
+  display: flex;
+  flex-direction: column;
+}
+.ws-open-dialog--native .ws-open-dialog__error { padding: 16px 20px; margin: 0; overflow-wrap: anywhere; }
+.ws-open-dialog--native .ws-open-dialog__footer { justify-content: flex-end; }

@@ -82,6 +82,12 @@ export class SessionService implements ConversationPort {
     return await (await this.actor(sessionId)).snapshot();
   }
 
+  async activity(): Promise<{ active: boolean }> {
+    const actors = await Promise.all(this.#actors.values());
+    const activity = await Promise.all(actors.map((actor) => actor.hasActiveWork()));
+    return { active: activity.some(Boolean) };
+  }
+
   async statuses(sessionIds: readonly string[]): Promise<ConversationSessionStatus[]> {
     return await Promise.all(sessionIds.map(async (sessionId) => {
       // Reuse the canonical reducer and read only new events after the first read.

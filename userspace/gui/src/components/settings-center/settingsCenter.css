@@ -2,12 +2,13 @@
   display: flex;
   height: 100%;
   min-height: 0;
+  min-width: 0;
   background: var(--bg-app, #0a0a0c);
   color: var(--text-main, #ededed);
 }
 
 .settings-nav {
-  width: 230px;
+  width: 210px;
   flex-shrink: 0;
   overflow-y: auto;
   padding: 16px 12px;
@@ -56,7 +57,7 @@
   border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
   border-radius: var(--radius-md, 6px);
   outline: none;
-  background: rgba(0, 0, 0, 0.2);
+  background: var(--dc-surface-subtle);
   color: var(--text-main, #ededed);
   padding: 5px 9px;
   font-size: 12px;
@@ -109,8 +110,6 @@
   align-items: center;
   justify-content: center;
   flex: 0 0 24px;
-  border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
-  border-radius: 999px;
   color: currentColor;
   font-size: 10px;
   font-weight: 700;
@@ -128,7 +127,7 @@
   flex: 1;
   min-width: 0;
   overflow-y: auto;
-  padding: 32px 40px 42px;
+  padding: 28px 32px 40px;
   background: var(--bg-app, #0a0a0c);
 }
 
@@ -145,7 +144,7 @@
   border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
   border-radius: var(--radius-lg, 8px);
   background: var(--bg-surface, #1c1c20);
-  box-shadow: var(--shadow-sm, 0 1px 2px rgba(0, 0, 0, 0.3));
+  box-shadow: none;
 }
 
 .settings-card__title {
@@ -920,15 +919,16 @@
   border: 1px solid var(--line, rgba(255, 255, 255, 0.08));
   border-radius: var(--radius-md, 6px);
   outline: none;
-  background: rgba(0, 0, 0, 0.2);
+  background: var(--dc-surface-subtle);
   color: var(--text-strong, #fff);
   font-size: 12px;
-  box-shadow: var(--shadow-inset, inset 0 1px 1px rgba(255, 255, 255, 0.05));
+  box-shadow: none;
 }
 
 .settings-field__input,
 .settings-field__select {
   width: 230px;
+  max-width: 100%;
   min-height: 30px;
   padding: 5px 9px;
 }
@@ -1461,4 +1461,53 @@
   .settings-kv td:first-child {
     width: 104px;
   }
+}
+
+/* Grouped settings lists share one quiet surface and a stable control column. */
+.settings-body > div { max-width: 1040px; margin-inline: auto; min-width: 0; }
+.settings-group { margin-bottom: 24px; }
+.settings-group > .settings-card__title { border: 0; background: transparent; padding: 0 4px 10px; min-height: 30px; }
+.settings-group > .settings-card__body { padding: 4px 18px; }
+.settings-field--compact { align-items: center; }
+.settings-field__main { min-width: 0; overflow-wrap: anywhere; }
+.settings-field--multiline { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+.settings-field--multiline .settings-field__control { align-items: flex-end; }
+.settings-field--multiline .settings-field__textarea { width: 100%; }
+.settings-section-description { color: var(--dc-muted, var(--text-muted)); font-size: 13px; line-height: 1.6; margin: -6px 0 24px; }
+.settings-button { flex-shrink: 0; min-height: 30px; padding: 5px 12px; border: 1px solid var(--dc-border); border-radius: 7px; background: var(--dc-surface); color: var(--dc-foreground); font: inherit; font-size: 12px; cursor: pointer; }
+.settings-button:hover:not(:disabled) { background: var(--dc-surface-hover); }
+.settings-button:disabled { opacity: 0.45; cursor: default; }
+.settings-center button:focus-visible, .settings-center input:focus-visible, .settings-center select:focus-visible, .settings-center textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.settings-actions { display: flex; gap: 8px; padding: 12px 0; }
+.settings-plugin-source { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--dc-border); }
+.settings-plugin-source__path { display: grid; gap: 5px; min-width: 0; }
+.settings-plugin-source__path strong { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.settings-plugin-source__path span { color: var(--dc-muted, var(--text-muted)); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; user-select: text; }
+.settings-plugin-source__actions { display: flex; align-items: center; gap: 4px; }
+.settings-plugin-description { color: var(--dc-muted, var(--text-muted)); font-size: 13px; line-height: 1.6; margin: 14px 0 8px; }
+.settings-plugin-empty { color: var(--dc-muted, var(--text-muted)); font-size: 12px; margin: 12px 0; }
+.settings-plugin-actions { flex-wrap: wrap; align-items: center; padding-bottom: 8px; }
+.settings-plugin-actions .settings-button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 32px; }
+.settings-plugin-actions svg { width: 15px; height: 15px; }
+.settings-plugin-save { margin-left: auto; }
+.settings-button--primary { background: var(--accent); color: #fff; border-color: transparent; }
+.settings-button--primary:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 88%, #000); }
+.settings-button--quiet { border-color: transparent; background: transparent; color: var(--dc-muted, var(--text-muted)); }
+.settings-plugin-manual { color: var(--dc-muted, var(--text-muted)); font-size: 12px; margin: 2px 0 14px; }
+.settings-plugin-manual summary { cursor: pointer; width: fit-content; padding: 5px 0; }
+.settings-plugin-manual summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+.settings-plugin-manual__form { display: flex; align-items: center; gap: 8px; padding-top: 6px; }
+.settings-plugin-manual__form .settings-field__input { flex: 1; width: 100%; min-width: 0; }
+.settings-plugin-source input[type=checkbox] { accent-color: var(--accent); }
+.settings-plugin-item { padding: 16px 0; border-bottom: 1px solid var(--dc-border); }
+.settings-plugin-item:last-child { border-bottom: 0; }
+.settings-plugin-item__heading { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.settings-plugin-item strong { color: var(--dc-foreground); font-size: 14px; overflow-wrap: anywhere; }
+.settings-plugin-item__heading span { flex-shrink: 0; font-size: 11px; color: var(--dc-muted, var(--text-muted)); }
+.settings-plugin-item p { margin: 6px 0 0; color: var(--dc-muted, var(--text-muted)); overflow-wrap: anywhere; }
+@container (max-width: 620px) {
+  .settings-field { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .settings-field__control { justify-content: flex-start; }
+  .settings-plugin-source { grid-template-columns: auto minmax(0, 1fr); gap: 10px; }
+  .settings-plugin-source__actions { grid-column: 2; }
 }

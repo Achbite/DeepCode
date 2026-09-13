@@ -169,8 +169,26 @@ impl LocalAgentRuntime {
             RunPreparationError::new("gui_state_lock_failed", "GUI state 锁已损坏。")
         })?;
         let settings = &gui.user_settings;
-        let environment = crate::session_environment::capture(settings)
-            .map_err(|message| RunPreparationError::new("session_environment_invalid", message))?;
+        let mut environment_settings = settings.clone();
+        if let Some(project_id) = gui
+            .conversation_catalog
+            .session(&request.session_id)
+            .and_then(|session| session.project_id.as_ref())
+        {
+            let projects =
+                crate::session_environment::project_environments(settings).map_err(|message| {
+                    RunPreparationError::new("session_environment_invalid", message)
+                })?;
+            if let Some(target) = projects.get(project_id) {
+                environment_settings["_executionTarget"] = target.clone();
+            }
+        }
+        let environment = crate::session_environment::prepare(
+            &environment_settings,
+            request.environment.as_ref(),
+            request.restore_environment,
+        )
+        .map_err(|message| RunPreparationError::new("session_environment_invalid", message))?;
         // Validate and freeze the requested Provider before starting any new
         // out-of-process plugin generation. A bad Profile must not replace the
         // currently usable tool generation or leave an unused MCP process set.
@@ -214,6 +232,32 @@ impl LocalAgentRuntime {
             crate::runtime_tool_configuration(&gui).map_err(|message| {
                 RunPreparationError::new("kernel_runtime_config_prepare_failed", message)
             })?;
+        executor_config.shell_program = serde_json::from_value(environment["shell"].clone())
+            .map_err(|error| {
+                RunPreparationError::new("session_environment_invalid", error.to_string())
+            })?;
+        if environment["executionTarget"]["kind"] == "wsl" {
+            executor_config.wsl = Some(deepcode_kernel_runtime::wsl_execution::WslExecution {
+                distribution: environment["executionTarget"]["distribution"]
+                    .as_str()
+                    .ok_or_else(|| {
+                        RunPreparationError::new(
+                            "session_environment_invalid",
+                            "Missing WSL distribution",
+                        )
+                    })?
+                    .into(),
+                worker: environment["executionTarget"]["worker"]
+                    .as_str()
+                    .ok_or_else(|| {
+                        RunPreparationError::new(
+                            "session_environment_invalid",
+                            "Missing WSL worker",
+                        )
+                    })?
+                    .into(),
+            });
+        }
         crate::local_agent_search::bind_cloud_search(
             &mut executor_config,
             &mut secrets,
@@ -441,6 +485,9 @@ pub(crate) struct PrepareRunRuntimeRequest {
     run_id: String,
     profile_id: Option<String>,
     reasoning_effort_override: Option<String>,
+    environment: Option<Value>,
+    #[serde(default)]
+    restore_environment: bool,
     plugin_catalog_revision: Option<String>,
     #[serde(default)]
     plugin_selections: Vec<crate::local_agent_plugins::PluginSelectionInput>,
@@ -681,19 +728,51 @@ pub(crate) async fn local_agent_tool_execute(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<LocalToolExecutionRequest>,
-) -> Json<ApiResponse> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use deepcode_kernel_runtime::executors::KernelProgressSink;
     if let Err(response) = require_session_service(&state, &headers) {
-        return response;
+        return response.into_response();
     }
     let kernel = state.local_agent.kernel.clone();
-    match tokio::task::spawn_blocking(move || kernel.execute(body)).await {
-        Ok(Ok(reply)) => ApiResponse::ok(reply),
-        Ok(Err(error)) => kernel_error(error),
-        Err(error) => ApiResponse::error(
-            "tool_runtime_join_failed",
-            format!("Kernel 工具任务结束异常：{error}"),
-        ),
-    }
+    // One execution stream, with bounded backpressure. Progress is never stored
+    // here; the final record remains the sole execution outcome.
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Value>(64);
+    let progress_sender = sender.clone();
+    let call_id = body.call_id.clone();
+    let attempt_id = body.attempt_id.clone();
+    let progress = KernelProgressSink::new(move |progress| {
+        let _ = progress_sender.blocking_send(json!({
+            "type": "progress", "callId": call_id, "attemptId": attempt_id, "progress": progress,
+        }));
+    });
+    tokio::spawn(async move {
+        let frame = match tokio::task::spawn_blocking(move || {
+            kernel.execute_with_progress(body, progress)
+        })
+        .await
+        {
+            Ok(Ok(reply)) => json!({ "type": "reply", "reply": reply }),
+            Ok(Err(error)) => {
+                json!({ "type": "error", "code": error.code, "message": error.message })
+            }
+            Err(error) => {
+                json!({ "type": "error", "code": "tool_runtime_join_failed", "message": error.to_string() })
+            }
+        };
+        let _ = sender.send(frame).await;
+    });
+    let stream = async_stream::stream! {
+        while let Some(frame) = receiver.recv().await {
+            // Value serialization cannot fail; each frame is a single NDJSON line.
+            yield Ok::<_, std::convert::Infallible>(bytes::Bytes::from(format!("{frame}\n")));
+        }
+    };
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
 }
 
 pub(crate) async fn local_agent_tool_cancel(
