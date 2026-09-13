@@ -332,11 +332,7 @@ async fn proxy_health(State(state): State<AppState>, headers: HeaderMap) -> Resp
         .await
     {
         Ok(response) => proxy_response(response).await,
-        Err(error) => ApiResponse::error(
-            "kernel_daemon_unavailable",
-            format!("Kernel daemon is not reachable: {error}"),
-        )
-        .into_response(),
+        Err(error) => proxy_request_error("kernel_daemon_unavailable", &error),
     }
 }
 
@@ -401,10 +397,19 @@ async fn proxy_api(
     let request = request.timeout(Duration::from_secs(60));
     match request.send().await {
         Ok(response) => proxy_response(response).await,
-        Err(error) => {
-            ApiResponse::error("kernel_daemon_proxy_failed", error.to_string()).into_response()
-        }
+        Err(error) => proxy_request_error("kernel_daemon_proxy_failed", &error),
     }
+}
+
+fn proxy_request_error(code: &str, error: &reqwest::Error) -> Response {
+    let mut message = error.to_string();
+    let mut cause = std::error::Error::source(error);
+    while let Some(source) = cause {
+        message.push_str(": ");
+        message.push_str(&source.to_string());
+        cause = source.source();
+    }
+    ApiResponse::error(code, message).into_response()
 }
 
 impl AppState {
@@ -487,7 +492,37 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::host_proxy_path_allowed;
+    use super::*;
+
+    #[tokio::test]
+    async fn proxy_transport_error_preserves_the_underlying_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/api/health", listener.local_addr().unwrap());
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let (request, ()) = tokio::join!(
+            client.get(&url).timeout(Duration::from_secs(2)).send(),
+            async {
+                let (stream, _) = listener.accept().await.unwrap();
+                drop(stream);
+            }
+        );
+        let error = request.unwrap_err();
+        let original_cause = std::error::Error::source(&error)
+            .expect("closed connection has an underlying cause")
+            .to_string();
+        assert!(!original_cause.is_empty());
+        let response = proxy_request_error("kernel_daemon_proxy_failed", &error);
+        let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"], "kernel_daemon_proxy_failed");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains(&url));
+        assert!(message.contains(&original_cause), "{message}");
+        assert_ne!(message, error.to_string());
+    }
 
     #[test]
     fn host_proxy_exposes_only_the_exact_plugin_catalog_get_route() {
@@ -622,8 +657,6 @@ async fn proxy_response(response: reqwest::Response) -> Response {
                 ApiResponse::error("proxy_response_build_failed", error.to_string()).into_response()
             })
         }
-        Err(error) => {
-            ApiResponse::error("proxy_response_read_failed", error.to_string()).into_response()
-        }
+        Err(error) => proxy_request_error("proxy_response_read_failed", &error),
     }
 }

@@ -1254,7 +1254,6 @@
 }
 
 :root[data-product='deepcode-gui'] .deepcode-session-model__composition-bar:focus-visible {
-  outline: none;
   outline-offset: 0;
 }
 
@@ -1636,6 +1635,7 @@
   color: var(--dc-foreground); text-align: left; font-size: 12px; cursor: pointer;
 }
 .deepcode-session-model__menu button:hover,
+.deepcode-session-model__menu button:focus-visible,
 .deepcode-session-model__menu button[aria-checked="true"] { background: var(--dc-surface-subtle); }
 .deepcode-session-model__menu button:focus-visible { outline: none; outline-offset: -2px; }
 .deepcode-session-model__menu button:disabled { opacity: .48; cursor: default; }

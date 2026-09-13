@@ -21,7 +21,7 @@ import {
   probeLlmProfile,
 } from '../../../services/runtimeAdapter';
 import { useSettingsStore } from '../../../state/settingsStore';
-import { normalizeUiLanguage, t } from '../../../i18n';
+import { normalizeUiLanguage, t, type UiLanguage } from '../../../i18n';
 
 const PROVIDERS: LlmProviderKind[] = ['openaiCompatible', 'responses', 'anthropic', 'ollama'];
 
@@ -169,8 +169,23 @@ function optionalNumber(value: string): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+type ProfileReadState = { status: 'loading' | 'loaded' } | { status: 'failed'; error: string };
+
+export function LlmProfileReadNotice({ state, hasProfiles, language }: {
+  state: ProfileReadState; hasProfiles: boolean; language: UiLanguage;
+}) {
+  if (state.status === 'failed') {
+    return <div className="settings-error" role="alert">
+      {t(language, 'settings.llm.loadFailed')}: {state.error}
+    </div>;
+  }
+  if (state.status !== 'loaded' || hasProfiles) return null;
+  return <div className="settings-card__hint">{t(language, 'settings.llm.empty')}</div>;
+}
+
 const LlmSection: React.FC = () => {
   const [profiles, setProfiles] = useState<LlmProviderProfile[]>([]);
+  const [profileRead, setProfileRead] = useState<ProfileReadState>({ status: 'loading' });
   const [defaultProfileId, setDefaultProfileId] = useState<string | undefined>();
   const [secrets, setSecrets] = useState<Record<string, string>>({});
   const [storePath, setStorePath] = useState<string | undefined>();
@@ -184,9 +199,11 @@ const LlmSection: React.FC = () => {
   );
 
   const hasProfiles = profiles.length > 0;
+  const profileStoreWritable = profileRead.status === 'loaded' || storeReplacementRequired;
 
   const load = async () => {
     setLoading(true);
+    setProfileRead({ status: 'loading' });
     setMessage(null);
     const result = await getLlmProfiles();
     if (result.ok && result.data) {
@@ -194,6 +211,7 @@ const LlmSection: React.FC = () => {
       setDefaultProfileId(result.data.defaultProfileId);
       setStorePath(result.data.storePath);
       setStoreReplacementRequired(false);
+      setProfileRead({ status: 'loaded' });
     } else if (result.error === INVALID_PROFILE_STORE_SCHEMA) {
       const replacementDrafts = currentProfileReplacementDrafts();
       setProfiles(replacementDrafts);
@@ -206,10 +224,9 @@ const LlmSection: React.FC = () => {
       setSecrets({});
       setProbeState({});
       setStoreReplacementRequired(true);
-      setMessageTone('error');
+      setProfileRead({ status: 'failed', error: result.message ?? result.error });
     } else {
-      setMessageTone('error');
-      setMessage(result.message ?? t(language, 'settings.llm.loadFailed'));
+      setProfileRead({ status: 'failed', error: result.message ?? result.error ?? t(language, 'settings.llm.loadFailed') });
     }
     setLoading(false);
   };
@@ -265,6 +282,7 @@ const LlmSection: React.FC = () => {
   };
 
   const save = async () => {
+    if (loading || !profileStoreWritable) return;
     if (!profiles.some((profile) => profile.id === defaultProfileId && profile.enabled)) return;
     setLoading(true);
     setMessage(null);
@@ -296,6 +314,7 @@ const LlmSection: React.FC = () => {
       setStorePath(result.data.storePath);
       setSecrets({});
       setStoreReplacementRequired(false);
+      setProfileRead({ status: 'loaded' });
       setMessageTone('success');
       setMessage(t(language, 'settings.llm.saved'));
       window.dispatchEvent(new CustomEvent('deepcode:llm-profiles-updated'));
@@ -373,7 +392,7 @@ const LlmSection: React.FC = () => {
           <button
             className="settings-action-button"
             onClick={() => void save()}
-            disabled={loading || !hasProfiles || !defaultValid}
+            disabled={loading || !profileStoreWritable || !hasProfiles || !defaultValid}
           >
             {t(language, 'settings.common.save')}
           </button>
@@ -411,11 +430,7 @@ const LlmSection: React.FC = () => {
           {t(language, 'settings.llm.defaultUnavailable')}
         </p>}
 
-        {profiles.length === 0 && (
-          <div className="settings-card__hint">
-            {t(language, 'settings.llm.empty')}
-          </div>
-        )}
+        <LlmProfileReadNotice state={profileRead} hasProfiles={hasProfiles} language={language} />
 
         <div className="llm-profile-list">
           {profiles.map((profile) => (
@@ -650,7 +665,7 @@ const LlmSection: React.FC = () => {
           ))}
         </div>
 
-        {storePath && (
+        {profileRead.status === 'loaded' && storePath && (
           <div className="settings-card__hint">
             {t(language, 'settings.llm.profileStoreLoaded')}
           </div>

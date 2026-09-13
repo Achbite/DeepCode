@@ -72,11 +72,6 @@ impl KernelToolRegistry {
                 "duplicate Kernel tool registration: {tool_id}"
             );
         }
-        assert_eq!(
-            registrations.len(),
-            8,
-            "Kernel catalog must contain the canonical callable tools"
-        );
         Self { registrations }
     }
 
@@ -93,15 +88,23 @@ impl KernelToolRegistry {
     }
 
     #[doc(hidden)]
+    pub fn prompt_guidance(
+        &self,
+    ) -> impl Iterator<Item = (&ToolDescriptor, &'static [&'static str])> {
+        self.registrations
+            .values()
+            .filter(|registration| !registration.usage_guidelines.is_empty())
+            .map(|registration| (&registration.descriptor, registration.usage_guidelines))
+    }
+
+    #[doc(hidden)]
     pub fn executor_bindings(
         &self,
     ) -> impl Iterator<Item = (&'static str, crate::kernel_internal::KernelExecutorBinding)> + '_
     {
-        self.registrations.values().filter_map(|registration| {
-            registration
-                .executor_binding
-                .map(|binding| (registration.tool_id(), binding))
-        })
+        self.registrations
+            .values()
+            .map(|registration| (registration.tool_id(), registration.executor_binding))
     }
 
     pub fn canonicalize(
@@ -116,9 +119,7 @@ impl KernelToolRegistry {
         if registration.descriptor.availability == ToolAvailability::Blocked {
             return Err(KernelToolCatalogError::ToolBlocked(tool_name.to_owned()));
         }
-        let canonicalize = registration
-            .canonicalize_invocation
-            .expect("callable Kernel tool must have a canonicalizer");
+        let canonicalize = registration.canonicalize_invocation;
         let invocation = canonicalize(raw_arguments.clone()).map_err(|reason| {
             // Explain a canonicalizer rejection using its published descriptor. This
             // is diagnostic only: admission remains owned by the canonicalizer.

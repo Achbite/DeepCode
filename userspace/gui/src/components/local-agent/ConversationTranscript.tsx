@@ -247,7 +247,6 @@ export function ConversationTranscript({
         />
       ) : (
         <ToolActivityGroup
-          sessionId={projection!.sessionId}
           activities={item.values}
           key={item.groupId}
           language={language}

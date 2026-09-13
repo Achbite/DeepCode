@@ -1,5 +1,5 @@
 use crate::invocation_types::{KernelCanonicalInvocation, KernelDeleteTarget, KernelToolKind};
-use crate::types::{Platform, ToolValidationError};
+use crate::types::ToolValidationError;
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
@@ -7,8 +7,6 @@ use thiserror::Error;
 pub enum InvocationNormalizationError {
     #[error("arguments for `{tool_id}` do not match the canonical input descriptor")]
     InvalidArguments { tool_id: &'static str },
-    #[error("canonical invocation for `{tool_id}` contains an implicit or non-normalized value")]
-    NotCanonical { tool_id: &'static str },
     #[error(transparent)]
     Validation(#[from] ToolValidationError),
 }
@@ -73,19 +71,6 @@ fn normalize_invocation(
         _ => {}
     }
     invocation.validate()?;
-    Ok(())
-}
-
-pub fn validate_canonical_invocation(
-    invocation: &KernelCanonicalInvocation,
-) -> Result<(), InvocationNormalizationError> {
-    let mut normalized = invocation.clone();
-    normalize_invocation(&mut normalized)?;
-    if normalized != *invocation {
-        return Err(InvocationNormalizationError::NotCanonical {
-            tool_id: invocation.tool_id().as_str(),
-        });
-    }
     Ok(())
 }
 
@@ -203,56 +188,5 @@ pub fn normalize_workspace_path(
     if normalized == "." && !allow_dot {
         return Err(invalid_arguments("workspace-path"));
     }
-    Ok(normalized)
-}
-
-/// Normalizes a resolver-produced absolute path for Kernel-private digesting.
-///
-/// The caller must first obtain the value from the platform filesystem
-/// resolver; this helper only materializes separators and preserves filename spelling.
-pub fn normalize_canonical_platform_path(
-    platform: Platform,
-    value: &str,
-) -> Result<String, InvocationNormalizationError> {
-    if value.is_empty() || value.contains('\0') {
-        return Err(invalid_arguments("canonical-platform-path"));
-    }
-    let materialized = match platform {
-        Platform::Windows => value.replace('\\', "/"),
-        Platform::Macos | Platform::Linux => value.to_owned(),
-    };
-    let prefix_len = match platform {
-        Platform::Macos | Platform::Linux if materialized.starts_with('/') => 1,
-        Platform::Windows
-            if materialized.as_bytes().get(1) == Some(&b':')
-                && materialized.as_bytes().get(2) == Some(&b'/')
-                && materialized
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphabetic) =>
-        {
-            3
-        }
-        Platform::Windows if materialized.starts_with("//") => 2,
-        _ => return Err(invalid_arguments("canonical-platform-path")),
-    };
-    let mut components = Vec::new();
-    for component in materialized[prefix_len..].split('/') {
-        if component.is_empty() {
-            continue;
-        }
-        if component == "." || component == ".." {
-            return Err(invalid_arguments("canonical-platform-path"));
-        }
-        components.push(component.to_owned());
-    }
-    let prefix = &materialized[..prefix_len];
-    let normalized = if components.is_empty() {
-        prefix.to_owned()
-    } else if prefix.ends_with('/') {
-        format!("{prefix}{}", components.join("/"))
-    } else {
-        format!("{prefix}/{}", components.join("/"))
-    };
     Ok(normalized)
 }

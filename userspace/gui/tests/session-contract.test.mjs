@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { InMemoryCommandJournal, loopSnapshot } from '../../session-core/dist/index.js';
+import { InMemoryCommandJournal, SessionService, loopSnapshot } from '../../session-core/dist/index.js';
 import {
   decodeGuiProjection,
   inputCacheMetric,
@@ -342,11 +342,14 @@ test('compaction owns last-call usage and an unreported next call clears it with
   assert.equal(lastCallInputCacheMetric(completed.contextUsage), null);
   assert.equal(completed.contextCompositions.at(-1).providerRequestId, requests[2].requestId);
   assert.equal(completed.contextCompositions.length, 1);
-  const historical = await actor.contextComposition(requests[0].requestId);
+  const historyService = new SessionService(journal, {
+    async create() { throw new Error('historical_read_must_not_open_actor'); },
+  });
+  const historical = await historyService.contextComposition(sessionId, requests[0].requestId);
   assert.equal(historical.providerRequestId, requests[0].requestId);
   historical.messages.length = 0;
-  assert.ok((await actor.contextComposition(requests[0].requestId)).messages.length > 0);
-  await assert.rejects(actor.contextComposition('provider-request:missing'), /context_composition_not_found/u);
+  assert.ok((await historyService.contextComposition(sessionId, requests[0].requestId)).messages.length > 0);
+  await assert.rejects(historyService.contextComposition(sessionId, 'provider-request:missing'), /context_composition_not_found/u);
   assert.equal(completed.tokenUsage.inputTokens, 300);
   assert.equal(completed.tokenUsage.cacheReadInputTokens, 95);
   assert.equal(completed.tokenUsage.cacheHitRatio, 95 / 300);
@@ -1894,4 +1897,268 @@ test('conversation reading survives native scroll deliveries and layout growth w
   flushFrames();
   assert.equal(top, 1_060, 'the explicit latest action resumes following after detached reading');
   assert.equal(frames.size, 0);
+});
+
+test('composer submission receipts preserve newer text and retain the complete failed draft', async (t) => {
+  const { submitComposerState, emptyComposerState } = await loadGuiModule(t, '/src/components/local-agent/composerSubmission.ts');
+  const original = { ...emptyComposerState(), draft: 'First request',
+    pastedTexts: [{ inputId: 'paste:one', text: 'Complete pasted content', expanded: false }],
+    filesystemPaths: [{ path: '/project/one.txt', kind: 'file' }],
+    pluginSelections: [{ selectionId: 'selection:one', uri: 'plugin://example@1', label: 'Example' }] };
+  for (const fails of [false, true]) {
+    let current = original;
+    const retained = [];
+    let complete;
+    const pending = new Promise((resolve, reject) => { complete = () => fails ? reject(new Error('command failed')) : resolve(); });
+    const submission = submitComposerState('session:one', original, {
+      read: () => current,
+      write: (key, value) => { assert.equal(key, 'session:one'); current = value; },
+      retainFailed: (key, value) => retained.push({ key, value }),
+      send: () => pending,
+    });
+    assert.deepEqual(current, emptyComposerState(), 'the submitted text and attachments move together');
+    current = { ...emptyComposerState(), draft: 'Second request', filesystemPaths: [{ path: '/project/two.txt', kind: 'file' }] };
+    complete();
+    assert.equal(await submission, !fails);
+    assert.equal(current.draft, 'Second request');
+    assert.equal(current.filesystemPaths[0].path, '/project/two.txt');
+    assert.deepEqual(retained, fails ? [{ key: 'session:one', value: original }] : []);
+  }
+  let current = original;
+  await submitComposerState('session:one', original, {
+    read: () => current, write: (_key, value) => { current = value; },
+    retainFailed: () => assert.fail('an untouched composer restores in place'),
+    send: async () => { throw new Error('rejected'); },
+  });
+  assert.deepEqual(current, original);
+});
+
+test('pending decisions keep ordinary input and the stop action available with a nonempty draft', async (t) => {
+  const previousSelf = globalThis.self;
+  globalThis.self = {};
+  t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { ConversationComposer } = await loadGuiModule(t, '/src/components/local-agent/ConversationComposer.tsx');
+  const composer = {
+    pendingApproval: { approvalId: 'approval:one', preview: { summary: 'Write the requested file', effects: [], logicalTargets: [] } },
+    projection: { queuedInputs: [{ commandId: 'queued:one', text: 'Keep the public API unchanged', status: 'queued', filesystemReferences: [] }] },
+    profiles: [], selectedProfileId: null, draft: 'Second request', pastedTexts: [], failedDrafts: [],
+    pendingFilesystemPaths: [], pluginSelections: [], filteredPlugins: [], showStopAction: true, canSend: false, submitting: true,
+    textareaRef: { current: null }, respondApproval() {},
+  };
+  const html = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', composer, uiActionError: null }));
+  assert.match(html, /Write the requested file/);
+  assert.match(html, /<textarea[^>]*>Second request<\/textarea>/);
+  assert.match(html, /class="local-agent__send local-agent__send--stop"/);
+  assert.doesNotMatch(html.match(/<button[^>]*class="local-agent__send local-agent__send--stop"[^>]*>/)[0], /disabled/);
+  assert.match(html, /class="local-agent__send"/);
+  assert.match(html, /等待加入当前任务/);
+  assert.match(html, /Keep the public API unchanged/);
+});
+
+test('resource preview uses the native dialog while committed content projects only displayed text', async (t) => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { ResourcePreview } = await loadGuiModule(t, '/src/components/local-agent/ResourcePreview.tsx');
+  const html = renderToStaticMarkup(createElement(ResourcePreview, { language: 'zh-CN', preview: {
+    resourcePreview: { workspaceId: 'workspace:one', logicalPath: 'README.md', status: 'loading' }, closeResourcePreview() {},
+  } }));
+  assert.match(html, /^<dialog\b/);
+  assert.match(html, /README.md/);
+  const { projectCommittedText } = await import('../../presentation-core/dist/index.js');
+  const projection = { messages: [
+    { messageId: 'user:one', role: 'user', content: '<plain>' },
+    { messageId: 'assistant:one', role: 'assistant', content: '**Answer**' },
+    { messageId: 'tool:one', role: 'tool', content: 'Tool internal output' },
+  ], narratives: [{ narrativeId: 'narrative:one', content: 'Checking.' }] };
+  assert.deepEqual([...projectCommittedText(projection).values()], [
+    { blockId: 'message:user:one:content', text: '<plain>', format: 'plain' },
+    { blockId: 'message:assistant:one:content', text: '**Answer**', format: 'markdown' },
+    { blockId: 'narrative:narrative:one', text: 'Checking.', format: 'markdown' },
+  ]);
+});
+
+test('unavailable plugins preserve their source error and cannot be selected in the picker', async (t) => {
+  const previousSelf = globalThis.self;
+  globalThis.self = {};
+  t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
+  const plugin = { uri: 'plugin://broken@1', displayName: 'Broken plugin', shortDescription: 'Optional extension',
+    activationMediaTypes: [], enabled: true, available: false, error: { code: 'plugin_load_failed', message: 'Manifest cannot be read' } };
+  installGuiFetch(t, () => Response.json({ ok: true, data: { revision: 'catalog:one', plugins: [plugin] } }));
+  const { getPluginCatalog } = await loadGuiModule(t, '/src/services/localAgentApi.ts');
+  assert.deepEqual((await getPluginCatalog()).plugins, [plugin]);
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { ConversationComposer } = await loadGuiModule(t, '/src/components/local-agent/ConversationComposer.tsx');
+  const html = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', uiActionError: null, composer: {
+    profiles: [], selectedProfileId: null, draft: '@', pastedTexts: [], failedDrafts: [],
+    pendingFilesystemPaths: [], pluginSelections: [], filteredPlugins: [plugin], pluginPickerOpen: true,
+    textareaRef: { current: null },
+  } }));
+  assert.match(html, /role="option"[^>]*disabled=""/);
+  assert.match(html, /plugin_load_failed: Manifest cannot be read/);
+});
+
+test('tool failure summaries render the original error without reading history', async (t) => {
+  const previousSelf = globalThis.self;
+  globalThis.self = {};
+  t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const [{ ToolActivityGroup }, { ConversationVirtualRow }] = await loadGuiModules(t, [
+    '/src/components/local-agent/ToolActivityDetails.tsx', '/src/components/local-agent/ConversationVirtualRow.tsx',
+  ]);
+  const layout = { state: new Map() };
+  const html = renderToStaticMarkup(createElement(ConversationVirtualRow, {
+    rowKey: 'tool-failure', eager: true, virtualizer: { layout: () => layout },
+    children: () => createElement(ToolActivityGroup, { activities: [{
+      activityId: 'activity:one', runId: 'run:one', status: 'failed', kind: 'tool', label: 'read',
+      tool: { operation: 'fs.read', resources: [], error: { code: 'path_not_directory', message: 'a.txt is not a directory' } },
+    }], language: 'zh-CN', onExpand() {}, onOpenWorkspaceResource() {} }),
+  }));
+  assert.match(html, /path_not_directory/);
+  assert.match(html, /a.txt is not a directory/);
+});
+
+test('GUI ordinary input queues during a decision without answering it or changing the active model', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:gui-queued-decision';
+  await createSession(journal, sessionId);
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    yield providerEvent(request.requestId, 'tool.call', {
+      callId: 'question:gui', name: request.tools.find((tool) => tool.inputSchema.properties?.prompt).name,
+      input: { kind: 'question', prompt: 'Which option?', allowFreeform: true },
+    });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel(), fakeRunPreparation().port, 'gui-queued-decision');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:gui-decision-start', 'Ask a question.'));
+  const waiting = await waitForProjection(actor, (value) => value.pendingInteraction !== null);
+  const commands = [];
+  const catalog = { projects: [], sessions: [] };
+  let delayReply = false;
+  let releaseReply;
+  let receivedMessage;
+  const replyGate = new Promise((resolve) => { releaseReply = resolve; });
+  const messageReceived = new Promise((resolve) => { receivedMessage = resolve; });
+  installGuiFetch(t, async (url, init) => {
+    if (url.pathname.endsWith('/commands')) {
+      const command = JSON.parse(init.body);
+      commands.push(command);
+      const reply = await actor.submit(command);
+      if (delayReply && command.type === 'message.submit') {
+        receivedMessage();
+        await replyGate;
+      }
+      return Response.json({ ok: true, data: reply });
+    }
+    if (url.pathname.endsWith('/projection')) return Response.json({ ok: true, data: await actor.snapshot() });
+    if (url.pathname.endsWith('/catalog')) return Response.json({ ok: true, data: catalog });
+    if (url.pathname.endsWith('/plugins')) return Response.json({ ok: true, data: { revision: 'plugins:queued', plugins: [] } });
+    throw new Error(`unexpected_gui_request:${url.pathname}`);
+  });
+  const store = await loadGuiModelStore(t);
+  store.setState({ sessionId, projection: waiting, catalog,
+    selectedProfileId: 'profile:next-run', reasoningEffortOverride: 'high', profiles: [] });
+  await store.getState().sendMessage('Keep the original file layout.');
+  assert.equal(commands.length, 1);
+  assert.equal(commands[0].type, 'message.submit');
+  assert.equal(commands[0].runId, waiting.run.runId);
+  assert.equal(commands[0].profileId, undefined);
+  assert.equal(commands[0].reasoningEffortOverride, undefined);
+  const queued = store.getState().projection;
+  assert.deepEqual(queued.pendingInteraction, waiting.pendingInteraction);
+  assert.equal(queued.run.runId, waiting.run.runId);
+  assert.equal(queued.queuedInputs[0].text, 'Keep the original file layout.');
+  assert.equal(queued.queuedInputs[0].status, 'queued');
+  assert.equal(queued.messages.some((message) => message.content === 'Keep the original file layout.'), false);
+  delayReply = true;
+  const sending = store.getState().sendMessage('Preserve this second supplement too.');
+  await messageReceived;
+  assert.equal(store.getState().submitting, true);
+  await Promise.all([store.getState().cancelRun(), store.getState().cancelRun()]);
+  assert.equal(commands.filter((command) => command.type === 'run.cancel').length, 1, 'repeated stop uses the existing command flight');
+  assert.equal(store.getState().projection.run.status, 'cancelled');
+  assert.equal(store.getState().submitting, true, 'a pending ordinary submission retains its own lifecycle');
+  releaseReply();
+  await sending;
+  assert.equal(store.getState().submitting, false);
+  assert.deepEqual(store.getState().projection.queuedInputs.map((input) => input.status), ['notApplied', 'notApplied']);
+  store.setState({ projection: waiting });
+  await assert.rejects(store.getState().sendMessage('A supplement sent from the older snapshot.'), /queued_input_run_unavailable/);
+  assert.equal(store.getState().projection.run.runId, waiting.run.runId);
+  assert.equal(store.getState().projection.run.status, 'cancelled');
+});
+
+test('new-session submission identifies the draft destination before publishing the session', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:gui-created-draft';
+  await createSession(journal, sessionId);
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    yield providerEvent(request.requestId, 'assistant.message', { messageId: 'answer:created', content: 'Received.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel(), fakeRunPreparation().port, 'gui-created-draft');
+  t.after(() => actor.dispose());
+  const catalog = { projects: [], sessions: [] };
+  installGuiFetch(t, async (url, init) => {
+    if (url.pathname.endsWith('/sessions')) return Response.json({ ok: true, data: await actor.snapshot() });
+    if (url.pathname.endsWith('/commands')) return Response.json({ ok: true, data: await actor.submit(JSON.parse(init.body)) });
+    if (url.pathname.endsWith('/projection')) return Response.json({ ok: true, data: await actor.snapshot() });
+    if (url.pathname.endsWith('/catalog')) return Response.json({ ok: true, data: catalog });
+    if (url.pathname.endsWith('/plugins')) return Response.json({ ok: true, data: { revision: 'plugins:created', plugins: [] } });
+    throw new Error(`unexpected_gui_request:${url.pathname}`);
+  });
+  const store = await loadGuiModelStore(t);
+  store.setState({ sessionId: null, projection: null, catalog,
+    selectedProfileId: 'profile:test', profiles: [{ id: 'profile:test', enabled: true }] });
+  const destinations = [];
+  await store.getState().sendMessage('Start the task.', [], [], [], (createdSessionId) => {
+    assert.equal(store.getState().sessionId, null);
+    destinations.push(createdSessionId);
+  });
+  assert.deepEqual(destinations, [sessionId]);
+  assert.equal(store.getState().sessionId, sessionId);
+});
+
+test('model settings distinguish a failed read from a successfully empty catalog and retain loaded profiles', async (t) => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const [{ default: LlmSection, LlmProfileReadNotice }, api, { t: translate }] = await loadGuiModules(t, [
+    '/src/components/settings-center/sections/LlmSection.tsx', '/src/services/apiClient.ts', '/src/i18n.ts',
+  ]);
+  const emptyMessage = translate('zh-CN', 'settings.llm.empty');
+  const notice = (state, hasProfiles = false) => renderToStaticMarkup(createElement(LlmProfileReadNotice, {
+    state, hasProfiles, language: 'zh-CN',
+  }));
+  assert.equal(notice({ status: 'loading' }), '');
+  const initial = renderToStaticMarkup(createElement(LlmSection));
+  assert.equal(initial.includes(emptyMessage), false, 'the first render has not read the catalog');
+  assert.equal(initial.includes(translate('en-US', 'settings.llm.empty')), false);
+  installGuiFetch(t, (url) => {
+    assert.equal(url.pathname, '/api/llm/profiles');
+    throw new TypeError('Failed to fetch');
+  });
+  const failed = await api.getLlmProfiles();
+  assert.equal(failed.ok, false);
+  assert.match(failed.message, /Failed to fetch/);
+  for (const hasProfiles of [false, true]) {
+    const html = notice({ status: 'failed', error: failed.message }, hasProfiles);
+    assert.match(html, /role="alert"/);
+    assert.match(html, /Failed to fetch/);
+    assert.equal(html.includes(emptyMessage), false);
+  }
+  assert.equal(notice({ status: 'loaded' }).includes(emptyMessage), true);
+  assert.equal(notice({ status: 'loaded' }, true), '');
+  const profiles = [
+    { id: 'profile:existing', name: 'Existing model', enabled: true },
+    { id: 'profile:disabled', name: 'Disabled model', enabled: false },
+  ];
+  const store = await loadGuiModelStore(t);
+  store.setState({ profiles, defaultProfileId: profiles[0].id, selectedProfileId: profiles[0].id });
+  await store.getState().refreshProfiles();
+  assert.deepEqual(store.getState().profiles, profiles);
+  assert.equal(store.getState().defaultProfileId, profiles[0].id);
+  assert.equal(store.getState().selectedProfileId, profiles[0].id);
+  assert.match(store.getState().error, /Failed to fetch/);
 });

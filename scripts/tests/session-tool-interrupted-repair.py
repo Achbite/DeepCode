@@ -24,7 +24,7 @@ class RepairTests(unittest.TestCase):
         runtime.mkdir(parents=True)
         self.database = runtime / "session.sqlite3"
         self.backup = self.root / "before.sqlite3"
-        self.original_schema = repair.SCHEMA.read_text().replace(repair.EVENT, "")
+        self.original_schema = repair.SCHEMA.read_text().replace("        'tool.interrupted',\n", "")
         with sqlite3.connect(self.database) as con:
             con.executescript(self.original_schema)
             con.execute("INSERT INTO sessions VALUES ('session:test','Keep this conversation',NULL,'2026-09-12')")
@@ -65,6 +65,28 @@ class RepairTests(unittest.TestCase):
                 repair.repair(self.root, self.backup)
         self.assertEqual(self.snapshot(self.database), self.before)
         self.assertEqual(self.snapshot(self.backup), self.before)
+
+    def test_repairs_only_the_queued_input_constraint_without_changing_history(self):
+        with sqlite3.connect(self.database) as con:
+            events = con.execute("SELECT rowid,* FROM session_events ORDER BY rowid").fetchall()
+            con.execute("DROP TABLE session_events")
+            con.executescript(repair.SCHEMA.read_text().replace("        'input.queued',\n", ""))
+            con.executemany("INSERT INTO session_events(rowid,session_id,sequence,event_id,event_type,run_id,call_id,payload_json,occurred_at) VALUES (?,?,?,?,?,?,?,?,?)", events)
+        before = self.snapshot(self.database)
+        result = repair.repair(self.root, self.backup, "input.queued")
+        self.assertEqual(result["status"], "repaired")
+        self.assertEqual(self.snapshot(self.backup), before)
+        after = self.snapshot(self.database)
+        self.assertEqual(after["tables"], before["tables"])
+        self.assertEqual(after["version"], before["version"])
+        self.assertEqual([obj for obj in after["objects"] if obj[1] != "session_events"],
+                         [obj for obj in before["objects"] if obj[1] != "session_events"])
+        with sqlite3.connect(self.database) as con:
+            con.execute("INSERT INTO session_events VALUES ('session:test',3,'event:queued','input.queued','run:test',NULL,?, '2026-09-14')", ('{"text":"追加消息🙂"}',))
+        unchanged = self.snapshot(self.database)
+        self.assertEqual(repair.repair(self.root, self.backup, "input.queued")["status"], "already_current")
+        self.assertEqual(self.snapshot(self.database), unchanged)
+        self.assertEqual(self.snapshot(self.backup), before)
 
     def test_refuses_live_config_root_without_modifying_database(self):
         lease = sqlite3.connect(self.database.parent / "root-owner.lock", timeout=0)

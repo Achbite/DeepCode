@@ -19,8 +19,7 @@ pub use types::{ToolAvailability, ToolDescriptor, ToolEffectClass, ToolEffectSco
 #[doc(hidden)]
 pub mod kernel_internal {
     pub use crate::invocation_adapter::{
-        canonicalize_invocation, normalize_canonical_platform_path, normalize_workspace_path,
-        validate_canonical_invocation, InvocationNormalizationError,
+        canonicalize_invocation, normalize_workspace_path, InvocationNormalizationError,
     };
     pub use crate::invocation_types::{
         process_shell_hard_deny_reason, KernelCanonicalInvocation, KernelDeleteTarget,
@@ -28,7 +27,6 @@ pub mod kernel_internal {
         MAX_TERMINAL_STDIN_BYTES,
     };
     pub use crate::registrations::KernelExecutorBinding;
-    pub use crate::types::Platform;
 }
 
 pub fn hash_bytes(bytes: &[u8]) -> String {

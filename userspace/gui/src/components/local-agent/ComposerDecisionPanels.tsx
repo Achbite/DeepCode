@@ -1,8 +1,9 @@
-import React from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import type { AgentComposer } from './useAgentComposer';
 import { MarkdownContent, MarkdownInline } from './BufferedMarkdown';
+import { shouldSubmitComposerKey } from './composerKeyboard';
 
 export function ComposerDecisionPanels({ language, composer }: { language: UiLanguage; composer: AgentComposer }) {
   const {
@@ -12,20 +13,53 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
     pendingApproval,
     submitting,
     submitPlanDecision,
-    setDraft,
     respondInteraction,
-    textareaRef,
-    draft,
-    recordComposerElementState,
-    beginComposition,
-    endComposition,
-    submitOnComposerEnter,
+    respondPlan,
     respondApproval,
   } = composer;
+  const decisionKey = pendingPlan ? `plan:${pendingPlan.planId}:${pendingPlan.revision}`
+    : pendingInteraction ? `interaction:${pendingInteraction.interactionId}` : '';
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const draft = drafts[decisionKey] ?? '';
+  const setDraft = (text: string) => setDrafts((current) => ({ ...current, [decisionKey]: text }));
+  const composing = useRef({ active: false, commitPending: false });
+  const compositionFrame = useRef<number | null>(null);
+  useEffect(() => () => { if (compositionFrame.current !== null) cancelAnimationFrame(compositionFrame.current); }, []);
+  const beginComposition = () => { composing.current.active = true; };
+  const endComposition = () => {
+    composing.current = { active: false, commitPending: true };
+    if (compositionFrame.current !== null) cancelAnimationFrame(compositionFrame.current);
+    compositionFrame.current = requestAnimationFrame(() => { composing.current.commitPending = false; compositionFrame.current = null; });
+  };
+  const sendDecision = async (text: string) => {
+    if (!text.trim() || submitting) return;
+    const submitted = draft;
+    try {
+      if (pendingPlan) await respondPlan({ kind: 'requestRevision', text });
+      else if (pendingInteraction) await respondInteraction(text);
+      else return;
+      setDrafts((current) => current[decisionKey] === submitted ? { ...current, [decisionKey]: '' } : current);
+    } catch {
+      // Keep this decision draft; the store reports the original command error.
+    }
+  };
+  const submitOnComposerEnter = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (!shouldSubmitComposerKey({ key: event.key, shiftKey: event.shiftKey, repeat: event.repeat,
+      isComposing: event.nativeEvent.isComposing, keyCode: event.nativeEvent.keyCode }, composing.current)) return;
+    event.preventDefault();
+    void sendDecision(draft);
+  };
   return (
     <>
       {(pendingPlan || pendingInteraction) && (
-        <section className={`local-agent__interaction-panel${pendingPlan ? ' local-agent__interaction-panel--plan' : ''}`}>
+        <section className={`local-agent__interaction-panel${pendingPlan ? ' local-agent__interaction-panel--plan' : ''}`}
+          onKeyDown={(event) => {
+            if (pendingPlan && event.key === 'Escape' && !event.repeat && !event.nativeEvent.isComposing
+              && !composing.current.active && !event.defaultPrevented) {
+              event.preventDefault();
+              void submitPlanDecision({ kind: 'cancel' });
+            }
+          }}>
           <div
             className="local-agent__interaction-document-scroll"
             tabIndex={0}
@@ -77,8 +111,7 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
                     disabled={submitting}
                     title={option.description ? `${option.label}\n\n${option.description}` : option.label}
                     onClick={() => {
-                      setDraft('');
-                      void respondInteraction(option.label).catch(() => undefined);
+                      void sendDecision(option.label);
                     }}
                   >
                     <span className="local-agent__interaction-option-marker" aria-hidden="true">
@@ -106,23 +139,19 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
                 <DeepCodeShellIcon name="compose" />
               </span>
               <textarea
-                ref={textareaRef}
                 value={draft}
                 rows={1}
                 placeholder={pendingPlan
                   ? t(language, 'agent.composer.placeholder.plan')
                   : t(language, 'agent.composer.placeholder.interaction')}
                 onChange={(event) => setDraft(event.target.value)}
-                onFocus={(event) => recordComposerElementState(event.currentTarget, true)}
-                onBlur={(event) => recordComposerElementState(event.currentTarget, false)}
-                onSelect={(event) => recordComposerElementState(
-                  event.currentTarget,
-                  document.activeElement === event.currentTarget,
-                )}
                 onCompositionStart={beginComposition}
                 onCompositionEnd={endComposition}
                 onKeyDown={submitOnComposerEnter}
               />
+              <button type="button" disabled={submitting || !draft.trim()} onClick={() => void sendDecision(draft)}>
+                {pendingPlan ? (language === 'zh-CN' ? '提交修改意见' : 'Request changes') : (language === 'zh-CN' ? '回答' : 'Answer')}
+              </button>
               {pendingPlan ? (
                 <button
                   type="button"
@@ -139,8 +168,7 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
                   className="local-agent__interaction-secondary"
                   disabled={submitting}
                   onClick={() => {
-                    setDraft('');
-                    void respondInteraction(t(language, 'agent.interaction.skip')).catch(() => undefined);
+                    void sendDecision(t(language, 'agent.interaction.skip'));
                   }}
                 >{t(language, 'agent.interaction.skip')}</button>
               )}

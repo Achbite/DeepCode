@@ -1,7 +1,8 @@
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -58,6 +59,10 @@ impl SessionServiceProcess {
                 format!("启动 Node Session Service 失败：{error}"),
             )
         })?;
+        Self::from_child(child)
+    }
+
+    fn from_child(child: Child) -> Result<Self, SessionServiceError> {
         let mut starting = ChildStartupGuard::new(child);
         let stdin = starting.child_mut().stdin.take().ok_or_else(|| {
             SessionServiceError::new(
@@ -84,28 +89,63 @@ impl SessionServiceProcess {
                 }
             })
         });
-        let child = starting.commit();
-        let mut owned = OwnedSessionService {
-            child,
-            stdin: Some(BufWriter::new(stdin)),
-            stdout: BufReader::new(stdout),
-            stderr_receipt,
-            stderr_reader,
-            stopped: false,
-            terminal_error: None,
-        };
-        let ready =
-            owned.exchange_with_timeout("host:startup", "health", json!({}), STARTUP_TIMEOUT)?;
-        if ready.get("state").and_then(Value::as_str) != Some("ready") {
-            return Err(owned.fail_and_stop(
-                "session_service_not_ready",
-                "Session Service 启动握手没有返回 ready。",
-            ));
-        }
-        Ok(Self {
-            process: Arc::new(Mutex::new(owned)),
+        let responses = Arc::new(Mutex::new(PendingResponses::default()));
+        let reader_responses = Arc::clone(&responses);
+        let stdout_reader = std::thread::spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            loop {
+                let response = read_response(&mut stdout).and_then(decode_response);
+                let Ok(mut pending) = reader_responses.lock() else {
+                    break;
+                };
+                if pending.terminal_error.is_some() {
+                    break;
+                }
+                match response {
+                    Ok((request_id, result)) => match pending.requests.remove(&request_id) {
+                        Some(sender) => {
+                            let _ = sender.send(SessionReply::Response(result));
+                        }
+                        None => {
+                            pending.fail(SessionServiceError::new(
+                                "session_service_response_identity_mismatch",
+                                "Session Service 回复没有对应的待处理请求。",
+                            ));
+                            break;
+                        }
+                    },
+                    Err(error) => {
+                        pending.fail(error);
+                        break;
+                    }
+                }
+            }
+        });
+        let service = Self {
+            process: Arc::new(Mutex::new(OwnedSessionService {
+                child: starting.commit(),
+                stdin: Some(BufWriter::new(stdin)),
+                responses,
+                stdout_reader: Some(stdout_reader),
+                stderr_receipt,
+                stderr_reader,
+                stopped: false,
+                closing: false,
+            })),
             next_request: Arc::new(AtomicU64::new(1)),
-        })
+        };
+        let ready = service.request_with_timeout("health", json!({}), STARTUP_TIMEOUT)?;
+        if ready.get("state").and_then(Value::as_str) != Some("ready") {
+            return Err(service
+                .process
+                .lock()
+                .map_err(|_| transport_lock_error())?
+                .fail_and_stop(SessionServiceError::new(
+                    "session_service_not_ready",
+                    "Session Service 启动握手没有返回 ready。",
+                )));
+        }
+        Ok(service)
     }
 
     pub(crate) fn request(
@@ -113,14 +153,54 @@ impl SessionServiceProcess {
         operation: &str,
         data: Value,
     ) -> Result<Value, SessionServiceError> {
+        self.request_with_timeout(operation, data, REQUEST_TIMEOUT)
+    }
+
+    fn request_with_timeout(
+        &self,
+        operation: &str,
+        data: Value,
+        timeout: Duration,
+    ) -> Result<Value, SessionServiceError> {
         let request_id = format!("host:{}", self.next_request.fetch_add(1, Ordering::Relaxed));
-        let mut process = self.process.lock().map_err(|_| {
-            SessionServiceError::new(
-                "session_service_lock_failed",
-                "Session Service transport 锁已损坏。",
-            )
-        })?;
-        process.exchange_with_timeout(&request_id, operation, data, REQUEST_TIMEOUT)
+        let receiver = self
+            .process
+            .lock()
+            .map_err(|_| transport_lock_error())?
+            .begin_request(&request_id, operation, data)?;
+        self.receive_response(receiver, timeout)
+    }
+
+    fn receive_response(
+        &self,
+        receiver: mpsc::Receiver<SessionReply>,
+        timeout: Duration,
+    ) -> Result<Value, SessionServiceError> {
+        match receiver.recv_timeout(timeout) {
+            Ok(SessionReply::Response(result)) => result,
+            Ok(SessionReply::TransportFailure(error)) => Err(self
+                .process
+                .lock()
+                .map_err(|_| transport_lock_error())?
+                .fail_and_stop(error)),
+            Err(error) => {
+                let failure = match error {
+                    mpsc::RecvTimeoutError::Timeout => SessionServiceError::new(
+                        "session_service_response_timeout",
+                        "Session Service 在本地 transport 截止时间内没有回复。",
+                    ),
+                    mpsc::RecvTimeoutError::Disconnected => SessionServiceError::new(
+                        "session_service_response_reader_failed",
+                        "Session Service 回复读取线程异常结束。",
+                    ),
+                };
+                Err(self
+                    .process
+                    .lock()
+                    .map_err(|_| transport_lock_error())?
+                    .fail_and_stop(failure))
+            }
+        }
     }
 
     pub(crate) fn is_ready(&self) -> bool {
@@ -131,13 +211,47 @@ impl SessionServiceProcess {
     }
 
     pub(crate) fn shutdown(&self) -> Result<(), SessionServiceError> {
-        let mut process = self.process.lock().map_err(|_| {
-            SessionServiceError::new(
-                "session_service_lock_failed",
-                "Session Service transport 锁已损坏。",
-            )
-        })?;
-        process.shutdown()
+        let receiver = {
+            let mut process = self.process.lock().map_err(|_| transport_lock_error())?;
+            if process.stopped {
+                return Ok(());
+            }
+            let receiver = process.begin_request("host:shutdown", "shutdown", json!({}))?;
+            process.closing = true;
+            receiver
+        };
+        let result = self.receive_response(receiver, Duration::from_secs(3));
+        let mut process = self.process.lock().map_err(|_| transport_lock_error())?;
+        process.finish_shutdown()?;
+        result.map(|_| ())
+    }
+}
+
+fn transport_lock_error() -> SessionServiceError {
+    SessionServiceError::new(
+        "session_service_lock_failed",
+        "Session Service transport 锁已损坏。",
+    )
+}
+
+enum SessionReply {
+    Response(Result<Value, SessionServiceError>),
+    TransportFailure(SessionServiceError),
+}
+
+#[derive(Default)]
+struct PendingResponses {
+    requests: HashMap<String, mpsc::Sender<SessionReply>>,
+    terminal_error: Option<SessionServiceError>,
+}
+
+impl PendingResponses {
+    fn fail(&mut self, error: SessionServiceError) -> SessionServiceError {
+        let error = self.terminal_error.get_or_insert(error).clone();
+        for (_, sender) in self.requests.drain() {
+            let _ = sender.send(SessionReply::TransportFailure(error.clone()));
+        }
+        error
     }
 }
 
@@ -171,51 +285,40 @@ impl Drop for ChildStartupGuard {
 struct OwnedSessionService {
     child: Child,
     stdin: Option<BufWriter<ChildStdin>>,
-    stdout: BufReader<ChildStdout>,
+    responses: Arc<Mutex<PendingResponses>>,
+    stdout_reader: Option<std::thread::JoinHandle<()>>,
     stderr_receipt: Arc<Mutex<Vec<u8>>>,
     stderr_reader: Option<std::thread::JoinHandle<()>>,
     stopped: bool,
-    terminal_error: Option<SessionServiceError>,
+    closing: bool,
 }
 
 impl OwnedSessionService {
-    fn exchange_with_timeout(
+    fn begin_request(
         &mut self,
         request_id: &str,
         operation: &str,
         data: Value,
-        timeout: Duration,
-    ) -> Result<Value, SessionServiceError> {
-        if self.stopped {
-            return Err(self.terminal_error.clone().unwrap_or_else(|| {
-                SessionServiceError::new("session_service_stopped", "Session Service 已停止。")
-            }));
-        }
-        let child_status = match self.child.try_wait() {
-            Ok(status) => status,
-            Err(error) => {
-                let terminal = process_wait_error(error);
-                self.terminal_error = Some(terminal.clone());
-                return Err(terminal);
-            }
-        };
-        if child_status.is_some() {
-            self.stopped = true;
-            self.join_stderr_reader();
-            let terminal = SessionServiceError::new(
-                "session_service_unavailable",
-                message_with_stderr("Session Service 已退出。", &self.stderr_receipt),
-            );
-            self.terminal_error = Some(terminal.clone());
+    ) -> Result<mpsc::Receiver<SessionReply>, SessionServiceError> {
+        if !self.is_running()? {
+            let terminal = self
+                .responses
+                .lock()
+                .map_err(|_| transport_lock_error())?
+                .terminal_error
+                .clone()
+                .unwrap_or_else(|| {
+                    SessionServiceError::new("session_service_stopped", "Session Service 已停止。")
+                });
             return Err(terminal);
         }
-        let request = json!({
+        let mut encoded = serde_json::to_vec(&json!({
             "protocolVersion": PROTOCOL_VERSION,
             "requestId": request_id,
             "operation": operation,
             "data": data,
-        });
-        let mut encoded = serde_json::to_vec(&request).map_err(|error| {
+        }))
+        .map_err(|error| {
             SessionServiceError::new(
                 "session_service_request_encode_failed",
                 format!("编码 Session Service 请求失败：{error}"),
@@ -228,119 +331,104 @@ impl OwnedSessionService {
             ));
         }
         encoded.push(b'\n');
-        let write_result = match self.stdin.as_mut() {
-            Some(stdin) => stdin.write_all(&encoded).and_then(|_| stdin.flush()),
-            None => {
-                return Err(
-                    self.fail_and_stop("session_service_stopped", "Session Service 输入已经关闭。")
-                );
+        let (sender, receiver) = mpsc::channel();
+        {
+            let mut responses = self.responses.lock().map_err(|_| transport_lock_error())?;
+            if let Some(error) = responses.terminal_error.clone() {
+                drop(responses);
+                return Err(self.fail_and_stop(error));
             }
-        };
+            responses.requests.insert(request_id.to_string(), sender);
+        }
+        let write_result = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "Session Service 输入已经关闭。",
+                )
+            })
+            .and_then(|stdin| stdin.write_all(&encoded).and_then(|_| stdin.flush()));
         if let Err(error) = write_result {
-            return Err(self.fail_and_stop(
+            return Err(self.fail_and_stop(SessionServiceError::new(
                 "session_service_request_write_failed",
-                &format!("写入 Session Service 请求失败：{error}"),
-            ));
+                format!("写入 Session Service 请求失败：{error}"),
+            )));
         }
-        let response = match read_frame_with_timeout(
-            &mut self.child,
-            &mut self.stdin,
-            &mut self.stdout,
-            &mut self.stopped,
-            &self.stderr_receipt,
-            timeout,
-        ) {
-            Ok(response) => response,
-            Err(error) => {
-                if !self.stopped {
-                    self.stdin.take();
-                    if self.child.try_wait().ok().flatten().is_none() {
-                        let _ = self.child.kill();
-                        let _ = self.child.wait();
-                    }
-                    self.stopped = true;
-                }
-                self.join_stderr_reader();
-                self.terminal_error = Some(error.clone());
-                return Err(error);
-            }
-        };
-        match decode_response(response, request_id) {
-            Err(error) if error.code.starts_with("session_service_response_") => {
-                let code = error.code.clone();
-                let message = error.message.clone();
-                Err(self.fail_and_stop(&code, &message))
-            }
-            result => result,
-        }
+        Ok(receiver)
     }
 
     fn is_running(&mut self) -> Result<bool, SessionServiceError> {
-        if self.stopped {
+        if self.stopped || self.closing {
             return Ok(false);
         }
-        let child_status = match self.child.try_wait() {
-            Ok(status) => status,
-            Err(error) => {
-                let terminal = process_wait_error(error);
-                self.terminal_error = Some(terminal.clone());
-                return Err(terminal);
+        let terminal = self
+            .responses
+            .lock()
+            .map_err(|_| transport_lock_error())?
+            .terminal_error
+            .clone();
+        if let Some(error) = terminal {
+            self.fail_and_stop(error);
+            return Ok(false);
+        }
+        match self.child.try_wait() {
+            Ok(None) => Ok(true),
+            Ok(Some(_)) => {
+                self.fail_and_stop(SessionServiceError::new(
+                    "session_service_unavailable",
+                    "Session Service 已退出。",
+                ));
+                Ok(false)
             }
-        };
-        if child_status.is_some() {
-            self.stopped = true;
-            self.join_stderr_reader();
-            self.terminal_error = Some(SessionServiceError::new(
-                "session_service_unavailable",
-                message_with_stderr("Session Service 已退出。", &self.stderr_receipt),
-            ));
-            return Ok(false);
+            Err(error) => Err(self.fail_and_stop(process_wait_error(error))),
         }
-        Ok(true)
     }
 
-    fn join_stderr_reader(&mut self) {
+    fn join_readers(&mut self) {
+        if let Some(reader) = self.stdout_reader.take() {
+            let _ = reader.join();
+        }
         if let Some(reader) = self.stderr_reader.take() {
             let _ = reader.join();
         }
     }
 
-    fn fail_and_stop(&mut self, code: &str, message: &str) -> SessionServiceError {
+    fn fail_and_stop(&mut self, error: SessionServiceError) -> SessionServiceError {
+        let mut terminal = self
+            .responses
+            .lock()
+            .map(|mut responses| responses.fail(error.clone()))
+            .unwrap_or(error);
+        if self.stopped {
+            return terminal;
+        }
         self.stdin.take();
         if self.child.try_wait().ok().flatten().is_none() {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
         self.stopped = true;
-        self.join_stderr_reader();
-        let terminal =
-            SessionServiceError::new(code, message_with_stderr(message, &self.stderr_receipt));
-        self.terminal_error = Some(terminal.clone());
+        self.join_readers();
+        terminal.message = message_with_stderr(&terminal.message, &self.stderr_receipt);
+        if let Ok(mut responses) = self.responses.lock() {
+            responses.terminal_error = Some(terminal.clone());
+        }
         terminal
     }
 
-    fn shutdown(&mut self) -> Result<(), SessionServiceError> {
+    fn finish_shutdown(&mut self) -> Result<(), SessionServiceError> {
         if self.stopped {
-            self.join_stderr_reader();
             return Ok(());
-        }
-        let result = self.exchange_with_timeout(
-            "host:shutdown",
-            "shutdown",
-            json!({}),
-            Duration::from_secs(3),
-        );
-        if self.stopped {
-            self.join_stderr_reader();
-            return result.map(|_| ());
         }
         self.stdin.take();
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             if self.child.try_wait().map_err(process_wait_error)?.is_some() {
                 self.stopped = true;
-                self.join_stderr_reader();
-                return result.map(|_| ());
+                self.join_readers();
+                return Ok(());
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -352,24 +440,17 @@ impl OwnedSessionService {
         })?;
         let _ = self.child.wait();
         self.stopped = true;
-        self.join_stderr_reader();
-        result.map(|_| ())
+        self.join_readers();
+        Ok(())
     }
 }
 
 impl Drop for OwnedSessionService {
     fn drop(&mut self) {
-        if self.stopped {
-            self.join_stderr_reader();
-            return;
-        }
-        self.stdin.take();
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-        self.stopped = true;
-        self.join_stderr_reader();
+        self.fail_and_stop(SessionServiceError::new(
+            "session_service_stopped",
+            "Session Service 已停止。",
+        ));
     }
 }
 
@@ -455,47 +536,6 @@ fn read_response(reader: &mut impl BufRead) -> Result<Vec<u8>, SessionServiceErr
     }
 }
 
-fn read_frame_with_timeout(
-    child: &mut Child,
-    stdin: &mut Option<BufWriter<ChildStdin>>,
-    reader: &mut BufReader<ChildStdout>,
-    stopped: &mut bool,
-    stderr_receipt: &Arc<Mutex<Vec<u8>>>,
-    timeout: Duration,
-) -> Result<Vec<u8>, SessionServiceError> {
-    std::thread::scope(|scope| {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        scope.spawn(move || {
-            let _ = sender.send(read_response(reader));
-        });
-        match receiver.recv_timeout(timeout) {
-            Ok(result) => result.map_err(|error| {
-                SessionServiceError::new(
-                    error.code,
-                    message_with_stderr(&error.message, stderr_receipt),
-                )
-            }),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                stdin.take();
-                let _ = child.kill();
-                let _ = child.wait();
-                *stopped = true;
-                Err(SessionServiceError::new(
-                    "session_service_response_timeout",
-                    message_with_stderr(
-                        "Session Service 在本地 transport 截止时间内没有回复。",
-                        stderr_receipt,
-                    ),
-                ))
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(SessionServiceError::new(
-                "session_service_response_reader_failed",
-                message_with_stderr("Session Service 回复读取线程异常结束。", stderr_receipt),
-            )),
-        }
-    })
-}
-
 fn append_stderr_receipt(receipt: &Arc<Mutex<Vec<u8>>>, chunk: &[u8]) {
     let Ok(mut buffer) = receipt.lock() else {
         return;
@@ -520,35 +560,43 @@ fn message_with_stderr(message: &str, receipt: &Arc<Mutex<Vec<u8>>>) -> String {
     }
 }
 
-fn decode_response(encoded: Vec<u8>, request_id: &str) -> Result<Value, SessionServiceError> {
+fn decode_response(
+    encoded: Vec<u8>,
+) -> Result<(String, Result<Value, SessionServiceError>), SessionServiceError> {
     let value: Value = serde_json::from_slice(&encoded).map_err(|error| {
         SessionServiceError::new(
             "session_service_response_json_invalid",
             format!("Session Service 回复不是有效 JSON：{error}"),
         )
     })?;
+    let request_id = value
+        .get("requestId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
     if value.get("protocolVersion").and_then(Value::as_str) != Some(PROTOCOL_VERSION)
-        || value.get("requestId").and_then(Value::as_str) != Some(request_id)
+        || request_id.is_none()
     {
         return Err(SessionServiceError::new(
             "session_service_response_identity_mismatch",
-            "Session Service 回复身份不匹配。",
+            "Session Service 回复身份无效。",
         ));
     }
-    if value.get("ok").and_then(Value::as_bool) == Some(true) {
-        return Ok(value.get("data").cloned().unwrap_or(Value::Null));
-    }
-    let error = value.get("error").and_then(Value::as_object);
-    Err(SessionServiceError::new(
-        error
-            .and_then(|value| value.get("code"))
-            .and_then(Value::as_str)
-            .unwrap_or("session_service_request_failed"),
-        error
-            .and_then(|value| value.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("Session Service 请求失败。"),
-    ))
+    let result = if value.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(value.get("data").cloned().unwrap_or(Value::Null))
+    } else {
+        let error = value.get("error").and_then(Value::as_object);
+        Err(SessionServiceError::new(
+            error
+                .and_then(|value| value.get("code"))
+                .and_then(Value::as_str)
+                .unwrap_or("session_service_request_failed"),
+            error
+                .and_then(|value| value.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("Session Service 请求失败。"),
+        ))
+    };
+    Ok((request_id.expect("validated requestId").to_string(), result))
 }
 
 fn resolve_bridge() -> Result<PathBuf, SessionServiceError> {
@@ -651,6 +699,90 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn session_eof_keeps_stderr_for_the_failed_and_later_requests() {
+        let child = Command::new(resolve_node().expect("test Node runtime"))
+            .arg("-e")
+            .arg(r#"
+const input = require('node:readline').createInterface({ input: process.stdin });
+input.on('line', line => {
+  const request = JSON.parse(line);
+  if (request.operation === 'health') {
+    process.stdout.write(JSON.stringify({ protocolVersion: 'deepcode.local-agent', requestId: request.requestId, ok: true, data: { state: 'ready' } }) + '\n');
+  } else {
+    process.stderr.write('session-exit-diagnostic\n', () => process.exit(7));
+  }
+});
+"#)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().expect("spawn test service");
+        let service = SessionServiceProcess::from_child(child).unwrap();
+        let failure = service
+            .request_with_timeout("snapshot", json!({}), Duration::from_secs(3))
+            .unwrap_err();
+        assert_eq!(failure.code, "session_service_response_missing");
+        assert!(failure.message.contains("session-exit-diagnostic"));
+        assert!(!service.is_ready());
+        let later = service.request("activity", json!({})).unwrap_err();
+        assert_eq!(later.code, failure.code);
+        assert_eq!(later.message, failure.message);
+        service.shutdown().unwrap();
+        let mut process = service.process.lock().unwrap();
+        assert!(process.child.try_wait().unwrap().is_some());
+        assert!(process.stdout_reader.is_none());
+        assert!(process.stderr_reader.is_none());
+    }
+
+    #[test]
+    fn requests_complete_independently_and_shutdown_releases_the_child() {
+        let child = Command::new(resolve_node().expect("test Node runtime"))
+            .arg("-e")
+            .arg(r#"
+const input = require('node:readline').createInterface({ input: process.stdin });
+let slow;
+function reply(request, data) {
+  process.stdout.write(JSON.stringify({ protocolVersion: 'deepcode.local-agent', requestId: request.requestId, ok: true, data }) + '\n');
+}
+input.on('line', line => {
+  const request = JSON.parse(line);
+  if (request.operation === 'health') reply(request, { state: 'ready' });
+  else if (request.operation === 'slow') slow = request;
+  else if (request.operation === 'fast') { reply(request, { source: 'fast' }); reply(slow, { source: 'slow' }); }
+  else if (request.operation === 'shutdown') { reply(request, {}); input.close(); process.stdin.destroy(); }
+});
+"#)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().expect("spawn test service");
+        let service = SessionServiceProcess::from_child(child).unwrap();
+        std::thread::scope(|scope| {
+            let slow = scope
+                .spawn(|| service.request_with_timeout("slow", json!({}), Duration::from_secs(5)));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let process = service.process.lock().unwrap();
+                let has_pending = !process.responses.lock().unwrap().requests.is_empty();
+                drop(process);
+                if has_pending {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "slow request was not admitted");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                service
+                    .request_with_timeout("fast", json!({}), Duration::from_secs(3))
+                    .unwrap(),
+                json!({"source": "fast"})
+            );
+            assert_eq!(slow.join().unwrap().unwrap(), json!({"source": "slow"}));
+        });
+        service.shutdown().unwrap();
+        let mut process = service.process.lock().unwrap();
+        assert!(process.child.try_wait().unwrap().is_some());
+        assert!(process.stdout_reader.is_none());
+        assert!(process.stderr_reader.is_none());
+    }
+
+    #[test]
     fn chunked_snapshot_preserves_unicode_and_next_response_boundary() {
         let expected = json!({"text": "中文🙂\n".repeat(180_000)});
         let encoded = json!({"protocolVersion": PROTOCOL_VERSION, "requestId": "large", "ok": true, "data": expected}).to_string();
@@ -667,12 +799,16 @@ mod tests {
         wire.push('\n');
         let mut reader = Cursor::new(wire);
         assert_eq!(
-            decode_response(read_response(&mut reader).unwrap(), "large").unwrap(),
-            expected
+            decode_response(read_response(&mut reader).unwrap())
+                .map(|(id, data)| (id, data.unwrap()))
+                .unwrap(),
+            ("large".to_string(), expected)
         );
         assert_eq!(
-            decode_response(read_response(&mut reader).unwrap(), "next").unwrap(),
-            json!({"ok": true})
+            decode_response(read_response(&mut reader).unwrap())
+                .map(|(id, data)| (id, data.unwrap()))
+                .unwrap(),
+            ("next".to_string(), json!({"ok": true}))
         );
     }
 
@@ -703,7 +839,9 @@ mod tests {
         let mut reader = BufReader::new(Cursor::new(encoded.into_bytes()));
 
         let frame = read_frame(&mut reader).expect("read response frame");
-        let data = decode_response(frame, "request:test").expect("decode response identity");
+        let (request_id, data) = decode_response(frame).expect("decode response identity");
+        assert_eq!(request_id, "request:test");
+        let data = data.unwrap();
 
         assert_eq!(data["revision"], 7);
     }

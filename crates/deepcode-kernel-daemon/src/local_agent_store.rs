@@ -693,6 +693,7 @@ fn validate_new_event(
         "session.directory-index.attached",
         "session.directory-index.detached",
         "input.accepted",
+        "input.queued",
         "run.started",
         "message.committed",
         "message.feedback.updated",
@@ -895,23 +896,30 @@ fn validate_new_event(
                 ));
             }
         }
-        "input.accepted" => {
+        "input.accepted" | "input.queued" => {
             let payload = event.get("payload").expect("validated payload");
             exact_object(
                 payload,
                 &["commandId", "messageId", "text"],
-                &["pluginSelections"],
+                if event_type == "input.queued" {
+                    &["filesystemReferences", "pluginSelections"]
+                } else {
+                    &["pluginSelections"]
+                },
             )?;
             validate_id("commandId", required_string(payload, "commandId")?)?;
             validate_id("messageId", required_string(payload, "messageId")?)?;
             if !payload.get("text").is_some_and(Value::is_string) {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
-                    "input.accepted text 必须是字符串；附件消息正文可以为空。",
+                    "输入 text 必须是字符串；附件消息正文可以为空。",
                 ));
             }
             if let Some(selections) = payload.get("pluginSelections") {
                 validate_plugin_selection_list(selections)?;
+            }
+            if let Some(references) = payload.get("filesystemReferences") {
+                validate_filesystem_references(references, "session_event_invalid")?;
             }
         }
         "session.directory-index.attached" => {
@@ -1736,7 +1744,8 @@ fn validate_event_facts(
     if provider_message
         || matches!(
             event_type,
-            "narrative.committed"
+            "input.queued"
+                | "narrative.committed"
                 | "plan.published"
                 | "plan.confirmed"
                 | "plan.revision.requested"
@@ -1787,6 +1796,23 @@ fn validate_event_facts(
         }
     }
     match event_type {
+        "input.queued" => {
+            let run_id = required_string(event, "runId")?;
+            let finishing: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session_events
+                 WHERE session_id=?1 AND run_id=?2 AND event_type='run.finishing')",
+                    params![session_id, run_id],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error("session_event_fact_read_failed"))?;
+            if finishing {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_run_not_active",
+                    "结束中的 run 不再接收排队输入。",
+                ));
+            }
+        }
         "message.committed" if provider_message => {
             validate_provider_output_identity(transaction, event, true)?;
         }
@@ -3036,6 +3062,7 @@ fn validate_command(command: &Value) -> Result<(), LocalAgentStoreError> {
                 text_field,
             ],
             &[
+                "runId",
                 "filesystemReferences",
                 "profileId",
                 "reasoningEffortOverride",
@@ -3043,6 +3070,20 @@ fn validate_command(command: &Value) -> Result<(), LocalAgentStoreError> {
                 "pluginSelections",
             ],
         )?;
+        if let Some(run_id) = command.get("runId") {
+            if command_type != "message.submit" {
+                return Err(LocalAgentStoreError::new(
+                    "session_command_invalid",
+                    "只有普通消息可指定排队目标 runId。",
+                ));
+            }
+            validate_id(
+                "runId",
+                run_id.as_str().ok_or_else(|| {
+                    LocalAgentStoreError::new("session_command_invalid", "runId 无效。")
+                })?,
+            )?;
+        }
         let text = command
             .get(text_field)
             .and_then(Value::as_str)
@@ -5450,6 +5491,42 @@ mod tests {
         assert_eq!(reopened.read_events("session:loop", 0).unwrap(), saved);
         drop(reopened);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn queued_input_retains_its_payload_only_while_run_can_accept_it() {
+        let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
+        journal
+            .create_session("session:loop", "Loop", &json!([]), Some("profile:test"))
+            .unwrap();
+        let queued = json!({"type":"input.queued", "sessionId":"session:loop", "runId":"run:loop",
+            "payload":{"commandId":"command:queued", "messageId":"message:queued", "text":"补充🙂",
+                "filesystemReferences":[], "pluginSelections":[]}});
+        assert_eq!(
+            journal.append(&queued).unwrap_err().code,
+            "session_event_run_not_active"
+        );
+        append_model_settings_and_rejected_call(&journal);
+        let committed = journal.append(&queued).unwrap();
+        assert_eq!(committed["payload"], queued["payload"]);
+        journal
+            .append(
+                &json!({"type":"run.finishing", "sessionId":"session:loop", "runId":"run:loop",
+            "payload":{"outcome":"cancelled"}}),
+            )
+            .unwrap();
+        assert_eq!(
+            journal.append(&queued).unwrap_err().code,
+            "session_event_run_not_active"
+        );
+        let saved = journal.read_events("session:loop", 0).unwrap();
+        assert_eq!(
+            saved
+                .iter()
+                .filter(|event| event["type"] == "input.queued")
+                .count(),
+            1
+        );
     }
 
     #[test]

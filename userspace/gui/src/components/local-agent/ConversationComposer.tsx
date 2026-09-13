@@ -1,6 +1,5 @@
 import React from 'react';
 import { t, type UiLanguage } from '../../i18n';
-import type { PresentedCommittedContent } from '../../presentation/PresentationRuntime';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import SessionModelSelector from './SessionModelSelector';
 import { ComposerDecisionPanels } from './ComposerDecisionPanels';
@@ -13,7 +12,6 @@ interface ConversationComposerProps {
   language: UiLanguage;
   composer: AgentComposer;
   uiActionError: string | null;
-  presentationStatus: PresentedCommittedContent['snapshot']['status'];
 }
 
 export function ConversationComposer({
@@ -21,7 +19,6 @@ export function ConversationComposer({
   language,
   composer,
   uiActionError,
-  presentationStatus,
 }: ConversationComposerProps) {
   const {
     pendingPlan,
@@ -78,14 +75,25 @@ export function ConversationComposer({
       {error && <div className="local-agent__error">{error}</div>}
       {attachmentError && <div className="local-agent__error">{attachmentError}</div>}
       {uiActionError && <div className="local-agent__error">{uiActionError}</div>}
-      {presentationStatus.state === 'unavailable' && (
-        <div className="local-agent__error">
-          {presentationStatus.error.message}
-        </div>
-      )}
+      {composer.failedDrafts.map((failed, index) => <details className="local-agent__failed-draft" key={index}>
+        <summary>{language === 'zh-CN' ? '未发送草稿已保留' : 'Unsent draft saved'}</summary>
+        <pre>{[failed.draft, ...failed.pastedTexts.map((item) => item.text)].filter(Boolean).join('\n\n')}</pre>
+        {failed.filesystemPaths.map((item) => <div key={item.path}>{item.path}</div>)}
+        {failed.pluginSelections.map((item) => <div key={item.selectionId}>@{item.label}</div>)}
+        <button type="button" disabled={!composer.canRestoreFailedDraft} onClick={() => composer.restoreFailedDraft(index)}>
+          {language === 'zh-CN' ? '恢复到输入框' : 'Restore draft'}
+        </button>
+        {!composer.canRestoreFailedDraft && <small>{language === 'zh-CN' ? '发送或清空当前草稿后可恢复。' : 'Send or clear the current draft to restore this one.'}</small>}
+      </details>)}
       <div className="conversation-change-dock" aria-live="polite">{changeBar}</div>
       <ComposerDecisionPanels language={language} composer={composer} />
-      {!pendingPlan && !pendingInteraction && !pendingApproval && <div
+      {projection?.queuedInputs.map((input) => <div className="local-agent__queued-input" key={input.commandId} role="status">
+        <strong>{input.status === 'queued'
+          ? (language === 'zh-CN' ? '等待加入当前任务' : 'Waiting to join this run')
+          : (language === 'zh-CN' ? '未加入本轮' : 'Not applied to this run')}</strong>
+        <span>{input.text}{input.filesystemReferences.length ? ` · ${input.filesystemReferences.map((item) => item.displayName).join(', ')}` : ''}</span>
+      </div>)}
+      <div
         className="local-agent__composer"
         onMouseDown={(event) => {
           const target = event.target as HTMLElement;
@@ -110,6 +118,7 @@ export function ConversationComposer({
                 role="option"
                 aria-selected={index === pluginActiveIndex}
                 key={plugin.uri}
+                disabled={!plugin.enabled || !plugin.available}
                 onClick={() => selectPlugin(plugin)}
                 onMouseEnter={() => setPluginActiveIndex(index)}
               >
@@ -117,6 +126,9 @@ export function ConversationComposer({
                 <span>
                   <b>{plugin.displayName}</b>
                   <small>{plugin.shortDescription}</small>
+                  {(!plugin.enabled || !plugin.available) && <small>{plugin.error
+                    ? `${plugin.error.code}: ${plugin.error.message}`
+                    : language === 'zh-CN' ? '插件未启用' : 'Plugin disabled'}</small>}
                 </span>
                 <code>{plugin.uri}</code>
               </button>
@@ -302,31 +314,28 @@ export function ConversationComposer({
               onProfileChange={selectProfile}
               onReasoningEffortChange={selectReasoningEffort}
             />
+            {showStopAction && <button
+              type="button"
+              className="local-agent__send local-agent__send--stop"
+              aria-label={t(language, 'agent.composer.stopCurrentRun')}
+              title={t(language, 'agent.composer.stop')}
+              onClick={() => void cancelRun()}
+            ><DeepCodeShellIcon name="stop" /></button>}
             <button
               type="button"
-              className={`local-agent__send${showStopAction ? ' local-agent__send--stop' : ''}`}
-              aria-label={showStopAction
-                ? t(language, 'agent.composer.stopCurrentRun')
-                : submitting
+              className="local-agent__send"
+              aria-label={submitting
                   ? t(language, 'agent.composer.sending')
                   : t(language, 'agent.composer.send')}
-              title={showStopAction
-                ? t(language, 'agent.composer.stop')
-                : t(language, 'agent.composer.sendEnter')}
-              disabled={showStopAction ? submitting : !canSend}
-              onClick={() => {
-                if (showStopAction) {
-                  void cancelRun();
-                  return;
-                }
-                void submitDraft();
-              }}
+              title={t(language, 'agent.composer.sendEnter')}
+              disabled={!canSend}
+              onClick={() => void submitDraft()}
             >
-              <DeepCodeShellIcon name={showStopAction ? 'stop' : 'arrowUp'} />
+              <DeepCodeShellIcon name="arrowUp" />
             </button>
           </div>
         </div>
-      </div>}
+      </div>
       {!pendingPlan && !pendingInteraction && !pendingApproval && (
         <div className="local-agent__composer-hint">
           {t(language, 'agent.composer.hint')}

@@ -30,6 +30,8 @@ pub(crate) struct McpPluginDescriptor {
     pub(crate) capability_refs: Vec<String>,
     pub(crate) capability_summary: String,
     pub(crate) tool_prompt_provider: Option<Value>,
+    pub(crate) enabled: bool,
+    pub(crate) error: Option<McpRuntimeError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +165,7 @@ impl McpRuntime {
         let servers = available_server_sources(settings)?;
         let available = servers
             .iter()
+            .filter(|server| server.setting.enabled)
             .map(|server| server.descriptor.uri.as_str())
             .collect::<BTreeSet<_>>();
         if let Some(missing) = selected_plugin_instances
@@ -177,7 +180,10 @@ impl McpRuntime {
         Self::from_servers(
             servers
                 .into_iter()
-                .filter(|server| selected_plugin_instances.contains_key(&server.descriptor.uri))
+                .filter(|server| {
+                    server.setting.enabled
+                        && selected_plugin_instances.contains_key(&server.descriptor.uri)
+                })
                 .collect(),
             selected_plugin_instances,
         )
@@ -303,7 +309,15 @@ pub(crate) fn available_plugins(
 ) -> Result<Vec<McpPluginDescriptor>, McpRuntimeError> {
     Ok(available_server_sources(settings)?
         .into_iter()
-        .map(|server| server.descriptor)
+        .map(|server| {
+            let mut descriptor = server.descriptor;
+            if server.setting.enabled {
+                descriptor.error = validate_server(&server.setting)
+                    .and_then(|()| split_args(&server.setting.args).map(|_| ()))
+                    .err();
+            }
+            descriptor
+        })
         .collect())
 }
 
@@ -395,6 +409,8 @@ fn external_server_source(setting: McpServerSetting) -> Result<McpServerSource, 
         capability_refs: vec![format!("mcp-server:{}", setting.id)],
         capability_summary: "The selected MCP service is active for this run. Its callable tools are supplied separately by the current tool catalog.".to_string(),
         tool_prompt_provider: None,
+        enabled: setting.enabled,
+        error: None,
     };
     Ok(McpServerSource {
         setting,
@@ -445,6 +461,8 @@ fn first_party_server_source(
             "pluginUri": uri,
             "contributions": prompt_contributions,
         })),
+        enabled: true,
+        error: None,
     };
     McpServerSource {
         setting: McpServerSetting {
@@ -591,27 +609,12 @@ fn configured_servers(settings: &Value) -> Result<Vec<McpServerSetting>, McpRunt
         .get("mcp.servers")
         .and_then(Value::as_str)
         .unwrap_or("[]");
-    let servers: Vec<McpServerSetting> = serde_json::from_str(encoded).map_err(|error| {
+    serde_json::from_str(encoded).map_err(|error| {
         McpRuntimeError::new(
             "mcp_config_invalid",
             format!("解析 mcp.servers 失败：{error}"),
         )
-    })?;
-    let mut seen = BTreeSet::new();
-    servers
-        .into_iter()
-        .filter(|server| server.enabled)
-        .map(|server| {
-            validate_server(&server)?;
-            if !seen.insert(server.id.clone()) {
-                return Err(McpRuntimeError::new(
-                    "mcp_server_duplicate",
-                    format!("MCP Server id 重复：{}", server.id),
-                ));
-            }
-            Ok(server)
-        })
-        .collect()
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -298,7 +298,7 @@ def main() -> None:
             require(waiting["pendingPlan"]["mutationManifest"][1]["writablePaths"] == WRITE_PATHS, "Plan 写入范围未完整保留")
             require(len(waiting["pendingPlan"]["steps"]) == 13 and len(waiting["pendingPlan"]["mutationManifest"]) == 129, "计划被旧数量限制截断")
             first_plan = waiting["pendingPlan"]
-            cli(daemon, session_id, "确认", expected=5)
+            cli(daemon, session_id, "/reply 确认", expected=5)
             state.assert_healthy()
             extension = fixture.projection(daemon, session_id)
             require(extension["pendingPlan"]["planId"] == first_plan["planId"] and extension["pendingPlan"]["revision"] == 2, "范围补充没有沿用当前 Plan")
@@ -308,7 +308,7 @@ def main() -> None:
             expected_statuses = ["completed"] + ["inProgress"] * 12
             require([item["status"] for item in extension["todoList"]["items"]] == expected_statuses, "待确认修订重置进度")
             require(not (workspace / "extra/new.txt").exists(), "范围补充确认前发生写入")
-            require("tool-input-cli-complete" in cli(daemon, session_id, "确认").stdout, "CLI 未输出完成正文")
+            require("tool-input-cli-complete" in cli(daemon, session_id, "/reply 确认").stdout, "CLI 未输出完成正文")
             state.assert_healthy()
             after_extension = fixture.projection(daemon, session_id)
             require(after_extension["plans"][-1]["steps"] == first_plan["steps"], "确认后阶段及验收被重写")

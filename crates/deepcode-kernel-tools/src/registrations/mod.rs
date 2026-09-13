@@ -24,8 +24,9 @@ pub enum KernelExecutorBinding {
 #[derive(Debug, Clone)]
 pub(crate) struct KernelToolRegistration {
     pub(crate) descriptor: ToolDescriptor,
-    pub(crate) executor_binding: Option<KernelExecutorBinding>,
-    pub(crate) canonicalize_invocation: Option<KernelInvocationCanonicalizer>,
+    pub(crate) executor_binding: KernelExecutorBinding,
+    pub(crate) canonicalize_invocation: KernelInvocationCanonicalizer,
+    pub(crate) usage_guidelines: &'static [&'static str],
     tool_id: &'static str,
 }
 
@@ -90,30 +91,21 @@ pub(crate) fn builtin_tool_registrations() -> Vec<KernelToolRegistration> {
 
 fn register_tool(spec: ToolSpec) -> KernelToolRegistration {
     let tool_id = spec.tool.as_str();
-    let availability = if spec.tool == KernelToolKind::ProcessShell {
-        process_shell_availability()
-    } else {
-        ToolAvailability::Callable
-    };
+    let (description, usage_guidelines) = tool_guidance(spec.tool);
     KernelToolRegistration {
         descriptor: ToolDescriptor {
             name: tool_id.to_owned(),
-            description: tool_description(spec.tool).to_owned(),
+            description: description.to_owned(),
             input_schema: provider_schema_for_tool(spec.tool),
             effect_class: spec.effect_class,
             effect_scope: spec.effect_scope,
-            availability,
+            availability: ToolAvailability::Callable,
         },
-        executor_binding: (availability == ToolAvailability::Callable)
-            .then_some(spec.executor_binding),
-        canonicalize_invocation: (availability == ToolAvailability::Callable)
-            .then(|| canonicalizer_for(spec.tool)),
+        executor_binding: spec.executor_binding,
+        canonicalize_invocation: canonicalizer_for(spec.tool),
+        usage_guidelines,
         tool_id,
     }
-}
-
-const fn process_shell_availability() -> ToolAvailability {
-    ToolAvailability::Callable
 }
 
 macro_rules! invocation_canonicalizer {
@@ -146,26 +138,57 @@ fn canonicalizer_for(tool: KernelToolKind) -> KernelInvocationCanonicalizer {
     }
 }
 
-fn tool_description(tool: KernelToolKind) -> &'static str {
+fn tool_guidance(tool: KernelToolKind) -> (&'static str, &'static [&'static str]) {
     match tool {
-        KernelToolKind::FsDelete => "Delete one explicitly named workspace file or directory tree.",
-        KernelToolKind::FsEdit => "Apply exact, non-overlapping text replacements to one existing workspace file. Every oldText must match a unique region of the original file; later edits do not see earlier replacements. Keep oldText as small as possible while still unique, and do not include large unchanged regions. Combine disjoint changes to the same file in one call. All replacements are applied atomically.",
-        KernelToolKind::FsRead => "Read bounded UTF-8 text from a workspace file. Do not use for PDFs or binary files. The content field contains the selected source text, including whitespace. Check the returned truncation fields and line range before requesting more content.",
-        KernelToolKind::FsWrite => "Create or replace one workspace file and any missing parent directories.",
-        KernelToolKind::WebFetch => "Read bounded text from a known HTTP or HTTPS URL.",
-        KernelToolKind::WebSearch => {
-            "Search the web by keyword and return sources."
-        }
-        KernelToolKind::ProcessPowerShell => "Execute a bounded PowerShell script in the selected native Windows environment. Use PowerShell syntax. Each call starts a fresh noninteractive process with no user profile and UTF-8 output. Scope and Plan authority are the same as other process tools. Check $LASTEXITCODE for native programs and use exit to preserve a failed command status.",
-        KernelToolKind::ProcessShell => {
-            #[cfg(target_os = "macos")]
-            {
-                "Execute one bounded Bash command from the bound workspace. executionScope \"workspace\" uses the macOS workspace sandbox; \"host\" uses the host user environment and external-effect authority. Use workspaceMode \"write\" for workspace mutations. terminal optionally supplies exact one-call PTY input; otherwise stdin is closed. The result follows the shell command's final exit status, so use fail-fast shell logic when every step must succeed."
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                "Execute one bounded Bash command from the bound workspace. On this platform executionScope \"workspace\" is unavailable because no workspace sandbox is registered; use \"host\" only when host execution is intended and external-effect authority is available. Use workspaceMode \"write\" for workspace mutations. terminal optionally supplies exact one-call PTY input; otherwise stdin is closed. The result follows the shell command's final exit status, so use fail-fast shell logic when every step must succeed."
-            }
-        }
+        KernelToolKind::FsDelete => (
+            "Delete one explicitly named workspace file or directory tree.",
+            &[],
+        ),
+        KernelToolKind::FsEdit => (
+            "Apply exact, non-overlapping text replacements to one existing workspace file. Every oldText must match a unique region of the original file; later edits do not see earlier replacements. Keep oldText as small as possible while still unique, and do not include large unchanged regions. Combine disjoint changes to the same file in one call. All replacements are applied atomically.",
+            &[],
+        ),
+        KernelToolKind::FsRead => (
+            "Read bounded UTF-8 text from a workspace file. Do not use for PDFs or binary files. The content field contains the selected source text, including whitespace. Check the returned truncation fields and line range before requesting more content.",
+            &[
+                "Use this to inspect the contents of a known workspace text file instead of shell commands such as cat or sed.",
+                "Use startLine and maxLines for a line range; startByte and maxBytes for byte bounds."
+            ],
+        ),
+        KernelToolKind::FsWrite => (
+            "Create or replace one workspace file and any missing parent directories.",
+            &[],
+        ),
+        KernelToolKind::WebFetch => (
+            "Read bounded text from a known HTTP or HTTPS URL.",
+            &[
+                "Read URLs supplied by the user or returned by search."
+            ],
+        ),
+        KernelToolKind::WebSearch => (
+            "Search the web by keyword and return sources.",
+            &[
+                "Cite returned sources and report search errors."
+            ],
+        ),
+        KernelToolKind::ProcessPowerShell => (
+            "Execute a bounded PowerShell script in the selected native Windows environment. Use PowerShell syntax. Each call starts a fresh noninteractive process with no user profile and UTF-8 output. Scope and Plan authority are the same as other process tools. Check $LASTEXITCODE for native programs and use exit to preserve a failed command status.",
+            &[
+                "Use PowerShell syntax directly. Each call starts without a profile and emits UTF-8. Windows PowerShell 5.1 does not support && or ||; use separate statements and explicit exit handling.",
+                "After a native executable, capture $LASTEXITCODE before running another command and exit with that code when validating a build or test. Do not assume a pipeline preserves the original exit code.",
+                "Use the declared project tools in the observed execution environment. A missing command or service is an environment fact; a nonzero test result is not evidence of shell incompatibility.",
+                "Stay within the confirmed Plan targets and execution scope. If the selected environment cannot enforce workspace scope, report that limit and request a permitted host scope or another project environment; changing shell syntax does not grant permission."
+            ],
+        ),
+        KernelToolKind::ProcessShell => (
+            "Execute one bounded Bash command from the bound workspace. executionScope \"workspace\" uses the selected environment's workspace sandbox; \"host\" uses the host environment and requires external-effect authority. Check the execution environment snapshot for sandbox availability. Use workspaceMode \"write\" for mutations. terminal supplies optional one-call PTY input; otherwise stdin is closed. The result preserves the command's final exit status.",
+            &[
+                "Use this for discovery, search, builds and commands. 检查命令独立执行；需要追加报告时，先保存退出码、最后 exit 原退出码。预期文件不存在用条件分支；管道中需要保留的失败用 pipefail 传播。",
+                "Do not use this as the default way to read a known UTF-8 workspace text file.",
+                "Use the project's declared build/test scripts in their required environment. Finding docker or another executable does not establish service availability; use an actual permitted service check and report its error.",
+                "A Plan denial means this call was not executed. Stay within confirmed targets and executionScope; routine command details do not require reconfirmation. Revise the Plan only when the authorized scope must change.",
+                "Output is limited to the last 2000 lines or 50 KiB. When truncated, fullOutput contains Session-owned log paths; inspect bounded sections with a read-only Bash command instead of repeating the original command."
+            ],
+        ),
     }
 }
