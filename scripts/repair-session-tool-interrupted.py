@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit, one-time repair of the schema-7 tool.interrupted CHECK omission.
+"""Explicit, one-time repair of a confirmed schema-7 event CHECK omission.
 
 Run only against an idle config root. This is an operator action, never a
 daemon startup migration. The supplied backup path must not already exist.
@@ -17,7 +17,7 @@ import sqlite3
 
 
 SCHEMA = Path(__file__).resolve().parents[1] / "contracts/agent-runtime/session.sql"
-EVENT = "        'tool.interrupted',\n"
+REPAIR_EVENTS = ("tool.interrupted", "input.queued")
 
 
 def normalize(sql: str) -> str:
@@ -57,7 +57,9 @@ def verify_unchanged(connection: sqlite3.Connection) -> dict[str, int]:
     return counts
 
 
-def repair(config_root: Path, backup: Path) -> dict:
+def repair(config_root: Path, backup: Path, event: str = "tool.interrupted") -> dict:
+    if event not in REPAIR_EVENTS:
+        raise ValueError("Only the confirmed event omissions can be repaired")
     runtime = config_root.resolve(strict=True) / "runtime" / "agent-runtime"
     database = (runtime / "session.sqlite3").resolve(strict=True)
     backup = backup.resolve()
@@ -65,9 +67,10 @@ def repair(config_root: Path, backup: Path) -> dict:
         statement.strip() for statement in SCHEMA.read_text().split(";")
         if statement.strip().startswith("CREATE TABLE IF NOT EXISTS session_events (")
     )
-    if table_sql.count(EVENT) != 1:
+    event_line = f"        '{event}',\n"
+    if table_sql.count(event_line) != 1:
         raise RuntimeError("Current contract no longer matches this one-time repair")
-    previous_sql = table_sql.replace(EVENT, "")
+    previous_sql = table_sql.replace(event_line, "")
 
     # Same SQLite lease as ConfigRootLease; no PID guessing or process killing.
     with closing(sqlite3.connect(runtime / "root-owner.lock", timeout=0)) as lease:
@@ -125,8 +128,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config-root", type=Path, required=True)
     parser.add_argument("--backup", type=Path, required=True)
+    parser.add_argument("--event", choices=REPAIR_EVENTS, default="tool.interrupted")
     args = parser.parse_args()
-    print(json.dumps(repair(args.config_root, args.backup), ensure_ascii=False, indent=2))
+    print(json.dumps(repair(args.config_root, args.backup, args.event), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
