@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" color="currentColor" role="img" aria-label="Chevron Right icon">
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" role="img" aria-label="Chevron Right">
 <title>Chevron Right</title>
-<path d="m9 5 7 7-7 7"/>
+<path d="m9 5.5 6.5 6.5L9 18.5"/>
 </svg>

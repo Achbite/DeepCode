@@ -1,7 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" color="#CBD5E1" role="img" aria-label="Refresh icon">
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" color="#D9DEE7" role="img" aria-label="Refresh">
 <title>Refresh</title>
-<path d="M20 6v5h-5"/>
-<path d="M4 18v-5h5"/>
-<path d="M18.2 10.8A6.5 6.5 0 0 0 7.6 7.2L4 10.5"/>
-<path d="M5.8 13.2a6.5 6.5 0 0 0 10.6 3.6l3.6-3.3"/>
+<path d="M20 9a8.25 8.25 0 0 0-14-3L3.5 8.5M3.5 4.25V8.5h4.25M4 15a8.25 8.25 0 0 0 14 3l2.5-2.5M20.5 19.75V15.5h-4.25"/>
 </svg>

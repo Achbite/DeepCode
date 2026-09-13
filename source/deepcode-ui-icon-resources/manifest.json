@@ -1,12 +1,19 @@
 {
   "name": "DeepCode UI Icon Set",
-  "version": "1.0.0",
-  "style": "D-style layout + C-theme palette",
+  "version": "2.0.0",
+  "style": "Optically balanced outline, a primary wordmark and an independent DC monogram",
   "viewBox": "0 0 24 24",
   "stroke": {
-    "width": 2,
+    "width": 1.75,
     "linecap": "round",
-    "linejoin": "round"
+    "linejoin": "round",
+    "by_size": {
+      "16": 2,
+      "20": 1.85,
+      "24": 1.75,
+      "32": 1.65,
+      "64": 1.5
+    }
   },
   "sizes": [
     16,
@@ -16,20 +23,86 @@
     64
   ],
   "palette": {
-    "bg_primary": "#0B0D10",
-    "surface_1": "#14171C",
-    "surface_2": "#1F2328",
-    "surface_3": "#23272D",
-    "border": "#2B3036",
-    "text_primary": "#E6E8EB",
-    "text_muted": "#8B949E",
-    "text_disabled": "#5C6470",
-    "icon_neutral": "#CBD5E1",
-    "icon_muted": "#64748B",
-    "accent_blue": "#3A82F6",
-    "success": "#22C55E",
-    "warning": "#F59E0B",
-    "error": "#EF4444"
+    "bg_primary": "#111214",
+    "surface_1": "#191A1D",
+    "surface_2": "#222428",
+    "surface_3": "#2B2D32",
+    "border": "#383B42",
+    "text_primary": "#F5F5F7",
+    "text_muted": "#A1A5AE",
+    "text_disabled": "#767C88",
+    "icon_neutral": "#D9DEE7",
+    "icon_muted": "#929BAA",
+    "accent_blue": "#459CFF",
+    "success": "#40D98B",
+    "warning": "#FFBD59",
+    "error": "#FF746C"
+  },
+  "palettes": {
+    "dark": {
+      "bg_primary": "#111214",
+      "surface_1": "#191A1D",
+      "surface_2": "#222428",
+      "surface_3": "#2B2D32",
+      "border": "#383B42",
+      "text_primary": "#F5F5F7",
+      "text_muted": "#A1A5AE",
+      "text_disabled": "#767C88",
+      "icon_neutral": "#D9DEE7",
+      "icon_muted": "#929BAA",
+      "accent_blue": "#459CFF",
+      "success": "#40D98B",
+      "warning": "#FFBD59",
+      "error": "#FF746C"
+    },
+    "light": {
+      "bg_primary": "#F5F5F7",
+      "surface_1": "#FFFFFF",
+      "surface_2": "#EBEDF1",
+      "surface_3": "#E2E5EB",
+      "border": "#D9DDE4",
+      "text_primary": "#1D1D1F",
+      "text_muted": "#616773",
+      "text_disabled": "#797F8A",
+      "icon_neutral": "#424854",
+      "icon_muted": "#737C89",
+      "accent_blue": "#0868CE",
+      "success": "#187D4B",
+      "warning": "#996000",
+      "error": "#CE3541"
+    }
+  },
+  "default_themed_appearance": "dark",
+  "sources": {
+    "icons": "sources/icons.json",
+    "mark": "brand/masters/deepcode-mark.svg",
+    "wordmark": "brand/masters/deepcode-wordmark.svg",
+    "preview": "sources/preview.html",
+    "generator": "scripts/generate-assets.mjs"
+  },
+  "brand": {
+    "name": "DeepCode",
+    "primary": "wordmark",
+    "secondary": "mark",
+    "lettering": "Original outlined glyphs, not an installable font",
+    "files": {
+      "mark": {
+        "light": "brand/svg/deepcode-mark-light.svg",
+        "dark": "brand/svg/deepcode-mark-dark.svg",
+        "mono": "brand/svg/deepcode-mark-mono.svg"
+      },
+      "wordmark": {
+        "light": "brand/svg/deepcode-wordmark-light.svg",
+        "dark": "brand/svg/deepcode-wordmark-dark.svg",
+        "mono": "brand/svg/deepcode-wordmark-mono.svg"
+      }
+    }
+  },
+  "previews": {
+    "interactive": "preview/index.html",
+    "brand": "preview/deepcode-brand-sheet.png",
+    "icons": "preview/deepcode-icon-sheet.png",
+    "sizes": "preview/deepcode-size-sheet.png"
   },
   "icons": [
     {
@@ -40,7 +113,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-workspace-24.svg",
         "svg_themed_24": "svg/themed/24/icon-workspace-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-workspace-24.svg",
         "png_24": "png/24/icon-workspace-24.png",
+        "png_light_24": "png/light/24/icon-workspace-24.png",
         "sprite_id": "dc-icon-workspace"
       }
     },
@@ -52,7 +127,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-folder-24.svg",
         "svg_themed_24": "svg/themed/24/icon-folder-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-folder-24.svg",
         "png_24": "png/24/icon-folder-24.png",
+        "png_light_24": "png/light/24/icon-folder-24.png",
         "sprite_id": "dc-icon-folder"
       }
     },
@@ -64,7 +141,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-folder-tree-24.svg",
         "svg_themed_24": "svg/themed/24/icon-folder-tree-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-folder-tree-24.svg",
         "png_24": "png/24/icon-folder-tree-24.png",
+        "png_light_24": "png/light/24/icon-folder-tree-24.png",
         "sprite_id": "dc-icon-folder-tree"
       }
     },
@@ -76,7 +155,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-file-24.svg",
         "svg_themed_24": "svg/themed/24/icon-file-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-file-24.svg",
         "png_24": "png/24/icon-file-24.png",
+        "png_light_24": "png/light/24/icon-file-24.png",
         "sprite_id": "dc-icon-file"
       }
     },
@@ -88,7 +169,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-tabs-24.svg",
         "svg_themed_24": "svg/themed/24/icon-tabs-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-tabs-24.svg",
         "png_24": "png/24/icon-tabs-24.png",
+        "png_light_24": "png/light/24/icon-tabs-24.png",
         "sprite_id": "dc-icon-tabs"
       }
     },
@@ -100,7 +183,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-code-editor-24.svg",
         "svg_themed_24": "svg/themed/24/icon-code-editor-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-code-editor-24.svg",
         "png_24": "png/24/icon-code-editor-24.png",
+        "png_light_24": "png/light/24/icon-code-editor-24.png",
         "sprite_id": "dc-icon-code-editor"
       }
     },
@@ -112,7 +197,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-terminal-24.svg",
         "svg_themed_24": "svg/themed/24/icon-terminal-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-terminal-24.svg",
         "png_24": "png/24/icon-terminal-24.png",
+        "png_light_24": "png/light/24/icon-terminal-24.png",
         "sprite_id": "dc-icon-terminal"
       }
     },
@@ -124,9 +211,12 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-ai-agent-24.svg",
         "svg_themed_24": "svg/themed/24/icon-ai-agent-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-ai-agent-24.svg",
         "png_24": "png/24/icon-ai-agent-24.png",
+        "png_light_24": "png/light/24/icon-ai-agent-24.png",
         "sprite_id": "dc-icon-ai-agent"
-      }
+      },
+      "compact_sprite_id": "dc-icon-ai-agent-16"
     },
     {
       "name": "browser",
@@ -136,7 +226,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-browser-24.svg",
         "svg_themed_24": "svg/themed/24/icon-browser-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-browser-24.svg",
         "png_24": "png/24/icon-browser-24.png",
+        "png_light_24": "png/light/24/icon-browser-24.png",
         "sprite_id": "dc-icon-browser"
       }
     },
@@ -148,7 +240,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-settings-24.svg",
         "svg_themed_24": "svg/themed/24/icon-settings-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-settings-24.svg",
         "png_24": "png/24/icon-settings-24.png",
+        "png_light_24": "png/light/24/icon-settings-24.png",
         "sprite_id": "dc-icon-settings"
       }
     },
@@ -160,7 +254,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-search-24.svg",
         "svg_themed_24": "svg/themed/24/icon-search-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-search-24.svg",
         "png_24": "png/24/icon-search-24.png",
+        "png_light_24": "png/light/24/icon-search-24.png",
         "sprite_id": "dc-icon-search"
       }
     },
@@ -172,9 +268,12 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-kernel-24.svg",
         "svg_themed_24": "svg/themed/24/icon-kernel-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-kernel-24.svg",
         "png_24": "png/24/icon-kernel-24.png",
+        "png_light_24": "png/light/24/icon-kernel-24.png",
         "sprite_id": "dc-icon-kernel"
-      }
+      },
+      "compact_sprite_id": "dc-icon-kernel-16"
     },
     {
       "name": "workflow-task",
@@ -184,7 +283,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-workflow-task-24.svg",
         "svg_themed_24": "svg/themed/24/icon-workflow-task-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-workflow-task-24.svg",
         "png_24": "png/24/icon-workflow-task-24.png",
+        "png_light_24": "png/light/24/icon-workflow-task-24.png",
         "sprite_id": "dc-icon-workflow-task"
       }
     },
@@ -196,7 +297,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-run-24.svg",
         "svg_themed_24": "svg/themed/24/icon-run-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-run-24.svg",
         "png_24": "png/24/icon-run-24.png",
+        "png_light_24": "png/light/24/icon-run-24.png",
         "sprite_id": "dc-icon-run"
       }
     },
@@ -208,7 +311,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-stop-24.svg",
         "svg_themed_24": "svg/themed/24/icon-stop-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-stop-24.svg",
         "png_24": "png/24/icon-stop-24.png",
+        "png_light_24": "png/light/24/icon-stop-24.png",
         "sprite_id": "dc-icon-stop"
       }
     },
@@ -220,7 +325,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-refresh-24.svg",
         "svg_themed_24": "svg/themed/24/icon-refresh-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-refresh-24.svg",
         "png_24": "png/24/icon-refresh-24.png",
+        "png_light_24": "png/light/24/icon-refresh-24.png",
         "sprite_id": "dc-icon-refresh"
       }
     },
@@ -232,7 +339,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-external-link-24.svg",
         "svg_themed_24": "svg/themed/24/icon-external-link-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-external-link-24.svg",
         "png_24": "png/24/icon-external-link-24.png",
+        "png_light_24": "png/light/24/icon-external-link-24.png",
         "sprite_id": "dc-icon-external-link"
       }
     },
@@ -244,7 +353,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-more-horizontal-24.svg",
         "svg_themed_24": "svg/themed/24/icon-more-horizontal-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-more-horizontal-24.svg",
         "png_24": "png/24/icon-more-horizontal-24.png",
+        "png_light_24": "png/light/24/icon-more-horizontal-24.png",
         "sprite_id": "dc-icon-more-horizontal"
       }
     },
@@ -256,7 +367,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-close-24.svg",
         "svg_themed_24": "svg/themed/24/icon-close-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-close-24.svg",
         "png_24": "png/24/icon-close-24.png",
+        "png_light_24": "png/light/24/icon-close-24.png",
         "sprite_id": "dc-icon-close"
       }
     },
@@ -268,7 +381,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-chevron-right-24.svg",
         "svg_themed_24": "svg/themed/24/icon-chevron-right-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-chevron-right-24.svg",
         "png_24": "png/24/icon-chevron-right-24.png",
+        "png_light_24": "png/light/24/icon-chevron-right-24.png",
         "sprite_id": "dc-icon-chevron-right"
       }
     },
@@ -280,7 +395,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-success-24.svg",
         "svg_themed_24": "svg/themed/24/icon-success-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-success-24.svg",
         "png_24": "png/24/icon-success-24.png",
+        "png_light_24": "png/light/24/icon-success-24.png",
         "sprite_id": "dc-icon-success"
       }
     },
@@ -292,7 +409,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-warning-24.svg",
         "svg_themed_24": "svg/themed/24/icon-warning-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-warning-24.svg",
         "png_24": "png/24/icon-warning-24.png",
+        "png_light_24": "png/light/24/icon-warning-24.png",
         "sprite_id": "dc-icon-warning"
       }
     },
@@ -304,7 +423,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-error-24.svg",
         "svg_themed_24": "svg/themed/24/icon-error-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-error-24.svg",
         "png_24": "png/24/icon-error-24.png",
+        "png_light_24": "png/light/24/icon-error-24.png",
         "sprite_id": "dc-icon-error"
       }
     },
@@ -316,7 +437,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-info-24.svg",
         "svg_themed_24": "svg/themed/24/icon-info-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-info-24.svg",
         "png_24": "png/24/icon-info-24.png",
+        "png_light_24": "png/light/24/icon-info-24.png",
         "sprite_id": "dc-icon-info"
       }
     },
@@ -328,7 +451,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-in-progress-24.svg",
         "svg_themed_24": "svg/themed/24/icon-in-progress-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-in-progress-24.svg",
         "png_24": "png/24/icon-in-progress-24.png",
+        "png_light_24": "png/light/24/icon-in-progress-24.png",
         "sprite_id": "dc-icon-in-progress"
       }
     },
@@ -340,7 +465,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-blocked-24.svg",
         "svg_themed_24": "svg/themed/24/icon-blocked-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-blocked-24.svg",
         "png_24": "png/24/icon-blocked-24.png",
+        "png_light_24": "png/light/24/icon-blocked-24.png",
         "sprite_id": "dc-icon-blocked"
       }
     },
@@ -352,7 +479,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-chart-line-24.svg",
         "svg_themed_24": "svg/themed/24/icon-chart-line-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-chart-line-24.svg",
         "png_24": "png/24/icon-chart-line-24.png",
+        "png_light_24": "png/light/24/icon-chart-line-24.png",
         "sprite_id": "dc-icon-chart-line"
       }
     },
@@ -364,7 +493,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-chart-bar-24.svg",
         "svg_themed_24": "svg/themed/24/icon-chart-bar-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-chart-bar-24.svg",
         "png_24": "png/24/icon-chart-bar-24.png",
+        "png_light_24": "png/light/24/icon-chart-bar-24.png",
         "sprite_id": "dc-icon-chart-bar"
       }
     },
@@ -376,7 +507,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-chart-donut-24.svg",
         "svg_themed_24": "svg/themed/24/icon-chart-donut-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-chart-donut-24.svg",
         "png_24": "png/24/icon-chart-donut-24.png",
+        "png_light_24": "png/light/24/icon-chart-donut-24.png",
         "sprite_id": "dc-icon-chart-donut"
       }
     },
@@ -388,7 +521,9 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-activity-grid-24.svg",
         "svg_themed_24": "svg/themed/24/icon-activity-grid-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-activity-grid-24.svg",
         "png_24": "png/24/icon-activity-grid-24.png",
+        "png_light_24": "png/light/24/icon-activity-grid-24.png",
         "sprite_id": "dc-icon-activity-grid"
       }
     },
@@ -400,9 +535,15 @@
       "files": {
         "svg_currentColor_24": "svg/currentColor/24/icon-kpi-card-24.svg",
         "svg_themed_24": "svg/themed/24/icon-kpi-card-24.svg",
+        "svg_themed_light_24": "svg/themed-light/24/icon-kpi-card-24.svg",
         "png_24": "png/24/icon-kpi-card-24.png",
+        "png_light_24": "png/light/24/icon-kpi-card-24.png",
         "sprite_id": "dc-icon-kpi-card"
       }
     }
+  ],
+  "references": [
+    "https://developer.apple.com/design/human-interface-guidelines/icons",
+    "https://developer.apple.com/design/human-interface-guidelines/typography"
   ]
 }
