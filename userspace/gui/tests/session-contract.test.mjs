@@ -27,6 +27,76 @@ import {
   waitUntil,
 } from '../../session-core/tests/local-agent-fixtures.mjs';
 
+test('sidebar reordering preserves project ownership and ignores stale drag targets', async (t) => {
+  const { moveSidebarItem } = await loadGuiModule(t, '/src/deepcode-gui/layout/sidebarOrder.ts');
+  const projects = [{ id: 'p:a' }, { id: 'p:b' }, { id: 'p:c' }];
+  const sessions = [
+    { id: 's:a', projectId: 'p:a' }, { id: 's:b', projectId: 'p:a' },
+    { id: 's:c', projectId: 'p:b' }, { id: 's:d' }, { id: 's:e' },
+  ];
+  const original = structuredClone({ projects, sessions });
+  const project = (id) => ({ kind: 'project', id });
+  const session = (id) => ({ kind: 'session', ...sessions.find((entry) => entry.id === id) });
+  const empty = { projects: [], sessions: [] };
+  const first = moveSidebarItem(empty, projects, sessions, project('p:c'), project('p:a'), 'before');
+  assert.deepEqual(first.projects, ['p:c', 'p:a', 'p:b']);
+  assert.deepEqual(moveSidebarItem(first, projects, sessions, project('p:c'), project('p:b'), 'after').projects, ['p:a', 'p:b', 'p:c']);
+  const nested = moveSidebarItem(first, projects, sessions, session('s:b'), session('s:a'), 'before');
+  assert.deepEqual(nested.sessions, ['s:b', 's:a', 's:c', 's:d', 's:e']);
+  assert.deepEqual(nested.projects, first.projects);
+  const standalone = moveSidebarItem(nested, projects, sessions, session('s:e'), session('s:d'), 'before');
+  assert.deepEqual(standalone.sessions, ['s:b', 's:a', 's:c', 's:e', 's:d']);
+  assert.equal(moveSidebarItem(standalone, projects, sessions, session('s:a'), session('s:c'), 'before'), null);
+  assert.equal(moveSidebarItem(standalone, projects, sessions, session('s:a'), session('s:d'), 'after'), null);
+  assert.equal(moveSidebarItem(standalone, projects, sessions, project('p:a'), session('s:a'), 'after'), null);
+  assert.equal(moveSidebarItem(standalone, projects, sessions, project('p:deleted'), project('p:a'), 'before'), null);
+  const changed = sessions.map((entry) => entry.id === 's:b' ? { ...entry, projectId: 'p:b' } : entry);
+  assert.equal(moveSidebarItem(standalone, projects, changed, session('s:b'), session('s:a'), 'after'), null);
+  assert.deepEqual({ projects, sessions }, original);
+});
+
+test('sidebar manual order survives catalog updates while new and deleted entries remain correct', async (t) => {
+  const { orderSidebarItems, readSidebarOrder } = await loadGuiModule(t, '/src/deepcode-gui/layout/sidebarOrder.ts');
+  const saved = readSidebarOrder(JSON.stringify({ projects: ['p:b', 'p:deleted', 'p:a'], sessions: [] }));
+  const updatedCatalog = [{ id: 'p:a', updatedAt: 'later' }, { id: 'p:new' }, { id: 'p:b', updatedAt: 'earlier' }];
+  assert.deepEqual(orderSidebarItems(updatedCatalog, saved.projects).map((entry) => entry.id), ['p:new', 'p:b', 'p:a']);
+  assert.deepEqual(orderSidebarItems([], saved.projects), []);
+  assert.deepEqual(orderSidebarItems(updatedCatalog, []).map((entry) => entry.id), updatedCatalog.map((entry) => entry.id));
+  assert.throws(() => readSidebarOrder('{broken'), SyntaxError);
+  assert.throws(() => readSidebarOrder('{"projects":false,"sessions":[]}'), /gui.sidebarOrder/);
+});
+
+test('sidebar order uses the shared settings store and failed saves retain the saved order', async (t) => {
+  const [{ useSettingsStore }, { SIDEBAR_ORDER_SETTING, readSidebarOrder }] = await loadGuiModules(t, [
+    '/src/state/settingsStore.ts', '/src/deepcode-gui/layout/sidebarOrder.ts',
+  ]);
+  let persisted = { 'gui.colorTheme': 'dark' };
+  let fail = false;
+  installGuiFetch(t, (url, init) => {
+    assert.equal(url.pathname, '/api/user-settings');
+    if (init.method === 'PATCH') {
+      const { patches } = JSON.parse(init.body);
+      assert.deepEqual(Object.keys(patches), [SIDEBAR_ORDER_SETTING]);
+      if (fail) return Response.json({ ok: false, message: 'settings write failed' });
+      persisted = { ...persisted, ...patches };
+      return Response.json({ ok: true, data: { settings: persisted, changedKeys: Object.keys(patches), activation: 'immediate' } });
+    }
+    return Response.json({ ok: true, data: { settings: persisted, runtimeSettings: persisted, overriddenKeys: Object.keys(persisted), storePath: '/test/user-settings.json' } });
+  });
+  await useSettingsStore.getState().loadUserSettings();
+  assert.deepEqual(readSidebarOrder(useSettingsStore.getState().effectiveSettings[SIDEBAR_ORDER_SETTING]), { projects: [], sessions: [] });
+  const order = { projects: ['p:b', 'p:a'], sessions: ['s:b', 's:a'] };
+  assert.equal(await useSettingsStore.getState().patchUserSetting(SIDEBAR_ORDER_SETTING, JSON.stringify(order)), 'immediate');
+  const [{ useSettingsStore: reloaded }] = await loadGuiModules(t, ['/src/state/settingsStore.ts']);
+  await reloaded.getState().loadUserSettings();
+  assert.deepEqual(readSidebarOrder(reloaded.getState().effectiveSettings[SIDEBAR_ORDER_SETTING]), order);
+  assert.equal(reloaded.getState().effectiveSettings['gui.colorTheme'], 'dark');
+  fail = true;
+  assert.equal(await reloaded.getState().patchUserSetting(SIDEBAR_ORDER_SETTING, '{"projects":[],"sessions":[]}'), null);
+  assert.match(reloaded.getState().errorMessage, /settings write failed/);
+  assert.deepEqual(readSidebarOrder(reloaded.getState().effectiveSettings[SIDEBAR_ORDER_SETTING]), order);
+});
+
 test('native path selection preserves OS paths, cancellation and dialog errors', async (t) => {
   const previousWindow = globalThis.window;
   const [{ pickNativePath, hasNativePathPicker }] = await loadGuiModules(t, ['/src/services/runtimeAdapter.ts']);
@@ -954,7 +1024,21 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
   t.after(() => actor.dispose());
   let commands = 0;
   let failSave = false;
+  const profiles = [
+    { id: 'profile:one', name: 'My fast model', model: 'configured-model', enabled: true, thinking: 'enabled' },
+    { id: 'profile:two', name: 'My other model', model: 'configured-model', enabled: true, thinking: 'enabled' },
+    { id: 'profile:off', name: 'No reasoning', model: 'configured-model', enabled: true, thinking: 'disabled' },
+  ];
+  let defaultProfileId = profiles[0].id;
   installGuiFetch(t, async (url, init) => {
+    if (url.pathname === '/api/llm/profiles') {
+      if (init.method === 'PATCH') {
+        const update = JSON.parse(init.body);
+        assert.deepEqual(Object.keys(update), ['defaultProfileId']);
+        defaultProfileId = update.defaultProfileId;
+      }
+      return Response.json({ ok: true, data: { profiles, defaultProfileId } });
+    }
     const sessionPath = `/api/conversation/sessions/${encodeURIComponent(sessionId)}`;
     if (url.pathname === `${sessionPath}/commands` && init.method === 'POST') {
       commands += 1;
@@ -969,14 +1053,10 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
     throw new Error(`unexpected_gui_request:${init.method ?? 'GET'}:${url.pathname}`);
   });
   const store = await loadGuiModelStore(t);
-  store.setState({ profiles: [
-    { id: 'profile:one', name: 'My fast model', model: 'configured-model', enabled: true, thinking: 'enabled' },
-    { id: 'profile:two', name: 'My other model', model: 'configured-model', enabled: true, thinking: 'enabled' },
-    { id: 'profile:off', name: 'No reasoning', model: 'configured-model', enabled: true, thinking: 'disabled' },
-  ] });
+  store.setState({ profiles });
   await store.getState().selectProfile('profile:one');
   await store.getState().selectReasoningEffort('max');
-  assert.equal(commands, 0, 'new draft selection stays in memory until a Session exists');
+  assert.equal(commands, 0, 'draft preference is saved without creating a Session');
   assert.equal(store.getState().reasoningEffortOverride, 'max');
   store.setState({ sessionId, projection: await actor.snapshot() });
   await store.getState().selectReasoningEffort('low');
@@ -985,6 +1065,7 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
   assert.equal(store.getState().selectedProfileId, 'profile:two');
   assert.equal(store.getState().reasoningEffortOverride, null);
   assert.equal((await actor.snapshot()).modelSettings.profileId, 'profile:two');
+  assert.equal(store.getState().defaultProfileId, 'profile:two');
   failSave = true;
   await store.getState().selectReasoningEffort('high');
   assert.equal(store.getState().reasoningEffortOverride, null);
@@ -997,6 +1078,14 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
   assert.equal(commands, before);
   assert.equal(store.getState().reasoningEffortOverride, null);
   assert.equal((await actor.snapshot()).run, null);
+  store.getState().startNewSession();
+  assert.equal(store.getState().selectedProfileId, 'profile:off');
+  await store.getState().selectProfile('profile:two');
+  store.getState().startNewSession();
+  assert.equal(store.getState().selectedProfileId, 'profile:two');
+  const reopened = await loadGuiModelStore(t);
+  await reopened.getState().refreshProfiles();
+  assert.equal(reopened.getState().selectedProfileId, 'profile:two');
 });
 
 test('starting a draft during initialization preserves navigation and still loads usable model configuration', async (t) => {
@@ -2229,4 +2318,69 @@ test('model settings distinguish a failed read from a successfully empty catalog
   assert.equal(store.getState().defaultProfileId, profiles[0].id);
   assert.equal(store.getState().selectedProfileId, profiles[0].id);
   assert.match(store.getState().error, /Failed to fetch/);
+});
+
+test('invalid default profiles retain editable settings and do not prevent reading conversation history', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:profile-error-history';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const provider = { async *stream(request) {
+    yield providerEvent(request.requestId, 'assistant.message', { messageId: 'message:history', content: 'Saved conversation response.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } };
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), fakeRunPreparation().port, 'profile-error-history');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:history', 'Keep this conversation.'));
+  const projection = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.ok(projection.messages.some((message) => message.role === 'assistant'));
+  const profile = { id: 'profile:kept', name: 'My configured model', kind: 'responses', model: 'configured-model', enabled: true, secretRef: 'local-secret:profile:kept' };
+  const editable = { profiles: [profile], defaultProfileId: 'profile:missing', storePath: '/config/settings/llm-profiles.json' };
+  const failure = { ok: false, error: 'invalid_llm_profile_store_schema', message: 'defaultProfileId: profile:missing', data: editable };
+  const catalog = { projects: [], sessions: [{ id: sessionId, title: 'Saved conversation', workspaceBindings: [workspaceBinding], profileId: profile.id,
+    createdAt: '2026-09-14T00:00:00Z', updatedAt: '2026-09-14T00:00:00Z' }] };
+  installGuiFetch(t, (url, init) => {
+    assert.equal(init.method ?? 'GET', 'GET');
+    if (url.pathname === '/api/llm/profiles') return Response.json(failure);
+    if (url.pathname === '/api/conversation/catalog') return Response.json({ ok: true, data: catalog });
+    if (url.pathname === '/api/conversation/plugins') return Response.json({ ok: true, data: { revision: 'plugin-catalog:empty', plugins: [] } });
+    if (url.pathname === '/api/conversation/statuses') return Response.json({ ok: true, data: [{ sessionId, revision: projection.revision,
+      run: { runId: projection.run.runId, status: projection.run.status } }] });
+    if (url.pathname.endsWith('/projection')) return Response.json({ ok: true, data: projection });
+    throw new Error(`Unexpected request: ${url.pathname}`);
+  });
+  const api = await loadGuiModule(t, '/src/services/apiClient.ts');
+  assert.deepEqual(await api.getLlmProfiles(), failure);
+  const store = await loadGuiModelStore(t);
+  await store.getState().initialize();
+  assert.deepEqual(store.getState().catalog, catalog);
+  await store.getState().activateSession(sessionId);
+  assert.equal(store.getState().loading, false);
+  assert.deepEqual(store.getState().projection.messages, projection.messages);
+  await assert.rejects(store.getState().sendMessage('Start a new run.'), /llm_profile_unavailable/);
+  assert.deepEqual((await actor.snapshot()).messages, projection.messages);
+});
+
+test('saving valid profiles enables an unbound draft and clears its profile error', async (t) => {
+  const profile = { id: 'profile:configured', name: 'Configured model', kind: 'responses', model: 'configured-model', enabled: true };
+  let profileResponse = { ok: false, error: 'invalid_llm_profile_store_schema', message: 'defaultProfileId: profile:missing',
+    data: { profiles: [profile], defaultProfileId: 'profile:missing' } };
+  installGuiFetch(t, (url) => {
+    if (url.pathname === '/api/llm/profiles') return Response.json(profileResponse);
+    if (url.pathname === '/api/conversation/catalog') return Response.json({ ok: true, data: { projects: [], sessions: [] } });
+    if (url.pathname === '/api/conversation/plugins') return Response.json({ ok: true, data: { revision: 'plugin-catalog:empty', plugins: [] } });
+    if (url.pathname === '/api/conversation/statuses') return Response.json({ ok: true, data: [] });
+    throw new Error(`Unexpected request: ${url.pathname}`);
+  });
+  const store = await loadGuiModelStore(t);
+  await store.getState().initialize();
+  assert.equal(store.getState().sessionId, null);
+  assert.equal(store.getState().selectedProfileId, null);
+  assert.equal(store.getState().defaultProfileId, null);
+  assert.equal(store.getState().error, profileResponse.message);
+  profileResponse = { ok: true, data: { profiles: [profile], defaultProfileId: profile.id } };
+  await store.getState().refreshProfiles();
+  assert.equal(store.getState().selectedProfileId, profile.id);
+  assert.deepEqual(store.getState().profiles, [profile]);
+  assert.equal(store.getState().error, null);
+  assert.equal(store.getState().errorSource, null);
 });

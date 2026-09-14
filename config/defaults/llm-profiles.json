@@ -15,5 +15,5 @@
       "enabled": true
     }
   ],
-  "defaultProfileId": "deepseek-openai"
+  "defaultProfileId": "deepseek-v4-flash-openai"
 }

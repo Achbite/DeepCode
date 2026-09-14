@@ -45,6 +45,7 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'gui.navigationDensity': 'comfortable',
   'gui.showContextRail': true,
   'gui.showReasoning': false,
+  'gui.sidebarOrder': '{"projects":[],"sessions":[]}',
   'terminal.integrated.defaultProfile.windows': 'wsl',
   'terminal.integrated.prewarm': 'afterStartup',
   'terminal.integrated.spawnTimeoutMs': 8000,

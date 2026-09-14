@@ -15,7 +15,7 @@ import type {
   SessionProjection,
 } from '@deepcode/protocol';
 import { CONVERSATION_COMMAND_VERSION } from '@deepcode/protocol';
-import { getLlmProfiles } from '../services/apiClient';
+import { getLlmProfiles, patchLlmProfiles } from '../services/apiClient';
 import type { PastedTextInput } from '../services/pastedText';
 import {
   attachConversationDirectoryIndex,
@@ -204,7 +204,7 @@ const store = create<LocalAgentState>((set, get) => ({
           : [];
         const defaultProfileId = initialProfileId(
           profiles,
-          profileResult.data?.defaultProfileId,
+          profileResult.ok ? profileResult.data?.defaultProfileId : undefined,
         );
         // Catalog readiness is independent of navigation. Starting a new draft
         // while boot data loads cancels view restoration, not the shared data.
@@ -217,7 +217,7 @@ const store = create<LocalAgentState>((set, get) => ({
           if (!profileResult.ok) {
             set({
               error: profileResult.message ?? 'llm_profiles_unavailable',
-              errorSource: 'initialization',
+              errorSource: 'profiles',
             });
           }
           return;
@@ -247,7 +247,7 @@ const store = create<LocalAgentState>((set, get) => ({
           loading: false,
           error: projectionError
             ?? (profileResult.ok ? null : (profileResult.message ?? 'llm_profiles_unavailable')),
-          errorSource: projectionError || !profileResult.ok ? 'initialization' : null,
+          errorSource: projectionError ? 'initialization' : (profileResult.ok ? null : 'profiles'),
         });
       } catch (error) {
         if (currentGeneration === generation) {
@@ -850,6 +850,11 @@ async function submitCommandAndReconcile(
 ): Promise<CommandReply> {
   const commandGeneration = generation;
   const reply = await submitLocalAgentCommand(command);
+  if (reply.status === 'accepted') {
+    const profileId = command.type === 'session.model-settings.set' ? command.settings.profileId
+      : command.type === 'message.submit' || command.type === 'context.focus' ? command.profileId : undefined;
+    if (profileId) set({ defaultProfileId: profileId });
+  }
   const rejection = reply.status === 'rejected' ? commandRejectionMessage(reply) : null;
   try {
     await reconcileProjectionAfterReply(set, get, command.sessionId, reply.revision, commandGeneration);
@@ -892,13 +897,21 @@ function projectModelSettings(projection: SessionProjection | null): Partial<Loc
 async function saveModelSettings(set: StoreSet, get: StoreGet, settings: SessionModelSettings): Promise<void> {
   if (get().modelSettingsBusy) return;
   const sessionId = get().sessionId;
-  if (!sessionId) {
-    set({ selectedProfileId: settings.profileId, reasoningEffortOverride: settings.reasoningEffortOverride });
-    return;
-  }
   const settingsGeneration = generation;
   set({ modelSettingsBusy: true });
   try {
+    if (!sessionId) {
+      if (get().selectedProfileId !== settings.profileId) {
+        const result = await patchLlmProfiles({ defaultProfileId: settings.profileId });
+        if (!result.ok || !result.data) throw new Error(result.message ?? result.error ?? 'llm_profiles_unavailable');
+        set({ defaultProfileId: result.data.defaultProfileId ?? null, profiles: result.data.profiles });
+      }
+      if (generation === settingsGeneration && !get().sessionId) {
+        set({ selectedProfileId: settings.profileId, reasoningEffortOverride: settings.reasoningEffortOverride,
+          error: null, errorSource: null });
+      }
+      return;
+    }
     await submitCommandAndReconcile(set, get, {
       schemaVersion: CONVERSATION_COMMAND_VERSION, type: 'session.model-settings.set',
       sessionId, commandId: nextId('command'), settings,

@@ -11,6 +11,7 @@ import { inputCacheMetric } from '../../utils/providerUsage';
 import DeepCodeConversationShell from './DeepCodeConversationShell';
 import DeepCodeSidebar from './DeepCodeSidebar';
 import { useReadRunMarkers } from './useReadRunMarkers';
+import { useSidebarOrder } from './useSidebarOrder';
 import DeepCodeTaskPanel from './DeepCodeTaskPanel';
 import DeepCodeTitlebar from './DeepCodeTitlebar';
 import DeepCodeShellIcon from '../../components/shared/DeepCodeShellIcon';
@@ -65,6 +66,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const activeSessionId = useLocalAgentStore((state) => state.sessionId);
   const draftProjectId = useLocalAgentStore((state) => state.draftProjectId);
   const catalog = useLocalAgentStore((state) => state.catalog);
+  const sidebarOrder = useSidebarOrder(catalog.projects, catalog.sessions);
   const sessionStatuses = useLocalAgentStore((state) => state.sessionStatuses);
   const sidebarStatuses = useMemo(() => {
     if (!projection || (sessionStatuses[projection.sessionId]?.revision ?? -1) > projection.revision) {
@@ -273,8 +275,11 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       >
         <DeepCodeSidebar
           language={language}
-          projects={catalog.projects}
-          sessions={catalog.sessions}
+          projects={sidebarOrder.projects}
+          sessions={sidebarOrder.sessions}
+          reorderDisabled={sidebarOrder.disabled}
+          reorderError={sidebarOrder.error}
+          onReorder={(source, target, edge) => void sidebarOrder.move(source, target, edge)}
           sessionStatuses={sidebarStatuses}
           readRunMarkers={readRunMarkers}
           collapsedProjectIds={collapsedSet}

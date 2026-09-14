@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   ConversationProject,
   ConversationSessionSummary,
@@ -10,6 +10,7 @@ import DeepCodeBrand from './DeepCodeBrand';
 import DeepCodeShellIcon from '../../components/shared/DeepCodeShellIcon';
 import { SessionRunStatus } from '../../components/local-agent/SessionRunStatus';
 import { runReadMarker } from './useReadRunMarkers';
+import { canDropSidebarItem, type SidebarDragItem, type SidebarDropEdge } from './sidebarOrder';
 
 interface DeepCodeSidebarProps {
   language: UiLanguage;
@@ -21,6 +22,9 @@ interface DeepCodeSidebarProps {
   activeSessionId: string | null;
   draftProjectId: string | null;
   busy: boolean;
+  reorderDisabled: boolean;
+  reorderError: string | null;
+  onReorder: (source: SidebarDragItem, target: SidebarDragItem, edge: SidebarDropEdge) => void;
   projectCreateMenuOpen: boolean;
   onCreatePrimarySession: () => void;
   onOpenProjectCreateMenu: (event: React.MouseEvent<HTMLElement>) => void;
@@ -48,6 +52,9 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
   activeSessionId,
   draftProjectId,
   busy,
+  reorderDisabled,
+  reorderError,
+  onReorder,
   projectCreateMenuOpen,
   onCreatePrimarySession,
   onOpenProjectCreateMenu,
@@ -58,6 +65,78 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
   onOpenSessionContextMenu,
   onOpenSettings,
 }) => {
+  const dragSource = useRef<{
+    item: SidebarDragItem; x: number; y: number; pointerId: number; element: HTMLElement;
+  } | null>(null);
+  const dragged = useRef(false);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<{ id: string; edge: SidebarDropEdge } | null>(null);
+  const endDrag = useCallback(() => {
+    const source = dragSource.current;
+    dragSource.current = null;
+    if (source?.element.hasPointerCapture(source.pointerId)) source.element.releasePointerCapture(source.pointerId);
+    setDraggingId(null);
+    setDropTarget(null);
+  }, []);
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') endDrag(); };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('blur', endDrag);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('blur', endDrag);
+    };
+  }, [endDrag]);
+  const targetAt = (source: SidebarDragItem, x: number, y: number) => {
+    const element = document.elementFromPoint(x, y)?.closest<HTMLElement>(`[data-sidebar-kind='${source.kind}']`);
+    if (!element) return null;
+    const id = element.dataset.sidebarId;
+    const record = source.kind === 'project' ? projects.find((item) => item.id === id) : sessions.find((item) => item.id === id);
+    if (!record) return null;
+    const item: SidebarDragItem = source.kind === 'project'
+      ? { kind: 'project', id: record.id }
+      : { kind: 'session', id: record.id, projectId: (record as ConversationSessionSummary).projectId };
+    if (!canDropSidebarItem(source, item)) return null;
+    const rect = element.getBoundingClientRect();
+    const edge: SidebarDropEdge = y < rect.top + rect.height / 2 ? 'before' : 'after';
+    return { item, edge };
+  };
+  const movePointer = (event: React.PointerEvent<HTMLElement>) => {
+    const source = dragSource.current;
+    if (!source || source.pointerId !== event.pointerId) return;
+    if (!dragged.current && Math.hypot(event.clientX - source.x, event.clientY - source.y) < 5) return;
+    dragged.current = true;
+    event.preventDefault();
+    setDraggingId(source.item.id);
+    const rail = event.currentTarget.getBoundingClientRect();
+    if (event.clientY < rail.top + 24) event.currentTarget.scrollTop -= 12;
+    else if (event.clientY > rail.bottom - 24) event.currentTarget.scrollTop += 12;
+    const target = targetAt(source.item, event.clientX, event.clientY);
+    setDropTarget(target ? { id: target.item.id, edge: target.edge } : null);
+  };
+  const dropPointer = (event: React.PointerEvent<HTMLElement>) => {
+    const source = dragSource.current;
+    if (!source || source.pointerId !== event.pointerId) return;
+    const target = dragged.current ? targetAt(source.item, event.clientX, event.clientY) : null;
+    endDrag();
+    if (target && !busy && !reorderDisabled) onReorder(source.item, target.item, target.edge);
+  };
+  const dragProps = (item: SidebarDragItem) => ({
+    'data-sidebar-kind': item.kind,
+    'data-sidebar-id': item.id,
+    'data-dragging': draggingId === item.id || undefined,
+    'data-drop-edge': dropTarget?.id === item.id ? dropTarget.edge : undefined,
+    onPointerDown: (event: React.PointerEvent<HTMLElement>) => {
+      if (event.button !== 0 || busy || reorderDisabled || (event.target as HTMLElement).closest(
+        '.deepcode-gui-project-archive-group__actions, .deepcode-gui-session-row__menu',
+      )) return;
+      event.stopPropagation();
+      const element = (event.target as HTMLElement).closest('button') ?? event.currentTarget;
+      dragged.current = false;
+      dragSource.current = { item, x: event.clientX, y: event.clientY, pointerId: event.pointerId, element };
+      element.setPointerCapture(event.pointerId);
+    },
+  });
   const renderStatus = (sessionId: string) => {
     const run = sessionStatuses[sessionId]?.run;
     const marker = runReadMarker(run ?? null);
@@ -105,7 +184,20 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
   }, [busy, onActivateSession, shortcutSessions]);
 
   return (
-    <aside className="deepcode-gui-left-rail">
+    <aside
+      className="deepcode-gui-left-rail"
+      onPointerMove={movePointer}
+      onPointerUp={dropPointer}
+      onPointerCancel={endDrag}
+      onLostPointerCapture={endDrag}
+      onDragStart={(event) => event.preventDefault()}
+      onClickCapture={(event) => {
+        if (!dragged.current) return;
+        dragged.current = false;
+        event.preventDefault();
+        event.stopPropagation();
+      }}
+    >
       {usesNativeWindowChrome() && (
         <div className="deepcode-gui-sidebar-brand">
           <DeepCodeBrand />
@@ -122,6 +214,12 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
           <span>{t(language, 'deepcodeGui.nav.newChat')}</span>
         </button>
       </div>
+
+      {reorderError && (
+        <div className="deepcode-gui-sidebar-order-error" role="alert">
+          {t(language, 'deepcodeGui.sidebar.orderError', { detail: reorderError })}
+        </div>
+      )}
 
       <section className="deepcode-gui-sidebar-section">
         <div className="deepcode-gui-sidebar-section__heading deepcode-gui-sidebar-section__heading--project">
@@ -159,6 +257,7 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
                 <div
                   key={project.id}
                   className={`deepcode-gui-project-archive-group${current ? ' deepcode-gui-project-archive-group--current' : ''}`}
+                  {...dragProps({ kind: 'project', id: project.id })}
                 >
                   <div
                     className="deepcode-gui-project-archive-group__title"
@@ -214,6 +313,7 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
                           <div
                             className={`deepcode-gui-session-row${session.id === activeSessionId ? ' deepcode-gui-session-row--active' : ''}`}
                             key={session.id}
+                            {...dragProps({ kind: 'session', id: session.id, projectId: session.projectId })}
                           >
                             <button
                               type="button"
@@ -274,6 +374,7 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
                 <div
                   className={`deepcode-gui-session-row${session.id === activeSessionId ? ' deepcode-gui-session-row--active' : ''}`}
                   key={session.id}
+                  {...dragProps({ kind: 'session', id: session.id, projectId: session.projectId })}
                 >
                   <button
                     type="button"

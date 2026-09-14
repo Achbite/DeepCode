@@ -1092,30 +1092,38 @@
 
 .llm-profile__header {
   flex-wrap: wrap;
-  margin-bottom: 10px;
+  align-items: flex-end;
+  gap: 16px;
+  margin-bottom: 20px;
 }
 
-.llm-profile__header > .settings-field__input {
+.llm-profile__name {
   min-width: 180px;
   flex: 1 1 240px;
 }
 
-.llm-profile__header > .settings-field__select {
+.llm-profile__protocol {
   min-width: 170px;
   flex: 0 1 220px;
 }
 
 .llm-profile__enabled {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
 }
 
 .llm-profile__grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
+  gap: 16px;
 }
 
 .llm-profile__grid label,
+.llm-profile__name,
+.llm-profile__protocol,
 .settings-default-row {
   display: flex;
   flex-direction: column;
@@ -1128,7 +1136,90 @@
 }
 
 .llm-profile__actions {
-  margin-top: 10px;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+}
+
+.llm-settings .settings-toolbar-row {
+  margin: 0 0 24px;
+  gap: 10px;
+}
+
+.llm-settings__reload {
+  margin-left: auto;
+}
+
+.llm-settings .llm-default-row {
+  justify-content: space-between;
+  gap: 16px;
+  margin: 0;
+}
+
+.llm-settings__default-hint {
+  margin: 8px 0 0;
+  color: var(--text-muted, #a1a1aa);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.llm-settings .llm-profile-list {
+  margin-top: 24px;
+  gap: 20px;
+}
+
+.llm-settings .llm-profile {
+  min-width: 0;
+  margin: 0;
+  padding: 20px;
+  border-radius: 12px;
+  background: var(--dc-surface, var(--bg-surface));
+  color: var(--text-muted, #a1a1aa);
+  font-size: 12px;
+}
+
+.llm-settings .llm-profile .settings-field__input,
+.llm-settings .llm-profile .settings-field__select {
+  width: 100%;
+  min-height: 34px;
+}
+
+.llm-settings .settings-action-button {
+  min-height: 34px;
+  padding-inline: 14px;
+}
+
+.llm-settings .llm-profile__save {
+  margin-left: auto;
+  border-color: transparent;
+  background: var(--accent, #0a84ff);
+  color: #fff;
+  font-weight: 600;
+}
+
+.llm-settings .llm-profile__save:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent, #0a84ff) 90%, #000);
+}
+
+.llm-settings .llm-profile__remove {
+  border-color: transparent;
+  background: transparent;
+  color: var(--danger, #ff3b30);
+}
+
+.llm-settings .llm-profile__remove:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger, #ff3b30) 8%, transparent);
+}
+
+.llm-settings .settings-card__hint,
+.llm-settings .settings-error,
+.llm-settings .llm-profile__status {
+  margin: 12px 0 0;
+  padding: 0;
+  border: 0;
+  overflow-wrap: anywhere;
 }
 
 .settings-pill {
@@ -1434,8 +1525,8 @@
     width: 100%;
   }
 
-  .llm-profile__header > .settings-field__input,
-  .llm-profile__header > .settings-field__select,
+  .llm-profile__name,
+  .llm-profile__protocol,
   .llm-profile__enabled {
     width: 100%;
     margin-left: 0;
