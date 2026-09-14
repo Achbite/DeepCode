@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useLayoutEffect } from 'react';
 import { t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import SessionModelSelector from './SessionModelSelector';
@@ -68,6 +68,27 @@ export function ConversationComposer({
     canSend,
     showStopAction,
   } = composer;
+  const inputMode = pendingPlan ? 'plan' : pendingInteraction ? 'interaction' : 'message';
+  const compactInput = inputMode !== 'message';
+
+  useLayoutEffect(() => {
+    if (textareaRef.current) resizeComposerTextarea(textareaRef.current);
+  }, [draft, compactInput, textareaRef]);
+
+  useLayoutEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    let previousWidth = textarea.getBoundingClientRect().width;
+    const observer = new ResizeObserver(() => {
+      const width = textarea.getBoundingClientRect().width;
+      if (width === previousWidth) return;
+      previousWidth = width;
+      resizeComposerTextarea(textarea);
+    });
+    observer.observe(textarea);
+    return () => observer.disconnect();
+  }, [textareaRef]);
+
   return (
     <footer className={`local-agent__composer-shell${pendingPlan || pendingInteraction || pendingApproval
       ? ' local-agent__composer-shell--decision'
@@ -86,7 +107,6 @@ export function ConversationComposer({
         {!composer.canRestoreFailedDraft && <small>{language === 'zh-CN' ? '发送或清空当前草稿后可恢复。' : 'Send or clear the current draft to restore this one.'}</small>}
       </details>)}
       <div className="conversation-change-dock" aria-live="polite">{changeBar}</div>
-      <ComposerDecisionPanels language={language} composer={composer} />
       {projection?.queuedInputs.map((input) => <div className="local-agent__queued-input" key={input.commandId} role="status">
         <strong>{input.status === 'queued'
           ? (language === 'zh-CN' ? '等待加入当前任务' : 'Waiting to join this run')
@@ -94,14 +114,22 @@ export function ConversationComposer({
         <span>{input.text}{input.filesystemReferences.length ? ` · ${input.filesystemReferences.map((item) => item.displayName).join(', ')}` : ''}</span>
       </div>)}
       <div
-        className="local-agent__composer"
+        className={`local-agent__composer local-agent__composer--${inputMode}`}
+        onKeyDown={(event) => {
+          if (pendingPlan && event.target !== textareaRef.current && event.key === 'Escape'
+            && !event.repeat && !event.nativeEvent.isComposing && !event.defaultPrevented) {
+            event.preventDefault();
+            void composer.submitPlanDecision({ kind: 'cancel' });
+          }
+        }}
         onMouseDown={(event) => {
           const target = event.target as HTMLElement;
-          if (target.closest('button, input, select, textarea, label, a, [role="button"]')) return;
+          if (target.closest('button, input, select, textarea, label, a, [role="button"], .local-agent__interaction-panel, .local-agent__decision')) return;
           event.preventDefault();
           textareaRef.current?.focus();
         }}
       >
+        <ComposerDecisionPanels language={language} composer={composer} />
         {pluginPickerOpen && (
           <div
             ref={pluginPickerRef}
@@ -179,8 +207,10 @@ export function ConversationComposer({
         <textarea
           ref={textareaRef}
           value={draft}
-          rows={3}
-          placeholder={t(language, 'agent.composer.placeholder.task')}
+          rows={compactInput ? 1 : 3}
+          placeholder={t(language, pendingPlan ? 'agent.composer.placeholder.plan'
+            : pendingInteraction ? 'agent.composer.placeholder.interaction' : 'agent.composer.placeholder.task')}
+          disabled={Boolean(pendingInteraction && !pendingInteraction.allowFreeform)}
           onChange={(event) => updateDraft(
             event.target.value,
             event.target.selectionStart ?? event.target.value.length,
@@ -243,7 +273,7 @@ export function ConversationComposer({
         )}
         <div className="local-agent__composer-footer">
           <div className="local-agent__composer-tools">
-            <div ref={attachmentControlRef} className="local-agent__attachment-control">
+            {!composer.textDecision && <div ref={attachmentControlRef} className="local-agent__attachment-control">
               <button
                 type="button"
                 className="local-agent__attach"
@@ -299,7 +329,7 @@ export function ConversationComposer({
                   </button>
                 </div>
               )}
-            </div>
+            </div>}
             <ComposerPermissionControl language={language} composer={composer} />
           </div>
           <div className="local-agent__composer-actions">
@@ -314,25 +344,49 @@ export function ConversationComposer({
               onProfileChange={selectProfile}
               onReasoningEffortChange={selectReasoningEffort}
             />
-            {showStopAction && <button
-              type="button"
-              className="local-agent__send local-agent__send--stop"
-              aria-label={t(language, 'agent.composer.stopCurrentRun')}
-              title={t(language, 'agent.composer.stop')}
-              onClick={() => void cancelRun()}
-            ><DeepCodeShellIcon name="stop" /></button>}
-            <button
-              type="button"
-              className="local-agent__send"
-              aria-label={submitting
-                  ? t(language, 'agent.composer.sending')
-                  : t(language, 'agent.composer.send')}
-              title={t(language, 'agent.composer.sendEnter')}
-              disabled={!canSend}
-              onClick={() => void submitDraft()}
-            >
-              <DeepCodeShellIcon name="arrowUp" />
-            </button>
+            <div className="local-agent__composer-primary-actions">
+              {(pendingPlan || pendingInteraction?.allowFreeform) && <button
+                type="button"
+                className="local-agent__interaction-secondary"
+                disabled={submitting}
+                aria-keyshortcuts={pendingPlan ? 'Escape' : undefined}
+                onClick={async () => {
+                  if (pendingPlan) {
+                    await composer.submitPlanDecision({ kind: 'cancel' });
+                  } else {
+                    try {
+                      await composer.respondInteraction(t(language, 'agent.interaction.skip'));
+                    } catch {
+                      // The store retains the command error and the current answer.
+                    }
+                  }
+                }}
+              >
+                <span>{t(language, pendingPlan ? 'agent.plan.ignoreAndStop' : 'agent.interaction.skip')}</span>
+                {pendingPlan && <kbd aria-hidden="true">Esc</kbd>}
+              </button>}
+              {showStopAction && <button
+                type="button"
+                className="local-agent__send local-agent__send--stop"
+                aria-label={t(language, 'agent.composer.stopCurrentRun')}
+                title={t(language, 'agent.composer.stop')}
+                onClick={() => void cancelRun()}
+              ><DeepCodeShellIcon name="stop" /></button>}
+              {!showStopAction && <button
+                type="button"
+                className="local-agent__send"
+                aria-label={submitting
+                    ? t(language, 'agent.composer.sending')
+                    : pendingInteraction ? (language === 'zh-CN' ? '回答' : 'Answer')
+                      : pendingPlan ? (language === 'zh-CN' ? '提交修改意见' : 'Request changes')
+                        : t(language, 'agent.composer.send')}
+                title={t(language, 'agent.composer.sendEnter')}
+                disabled={!canSend}
+                onClick={() => void submitDraft()}
+              >
+                <DeepCodeShellIcon name="arrowUp" />
+              </button>}
+            </div>
           </div>
         </div>
       </div>
@@ -343,6 +397,11 @@ export function ConversationComposer({
       )}
     </footer>
   );
+}
+
+function resizeComposerTextarea(textarea: HTMLTextAreaElement): void {
+  textarea.style.height = 'auto';
+  textarea.style.height = `${textarea.scrollHeight}px`;
 }
 
 function filesystemPathDisplayName(absolutePath: string): string {

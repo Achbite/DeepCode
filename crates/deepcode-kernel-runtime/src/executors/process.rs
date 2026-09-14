@@ -359,7 +359,7 @@ fn invoke_shell(
         "durationMs": duration_ms,
         "environment": {
             "shell": bash_program.to_string_lossy(),
-            "interactive": false,
+            "interactive": terminal,
             "executionScope": execution_scope,
             "terminal": terminal,
             "pathSource": AGENT_SHELL_PATH_SOURCE,

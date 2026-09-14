@@ -598,7 +598,7 @@
     "agent.plan.requestRevisionLabel": "如需调整，直接在下方输入修改意见并发送",
     "agent.plan.adopt": "采用这份计划并继续",
     "agent.plan.adoptTodoHint": "确认执行范围，继续完成任务",
-    "agent.plan.ignoreAndStop": "忽略并终止请求",
+    "agent.plan.ignoreAndStop": "取消并停止",
     "agent.interaction.inputNeeded": "需要你的决定",
     "agent.interaction.details": "问题说明",
     "agent.interaction.skip": "跳过",
