@@ -1,6 +1,6 @@
 # DeepCode
 
-当前产品版本：**0.5.52**。
+当前产品版本：**0.5.60**。
 
 > English guide: [README.md](README.md)
 
@@ -32,6 +32,17 @@ DeepCode 是一个本地优先的编码 Agent 框架。Editor、DeepCode-GUI、C
 DeepCode 不包含 Requirement、Plan、Review 等并行工作流引擎。普通叙述和最终回答是 LLM 的原生 Markdown 正文；Session 只依据 typed Provider turn 是否包含工具调用来区分两者，并把当前 run 的文本增量作为可丢弃 `assistantDraft` 投影给所有界面。Plan 与 interaction 只能由 LLM 调用 Session 保留的结构化 control 工具产生，不使用 JSONL 正文封装、自然语言推断或失败回退。`plan.publish` 发布一份完整 revision；`plan.respond(confirm)` 只为精确的 workspace、operation 和 normalized targets 提交 session-scoped authority，并从 Plan 步骤原子生成 Todo。修订请求保留同一 Plan identity 并递增 revision，取消则不生成 authority 或 Todo。已确认的 Plan/Todo 会跨普通补充输入和后续 run 保留，直到显式 Plan lifecycle 事实将其 supersede、complete、cancel 或 invalidate。
 
 Session binding 始终把工作区工具限制在当前 run 的不可变目录快照内。`agent.permissions.workspaceMutation` 默认是 `plan`；改为 `allow` 会关闭工作区修改的 Plan admission 门禁，包括声明 `workspaceMode=write` 的 `bash` 调用。所选 Shell 工具（`bash` 或 `powershell`）从绑定工作区执行一条有界命令，并强制声明 `workspaceMode` 与 `executionScope`。`executionScope=workspace` 使用工作区沙箱：read 模式只可写 Kernel 持有的临时存储，write 模式需要精确的工作区修改 authority；平台适配分别使用 macOS sandbox-exec、Linux/WSL2 Bubblewrap 和需要初始化的原生 Windows 工作区支持；缺少条件时明确返回错误，详见[执行环境说明](docs/product/execution-environments.md)。`executionScope=host` 使用宿主用户环境，并额外要求 `agent.permissions.external`；若 Host 命令会修改工作区，必须声明 write 模式，因此同时需要工作区修改与 external authority。可选的 `terminal.stdin` 会向一次性临时 PTY 精确写入一次；未声明时 stdin 关闭，不创建可持续复用的 terminal session。命令从绑定工作区根目录启动，PATH 由 Host PATH 与现有标准开发工具目录组成；每次 attempt 只持有并回收自己创建的子进程组、PTY 与临时文件。退出码为零生成 completed ToolRecord；非零退出或超时生成 failed ToolRecord，并保留有界输出和退出事实。网络读取默认 `allow`；Host Bash 与外部 effect 工具使用独立 external 权限。`web.search` 与 `web.fetch` 保持为通用核心联网工具，GitHub、arXiv 与 PDF 专用工作流通过 Skill 或插件按需激活。`agent.permissions.engineeringDecisions` 独立控制实质工程路线不明确时通过 `interaction.request` 询问，还是委托 Agent 依据当前代码事实自行裁决。
+
+## 0.5.60 更新
+
+- Agent 工作时可以继续发送消息。Session 按顺序排队，在当前模型输出和工具结果完整落定后、下次模型请求前引入；等待决策时仍通过专门答复处理，只有显式停止才取消。
+- 内核工具和 Session 扩展接口按实际消费者简化。未选择插件的装载错误只影响该插件；本次选中的插件仍须完整装载成功。
+- 共享 Host 发现保留启动及代理错误，包含本轮 Windows 原生工作区 sandbox、进程执行和 Shell 选择修复。
+- 模型配置无效时，Host 和已有对话仍可打开；设置页保留配置错误并提供明确的重新配置入口。
+- 新配置默认提供 DeepSeek Flash 模板；每个模型在自己的配置卡内保存，上次选择的模型会作为新对话默认模型。
+- 侧边栏项目和对话支持拖动排序；复制、赞、踩采用一致的悬停和键盘聚焦交互。
+
+产品版本由包清单声明，生成的 `build-info.json` 记录 `productVersion`、源码提交、构建时间和源码状态。制品身份与数据库、wire schema 的版本分别表达。
 
 ## 选择界面
 
@@ -136,10 +147,10 @@ ARM64 Linux 产物改用 `bin/linux-arm64`。
 首次运行任务前：
 
 1. 打开“设置 → 模型与服务”。
-2. 新建 OpenAI-compatible、Anthropic 或 Ollama profile。
-3. 填写 Base URL、模型名和 Provider 所需的 API key。
-4. 启用 profile，设为默认值并保存。
-5. 界面提供 Probe 时，可用它检查连接。
+2. 使用初始 DeepSeek Flash 模板，或添加 OpenAI-compatible、Responses、Anthropic、Ollama profile。
+3. 填写 Provider 所需的 API key，按需要调整 Base URL 和模型名。
+4. 启用 profile，在该模型自己的配置卡内点击“保存模型”；保存和探测操作分别归属各模型。
+5. 在对话中选择模型，共享配置会记住该选择并作为新对话默认值；也可以直接在设置中调整默认模型。
 
 打包产物不会包含你的 API key。密钥保存在当前配置根的本地 secret store；不要分享该目录。
 
@@ -154,11 +165,13 @@ ARM64 Linux 产物改用 `bin/linux-arm64`。
 5. 输入希望 Agent 完成的编码任务。独立 Session 可以保持无 binding，直到确实需要访问文件夹。
 6. Agent 在 Provider 与工具循环运行时，将当前 typed turn 的 LLM 文本增量作为共享 `assistantDraft` 投影；turn 闭合后再提交为叙述或终答。
 7. Agent 发布 Plan 后，在可折叠 Plan 卡中审阅完整步骤和 mutation manifest；可以确认、用自由文本请求修订或取消。确认后卡片自动折叠但不会被删除，同时原子生成 Todo。若工作区修改策略设为 `allow`，Agent 可以在绑定工作区内直接工作，不必为了权限门禁发布 Plan。
-8. 对话中仍可切换模型，新的 profile 从后续 Provider turn 起生效。
+8. 对话中仍可切换模型，新的 profile 从后续 Provider turn 起生效；新对话默认使用上次选择的模型。
 9. 消息、Plan、activities、产物、上下文用量和 run 状态都来自同一份共享投影。
-10. 已提交的 Assistant 回答可以复制、赞、踩或清除反馈。赞踩是本地 Session 持久事实，重启后可恢复，不会由 GUI 私存，也不会发送给 Provider。
+10. 已提交的 Assistant 回答可以复制、赞、踩或清除反馈。操作栏在消息悬停或键盘聚焦时显示，鼠标移出后隐藏。赞踩是本地 Session 持久事实，重启后可恢复，不会由 GUI 私存，也不会发送给 Provider。
 11. 点击输入框中的上下文球可以查看当前 Provider 请求的上下文分区。分区条目数和估算取 Session，缓存命中/未命中取 Provider；缺失显示 `N/A`，GUI/TUI 不自行归因或重算。设置页显示由 Session 汇总、按新到旧排列的逐轮 Token 消耗（每页 10 条）。
 12. 复杂任务由 LLM 通过 `plan.publish` 发布完整 Plan；用户确认时 Session 从 Plan 步骤原子生成 Todo，后续 `plan.progress` 只能更新已生成条目的状态。右侧任务面板只消费该共享投影，不把工具调用或 GUI 推断伪装成任务。工具调用仍与叙述按 Session 时间线交错显示在主对话区。
+
+拖动项目可以调整项目顺序，拖动同一分组内的对话可以调整对话顺序。排序保存在用户设置中，重新打开后继续生效；排序不会改变对话所属项目或 Session 事实。
 
 删除 Session 会同时删除对话 Catalog 条目及其完整归档：Session events、command replay、binding 关系和 Kernel ToolRecord。活动 run 必须先停止。
 
@@ -192,7 +205,7 @@ ARM64 Linux 产物改用 `bin/linux-arm64`。
 
 ```bash
 ./DeepCode-TUI.command -C /path/to/project
-./DeepCode-TUI.command -C /path/to/project --session <session-id>
+./DeepCode-TUI.command --session <session-id>
 ```
 
 普通文本会提交到当前 Session。交互命令包括：
@@ -232,7 +245,7 @@ logs/                                         launcher 或 Kernel 日志（产�
 
 ### 没有可用模型
 
-打开“设置 → 模型与服务”，确认至少一个 profile 已启用并设为默认值，填写所需 API key，保存后 Probe。
+打开“设置 → 模型与服务”，填写所需 API key，在模型自己的配置卡内保存，然后选择已启用的模型。如果 Profile 文件无法读取，设置页会显示原始错误并提供明确的重新配置入口；有效配置保存前模型请求保持不可用，Session store 有效时已有对话仍可读取。
 
 ### CLI/TUI 无法连接本地 Daemon
 

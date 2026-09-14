@@ -41,37 +41,6 @@ export const DEEPSEEK_LLM_MODEL_OPTIONS = [
 export const GLM_LLM_MODEL_OPTIONS = ['glm-5.3', 'glm-5.2', 'glm-5.1'] as const;
 export const KIMI_LLM_MODEL_OPTIONS = ['kimi-k3', 'kimi-k2.7-code', 'kimi-k2.7-code-highspeed', 'kimi-k2.6'] as const;
 
-export const DEFAULT_LLM_PROVIDER_PROFILES: LlmProviderProfile[] = [
-  {
-    id: 'deepseek-v4-flash-openai',
-    name: 'DeepSeek Flash',
-    kind: 'responses',
-    providerFlavor: 'deepseek',
-    baseUrl: DEEPSEEK_OPENAI_BASE_URL,
-    model: 'deepseek-flash',
-    contextWindowTokens: 1000000,
-    maxOutputTokens: 384000,
-    temperature: 0.2,
-    reasoningEffort: 'high',
-    thinking: 'enabled',
-    enabled: true,
-  },
-  {
-    id: 'deepseek-v4-pro-openai',
-    name: 'DeepSeek V4 Pro',
-    kind: 'responses',
-    providerFlavor: 'deepseek',
-    baseUrl: DEEPSEEK_OPENAI_BASE_URL,
-    model: 'deepseek-v4-pro',
-    contextWindowTokens: 1000000,
-    maxOutputTokens: 384000,
-    temperature: 0.2,
-    reasoningEffort: 'max',
-    thinking: 'enabled',
-    enabled: true,
-  },
-];
-
 export interface LlmProfilesResult {
   profiles: LlmProviderProfile[];
   defaultProfileId?: string;
@@ -79,7 +48,9 @@ export interface LlmProfilesResult {
 }
 
 export interface PatchLlmProfilesRequest {
-  profiles: LlmProviderProfile[];
+  profiles?: LlmProviderProfile[];
+  profile?: LlmProviderProfile;
+  removeProfileId?: string;
   defaultProfileId?: string;
   secrets?: Record<string, string | null>;
 }

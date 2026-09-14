@@ -126,21 +126,9 @@ pub(crate) async fn user_settings_patch(
 }
 
 pub(crate) async fn llm_profiles_get(State(state): State<AppState>) -> Json<ApiResponse> {
-    let (mut profiles, store_path) = {
-        let gui = state.gui.lock().expect("gui state lock");
-        (
-            gui.llm_profiles.clone(),
-            gui.paths.llm_profiles_path.to_string_lossy().to_string(),
-        )
-    };
-    if !llm_profile_store_is_current(&profiles) {
-        return ApiResponse::error(
-            "invalid_llm_profile_store_schema",
-            "本地 LLM Profile 文件不是当前格式，请在设置页重新保存。",
-        );
-    }
-    profiles["storePath"] = json!(store_path);
-    ApiResponse::ok(profiles)
+    let gui = state.gui.lock().expect("gui state lock");
+    gui.llm_profiles
+        .settings_response(&gui.paths.llm_profiles_path)
 }
 
 pub(crate) async fn llm_profiles_patch(
@@ -157,7 +145,13 @@ pub(crate) async fn llm_profiles_patch(
             "LLM Profile 更新必须是 JSON 对象。",
         );
     };
-    const REQUEST_FIELDS: &[&str] = &["profiles", "defaultProfileId", "secrets"];
+    const REQUEST_FIELDS: &[&str] = &[
+        "profiles",
+        "profile",
+        "removeProfileId",
+        "defaultProfileId",
+        "secrets",
+    ];
     if body_object
         .keys()
         .any(|field| !REQUEST_FIELDS.contains(&field.as_str()))
@@ -167,6 +161,34 @@ pub(crate) async fn llm_profiles_patch(
             "LLM Profile 更新包含未知字段。",
         );
     }
+    if !["profiles", "profile", "removeProfileId"]
+        .iter()
+        .any(|field| body_object.contains_key(*field))
+    {
+        let Some(profile_id) = body
+            .get("defaultProfileId")
+            .and_then(Value::as_str)
+            .filter(|_| !body_object.contains_key("secrets"))
+        else {
+            return ApiResponse::error(
+                "invalid_llm_profiles_request",
+                "仅选择默认模型时需要 defaultProfileId，不能同时修改 secrets。",
+            );
+        };
+        let mut gui = state.gui.lock().expect("gui state lock");
+        let path = gui.paths.llm_profiles_path.clone();
+        if let Err(error) = gui.llm_profiles.select_default(&path, profile_id) {
+            return ApiResponse::error("select_default_llm_profile_failed", error);
+        }
+        return gui.llm_profiles.settings_response(&path);
+    }
+    let body = {
+        let gui = state.gui.lock().expect("gui state lock");
+        match expand_profile_edit(&gui.llm_profiles, body) {
+            Ok(body) => body,
+            Err(error) => return ApiResponse::error("invalid_llm_profiles_request", error),
+        }
+    };
     let Some(profile_items) = body.get("profiles").and_then(Value::as_array) else {
         return ApiResponse::error("invalid_llm_profiles", "profiles 必须是数组。");
     };
@@ -186,18 +208,24 @@ pub(crate) async fn llm_profiles_patch(
                 format!("LLM Profile id 重复：{profile_id}"),
             );
         }
-        if !llm_profile_value_is_current(profile) {
+        if let Err(error) = validate_llm_profile(profile) {
             return ApiResponse::error(
                 "invalid_llm_profile_schema",
-                format!("LLM Profile {profile_id} 不是当前格式。"),
+                format!("LLM Profile {profile_id}: {error}"),
             );
         }
     }
 
-    let requested_default = body
-        .get("defaultProfileId")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.trim() == *value);
+    let requested_default = match body.get("defaultProfileId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if !id.is_empty() && id.trim() == id => Some(id.as_str()),
+        _ => {
+            return ApiResponse::error(
+                "invalid_default_llm_profile",
+                "defaultProfileId 必须是非空模型 ID 或 null。",
+            )
+        }
+    };
     if let Some(default_id) = requested_default {
         let enabled = profile_items.iter().any(|profile| {
             profile.get("id").and_then(Value::as_str) == Some(default_id)
@@ -278,11 +306,8 @@ pub(crate) async fn llm_profiles_patch(
         "profiles": profiles,
         "defaultProfileId": requested_default
     });
-    if !llm_profile_store_is_current(&next_profiles) {
-        return ApiResponse::error(
-            "invalid_llm_profile_store_schema",
-            "提交后的 LLM Profile 文件不是当前格式。",
-        );
+    if let Err(error) = validate_llm_profile_store(&next_profiles) {
+        return ApiResponse::error("invalid_llm_profile_store_schema", error);
     }
     if let Err(error) = atomic_write_json(&secrets_path, &next_secret_store) {
         return ApiResponse::error("write_llm_secrets_failed", error);
@@ -296,7 +321,7 @@ pub(crate) async fn llm_profiles_patch(
     }
     {
         let mut gui = state.gui.lock().expect("gui state lock");
-        gui.llm_profiles = next_profiles.clone();
+        gui.llm_profiles = LlmProfileStore::Ready(next_profiles.clone());
     }
     next_profiles["storePath"] = json!(profiles_path.to_string_lossy());
     ApiResponse::ok(next_profiles)
@@ -461,40 +486,4 @@ pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), St
         }
     }
     Ok(())
-}
-
-pub(crate) fn default_llm_profiles() -> Value {
-    json!({
-        "profiles": [
-            {
-                "id": "deepseek-v4-flash-openai",
-                "name": "DeepSeek Flash",
-                "kind": "responses",
-                "providerFlavor": "deepseek",
-                "baseUrl": "https://api.deepseek.com",
-                "model": "deepseek-flash",
-                "contextWindowTokens": 1000000,
-                "maxOutputTokens": 384000,
-                "temperature": 0.2,
-                "reasoningEffort": "high",
-                "thinking": "enabled",
-                "enabled": true
-            },
-            {
-                "id": "deepseek-v4-pro-openai",
-                "name": "DeepSeek V4 Pro",
-                "kind": "responses",
-                "providerFlavor": "deepseek",
-                "baseUrl": "https://api.deepseek.com",
-                "model": "deepseek-v4-pro",
-                "contextWindowTokens": 1000000,
-                "maxOutputTokens": 384000,
-                "temperature": 0.2,
-                "reasoningEffort": "max",
-                "thinking": "enabled",
-                "enabled": true
-            }
-        ],
-        "defaultProfileId": "deepseek-v4-pro-openai"
-    })
 }

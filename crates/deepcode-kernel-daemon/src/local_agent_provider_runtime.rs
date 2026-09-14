@@ -219,8 +219,9 @@ fn capture_binding(
 }
 
 fn selected_profile_id(gui: &GuiState, requested: Option<&str>) -> Result<String, String> {
+    let configured_profiles = gui.llm_profiles.usable()?;
     let selected = requested.or_else(|| {
-        gui.llm_profiles
+        configured_profiles
             .get("defaultProfileId")
             .and_then(Value::as_str)
     });
@@ -301,6 +302,7 @@ mod tests {
 
 fn selected_profile<'a>(gui: &'a GuiState, profile_id: &str) -> Result<&'a Value, String> {
     gui.llm_profiles
+        .usable()?
         .get("profiles")
         .and_then(Value::as_array)
         .and_then(|profiles| {

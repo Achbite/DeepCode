@@ -1,6 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
-  DEFAULT_LLM_PROVIDER_PROFILES,
   DEEPSEEK_ANTHROPIC_BASE_URL,
   DEEPSEEK_LLM_MODEL_OPTIONS,
   DEEPSEEK_OPENAI_BASE_URL,
@@ -14,6 +13,7 @@ import type {
   LlmHostedWebSearch,
   LlmProviderKind,
   LlmProviderProfile,
+  LlmProfilesResult,
 } from '@deepcode/protocol';
 import {
   getLlmProfiles,
@@ -33,7 +33,6 @@ const PROVIDER_FLAVORS: LlmProviderFlavor[] = [
 ];
 
 const INVALID_PROFILE_STORE_SCHEMA = 'invalid_llm_profile_store_schema';
-const DEFAULT_REPLACEMENT_PROFILE_ID = 'deepseek-v4-pro-openai';
 
 type ProfileWithoutId<T> = T extends unknown ? Omit<T, 'id'> : never;
 type NewProfile = ProfileWithoutId<LlmProviderProfile>;
@@ -146,13 +145,6 @@ function createProfile(
   };
 }
 
-function currentProfileReplacementDrafts(): LlmProviderProfile[] {
-  return DEFAULT_LLM_PROVIDER_PROFILES.map((profile) => ({
-    ...profile,
-    enabled: profile.id === DEFAULT_REPLACEMENT_PROFILE_ID,
-  }));
-}
-
 function profileWithProviderKind(
   profile: LlmProviderProfile,
   kind: LlmProviderKind,
@@ -170,6 +162,7 @@ function optionalNumber(value: string): number | undefined {
 }
 
 type ProfileReadState = { status: 'loading' | 'loaded' } | { status: 'failed'; error: string };
+type ProfileFeedback = { tone: 'error' | 'success'; message: string };
 
 export function LlmProfileReadNotice({ state, hasProfiles, language }: {
   state: ProfileReadState; hasProfiles: boolean; language: UiLanguage;
@@ -185,47 +178,43 @@ export function LlmProfileReadNotice({ state, hasProfiles, language }: {
 
 const LlmSection: React.FC = () => {
   const [profiles, setProfiles] = useState<LlmProviderProfile[]>([]);
+  const [savedProfiles, setSavedProfiles] = useState<LlmProviderProfile[]>([]);
   const [profileRead, setProfileRead] = useState<ProfileReadState>({ status: 'loading' });
   const [defaultProfileId, setDefaultProfileId] = useState<string | undefined>();
   const [secrets, setSecrets] = useState<Record<string, string>>({});
-  const [storePath, setStorePath] = useState<string | undefined>();
-  const [storeReplacementRequired, setStoreReplacementRequired] = useState(false);
+  const [storeRepairRequired, setStoreRepairRequired] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const [messageTone, setMessageTone] = useState<'error' | 'success'>('error');
+  const [pendingAction, setPendingAction] = useState<{
+    kind: 'save' | 'remove' | 'default'; profileId?: string;
+  } | null>(null);
+  const [profileFeedback, setProfileFeedback] = useState<Record<string, ProfileFeedback>>({});
+  const [defaultFeedback, setDefaultFeedback] = useState<ProfileFeedback | null>(null);
   const [probeState, setProbeState] = useState<Record<string, string>>({});
   const language = normalizeUiLanguage(
     useSettingsStore((s) => s.effectiveSettings['workbench.language'])
   );
 
   const hasProfiles = profiles.length > 0;
-  const profileStoreWritable = profileRead.status === 'loaded' || storeReplacementRequired;
+  const profileStoreWritable = profileRead.status === 'loaded' || storeRepairRequired;
 
   const load = async () => {
     setLoading(true);
     setProfileRead({ status: 'loading' });
-    setMessage(null);
+    setDefaultFeedback(null);
     const result = await getLlmProfiles();
-    if (result.ok && result.data) {
+    if (result.data && (result.ok || result.error === INVALID_PROFILE_STORE_SCHEMA)) {
       setProfiles(result.data.profiles);
-      setDefaultProfileId(result.data.defaultProfileId);
-      setStorePath(result.data.storePath);
-      setStoreReplacementRequired(false);
-      setProfileRead({ status: 'loaded' });
-    } else if (result.error === INVALID_PROFILE_STORE_SCHEMA) {
-      const replacementDrafts = currentProfileReplacementDrafts();
-      setProfiles(replacementDrafts);
-      setDefaultProfileId(
-        replacementDrafts.find((profile) => (
-          profile.id === DEFAULT_REPLACEMENT_PROFILE_ID && profile.enabled
-        ))?.id ?? replacementDrafts.find((profile) => profile.enabled)?.id
-      );
-      setStorePath(undefined);
+      setSavedProfiles(result.data.profiles);
       setSecrets({});
+      setProfileFeedback({});
       setProbeState({});
-      setStoreReplacementRequired(true);
-      setProfileRead({ status: 'failed', error: result.message ?? result.error });
+      setDefaultProfileId(result.data.defaultProfileId);
+      setStoreRepairRequired(!result.ok);
+      setProfileRead(result.ok
+        ? { status: 'loaded' }
+        : { status: 'failed', error: result.message ?? result.error! });
     } else {
+      setStoreRepairRequired(result.error === INVALID_PROFILE_STORE_SCHEMA);
       setProfileRead({ status: 'failed', error: result.message ?? result.error ?? t(language, 'settings.llm.loadFailed') });
     }
     setLoading(false);
@@ -266,12 +255,12 @@ const LlmSection: React.FC = () => {
   ) => {
     const profile = createProfile(preset);
     setProfiles((prev) => [...prev, profile]);
-    if (profile.enabled) {
+    if (storeRepairRequired && profile.enabled) {
       setDefaultProfileId((prev) => prev ?? profile.id);
     }
   };
 
-  const removeProfile = (id: string) => {
+  const removeDraft = (id: string) => {
     setProfiles((prev) => prev.filter((profile) => profile.id !== id));
     setSecrets((prev) => {
       const next = { ...prev };
@@ -279,50 +268,103 @@ const LlmSection: React.FC = () => {
       return next;
     });
 
+    setProfileFeedback((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setProbeState((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
   };
 
-  const save = async () => {
-    if (loading || !profileStoreWritable) return;
-    if (!profiles.some((profile) => profile.id === defaultProfileId && profile.enabled)) return;
-    setLoading(true);
-    setMessage(null);
-    const savableProfiles = profiles;
-    const replacementProfileMissingApiKey = storeReplacementRequired
-      ? savableProfiles.find((profile) => (
-        profile.enabled
-        && profile.kind !== 'ollama'
-        && !profile.secretRef
-        && !secrets[profile.id]?.trim()
-      ))
-      : undefined;
-    if (replacementProfileMissingApiKey) {
-      setMessageTone('error');
-      setMessage(t(language, 'settings.llm.reenterRecoveredApiKey', {
-        name: replacementProfileMissingApiKey.name,
-      }));
-      setLoading(false);
-      return;
-    }
+  const acceptSavedResult = (data: LlmProfilesResult) => {
+    setSavedProfiles(data.profiles);
+    setDefaultProfileId(data.defaultProfileId);
+    setStoreRepairRequired(false);
+    setProfileRead({ status: 'loaded' });
+    window.dispatchEvent(new CustomEvent('deepcode:llm-profiles-updated'));
+  };
+
+  const save = async (profile: LlmProviderProfile) => {
+    if (loading || pendingAction || !profileStoreWritable) return;
+    setPendingAction({ kind: 'save', profileId: profile.id });
+    setProfileFeedback((prev) => {
+      const next = { ...prev };
+      delete next[profile.id];
+      return next;
+    });
     const result = await patchLlmProfiles({
-      profiles: savableProfiles,
-      defaultProfileId,
-      secrets,
+      profile,
+      ...(storeRepairRequired && defaultProfileId ? { defaultProfileId } : {}),
+      ...(secrets[profile.id] ? { secrets: { [profile.id]: secrets[profile.id] } } : {}),
     });
     if (result.ok && result.data) {
-      setProfiles(result.data.profiles);
-      setDefaultProfileId(result.data.defaultProfileId);
-      setStorePath(result.data.storePath);
-      setSecrets({});
-      setStoreReplacementRequired(false);
-      setProfileRead({ status: 'loaded' });
-      setMessageTone('success');
-      setMessage(t(language, 'settings.llm.saved'));
-      window.dispatchEvent(new CustomEvent('deepcode:llm-profiles-updated'));
+      const savedProfile = result.data.profiles.find((item) => item.id === profile.id);
+      if (savedProfile) {
+        setProfiles((prev) => prev.map((item) => item.id === profile.id ? savedProfile : item));
+        setSecrets((prev) => {
+          const next = { ...prev };
+          delete next[profile.id];
+          return next;
+        });
+        acceptSavedResult(result.data);
+        setProfileFeedback((prev) => ({
+          ...prev, [profile.id]: { tone: 'success', message: t(language, 'settings.llm.saved') },
+        }));
+      } else {
+        setProfileFeedback((prev) => ({
+          ...prev, [profile.id]: { tone: 'error', message: t(language, 'settings.llm.savedProfileMissing') },
+        }));
+      }
     } else {
-      setMessageTone('error');
-      setMessage(result.message ?? t(language, 'settings.llm.saveFailed'));
+      setProfileFeedback((prev) => ({
+        ...prev, [profile.id]: { tone: 'error', message: result.message ?? result.error ?? t(language, 'settings.llm.saveFailed') },
+      }));
     }
-    setLoading(false);
+    setPendingAction(null);
+  };
+
+  const removeProfile = async (id: string) => {
+    if (loading || pendingAction) return;
+    if (!savedProfiles.some((profile) => profile.id === id)) {
+      removeDraft(id);
+      if (storeRepairRequired && defaultProfileId === id) setDefaultProfileId(undefined);
+      return;
+    }
+    if (!profileStoreWritable) return;
+    setPendingAction({ kind: 'remove', profileId: id });
+    const result = await patchLlmProfiles({ removeProfileId: id });
+    if (result.ok && result.data) {
+      removeDraft(id);
+      acceptSavedResult(result.data);
+    } else {
+      setProfileFeedback((prev) => ({
+        ...prev, [id]: { tone: 'error', message: result.message ?? result.error ?? t(language, 'settings.llm.removeFailed') },
+      }));
+    }
+    setPendingAction(null);
+  };
+
+  const saveDefault = async (id: string) => {
+    if (loading || pendingAction) return;
+    setDefaultFeedback(null);
+    if (storeRepairRequired) {
+      setDefaultProfileId(id);
+      return;
+    }
+    if (!profileStoreWritable) return;
+    setPendingAction({ kind: 'default' });
+    const result = await patchLlmProfiles({ defaultProfileId: id });
+    if (result.ok && result.data) {
+      acceptSavedResult(result.data);
+      setDefaultFeedback({ tone: 'success', message: t(language, 'settings.llm.defaultSaved') });
+    } else {
+      setDefaultFeedback({ tone: 'error', message: result.message ?? result.error ?? t(language, 'settings.llm.saveFailed') });
+    }
+    setPendingAction(null);
   };
 
   const probe = async (profileId: string) => {
@@ -346,28 +388,30 @@ const LlmSection: React.FC = () => {
   };
 
   const defaultOptions = useMemo(
-    () => profiles
+    () => (storeRepairRequired ? profiles : savedProfiles)
       .filter((profile) => profile.enabled)
       .map((profile) => ({ id: profile.id, name: profile.name })),
-    [profiles]
+    [profiles, savedProfiles, storeRepairRequired]
   );
 
   const defaultValid = defaultOptions.some((profile) => profile.id === defaultProfileId);
-  const selectedDefault = profiles.find((profile) => profile.id === defaultProfileId);
+  const showDefaultControl = savedProfiles.length > 0 || !!defaultProfileId
+    || (storeRepairRequired && hasProfiles);
+  const selectedDefault = (storeRepairRequired ? profiles : savedProfiles)
+    .find((profile) => profile.id === defaultProfileId);
 
   return (
-    <div>
+    <div className="llm-settings">
       <h2 className="settings-title">{t(language, 'settings.llm.title')}</h2>
 
-      <div className="settings-card">
-        <h3 className="settings-card__title">{t(language, 'settings.llm.profiles')}</h3>
-        <p className="settings-card__body">
+      <div className="llm-settings__content">
+        <p className="settings-section-description">
           {t(language, 'settings.llm.body')}
         </p>
 
-        {storeReplacementRequired && (
+        {storeRepairRequired && (
           <div className="settings-recovery-notice" role="alert">
-            {t(language, 'settings.llm.replaceInvalidStore')}
+            {t(language, 'settings.llm.repairInvalidStore')}
           </div>
         )}
 
@@ -379,39 +423,40 @@ const LlmSection: React.FC = () => {
           >
             {t(language, 'settings.llm.addProfile')}
           </button>
-          {PROFILE_PRESETS.map((preset) => (
-            <button
-              className="settings-action-button"
-              key={preset.labelKey}
-              onClick={() => addProfile(preset.profile)}
-              disabled={loading}
-            >
-              {t(language, preset.labelKey)}
-            </button>
-          ))}
-          <button
-            className="settings-action-button"
-            onClick={() => void save()}
-            disabled={loading || !profileStoreWritable || !hasProfiles || !defaultValid}
-          >
-            {t(language, 'settings.common.save')}
-          </button>
-          <button
-            className="settings-action-button"
-            onClick={() => void load()}
+          <select
+            className="settings-field__select"
+            aria-label={t(language, 'settings.llm.addPreset')}
+            value=""
+            onChange={(event) => {
+              const preset = PROFILE_PRESETS.find((item) => item.labelKey === event.target.value);
+              if (preset) addProfile(preset.profile);
+            }}
             disabled={loading}
+          >
+            <option value="" disabled>{t(language, 'settings.llm.addPreset')}</option>
+            {PROFILE_PRESETS.map((preset) => (
+              <option key={preset.labelKey} value={preset.labelKey}>
+                {t(language, preset.labelKey)}
+              </option>
+            ))}
+          </select>
+          <button
+            className="settings-action-button llm-settings__reload"
+            onClick={() => void load()}
+            disabled={loading || !!pendingAction}
           >
             {t(language, 'settings.common.reload')}
           </button>
         </div>
 
-        {(hasProfiles || defaultProfileId) && (
+        {showDefaultControl && (
           <label className="llm-default-row">
             <span>{t(language, 'settings.llm.defaultProfile')}</span>
             <select
               className="settings-field__select"
               value={defaultProfileId ?? ''}
-              onChange={(e) => setDefaultProfileId(e.target.value)}
+              onChange={(e) => void saveDefault(e.target.value)}
+              disabled={loading || !!pendingAction || !profileStoreWritable || defaultOptions.length === 0}
             >
               {!defaultValid && <option value={defaultProfileId ?? ''} disabled>
                 {selectedDefault?.name ?? defaultProfileId ?? t(language, 'agent.profile.selectionRequired')}
@@ -426,36 +471,67 @@ const LlmSection: React.FC = () => {
           </label>
         )}
 
-        {(hasProfiles || defaultProfileId) && !defaultValid && <p className="settings-card__hint" role="alert">
+        {defaultOptions.length > 0 && (
+          <p className="llm-settings__default-hint">
+            {t(language, storeRepairRequired ? 'settings.llm.defaultRepairHint' : 'settings.llm.defaultHint')}
+          </p>
+        )}
+        {defaultFeedback && (
+          <div
+            className={defaultFeedback.tone === 'error' ? 'settings-error' : 'llm-profile__status'}
+            role={defaultFeedback.tone === 'error' ? 'alert' : 'status'}
+          >
+            {defaultFeedback.message}
+          </div>
+        )}
+
+        {showDefaultControl && !defaultValid && <p className="settings-card__hint" role="alert">
           {t(language, 'settings.llm.defaultUnavailable')}
         </p>}
 
         <LlmProfileReadNotice state={profileRead} hasProfiles={hasProfiles} language={language} />
 
         <div className="llm-profile-list">
-          {profiles.map((profile) => (
-            <div className="llm-profile" key={profile.id}>
+          {profiles.map((profile) => {
+            const savedProfile = savedProfiles.find((item) => item.id === profile.id);
+            const hasUnsavedChanges = !savedProfile
+              || JSON.stringify(profile) !== JSON.stringify(savedProfile)
+              || !!secrets[profile.id];
+            const feedback = profileFeedback[profile.id];
+            return (
+            <fieldset
+              className="llm-profile"
+              key={profile.id}
+              aria-label={profile.name || t(language, 'settings.llm.profileName')}
+              disabled={loading || pendingAction?.profileId === profile.id}
+            >
               <div className="llm-profile__header">
-                <input
-                  className="settings-field__input"
-                  value={profile.name}
-                  onChange={(e) => updateProfile(profile.id, { name: e.target.value })}
-                  placeholder={t(language, 'settings.llm.profileName')}
-                />
-                <select
-                  className="settings-field__select"
-                  value={profile.kind}
-                  onChange={(e) => updateProfileProviderKind(
-                    profile.id,
-                    e.target.value as LlmProviderKind,
-                  )}
-                >
-                  {PROVIDERS.map((provider) => (
-                    <option key={provider} value={provider}>
-                      {t(language, `settings.llm.providerKind.${provider}`)}
-                    </option>
-                  ))}
-                </select>
+                <label className="llm-profile__name">
+                  <span>{t(language, 'settings.llm.profileName')}</span>
+                  <input
+                    className="settings-field__input"
+                    value={profile.name}
+                    onChange={(e) => updateProfile(profile.id, { name: e.target.value })}
+                    placeholder={t(language, 'settings.llm.profileName')}
+                  />
+                </label>
+                <label className="llm-profile__protocol">
+                  <span>{t(language, 'settings.llm.protocol')}</span>
+                  <select
+                    className="settings-field__select"
+                    value={profile.kind}
+                    onChange={(e) => updateProfileProviderKind(
+                      profile.id,
+                      e.target.value as LlmProviderKind,
+                    )}
+                  >
+                    {PROVIDERS.map((provider) => (
+                      <option key={provider} value={provider}>
+                        {t(language, `settings.llm.providerKind.${provider}`)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
                 <label className="llm-profile__enabled">
                   <input
                     type="checkbox"
@@ -528,19 +604,6 @@ const LlmSection: React.FC = () => {
                     }
                     placeholder="deepseek-v4-flash"
                   />
-                  <datalist id="llm-model-options">
-                    {[
-                      ...DEEPSEEK_LLM_MODEL_OPTIONS,
-                      ...GLM_LLM_MODEL_OPTIONS,
-                      ...KIMI_LLM_MODEL_OPTIONS,
-                    ].map((model) => (
-                      <option
-                        key={model}
-                        value={model}
-                        label={model}
-                      />
-                    ))}
-                  </datalist>
                 </label>
                 <label>
                   <span>{t(language, 'settings.llm.apiKey')}</span>
@@ -638,46 +701,62 @@ const LlmSection: React.FC = () => {
                   className="settings-action-button"
                   onClick={() => void probe(profile.id)}
                   disabled={
-                    loading
-                    || (profile.kind !== 'ollama' && !profile.secretRef)
-                    || !!secrets[profile.id]
+                    loading || !!pendingAction || !profileStoreWritable
+                    || !savedProfile || hasUnsavedChanges
+                    || (savedProfile.kind !== 'ollama' && !savedProfile.secretRef)
                   }
-                  title={secrets[profile.id]
-                    ? t(language, 'settings.llm.saveKeyBeforeProbe')
+                  title={hasUnsavedChanges
+                    ? t(language, 'settings.llm.saveBeforeProbe')
                     : t(language, 'settings.llm.probe')}
                 >
                   {t(language, 'settings.llm.probe')}
                 </button>
                 <button
-                  className="settings-action-button"
-                  onClick={() => removeProfile(profile.id)}
-                  disabled={loading}
+                  className="settings-action-button llm-profile__remove"
+                  onClick={() => void removeProfile(profile.id)}
+                  disabled={loading || !!pendingAction || (!!savedProfile && !profileStoreWritable)}
+                  title={savedProfile && defaultProfileId === profile.id
+                    ? t(language, 'settings.llm.removeDefaultHint')
+                    : t(language, 'settings.common.remove')}
                 >
                   {t(language, 'settings.common.remove')}
                 </button>
-                {probeState[profile.id] && (
-                  <span className="llm-profile__status">
-                    {probeState[profile.id]}
-                  </span>
-                )}
+                <button
+                  className="settings-action-button llm-profile__save"
+                  onClick={() => void save(profile)}
+                  disabled={loading || !!pendingAction || !profileStoreWritable}
+                >
+                  {t(language, pendingAction?.kind === 'save' && pendingAction.profileId === profile.id
+                    ? 'settings.llm.savingProfile'
+                    : 'settings.llm.saveProfile')}
+                </button>
               </div>
-            </div>
-          ))}
+              {feedback && (
+                <div
+                  className={feedback.tone === 'error' ? 'settings-error' : 'llm-profile__status'}
+                  role={feedback.tone === 'error' ? 'alert' : 'status'}
+                >
+                  {feedback.message}
+                </div>
+              )}
+              {probeState[profile.id] && (
+                <div className="llm-profile__status" role="status">
+                  {probeState[profile.id]}
+                </div>
+              )}
+            </fieldset>
+            );
+          })}
         </div>
 
-        {profileRead.status === 'loaded' && storePath && (
-          <div className="settings-card__hint">
-            {t(language, 'settings.llm.profileStoreLoaded')}
-          </div>
-        )}
-        {message && (
-          <div
-            className={messageTone === 'success' ? 'settings-save-message' : 'settings-error'}
-            role={messageTone === 'success' ? 'status' : 'alert'}
-          >
-            {message}
-          </div>
-        )}
+        <datalist id="llm-model-options">
+          {[
+            ...DEEPSEEK_LLM_MODEL_OPTIONS,
+            ...GLM_LLM_MODEL_OPTIONS,
+            ...KIMI_LLM_MODEL_OPTIONS,
+          ].map((model) => <option key={model} value={model} />)}
+        </datalist>
+
       </div>
     </div>
   );

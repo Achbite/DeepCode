@@ -1,5 +1,7 @@
 # Skill / MCP 链路输入
 
+产品版本和插件使用说明见[项目 README](../../README.zh-CN.md)。本目录随源码发布，不单独声明产品版本。
+
 该目录只保留两项可由测试临时装配的原始输入：
 
 - `skills/text-echo-declarative/SKILL.md` 是纯 instruction contribution；它不授予

@@ -464,12 +464,13 @@
 }
 
 .local-agent__message--assistant:hover .local-agent__message-actions,
-.local-agent__message-actions:focus-within {
+.local-agent__message-actions:has(button:focus-visible) {
   opacity: 1;
   pointer-events: auto;
 }
 
 .local-agent .local-agent__message-actions button {
+  position: relative;
   display: grid;
   width: 24px;
   height: 24px;

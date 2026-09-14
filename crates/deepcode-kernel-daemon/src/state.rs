@@ -28,14 +28,18 @@ pub(crate) struct GuiState {
     _config_root_lease: ConfigRootLease,
     pub(crate) paths: HostPaths,
     pub(crate) user_settings: Value,
-    pub(crate) llm_profiles: Value,
+    pub(crate) llm_profiles: LlmProfileStore,
     pub(crate) conversation_catalog: crate::conversation_catalog::ConversationCatalog,
     pub(crate) conversation_catalog_error: Option<String>,
 }
 
 impl GuiState {
     pub(crate) fn open() -> Result<Self, String> {
-        let paths = HostPaths::new();
+        Self::open_at(&user_config_root())
+    }
+
+    pub(crate) fn open_at(root: &FsPath) -> Result<Self, String> {
+        let paths = HostPaths::at(root);
         let config_root_lease = ConfigRootLease::acquire(&paths.root_owner_lease_path)?;
         let user_settings = match read_optional_json_file(&paths.settings_path)? {
             Some(value @ Value::Object(_)) => {
@@ -45,11 +49,7 @@ impl GuiState {
             Some(_) => return Err("本地用户设置文件必须是 JSON 对象。".to_string()),
             None => default_user_settings(),
         };
-        let llm_profiles = match read_optional_json_file(&paths.llm_profiles_path)? {
-            Some(value) if llm_profile_store_is_current(&value) => value,
-            Some(_) => return Err("本地 LLM Profile 文件不是当前格式。".to_string()),
-            None => default_llm_profiles(),
-        };
+        let llm_profiles = LlmProfileStore::load(&paths.llm_profiles_path);
         let (conversation_catalog, conversation_catalog_error) =
             match crate::conversation_catalog::ConversationCatalog::load(&paths.catalog_store_path)
             {
@@ -71,8 +71,7 @@ impl GuiState {
 }
 
 impl HostPaths {
-    pub(crate) fn new() -> Self {
-        let root = user_config_root();
+    fn at(root: &FsPath) -> Self {
         let settings_dir = root
             .join("config")
             .join("user")

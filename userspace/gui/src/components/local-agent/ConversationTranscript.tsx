@@ -198,7 +198,6 @@ export function ConversationTranscript({
                     type="button"
                     className={item.value.feedback === 'up' ? 'is-selected' : ''}
                     aria-pressed={item.value.feedback === 'up'}
-                    title={t(language, 'agent.message.helpful')}
                     aria-label={t(language, 'agent.message.helpful')}
                     disabled={submitting}
                     onClick={() => void updateMessageFeedback(
@@ -207,12 +206,14 @@ export function ConversationTranscript({
                     )}
                   >
                     <DeepCodeShellIcon name="thumbUp" />
+                    <span className="local-agent__message-action-hint" aria-hidden="true">
+                      {t(language, 'agent.message.helpful')}
+                    </span>
               </button>
               <button
                     type="button"
                     className={item.value.feedback === 'down' ? 'is-selected' : ''}
                     aria-pressed={item.value.feedback === 'down'}
-                    title={t(language, 'agent.message.notHelpful')}
                     aria-label={t(language, 'agent.message.notHelpful')}
                     disabled={submitting}
                     onClick={() => void updateMessageFeedback(
@@ -221,6 +222,9 @@ export function ConversationTranscript({
                     )}
                   >
                     <DeepCodeShellIcon name="thumbDown" />
+                    <span className="local-agent__message-action-hint" aria-hidden="true">
+                      {t(language, 'agent.message.notHelpful')}
+                    </span>
               </button>
             </div>
           )}
