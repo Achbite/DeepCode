@@ -1541,7 +1541,7 @@ write_readme() {
   DeepCode-GUI          Linux DeepCode-GUI shell, shares the same Kernel and config"
   fi
   cat > "$dist_dir/README.txt" <<README
-DeepCode Unified Distribution ($platform)
+DeepCode $PACKAGE_PRODUCT_VERSION Unified Distribution ($platform)
 =========================================
 
 This folder is one DeepCode host distribution. GUI, CLI, and TUI entries share
@@ -1550,6 +1550,14 @@ and configuration directory.
 Editor assets live in web/. DeepCode-GUI assets live in web-deepcode-gui/.
 The single Agent Loop and projection reducer live in the TS session-core package;
 all tool effects enter the Rust Kernel through its local execution port.
+
+Artifact identity is recorded in build-info.json: productVersion, buildCommit,
+buildTimeUtc and source state. Database schema versions are independent.
+
+Configure the initial DeepSeek Flash template or add a model under Settings >
+Models & services. Save each model in its own card. The last selected model is
+remembered for new conversations. Project and conversation order can be changed
+by dragging within the sidebar's existing groups.
 
 Writable package-local data is preserved across package refreshes:
   config/user/local/settings/     User settings and LLM profiles.

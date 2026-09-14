@@ -1,5 +1,7 @@
 # DeepCode 品牌与界面图标
 
+产品版本与当前界面功能见[项目 README](../../README.zh-CN.md)。本目录保存图标源资产，按钮悬停、键盘聚焦和赞踩状态由使用图标的 UI 组件处理。
+
 DeepCode 原创品牌标识、定制路径字标与 31 枚界面图标。设计参考 Apple Human Interface Guidelines 对简洁轮廓、视觉一致性、文字可读性和明暗环境的建议；图形与字形均为本项目原创绘制。
 
 ![DeepCode 品牌与图标总览](preview/deepcode-brand-sheet.png)

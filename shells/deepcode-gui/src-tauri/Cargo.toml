@@ -2,7 +2,7 @@
 
 [package]
 name = "deepcode-gui-tauri-shell"
-version = "0.5.52"
+version = "0.5.60"
 edition = "2021"
 license = "MIT"
 rust-version = "1.86"

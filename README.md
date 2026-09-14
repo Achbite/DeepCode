@@ -1,12 +1,23 @@
 # DeepCode
 
-Current product version: **0.5.52**.
+Current product version: **0.5.60**.
 
 > 中文说明：[README.zh-CN.md](README.zh-CN.md)
 
 DeepCode is a local-first coding-agent framework. The Editor, DeepCode-GUI, CLI, and TUI share one local Session Runtime, Kernel, and `SessionProjection`; their differences are limited to rendering and interaction.
 
 “Local-first” means workspace access, the Session journal, shared projections, tool execution, and tool records stay on this machine. Prompts and context selected by the Agent are still sent to the configured model provider unless you use a local provider such as Ollama.
+
+## What's new in 0.5.60
+
+- Submit messages while the Agent is working. Session queues them in order and introduces them before the next model request after the current model output and tool results settle. Pending decisions keep their dedicated response flow; stopping is explicit.
+- Kernel tools and Session extension points have been simplified around their actual consumers. An unselected plugin's loading error stays local to that plugin; selected plugins must load successfully.
+- Shared Host discovery preserves startup and proxy errors. Native Windows workspace sandbox, process execution, and shell selection include the current Windows fixes.
+- Invalid model configuration no longer prevents the Host from starting or displaying existing conversations. Settings retains the configuration error and provides an explicit repair action.
+- A new configuration starts with a DeepSeek Flash template. Save each model in its own configuration card; the last selected model becomes the default for new conversations.
+- Drag projects and conversations to reorder the sidebar. Copy, thumbs-up, and thumbs-down actions now share consistent hover and keyboard-focus behavior.
+
+The release version is declared in the package manifests. Generated `build-info.json` records `productVersion`, source commit, build time, and source state; these identify the artifact independently of database and wire schema versions.
 
 ## How it works
 
@@ -148,10 +159,10 @@ See [Execution environments](docs/product/execution-environments.md) for platfor
 Before the first task:
 
 1. Open **Settings → Models & services**.
-2. Create an OpenAI-compatible, Anthropic, or Ollama profile.
-3. Enter the base URL, model, and any API key required by the provider.
-4. Enable the profile, select it as the default, and save.
-5. Use **Probe** when available to check connectivity.
+2. Use the initial DeepSeek Flash template, or add an OpenAI-compatible, Responses, Anthropic, or Ollama profile.
+3. Enter the API key required by the provider and adjust the base URL and model if needed.
+4. Enable the profile and use **Save model** in that model's card. Each saved model has its own save and probe actions.
+5. Select a model in the conversation. The shared configuration remembers that selection as the default for new conversations; Settings can also change the default directly.
 
 Packages never include your API key. Secrets are stored in the active configuration root's local secret store; do not share that directory.
 
@@ -166,11 +177,13 @@ For providers that require a reasoning field to be echoed across a tool continua
 5. Describe the coding result you want. An independent Session may remain unbound until folder access is actually needed.
 6. While the Provider/tool loop runs, Session projects the current typed turn's LLM text deltas as a shared `assistantDraft`, then commits that text as narrative or a final answer when the turn closes.
 7. When a Plan is published, review its complete steps and mutation manifest in the expandable Plan card. Confirm it, request a revision with free-form feedback, or cancel it. Confirmation automatically collapses the card without removing it and atomically creates the Todo list. If workspace mutation is configured as `allow`, the Agent may work directly inside bound workspaces without publishing a gate-only Plan.
-8. The model selector remains available during the conversation and changes subsequent Provider turns.
+8. The model selector remains available during the conversation and changes subsequent Provider turns. New conversations start with the last selected model.
 9. Messages, Plan state, activities, artifacts, context usage, and run status all come from the shared projection.
-10. A committed Assistant answer can be copied, rated up or down, or have its rating cleared. Ratings are durable local Session facts, recover after restart, are not stored by the GUI, and are not sent to the Provider.
+10. A committed Assistant answer can be copied, rated up or down, or have its rating cleared. The action bar appears on message hover or keyboard focus and hides after the pointer leaves. Ratings are durable local Session facts, recover after restart, are not stored by the GUI, and are not sent to the Provider.
 11. Click the context ball in the composer to inspect the current Provider request partitions. Per-partition item counts and estimates come from Session; cache hit and miss counts come from Provider usage. Missing facts display `N/A`, and GUI/TUI do not attribute or recompute them. Settings shows Session-aggregated per-round token consumption newest first, 10 rows per page.
 12. For complex work, the LLM publishes a complete Plan through `plan.publish`; confirmation atomically seeds the Todo list from Plan steps, and later `plan.progress` calls may update only those generated item states. The right task panel consumes only that shared projection; it does not reinterpret tool calls or GUI state as tasks. Tool calls remain interleaved with narrative in the main Session timeline.
+
+Drag a project to change project order, or drag a conversation within its current group to change conversation order. The order is saved in user settings and survives reopening. Sorting does not move conversations between projects or change Session facts.
 
 Deleting a Session deletes the conversation catalog entry and its complete archive: Session events, command replay rows, binding relations, and Kernel tool records. An active run must be stopped first.
 
@@ -204,7 +217,7 @@ Only an explicit `-C` / `--workspace` creates a binding for a new CLI Session; t
 
 ```bash
 ./DeepCode-TUI.command -C /path/to/project
-./DeepCode-TUI.command -C /path/to/project --session <session-id>
+./DeepCode-TUI.command --session <session-id>
 ```
 
 Plain text is submitted to the current Session. Interactive commands are:
@@ -244,7 +257,7 @@ Within `contracts/agent-runtime/`, `catalog.sql`, `session.sql`, and `tool-recor
 
 ### No model is available
 
-Open **Settings → Models & services**, enable and select a default profile, add the required API key, save, and probe it.
+Open **Settings → Models & services**, add the required API key and save the model in its own card, then select an enabled model. If the profile file cannot be read, the settings page shows the original error and an explicit repair action. Model requests remain unavailable until valid configuration is saved; existing conversation history remains readable when its Session store is valid.
 
 ### CLI/TUI cannot reach the local Daemon
 
