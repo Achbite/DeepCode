@@ -42,9 +42,14 @@ pub fn discover(tool: &str) -> KernelResult<ShellProgram> {
 }
 
 pub fn find_command(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .flat_map(|directory| {
+    command_candidates(name).find(|path| executable_file(path))
+}
+
+fn command_candidates(name: &str) -> impl Iterator<Item = PathBuf> + '_ {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .flat_map(move |directory| {
             if cfg!(windows) {
                 ["exe", "cmd", "bat", "com"]
                     .into_iter()
@@ -54,7 +59,6 @@ pub fn find_command(name: &str) -> Option<PathBuf> {
                 vec![directory.join(name)]
             }
         })
-        .find(|path| executable_file(path))
 }
 
 fn executable_file(path: &Path) -> bool {
@@ -76,13 +80,8 @@ fn executable_file(path: &Path) -> bool {
 }
 
 pub fn find_powershell7() -> Option<PathBuf> {
-    find_command("pwsh")
-        .filter(|path| {
-            !cfg!(windows)
-                || path
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
-        })
+    command_candidates("pwsh")
+        .find(|path| executable_file(path) && powershell_path_is_compatible(path))
         .or_else(|| {
             if !cfg!(windows) {
                 return None;
@@ -93,15 +92,43 @@ pub fn find_powershell7() -> Option<PathBuf> {
         })
 }
 
+/// Store app execution aliases belong to the interactive user and cannot be
+/// launched by the dedicated workspace account. Other WindowsApps packages may
+/// contain ordinary executables, so only exclude PowerShell aliases/packages.
+pub fn powershell_path_is_compatible(path: &Path) -> bool {
+    if !cfg!(windows) {
+        return true;
+    }
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+        && !is_store_powershell_path(path)
+        && !path
+            .canonicalize()
+            .ok()
+            .is_some_and(|path| is_store_powershell_path(&path))
+}
+
+fn is_store_powershell_path(path: &Path) -> bool {
+    path.as_os_str()
+        .to_string_lossy()
+        .split(['\\', '/'])
+        .skip_while(|part| !part.eq_ignore_ascii_case("WindowsApps"))
+        .nth(1)
+        .is_some_and(|part| {
+            part.eq_ignore_ascii_case("pwsh.exe")
+                || part.eq_ignore_ascii_case("powershell.exe")
+                || part
+                    .to_ascii_lowercase()
+                    .starts_with("microsoft.powershell")
+        })
+}
+
 pub fn find_windows_powershell() -> Option<PathBuf> {
     if !cfg!(windows) {
         return None;
     }
-    find_command("powershell")
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
-        })
+    command_candidates("powershell")
+        .find(|path| executable_file(path) && powershell_path_is_compatible(path))
         .or_else(|| {
             let path = PathBuf::from(std::env::var_os("SystemRoot")?)
                 .join("System32/WindowsPowerShell/v1.0/powershell.exe");
@@ -210,6 +237,41 @@ impl Drop for ShellScript {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn store_powershell_is_distinguished_from_portable_windows_apps_executables() {
+        for path in [
+            r"C:\Users\user\AppData\Local\Microsoft\WindowsApps\pwsh.exe",
+            r"\\?\C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.6_x64__example\pwsh.exe",
+            r"C:/Program Files/WindowsApps/Microsoft.PowerShellPreview_7_x64__example/pwsh.exe",
+        ] {
+            assert!(is_store_powershell_path(Path::new(path)), "{path}");
+        }
+        for path in [
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            r"C:\Program Files\WindowsApps\OpenAI.CodexPrimaryRuntime\dependencies\native\powershell\pwsh.exe",
+            r"C:\portable\NotWindowsApps\pwsh.exe",
+        ] {
+            assert!(!is_store_powershell_path(Path::new(path)), "{path}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_path_candidates_continue_after_store_aliases() {
+        let candidates = [
+            PathBuf::from(r"C:\Users\user\AppData\Local\Microsoft\WindowsApps\pwsh.exe"),
+            PathBuf::from(r"C:\tools\pwsh.cmd"),
+            PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+        ];
+        assert_eq!(
+            candidates
+                .iter()
+                .find(|path| powershell_path_is_compatible(path)),
+            Some(&candidates[2])
+        );
+    }
     #[test]
     fn long_powershell_scripts_use_a_scoped_file_without_changing_user_text() {
         let program = ShellProgram {

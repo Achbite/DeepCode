@@ -12,16 +12,17 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
     pendingApproval,
     submitting,
     submitPlanDecision,
-    setDraft,
     respondInteraction,
-    textareaRef,
-    draft,
-    recordComposerElementState,
-    beginComposition,
-    endComposition,
-    submitOnComposerEnter,
     respondApproval,
   } = composer;
+  const sendDecision = async (text: string) => {
+    if (!pendingInteraction || !text.trim() || submitting) return;
+    try {
+      await respondInteraction(text);
+    } catch {
+      // The store reports the original command error; the shared draft is retained.
+    }
+  };
   return (
     <>
       {(pendingPlan || pendingInteraction) && (
@@ -38,16 +39,6 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
                   ? (language === 'zh-CN' ? '确认新增执行范围' : 'Confirm additional execution scope')
                   : t(language, 'agent.plan.confirmQuestion', { title: pendingPlan.title })}</MarkdownInline></strong>
                 : <MarkdownContent>{pendingInteraction?.prompt ?? ''}</MarkdownContent>}
-              {pendingPlan && (
-                <button
-                  type="button"
-                  className="local-agent__interaction-close"
-                  aria-label={t(language, 'agent.plan.ignoreAndStop')}
-                  title={t(language, 'agent.plan.ignoreAndStop')}
-                  disabled={submitting}
-                  onClick={() => void submitPlanDecision({ kind: 'cancel' })}
-                >×</button>
-              )}
             </header>
             <ol className="local-agent__interaction-options">
               {pendingPlan ? (
@@ -77,8 +68,7 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
                     disabled={submitting}
                     title={option.description ? `${option.label}\n\n${option.description}` : option.label}
                     onClick={() => {
-                      setDraft('');
-                      void respondInteraction(option.label).catch(() => undefined);
+                      void sendDecision(option.label);
                     }}
                   >
                     <span className="local-agent__interaction-option-marker" aria-hidden="true">
@@ -100,52 +90,6 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
               ))}
             </ol>
           </div>
-          {(pendingPlan || pendingInteraction?.allowFreeform) && (
-            <div className="local-agent__interaction-composer">
-              <span className="local-agent__interaction-compose-mark" aria-hidden="true">
-                <DeepCodeShellIcon name="compose" />
-              </span>
-              <textarea
-                ref={textareaRef}
-                value={draft}
-                rows={1}
-                placeholder={pendingPlan
-                  ? t(language, 'agent.composer.placeholder.plan')
-                  : t(language, 'agent.composer.placeholder.interaction')}
-                onChange={(event) => setDraft(event.target.value)}
-                onFocus={(event) => recordComposerElementState(event.currentTarget, true)}
-                onBlur={(event) => recordComposerElementState(event.currentTarget, false)}
-                onSelect={(event) => recordComposerElementState(
-                  event.currentTarget,
-                  document.activeElement === event.currentTarget,
-                )}
-                onCompositionStart={beginComposition}
-                onCompositionEnd={endComposition}
-                onKeyDown={submitOnComposerEnter}
-              />
-              {pendingPlan ? (
-                <button
-                  type="button"
-                  className="local-agent__interaction-secondary"
-                  disabled={submitting}
-                  onClick={() => void submitPlanDecision({ kind: 'cancel' })}
-                >
-                  <span>{t(language, 'agent.plan.ignoreAndStop')}</span>
-                  <kbd>Esc</kbd>
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  className="local-agent__interaction-secondary"
-                  disabled={submitting}
-                  onClick={() => {
-                    setDraft('');
-                    void respondInteraction(t(language, 'agent.interaction.skip')).catch(() => undefined);
-                  }}
-                >{t(language, 'agent.interaction.skip')}</button>
-              )}
-            </div>
-          )}
         </section>
       )}
       {pendingApproval && (

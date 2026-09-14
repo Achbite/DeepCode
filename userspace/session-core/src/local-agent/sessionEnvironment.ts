@@ -33,7 +33,7 @@ export function environmentInstruction(value: unknown): RunRuntimeSnapshot['inst
       locale: data.locale,
       userShell: data.userShell,
       ...(data.executionTarget ? { executionTarget: data.executionTarget, shell: data.shell, shellAvailable: data.shellAvailable, developerCommands: data.developerCommands, workspaceShellSupported: data.workspaceShellSupported, ...(data.workspaceSandbox ? { workspaceSandbox: data.workspaceSandbox } : {}) } : {}),
-    })}\nDefault language for user-facing responses: ${data.responseLanguage ?? 'not specified'}. Installed commands do not imply service readiness or permission.`,
+    })}\nUse ${data.responseLanguage ?? "the user's language"} for all user-facing text, including progress updates, unless the user explicitly requests another language. Installed commands do not imply service readiness or permission.`,
   };
 }
 

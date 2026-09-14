@@ -78,6 +78,7 @@ pub struct PluginCatalogItem {
     pub activation_media_types: Vec<String>,
     pub enabled: bool,
     pub available: bool,
+    pub error: Option<ConversationError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -100,6 +101,7 @@ pub struct SessionProjection {
     pub session_directory_indexes: Vec<WorkspaceBindingDisplay>,
     pub timeline: Vec<SessionTimelineItem>,
     pub messages: Vec<ProjectionMessage>,
+    pub queued_inputs: Vec<QueuedInputProjection>,
     pub narratives: Vec<NarrativeProjection>,
     pub assistant_draft: Option<AssistantDraftProjection>,
     pub pending_interaction: Option<InteractionProjection>,
@@ -118,6 +120,20 @@ pub struct SessionProjection {
     pub file_change_rounds: Vec<FileChangeRound>,
     pub artifacts: Vec<ArtifactProjection>,
     pub terminal_error: Option<ConversationError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QueuedInputProjection {
+    pub command_id: String,
+    pub message_id: String,
+    pub run_id: String,
+    pub text: String,
+    pub filesystem_references: Vec<FilesystemReference>,
+    pub plugin_selections: Vec<PluginSelectionInput>,
+    pub sequence: u64,
+    pub created_at: String,
+    pub status: String,
 }
 
 impl SessionProjection {
@@ -279,6 +295,23 @@ impl SessionProjection {
                 })
         }) {
             return Err("shared Session projection has invalid messages".to_string());
+        }
+        if self.queued_inputs.iter().any(|input| {
+            input.command_id.is_empty()
+                || input.message_id.is_empty()
+                || input.run_id.is_empty()
+                || input.sequence == 0
+                || input.sequence > self.revision
+                || input.created_at.is_empty()
+                || !matches!(input.status.as_str(), "queued" | "notApplied")
+                || invalid_filesystem_references(&input.filesystem_references)
+                || input.plugin_selections.iter().any(|selection| {
+                    selection.selection_id.is_empty()
+                        || !valid_plugin_uri(&selection.uri)
+                        || selection.label.trim().is_empty()
+                })
+        }) {
+            return Err("shared Session projection has invalid queued inputs".to_string());
         }
         if self.narratives.iter().any(|narrative| {
             narrative.narrative_id.is_empty()
@@ -529,6 +562,10 @@ impl SessionProjection {
                     })
                 || activity.tool.as_ref().is_some_and(|tool| {
                     tool.operation.is_empty()
+                        || tool
+                            .error
+                            .as_ref()
+                            .is_some_and(|error| error.code.is_empty() || error.message.is_empty())
                         || tool.shell.as_ref().is_some_and(|shell| {
                             !matches!(tool.operation.as_str(), "bash" | "powershell")
                                 || shell.command.trim().is_empty()
@@ -1593,6 +1630,7 @@ pub struct ProviderHostedActivityProjection {
 pub struct ToolActivityProjection {
     pub record_id: Option<String>,
     pub operation: String,
+    pub error: Option<ConversationError>,
     pub resources: Vec<ActivityResourceProjection>,
     pub shell: Option<ShellActivityProjection>,
     #[serde(default)]
@@ -2339,6 +2377,7 @@ mod tests {
             "artifacts": [],
             "terminalError": null
         });
+        value["queuedInputs"] = json!([]);
         value["timeline"] = json!([
             {
                 "kind": "message",
@@ -2387,6 +2426,32 @@ mod tests {
             projection.activities[0].call_id.as_deref(),
             Some("call:read")
         );
+    }
+
+    #[test]
+    fn queued_input_and_original_tool_error_are_shared_facts() {
+        let mut value = projection_value();
+        value["queuedInputs"] = json!([{
+            "commandId":"command:queued", "messageId":"message:queued", "runId":"run:test",
+            "text":"未执行的补充🙂", "filesystemReferences":[], "pluginSelections":[],
+            "sequence":5, "createdAt":"now", "status":"notApplied"
+        }]);
+        value["activities"][0]["status"] = json!("failed");
+        value["activities"][0]["tool"]["error"] =
+            json!({"code":"fs_read_failed", "message":"original read error"});
+        let projection: SessionProjection = serde_json::from_value(value).unwrap();
+        projection.validate().unwrap();
+        assert_eq!(projection.queued_inputs[0].status, "notApplied");
+        assert_eq!(projection.queued_inputs[0].text, "未执行的补充🙂");
+        let error = projection.activities[0]
+            .tool
+            .as_ref()
+            .unwrap()
+            .error
+            .as_ref()
+            .unwrap();
+        assert_eq!(error.code, "fs_read_failed");
+        assert_eq!(error.message, "original read error");
     }
 
     #[test]

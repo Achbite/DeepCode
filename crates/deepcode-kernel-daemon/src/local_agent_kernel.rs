@@ -1060,10 +1060,25 @@ impl LocalAgentKernel {
                         resolve_target(target)
                             .map(|path| path.to_string_lossy().to_string())
                             .map_err(|error| {
-                                LocalAgentKernelError::new(
+                                let mut failure = LocalAgentKernelError::new(
                                     "workspace_target_invalid",
                                     error.to_string(),
-                                )
+                                );
+                                // Target I/O failures belong to this invocation. Resolver,
+                                // workspace-root and record-store failures keep their error path.
+                                if matches!(error, deepcode_kernel_abi::KernelError::Other(_)) {
+                                    failure.input_issues = Some(vec![ToolInputIssue::new(
+                                        if arguments.get("path").is_some() {
+                                            "$.path"
+                                        } else {
+                                            "$"
+                                        },
+                                        "workspaceTarget",
+                                        &failure.message,
+                                        None,
+                                    )]);
+                                }
+                                failure
                             })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -2310,25 +2325,18 @@ fn is_shell_tool(name: &str) -> bool {
 mod attempt_control_tests {
     use super::*;
 
-    #[test]
-    fn invalid_bound_tool_input_returns_a_rejection_before_resolution_or_tool_record_creation() {
-        struct UnexpectedResolver;
-        impl WorkspaceResolverPort for UnexpectedResolver {
-            fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
-                panic!("input rejection must precede filesystem resolution")
-            }
-        }
+    fn kernel_with_request(
+        resolver: Arc<dyn WorkspaceResolverPort>,
+        tool_name: &str,
+        input: Value,
+    ) -> (LocalAgentKernel, LocalToolExecutionRequest, Value) {
         let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
         let bindings = json!([{"workspaceId":"workspace:test", "displayName":"Fixture"}]);
         journal
             .create_session("session:reject", "Input rejection", &bindings, None)
             .unwrap();
-        let kernel = LocalAgentKernel::open(
-            Path::new(":memory:"),
-            journal.clone(),
-            Arc::new(UnexpectedResolver),
-        )
-        .unwrap();
+        let kernel =
+            LocalAgentKernel::open(Path::new(":memory:"), journal.clone(), resolver).unwrap();
         let generation = LocalAgentKernel::prepare_generation(
             "extension:test",
             "kernel-generation:test",
@@ -2348,7 +2356,7 @@ mod attempt_control_tests {
             .unwrap();
         let tools = catalog["tools"].as_array().unwrap();
         let binding =
-            tools.iter().find(|tool| tool["name"] == "bash").unwrap()["toolBindingRef"].clone();
+            tools.iter().find(|tool| tool["name"] == tool_name).unwrap()["toolBindingRef"].clone();
         let mut aliases: Vec<Value> = tools.iter().filter(|tool| tool["availability"] == "callable").map(|tool| json!({"canonicalName":tool["name"],"wireName":tool["name"].as_str().unwrap().replace('.', "_")})).collect();
         aliases.extend([
             json!({"canonicalName":"interaction.request","wireName":"interaction_request"}),
@@ -2369,9 +2377,25 @@ mod attempt_control_tests {
         let request: LocalToolExecutionRequest = serde_json::from_value(json!({
             "schemaVersion":KERNEL_REQUEST_VERSION, "type":"tool.execute", "requestId":"request:reject", "sessionId":"session:reject", "runId":"run:reject",
             "extensionGenerationRef":"extension:test", "kernelCatalogSnapshotRef":catalog["kernelCatalogSnapshotRef"],
-            "toolBindingRef":binding, "callId":"call:reject", "attemptId":"attempt:reject", "toolName":"bash",
-            "workspaceBindings":["workspace:test"], "input":{"workspaceId":"workspace:test", "command":"pwd", "executionMode":"read"}
+            "toolBindingRef":binding, "callId":"call:reject", "attemptId":"attempt:reject", "toolName":tool_name,
+            "workspaceBindings":["workspace:test"], "input":input
         })).unwrap();
+        (kernel, request, catalog)
+    }
+
+    #[test]
+    fn invalid_bound_tool_input_returns_a_rejection_before_resolution_or_tool_record_creation() {
+        struct UnexpectedResolver;
+        impl WorkspaceResolverPort for UnexpectedResolver {
+            fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
+                panic!("input rejection must precede filesystem resolution")
+            }
+        }
+        let (kernel, request, catalog) = kernel_with_request(
+            Arc::new(UnexpectedResolver),
+            "bash",
+            json!({"workspaceId":"workspace:test", "command":"pwd", "executionMode":"read"}),
+        );
         let reply = kernel.execute(request.clone()).unwrap();
         assert_eq!(reply["status"], "inputRejected");
         assert_eq!(reply["rejection"]["input"], request.input);
@@ -2399,6 +2423,98 @@ mod attempt_control_tests {
                 catalog["kernelCatalogSnapshotRef"].as_str().unwrap(),
             ))
             .unwrap();
+    }
+
+    #[test]
+    fn target_io_rejection_allows_the_next_call_and_preserves_infrastructure_errors() {
+        struct TestWorkspace(PathBuf);
+        impl WorkspaceResolverPort for TestWorkspace {
+            fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
+                Ok(ResolvedWorkspace {
+                    root: self.0.to_string_lossy().into_owned(),
+                    read_only: false,
+                })
+            }
+        }
+        impl Drop for TestWorkspace {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root =
+            std::env::temp_dir().join(random_id("target-rejection").unwrap().replace(':', "-"));
+        std::fs::create_dir(&root).unwrap();
+        let workspace = Arc::new(TestWorkspace(root));
+        std::fs::write(workspace.0.join("README.md"), "source text").unwrap();
+        let original_error = workspace
+            .0
+            .join("README.md/child")
+            .canonicalize()
+            .unwrap_err();
+        let (kernel, request, _) = kernel_with_request(
+            workspace.clone(),
+            "fs.read",
+            json!({"workspaceId":"workspace:test", "path":"README.md/child"}),
+        );
+        let reply = kernel.execute(request.clone()).unwrap();
+        assert_eq!(reply["status"], "inputRejected");
+        assert_eq!(
+            reply["rejection"]["error"]["code"],
+            "workspace_target_invalid"
+        );
+        assert_eq!(reply["rejection"]["error"]["issues"][0]["path"], "$.path");
+        assert!(reply["rejection"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&original_error.to_string()));
+        assert_eq!(reply["rejection"]["input"], request.input);
+        assert!(kernel.records.read(&request.call_id).unwrap().is_none());
+
+        let mut next = request.clone();
+        next.call_id = "call:valid".into();
+        next.attempt_id = "attempt:valid".into();
+        next.input["path"] = json!("README.md");
+        let completed = kernel.execute(next).unwrap();
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["record"]["output"]["content"], "source text");
+
+        let mut missing = request.clone();
+        missing.call_id = "call:missing".into();
+        missing.attempt_id = "attempt:missing".into();
+        missing.input["path"] = json!("missing.txt");
+        let failed = kernel.execute(missing).unwrap();
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["record"]["outcome"], "failed");
+
+        kernel
+            .records
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE tool_records")
+            .unwrap();
+        let store_error = kernel.execute(request).unwrap_err();
+        assert_eq!(store_error.code, "tool_record_read_failed");
+        assert!(store_error.input_issues.is_none());
+
+        struct FailedResolver;
+        impl WorkspaceResolverPort for FailedResolver {
+            fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
+                Err(LocalAgentKernelError::new(
+                    "workspace_catalog_unavailable",
+                    "catalog read failed",
+                ))
+            }
+        }
+        let (kernel, request, _) = kernel_with_request(
+            Arc::new(FailedResolver),
+            "fs.read",
+            json!({"workspaceId":"workspace:test", "path":"README.md"}),
+        );
+        let error = kernel.execute(request).unwrap_err();
+        assert_eq!(error.code, "workspace_catalog_unavailable");
+        assert_eq!(error.message, "catalog read failed");
+        assert!(error.input_issues.is_none());
     }
 
     #[test]

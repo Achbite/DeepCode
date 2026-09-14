@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS session_events (
         'session.directory-index.attached',
         'session.directory-index.detached',
         'input.accepted',
+        'input.queued',
         'run.started',
         'message.committed',
         'message.feedback.updated',

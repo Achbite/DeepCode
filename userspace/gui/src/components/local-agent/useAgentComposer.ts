@@ -6,22 +6,13 @@ import { useLocalAgentStore } from '../../state/localAgentStore';
 import { shouldOfferFocusCommand, shouldSubmitComposerKey } from './composerKeyboard';
 import { planScopeAddition } from './planReview';
 import { isLongPastedText, type PastedTextInput } from '../../services/pastedText';
+import { cloneComposerState, composerStateIsEmpty, emptyComposerState, submitComposerState, type ComposerState } from './composerSubmission';
 
 interface PastedTextDraft extends PastedTextInput { expanded: boolean }
 
 interface PendingFilesystemPath {
   path: string;
   kind: 'file' | 'directory';
-}
-
-interface ComposerState {
-  draft: string;
-  pastedTexts: PastedTextDraft[];
-  filesystemPaths: PendingFilesystemPath[];
-  pluginSelections: PluginSelectionInput[];
-  selectionStart: number;
-  selectionEnd: number;
-  focused: boolean;
 }
 
 export function useAgentComposer(
@@ -40,15 +31,13 @@ export function useAgentComposer(
   const pendingScopeAddition = pendingPlan ? planScopeAddition(projection?.plans.find((plan) => (
     plan.planId === pendingPlan.planId && plan.revision === pendingPlan.revision - 1
   )), pendingPlan) : null;
-  const composerViewKey = sessionId ?? `new:${draftProjectId ?? 'independent'}`;
-  const composerModeKey = pendingPlan
-    ? `plan:${pendingPlan.planId}:${pendingPlan.revision}`
+  const textDecision = Boolean(pendingPlan || pendingInteraction);
+  const conversationKey = sessionId ?? `new:${draftProjectId ?? 'independent'}`;
+  const composerStateKey = pendingPlan
+    ? `${conversationKey}:plan:${pendingPlan.planId}:${pendingPlan.revision}`
     : pendingInteraction
-      ? `interaction:${pendingInteraction.interactionId}`
-      : pendingApproval
-        ? `approval:${pendingApproval.approvalId}`
-        : 'normal';
-  const composerStateKey = `${composerViewKey}\u0000${composerModeKey}`;
+      ? `${conversationKey}:interaction:${pendingInteraction.interactionId}`
+      : conversationKey;
   const loading = useLocalAgentStore((state) => state.loading);
   const submitting = useLocalAgentStore((state) => state.submitting);
   const catalogBusy = useLocalAgentStore((state) => state.catalogBusy);
@@ -82,6 +71,12 @@ export function useAgentComposer(
   const permissionControlRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const composerStatesRef = useRef(new Map<string, ComposerState>());
+  const [failedDrafts, setFailedDrafts] = useState<Record<string, ComposerState[]>>({});
+  const currentComposerStateRef = useRef<ComposerState>(emptyComposerState());
+  currentComposerStateRef.current = { draft, pastedTexts, filesystemPaths: pendingFilesystemPaths,
+    pluginSelections, selectionStart: textareaRef.current?.selectionStart ?? draft.length,
+    selectionEnd: textareaRef.current?.selectionEnd ?? draft.length,
+    focused: typeof document !== 'undefined' && document.activeElement === textareaRef.current };
   const activeComposerStateKeyRef = useRef(composerStateKey);
   const pendingComposerRestoreRef = useRef<{
     key: string;
@@ -109,6 +104,7 @@ export function useAgentComposer(
     const copy = cloneComposerState(state);
     composerStatesRef.current.set(key, copy);
     if (activeComposerStateKeyRef.current !== key) return;
+    currentComposerStateRef.current = copy;
     setDraft(copy.draft);
     setPastedTexts(copy.pastedTexts);
     setPendingFilesystemPaths(copy.filesystemPaths);
@@ -121,20 +117,21 @@ export function useAgentComposer(
     if (previousKey === composerStateKey) return;
     const textarea = textareaRef.current;
     const previous = composerStatesRef.current.get(previousKey);
-    const outgoing: ComposerState = {
-      draft: textarea?.value ?? draft,
-      pastedTexts: pastedTexts.map((item) => ({ ...item })),
-      filesystemPaths: pendingFilesystemPaths.map((item) => ({ ...item })),
-      pluginSelections: pluginSelections.map((item) => ({ ...item })),
-      selectionStart: textarea?.selectionStart ?? previous?.selectionStart ?? draft.length,
-      selectionEnd: textarea?.selectionEnd ?? previous?.selectionEnd ?? draft.length,
-      focused: document.activeElement === textarea || previous?.focused === true,
-    };
+    const outgoing: ComposerState = pendingComposerRestoreRef.current?.key === previousKey
+      ? cloneComposerState(pendingComposerRestoreRef.current.state)
+      : {
+          draft: textarea?.value ?? draft,
+          pastedTexts: pastedTexts.map((item) => ({ ...item })),
+          filesystemPaths: pendingFilesystemPaths.map((item) => ({ ...item })),
+          pluginSelections: pluginSelections.map((item) => ({ ...item })),
+          selectionStart: textarea?.selectionStart ?? previous?.selectionStart ?? draft.length,
+          selectionEnd: textarea?.selectionEnd ?? previous?.selectionEnd ?? draft.length,
+          focused: document.activeElement === textarea || previous?.focused === true,
+        };
     composerStatesRef.current.set(previousKey, outgoing);
 
-    const cachedIncoming = composerStatesRef.current.get(composerStateKey);
     const incoming = cloneComposerState(
-      cachedIncoming ?? { ...emptyComposerState(), focused: outgoing.focused },
+      composerStatesRef.current.get(composerStateKey) ?? { ...emptyComposerState(), focused: outgoing.focused },
     );
     activeComposerStateKeyRef.current = composerStateKey;
     pendingComposerRestoreRef.current = { key: composerStateKey, state: incoming };
@@ -149,19 +146,26 @@ export function useAgentComposer(
     setAttachmentError(null);
   }, [composerStateKey]);
 
-  useLayoutEffect(() => {
+  useEffect(() => {
     const pending = pendingComposerRestoreRef.current;
     if (!pending || pending.key !== activeComposerStateKeyRef.current) return;
     const textarea = textareaRef.current;
     if (!textarea || textarea.value !== pending.state.draft) return;
-    const selectionStart = Math.min(pending.state.selectionStart, textarea.value.length);
-    const selectionEnd = Math.min(
-      Math.max(selectionStart, pending.state.selectionEnd),
-      textarea.value.length,
-    );
-    textarea.setSelectionRange(selectionStart, selectionEnd);
-    if (pending.state.focused && !textarea.disabled) textarea.focus({ preventScroll: true });
-    pendingComposerRestoreRef.current = null;
+    // Restore after the controlled value and the switching pointer event settle.
+    const frame = window.requestAnimationFrame(() => {
+      if (pendingComposerRestoreRef.current !== pending
+        || activeComposerStateKeyRef.current !== pending.key
+        || textareaRef.current !== textarea || textarea.value !== pending.state.draft) return;
+      const selectionStart = Math.min(pending.state.selectionStart, textarea.value.length);
+      const selectionEnd = Math.min(
+        Math.max(selectionStart, pending.state.selectionEnd),
+        textarea.value.length,
+      );
+      if (pending.state.focused && !textarea.disabled) textarea.focus({ preventScroll: true });
+      textarea.setSelectionRange(selectionStart, selectionEnd);
+      pendingComposerRestoreRef.current = null;
+    });
+    return () => window.cancelAnimationFrame(frame);
   });
 
   useEffect(() => () => {
@@ -193,29 +197,29 @@ export function useAgentComposer(
     return () => document.removeEventListener('pointerdown', closeOnOutsidePointer);
   }, [attachmentMenuOpen, permissionMenuOpen, pluginPickerOpen]);
 
-  useEffect(() => {
-    if (pendingPlan || pendingInteraction || pendingApproval) {
-      setPendingFilesystemPaths([]);
-      setPluginSelections([]);
-      setPluginPickerOpen(false);
-      setAttachmentMenuOpen(false);
-      setAttachmentDialogOpen(false);
-    }
-  }, [pendingApproval, pendingInteraction, pendingPlan]);
-
   const submitDraft = async () => {
     const submittedText = draft;
     if (
-      (!submittedText.trim() && !pastedTexts.length)
-      || loading
-      || submitting
-      || catalogBusy
-      || pendingApproval
-      || (!selectedProfileId && !pendingInteraction && !pendingPlan)
+      !canSend
       || compositionActiveRef.current
       || compositionCommitPendingRef.current
     ) return;
     const submittedComposerKey = activeComposerStateKeyRef.current;
+    const submission = { key: submittedComposerKey };
+    const onSessionCreated = (createdSessionId: string) => {
+      const previousKey = submission.key;
+      submission.key = createdSessionId;
+      const cached = composerStatesRef.current.get(previousKey);
+      if (cached) composerStatesRef.current.set(createdSessionId, cached);
+      composerStatesRef.current.delete(previousKey);
+      if (activeComposerStateKeyRef.current === previousKey) activeComposerStateKeyRef.current = createdSessionId;
+      setFailedDrafts((current) => {
+        if (!current[previousKey]) return current;
+        const next = { ...current, [createdSessionId]: current[previousKey] };
+        delete next[previousKey];
+        return next;
+      });
+    };
     const submittedFilesystemPaths = pendingFilesystemPaths;
     const submittedPluginSelections = pluginSelections;
     const submittedTextarea = textareaRef.current;
@@ -228,41 +232,32 @@ export function useAgentComposer(
       selectionEnd: submittedTextarea?.selectionEnd ?? submittedText.length,
       focused: document.activeElement === submittedTextarea,
     };
-    setDraft('');
     setPluginPickerOpen(false);
     setLatestFollowMode(true);
-    try {
-      const focusMatch = submittedText.match(/^\/focus(?:\s+)([\s\S]+)$/u);
-      if (focusMatch) {
-        await focusContext(
-          focusMatch[1]!.trim(),
-          submittedFilesystemPaths,
-          submittedPluginSelections,
-          pastedTexts,
-        );
-      } else {
-        await sendMessage(
-          submittedText,
-          submittedFilesystemPaths,
-          submittedPluginSelections,
-          pastedTexts,
-        );
-      }
-      setComposerStateForKey(submittedComposerKey, {
-        ...submittedComposerState,
-        draft: '',
-        pastedTexts: [],
-        filesystemPaths: [],
-        pluginSelections: [],
-        selectionStart: 0,
-        selectionEnd: 0,
-      });
-      if (activeComposerStateKeyRef.current === submittedComposerKey) {
-        setAttachmentError(null);
-      }
-    } catch {
-      setComposerStateForKey(submittedComposerKey, submittedComposerState);
-    }
+    const sent = await submitComposerState(submittedComposerKey, submittedComposerState, {
+      read: () => activeComposerStateKeyRef.current === submission.key
+        ? { ...currentComposerStateRef.current, draft: textareaRef.current?.value ?? currentComposerStateRef.current.draft }
+        : composerStatesRef.current.get(submission.key) ?? emptyComposerState(),
+      write: (_key, state) => setComposerStateForKey(submission.key, state),
+      retainFailed: (_key, state) => setFailedDrafts((current) => ({ ...current, [submission.key]: [...(current[submission.key] ?? []), state] })),
+      send: async () => {
+        if (pendingPlan) {
+          await respondPlan({ kind: 'requestRevision', text: submittedText });
+          return;
+        }
+        if (pendingInteraction) {
+          await respondInteraction(submittedText);
+          return;
+        }
+        const focusMatch = submittedText.match(/^\/focus(?:\s+)([\s\S]+)$/u);
+        if (focusMatch) {
+          await focusContext(focusMatch[1]!.trim(), submittedFilesystemPaths, submittedPluginSelections, submittedComposerState.pastedTexts, onSessionCreated);
+        } else {
+          await sendMessage(submittedText, submittedFilesystemPaths, submittedPluginSelections, submittedComposerState.pastedTexts, onSessionCreated);
+        }
+      },
+    });
+    if (sent && activeComposerStateKeyRef.current === submission.key) setAttachmentError(null);
   };
 
   const beginComposition = () => {
@@ -334,7 +329,9 @@ export function useAgentComposer(
   };
 
   const updateDraft = (value: string, cursor: number) => {
+    pendingComposerRestoreRef.current = null;
     setDraft(value);
+    if (textDecision) return;
     setPluginSelections((current) => current.filter((selection) => (
       value.includes(`@${selection.label}`)
     )));
@@ -354,6 +351,7 @@ export function useAgentComposer(
   };
 
   const selectPlugin = (plugin: (typeof pluginCatalog.plugins)[number]) => {
+    if (!plugin.enabled || !plugin.available) return;
     const cursor = textareaRef.current?.selectionStart ?? draft.length;
     const mention = `@${plugin.displayName}`;
     const alreadySelected = pluginSelections.some((selection) => selection.uri === plugin.uri);
@@ -390,9 +388,16 @@ export function useAgentComposer(
     });
   };
 
-  const focusCommandSuggestionVisible = shouldOfferFocusCommand(draft);
+  const focusCommandSuggestionVisible = !textDecision && shouldOfferFocusCommand(draft);
 
   const submitOnComposerEnter = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (pendingPlan && event.key === 'Escape' && !event.repeat
+      && !event.nativeEvent.isComposing && !compositionActiveRef.current
+      && !compositionCommitPendingRef.current) {
+      event.preventDefault();
+      void submitPlanDecision({ kind: 'cancel' });
+      return;
+    }
     if (
       pluginPickerOpen
       && !event.nativeEvent.isComposing
@@ -442,45 +447,18 @@ export function useAgentComposer(
     response: Extract<PlanResponse, { kind: 'confirm' | 'cancel' }>,
   ) => {
     if (!pendingPlan || submitting) return;
-    const submittedComposerKey = activeComposerStateKeyRef.current;
     try {
       await respondPlan(response);
-      const cached = composerStatesRef.current.get(submittedComposerKey) ?? emptyComposerState();
-      setComposerStateForKey(submittedComposerKey, {
-        ...cached,
-        draft: '',
-        selectionStart: 0,
-        selectionEnd: 0,
-      });
     } catch {
       // The store preserves the authoritative command error for the shared error panel.
     }
   }, [pendingPlan, respondPlan, submitting]);
-
-  useEffect(() => {
-    if (!pendingPlan || submitting) return undefined;
-    const ignorePlanOnEscape = (event: KeyboardEvent) => {
-      if (
-        event.key !== 'Escape'
-        || event.repeat
-        || compositionActiveRef.current
-        || event.isComposing
-        || event.keyCode === 229
-        || event.defaultPrevented
-      ) return;
-      event.preventDefault();
-      void submitPlanDecision({ kind: 'cancel' });
-    };
-    window.addEventListener('keydown', ignorePlanOnEscape);
-    return () => window.removeEventListener('keydown', ignorePlanOnEscape);
-  }, [pendingPlan, submitPlanDecision, submitting]);
 
   const selectMessageAttachment = async (
     absolutePath: string,
     type: 'directory' | 'file',
   ) => {
     setAttachmentDialogOpen(false);
-    if (pendingPlan || pendingInteraction || pendingApproval) return;
     try {
       if (pendingFilesystemPaths.length + pastedTexts.length >= 8) {
         throw new Error(t(language, 'agent.attachment.error.maxFiles'));
@@ -493,6 +471,9 @@ export function useAgentComposer(
           throw new Error('plugin_selection_unavailable:application/pdf');
         }
         const plugin = matches[0]!;
+        if (!plugin.enabled || !plugin.available) {
+          throw new Error(plugin.error ? `${plugin.error.code}: ${plugin.error.message}` : `plugin_selection_unavailable:${plugin.uri}`);
+        }
         setPluginSelections((current) => (
           current.some((selection) => selection.uri === plugin.uri)
             ? current
@@ -528,6 +509,8 @@ export function useAgentComposer(
     projection?.run && ['running', 'waiting'].includes(projection.run.status),
   );
   const pasteText = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    pendingComposerRestoreRef.current = null;
+    if (textDecision) return;
     const text = event.clipboardData.getData('text/plain');
     if (!isLongPastedText(text)) return;
     event.preventDefault();
@@ -545,16 +528,22 @@ export function useAgentComposer(
   const editPastedText = (inputId: string, text: string) => setPastedTexts((current) => current.map((item) => (
     item.inputId === inputId ? { ...item, inputId: nextPanelId('paste'), text } : item
   )));
-  const canSend = Boolean(draft.trim() || pastedTexts.length)
-    && !modelSettingsBusy
-    && !loading
-    && !submitting
-    && !catalogBusy
-    && !pendingApproval
-    && Boolean(profiles.some((profile) => profile.id === selectedProfileId && profile.enabled) || pendingInteraction || pendingPlan);
-  const showStopAction = canCancel && !pendingPlan && !draft.trim() && !pastedTexts.length;
+  const canSend = !loading && !submitting && (textDecision
+    ? Boolean(draft.trim()) && (!pendingInteraction || pendingInteraction.allowFreeform)
+    : Boolean(draft.trim() || pastedTexts.length)
+      && !modelSettingsBusy && !catalogBusy
+      && Boolean(canCancel || profiles.some((profile) => profile.id === selectedProfileId && profile.enabled)));
+  const showStopAction = canCancel && !textDecision && !draft.trim() && !pastedTexts.length;
+  const canRestoreFailedDraft = composerStateIsEmpty(currentComposerStateRef.current);
+  const restoreFailedDraft = (index: number) => {
+    const saved = failedDrafts[composerStateKey]?.[index];
+    if (!saved || !composerStateIsEmpty(currentComposerStateRef.current)) return;
+    setComposerStateForKey(composerStateKey, { ...saved, focused: true });
+    setFailedDrafts((current) => ({ ...current, [composerStateKey]: current[composerStateKey]!.filter((_, candidate) => candidate !== index) }));
+  };
 
   return {
+    textDecision,
     pendingPlan,
     pendingScopeAddition,
     pendingInteraction,
@@ -570,6 +559,7 @@ export function useAgentComposer(
     modelSettingsBusy,
     respondInteraction,
     respondApproval,
+    respondPlan,
     cancelRun,
     selectProfile,
     selectReasoningEffort,
@@ -613,31 +603,13 @@ export function useAgentComposer(
     selectMessageAttachment,
     canSend,
     showStopAction,
+    failedDrafts: failedDrafts[composerStateKey] ?? [],
+    canRestoreFailedDraft,
+    restoreFailedDraft,
   };
 }
 
 export type AgentComposer = ReturnType<typeof useAgentComposer>;
-
-function emptyComposerState(): ComposerState {
-  return {
-    draft: '',
-    pastedTexts: [],
-    filesystemPaths: [],
-    pluginSelections: [],
-    selectionStart: 0,
-    selectionEnd: 0,
-    focused: false,
-  };
-}
-
-function cloneComposerState(state: ComposerState): ComposerState {
-  return {
-    ...state,
-    pastedTexts: state.pastedTexts.map((item) => ({ ...item })),
-    filesystemPaths: state.filesystemPaths.map((item) => ({ ...item })),
-    pluginSelections: state.pluginSelections.map((item) => ({ ...item })),
-  };
-}
 
 function nextPanelId(kind: string): string {
   const random = globalThis.crypto?.randomUUID?.()

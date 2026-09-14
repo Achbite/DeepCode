@@ -953,7 +953,7 @@ write_readme() {
     terminal_section="TUI/CLI:
   ./$TUI_COMMAND_NAME
   DEEPCODE_WORKSPACE=/path/to/project ./$TUI_COMMAND_NAME
-  ./$TUI_COMMAND_NAME --smoke -C /path/to/project
+  ./$TUI_COMMAND_NAME --session <session-id>
   In TUI, /cancel submits a daemon session run cancel and refreshes shared session projection.
   ./$CLI_COMMAND_NAME --help
   ./$CLI_COMMAND_NAME ask -C /path/to/project \"explain this project\""
@@ -977,8 +977,8 @@ write_readme() {
   shared Session Runtime run API. The daemon uses session-core/dist/$SESSION_BRIDGE_NAME,
   package-local node/bin/node, and node_modules/@deepcode/protocol internally.
   Set DEEPCODE_NODE or DEEPCODE_SESSION_BRIDGE only when overriding that packaged
-  daemon runtime. DEEPCODE_SESSION_BRIDGE_TIMEOUT_MS controls the daemon session
-  run hard timeout; default 600000 ms, 0 disables it.
+  daemon runtime. Ordinary messages can be queued while a run is active;
+  Session introduces them at the next model-request boundary after tool results settle.
 	  By default, this local package stores writable data under:
 	    config/user/local/settings/
 	    config/user/local/secrets/
@@ -1013,8 +1013,16 @@ write_readme() {
   fi
 
   cat > "$BIN_DIR/README.txt" <<README
-DeepCode macOS arm64 Distribution
+DeepCode $PRODUCT_VERSION macOS arm64 Distribution
 =================================
+
+Artifact identity: build-info.json records productVersion, buildCommit,
+buildTimeUtc and source state. Database schema versions are independent.
+
+Models: configure the initial DeepSeek Flash template or add a model under
+Settings > Models & services. Save each model in its own card. The last selected
+model is remembered for new conversations. Drag projects and conversations
+within their sidebar groups to reorder them.
 
 GUI:
 $gui_section
@@ -1052,7 +1060,8 @@ write_build_info() {
   "sourceStatusHash": "$SOURCE_STATUS_HASH",
   "sourceFingerprint": "$SOURCE_FINGERPRINT",
   "sessionBridge": "$SESSION_BRIDGE_NAME",
-  "product": "$product"
+  "product": "$product",
+  "productVersion": "$PRODUCT_VERSION"
 }
 JSON
 }

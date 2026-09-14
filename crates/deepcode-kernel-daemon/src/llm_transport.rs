@@ -2,7 +2,6 @@ use crate::prelude::*;
 use crate::*;
 use axum::body::Body;
 use bytes::Bytes;
-use std::collections::HashSet;
 use std::convert::Infallible;
 
 const LLM_PROFILE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -57,129 +56,6 @@ pub(crate) enum ProviderThinkingCompatibility {
     Generic,
 }
 
-fn local_secret_ref_key(secret_ref: &str) -> Option<&str> {
-    if secret_ref.trim() != secret_ref {
-        return None;
-    }
-    let key = secret_ref.strip_prefix("local-secret:")?;
-    (!key.is_empty() && key.trim() == key).then_some(key)
-}
-
-pub(crate) fn llm_profile_value_is_enabled(profile: &Value) -> bool {
-    llm_profile_value_is_current(profile)
-        && profile.get("enabled").and_then(Value::as_bool) == Some(true)
-}
-
-pub(crate) fn llm_profile_value_is_current(profile: &Value) -> bool {
-    const FIELDS: &[&str] = &[
-        "id",
-        "name",
-        "kind",
-        "providerFlavor",
-        "baseUrl",
-        "model",
-        "contextWindowTokens",
-        "maxOutputTokens",
-        "temperature",
-        "reasoningEffort",
-        "thinking",
-        "hostedWebSearch",
-        "secretRef",
-        "enabled",
-    ];
-    let Some(profile) = profile.as_object() else {
-        return false;
-    };
-    let text = |field: &str| {
-        profile
-            .get(field)
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty() && value.trim() == value)
-    };
-    let optional_text = |field: &str| profile.get(field).is_none_or(|_| text(field));
-    let optional_positive_integer = |field: &str| {
-        profile.get(field).is_none_or(|value| {
-            value
-                .as_u64()
-                .is_some_and(|value| value > 0 && value <= 1_000_000_000)
-        })
-    };
-    profile.keys().all(|field| FIELDS.contains(&field.as_str()))
-        && text("id")
-        && text("name")
-        && text("model")
-        && profile.get("enabled").and_then(Value::as_bool).is_some()
-        && matches!(
-            profile.get("kind").and_then(Value::as_str),
-            Some("openaiCompatible" | "responses" | "anthropic" | "ollama")
-        )
-        && profile.get("providerFlavor").is_none_or(|value| {
-            matches!(
-                value.as_str(),
-                Some("openai" | "deepseek" | "zhipu" | "moonshot")
-            )
-        })
-        && optional_text("baseUrl")
-        && optional_positive_integer("contextWindowTokens")
-        && optional_positive_integer("maxOutputTokens")
-        && profile
-            .get("temperature")
-            .is_none_or(|value| value.as_f64().is_some_and(f64::is_finite))
-        && profile
-            .get("reasoningEffort")
-            .is_none_or(|value| matches!(value.as_str(), Some("low" | "medium" | "high" | "max")))
-        && profile
-            .get("thinking")
-            .is_none_or(|value| matches!(value.as_str(), Some("enabled" | "disabled")))
-        && profile.get("hostedWebSearch").is_none_or(|value| {
-            value.as_str() == Some("web_search")
-                && profile.get("kind").and_then(Value::as_str) == Some("responses")
-        })
-        && profile
-            .get("secretRef")
-            .is_none_or(|value| value.as_str().and_then(local_secret_ref_key).is_some())
-        && match (
-            profile.get("contextWindowTokens").and_then(Value::as_u64),
-            profile.get("maxOutputTokens").and_then(Value::as_u64),
-        ) {
-            (Some(context), Some(output)) => output < context,
-            _ => true,
-        }
-}
-
-pub(crate) fn llm_profile_store_is_current(config: &Value) -> bool {
-    const FIELDS: &[&str] = &["profiles", "defaultProfileId"];
-    let Some(config) = config.as_object() else {
-        return false;
-    };
-    if config.len() != FIELDS.len() || config.keys().any(|field| !FIELDS.contains(&field.as_str()))
-    {
-        return false;
-    }
-    let Some(profiles) = config.get("profiles").and_then(Value::as_array) else {
-        return false;
-    };
-    let mut ids = HashSet::with_capacity(profiles.len());
-    if profiles.iter().any(|profile| {
-        !llm_profile_value_is_current(profile)
-            || !ids.insert(
-                profile
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .expect("current profile id")
-                    .to_string(),
-            )
-    }) {
-        return false;
-    }
-    let default_is_valid = match config.get("defaultProfileId") {
-        Some(Value::Null) => true,
-        Some(Value::String(id)) if !id.is_empty() && id.trim() == id => ids.contains(id),
-        _ => false,
-    };
-    default_is_valid
-}
-
 pub(crate) fn llm_secret_store_is_current(store: &Value) -> bool {
     store.as_object().is_some_and(|store| {
         store.iter().all(|(key, value)| {
@@ -198,16 +74,13 @@ pub(crate) fn resolve_llm_profile(
     gui: &GuiState,
     profile_id: Option<&str>,
 ) -> Result<ResolvedLlmProfile, String> {
-    if !llm_profile_store_is_current(&gui.llm_profiles) {
-        return Err("LLM Profile 文件不是当前格式。".to_string());
-    }
+    let configured_profiles = gui.llm_profiles.usable()?;
     let selected_id = profile_id.or_else(|| {
-        gui.llm_profiles
+        configured_profiles
             .get("defaultProfileId")
             .and_then(Value::as_str)
     });
-    let profiles = gui
-        .llm_profiles
+    let profiles = configured_profiles
         .get("profiles")
         .and_then(Value::as_array)
         .ok_or_else(|| "LLM Profile 列表不存在。".to_string())?;

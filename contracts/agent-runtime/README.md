@@ -1,5 +1,7 @@
 # Agent Runtime 合同资产
 
+产品发布说明见[项目 README](../../README.zh-CN.md)。产品版本、制品 `build-info.json` 与下面各 owner 的 schema 版本独立维护；发布产品新版本不会自动提升数据库版本。
+
 本目录只保存当前本地 Agent Runtime 的机器合同。它没有迁移脚本、兼容 alias、双读、双写、旧根 fallback，也不包含第二套 Session 或 Kernel 执行路径。
 
 ## 当前合同
@@ -11,6 +13,8 @@
 | Kernel | `tool-record.sql` | 1 | Session 保留期间不可变的 ToolRecord |
 
 `schema.json` 是 UI、CLI、TUI、Host、Session 与 Kernel 之间的当前 wire schema。SQL 只约束各自 store 的持久化边界，不能替代 wire schema，也不能跨 owner 推断另一层事实。
+
+模型 Profile 和侧边栏排序属于 Host 用户配置。模型配置错误通过设置接口保留并展示，不阻止 Host 打开有效的 Session store；运行请求仍要求可用的模型配置。GUI 排序不改变 Catalog 的项目归属或 Session 的语义事实。
 
 同一个配置根在任一时刻只有一个 daemon owner。daemon 在读取权威配置和打开三个业务 store 之前，必须持有 `runtime/agent-runtime/root-owner.lock` 的进程生命周期租约；同根的第二个 daemon 以 `config_root_already_owned` 显式失败。该文件只是由操作系统锁生命周期约束的 owner 租约，不是第四个业务事实 store，进程退出或崩溃即释放所有权。
 

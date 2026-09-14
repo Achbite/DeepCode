@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { InMemoryCommandJournal, loopSnapshot } from '../../session-core/dist/index.js';
+import { InMemoryCommandJournal, SessionService, loopSnapshot } from '../../session-core/dist/index.js';
 import {
   decodeGuiProjection,
   inputCacheMetric,
@@ -26,6 +26,76 @@ import {
   waitForProjection,
   waitUntil,
 } from '../../session-core/tests/local-agent-fixtures.mjs';
+
+test('sidebar reordering preserves project ownership and ignores stale drag targets', async (t) => {
+  const { moveSidebarItem } = await loadGuiModule(t, '/src/deepcode-gui/layout/sidebarOrder.ts');
+  const projects = [{ id: 'p:a' }, { id: 'p:b' }, { id: 'p:c' }];
+  const sessions = [
+    { id: 's:a', projectId: 'p:a' }, { id: 's:b', projectId: 'p:a' },
+    { id: 's:c', projectId: 'p:b' }, { id: 's:d' }, { id: 's:e' },
+  ];
+  const original = structuredClone({ projects, sessions });
+  const project = (id) => ({ kind: 'project', id });
+  const session = (id) => ({ kind: 'session', ...sessions.find((entry) => entry.id === id) });
+  const empty = { projects: [], sessions: [] };
+  const first = moveSidebarItem(empty, projects, sessions, project('p:c'), project('p:a'), 'before');
+  assert.deepEqual(first.projects, ['p:c', 'p:a', 'p:b']);
+  assert.deepEqual(moveSidebarItem(first, projects, sessions, project('p:c'), project('p:b'), 'after').projects, ['p:a', 'p:b', 'p:c']);
+  const nested = moveSidebarItem(first, projects, sessions, session('s:b'), session('s:a'), 'before');
+  assert.deepEqual(nested.sessions, ['s:b', 's:a', 's:c', 's:d', 's:e']);
+  assert.deepEqual(nested.projects, first.projects);
+  const standalone = moveSidebarItem(nested, projects, sessions, session('s:e'), session('s:d'), 'before');
+  assert.deepEqual(standalone.sessions, ['s:b', 's:a', 's:c', 's:e', 's:d']);
+  assert.equal(moveSidebarItem(standalone, projects, sessions, session('s:a'), session('s:c'), 'before'), null);
+  assert.equal(moveSidebarItem(standalone, projects, sessions, session('s:a'), session('s:d'), 'after'), null);
+  assert.equal(moveSidebarItem(standalone, projects, sessions, project('p:a'), session('s:a'), 'after'), null);
+  assert.equal(moveSidebarItem(standalone, projects, sessions, project('p:deleted'), project('p:a'), 'before'), null);
+  const changed = sessions.map((entry) => entry.id === 's:b' ? { ...entry, projectId: 'p:b' } : entry);
+  assert.equal(moveSidebarItem(standalone, projects, changed, session('s:b'), session('s:a'), 'after'), null);
+  assert.deepEqual({ projects, sessions }, original);
+});
+
+test('sidebar manual order survives catalog updates while new and deleted entries remain correct', async (t) => {
+  const { orderSidebarItems, readSidebarOrder } = await loadGuiModule(t, '/src/deepcode-gui/layout/sidebarOrder.ts');
+  const saved = readSidebarOrder(JSON.stringify({ projects: ['p:b', 'p:deleted', 'p:a'], sessions: [] }));
+  const updatedCatalog = [{ id: 'p:a', updatedAt: 'later' }, { id: 'p:new' }, { id: 'p:b', updatedAt: 'earlier' }];
+  assert.deepEqual(orderSidebarItems(updatedCatalog, saved.projects).map((entry) => entry.id), ['p:new', 'p:b', 'p:a']);
+  assert.deepEqual(orderSidebarItems([], saved.projects), []);
+  assert.deepEqual(orderSidebarItems(updatedCatalog, []).map((entry) => entry.id), updatedCatalog.map((entry) => entry.id));
+  assert.throws(() => readSidebarOrder('{broken'), SyntaxError);
+  assert.throws(() => readSidebarOrder('{"projects":false,"sessions":[]}'), /gui.sidebarOrder/);
+});
+
+test('sidebar order uses the shared settings store and failed saves retain the saved order', async (t) => {
+  const [{ useSettingsStore }, { SIDEBAR_ORDER_SETTING, readSidebarOrder }] = await loadGuiModules(t, [
+    '/src/state/settingsStore.ts', '/src/deepcode-gui/layout/sidebarOrder.ts',
+  ]);
+  let persisted = { 'gui.colorTheme': 'dark' };
+  let fail = false;
+  installGuiFetch(t, (url, init) => {
+    assert.equal(url.pathname, '/api/user-settings');
+    if (init.method === 'PATCH') {
+      const { patches } = JSON.parse(init.body);
+      assert.deepEqual(Object.keys(patches), [SIDEBAR_ORDER_SETTING]);
+      if (fail) return Response.json({ ok: false, message: 'settings write failed' });
+      persisted = { ...persisted, ...patches };
+      return Response.json({ ok: true, data: { settings: persisted, changedKeys: Object.keys(patches), activation: 'immediate' } });
+    }
+    return Response.json({ ok: true, data: { settings: persisted, runtimeSettings: persisted, overriddenKeys: Object.keys(persisted), storePath: '/test/user-settings.json' } });
+  });
+  await useSettingsStore.getState().loadUserSettings();
+  assert.deepEqual(readSidebarOrder(useSettingsStore.getState().effectiveSettings[SIDEBAR_ORDER_SETTING]), { projects: [], sessions: [] });
+  const order = { projects: ['p:b', 'p:a'], sessions: ['s:b', 's:a'] };
+  assert.equal(await useSettingsStore.getState().patchUserSetting(SIDEBAR_ORDER_SETTING, JSON.stringify(order)), 'immediate');
+  const [{ useSettingsStore: reloaded }] = await loadGuiModules(t, ['/src/state/settingsStore.ts']);
+  await reloaded.getState().loadUserSettings();
+  assert.deepEqual(readSidebarOrder(reloaded.getState().effectiveSettings[SIDEBAR_ORDER_SETTING]), order);
+  assert.equal(reloaded.getState().effectiveSettings['gui.colorTheme'], 'dark');
+  fail = true;
+  assert.equal(await reloaded.getState().patchUserSetting(SIDEBAR_ORDER_SETTING, '{"projects":[],"sessions":[]}'), null);
+  assert.match(reloaded.getState().errorMessage, /settings write failed/);
+  assert.deepEqual(readSidebarOrder(reloaded.getState().effectiveSettings[SIDEBAR_ORDER_SETTING]), order);
+});
 
 test('native path selection preserves OS paths, cancellation and dialog errors', async (t) => {
   const previousWindow = globalThis.window;
@@ -342,11 +412,14 @@ test('compaction owns last-call usage and an unreported next call clears it with
   assert.equal(lastCallInputCacheMetric(completed.contextUsage), null);
   assert.equal(completed.contextCompositions.at(-1).providerRequestId, requests[2].requestId);
   assert.equal(completed.contextCompositions.length, 1);
-  const historical = await actor.contextComposition(requests[0].requestId);
+  const historyService = new SessionService(journal, {
+    async create() { throw new Error('historical_read_must_not_open_actor'); },
+  });
+  const historical = await historyService.contextComposition(sessionId, requests[0].requestId);
   assert.equal(historical.providerRequestId, requests[0].requestId);
   historical.messages.length = 0;
-  assert.ok((await actor.contextComposition(requests[0].requestId)).messages.length > 0);
-  await assert.rejects(actor.contextComposition('provider-request:missing'), /context_composition_not_found/u);
+  assert.ok((await historyService.contextComposition(sessionId, requests[0].requestId)).messages.length > 0);
+  await assert.rejects(historyService.contextComposition(sessionId, 'provider-request:missing'), /context_composition_not_found/u);
   assert.equal(completed.tokenUsage.inputTokens, 300);
   assert.equal(completed.tokenUsage.cacheReadInputTokens, 95);
   assert.equal(completed.tokenUsage.cacheHitRatio, 95 / 300);
@@ -951,7 +1024,21 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
   t.after(() => actor.dispose());
   let commands = 0;
   let failSave = false;
+  const profiles = [
+    { id: 'profile:one', name: 'My fast model', model: 'configured-model', enabled: true, thinking: 'enabled' },
+    { id: 'profile:two', name: 'My other model', model: 'configured-model', enabled: true, thinking: 'enabled' },
+    { id: 'profile:off', name: 'No reasoning', model: 'configured-model', enabled: true, thinking: 'disabled' },
+  ];
+  let defaultProfileId = profiles[0].id;
   installGuiFetch(t, async (url, init) => {
+    if (url.pathname === '/api/llm/profiles') {
+      if (init.method === 'PATCH') {
+        const update = JSON.parse(init.body);
+        assert.deepEqual(Object.keys(update), ['defaultProfileId']);
+        defaultProfileId = update.defaultProfileId;
+      }
+      return Response.json({ ok: true, data: { profiles, defaultProfileId } });
+    }
     const sessionPath = `/api/conversation/sessions/${encodeURIComponent(sessionId)}`;
     if (url.pathname === `${sessionPath}/commands` && init.method === 'POST') {
       commands += 1;
@@ -966,14 +1053,10 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
     throw new Error(`unexpected_gui_request:${init.method ?? 'GET'}:${url.pathname}`);
   });
   const store = await loadGuiModelStore(t);
-  store.setState({ profiles: [
-    { id: 'profile:one', name: 'My fast model', model: 'configured-model', enabled: true, thinking: 'enabled' },
-    { id: 'profile:two', name: 'My other model', model: 'configured-model', enabled: true, thinking: 'enabled' },
-    { id: 'profile:off', name: 'No reasoning', model: 'configured-model', enabled: true, thinking: 'disabled' },
-  ] });
+  store.setState({ profiles });
   await store.getState().selectProfile('profile:one');
   await store.getState().selectReasoningEffort('max');
-  assert.equal(commands, 0, 'new draft selection stays in memory until a Session exists');
+  assert.equal(commands, 0, 'draft preference is saved without creating a Session');
   assert.equal(store.getState().reasoningEffortOverride, 'max');
   store.setState({ sessionId, projection: await actor.snapshot() });
   await store.getState().selectReasoningEffort('low');
@@ -982,6 +1065,7 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
   assert.equal(store.getState().selectedProfileId, 'profile:two');
   assert.equal(store.getState().reasoningEffortOverride, null);
   assert.equal((await actor.snapshot()).modelSettings.profileId, 'profile:two');
+  assert.equal(store.getState().defaultProfileId, 'profile:two');
   failSave = true;
   await store.getState().selectReasoningEffort('high');
   assert.equal(store.getState().reasoningEffortOverride, null);
@@ -994,6 +1078,14 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
   assert.equal(commands, before);
   assert.equal(store.getState().reasoningEffortOverride, null);
   assert.equal((await actor.snapshot()).run, null);
+  store.getState().startNewSession();
+  assert.equal(store.getState().selectedProfileId, 'profile:off');
+  await store.getState().selectProfile('profile:two');
+  store.getState().startNewSession();
+  assert.equal(store.getState().selectedProfileId, 'profile:two');
+  const reopened = await loadGuiModelStore(t);
+  await reopened.getState().refreshProfiles();
+  assert.equal(reopened.getState().selectedProfileId, 'profile:two');
 });
 
 test('starting a draft during initialization preserves navigation and still loads usable model configuration', async (t) => {
@@ -1337,7 +1429,11 @@ test('Plan documents and previews render Markdown entities, code names and verif
   const { PlanPreviewCard, PlanPreviewContent } = await loadGuiModule(t, '/src/components/local-agent/PlanPreviewCard.tsx');
   const { MarkdownInline } = await loadGuiModule(t, '/src/components/local-agent/BufferedMarkdown.tsx');
   const { ComposerDecisionPanels } = await loadGuiModule(t, '/src/components/local-agent/ComposerDecisionPanels.tsx');
-  const { InteractionReplyQuote } = await loadGuiModule(t, '/src/components/local-agent/ConversationTranscript.tsx');
+  const [{ InteractionReplyQuote }, { ConversationVirtualRow }, { ConversationLayoutCache, ConversationVirtualizer }] = await loadGuiModules(t, [
+    '/src/components/local-agent/ConversationTranscript.tsx',
+    '/src/components/local-agent/ConversationVirtualRow.tsx',
+    '/src/components/local-agent/conversationVirtualizer.ts',
+  ]);
   const plan = {
     planId: 'plan:document', revision: 1, runId: 'run:document', callId: 'call:document', status: 'published',
     title: '对象池 ObjectPool&lt;T,N&gt; 升级', summary: '保留 **互斥访问** 与 `C++17`。',
@@ -1406,9 +1502,24 @@ test('Plan documents and previews render Markdown entities, code names and verif
   assert.match(optionButton, /<code>Makefile<\/code>/, 'the description is part of the option hit target and accessible name');
   assert.ok(optionButton.includes('说明'));
   assert.equal(optionButton.includes('<a '), false, 'an option cannot contain a second interactive link');
-  const reply = renderToStaticMarkup(createElement(InteractionReplyQuote, { prompt }));
-  assert.match(reply, /<details class="conversation-answered-question">/);
-  assert.match(reply, /<code>Dockerfile<\/code>/, 'the full question remains available after answering');
+  const virtualizer = new ConversationVirtualizer(new ConversationLayoutCache().session('session:reply'), () => {});
+  const renderReply = () => renderToStaticMarkup(createElement(ConversationVirtualRow, {
+    rowKey: 'message:reply', virtualizer, eager: true,
+    children: () => createElement(InteractionReplyQuote, { prompt, language: 'zh-CN' }),
+  }));
+  const reply = renderReply();
+  assert.match(reply, /aria-expanded="false"/);
+  assert.match(reply, /<strong>容器环境<\/strong>/);
+  assert.equal(reply.includes('Dockerfile'), false, 'the collapsed quote only mounts its first-paragraph preview');
+  virtualizer.layout('message:reply').state.set('interaction-reply:expanded', true);
+  const expandedReply = renderReply();
+  assert.match(expandedReply, /aria-expanded="true"/);
+  assert.match(expandedReply, /aria-label="收起问题"/);
+  assert.equal(expandedReply.match(/容器环境/g)?.length, 1, 'expanding replaces the preview instead of repeating the question');
+  assert.match(expandedReply, /<li>保留 <code>Dockerfile<\/code><\/li>/, 'the full question retains its Markdown after answering');
+  assert.ok(expandedReply.includes('删除演示产物'));
+  virtualizer.layout('message:reply').state.set('interaction-reply:expanded', false);
+  assert.equal(renderReply(), reply, 'collapsing restores the original preview');
 });
 
 test('reasoning details are a default-off shell preference in the real Settings catalog', async (t) => {
@@ -1894,4 +2005,382 @@ test('conversation reading survives native scroll deliveries and layout growth w
   flushFrames();
   assert.equal(top, 1_060, 'the explicit latest action resumes following after detached reading');
   assert.equal(frames.size, 0);
+});
+
+test('composer submission receipts preserve newer text and retain the complete failed draft', async (t) => {
+  const { submitComposerState, emptyComposerState } = await loadGuiModule(t, '/src/components/local-agent/composerSubmission.ts');
+  const original = { ...emptyComposerState(), draft: 'First request',
+    pastedTexts: [{ inputId: 'paste:one', text: 'Complete pasted content', expanded: false }],
+    filesystemPaths: [{ path: '/project/one.txt', kind: 'file' }],
+    pluginSelections: [{ selectionId: 'selection:one', uri: 'plugin://example@1', label: 'Example' }] };
+  for (const fails of [false, true]) {
+    let current = original;
+    const retained = [];
+    let complete;
+    const pending = new Promise((resolve, reject) => { complete = () => fails ? reject(new Error('command failed')) : resolve(); });
+    const submission = submitComposerState('session:one', original, {
+      read: () => current,
+      write: (key, value) => { assert.equal(key, 'session:one'); current = value; },
+      retainFailed: (key, value) => retained.push({ key, value }),
+      send: () => pending,
+    });
+    assert.deepEqual(current, emptyComposerState(), 'the submitted text and attachments move together');
+    current = { ...emptyComposerState(), draft: 'Second request', filesystemPaths: [{ path: '/project/two.txt', kind: 'file' }] };
+    complete();
+    assert.equal(await submission, !fails);
+    assert.equal(current.draft, 'Second request');
+    assert.equal(current.filesystemPaths[0].path, '/project/two.txt');
+    assert.deepEqual(retained, fails ? [{ key: 'session:one', value: original }] : []);
+  }
+  let current = original;
+  await submitComposerState('session:one', original, {
+    read: () => current, write: (_key, value) => { current = value; },
+    retainFailed: () => assert.fail('an untouched composer restores in place'),
+    send: async () => { throw new Error('rejected'); },
+  });
+  assert.deepEqual(current, original);
+});
+
+test('pending approvals preserve ordinary input with one primary action', async (t) => {
+  const previousSelf = globalThis.self;
+  globalThis.self = {};
+  t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { ConversationComposer } = await loadGuiModule(t, '/src/components/local-agent/ConversationComposer.tsx');
+  const composer = {
+    pendingApproval: { approvalId: 'approval:one', preview: { summary: 'Write the requested file', effects: [], logicalTargets: [] } },
+    projection: { queuedInputs: [{ commandId: 'queued:one', text: 'Keep the public API unchanged', status: 'queued', filesystemReferences: [] }] },
+    profiles: [], selectedProfileId: null, draft: 'Second request', pastedTexts: [], failedDrafts: [],
+    pendingFilesystemPaths: [], pluginSelections: [], filteredPlugins: [], showStopAction: false, canSend: false, submitting: true,
+    textareaRef: { current: null }, respondApproval() {},
+  };
+  const html = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', composer, uiActionError: null }));
+  assert.match(html, /Write the requested file/);
+  assert.match(html, /<textarea[^>]*>Second request<\/textarea>/);
+  assert.match(html, /local-agent__composer--message/);
+  assert.match(html, /<textarea[^>]*rows="3"/);
+  assert.doesNotMatch(html, /local-agent__send--stop/);
+  assert.match(html, /class="local-agent__send"/);
+  assert.equal((html.match(/<button[^>]*class="local-agent__send(?: |")/g) ?? []).length, 1);
+  assert.match(html, /等待加入当前任务/);
+  assert.match(html, /Keep the public API unchanged/);
+});
+
+test('questions and Plan revisions share the main input and render a single primary action', async (t) => {
+  const previousSelf = globalThis.self;
+  globalThis.self = {};
+  t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { ConversationComposer } = await loadGuiModule(t, '/src/components/local-agent/ConversationComposer.tsx');
+  const base = { profiles: [], selectedProfileId: null, draft: '保留构建配置', pastedTexts: [], failedDrafts: [],
+    pendingFilesystemPaths: [], pluginSelections: [], filteredPlugins: [], textareaRef: { current: null },
+    canSend: true, showStopAction: false, textDecision: true };
+  for (const decision of [
+    { pendingInteraction: { interactionId: 'question:one', prompt: '需要保留什么？', allowFreeform: true, options: [] } },
+    { pendingPlan: { planId: 'plan:one', revision: 1, title: '清理工作区' } },
+  ]) {
+    const html = renderToStaticMarkup(createElement(ConversationComposer, {
+      language: 'zh-CN', composer: { ...base, ...decision }, uiActionError: null,
+    }));
+    assert.equal((html.match(/<textarea\b/g) ?? []).length, 1);
+    assert.match(html, /<textarea[^>]*rows="1"/);
+    assert.ok(html.includes(`local-agent__composer--${decision.pendingPlan ? 'plan' : 'interaction'}`));
+    assert.equal((html.match(/<button[^>]*class="local-agent__send(?: |")/g) ?? []).length, 1);
+    assert.match(html, /保留构建配置<\/textarea>/);
+    assert.doesNotMatch(html, /local-agent__send--stop/);
+    assert.doesNotMatch(html, /local-agent__interaction-composer/);
+    assert.doesNotMatch(html, /local-agent__interaction-close|local-agent__interaction-secondary-actions/);
+    const secondaryLabel = decision.pendingPlan ? '取消并停止' : '跳过';
+    assert.equal(html.split(secondaryLabel).length - 1, 1);
+    const actions = html.slice(html.indexOf('class="local-agent__composer-primary-actions"'));
+    assert.ok(actions.includes(secondaryLabel));
+    assert.ok(actions.indexOf(secondaryLabel) < actions.indexOf('class="local-agent__send"'));
+  }
+  const running = renderToStaticMarkup(createElement(ConversationComposer, {
+    language: 'zh-CN', composer: { ...base, textDecision: false, draft: '', canSend: false, showStopAction: true }, uiActionError: null,
+  }));
+  assert.equal((running.match(/<button[^>]*class="local-agent__send(?: |")/g) ?? []).length, 1);
+  assert.match(running, /local-agent__send--stop/);
+  assert.match(running, /local-agent__composer--message/);
+  assert.match(running, /<textarea[^>]*rows="3"/);
+  const editing = renderToStaticMarkup(createElement(ConversationComposer, {
+    language: 'zh-CN', composer: { ...base, textDecision: false }, uiActionError: null,
+  }));
+  assert.match(editing, /<textarea[^>]*rows="3"/);
+  assert.match(editing, /保留构建配置<\/textarea>/);
+  assert.match(editing, /aria-label="发送"/);
+  assert.doesNotMatch(editing, /local-agent__send--stop|local-agent__interaction-secondary/);
+});
+
+test('resource preview uses the native dialog while committed content projects only displayed text', async (t) => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { ResourcePreview } = await loadGuiModule(t, '/src/components/local-agent/ResourcePreview.tsx');
+  const html = renderToStaticMarkup(createElement(ResourcePreview, { language: 'zh-CN', preview: {
+    resourcePreview: { workspaceId: 'workspace:one', logicalPath: 'README.md', status: 'loading' }, closeResourcePreview() {},
+  } }));
+  assert.match(html, /^<dialog\b/);
+  assert.match(html, /README.md/);
+  const { projectCommittedText } = await import('../../presentation-core/dist/index.js');
+  const projection = { messages: [
+    { messageId: 'user:one', role: 'user', content: '<plain>' },
+    { messageId: 'assistant:one', role: 'assistant', content: '**Answer**' },
+    { messageId: 'tool:one', role: 'tool', content: 'Tool internal output' },
+  ], narratives: [{ narrativeId: 'narrative:one', content: 'Checking.' }] };
+  assert.deepEqual([...projectCommittedText(projection).values()], [
+    { blockId: 'message:user:one:content', text: '<plain>', format: 'plain' },
+    { blockId: 'message:assistant:one:content', text: '**Answer**', format: 'markdown' },
+    { blockId: 'narrative:narrative:one', text: 'Checking.', format: 'markdown' },
+  ]);
+});
+
+test('unavailable plugins preserve their source error and cannot be selected in the picker', async (t) => {
+  const previousSelf = globalThis.self;
+  globalThis.self = {};
+  t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
+  const plugin = { uri: 'plugin://broken@1', displayName: 'Broken plugin', shortDescription: 'Optional extension',
+    activationMediaTypes: [], enabled: true, available: false, error: { code: 'plugin_load_failed', message: 'Manifest cannot be read' } };
+  installGuiFetch(t, () => Response.json({ ok: true, data: { revision: 'catalog:one', plugins: [plugin] } }));
+  const { getPluginCatalog } = await loadGuiModule(t, '/src/services/localAgentApi.ts');
+  assert.deepEqual((await getPluginCatalog()).plugins, [plugin]);
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { ConversationComposer } = await loadGuiModule(t, '/src/components/local-agent/ConversationComposer.tsx');
+  const html = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', uiActionError: null, composer: {
+    profiles: [], selectedProfileId: null, draft: '@', pastedTexts: [], failedDrafts: [],
+    pendingFilesystemPaths: [], pluginSelections: [], filteredPlugins: [plugin], pluginPickerOpen: true,
+    textareaRef: { current: null },
+  } }));
+  assert.match(html, /role="option"[^>]*disabled=""/);
+  assert.match(html, /plugin_load_failed: Manifest cannot be read/);
+});
+
+test('tool failure summaries render the original error without reading history', async (t) => {
+  const previousSelf = globalThis.self;
+  globalThis.self = {};
+  t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const [{ ToolActivityGroup }, { ConversationVirtualRow }] = await loadGuiModules(t, [
+    '/src/components/local-agent/ToolActivityDetails.tsx', '/src/components/local-agent/ConversationVirtualRow.tsx',
+  ]);
+  const layout = { state: new Map() };
+  const html = renderToStaticMarkup(createElement(ConversationVirtualRow, {
+    rowKey: 'tool-failure', eager: true, virtualizer: { layout: () => layout },
+    children: () => createElement(ToolActivityGroup, { activities: [{
+      activityId: 'activity:one', runId: 'run:one', status: 'failed', kind: 'tool', label: 'read',
+      tool: { operation: 'fs.read', resources: [], error: { code: 'path_not_directory', message: 'a.txt is not a directory' } },
+    }], language: 'zh-CN', onExpand() {}, onOpenWorkspaceResource() {} }),
+  }));
+  assert.match(html, /path_not_directory/);
+  assert.match(html, /a.txt is not a directory/);
+});
+
+test('GUI ordinary input queues during a decision without answering it or changing the active model', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:gui-queued-decision';
+  await createSession(journal, sessionId);
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    yield providerEvent(request.requestId, 'tool.call', {
+      callId: 'question:gui', name: request.tools.find((tool) => tool.inputSchema.properties?.prompt).name,
+      input: { kind: 'question', prompt: 'Which option?', allowFreeform: true },
+    });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel(), fakeRunPreparation().port, 'gui-queued-decision');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:gui-decision-start', 'Ask a question.'));
+  const waiting = await waitForProjection(actor, (value) => value.pendingInteraction !== null);
+  const commands = [];
+  const catalog = { projects: [], sessions: [] };
+  let delayReply = false;
+  let releaseReply;
+  let receivedMessage;
+  const replyGate = new Promise((resolve) => { releaseReply = resolve; });
+  const messageReceived = new Promise((resolve) => { receivedMessage = resolve; });
+  installGuiFetch(t, async (url, init) => {
+    if (url.pathname.endsWith('/commands')) {
+      const command = JSON.parse(init.body);
+      commands.push(command);
+      const reply = await actor.submit(command);
+      if (delayReply && command.type === 'message.submit') {
+        receivedMessage();
+        await replyGate;
+      }
+      return Response.json({ ok: true, data: reply });
+    }
+    if (url.pathname.endsWith('/projection')) return Response.json({ ok: true, data: await actor.snapshot() });
+    if (url.pathname.endsWith('/catalog')) return Response.json({ ok: true, data: catalog });
+    if (url.pathname.endsWith('/plugins')) return Response.json({ ok: true, data: { revision: 'plugins:queued', plugins: [] } });
+    throw new Error(`unexpected_gui_request:${url.pathname}`);
+  });
+  const store = await loadGuiModelStore(t);
+  store.setState({ sessionId, projection: waiting, catalog,
+    selectedProfileId: 'profile:next-run', reasoningEffortOverride: 'high', profiles: [] });
+  await store.getState().sendMessage('Keep the original file layout.');
+  assert.equal(commands.length, 1);
+  assert.equal(commands[0].type, 'message.submit');
+  assert.equal(commands[0].runId, waiting.run.runId);
+  assert.equal(commands[0].profileId, undefined);
+  assert.equal(commands[0].reasoningEffortOverride, undefined);
+  const queued = store.getState().projection;
+  assert.deepEqual(queued.pendingInteraction, waiting.pendingInteraction);
+  assert.equal(queued.run.runId, waiting.run.runId);
+  assert.equal(queued.queuedInputs[0].text, 'Keep the original file layout.');
+  assert.equal(queued.queuedInputs[0].status, 'queued');
+  assert.equal(queued.messages.some((message) => message.content === 'Keep the original file layout.'), false);
+  delayReply = true;
+  const sending = store.getState().sendMessage('Preserve this second supplement too.');
+  await messageReceived;
+  assert.equal(store.getState().submitting, true);
+  await Promise.all([store.getState().cancelRun(), store.getState().cancelRun()]);
+  assert.equal(commands.filter((command) => command.type === 'run.cancel').length, 1, 'repeated stop uses the existing command flight');
+  assert.equal(store.getState().projection.run.status, 'cancelled');
+  assert.equal(store.getState().submitting, true, 'a pending ordinary submission retains its own lifecycle');
+  releaseReply();
+  await sending;
+  assert.equal(store.getState().submitting, false);
+  assert.deepEqual(store.getState().projection.queuedInputs.map((input) => input.status), ['notApplied', 'notApplied']);
+  store.setState({ projection: waiting });
+  await assert.rejects(store.getState().sendMessage('A supplement sent from the older snapshot.'), /queued_input_run_unavailable/);
+  assert.equal(store.getState().projection.run.runId, waiting.run.runId);
+  assert.equal(store.getState().projection.run.status, 'cancelled');
+});
+
+test('new-session submission identifies the draft destination before publishing the session', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:gui-created-draft';
+  await createSession(journal, sessionId);
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    yield providerEvent(request.requestId, 'assistant.message', { messageId: 'answer:created', content: 'Received.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel(), fakeRunPreparation().port, 'gui-created-draft');
+  t.after(() => actor.dispose());
+  const catalog = { projects: [], sessions: [] };
+  installGuiFetch(t, async (url, init) => {
+    if (url.pathname.endsWith('/sessions')) return Response.json({ ok: true, data: await actor.snapshot() });
+    if (url.pathname.endsWith('/commands')) return Response.json({ ok: true, data: await actor.submit(JSON.parse(init.body)) });
+    if (url.pathname.endsWith('/projection')) return Response.json({ ok: true, data: await actor.snapshot() });
+    if (url.pathname.endsWith('/catalog')) return Response.json({ ok: true, data: catalog });
+    if (url.pathname.endsWith('/plugins')) return Response.json({ ok: true, data: { revision: 'plugins:created', plugins: [] } });
+    throw new Error(`unexpected_gui_request:${url.pathname}`);
+  });
+  const store = await loadGuiModelStore(t);
+  store.setState({ sessionId: null, projection: null, catalog,
+    selectedProfileId: 'profile:test', profiles: [{ id: 'profile:test', enabled: true }] });
+  const destinations = [];
+  await store.getState().sendMessage('Start the task.', [], [], [], (createdSessionId) => {
+    assert.equal(store.getState().sessionId, null);
+    destinations.push(createdSessionId);
+  });
+  assert.deepEqual(destinations, [sessionId]);
+  assert.equal(store.getState().sessionId, sessionId);
+});
+
+test('model settings distinguish a failed read from a successfully empty catalog and retain loaded profiles', async (t) => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const [{ default: LlmSection, LlmProfileReadNotice }, api, { t: translate }] = await loadGuiModules(t, [
+    '/src/components/settings-center/sections/LlmSection.tsx', '/src/services/apiClient.ts', '/src/i18n.ts',
+  ]);
+  const emptyMessage = translate('zh-CN', 'settings.llm.empty');
+  const notice = (state, hasProfiles = false) => renderToStaticMarkup(createElement(LlmProfileReadNotice, {
+    state, hasProfiles, language: 'zh-CN',
+  }));
+  assert.equal(notice({ status: 'loading' }), '');
+  const initial = renderToStaticMarkup(createElement(LlmSection));
+  assert.equal(initial.includes(emptyMessage), false, 'the first render has not read the catalog');
+  assert.equal(initial.includes(translate('en-US', 'settings.llm.empty')), false);
+  installGuiFetch(t, (url) => {
+    assert.equal(url.pathname, '/api/llm/profiles');
+    throw new TypeError('Failed to fetch');
+  });
+  const failed = await api.getLlmProfiles();
+  assert.equal(failed.ok, false);
+  assert.match(failed.message, /Failed to fetch/);
+  for (const hasProfiles of [false, true]) {
+    const html = notice({ status: 'failed', error: failed.message }, hasProfiles);
+    assert.match(html, /role="alert"/);
+    assert.match(html, /Failed to fetch/);
+    assert.equal(html.includes(emptyMessage), false);
+  }
+  assert.equal(notice({ status: 'loaded' }).includes(emptyMessage), true);
+  assert.equal(notice({ status: 'loaded' }, true), '');
+  const profiles = [
+    { id: 'profile:existing', name: 'Existing model', enabled: true },
+    { id: 'profile:disabled', name: 'Disabled model', enabled: false },
+  ];
+  const store = await loadGuiModelStore(t);
+  store.setState({ profiles, defaultProfileId: profiles[0].id, selectedProfileId: profiles[0].id });
+  await store.getState().refreshProfiles();
+  assert.deepEqual(store.getState().profiles, profiles);
+  assert.equal(store.getState().defaultProfileId, profiles[0].id);
+  assert.equal(store.getState().selectedProfileId, profiles[0].id);
+  assert.match(store.getState().error, /Failed to fetch/);
+});
+
+test('invalid default profiles retain editable settings and do not prevent reading conversation history', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:profile-error-history';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const provider = { async *stream(request) {
+    yield providerEvent(request.requestId, 'assistant.message', { messageId: 'message:history', content: 'Saved conversation response.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } };
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), fakeRunPreparation().port, 'profile-error-history');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:history', 'Keep this conversation.'));
+  const projection = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.ok(projection.messages.some((message) => message.role === 'assistant'));
+  const profile = { id: 'profile:kept', name: 'My configured model', kind: 'responses', model: 'configured-model', enabled: true, secretRef: 'local-secret:profile:kept' };
+  const editable = { profiles: [profile], defaultProfileId: 'profile:missing', storePath: '/config/settings/llm-profiles.json' };
+  const failure = { ok: false, error: 'invalid_llm_profile_store_schema', message: 'defaultProfileId: profile:missing', data: editable };
+  const catalog = { projects: [], sessions: [{ id: sessionId, title: 'Saved conversation', workspaceBindings: [workspaceBinding], profileId: profile.id,
+    createdAt: '2026-09-14T00:00:00Z', updatedAt: '2026-09-14T00:00:00Z' }] };
+  installGuiFetch(t, (url, init) => {
+    assert.equal(init.method ?? 'GET', 'GET');
+    if (url.pathname === '/api/llm/profiles') return Response.json(failure);
+    if (url.pathname === '/api/conversation/catalog') return Response.json({ ok: true, data: catalog });
+    if (url.pathname === '/api/conversation/plugins') return Response.json({ ok: true, data: { revision: 'plugin-catalog:empty', plugins: [] } });
+    if (url.pathname === '/api/conversation/statuses') return Response.json({ ok: true, data: [{ sessionId, revision: projection.revision,
+      run: { runId: projection.run.runId, status: projection.run.status } }] });
+    if (url.pathname.endsWith('/projection')) return Response.json({ ok: true, data: projection });
+    throw new Error(`Unexpected request: ${url.pathname}`);
+  });
+  const api = await loadGuiModule(t, '/src/services/apiClient.ts');
+  assert.deepEqual(await api.getLlmProfiles(), failure);
+  const store = await loadGuiModelStore(t);
+  await store.getState().initialize();
+  assert.deepEqual(store.getState().catalog, catalog);
+  await store.getState().activateSession(sessionId);
+  assert.equal(store.getState().loading, false);
+  assert.deepEqual(store.getState().projection.messages, projection.messages);
+  await assert.rejects(store.getState().sendMessage('Start a new run.'), /llm_profile_unavailable/);
+  assert.deepEqual((await actor.snapshot()).messages, projection.messages);
+});
+
+test('saving valid profiles enables an unbound draft and clears its profile error', async (t) => {
+  const profile = { id: 'profile:configured', name: 'Configured model', kind: 'responses', model: 'configured-model', enabled: true };
+  let profileResponse = { ok: false, error: 'invalid_llm_profile_store_schema', message: 'defaultProfileId: profile:missing',
+    data: { profiles: [profile], defaultProfileId: 'profile:missing' } };
+  installGuiFetch(t, (url) => {
+    if (url.pathname === '/api/llm/profiles') return Response.json(profileResponse);
+    if (url.pathname === '/api/conversation/catalog') return Response.json({ ok: true, data: { projects: [], sessions: [] } });
+    if (url.pathname === '/api/conversation/plugins') return Response.json({ ok: true, data: { revision: 'plugin-catalog:empty', plugins: [] } });
+    if (url.pathname === '/api/conversation/statuses') return Response.json({ ok: true, data: [] });
+    throw new Error(`Unexpected request: ${url.pathname}`);
+  });
+  const store = await loadGuiModelStore(t);
+  await store.getState().initialize();
+  assert.equal(store.getState().sessionId, null);
+  assert.equal(store.getState().selectedProfileId, null);
+  assert.equal(store.getState().defaultProfileId, null);
+  assert.equal(store.getState().error, profileResponse.message);
+  profileResponse = { ok: true, data: { profiles: [profile], defaultProfileId: profile.id } };
+  await store.getState().refreshProfiles();
+  assert.equal(store.getState().selectedProfileId, profile.id);
+  assert.deepEqual(store.getState().profiles, [profile]);
+  assert.equal(store.getState().error, null);
+  assert.equal(store.getState().errorSource, null);
 });

@@ -1,10 +1,6 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './app/App';
-import {
-  createGuiPresentationRegistry,
-  GuiPresentationProvider,
-} from './presentation/PresentationRuntime';
 import { installNativeContextMenuGuard } from './utils/nativeContextMenuGuard';
 import { activeT } from './i18n';
 
@@ -130,16 +126,12 @@ if (!rootEl) {
 installNativeContextMenuGuard();
 
 const root = ReactDOM.createRoot(rootEl);
-const presentationRegistry = createGuiPresentationRegistry();
 let compositionDisposed = false;
 const disposeComposition = () => {
   if (compositionDisposed) return;
   compositionDisposed = true;
   window.removeEventListener('pagehide', handlePageHide);
   root.unmount();
-  void presentationRegistry.dispose().catch((error) => {
-    console.error('[GUI presentation disposal]', error);
-  });
 };
 const handlePageHide = (event: PageTransitionEvent) => {
   if (!event.persisted) disposeComposition();
@@ -151,9 +143,7 @@ try {
   root.render(
     <React.StrictMode>
       <ErrorBoundary>
-        <GuiPresentationProvider registry={presentationRegistry}>
-          <App />
-        </GuiPresentationProvider>
+        <App />
       </ErrorBoundary>
     </React.StrictMode>
   );

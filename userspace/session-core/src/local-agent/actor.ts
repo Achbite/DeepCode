@@ -6,7 +6,6 @@ import type {
   AssistantDraftProjection,
   CommandJournalPort,
   CommandReply,
-  ContextCompositionProjection,
   ConversationCommand,
   InteractionProjection,
   NewSessionEvent,
@@ -50,10 +49,10 @@ export class SessionActor {
   readonly #profileId?: string;
   readonly #nextId: (kind: string) => string;
   #mailbox = Promise.resolve();
+  #writes = Promise.resolve();
   #active?: ActiveRun;
   #disposed = false;
   #loopFailure?: Error;
-  #projectionState?: LoopSnapshot['state'];
   #snapshot?: LoopSnapshot;
   #initialEvents?: readonly SessionEvent[];
   #snapshotReads: Promise<void> = Promise.resolve();
@@ -110,15 +109,6 @@ export class SessionActor {
       }
     }
     return projection;
-  }
-
-  async contextComposition(providerRequestId: string): Promise<ContextCompositionProjection> {
-    this.assertOperational();
-    const receipt = (await this.loadSnapshot()).state.contextCompositions.find(
-      (candidate) => candidate.providerRequestId === providerRequestId,
-    );
-    if (!receipt) throw new Error('context_composition_not_found');
-    return structuredClone(receipt);
   }
 
   hasLoopFailure(): boolean {
@@ -199,7 +189,7 @@ export class SessionActor {
       || !validReasoningOverride(command.settings.reasoningEffortOverride)) {
       return await this.recordRejection(command, 'session_model_settings_invalid', '对话模型设置无效。');
     }
-    return await this.#journal.commitCommand(command, [{
+    return await this.commitCommand(command, [{
       type: 'session.model-settings.updated', sessionId: this.sessionId,
       payload: { commandId: command.commandId, settings: { ...command.settings } },
     }], acceptedReply(command));
@@ -225,7 +215,7 @@ export class SessionActor {
         '该目录已经属于当前 Session 的有效目录集合。',
       );
     }
-    const reply = await this.#journal.commitCommand(
+    const reply = await this.commitCommand(
       command,
       [{
         type: 'session.directory-index.attached',
@@ -286,7 +276,7 @@ export class SessionActor {
         },
       });
     }
-    const reply = await this.#journal.commitCommand(
+    const reply = await this.commitCommand(
       command,
       events,
       acceptedReply(command),
@@ -335,29 +325,64 @@ export class SessionActor {
         filesystemReferenceError,
       );
     }
+    const queued = await this.withWrite(async () => {
+      const current = await this.loadSnapshot();
+      const run = current.state.run;
+      if (command.type === 'message.submit' && command.runId !== undefined
+        && (!run || run.runId !== command.runId || !['running', 'waiting'].includes(run.status))) {
+        return await this.#journal.commitCommand(command, [], {
+          ...acceptedReply(command), status: 'rejected',
+          error: { code: 'queued_input_run_unavailable', message: '该消息所属的运行已结束或不再接收输入；消息未进入其他运行。' },
+        });
+      }
+      if (!run || !['running', 'waiting'].includes(run.status)) return null;
+      if (command.type === 'context.focus') {
+        return await this.#journal.commitCommand(command, [], {
+          ...acceptedReply(command), status: 'rejected',
+          error: { code: 'context_focus_run_active', message: '当前任务仍在运行；普通补充消息可以排队，/focus 请在本轮结束后使用。' },
+        });
+      }
+      const runtime = current.state.runRuntimeSnapshots[run.runId];
+      if (!runtime) throw new Error('run_runtime_snapshot_missing');
+      let incompatible: string | undefined;
+      if (command.filesystemReferences?.some((reference) => (
+        !run.workspaceBindings.some((binding) => binding.workspaceId === reference.workspaceId)
+      ))) {
+        incompatible = '当前运行的目录绑定已固定，无法在排队消息中新增目录。';
+      } else if (command.pluginSelections?.some((selection) => (
+        !runtime.selectedPlugins.plugins.some((plugin) => plugin.uri === selection.uri)
+      ))) {
+        incompatible = '当前运行的插件已固定，无法在排队消息中激活新插件。';
+      } else if (
+        command.profileId !== undefined && command.profileId !== runtime.provider.profileId
+        || command.reasoningEffortOverride !== undefined
+          && command.reasoningEffortOverride !== (runtime.provider.reasoningEffortOverride ?? null)
+      ) {
+        incompatible = '当前运行的模型设置已固定，排队消息不能替换本轮模型或推理设置。';
+      }
+      if (incompatible) {
+        return await this.#journal.commitCommand(command, [], {
+          ...acceptedReply(command), status: 'rejected',
+          error: { code: 'queued_input_runtime_change', message: incompatible },
+        });
+      }
+      return await this.#journal.commitCommand(command, [{
+        type: 'input.queued', sessionId: this.sessionId, runId: run.runId,
+        payload: {
+          commandId: command.commandId, messageId: this.#nextId('message'), text: submittedText,
+          ...(command.filesystemReferences?.length ? { filesystemReferences: command.filesystemReferences.map((reference) => ({ ...reference })) } : {}),
+          ...(command.pluginSelections?.length ? { pluginSelections: command.pluginSelections.map((selection) => ({ ...selection })) } : {}),
+        },
+      }], acceptedReply(command));
+    });
+    if (queued) return queued;
+    // A final turn may already be releasing its runtime; wait for that owned task
+    // before admitting the next run, without blocking other Sessions.
+    if (this.#active) await this.#active.task;
     const before = await this.loadSnapshot();
-    if (before.state.pendingPlan) {
-      return await this.recordRejection(
-        command,
-        'plan_response_required',
-        '当前运行正在等待 plan.respond，不能创建并发运行。',
-      );
+    if (before.state.run && !isTerminal(before.state.run.status)) {
+      return await this.recordRejection(command, 'run_release_pending', '当前运行尚未完成资源释放。');
     }
-    if (before.state.pendingInteraction) {
-      return await this.recordRejection(
-        command,
-        'interaction_response_required',
-        '当前运行正在等待 interaction.respond，不能创建并发运行。',
-      );
-    }
-    if (before.state.pendingApproval) {
-      return await this.recordRejection(
-        command,
-        'approval_response_required',
-        '当前运行正在等待 approval.respond，不能创建并发运行。',
-      );
-    }
-    await this.stopCurrentRunForSteering();
     const messageId = this.#nextId('message');
     const runId = this.#nextId('run');
     const profileId = command.profileId ?? before.state.modelSettings?.profileId ?? this.#profileId;
@@ -452,7 +477,7 @@ export class SessionActor {
     }
     let reply: CommandReply;
     try {
-      reply = await this.#journal.commitCommand(
+      reply = await this.commitCommand(
         command,
         events,
         acceptedReply(command),
@@ -494,7 +519,7 @@ export class SessionActor {
         '反馈只能关联当前 Session 中已有的 Assistant 消息。',
       );
     }
-    const reply = await this.#journal.commitCommand(
+    const reply = await this.commitCommand(
       command,
       [{
         type: 'message.feedback.updated',
@@ -562,7 +587,7 @@ export class SessionActor {
         payload: { messageId, role: 'user', content: command.response },
       },
     ];
-    const reply = await this.#journal.commitCommand(command, events, acceptedReply(command));
+    const reply = await this.commitCommand(command, events, acceptedReply(command));
     this.startLoop({ type: 'resume', runId: command.runId });
     return reply;
   }
@@ -587,7 +612,7 @@ export class SessionActor {
         '该 effect 裁决已经关闭或不属于当前运行。',
       );
     }
-    const reply = await this.#journal.commitCommand(
+    const reply = await this.commitCommand(
       command,
       [{
         type: 'approval.resolved',
@@ -726,7 +751,7 @@ export class SessionActor {
         },
       });
     }
-    const reply = await this.#journal.commitCommand(command, events, acceptedReply(command));
+    const reply = await this.commitCommand(command, events, acceptedReply(command));
     if (command.response.kind === 'cancel') {
       if (this.#active?.runId === command.runId) {
         this.#active.controller.abort('user_cancelled_plan');
@@ -751,7 +776,7 @@ export class SessionActor {
       return await this.recordRejection(command, 'run_already_settled', '运行已经结束。');
     }
     const plan = snapshot.state.pendingPlan;
-    const reply = await this.#journal.commitCommand(
+    const reply = await this.commitCommand(
       command,
       plan
         ? [{
@@ -775,18 +800,6 @@ export class SessionActor {
       await this.runLoop({ type: 'cancel', runId: command.runId });
     }
     return reply;
-  }
-
-  private async stopCurrentRunForSteering(): Promise<void> {
-    const snapshot = await this.loadSnapshot();
-    const run = snapshot.state.run;
-    if (!run || isTerminal(run.status)) return;
-    if (this.#active?.runId === run.runId) {
-      this.#active.controller.abort('superseded_by_user_message');
-      await this.#active.task;
-    } else {
-      await this.runLoop({ type: 'cancel', runId: run.runId });
-    }
   }
 
   private startLoop(command: LoopCommand): void {
@@ -815,40 +828,34 @@ export class SessionActor {
       command,
       {
         composition: this.#composition,
-        commit: async (events) => {
-          const batch = Array.isArray(events) ? events : [events];
-          const previousDraft = this.#assistantDraft;
-          const closesDraft = closesAssistantDraft(batch, command.runId);
-          if (closesDraft) this.#assistantDraft = null;
-          let committed: SessionEvent[];
-          try {
-            const current = await this.loadSnapshot();
-            let previewState = current.state;
-            for (const [index, event] of batch.entries()) {
-              previewState = reduceSession(previewState, {
-                ...event,
-                schemaVersion: SESSION_EVENT_VERSION,
-                eventId: `preflight:${current.state.revision + index + 1}`,
-                sequence: current.state.revision + index + 1,
-                occurredAt: '1970-01-01T00:00:00.000Z',
-              } as SessionEvent);
-            }
-            committed = batch.length === 1
-              ? [await this.#journal.append(batch[0]!)]
-              : await this.#journal.appendBatch(batch);
-          } catch (error) {
-            if (closesDraft) this.#assistantDraft = previousDraft;
-            throw error;
-          }
-          for (const event of committed) await this.observe(event);
+        commit: (events) => this.withWrite(async () => {
+          const current = await this.loadSnapshot();
+          const batch = typeof events === 'function' ? events(current) : Array.isArray(events) ? events : [events];
+          await this.appendEvents(batch, current);
           return await this.loadSnapshot();
-        },
+        }),
+        takeQueuedInputs: (runId) => this.withWrite(async () => {
+          const current = await this.loadSnapshot();
+          if (signal.aborted) return current;
+          const queued = current.state.queuedInputs.filter((input) => input.runId === runId);
+          const events = queued.flatMap<NewSessionEvent>((input) => [{
+            type: 'input.accepted', sessionId: this.sessionId,
+            payload: { commandId: input.commandId, messageId: input.messageId, text: input.text,
+              ...(input.pluginSelections.length ? { pluginSelections: input.pluginSelections } : {}) },
+          }, {
+            type: 'message.committed', sessionId: this.sessionId, runId,
+            payload: { messageId: input.messageId, role: 'user', content: input.text,
+              ...(input.filesystemReferences.length ? { filesystemReferences: input.filesystemReferences } : {}),
+              ...(input.pluginSelections.length ? { pluginSelections: input.pluginSelections } : {}) },
+          }]);
+          if (events.length) await this.appendEvents(events, current);
+          return await this.loadSnapshot();
+        }),
         updateAssistantDraft: (draft) => {
           if (draft && draft.runId !== command.runId) {
             throw new Error('assistant_draft_run_identity_mismatch');
           }
           this.#assistantDraft = draft ? structuredClone(draft) : null;
-          if (!this.#projectionState) throw new Error('session_projection_state_missing');
         },
         updateReasoning: (requestId, runId, text, kind) => this.liveReasoning.append(requestId, runId, text, kind),
         updateToolProgress: (callId, progress) => this.#liveToolOutput.update(callId, progress),
@@ -1015,7 +1022,10 @@ export class SessionActor {
   }
 
   private async appendLifecycleEvents(events: readonly NewSessionEvent[]): Promise<void> {
-    const current = await this.loadSnapshot();
+    await this.withWrite(async () => this.appendEvents(events, await this.loadSnapshot()));
+  }
+
+  private async appendEvents(events: readonly NewSessionEvent[], current: LoopSnapshot): Promise<void> {
     let previewState = current.state;
     for (const [index, event] of events.entries()) {
       previewState = reduceSession(previewState, {
@@ -1026,10 +1036,32 @@ export class SessionActor {
         occurredAt: '1970-01-01T00:00:00.000Z',
       } as SessionEvent);
     }
-    const committed = events.length === 1
-      ? [await this.#journal.append(events[0]!)]
-      : await this.#journal.appendBatch(events);
-    for (const event of committed) await this.observe(event);
+    const previousDraft = this.#assistantDraft;
+    const closesDraft = current.state.run && closesAssistantDraft(events, current.state.run.runId);
+    if (closesDraft) this.#assistantDraft = null;
+    try {
+      const committed = events.length === 1
+        ? [await this.#journal.append(events[0]!)]
+        : await this.#journal.appendBatch(events);
+      for (const event of committed) await this.observe(event);
+    } catch (error) {
+      if (closesDraft) this.#assistantDraft = previousDraft;
+      throw error;
+    }
+  }
+
+  private async commitCommand(
+    command: ConversationCommand,
+    events: readonly NewSessionEvent[],
+    reply: Omit<CommandReply, 'revision'>,
+  ): Promise<CommandReply> {
+    return await this.withWrite(() => this.#journal.commitCommand(command, events, reply));
+  }
+
+  private async withWrite<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.#writes.then(operation, operation);
+    this.#writes = result.then(() => undefined, () => undefined);
+    return await result;
   }
 
   private async loadSnapshot(): Promise<LoopSnapshot> {
@@ -1044,7 +1076,6 @@ export class SessionActor {
       const snapshot = added.length ? { events: [...current.events, ...added], state } : current;
       this.#snapshot = snapshot;
       this.#initialEvents = undefined;
-      this.#projectionState = snapshot.state;
       return snapshot;
     });
     this.#snapshotReads = read.then(() => undefined, () => undefined);
@@ -1056,7 +1087,6 @@ export class SessionActor {
       this.#liveToolOutput.delete(event.callId);
     }
     if (event.type === 'run.settled') this.#liveToolOutput.clear();
-    await Promise.all(this.#composition.observers.map((observer) => observer.observe(event)));
   }
 
   private async recordRejection(
@@ -1064,7 +1094,7 @@ export class SessionActor {
     code: string,
     message: string,
   ): Promise<CommandReply> {
-    return await this.#journal.commitCommand(command, [], {
+    return await this.commitCommand(command, [], {
       schemaVersion: COMMAND_REPLY_VERSION,
       commandId: command.commandId,
       sessionId: command.sessionId,

@@ -1,18 +1,38 @@
-:root {
-  --dc-icon-bg-primary: #0B0D10;
-  --dc-icon-surface-1: #14171C;
-  --dc-icon-surface-2: #1F2328;
-  --dc-icon-surface-3: #23272D;
-  --dc-icon-border: #2B3036;
-  --dc-icon-text-primary: #E6E8EB;
-  --dc-icon-text-muted: #8B949E;
-  --dc-icon-neutral: #CBD5E1;
-  --dc-icon-muted: #64748B;
-  --dc-icon-accent: #3A82F6;
-  --dc-icon-success: #22C55E;
-  --dc-icon-warning: #F59E0B;
-  --dc-icon-error: #EF4444;
+:root, [data-dc-theme="dark"] {
+  color-scheme: dark;
+  --dc-icon-bg-primary: #111214;
+  --dc-icon-surface-1: #191A1D;
+  --dc-icon-surface-2: #222428;
+  --dc-icon-surface-3: #2B2D32;
+  --dc-icon-border: #383B42;
+  --dc-icon-text-primary: #F5F5F7;
+  --dc-icon-text-muted: #A1A5AE;
+  --dc-icon-text-disabled: #767C88;
+  --dc-icon-neutral: #D9DEE7;
+  --dc-icon-muted: #929BAA;
+  --dc-icon-accent: #459CFF;
+  --dc-icon-success: #40D98B;
+  --dc-icon-warning: #FFBD59;
+  --dc-icon-error: #FF746C;
 }
+[data-dc-theme="light"] {
+  color-scheme: light;
+  --dc-icon-bg-primary: #F5F5F7;
+  --dc-icon-surface-1: #FFFFFF;
+  --dc-icon-surface-2: #EBEDF1;
+  --dc-icon-surface-3: #E2E5EB;
+  --dc-icon-border: #D9DDE4;
+  --dc-icon-text-primary: #1D1D1F;
+  --dc-icon-text-muted: #616773;
+  --dc-icon-text-disabled: #797F8A;
+  --dc-icon-neutral: #424854;
+  --dc-icon-muted: #737C89;
+  --dc-icon-accent: #0868CE;
+  --dc-icon-success: #187D4B;
+  --dc-icon-warning: #996000;
+  --dc-icon-error: #CE3541;
+}
+
 .dc-icon { width: 20px; height: 20px; color: var(--dc-icon-neutral); display: inline-block; vertical-align: -0.125em; flex: 0 0 auto; }
 .dc-icon--sm { width: 16px; height: 16px; }
 .dc-icon--md { width: 20px; height: 20px; }

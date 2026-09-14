@@ -10,6 +10,22 @@ pub(super) fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     value.as_ref().encode_wide().chain(Some(0)).collect()
 }
+
+/// Shells treat a verbatim DOS cwd as a UNC location and may start at C:\ instead.
+/// Keep canonical paths for ACLs, but pass the equivalent Win32 path to processes.
+pub(super) fn process_path(path: &Path) -> Vec<u16> {
+    let value = wide(path);
+    match path.components().next() {
+        Some(std::path::Component::Prefix(prefix)) => match prefix.kind() {
+            std::path::Prefix::VerbatimDisk(_) => value[4..].to_vec(),
+            std::path::Prefix::VerbatimUNC(_, _) => {
+                [wide(r"\\")[..2].to_vec(), value[8..].to_vec()].concat()
+            }
+            _ => value,
+        },
+        _ => value,
+    }
+}
 pub(super) fn error(operation: &str) -> String {
     format!("{operation}: {}", std::io::Error::last_os_error())
 }
@@ -132,6 +148,63 @@ pub(super) fn new_capability_sid() -> Result<String, String> {
 pub(super) fn grant(path: &Path, account: &str, permissions: u32) -> Result<(), String> {
     update_acl(path, account, permissions, GRANT_ACCESS)
 }
+
+/// System-installed executables already grant the sandbox account read/execute
+/// access. Check that access before attempting to edit a protected file's DACL.
+pub(super) fn grant_program_read(path: &Path, account: &str, token: &Handle) -> Result<(), String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    };
+    let mut descriptor = null_mut();
+    code("Read program security descriptor", unsafe {
+        GetNamedSecurityInfoW(
+            wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut descriptor,
+        )
+    })?;
+    let descriptor = Local(descriptor);
+    let mut impersonation = null_mut();
+    if unsafe { DuplicateToken(token.0, SecurityImpersonation, &mut impersonation) } == 0 {
+        return Err(error("Duplicate workspace access-check token"));
+    }
+    let impersonation = Handle(impersonation);
+    let mapping = GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ,
+        GenericWrite: FILE_GENERIC_WRITE,
+        GenericExecute: FILE_GENERIC_EXECUTE,
+        GenericAll: FILE_ALL_ACCESS,
+    };
+    let access = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+    let mut privileges: PRIVILEGE_SET = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<PRIVILEGE_SET>() as u32;
+    let mut granted = 0;
+    let mut allowed = 0;
+    if unsafe {
+        AccessCheck(
+            descriptor.0,
+            impersonation.0,
+            access,
+            &mapping,
+            &mut privileges,
+            &mut length,
+            &mut granted,
+            &mut allowed,
+        )
+    } == 0
+    {
+        return Err(error("Check workspace program access"));
+    }
+    if allowed != 0 {
+        return Ok(());
+    }
+    grant(path, account, access)
+}
 pub(super) fn revoke(path: &Path, account: &str) -> Result<(), String> {
     update_acl(path, account, 0, REVOKE_ACCESS)
 }
@@ -228,22 +301,55 @@ pub(super) fn protect_file(path: &Path, owner: &str) -> Result<(), String> {
 pub(super) fn restricted_token(write_sid: &str) -> Result<Handle, String> {
     let base = current_token()?;
     let capability = sid(write_sid)?;
-    let restricting = SID_AND_ATTRIBUTES {
-        Sid: capability.0,
-        Attributes: 0,
-    };
+    let everyone = sid("S-1-1-0")?;
+    let mut length = 0;
+    unsafe { GetTokenInformation(base.0, TokenLogonSid, null_mut(), 0, &mut length) };
+    let mut group_data = vec![0usize; (length as usize).div_ceil(std::mem::size_of::<usize>())];
+    if unsafe {
+        GetTokenInformation(
+            base.0,
+            TokenLogonSid,
+            group_data.as_mut_ptr().cast(),
+            length,
+            &mut length,
+        )
+    } == 0
+    {
+        return Err(error("Read workspace logon SID"));
+    }
+    let groups = unsafe { &*group_data.as_ptr().cast::<TOKEN_GROUPS>() };
+    if groups.GroupCount != 1 {
+        return Err("Workspace worker must have one logon SID.".into());
+    }
+    let logon_sid = sid_string(groups.Groups[0].Sid)?;
+    let restricting = [
+        SID_AND_ATTRIBUTES {
+            Sid: capability.0,
+            Attributes: 0,
+        },
+        // Windows runtime objects belong to this invocation's fresh logon.
+        SID_AND_ATTRIBUTES {
+            Sid: groups.Groups[0].Sid,
+            Attributes: 0,
+        },
+        // Windows runtime devices (including CNG) require Everyone access.
+        SID_AND_ATTRIBUTES {
+            Sid: everyone.0,
+            Attributes: 0,
+        },
+    ];
     let mut token = null_mut();
     // Restrict writes; retain ordinary toolchain reads. The account is not an administrator.
     if unsafe {
         CreateRestrictedToken(
             base.0,
-            DISABLE_MAX_PRIVILEGE | 0x08,
+            DISABLE_MAX_PRIVILEGE | LUA_TOKEN | 0x08,
             0,
             null(),
             0,
             null(),
-            1,
-            &restricting,
+            restricting.len() as u32,
+            restricting.as_ptr(),
             &mut token,
         )
     } == 0
@@ -253,7 +359,7 @@ pub(super) fn restricted_token(write_sid: &str) -> Result<Handle, String> {
     let token = Handle(token);
     let user = current_user_sid()?;
     let dacl = descriptor(&format!(
-        "D:(A;;GA;;;{user})(A;;GA;;;{write_sid})(A;;GA;;;SY)"
+        "D:(A;;GA;;;{user})(A;;GA;;;{write_sid})(A;;GA;;;{logon_sid})(A;;GA;;;SY)"
     ))?;
     let mut acl = null_mut();
     let mut present = 0;

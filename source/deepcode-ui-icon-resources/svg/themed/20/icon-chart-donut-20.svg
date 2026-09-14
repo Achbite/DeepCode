@@ -1,6 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" color="#3A82F6" role="img" aria-label="Chart Donut icon">
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" color="#459CFF" role="img" aria-label="Chart Donut">
 <title>Chart Donut</title>
-<circle cx="12" cy="12" r="7"/>
-<path d="M12 5a7 7 0 0 1 6.8 8.6"/>
-<circle cx="12" cy="12" r="3"/>
+<path d="M10 3.5a8.75 8.75 0 1 0 10.5 10.75h-4.75A4.25 4.25 0 1 1 10 8V3.5Z"/><path d="M14 3.5v4.75a4.25 4.25 0 0 1 2 2h4.5A8.75 8.75 0 0 0 14 3.5Z"/>
 </svg>

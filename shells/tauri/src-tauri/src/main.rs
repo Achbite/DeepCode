@@ -348,16 +348,11 @@ fn deepcode_start_kernel_after_permission(
             }
         };
     }
-    match spawn_host_processes_if_available(&target, &host_tokens) {
-        Ok(Some(children)) => {
+    match spawn_host_processes(&target, &host_tokens) {
+        Ok(children) => {
             processes.replace(Some(children));
             status.finish(true, false, "Host is ready.".into())
         }
-        Ok(None) => status.finish(
-            false,
-            false,
-            "kernel binary was not found or could not be started".into(),
-        ),
         Err(message) => status.finish(false, false, message),
     }
 }
@@ -597,22 +592,12 @@ fn content_type_for_path(path: &Path) -> &'static str {
     }
 }
 
-fn spawn_host_processes_if_available(
+fn spawn_host_processes(
     target: &LaunchTarget,
     host_tokens: &HostConnectionTokens,
-) -> Result<Option<OwnedHostChildren>, String> {
-    if local_port_has_listener(&target.host, &target.port)
-        || local_port_has_listener(&target.host, &target.daemon_port)
-    {
-        return Ok(None);
-    }
+) -> Result<OwnedHostChildren, String> {
     let _start_lock = acquire_kernel_start_lock(&target.host, &target.port)
         .ok_or("无法取得本地 Host 启动锁。")?;
-    if local_port_has_listener(&target.host, &target.port)
-        || local_port_has_listener(&target.host, &target.daemon_port)
-    {
-        return Ok(None);
-    }
 
     let exe_dir = current_exe_dir().ok_or("无法定位壳可执行文件目录。")?;
     let daemon_path =
@@ -632,11 +617,7 @@ fn spawn_host_processes_if_available(
         .map_err(|error| format!("host_config_root_invalid: {error}"))?;
     let shared = deepcode_host_connection::LocalHostConnection::discover(&config_root)
         .map_err(|error| format!("host_connection_discovery_failed: {error}"))?;
-    if local_port_has_listener(&target.host, &target.port)
-        || (shared.is_none() && local_port_has_listener(&target.host, &target.daemon_port))
-    {
-        return Err("a required private Host port is already in use".into());
-    }
+    admit_private_host_ports(target, shared.is_some())?;
     let proxy_host = target.host.clone();
     let mut target = target.clone();
     let mut host_tokens = host_tokens.clone();
@@ -797,7 +778,7 @@ fn spawn_host_processes_if_available(
         children.shutdown();
         return Err(format!("Host client attach failed: {error}"));
     }
-    Ok(Some(children))
+    Ok(children)
 }
 
 fn configured_or_bundled_file(
@@ -1061,6 +1042,23 @@ fn request_loopback_json<T: DeserializeOwned>(
     })
 }
 
+fn admit_private_host_ports(target: &LaunchTarget, reuse_daemon: bool) -> Result<(), String> {
+    let unavailable = if local_port_has_listener(&target.host, &target.port) {
+        Some(("Host proxy", &target.port))
+    } else if !reuse_daemon && local_port_has_listener(&target.host, &target.daemon_port) {
+        Some(("Kernel daemon", &target.daemon_port))
+    } else {
+        None
+    };
+    match unavailable {
+        Some((service, port)) => Err(format!(
+            "host_startup_port_in_use: The {service} port {}:{port} is already in use.",
+            target.host
+        )),
+        None => Ok(()),
+    }
+}
+
 fn local_port_has_listener(host: &str, port: &str) -> bool {
     let Ok(port) = port.parse::<u16>() else {
         return false;
@@ -1159,10 +1157,32 @@ fn env_truthy(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn shared_daemon_can_be_reused_but_private_ports_must_be_available() {
+        let daemon = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let proxy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let target = LaunchTarget {
+            host: "127.0.0.1".into(),
+            port: proxy.local_addr().unwrap().port().to_string(),
+            daemon_port: daemon.local_addr().unwrap().port().to_string(),
+        };
+        let proxy_error = admit_private_host_ports(&target, true).unwrap_err();
+        assert!(proxy_error.contains("host_startup_port_in_use"));
+        assert!(proxy_error.contains("Host proxy"));
+        assert!(proxy_error.contains(&target.port));
+        drop(proxy);
+        assert!(admit_private_host_ports(&target, true).is_ok());
+        let daemon_error = admit_private_host_ports(&target, false).unwrap_err();
+        assert!(daemon_error.contains("Kernel daemon"));
+        assert!(daemon_error.contains(&target.daemon_port));
+        assert!(TcpStream::connect(daemon.local_addr().unwrap()).is_ok());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn startup_error_keeps_the_child_exit_and_original_stderr() {
         let directory =

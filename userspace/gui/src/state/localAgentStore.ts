@@ -15,7 +15,7 @@ import type {
   SessionProjection,
 } from '@deepcode/protocol';
 import { CONVERSATION_COMMAND_VERSION } from '@deepcode/protocol';
-import { getLlmProfiles } from '../services/apiClient';
+import { getLlmProfiles, patchLlmProfiles } from '../services/apiClient';
 import type { PastedTextInput } from '../services/pastedText';
 import {
   attachConversationDirectoryIndex,
@@ -86,12 +86,14 @@ export interface LocalAgentState {
     filesystemPaths?: PendingFilesystemPath[],
     pluginSelections?: PluginSelectionInput[],
     pastedTexts?: PastedTextInput[],
+    onSessionCreated?: (sessionId: string) => void,
   ): Promise<CommandReply>;
   focusContext(
     task: string,
     filesystemPaths?: PendingFilesystemPath[],
     pluginSelections?: PluginSelectionInput[],
     pastedTexts?: PastedTextInput[],
+    onSessionCreated?: (sessionId: string) => void,
   ): Promise<CommandReply>;
   setMessageFeedback(messageId: string, feedback: MessageFeedback | null): Promise<CommandReply>;
   attachSessionDirectory(canonicalRoot: string): Promise<void>;
@@ -202,7 +204,7 @@ const store = create<LocalAgentState>((set, get) => ({
           : [];
         const defaultProfileId = initialProfileId(
           profiles,
-          profileResult.data?.defaultProfileId,
+          profileResult.ok ? profileResult.data?.defaultProfileId : undefined,
         );
         // Catalog readiness is independent of navigation. Starting a new draft
         // while boot data loads cancels view restoration, not the shared data.
@@ -215,7 +217,7 @@ const store = create<LocalAgentState>((set, get) => ({
           if (!profileResult.ok) {
             set({
               error: profileResult.message ?? 'llm_profiles_unavailable',
-              errorSource: 'initialization',
+              errorSource: 'profiles',
             });
           }
           return;
@@ -245,7 +247,7 @@ const store = create<LocalAgentState>((set, get) => ({
           loading: false,
           error: projectionError
             ?? (profileResult.ok ? null : (profileResult.message ?? 'llm_profiles_unavailable')),
-          errorSource: projectionError || !profileResult.ok ? 'initialization' : null,
+          errorSource: projectionError ? 'initialization' : (profileResult.ok ? null : 'profiles'),
         });
       } catch (error) {
         if (currentGeneration === generation) {
@@ -478,27 +480,11 @@ const store = create<LocalAgentState>((set, get) => ({
     filesystemPaths = [],
     pluginSelections = [],
     pastedTexts = [],
+    onSessionCreated,
   ) => {
     const trimmed = text.trim();
     if (!trimmed && !pastedTexts.length) throw new Error('message_empty');
     if (trimmed.startsWith('/')) throw new Error(`conversation_command_unknown:${trimmed}`);
-    const { projection } = get();
-    if (projection?.pendingPlan) {
-      if (filesystemPaths.length || pluginSelections.length || pastedTexts.length) {
-        throw new Error('plan_revision_filesystem_references_unsupported');
-      }
-      return await get().respondPlan({ kind: 'requestRevision', text: trimmed });
-    }
-    if (projection?.pendingApproval) {
-      throw new Error('approval_response_requires_explicit_command');
-    }
-    if (projection?.pendingInteraction) {
-      if (filesystemPaths.length || pluginSelections.length || pastedTexts.length) {
-        throw new Error('interaction_response_filesystem_references_unsupported');
-      }
-      return await get().respondInteraction(trimmed);
-    }
-
     return await submitNewRun(
       set,
       get,
@@ -507,6 +493,7 @@ const store = create<LocalAgentState>((set, get) => ({
       filesystemPaths,
       pluginSelections,
       pastedTexts,
+      onSessionCreated,
     );
   },
 
@@ -515,6 +502,7 @@ const store = create<LocalAgentState>((set, get) => ({
     filesystemPaths = [],
     pluginSelections = [],
     pastedTexts = [],
+    onSessionCreated,
   ) => {
     if (!task.trim()) throw new Error('context_focus_task_empty');
     const { projection } = get();
@@ -529,6 +517,7 @@ const store = create<LocalAgentState>((set, get) => ({
       filesystemPaths,
       pluginSelections,
       pastedTexts,
+      onSessionCreated,
     );
   },
 
@@ -627,13 +616,13 @@ const store = create<LocalAgentState>((set, get) => ({
     const sessionId = requiredSession(state);
     const runId = state.projection?.run?.runId;
     if (!runId) throw new Error('conversation_run_missing');
-    return await submitExisting(set, get, {
+    return await submitDecision(set, get, `cancel:${sessionId}:${runId}`, () => ({
       schemaVersion: CONVERSATION_COMMAND_VERSION,
       type: 'run.cancel',
       commandId: nextId('command'),
       sessionId,
       runId,
-    });
+    }));
   },
 
   createProject: async (title, workspacePaths = []) => {
@@ -738,22 +727,27 @@ async function submitNewRun(
   filesystemPaths: PendingFilesystemPath[],
   pluginSelections: PluginSelectionInput[],
   pastedTexts: PastedTextInput[],
+  onSessionCreated?: (sessionId: string) => void,
 ): Promise<CommandReply> {
   const submissionGeneration = beginSubmission(set);
   try {
     if (filesystemPaths.length + pastedTexts.length > 8) throw new Error('message_filesystem_reference_limit');
     const messageProfileId = get().selectedProfileId;
     const reasoningEffortOverride = get().reasoningEffortOverride;
-    if (!messageProfileId || !get().profiles.some((profile) => profile.id === messageProfileId && profile.enabled)) throw new Error('llm_profile_unavailable');
+    const activeRun = get().projection?.run;
+    const queuedMessage = type === 'message.submit' && activeRun && ['running', 'waiting'].includes(activeRun.status);
+    if (!queuedMessage && (!messageProfileId || !get().profiles.some((profile) => profile.id === messageProfileId && profile.enabled))) throw new Error('llm_profile_unavailable');
     const pluginCatalog = get().pluginCatalog;
     const effectivePluginSelections = requiredFilesystemPluginSelections(
       pluginCatalog,
       filesystemPaths,
       pluginSelections,
     );
-    const availableUris = new Set(pluginCatalog.plugins.map((plugin) => plugin.uri));
-    if (effectivePluginSelections.some((selection) => !availableUris.has(selection.uri))) {
-      throw new Error('plugin_selection_unavailable');
+    for (const selection of effectivePluginSelections) {
+      const plugin = pluginCatalog.plugins.find((item) => item.uri === selection.uri);
+      if (!plugin?.enabled || !plugin.available) {
+        throw new Error(plugin?.error ? `${plugin.error.code}: ${plugin.error.message}` : `plugin_selection_unavailable:${selection.uri}`);
+      }
     }
     let { sessionId } = get();
     if (!sessionId) {
@@ -764,6 +758,7 @@ async function submitNewRun(
       if (generation !== submissionGeneration) throw new Error('conversation_session_changed');
       sessionId = created.sessionId;
       rememberSession(sessionId);
+      onSessionCreated?.(sessionId);
       set({ sessionId, projection: created, draftProjectId: null });
       await get().refreshCatalog();
     }
@@ -785,8 +780,7 @@ async function submitNewRun(
             })),
           }
         : {}),
-      profileId: messageProfileId,
-      reasoningEffortOverride,
+      ...(!queuedMessage ? { profileId: messageProfileId!, reasoningEffortOverride } : {}),
       ...(effectivePluginSelections.length
         ? {
             pluginCatalogRevision: pluginCatalog.revision,
@@ -795,7 +789,7 @@ async function submitNewRun(
         : {}),
     };
     const command: ConversationCommand = type === 'message.submit'
-      ? { ...common, type, text }
+      ? { ...common, type, text, ...(queuedMessage ? { runId: activeRun.runId } : {}) }
       : { ...common, type, task: text };
     const reply = await submitCommandAndReconcile(set, get, command);
     await Promise.all([
@@ -856,6 +850,11 @@ async function submitCommandAndReconcile(
 ): Promise<CommandReply> {
   const commandGeneration = generation;
   const reply = await submitLocalAgentCommand(command);
+  if (reply.status === 'accepted') {
+    const profileId = command.type === 'session.model-settings.set' ? command.settings.profileId
+      : command.type === 'message.submit' || command.type === 'context.focus' ? command.profileId : undefined;
+    if (profileId) set({ defaultProfileId: profileId });
+  }
   const rejection = reply.status === 'rejected' ? commandRejectionMessage(reply) : null;
   try {
     await reconcileProjectionAfterReply(set, get, command.sessionId, reply.revision, commandGeneration);
@@ -898,13 +897,21 @@ function projectModelSettings(projection: SessionProjection | null): Partial<Loc
 async function saveModelSettings(set: StoreSet, get: StoreGet, settings: SessionModelSettings): Promise<void> {
   if (get().modelSettingsBusy) return;
   const sessionId = get().sessionId;
-  if (!sessionId) {
-    set({ selectedProfileId: settings.profileId, reasoningEffortOverride: settings.reasoningEffortOverride });
-    return;
-  }
   const settingsGeneration = generation;
   set({ modelSettingsBusy: true });
   try {
+    if (!sessionId) {
+      if (get().selectedProfileId !== settings.profileId) {
+        const result = await patchLlmProfiles({ defaultProfileId: settings.profileId });
+        if (!result.ok || !result.data) throw new Error(result.message ?? result.error ?? 'llm_profiles_unavailable');
+        set({ defaultProfileId: result.data.defaultProfileId ?? null, profiles: result.data.profiles });
+      }
+      if (generation === settingsGeneration && !get().sessionId) {
+        set({ selectedProfileId: settings.profileId, reasoningEffortOverride: settings.reasoningEffortOverride,
+          error: null, errorSource: null });
+      }
+      return;
+    }
     await submitCommandAndReconcile(set, get, {
       schemaVersion: CONVERSATION_COMMAND_VERSION, type: 'session.model-settings.set',
       sessionId, commandId: nextId('command'), settings,
@@ -1023,6 +1030,9 @@ function requiredFilesystemPluginSelections(
       throw new Error(`plugin_selection_unavailable:${mediaType}`);
     }
     const plugin = matches[0]!;
+    if (!plugin.enabled || !plugin.available) {
+      throw new Error(plugin.error ? `${plugin.error.code}: ${plugin.error.message}` : `plugin_selection_unavailable:${plugin.uri}`);
+    }
     if (selectedUris.has(plugin.uri)) continue;
     selections.push({
       selectionId: nextId('plugin-selection'),

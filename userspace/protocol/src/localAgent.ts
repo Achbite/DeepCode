@@ -96,8 +96,9 @@ export interface PluginCatalogItem {
   shortDescription: string;
   iconRef?: string;
   activationMediaTypes: string[];
-  enabled: true;
-  available: true;
+  enabled: boolean;
+  available: boolean;
+  error?: LocalAgentError;
 }
 
 export interface PluginCatalogProjection {
@@ -207,6 +208,7 @@ export type ConversationCommand =
       type: 'message.submit';
       commandId: string;
       sessionId: string;
+      runId?: string;
       text: string;
       filesystemReferences?: FilesystemReference[];
       profileId?: string;
@@ -582,6 +584,17 @@ export type SessionEvent =
   | (SessionEventBase & {
       type: 'session.directory-index.detached';
       payload: { workspaceId: string; commandId: string };
+    })
+  | (SessionEventBase & {
+      type: 'input.queued';
+      runId: string;
+      payload: {
+        commandId: string;
+        messageId: string;
+        text: string;
+        filesystemReferences?: FilesystemReference[];
+        pluginSelections?: PluginSelectionInput[];
+      };
     })
   | (SessionEventBase & {
       type: 'input.accepted';
@@ -1078,6 +1091,7 @@ export interface ActivityResourceProjection {
 
 export interface ToolActivityProjection {
   recordId?: string;
+  error?: LocalAgentError;
   operation: string;
   resources: ActivityResourceProjection[];
   shell?: ShellActivityProjection;
@@ -1146,6 +1160,19 @@ export interface SessionModelSettings {
   reasoningEffortOverride: LlmReasoningEffort | null;
 }
 
+export interface QueuedInputProjection {
+  commandId: string;
+  messageId: string;
+  runId: string;
+  text: string;
+  filesystemReferences: FilesystemReference[];
+  pluginSelections: PluginSelectionInput[];
+  sequence: number;
+  createdAt: string;
+  /** A terminal run retains unconsumed input visibly without starting another run. */
+  status: 'queued' | 'notApplied';
+}
+
 export interface SessionProjection {
   modelSettings: SessionModelSettings | null;
   schemaVersion: typeof SESSION_PROJECTION_VERSION;
@@ -1157,6 +1184,7 @@ export interface SessionProjection {
   /** Session-private directory indexes that the user may detach for future runs. */
   sessionDirectoryIndexes: WorkspaceBindingDisplay[];
   messages: ProjectionMessage[];
+  queuedInputs: QueuedInputProjection[];
   narratives: NarrativeProjection[];
   /** Session-owned semantic transcript order. Shells render this list without re-sorting it. */
   timeline: SessionTimelineItem[];

@@ -45,6 +45,7 @@ export CI="${CI:-true}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$ROOT_DIR/scripts/source-identity.sh"
+source "$ROOT_DIR/scripts/build-platforms.sh"
 
 is_docker_environment() {
   [ -f /.dockerenv ] && return 0
@@ -483,7 +484,6 @@ if [ "$run_all" = 1 ]; then
     echo "==[build][error]== all/package must run by itself; use explicit stages for a partial build." >&2
     exit 2
   fi
-  source "$ROOT_DIR/scripts/build-platforms.sh"
   run_all_platform_builds
   exit 0
 fi
@@ -1541,7 +1541,7 @@ write_readme() {
   DeepCode-GUI          Linux DeepCode-GUI shell, shares the same Kernel and config"
   fi
   cat > "$dist_dir/README.txt" <<README
-DeepCode Unified Distribution ($platform)
+DeepCode $PACKAGE_PRODUCT_VERSION Unified Distribution ($platform)
 =========================================
 
 This folder is one DeepCode host distribution. GUI, CLI, and TUI entries share
@@ -1550,6 +1550,14 @@ and configuration directory.
 Editor assets live in web/. DeepCode-GUI assets live in web-deepcode-gui/.
 The single Agent Loop and projection reducer live in the TS session-core package;
 all tool effects enter the Rust Kernel through its local execution port.
+
+Artifact identity is recorded in build-info.json: productVersion, buildCommit,
+buildTimeUtc and source state. Database schema versions are independent.
+
+Configure the initial DeepSeek Flash template or add a model under Settings >
+Models & services. Save each model in its own card. The last selected model is
+remembered for new conversations. Project and conversation order can be changed
+by dragging within the sidebar's existing groups.
 
 Writable package-local data is preserved across package refreshes:
   config/user/local/settings/     User settings and LLM profiles.
@@ -1643,6 +1651,7 @@ package_platform_distribution() {
   fi
   echo "==[build][package]== prepare bin/$platform"
   validate_package_inputs "$platform"
+  preflight_package_files "$dist_dir" "$platform"
   mkdir -p "$dist_dir"
   clean_package_generated_outputs "$dist_dir" "$platform"
   prepare_distribution_tree "$dist_dir" "$platform"
@@ -1732,11 +1741,15 @@ package_distribution() {
 }
 
 if [ "$run_package" = "1" ]; then
-  source "$ROOT_DIR/scripts/build-platforms.sh"
   for platform in "${package_platforms[@]}"; do
     if ! reason="$(build_platform_support "$platform")"; then
       echo "==[build][error]== $platform packaging requires its support environment: $reason" >&2
       exit 3
+    fi
+    # Reject an already running Windows package before spending time compiling.
+    # The check at cleanup also catches applications started during the build.
+    if [ "$platform" = windows ]; then
+      preflight_package_files "$WIN_DIR" win64
     fi
   done
 fi

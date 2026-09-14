@@ -63,22 +63,27 @@ fn catalog_exposes_basic_callable_tools() {
         .descriptors()
         .map(|descriptor| descriptor.name.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(
-        names,
-        vec![
-            "bash",
-            "fs.delete",
-            "fs.edit",
-            "fs.read",
-            "fs.write",
-            "powershell",
-            "web.fetch",
-            "web.search",
-        ]
-    );
+    for required in [
+        "bash",
+        "fs.delete",
+        "fs.edit",
+        "fs.read",
+        "fs.write",
+        "powershell",
+        "web.fetch",
+        "web.search",
+    ] {
+        assert!(names.contains(&required), "missing basic tool {required}");
+    }
+    let bindings = registry
+        .executor_bindings()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
     for name in names {
         let descriptor = registry.descriptor(name).unwrap();
         assert_eq!(descriptor.availability, ToolAvailability::Callable);
+        assert!(bindings.contains(&name), "missing executor for {name}");
+        assert_eq!(descriptor.input_schema["type"], "object");
     }
     let bash = registry.descriptor("bash").expect("bash descriptor");
     let web_search = registry
@@ -176,8 +181,7 @@ fn canonical_arguments_reach_the_executor_boundary() {
 }
 
 #[test]
-fn file_names_keep_distinct_unicode_spelling_through_invocation_and_identity() {
-    use deepcode_kernel_tools::kernel_internal::{normalize_canonical_platform_path, Platform};
+fn file_names_keep_distinct_unicode_spelling_through_invocation() {
     let registry = KernelToolRegistry::new();
     let decomposed = "e\u{301}.txt";
     let composed = "é.txt";
@@ -186,11 +190,6 @@ fn file_names_keep_distinct_unicode_spelling_through_invocation_and_identity() {
             .canonicalize("fs.read", json!({"path": path}))
             .unwrap();
         assert_eq!(read.arguments["path"], path);
-        let absolute = format!("/workspace/{path}");
-        assert_eq!(
-            normalize_canonical_platform_path(Platform::Linux, &absolute).unwrap(),
-            absolute
-        );
     }
     assert_ne!(
         registry

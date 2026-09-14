@@ -1,6 +1,28 @@
 #!/usr/bin/env bash
 # Platform preflight and the sequential default build. No toolchain installation.
 
+# DrvFS reports mapped Windows binaries as EIO during removal. Check before
+# deleting any generated files so an active Host cannot leave a partial package.
+preflight_package_files() {
+  local dist_dir="$1" platform="$2" path descriptor failed=0
+  [ "$platform" = win64 ] || return 0
+  for path in "$dist_dir"/*.exe "$dist_dir"/*.dll "$dist_dir/node/bin/node.exe"; do
+    [ -f "$path" ] || continue
+    # O_RDWR without O_TRUNC checks Windows sharing/access without changing data.
+    if { exec {descriptor}<>"$path"; }; then
+      exec {descriptor}>&-
+    else
+      printf '==[build][package][error]== cannot replace %s (in use or access denied)\n' "$path" >&2
+      failed=1
+    fi
+  done
+  if [ "$failed" -ne 0 ]; then
+    printf '==[build][package][error]== close applications from this package and stop its Host with DEEPCODE_CONFIG_DIR set to this package root: deepcode-cli.exe stop-host\n' >&2
+    printf '==[build][package][error]== package cleanup has not started; config/runtime are unchanged\n' >&2
+  fi
+  return "$failed"
+}
+
 build_platform_support() {
   local platform="$1" tool required node_bin
   if [ "$platform" = macos ]; then

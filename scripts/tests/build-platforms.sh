@@ -4,7 +4,15 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 source "$REPO_ROOT/scripts/build-platforms.sh"
 test_root="$(mktemp -d)"
-trap 'rm -rf "$test_root"' EXIT
+package_process=''
+cleanup() {
+  if [ -n "$package_process" ]; then
+    kill "$package_process" 2>/dev/null || true
+    wait "$package_process" 2>/dev/null || true
+  fi
+  rm -rf "$test_root"
+}
+trap cleanup EXIT
 ROOT_DIR="$test_root"
 clean_cache=0
 kill_running=0
@@ -78,3 +86,39 @@ run_all_platform_builds > "$test_root/log"
 grep -q 'No new distribution was produced' "$test_root/log"
 grep -q 'built=0 skipped=3 failed=0' "$test_root/log"
 printf '[build-platforms] no environment reports no outputs: PASS\n'
+
+dist_dir="$test_root/win64"
+preflight_package_files "$dist_dir" win64
+if [ "$(uname -s)" != Linux ]; then
+  printf '[build-platforms] mapped-image lock fixture requires Linux /proc: SKIP\n'
+  exit 0
+fi
+mkdir -p "$dist_dir/node/bin" "$dist_dir/web" "$dist_dir/config" "$dist_dir/runtime/agent-runtime"
+printf 'frontend\n' > "$dist_dir/web/index.html"
+printf 'settings\n' > "$dist_dir/config/settings.json"
+printf 'session\n' > "$dist_dir/runtime/agent-runtime/session.fixture"
+for binary in "$dist_dir/node/bin/node.exe" "$dist_dir/deepcode-kernel.exe"; do
+  cp "$(command -v sleep)" "$binary"
+  # A real running image, not a mocked permission check, rejects O_RDWR on Linux.
+  "$binary" 60 &
+  package_process=$!
+  # Wait until the child has exec'd the image rather than relying on a delay.
+  for ((attempt = 0; attempt < 200; attempt++)); do
+    [ "$(readlink "/proc/$package_process/exe" 2>/dev/null || true)" != "$binary" ] || break
+    sleep 0.01
+  done
+  [ "$(readlink "/proc/$package_process/exe")" = "$binary" ]
+  before="$(find "$dist_dir" -type f -exec sha256sum '{}' + | sort)"
+  status=0
+  preflight_package_files "$dist_dir" win64 > "$test_root/package-log" 2>&1 || status=$?
+  [ "$status" -ne 0 ]
+  grep -Fq "$binary (in use or access denied)" "$test_root/package-log"
+  grep -q 'package cleanup has not started' "$test_root/package-log"
+  [ "$before" = "$(find "$dist_dir" -type f -exec sha256sum '{}' + | sort)" ]
+  kill "$package_process"
+  wait "$package_process" 2>/dev/null || true
+  package_process=''
+  preflight_package_files "$dist_dir" win64
+  [ "$before" = "$(find "$dist_dir" -type f -exec sha256sum '{}' + | sort)" ]
+done
+printf '[build-platforms] running Node/Kernel blocks cleanup; contents retained; released images pass: PASS\n'

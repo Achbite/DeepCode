@@ -140,7 +140,7 @@ function FileChangePreview({ sessionId, file, statistic, close }: { sessionId: s
       } });
     return () => { controller.abort(); dispose?.(); };
   }, [readChange, sessionId, file, theme]);
-  return createPortal(<div className="local-agent__resource-overlay conversation-diff-overlay" onClick={(event) => { if (event.target === event.currentTarget) close(); }} onKeyDown={(event) => { if (event.key === 'Escape') { event.stopPropagation(); close(); } }}>
+  return createPortal(<div className="conversation-diff-overlay" onClick={(event) => { if (event.target === event.currentTarget) close(); }} onKeyDown={(event) => { if (event.key === 'Escape') { event.stopPropagation(); close(); } }}>
     <section role="dialog" aria-modal="true" aria-label={`${file.path} 修改 Diff`} className="conversation-diff-dialog">
       <header className="conversation-diff-header">
         <DeepCodeShellIcon name="artifact" />

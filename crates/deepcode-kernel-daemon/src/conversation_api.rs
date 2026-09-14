@@ -1204,6 +1204,28 @@ pub(crate) async fn conversation_command_submit(
         Ok(value) => value,
         Err(error) => return session_service_error(error),
     };
+    if reply.get("status").and_then(Value::as_str) == Some("accepted") {
+        let chosen_profile = match command["type"].as_str() {
+            Some("session.model-settings.set") => command["settings"]["profileId"].as_str(),
+            Some("message.submit" | "context.focus") => command["profileId"].as_str(),
+            _ => None,
+        };
+        if let Some(profile_id) = chosen_profile {
+            let result = (|| {
+                let _transition = state.local_agent.runtime_transition()?;
+                let mut gui = state.gui.lock().expect("gui state lock");
+                let path = gui.paths.llm_profiles_path.clone();
+                gui.llm_profiles.select_default(&path, profile_id)
+            })();
+            if let Err(error) = result {
+                return ApiResponse::error_with_data(
+                    "select_default_llm_profile_failed",
+                    error,
+                    reply,
+                );
+            }
+        }
+    }
     if reply.get("status").and_then(Value::as_str) != Some("rejected") {
         let automatic_title = command
             .get("type")
@@ -1883,20 +1905,17 @@ fn selected_profile_id(
     gui: &crate::GuiState,
     requested: Option<&str>,
 ) -> Result<String, (&'static str, String)> {
-    if !crate::llm_profile_store_is_current(&gui.llm_profiles) {
-        return Err((
-            "llm_profile_store_invalid",
-            "本地模型 Profile 配置不是当前格式。".to_string(),
-        ));
-    }
-    let profiles = gui
+    let configured_profiles = gui
         .llm_profiles
+        .usable()
+        .map_err(|error| ("llm_profile_store_invalid", error))?;
+    let profiles = configured_profiles
         .get("profiles")
         .and_then(Value::as_array)
         .expect("validated LLM profile store");
     let selected = requested
         .or_else(|| {
-            gui.llm_profiles
+            configured_profiles
                 .get("defaultProfileId")
                 .and_then(Value::as_str)
         })

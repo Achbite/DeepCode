@@ -115,7 +115,9 @@ pub(super) fn proxy(path: &Path) -> Result<i32, String> {
     let raw = unsafe {
         CreateNamedPipeW(
             wide(&pipe_name).as_ptr(),
-            PIPE_ACCESS_INBOUND,
+            // Switching from nonblocking connection to blocking reads requires
+            // write-attribute access, which the duplex server handle includes.
+            PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
             1,
             65536,
@@ -154,7 +156,7 @@ pub(super) fn proxy(path: &Path) -> Result<i32, String> {
             command.as_mut_ptr(),
             CREATE_NO_WINDOW | CREATE_SUSPENDED,
             null(),
-            wide(&request.cwd).as_ptr(),
+            process_path(&request.cwd).as_ptr(),
             &startup,
             &mut info,
         )
@@ -165,10 +167,15 @@ pub(super) fn proxy(path: &Path) -> Result<i32, String> {
     let mut child = Child::from_info(info)?;
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if unsafe { ConnectNamedPipe(pipe.0, null_mut()) } != 0
-            || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED
-        {
+        let connected = unsafe { ConnectNamedPipe(pipe.0, null_mut()) };
+        let pipe_error = unsafe { GetLastError() };
+        // A fast worker may already have written its result and disconnected.
+        // Read that buffered result before inspecting its process exit status.
+        if connected != 0 || matches!(pipe_error, ERROR_PIPE_CONNECTED | ERROR_NO_DATA) {
             break;
+        }
+        if pipe_error != ERROR_PIPE_LISTENING {
+            return Err(error("Connect Shell output pipe"));
         }
         if let Some(code) = child.poll()? {
             return Err(format!(
@@ -349,11 +356,13 @@ impl Drop for Attributes {
 }
 
 fn run(request: Request, output: Output) -> Result<i32, String> {
+    let mut desktop = super::desktop::PrivateDesktop::new(&request.write_sid)?;
     let token = restricted_token(&request.write_sid)?;
     let (input_read, input_write) = pipe()?;
     let (output_read, output_write) = pipe()?;
     let terminal = request.stdin.is_some();
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    startup.StartupInfo.lpDesktop = desktop.path.as_mut_ptr();
     startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut console = None;
     let mut attributes = None;
@@ -423,7 +432,7 @@ fn run(request: Request, output: Output) -> Result<i32, String> {
             i32::from(!terminal),
             flags,
             environment.as_ptr().cast(),
-            wide(&request.cwd).as_ptr(),
+            process_path(&request.cwd).as_ptr(),
             &startup.StartupInfo,
             &mut info,
         )
@@ -441,15 +450,26 @@ fn run(request: Request, output: Output) -> Result<i32, String> {
     let mut input = as_file(input_write);
     let input_thread = std::thread::spawn(move || {
         if let Some(text) = request.stdin {
-            let _ = input.write_all(text.as_bytes());
-            let _ = input.flush();
+            let text = if terminal {
+                text.replace("\r\n", "\n").replace('\n', "\r")
+            } else {
+                text
+            };
+            input.write_all(text.as_bytes())?;
+            input.flush()?;
         }
+        // Closing ConPTY input signals terminal shutdown and terminates its
+        // client. Keep it owned by the join result until the Shell has exited.
+        Ok::<_, std::io::Error>(terminal.then_some(input))
     });
     let status = child.wait();
     // Closing the job stops remaining descendants before joining pipe readers.
     drop(child);
     drop(console);
-    let _ = input_thread.join();
+    input_thread
+        .join()
+        .map_err(|_| "Shell input writer failed")?
+        .map_err(|e| format!("Write Shell input: {e}"))?;
     stdout_thread
         .join()
         .map_err(|_| "Shell stdout reader failed")??;
