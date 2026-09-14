@@ -1340,7 +1340,11 @@ test('Plan documents and previews render Markdown entities, code names and verif
   const { PlanPreviewCard, PlanPreviewContent } = await loadGuiModule(t, '/src/components/local-agent/PlanPreviewCard.tsx');
   const { MarkdownInline } = await loadGuiModule(t, '/src/components/local-agent/BufferedMarkdown.tsx');
   const { ComposerDecisionPanels } = await loadGuiModule(t, '/src/components/local-agent/ComposerDecisionPanels.tsx');
-  const { InteractionReplyQuote } = await loadGuiModule(t, '/src/components/local-agent/ConversationTranscript.tsx');
+  const [{ InteractionReplyQuote }, { ConversationVirtualRow }, { ConversationLayoutCache, ConversationVirtualizer }] = await loadGuiModules(t, [
+    '/src/components/local-agent/ConversationTranscript.tsx',
+    '/src/components/local-agent/ConversationVirtualRow.tsx',
+    '/src/components/local-agent/conversationVirtualizer.ts',
+  ]);
   const plan = {
     planId: 'plan:document', revision: 1, runId: 'run:document', callId: 'call:document', status: 'published',
     title: '对象池 ObjectPool&lt;T,N&gt; 升级', summary: '保留 **互斥访问** 与 `C++17`。',
@@ -1409,9 +1413,24 @@ test('Plan documents and previews render Markdown entities, code names and verif
   assert.match(optionButton, /<code>Makefile<\/code>/, 'the description is part of the option hit target and accessible name');
   assert.ok(optionButton.includes('说明'));
   assert.equal(optionButton.includes('<a '), false, 'an option cannot contain a second interactive link');
-  const reply = renderToStaticMarkup(createElement(InteractionReplyQuote, { prompt }));
-  assert.match(reply, /<details class="conversation-answered-question">/);
-  assert.match(reply, /<code>Dockerfile<\/code>/, 'the full question remains available after answering');
+  const virtualizer = new ConversationVirtualizer(new ConversationLayoutCache().session('session:reply'), () => {});
+  const renderReply = () => renderToStaticMarkup(createElement(ConversationVirtualRow, {
+    rowKey: 'message:reply', virtualizer, eager: true,
+    children: () => createElement(InteractionReplyQuote, { prompt, language: 'zh-CN' }),
+  }));
+  const reply = renderReply();
+  assert.match(reply, /aria-expanded="false"/);
+  assert.match(reply, /<strong>容器环境<\/strong>/);
+  assert.equal(reply.includes('Dockerfile'), false, 'the collapsed quote only mounts its first-paragraph preview');
+  virtualizer.layout('message:reply').state.set('interaction-reply:expanded', true);
+  const expandedReply = renderReply();
+  assert.match(expandedReply, /aria-expanded="true"/);
+  assert.match(expandedReply, /aria-label="收起问题"/);
+  assert.equal(expandedReply.match(/容器环境/g)?.length, 1, 'expanding replaces the preview instead of repeating the question');
+  assert.match(expandedReply, /<li>保留 <code>Dockerfile<\/code><\/li>/, 'the full question retains its Markdown after answering');
+  assert.ok(expandedReply.includes('删除演示产物'));
+  virtualizer.layout('message:reply').state.set('interaction-reply:expanded', false);
+  assert.equal(renderReply(), reply, 'collapsing restores the original preview');
 });
 
 test('reasoning details are a default-off shell preference in the real Settings catalog', async (t) => {
@@ -1933,7 +1952,7 @@ test('composer submission receipts preserve newer text and retain the complete f
   assert.deepEqual(current, original);
 });
 
-test('pending decisions keep ordinary input and the stop action available with a nonempty draft', async (t) => {
+test('pending approvals preserve ordinary input with one primary action', async (t) => {
   const previousSelf = globalThis.self;
   globalThis.self = {};
   t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
@@ -1944,17 +1963,66 @@ test('pending decisions keep ordinary input and the stop action available with a
     pendingApproval: { approvalId: 'approval:one', preview: { summary: 'Write the requested file', effects: [], logicalTargets: [] } },
     projection: { queuedInputs: [{ commandId: 'queued:one', text: 'Keep the public API unchanged', status: 'queued', filesystemReferences: [] }] },
     profiles: [], selectedProfileId: null, draft: 'Second request', pastedTexts: [], failedDrafts: [],
-    pendingFilesystemPaths: [], pluginSelections: [], filteredPlugins: [], showStopAction: true, canSend: false, submitting: true,
+    pendingFilesystemPaths: [], pluginSelections: [], filteredPlugins: [], showStopAction: false, canSend: false, submitting: true,
     textareaRef: { current: null }, respondApproval() {},
   };
   const html = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', composer, uiActionError: null }));
   assert.match(html, /Write the requested file/);
   assert.match(html, /<textarea[^>]*>Second request<\/textarea>/);
-  assert.match(html, /class="local-agent__send local-agent__send--stop"/);
-  assert.doesNotMatch(html.match(/<button[^>]*class="local-agent__send local-agent__send--stop"[^>]*>/)[0], /disabled/);
+  assert.match(html, /local-agent__composer--message/);
+  assert.match(html, /<textarea[^>]*rows="3"/);
+  assert.doesNotMatch(html, /local-agent__send--stop/);
   assert.match(html, /class="local-agent__send"/);
+  assert.equal((html.match(/<button[^>]*class="local-agent__send(?: |")/g) ?? []).length, 1);
   assert.match(html, /等待加入当前任务/);
   assert.match(html, /Keep the public API unchanged/);
+});
+
+test('questions and Plan revisions share the main input and render a single primary action', async (t) => {
+  const previousSelf = globalThis.self;
+  globalThis.self = {};
+  t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { ConversationComposer } = await loadGuiModule(t, '/src/components/local-agent/ConversationComposer.tsx');
+  const base = { profiles: [], selectedProfileId: null, draft: '保留构建配置', pastedTexts: [], failedDrafts: [],
+    pendingFilesystemPaths: [], pluginSelections: [], filteredPlugins: [], textareaRef: { current: null },
+    canSend: true, showStopAction: false, textDecision: true };
+  for (const decision of [
+    { pendingInteraction: { interactionId: 'question:one', prompt: '需要保留什么？', allowFreeform: true, options: [] } },
+    { pendingPlan: { planId: 'plan:one', revision: 1, title: '清理工作区' } },
+  ]) {
+    const html = renderToStaticMarkup(createElement(ConversationComposer, {
+      language: 'zh-CN', composer: { ...base, ...decision }, uiActionError: null,
+    }));
+    assert.equal((html.match(/<textarea\b/g) ?? []).length, 1);
+    assert.match(html, /<textarea[^>]*rows="1"/);
+    assert.ok(html.includes(`local-agent__composer--${decision.pendingPlan ? 'plan' : 'interaction'}`));
+    assert.equal((html.match(/<button[^>]*class="local-agent__send(?: |")/g) ?? []).length, 1);
+    assert.match(html, /保留构建配置<\/textarea>/);
+    assert.doesNotMatch(html, /local-agent__send--stop/);
+    assert.doesNotMatch(html, /local-agent__interaction-composer/);
+    assert.doesNotMatch(html, /local-agent__interaction-close|local-agent__interaction-secondary-actions/);
+    const secondaryLabel = decision.pendingPlan ? '取消并停止' : '跳过';
+    assert.equal(html.split(secondaryLabel).length - 1, 1);
+    const actions = html.slice(html.indexOf('class="local-agent__composer-primary-actions"'));
+    assert.ok(actions.includes(secondaryLabel));
+    assert.ok(actions.indexOf(secondaryLabel) < actions.indexOf('class="local-agent__send"'));
+  }
+  const running = renderToStaticMarkup(createElement(ConversationComposer, {
+    language: 'zh-CN', composer: { ...base, textDecision: false, draft: '', canSend: false, showStopAction: true }, uiActionError: null,
+  }));
+  assert.equal((running.match(/<button[^>]*class="local-agent__send(?: |")/g) ?? []).length, 1);
+  assert.match(running, /local-agent__send--stop/);
+  assert.match(running, /local-agent__composer--message/);
+  assert.match(running, /<textarea[^>]*rows="3"/);
+  const editing = renderToStaticMarkup(createElement(ConversationComposer, {
+    language: 'zh-CN', composer: { ...base, textDecision: false }, uiActionError: null,
+  }));
+  assert.match(editing, /<textarea[^>]*rows="3"/);
+  assert.match(editing, /保留构建配置<\/textarea>/);
+  assert.match(editing, /aria-label="发送"/);
+  assert.doesNotMatch(editing, /local-agent__send--stop|local-agent__interaction-secondary/);
 });
 
 test('resource preview uses the native dialog while committed content projects only displayed text', async (t) => {

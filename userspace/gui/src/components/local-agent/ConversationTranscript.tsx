@@ -18,7 +18,7 @@ import { formatBytes } from './conversationFormatting';
 import { ConversationNavigation } from './ConversationNavigation';
 import { conversationNavigation } from './conversationWindow';
 import { ConversationLayoutCache, ConversationVirtualizer } from './conversationVirtualizer';
-import { ConversationVirtualRow } from './ConversationVirtualRow';
+import { ConversationVirtualRow, useConversationRowState } from './ConversationVirtualRow';
 
 interface ConversationTranscriptProps {
   language: UiLanguage;
@@ -143,7 +143,7 @@ export function ConversationTranscript({
           <div className="local-agent__message-content">
             {(item.value.content.trim() || item.value.replyToInteraction) && (
               <div className="local-agent__message-text">
-                {item.value.replyToInteraction && <InteractionReplyQuote prompt={item.value.replyToInteraction.prompt} />}
+                {item.value.replyToInteraction && <InteractionReplyQuote prompt={item.value.replyToInteraction.prompt} language={language} />}
                 {item.value.role === 'assistant'
                   ? committedProviderContent(
                       item.streamId,
@@ -385,9 +385,17 @@ function CommittedPresentation({ identity, text, onDisplayed, children }: { iden
   return <>{children}</>;
 }
 
-export function InteractionReplyQuote({ prompt }: { prompt: string }) {
-  return <details className="conversation-answered-question">
-    <summary><span><MarkdownInline>{prompt.split(/\n\s*\n/)[0]!}</MarkdownInline></span><DeepCodeShellIcon name="chevronDown" /></summary>
-    <div className="conversation-answered-question-body"><MarkdownContent>{prompt}</MarkdownContent></div>
-  </details>;
+export function InteractionReplyQuote({ prompt, language }: { prompt: string; language: UiLanguage }) {
+  const [expanded, setExpanded] = useConversationRowState('interaction-reply:expanded', false);
+  const toggleLabel = language === 'zh-CN'
+    ? (expanded ? '收起问题' : '展开问题')
+    : (expanded ? 'Collapse question' : 'Expand question');
+  return <div className="conversation-answered-question">
+    <button type="button" className="conversation-answered-question-toggle" aria-expanded={expanded}
+      aria-label={toggleLabel} title={toggleLabel} onClick={() => setExpanded((value) => !value)}>
+      {!expanded && <span><MarkdownInline>{prompt.split(/\n\s*\n/)[0]!}</MarkdownInline></span>}
+      <DeepCodeShellIcon name="chevronDown" />
+    </button>
+    {expanded && <div className="conversation-answered-question-body"><MarkdownContent>{prompt}</MarkdownContent></div>}
+  </div>;
 }

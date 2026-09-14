@@ -18,7 +18,11 @@ pub(crate) fn prepare(
         "revision": settings.get("agent.environmentRevision").and_then(Value::as_u64).unwrap_or(0),
     });
     if let Some(saved) = previous {
-        if restoring || saved.get("configuration") == Some(&configuration) {
+        let compatible_shell = saved["shell"]["tool"] != "powershell"
+            || saved["shell"]["executable"].as_str().is_some_and(|path| {
+                shell_environment::powershell_path_is_compatible(std::path::Path::new(path))
+            });
+        if restoring || saved.get("configuration") == Some(&configuration) && compatible_shell {
             validate_snapshot(saved)?;
             return Ok(saved.clone());
         }
@@ -296,6 +300,19 @@ fn system_locale() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn store_shell_snapshot_refreshes_for_new_runs_but_not_during_restore() {
+        let settings = json!({});
+        let mut saved = capture(&settings).unwrap();
+        saved["shell"] = json!({"tool":"powershell", "dialect":"powershell7",
+            "executable":r"C:\Users\user\AppData\Local\Microsoft\WindowsApps\pwsh.exe"});
+        let refreshed = prepare(&settings, Some(&saved), false).unwrap();
+        assert_ne!(refreshed["shell"], saved["shell"]);
+        assert_eq!(refreshed["configuration"], saved["configuration"]);
+        assert_eq!(prepare(&settings, Some(&saved), true).unwrap(), saved);
+    }
 
     #[test]
     fn locale_without_a_human_language_is_not_invented() {

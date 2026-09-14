@@ -1,4 +1,4 @@
-.conversation-markdown { min-width: 0; overflow-wrap: break-word; font-family: var(--dc-font-ui); font-size: var(--dc-font-body, 14px); line-height: 1.78; }
+.conversation-markdown { min-width: 0; overflow-wrap: anywhere; font-family: var(--dc-font-ui); font-size: var(--dc-font-body, 14px); line-height: 1.78; }
 .conversation-markdown :is(h1, h2, h3, h4, h5, h6) { color: var(--dc-foreground-strong); font-weight: 600; line-height: 1.4; margin: 1.5em 0 .7em; letter-spacing: -.01em; }
 .conversation-markdown h1 { font-size: 1.8em; }
 .conversation-markdown h2 { font-size: 1.3em; margin-top: 1.8em; }

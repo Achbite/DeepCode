@@ -3,7 +3,8 @@ use base64::Engine;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::{
     NetworkManagement::NetManagement::*, NetworkManagement::WindowsFilteringPlatform::*,
-    Security::Cryptography::*, Security::*, System::Rpc::RPC_C_AUTHN_WINNT,
+    Security::Authentication::Identity::*, Security::Cryptography::*, Security::*,
+    System::Rpc::RPC_C_AUTHN_WINNT,
 };
 
 fn crypt(input: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
@@ -109,10 +110,36 @@ impl Drop for EngineHandle {
     }
 }
 
-pub(super) fn check(state: &Installation) -> Result<(), String> {
+fn check_account(state: &Installation) -> Result<(), String> {
     if account_sid(&state.account)? != state.account_sid {
         return Err("The configured sandbox account is unavailable. Run sandbox setup from Execution environment settings.".into());
     }
+    Ok(())
+}
+
+pub(super) fn logon(state: &Installation) -> Result<Handle, String> {
+    let mut token = null_mut();
+    // The existing CreateProcessWithLogonW launcher requires local logon.
+    // Merely finding the account and network filters does not prove readiness.
+    if unsafe {
+        LogonUserW(
+            wide(&state.account).as_ptr(),
+            wide(".").as_ptr(),
+            wide(password(state)?).as_ptr(),
+            LOGON32_LOGON_INTERACTIVE,
+            LOGON32_PROVIDER_DEFAULT,
+            &mut token,
+        )
+    } == 0
+    {
+        return Err(error("Log on workspace account"));
+    }
+    Ok(Handle(token))
+}
+
+pub(super) fn check(state: &Installation) -> Result<(), String> {
+    check_account(state)?;
+    let _token = logon(state)?;
     let engine = EngineHandle::open()?;
     if state.network_filters.len() != 4 {
         return Err("Windows workspace network policy is incomplete.".into());
@@ -127,6 +154,39 @@ pub(super) fn check(state: &Installation) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// The existing worker launcher requires this account-level local logon right.
+// Setup changes only the dedicated account, without adding group memberships.
+fn worker_logon_right(account: &str, add: bool) -> Result<(), String> {
+    let account = sid(account)?;
+    let mut name = wide("SeInteractiveLogonRight");
+    let right = LSA_UNICODE_STRING {
+        Length: ((name.len() - 1) * 2) as u16,
+        MaximumLength: (name.len() * 2) as u16,
+        Buffer: name.as_mut_ptr(),
+    };
+    let mut attributes: LSA_OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    attributes.Length = std::mem::size_of_val(&attributes) as u32;
+    let mut policy: LSA_HANDLE = 0;
+    code("Open workspace account logon policy", unsafe {
+        LsaNtStatusToWinError(LsaOpenPolicy(
+            null(),
+            &attributes,
+            (POLICY_LOOKUP_NAMES | POLICY_CREATE_ACCOUNT) as u32,
+            &mut policy,
+        ))
+    })?;
+    let status = unsafe {
+        let status = if add {
+            LsaAddAccountRights(policy, account.0, &right, 1)
+        } else {
+            LsaRemoveAccountRights(policy, account.0, false, &right, 1)
+        };
+        LsaClose(policy);
+        LsaNtStatusToWinError(status)
+    };
+    code("Configure workspace account logon right", status)
 }
 
 fn network_filters(account: &str) -> Result<Vec<u64>, String> {
@@ -184,6 +244,8 @@ pub(super) fn install(path: &Path, owner: &str) -> Result<(), String> {
         let state: Installation =
             serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
+        check_account(&state)?;
+        worker_logon_right(&state.account_sid, true)?;
         return check(&state);
     }
     let account = format!("DeepCode_{}", &random_text()[..10]);
@@ -212,6 +274,7 @@ pub(super) fn install(path: &Path, owner: &str) -> Result<(), String> {
     let mut filters = Vec::new();
     let result = (|| {
         let account_sid = account_sid(&account)?;
+        worker_logon_right(&account_sid, true)?;
         filters = network_filters(&account_sid)?;
         let protected_password =
             base64::engine::general_purpose::STANDARD.encode(crypt(secret.as_bytes(), true)?);
@@ -233,6 +296,9 @@ pub(super) fn install(path: &Path, owner: &str) -> Result<(), String> {
         check(&state)
     })();
     if result.is_err() {
+        if let Ok(sid) = account_sid(&account) {
+            let _ = worker_logon_right(&sid, false);
+        }
         if let Ok(engine) = EngineHandle::open() {
             for id in filters {
                 unsafe {

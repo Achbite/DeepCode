@@ -31,7 +31,13 @@ export function useAgentComposer(
   const pendingScopeAddition = pendingPlan ? planScopeAddition(projection?.plans.find((plan) => (
     plan.planId === pendingPlan.planId && plan.revision === pendingPlan.revision - 1
   )), pendingPlan) : null;
-  const composerStateKey = sessionId ?? `new:${draftProjectId ?? 'independent'}`;
+  const textDecision = Boolean(pendingPlan || pendingInteraction);
+  const conversationKey = sessionId ?? `new:${draftProjectId ?? 'independent'}`;
+  const composerStateKey = pendingPlan
+    ? `${conversationKey}:plan:${pendingPlan.planId}:${pendingPlan.revision}`
+    : pendingInteraction
+      ? `${conversationKey}:interaction:${pendingInteraction.interactionId}`
+      : conversationKey;
   const loading = useLocalAgentStore((state) => state.loading);
   const submitting = useLocalAgentStore((state) => state.submitting);
   const catalogBusy = useLocalAgentStore((state) => state.catalogBusy);
@@ -111,15 +117,17 @@ export function useAgentComposer(
     if (previousKey === composerStateKey) return;
     const textarea = textareaRef.current;
     const previous = composerStatesRef.current.get(previousKey);
-    const outgoing: ComposerState = {
-      draft: textarea?.value ?? draft,
-      pastedTexts: pastedTexts.map((item) => ({ ...item })),
-      filesystemPaths: pendingFilesystemPaths.map((item) => ({ ...item })),
-      pluginSelections: pluginSelections.map((item) => ({ ...item })),
-      selectionStart: textarea?.selectionStart ?? previous?.selectionStart ?? draft.length,
-      selectionEnd: textarea?.selectionEnd ?? previous?.selectionEnd ?? draft.length,
-      focused: document.activeElement === textarea || previous?.focused === true,
-    };
+    const outgoing: ComposerState = pendingComposerRestoreRef.current?.key === previousKey
+      ? cloneComposerState(pendingComposerRestoreRef.current.state)
+      : {
+          draft: textarea?.value ?? draft,
+          pastedTexts: pastedTexts.map((item) => ({ ...item })),
+          filesystemPaths: pendingFilesystemPaths.map((item) => ({ ...item })),
+          pluginSelections: pluginSelections.map((item) => ({ ...item })),
+          selectionStart: textarea?.selectionStart ?? previous?.selectionStart ?? draft.length,
+          selectionEnd: textarea?.selectionEnd ?? previous?.selectionEnd ?? draft.length,
+          focused: document.activeElement === textarea || previous?.focused === true,
+        };
     composerStatesRef.current.set(previousKey, outgoing);
 
     const incoming = cloneComposerState(
@@ -138,19 +146,26 @@ export function useAgentComposer(
     setAttachmentError(null);
   }, [composerStateKey]);
 
-  useLayoutEffect(() => {
+  useEffect(() => {
     const pending = pendingComposerRestoreRef.current;
     if (!pending || pending.key !== activeComposerStateKeyRef.current) return;
     const textarea = textareaRef.current;
     if (!textarea || textarea.value !== pending.state.draft) return;
-    const selectionStart = Math.min(pending.state.selectionStart, textarea.value.length);
-    const selectionEnd = Math.min(
-      Math.max(selectionStart, pending.state.selectionEnd),
-      textarea.value.length,
-    );
-    textarea.setSelectionRange(selectionStart, selectionEnd);
-    if (pending.state.focused && !textarea.disabled) textarea.focus({ preventScroll: true });
-    pendingComposerRestoreRef.current = null;
+    // Restore after the controlled value and the switching pointer event settle.
+    const frame = window.requestAnimationFrame(() => {
+      if (pendingComposerRestoreRef.current !== pending
+        || activeComposerStateKeyRef.current !== pending.key
+        || textareaRef.current !== textarea || textarea.value !== pending.state.draft) return;
+      const selectionStart = Math.min(pending.state.selectionStart, textarea.value.length);
+      const selectionEnd = Math.min(
+        Math.max(selectionStart, pending.state.selectionEnd),
+        textarea.value.length,
+      );
+      if (pending.state.focused && !textarea.disabled) textarea.focus({ preventScroll: true });
+      textarea.setSelectionRange(selectionStart, selectionEnd);
+      pendingComposerRestoreRef.current = null;
+    });
+    return () => window.cancelAnimationFrame(frame);
   });
 
   useEffect(() => () => {
@@ -185,11 +200,7 @@ export function useAgentComposer(
   const submitDraft = async () => {
     const submittedText = draft;
     if (
-      (!submittedText.trim() && !pastedTexts.length)
-      || loading
-      || submitting
-      || catalogBusy
-      || (!selectedProfileId && !canCancel)
+      !canSend
       || compositionActiveRef.current
       || compositionCommitPendingRef.current
     ) return;
@@ -230,6 +241,14 @@ export function useAgentComposer(
       write: (_key, state) => setComposerStateForKey(submission.key, state),
       retainFailed: (_key, state) => setFailedDrafts((current) => ({ ...current, [submission.key]: [...(current[submission.key] ?? []), state] })),
       send: async () => {
+        if (pendingPlan) {
+          await respondPlan({ kind: 'requestRevision', text: submittedText });
+          return;
+        }
+        if (pendingInteraction) {
+          await respondInteraction(submittedText);
+          return;
+        }
         const focusMatch = submittedText.match(/^\/focus(?:\s+)([\s\S]+)$/u);
         if (focusMatch) {
           await focusContext(focusMatch[1]!.trim(), submittedFilesystemPaths, submittedPluginSelections, submittedComposerState.pastedTexts, onSessionCreated);
@@ -310,7 +329,9 @@ export function useAgentComposer(
   };
 
   const updateDraft = (value: string, cursor: number) => {
+    pendingComposerRestoreRef.current = null;
     setDraft(value);
+    if (textDecision) return;
     setPluginSelections((current) => current.filter((selection) => (
       value.includes(`@${selection.label}`)
     )));
@@ -367,9 +388,16 @@ export function useAgentComposer(
     });
   };
 
-  const focusCommandSuggestionVisible = shouldOfferFocusCommand(draft);
+  const focusCommandSuggestionVisible = !textDecision && shouldOfferFocusCommand(draft);
 
   const submitOnComposerEnter = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (pendingPlan && event.key === 'Escape' && !event.repeat
+      && !event.nativeEvent.isComposing && !compositionActiveRef.current
+      && !compositionCommitPendingRef.current) {
+      event.preventDefault();
+      void submitPlanDecision({ kind: 'cancel' });
+      return;
+    }
     if (
       pluginPickerOpen
       && !event.nativeEvent.isComposing
@@ -481,6 +509,8 @@ export function useAgentComposer(
     projection?.run && ['running', 'waiting'].includes(projection.run.status),
   );
   const pasteText = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    pendingComposerRestoreRef.current = null;
+    if (textDecision) return;
     const text = event.clipboardData.getData('text/plain');
     if (!isLongPastedText(text)) return;
     event.preventDefault();
@@ -498,13 +528,12 @@ export function useAgentComposer(
   const editPastedText = (inputId: string, text: string) => setPastedTexts((current) => current.map((item) => (
     item.inputId === inputId ? { ...item, inputId: nextPanelId('paste'), text } : item
   )));
-  const canSend = Boolean(draft.trim() || pastedTexts.length)
-    && !modelSettingsBusy
-    && !loading
-    && !submitting
-    && !catalogBusy
-    && Boolean(canCancel || profiles.some((profile) => profile.id === selectedProfileId && profile.enabled));
-  const showStopAction = canCancel;
+  const canSend = !loading && !submitting && (textDecision
+    ? Boolean(draft.trim()) && (!pendingInteraction || pendingInteraction.allowFreeform)
+    : Boolean(draft.trim() || pastedTexts.length)
+      && !modelSettingsBusy && !catalogBusy
+      && Boolean(canCancel || profiles.some((profile) => profile.id === selectedProfileId && profile.enabled)));
+  const showStopAction = canCancel && !textDecision && !draft.trim() && !pastedTexts.length;
   const canRestoreFailedDraft = composerStateIsEmpty(currentComposerStateRef.current);
   const restoreFailedDraft = (index: number) => {
     const saved = failedDrafts[composerStateKey]?.[index];
@@ -514,6 +543,7 @@ export function useAgentComposer(
   };
 
   return {
+    textDecision,
     pendingPlan,
     pendingScopeAddition,
     pendingInteraction,

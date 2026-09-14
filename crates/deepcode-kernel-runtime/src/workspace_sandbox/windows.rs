@@ -9,6 +9,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
 };
 
+mod desktop;
 mod os;
 mod runner;
 mod setup;
@@ -70,7 +71,7 @@ pub fn request_setup() -> Result<(), String> {
         path.to_string_lossy().into_owned(),
         owner,
     ];
-    let command = format!("$p = Start-Process -FilePath '{}' -ArgumentList '{}' -Verb RunAs -Wait -PassThru; exit $p.ExitCode", exe.to_string_lossy().replace('\'', "''"), args.iter().map(|s| os::quote(s)).collect::<Vec<_>>().join(" ").replace('\'', "''"));
+    let command = format!("$p = Start-Process -FilePath '{}' -ArgumentList '{}' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode", exe.to_string_lossy().replace('\'', "''"), args.iter().map(|s| os::quote(s)).collect::<Vec<_>>().join(" ").replace('\'', "''"));
     let shell = crate::shell_environment::discover("powershell").map_err(|e| e.to_string())?;
     let output = std::process::Command::new(&shell.executable)
         .args(crate::shell_environment::script_arguments(&shell, &command))
@@ -117,22 +118,18 @@ impl WorkspaceGrants {
             error_file: temp.join("sandbox-error.txt"),
         };
         let result = (|| -> Result<(), String> {
-            // The bootstrap account can traverse/read the toolchain. The user
-            // command's restricting SID is granted writes only for this call.
-            for path in [
-                Some(root),
-                std::env::var_os("USERPROFILE").as_deref().map(Path::new),
-                shell.executable.parent(),
-                grants.program.parent(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                os::grant(
-                    path,
-                    &state.account_sid,
-                    FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
-                )?;
+            // Grant the invocation's inputs. An inheritable grant on USERPROFILE
+            // or the distribution root walks unrelated trees before Shell startup.
+            // Installed toolchain files retain their normal Windows read access.
+            os::grant(
+                root,
+                &state.account_sid,
+                FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            )?;
+            let token = setup::logon(&state)?;
+            for path in [shell.executable.as_path(), grants.program.as_path()] {
+                os::grant_program_read(path, &state.account_sid, &token)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
             }
             os::grant(temp, &state.account_sid, FILE_ALL_ACCESS)?;
             let scratch = temp.join("scratch");

@@ -593,6 +593,7 @@ class OwnedDaemon:
             stdout=self.log_file,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
 
         def ready() -> dict[str, Any] | None:
@@ -633,6 +634,13 @@ class OwnedDaemon:
 
     def terminate_group(self) -> None:
         if self.process is None or self.process.poll() is not None:
+            return
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(self.process.pid), "/T", "/F"],
+                capture_output=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            self.process.wait(timeout=5)
             return
         try:
             os.killpg(self.process.pid, signal.SIGTERM)
