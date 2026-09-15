@@ -4,7 +4,7 @@
   "version": "0.5.60",
   "identifier": "com.achbite.deepcode",
   "build": {
-    "frontendDist": "../dist",
+    "frontendDist": [],
     "devUrl": "http://127.0.0.1:31245",
     "beforeDevCommand": "",
     "beforeBuildCommand": ""

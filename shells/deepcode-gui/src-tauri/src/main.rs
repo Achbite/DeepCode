@@ -1,7 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[path = "../../../shared/open_file.rs"]
+mod open_file;
+
 #[path = "../../../shared/native_path_dialog/mod.rs"]
 mod native_path_dialog;
+#[path = "../../../shared/native_browser/mod.rs"]
+mod native_browser;
 
 use deepcode_kernel_abi::{
     is_valid_host_instance_id, is_valid_host_shell_token, is_valid_host_ui_token,
@@ -16,7 +21,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::http::{header, Request, Response, StatusCode};
 use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent};
@@ -248,13 +253,9 @@ impl Drop for HostProcessGroup {
 }
 
 fn main() {
-    let app = tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
-        .register_uri_scheme_protocol(APP_ASSET_SCHEME, |_ctx, request| {
-            serve_bundled_asset(APP_ASSET_DIR, request)
-        })
-        .invoke_handler(tauri::generate_handler![
+    let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
             native_path_dialog::deepcode_pick_path,
+            open_file::deepcode_open_file,
             deepcode_boot_target,
             deepcode_default_workspace_path,
             deepcode_host_startup_status,
@@ -262,42 +263,53 @@ fn main() {
             deepcode_window_minimize,
             deepcode_window_toggle_maximize,
             deepcode_window_close,
-            deepcode_open_external_url
-        ])
+            deepcode_open_external_url,
+            native_browser::deepcode_browser_host,
+            native_browser::deepcode_browser_command
+            ];
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .register_uri_scheme_protocol(APP_ASSET_SCHEME, |_ctx, request| {
+            serve_bundled_asset(APP_ASSET_DIR, request)
+        })
+        .invoke_handler(move |invoke| {
+            if invoke.message.webview_ref().label() != "main" {
+                invoke.resolver.reject("Host commands belong to the primary GUI view.");
+                return true;
+            }
+            handler(invoke)
+        })
         .setup(|app| {
             let target = resolve_launch_target();
-            let host_tokens = HostConnectionTokens::resolve()?;
+            let mut host_tokens = HostConnectionTokens::resolve()?;
+            let registration = Arc::clone(&host_tokens.browser_registration);
+            let browser_id = host_tokens.browser_instance_id.clone();
+            let callback_token = host_tokens.browser_token.clone();
+            host_tokens.browser_endpoint = native_browser::start(app.handle(), host_tokens.browser_instance_id.clone(), host_tokens.browser_token.clone(), host_bootstrap_script(&target, &host_tokens, true), Box::new(move || {
+                if let Ok(mut registration) = registration.lock() {
+                    if let Some((host,port,token,endpoint)) = registration.take() {
+                        let _ = register_native_browser(&host,&port,&token,&browser_id,&endpoint,&callback_token,true);
+                    }
+                }
+            })).map_err(std::io::Error::other)?;
             app.manage(target.clone());
             app.manage(host_tokens.clone());
             app.manage(HostProcessGroup::new(None));
             app.manage(HostStartupStatusStore::new());
             create_main_window(app, &target, &host_tokens)?;
-            // Filesystem preflight may wait for a macOS permission dialog. The
-            // window event loop must already be free to accept clicks and input.
+            // Actual Host I/O reports access failures. Do not enumerate parent
+            // directories before startup or block the native window event loop.
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
-                if startup_permission_preflight(APP_ASSET_DIR) {
-                    let processes = app_handle.state::<HostProcessGroup>();
-                    let status = app_handle.state::<HostStartupStatusStore>();
-                    start_host_processes(&target, &host_tokens, &processes, &status);
-                } else {
-                    app_handle.state::<HostStartupStatusStore>().update(
-                        "preflight",
-                        "blocked",
-                        "permissionPreflight",
-                        "host_startup_permission_blocked",
-                        None,
-                        "Startup permission preflight did not complete.",
-                        true,
-                        false,
-                        None,
-                    );
-                }
+                let processes = app_handle.state::<HostProcessGroup>();
+                let status = app_handle.state::<HostStartupStatusStore>();
+                start_host_processes(&target, &host_tokens, &processes, &status);
             });
             Ok(())
         })
         .on_window_event(|window, event| match event {
             WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed => {
+                window.state::<native_browser::NativeBrowser>().stop();
                 window.state::<HostProcessGroup>().detach();
                 window.app_handle().exit(0);
             }
@@ -308,6 +320,7 @@ fn main() {
 
     app.run(|app_handle, event| match event {
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+            app_handle.state::<native_browser::NativeBrowser>().stop();
             app_handle.state::<HostProcessGroup>().detach();
         }
         _ => {}
@@ -328,6 +341,10 @@ struct HostConnectionTokens {
     daemon: String,
     proxy: String,
     instance_id: String,
+    browser_endpoint: String,
+    browser_instance_id: String,
+    browser_token: String,
+    browser_registration: Arc<Mutex<Option<(String,String,String,String)>>>,
 }
 
 impl HostConnectionTokens {
@@ -351,9 +368,13 @@ impl HostConnectionTokens {
         let instance_id =
             generate_local_identity(HOST_INSTANCE_ID_PREFIX, is_valid_host_instance_id)?;
         Ok(Self {
+            browser_instance_id: instance_id.clone(),
+            browser_token: daemon.clone(),
+            browser_registration: Arc::new(Mutex::new(None)),
             daemon,
             proxy,
             instance_id,
+            browser_endpoint: String::new(),
         })
     }
 
@@ -458,32 +479,13 @@ fn deepcode_host_startup_status(status: State<'_, HostStartupStatusStore>) -> Ho
     status.read()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn deepcode_start_kernel_after_permission(
     target: State<'_, LaunchTarget>,
     host_tokens: State<'_, HostConnectionTokens>,
     processes: State<'_, HostProcessGroup>,
     status: State<'_, HostStartupStatusStore>,
 ) -> KernelStartResult {
-    if !startup_permission_preflight(APP_ASSET_DIR) {
-        let current = status.update(
-            "preflight",
-            "blocked",
-            "permissionPreflight",
-            "host_startup_permission_blocked",
-            None,
-            "Startup permission preflight did not complete.",
-            true,
-            false,
-            None,
-        );
-        return KernelStartResult {
-            started: false,
-            blocked: true,
-            message: current.message.clone(),
-            status: current,
-        };
-    }
     let current = start_host_processes(&target, &host_tokens, &processes, &status);
     let started = current.phase == "ready";
     KernelStartResult {
@@ -580,18 +582,7 @@ fn create_main_window(
     host_tokens: &HostConnectionTokens,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let boot_url = format!("{APP_ASSET_SCHEME}://localhost/index.html");
-    let window_chrome = if cfg!(target_os = "macos") {
-        "nativeOverlay"
-    } else {
-        "custom"
-    };
-    let initialization_script = format!(
-        "Object.defineProperty(window,'__DEEPCODE_HOST_BOOT__',{{value:Object.freeze({{schemaVersion:'deepcode.host-ui-bootstrap',host:'{}',port:'{}',uiToken:'{}',windowChrome:'{}'}}),writable:false,configurable:true}});",
-        target.host,
-        target.port,
-        host_tokens.ui_token(),
-        window_chrome
-    );
+    let initialization_script = host_bootstrap_script(target, host_tokens, false);
     let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(boot_url.parse()?))
         .initialization_script(initialization_script)
         .on_navigation(trusted_app_navigation)
@@ -619,57 +610,19 @@ fn create_main_window(
     Ok(())
 }
 
+fn host_bootstrap_script(target: &LaunchTarget, host_tokens: &HostConnectionTokens, preview: bool) -> String {
+    let bootstrap = serde_json::json!({
+        "schemaVersion":"deepcode.host-ui-bootstrap", "host":target.host, "port":target.port.to_string(),
+        "uiToken":host_tokens.ui_token(), "windowChrome":if cfg!(target_os="macos") && !preview {"nativeOverlay"} else {"custom"}
+    });
+    format!("Object.defineProperty(window,'__DEEPCODE_HOST_BOOT__',{{value:Object.freeze({bootstrap}),writable:false,configurable:true}});window.__DEEPCODE_SELF_PREVIEW__={preview};")
+}
+
 fn trusted_app_navigation(url: &tauri::Url) -> bool {
     (url.scheme() == APP_ASSET_SCHEME && url.host_str() == Some("localhost"))
         || (url.scheme() == "http" && url.host_str() == Some(concat!("deepcode-gui", ".localhost")))
-}
-
-fn startup_permission_preflight(web_dir_name: &str) -> bool {
-    if env_truthy("DEEPCODE_SKIP_STARTUP_PERMISSION_PREFLIGHT") || !cfg!(target_os = "macos") {
-        return true;
-    }
-
-    let Some(exe_dir) = current_exe_dir() else {
-        return true;
-    };
-    let mut paths = Vec::new();
-    if let Some(path) = std::env::var_os("DEEPCODE_CONFIG_DIR").map(PathBuf::from) {
-        paths.push(path);
-    }
-    if let Some(path) = std::env::var_os("DEEPCODE_CLIENT_DIST").map(PathBuf::from) {
-        paths.push(path);
-    }
-    if let Some(path) = std::env::var_os("DEEPCODE_DEFAULT_WORKSPACE").map(PathBuf::from) {
-        paths.push(path);
-    }
-    if let Some(path) = find_bundled_dir(&exe_dir, web_dir_name) {
-        paths.push(path);
-    }
-    if let Some(path) = package_root(&exe_dir) {
-        paths.push(path);
-    }
-
-    paths.iter().all(|path| path_permission_available(path))
-}
-
-fn path_permission_available(path: &Path) -> bool {
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) => return error.kind() != std::io::ErrorKind::PermissionDenied,
-    };
-    if metadata.is_dir() {
-        return match std::fs::read_dir(path) {
-            Ok(mut entries) => {
-                let _ = entries.next();
-                true
-            }
-            Err(error) => error.kind() != std::io::ErrorKind::PermissionDenied,
-        };
-    }
-    match std::fs::File::open(path) {
-        Ok(_) => true,
-        Err(error) => error.kind() != std::io::ErrorKind::PermissionDenied,
-    }
+        // WKWebView also reports navigation inside the sandboxed document iframe.
+        || (url.scheme() == "about" && matches!(url.path(), "srcdoc" | "blank"))
 }
 
 fn serve_bundled_asset(web_dir_name: &str, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
@@ -678,6 +631,7 @@ fn serve_bundled_asset(web_dir_name: &str, request: Request<Vec<u8>>) -> Respons
             Ok(bytes) => Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, content_type_for_path(&path))
+                .header(header::CACHE_CONTROL, "no-cache")
                 .body(bytes)
                 .unwrap_or_else(|_| empty_response(StatusCode::INTERNAL_SERVER_ERROR)),
             Err(_) => text_response(StatusCode::NOT_FOUND, "asset not found"),
@@ -1150,6 +1104,12 @@ fn spawn_host_processes_if_available(
         (Some(daemon), daemon_identity)
     };
 
+    if let Err(message) = register_native_browser(&target.host,&target.daemon_port,host_tokens.daemon_token(),
+        &host_tokens.browser_instance_id,&host_tokens.browser_endpoint,&host_tokens.browser_token,false) {
+        eprintln!("[native-browser] {message}");
+    } else if let Ok(mut registration) = host_tokens.browser_registration.lock() {
+        *registration=Some((target.host.clone(),target.daemon_port.clone(),host_tokens.daemon.clone(),host_tokens.browser_endpoint.clone()));
+    }
     status.update(
         attempt_id,
         "starting",
@@ -1747,6 +1707,14 @@ fn http_request(
     }
     request.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
     request
+}
+
+fn register_native_browser(host:&str,port:&str,token:&str,id:&str,endpoint:&str,callback_token:&str,remove:bool)->Result<(),String> {
+    let body=serde_json::json!({"hostInstanceId":id,"endpoint":endpoint,"callbackToken":callback_token,"remove":remove}).to_string();
+    let request=http_request(host,port,"POST","/api/host/native-browser",&[(HOST_SHELL_TOKEN_HEADER,token),("Content-Type","application/json")])
+        .replace("Content-Length: 0",&format!("Content-Length: {}",body.len())) + &body;
+    let response:serde_json::Value=request_loopback_json(host,port,&request,6000).ok_or("Native browser registration connection failed.")?;
+    if response["ok"]==true {Ok(())} else {Err(response["message"].as_str().unwrap_or("Native browser registration failed.").into())}
 }
 
 fn request_loopback_json<T: DeserializeOwned>(

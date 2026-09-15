@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[path = "../../../shared/open_file.rs"]
+mod open_file;
+
 #[path = "../../../shared/native_path_dialog/mod.rs"]
 mod native_path_dialog;
 
@@ -85,6 +88,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             native_path_dialog::deepcode_pick_path,
+            open_file::deepcode_open_file,
             deepcode_boot_target,
             deepcode_host_startup_status,
             deepcode_start_kernel_after_permission,
@@ -467,6 +471,7 @@ fn trusted_app_navigation(url: &tauri::Url) -> bool {
     (url.scheme() == APP_ASSET_SCHEME && url.host_str() == Some("localhost"))
         || (url.scheme() == "http"
             && url.host_str() == Some(concat!("deepcode-editor", ".localhost")))
+        || (url.scheme() == "about" && matches!(url.path(), "srcdoc" | "blank"))
 }
 
 fn startup_permission_preflight(web_dir_name: &str) -> bool {
@@ -523,6 +528,7 @@ fn serve_bundled_asset(web_dir_name: &str, request: Request<Vec<u8>>) -> Respons
             Ok(bytes) => Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, content_type_for_path(&path))
+                .header(header::CACHE_CONTROL, "no-cache")
                 .body(bytes)
                 .unwrap_or_else(|_| empty_response(StatusCode::INTERNAL_SERVER_ERROR)),
             Err(_) => text_response(StatusCode::NOT_FOUND, "asset not found"),
