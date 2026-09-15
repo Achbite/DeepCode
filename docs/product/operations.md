@@ -26,12 +26,32 @@ The local Provider stream has no body idle timeout or total duration limit. User
 
 Input cache hit rate is cached input tokens divided by total input tokens. The context indicator refers to the last settled request, while the top session indicator aggregates the entire session. Settings provide token details. Different ratios across these scopes are not by themselves a calculation error.
 
-The tool catalog and system instructions remain stable during a run. Tool results, product Skill text and new messages append to history. Do not rewrite historical facts, reduce reasoning effort, hide errors or fabricate usage to claim improved cache efficiency.
+The model and task identity remain fixed during a run. Explicit plugin selections received during that run are prepared before the next model request. Each request records its tool definitions, instructions, aliases and Kernel catalog binding. Earlier requests, pending approvals and in-flight calls keep their original bindings. Registration alone does not expose an optional plugin. A preparation failure retains its reason and is not reported as an applied selection. Tool results, Skill text and new messages append to history. Do not rewrite historical facts, reduce reasoning effort, hide errors or fabricate usage to claim improved cache efficiency.
 
 ## Settings and extensions
 
-Settings are grouped into Appearance, Agent behavior, Execution environment, Tool permissions, Models & services, and Plugins. Plugins currently lists built-in text Skills and configured Skill sources. A text Skill supplies instructions; it is not an executable binary. MCP and other executable extensions belong to the plugin system, with their own activation and execution facts. Saving a source is not evidence that a plugin has executed.
+Settings separate appearance, Agent behavior, execution environments, permissions, model profiles, services and plugins. Plugins are grouped by purpose: functional MCP plugins, UI extensions and custom Skills. Built-in Skills are omitted from settings lists, counts and search. A text Skill supplies instructions; it is not an executable binary. Save a model or plugin with the controls for that item. New conversations use the last model selected for a submitted task; merely viewing history or editing a profile does not change that choice.
+
+The `@` picker and plugin chooser share one catalog. Functional Skills and plugins are discoverable by default; product documentation remains searchable. A selected item is prepared on submission. A pure documentation reference uses structured guidance and `skill.read` or `doc.read`, without creating an execution plugin instance. MCP tools and UI extensions serve different purposes: an Echo MCP tool is selected for task execution; a UI extension renders content.
 
 Desktop selection uses the operating system's dialog. Attachments keep one "Files and folders" entry: choose either type in the same window and add it to the existing reference list. Skill sources and workspaces also use a single selection window; creating a project requires a directory. Windows provides a "Select" action inside its native dialog to confirm the highlighted file or folder, while the standard Open action can navigate into folders. Cancelling leaves the selection unchanged. Browser sessions use the existing Host directory browser because a browser file upload does not provide a usable absolute Host path.
 
 In Plugins, choose a Skill folder or an individual SKILL.md file, review the displayed path and save the changes. Sources can be enabled, changed or removed. Manual path entry is a secondary option. Native paths, including Windows drive paths and UNC shares, pass to the existing Skill loader without POSIX conversion. The available Skill list is read through the Host UI proxy.
+
+## Document output
+
+For a requested polished report or document export, read `skill.read` with `name=deepcode-documents`, then only its relevant references or template. Use `document.render` with an output `path`, `format` (`html`, `pdf` or `markdown`) and `content`. HTML and PDF inputs are complete self-contained HTML; Markdown input is source text. Embed images and SVG; PDF export has no network or arbitrary local resource-read effect and does not execute JavaScript. Source is limited to 1 MiB and PDF output to 32 MiB.
+
+Document generation is a workspace mutation. It shares confirmed file/directory write scope with `fs.write` and `fs.edit`, while deletion remains separate. PDF rendering uses the Python interpreter in `agent.documents.pythonPath`, then the configured document environment or system Python when the setting is omitted. WeasyPrint and its platform libraries must be available. A renderer error or cancellation retains the error and does not replace the existing output file. Do not claim an artifact until the successful ToolRecord returns it.
+
+GUI and Editor read artifact bytes through the Session-bound resource API. HTML has a static preview and source view; PDF supports local page rendering, zoom and selectable text; Markdown uses the shared renderer. These viewers do not run another Agent Loop. CLI/TUI retain the same artifact facts and paths.
+
+## UI resource updates
+
+`make ui` builds only the frontend and its shared presentation/types dependencies in Docker. `python3 scripts/update-ui.py --package <existing-package>` publishes those resources, or `make ui-update UI_PACKAGE=<existing-package>` performs both steps. The updater preserves Kernel, Session runtime, user data and the original package identity; frontend identity is recorded in `frontend-build-info.json`. macOS updates run on the host and refresh the App resource signature. Reload the interface from settings or reopen the window after saving edits and unsent input. Changes that introduce a Host/Session interface or a tool executor need the corresponding normal service build.
+
+## Display plugin hot replacement and package builds
+
+Add a local standalone JavaScript module in Settings → Plugins → UI plugins. Saved files update that plugin; disabling it releases its views and styles. Plugins receive display text, document data and theme inputs, without Session or tool ports. See the [UI plugin API and example](ui-plugins.md).
+
+Native shells read Web resources from the package instead of embedding a duplicate copy in the executable. Normal packaging still builds current source with Cargo and Vite. Use `make ui-update UI_PACKAGE=...` for UI-only edits; this retains native binaries and Session runtime.

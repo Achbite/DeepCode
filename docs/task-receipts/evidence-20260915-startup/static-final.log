@@ -1,0 +1,9 @@
+[test] 源码身份与脚本语法
+==[architecture]== 分层依赖检查通过
+[build-platforms] all available targets built; macOS flags retained: PASS
+[build-platforms] absent Windows support does not block other targets: PASS
+[build-platforms] build failure remains nonzero; later targets still build: PASS
+[build-platforms] interruption stops the remaining targets: PASS
+[build-platforms] no environment reports no outputs: PASS
+[build-platforms] running Node/Kernel blocks cleanup; contents retained; released images pass: PASS
+[test] 登记链路检查完成 profile=static（不等于效果、稳定性、真实 Provider 或发布验收）

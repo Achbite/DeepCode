@@ -1,0 +1,129 @@
+{
+  "scope": "Source color tokens on background, surface, subtle and raised surfaces; excludes authored documents, images, disabled controls and native control rendering.",
+  "text": {
+    "light": {
+      "foreground": {
+        "background": 15.49,
+        "surface": 17.015,
+        "surface-subtle": 15.892,
+        "surface-raised": 17.015
+      },
+      "muted": {
+        "background": 5.451,
+        "surface": 5.988,
+        "surface-subtle": 5.593,
+        "surface-raised": 5.988
+      },
+      "faint": {
+        "background": 4.809,
+        "surface": 5.282,
+        "surface-subtle": 4.933,
+        "surface-raised": 5.282
+      },
+      "success": {
+        "background": 4.863,
+        "surface": 5.342,
+        "surface-subtle": 4.989,
+        "surface-raised": 5.342
+      },
+      "warning": {
+        "background": 5.076,
+        "surface": 5.576,
+        "surface-subtle": 5.208,
+        "surface-raised": 5.576
+      },
+      "danger": {
+        "background": 4.937,
+        "surface": 5.423,
+        "surface-subtle": 5.065,
+        "surface-raised": 5.423
+      }
+    },
+    "dark": {
+      "foreground": {
+        "background": 12.44,
+        "surface": 11.958,
+        "surface-subtle": 10.856,
+        "surface-raised": 10.248
+      },
+      "muted": {
+        "background": 7.613,
+        "surface": 7.318,
+        "surface-subtle": 6.644,
+        "surface-raised": 6.272
+      },
+      "faint": {
+        "background": 6.197,
+        "surface": 5.958,
+        "surface-subtle": 5.409,
+        "surface-raised": 5.106
+      },
+      "success": {
+        "background": 8.06,
+        "surface": 7.748,
+        "surface-subtle": 7.034,
+        "surface-raised": 6.64
+      },
+      "warning": {
+        "background": 8.639,
+        "surface": 8.305,
+        "surface-subtle": 7.539,
+        "surface-raised": 7.117
+      },
+      "danger": {
+        "background": 5.774,
+        "surface": 5.551,
+        "surface-subtle": 5.039,
+        "surface-raised": 4.757
+      }
+    }
+  },
+  "accent": {
+    "light": {
+      "blue": {
+        "background": 5.283,
+        "surface": 5.803,
+        "surface-subtle": 5.42,
+        "surface-raised": 5.803,
+        "fillLabel": 5.803
+      },
+      "purple": {
+        "background": 5.183,
+        "surface": 5.694,
+        "surface-subtle": 5.318,
+        "surface-raised": 5.694,
+        "fillLabel": 5.694
+      },
+      "green": {
+        "background": 4.81,
+        "surface": 5.283,
+        "surface-subtle": 4.935,
+        "surface-raised": 5.283,
+        "fillLabel": 5.283
+      }
+    },
+    "dark": {
+      "blue": {
+        "background": 7.04,
+        "surface": 6.767,
+        "surface-subtle": 6.144,
+        "surface-raised": 5.8,
+        "fillLabel": 7.391
+      },
+      "purple": {
+        "background": 6.381,
+        "surface": 6.134,
+        "surface-subtle": 5.569,
+        "surface-raised": 5.257,
+        "fillLabel": 7.569
+      },
+      "green": {
+        "background": 8.06,
+        "surface": 7.748,
+        "surface-subtle": 7.034,
+        "surface-raised": 6.64,
+        "fillLabel": 9.29
+      }
+    }
+  }
+}

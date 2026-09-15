@@ -1,0 +1,8 @@
+==[build][START]== 2026-09-15T13:16:14Z
+==[build]== source: /Users/wangdi/Desktop/Project/DeepCode/DeepCode-dev-main
+==[build]== host=Darwin; requested stages: package-macos; clean-cache=0
+==[build][package-macos]== package product set on macOS host: DeepCode-GUI,DeepCode
+  967 /Users/wangdi/Desktop/Project/DeepCode/DeepCode-dev-main/bin/macos-arm64/DeepCode-GUI.app/Contents/MacOS/DeepCode-GUI
+==[macos-package][error]== DeepCode-GUI.app is still running from /Users/wangdi/Desktop/Project/DeepCode/DeepCode-dev-main/bin/macos-arm64. Re-run without --no-kill-running, or quit it before packaging.
+
+==[build][FAILED]== stopped at 2026-09-15T13:16:14Z; exit_code=1; elapsed=0s. See the error above.

@@ -1,0 +1,93 @@
+{
+  "session.sqlite3": {
+    "tables": {
+      "sessions": {
+        "before": 4,
+        "after": 4,
+        "originalRowsUnchanged": true,
+        "changes": []
+      },
+      "session_workspace_bindings": {
+        "before": 3,
+        "after": 3,
+        "originalRowsUnchanged": true,
+        "changes": []
+      },
+      "session_events": {
+        "before": 443,
+        "after": 465,
+        "originalRowsUnchanged": true,
+        "changes": []
+      },
+      "session_commands": {
+        "before": 8,
+        "after": 10,
+        "originalRowsUnchanged": true,
+        "changes": []
+      }
+    },
+    "userVersion": 7,
+    "integrity": "ok",
+    "indexesUnchanged": true
+  },
+  "lastResume": [
+    "session:c701be8e1278ab0125e22cbaf9e51732",
+    "session:c701be8e1278ab0125e22cbaf9e51732:run:mu2p67ms:2",
+    "{\"finalMessageId\":\"session:c701be8e1278ab0125e22cbaf9e51732:message:mu2p68wa:4\",\"outcome\":\"completed\"}"
+  ],
+  "catalog.sqlite3": {
+    "tables": {
+      "workspaces": {
+        "before": 3,
+        "after": 3,
+        "originalRowsUnchanged": true,
+        "changes": []
+      },
+      "projects": {
+        "before": 2,
+        "after": 2,
+        "originalRowsUnchanged": true,
+        "changes": []
+      },
+      "project_workspace_bindings": {
+        "before": 2,
+        "after": 2,
+        "originalRowsUnchanged": true,
+        "changes": []
+      },
+      "session_catalog": {
+        "before": 4,
+        "after": 4,
+        "originalRowsUnchanged": false,
+        "changes": [
+          {
+            "rowid": 1,
+            "changedFields": [
+              "updated_at"
+            ]
+          }
+        ]
+      }
+    },
+    "userVersion": 2,
+    "integrity": "ok"
+  },
+  "tool-record.sqlite3": {
+    "tables": {
+      "tool_records": {
+        "before": 77,
+        "after": 77,
+        "originalRowsUnchanged": true,
+        "changes": []
+      }
+    },
+    "userVersion": 1,
+    "integrity": "ok"
+  },
+  "backup": "/Users/wangdi/Desktop/Project/DeepCode/DeepCode-dev-main/bin/runtime-backups/session-storage-20260915-210303",
+  "settingsUnchanged": {
+    "config/user/local/settings/llm-profiles.json": true,
+    "config/user/local/secrets/llm-secrets.json": true
+  },
+  "archivedToolOutputsUnchanged": true
+}

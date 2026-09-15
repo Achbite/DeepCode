@@ -1,0 +1,19 @@
+{
+  "artifactId": "artifact:session:8b3edd2f1f6463d3f1b7d70ffff4ead7:attempt:mu2fnli0:m",
+  "callId": "session:8b3edd2f1f6463d3f1b7d70ffff4ead7:call:mu2fnlhz:k",
+  "contentMode": "fixed",
+  "contentType": "text/markdown",
+  "createdAt": "1789462307761",
+  "label": "report.md",
+  "logicalPath": "report.md",
+  "recordId": "record:ee746a0d4f804759f99ede9cfbc68f19",
+  "runId": "session:8b3edd2f1f6463d3f1b7d70ffff4ead7:run:mu2fmrl7:2",
+  "sessionId": "session:8b3edd2f1f6463d3f1b7d70ffff4ead7",
+  "uri": "artifact://artifact:session:8b3edd2f1f6463d3f1b7d70ffff4ead7:attempt:mu2fnli0:m",
+  "workspaceId": "workspace:7ab29ffc23d54e5346e9a3b8c843727d"
+}
+archived bytes: 47
+# 原生预览开发记录
+
+第一版已生成
+

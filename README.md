@@ -140,6 +140,33 @@ Use `bin/linux-arm64` instead for an ARM64 Linux build.
 
 Then open [http://127.0.0.1:31245/](http://127.0.0.1:31245/). On Windows, use `DeepCode.exe` or `DeepCode-GUI.exe`; Microsoft Edge WebView2 Evergreen Runtime is required.
 
+## Update the UI independently
+
+Build both frontends while retaining the installed Kernel, Session runtime and native applications:
+
+```bash
+make ui
+python3 scripts/update-ui.py --package bin/macos-arm64
+# Build and update in one command:
+make ui-update UI_PACKAGE=bin/macos-arm64
+```
+
+`make ui` runs dependency setup, frontend type checking and Vite builds in Docker. It emits `bin/ui/web` and `bin/ui/web-deepcode-gui` without compiling Rust or the Session runtime. The updater replaces only Web resource directories in an existing package. Use `bin/win64` or the appropriate Linux directory for those platforms, a single `.app`, or `--surface gui` / `--surface editor`. Windows development builds continue through WSL / Docker; the updater uses only Python's standard library.
+
+Run macOS updates on the host so the updater can refresh and verify each App's resource signature. Then choose **Reload interface** in Settings → Appearance / Common settings → Runtime information, or reopen the window. Save edits and unsent input first. User configuration, session history and the original package `build-info.json` remain intact. Each frontend has its own `frontend-build-info.json` with source and build time; these identities do not impose a version-equality gate with the Kernel.
+
+This path covers UI changes using existing Host / Session interfaces. New backend interfaces or executors still require the corresponding service build. The document tools and resource API introduced here require an initial full version containing those services.
+
+UI plugins also support live replacement in the open window. Add a local plugin folder in **Settings → Plugins → UI plugins**; saved entry changes update only its presentation. The first slots cover committed message text, document previews and themes. See the [plugin API and example](docs/product/ui-plugins.md). No Session, Provider or tool ports are exposed.
+
+## Document composition and preview
+
+The built-in [deepcode-documents Skill](skills/deepcode-documents/SKILL.md) is read on demand when a user requests polished layouts or document exports. It includes design guidance inspired by Kami, a reusable HTML template and format instructions. Ordinary replies do not automatically create files. For example: “Format this analysis as a concise report and save HTML, PDF and Markdown versions in the workspace.”
+
+`document.render` uses existing workspace write permissions and Plan scope, publishing a Session artifact only after the file is written. HTML and Markdown need no additional generation runtime. PDF uses WeasyPrint with self-contained HTML. Set the Python interpreter in **Settings → Plugins → Document composition** after installing [WeasyPrint's platform prerequisites](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html) and the [Python requirements](skills/deepcode-documents/scripts/requirements.txt). The development container includes this environment. Native installations need the corresponding runtime; configuration errors remain visible and do not overwrite an existing document.
+
+GUI and Editor artifacts and workspace links open a shared preview: static HTML with source view, local PDF.js with page navigation, zoom, text selection and download, and the existing Markdown renderer. PDF reading needs no Python or online viewer. Generated HTML embeds its images, SVG and styles; PDF generation does not run JavaScript. Ordinary text retains its paged reader.
+
 ## Execution, settings and extensions
 
 Native Windows defaults to automatic shell selection: PowerShell 7 is preferred, with Windows PowerShell 5.1 used when PowerShell 7 is absent. Git Bash is optional; WSL is an explicit project execution environment. The selected shell, platform and detected development commands form stable Session context, refreshed at an environment boundary rather than every model turn. Shell selection and workspace sandbox availability are separate capabilities.

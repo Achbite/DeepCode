@@ -1,0 +1,23 @@
+   Compiling deepcode-kernel-runtime v0.5.60 (/workspace/crates/deepcode-kernel-runtime)
+   Compiling deepcode-kernel-daemon v0.5.60 (/workspace/crates/deepcode-kernel-daemon)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.60s
+     Running unittests src/main.rs (target/debug/deps/deepcode_kernel_daemon-3e414ae8c75ffe3d)
+
+running 14 tests
+test local_agent_store::tests::explicit_plan_progress_persists_with_provider_order_and_tool_evidence ... ok
+test local_agent_store::tests::journal_event_extension_rolls_back_on_invalid_stored_content ... ok
+test local_agent_store::tests::journal_extends_event_storage_without_rewriting_history ... ok
+test local_agent_store::tests::journal_closes_unknown_tool_result_after_release_before_settlement ... ok
+test local_agent_store::tests::journal_persists_basic_provider_turn_and_usage_flow ... ok
+test local_agent_store::tests::journal_persists_session_input_rejection_without_a_kernel_call ... ok
+test local_agent_store::tests::journal_uses_required_fields_instead_of_a_version_gate ... ok
+test local_agent_store::tests::journal_writes_model_settings_and_input_rejection_to_sqlite ... ok
+test local_agent_store::tests::ordered_tool_call_identity_must_match_the_committed_provider_call_fact ... ok
+test local_agent_store::tests::provider_call_identity_is_required_and_distinct_from_logical_call_identity ... ok
+test local_agent_store::tests::queued_input_retains_its_payload_only_while_run_can_accept_it ... ok
+test local_agent_store::tests::rejected_commands_are_eventless_while_accepted_plan_responses_remain_atomic ... ok
+test local_agent_store::tests::runtime_snapshot_requires_tool_prompt_to_match_a_callable_prepared_binding ... ok
+test local_agent_store::tests::pending_provider_composition_is_closed_atomically_before_run_finishing ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 83 filtered out; finished in 0.20s
+

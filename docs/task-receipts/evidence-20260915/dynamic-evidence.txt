@@ -1,0 +1,4 @@
+run IDs: ['session:19fd9a629bdc795c5d8a551a8f3898fd:run:mu2f7xev:2']
+schema: 8
+events: [(5, 'run.started'), (26, 'run.tools.prepared'), (33, 'approval.requested'), (35, 'approval.resolved'), (43, 'run.runtime.released'), (44, 'run.settled')]
+request bindings: [(6, 'kernel-catalog:sha256:1d92a65ad1a4d263c900e50ed92adf41fa21022c84b31bcd04aa19e065b8e202', []), (16, 'kernel-catalog:sha256:1d92a65ad1a4d263c900e50ed92adf41fa21022c84b31bcd04aa19e065b8e202', []), (29, 'kernel-catalog:sha256:d920b0bafd4fc657933129f8a1d6c4cb5241a062a63b69c16d31dc8920dae68a', ['mcp.echo-example.echo']), (38, 'kernel-catalog:sha256:d920b0bafd4fc657933129f8a1d6c4cb5241a062a63b69c16d31dc8920dae68a', ['mcp.echo-example.echo'])]

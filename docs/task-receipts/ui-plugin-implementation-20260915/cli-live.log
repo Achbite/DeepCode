@@ -1,0 +1,16 @@
+兩项调用均已完成，结果如下。
+
+**PDF 原文（cli-check.pdf 第 1 页，共 1 页）**
+
+```
+--- page 1 ---
+
+DeepCode CLI plugin verification.
+```
+
+**github.search 查询结果（query: repo:deepseek-ai/DeepSeek-V3，kind: repositories，limit: 1）**
+
+- 仓库名称：deepseek-ai/DeepSeek-V3
+- 网址：https://github.com/deepseek-ai/DeepSeek-V3
+
+未修改任何文件，也未调用其他工具。

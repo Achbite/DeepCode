@@ -1,0 +1,127 @@
+[
+  {
+    "recordId": "record:a51bea46e8b65694b0fcf65001c2f0fa",
+    "toolName": "browser.service",
+    "outcome": "completed",
+    "output": {
+      "args": [
+        "-m",
+        "http.server",
+        "32185",
+        "--bind",
+        "127.0.0.1"
+      ],
+      "command": "/usr/bin/python3",
+      "directory": "/private/tmp/deepcode-ah-gui-20260915/workspace",
+      "logPath": "/Users/wangdi/Library/Application Support/com.achbite.deepcode.gui/development-services/dcinstance_c8ed7b536515e5e0568ff33520cf79cbee1a1cc3d2a57ad4c99dc27c6c0b1ce6/development-5.log",
+      "owner": "host",
+      "pid": 61626,
+      "serviceId": "development-5",
+      "sessionId": "session:eb263eaa0e2af08fa2139336f3e9ec55",
+      "status": "started",
+      "url": "http://127.0.0.1:32185/"
+    }
+  },
+  {
+    "recordId": "record:2e55a02a3181a1409a05254ee2c43699",
+    "toolName": "browser.page",
+    "outcome": "completed",
+    "output": {
+      "hostInstanceId": "dcinstance_c8ed7b536515e5e0568ff33520cf79cbee1a1cc3d2a57ad4c99dc27c6c0b1ce6",
+      "kind": "page",
+      "openedBy": "tool",
+      "previewId": "preview-6",
+      "serviceId": "development-5",
+      "serviceOwner": "host",
+      "sessionId": "session:eb263eaa0e2af08fa2139336f3e9ec55",
+      "status": "loading",
+      "url": "http://127.0.0.1:32185/",
+      "visible": false,
+      "windowLabel": "main"
+    }
+  },
+  {
+    "recordId": "record:a134653b0a14ca3363864685044e075e",
+    "toolName": "browser.service",
+    "outcome": "completed",
+    "output": {
+      "args": [
+        "-m",
+        "http.server",
+        "32185",
+        "--bind",
+        "127.0.0.1"
+      ],
+      "command": "/usr/bin/python3",
+      "directory": "/private/tmp/deepcode-ah-gui-20260915/workspace",
+      "logPath": "/Users/wangdi/Library/Application Support/com.achbite.deepcode.gui/development-services/dcinstance_c8ed7b536515e5e0568ff33520cf79cbee1a1cc3d2a57ad4c99dc27c6c0b1ce6/development-5.log",
+      "owner": "host",
+      "pid": 61626,
+      "serviceId": "development-5",
+      "sessionId": "session:eb263eaa0e2af08fa2139336f3e9ec55",
+      "status": "started",
+      "url": "http://127.0.0.1:32185/"
+    }
+  },
+  {
+    "recordId": "record:242a82c82fd9eb64b55e04d5c36995b9",
+    "toolName": "browser.page",
+    "outcome": "completed",
+    "output": {
+      "page": {
+        "hostInstanceId": "dcinstance_c8ed7b536515e5e0568ff33520cf79cbee1a1cc3d2a57ad4c99dc27c6c0b1ce6",
+        "kind": "page",
+        "openedBy": "tool",
+        "previewId": "preview-6",
+        "serviceId": "development-5",
+        "serviceOwner": "host",
+        "sessionId": "session:eb263eaa0e2af08fa2139336f3e9ec55",
+        "status": "ready",
+        "url": "http://127.0.0.1:32185/",
+        "visible": true,
+        "windowLabel": "main"
+      },
+      "result": {
+        "readyState": "complete",
+        "text": "DEEPCODE · NATIVE PREVIEW\n\n原生页面与相对资源\n\n审阅备注\n更新页面\n第一版页面",
+        "title": "DeepCode 原生预览",
+        "url": "http://127.0.0.1:32185/"
+      }
+    }
+  },
+  {
+    "recordId": "record:171ba803a1e3899b51a6f03838f09b4c",
+    "toolName": "browser.page",
+    "outcome": "completed",
+    "output": {
+      "previewId": "preview-6",
+      "status": "closed"
+    }
+  },
+  {
+    "recordId": "record:e9d3b7630afe75842c9651c2883944d0",
+    "toolName": "browser.service",
+    "outcome": "completed",
+    "output": {
+      "owner": "host",
+      "serviceId": "development-5",
+      "status": "stopped"
+    }
+  },
+  {
+    "recordId": "record:69b1080102137ec116ee29c82dbbd52d",
+    "toolName": "browser.service",
+    "outcome": "completed",
+    "output": {
+      "services": []
+    }
+  },
+  {
+    "recordId": "record:78b2938d965745f7bb63090dbad16f8b",
+    "toolName": "browser.page",
+    "outcome": "completed",
+    "output": {
+      "pages": []
+    }
+  }
+]

@@ -1,0 +1,165 @@
+Window: "DeepCode-GUI", App: DeepCode-GUI.
+0 standard window DeepCode-GUI, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: DeepCode-GUI, URL: deepcode-gui://localhost/index.html
+			3 container
+				4 text 总缓存命中 97.7% API 已连接 Agent 就绪
+			5 container
+				6 text DC DeepCode-GUI
+				7 button 新对话
+				8 text 项目
+				9 pop up button 新建项目
+				10 button (expanded) DeepCode, Secondary Actions: Collapse
+				11 button 在项目中新建对话
+				12 button 项目操作
+				13 button 根据当前DeepCode的前端制作一个预览我要检查批注
+				14 button 对话操作
+				15 button 分析一下你自己的源代码
+				16 button 对话操作
+				17 button (expanded) Test, Secondary Actions: Collapse
+				18 button 在项目中新建对话
+				19 button 项目操作
+				20 button 检查当前的项目环境
+				21 button 对话操作
+				22 text 对话
+				23 button 新对话
+				24 button 这是本次基础运行验证。请分别调用已选的 pdf.read 读取附件第 1 页，以及 github
+				25 button 对话操作
+				26 button 这是本次基础运行验证。请分别调用已选的 pdf.read 读取附件第 1 页，以及 github
+				27 button 对话操作
+				28 button 新对话
+				29 button 对话操作
+				30 button 请用 bash 工具在 workspace 作用域执行 pwd，仅报告实际工作目录。这是一次只读
+				31 button 对话操作
+				32 button help
+				33 button 对话操作
+				34 button DeepCode 设置
+			35 container
+				36 text 根据当前DeepCode的前端制作一个预览我要检查批注 DeepCode
+				37 container 已完成
+					38 text 已完成
+				39 toggle button 浏览器与预览, Value: on
+			40 container
+				41 container 对话导航
+					42 button 跳至消息 1: 根据当前DeepCode的前端制作一个预览我要检查批注
+					43 button 跳至消息 2: B 带编号批注的静态预览稿（你写批注，我核对）
+				44 button (collapsed) 查看执行过程, Secondary Actions: Expand
+				45 container 交付
+					46 text 批注预览稿已完成并在预览窗口打开。
+					47 heading 交付, Value: 2
+						48 text 交付
+					49 content list
+						50 container DeepCode/deepcode-frontend-annotated-preview-2026-09-15.html（76.4 KB，单文件、内联 CSS、无外部引用、无网络请求）
+							51 list marker •
+							52 text DeepCode/deepcode-frontend-annotated-preview-2026-09-15.html
+							53 text （76.4 KB，单文件、内联 CSS、无外部引用、无网络请求）
+						54 container DeepCode/deepcode-frontend-annotated-preview-2026-09-15.png（预览窗口截图留证，来自 preview-6）
+							55 list marker •
+							56 text DeepCode/deepcode-frontend-annotated-preview-2026-09-15.png
+							57 text （预览窗口截图留证，来自 
+							58 text preview-6
+							59 text ）
+					60 heading 稿子里有什么, Value: 2
+						61 text 稿子里有什么
+					62 button 放大表格
+					63 container 表格，可横向滚动
+						64 table
+							65 row (selectable) 区块
+内容
+							66 row (selectable)
+								67 cell (selectable) 预览 1
+								68 cell (selectable) 主界面（有对话内容）：标题栏、左栏 232px、会话区、右侧工作栏 276px，按真实三列网格复现
+							69 row (selectable)
+								70 cell (selectable) 预览 2
+								71 cell (selectable) 空态（新对话）
+							72 row (selectable)
+								73 cell (selectable) 预览 3 / 4
+								74 cell (selectable) 设置中心「界面」与「插件 → 界面插件」
+							75 row (selectable)
+								76 cell (selectable) 预览 5
+								77 cell (selectable) 阅读模式与文档预览（
+HTML
+/
+查看源码
+/
+下载文档
+工具条）
+							78 row (selectable)
+								79 cell (selectable) 预览 6
+								80 cell (selectable) 项目菜单、会话菜单、重命名与删除确认、工作目录对话框
+							81 row (selectable)
+								82 cell (selectable) 批注清单
+								83 cell (selectable) 21 条，每条含「现状与依据（源码文件，必要时到行）」+「需要你确认」
+							84 row (selectable)
+								85 cell (selectable) 附录
+								86 cell (selectable) 逐条抄录的浅色/深色 token 值；8 项本稿未还原的内容
+					87 container
+						88 text 配色与字号直接取  deepcodeDesignTokens.css  的 token 值，文案取 config/i18n/zh-CN.json ，没有自行调色或编造产品文案；会话标题、模型名、缓存命中率等示例数据已在页首和文末标注为示例。
+					89 heading 怎么核对, Value: 2
+						90 text 怎么核对
+					91 container
+						92 text 点预览里的橙红圆点会跳到并高亮对应清单行；点清单里的编号会滚回预览并点亮圆点。顶部可切浅色/深色、隐藏批注编号、开关「适应宽度」。回复时只写编号和结论即可，例如： 3 不需要拖拽；5 合并成一个分组；11 停止要二次确认 。
+					93 heading 已验证 / 未验证, Value: 2
+						94 text 已验证 / 未验证
+					95 content list
+						96 container 已验证：页面在预览窗口实际打开并完整渲染（标题、6 个预览区、21 条批注、token 与未还原项正文均可读出）；HTML 标签配平无错误；无外部资源引用；编号 1–21 的圆点与清单行一一对应。
+							97 list marker •
+							98 text 已验证：页面在预览窗口实际打开并完整渲染（标题、6 个预览区、21 条批注、token 与未还原项正文均可读出）；HTML 标签配平无错误；无外部资源引用；编号 1–21 的圆点与清单行一一对应。
+						99 container 未验证：像素级观感与标记位置没有经过图像层的比对（截图已留存，由你核对）；本稿不连接 Kernel / Host / Provider，不构成前端运行验收。
+							100 list marker •
+							101 text 未验证：像素级观感与标记位置没有经过图像层的比对（截图已留存，由你核对）；本稿不连接 Kernel / Host / Provider，不构成前端运行验收。
+					102 text 下一步等你按编号给批注，我再据此改前端或改稿。
+					103 container 消息操作
+						104 button 复制回答
+						105 toggle button 赞, Value: off
+						106 toggle button 踩, Value: off
+				107 button deepcode-frontend-annotated-preview-2026-09-15.html 2026/9/15 21:33:01
+				108 button deepcode-frontend-annotated-preview-2026-09-15.png deepcode-frontend-annotated-preview-2026-09-15.png 2026/9/15 21:34:32
+				109 button (expanded) 已修改 2 个文件 本轮修改 新增 1162 行，删除 0 行 另含 1 个二进制文件, Secondary Actions: Collapse
+				110 button deepcode-frontend-annotated-preview-2026-09-15.html 新增 1162 行，删除 0 行, Help: deepcode-frontend-annotated-preview-2026-09-15.html
+				111 button deepcode-frontend-annotated-preview-2026-09-15.png 二进制 · 新增, Help: deepcode-frontend-annotated-preview-2026-09-15.png
+				112 button 前往最新消息
+				113 text entry area (settable) 描述要完成的编码任务…
+					114 text 描述要完成的编码任务…
+				115 pop up button 添加
+				116 button (collapsed) 工作区读取/只读 Shell：允许 · 工作区修改：Plan 门禁 · Host Shell/外部：询问, Secondary Actions: Expand
+				117 button (collapsed) 19%, Help: 194,826 / 1,000,000 Token, Secondary Actions: Expand
+				118 pop up button 本对话使用的模型：DeepSeek Flash · 最高, Help: DeepSeek Flash · 最高
+				119 button (disabled) 发送, Help: 发送（Enter）
+				120 text Enter 发送 · Shift+Enter 换行
+				121 splitter 调整预览宽度, Value: 55
+				122 container 只读资源预览
+					123 container
+						124 tab group (selectable) 打开的预览
+							125 tab (selectable) deepcode-frontend-annotated-preview-2026-09-15.html
+							126 button 关闭 deepcode-frontend-annotated-preview-2026-09-15.html
+							127 tab (selected) preview.html
+							128 button 关闭 preview.html
+						129 button 打开预览
+						130 button 铺满工作区
+					131 container
+						132 text field (settable) 页面地址, Value: preview.html, Placeholder: https://…, Help: file:///Users/wangdi/Desktop/Project/DeepCode/DeepCode-dev-main/docs/task-receipts/ui-plugin-implementation-20260915/runtime-check/preview.html
+						133 button 打开
+						134 button 刷新页面
+	135 scroll area
+		136 HTML content Description: DeepCode 预览检查, URL: file:///Users/wangdi/Desktop/Project/DeepCode/DeepCode-dev-main/docs/task-receipts/ui-plugin-implementation-20260915/runtime-check/preview.html
+			137 heading DeepCode 预览检查, Value: 1
+				138 text DeepCode 预览检查
+			139 text 本文件用于核对本次原生页面的布局、输入与实例保留。
+			140 container
+				141 text 草稿 
+				142 text field (settable) 草稿, Placeholder: 输入后收起、展开预览
+			143 button 页面计数：0
+			144 text 并排、铺满工作区和收起再打开应保留此页计数。
+	145 close button
+	146 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	147 minimize button
+148 menu bar
+	149 DeepCode-GUI
+	150 File
+	151 Edit
+	152 View
+	153 Window
+	154 Help
+
+The focused UI element is 2 HTML content Description: DeepCode-GUI, URL: deepcode-gui://localhost/index.html

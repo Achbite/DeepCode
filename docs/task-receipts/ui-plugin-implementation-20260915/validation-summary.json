@@ -1,0 +1,9 @@
+{
+  "rustTestsPassed": 194,
+  "sessionTestsPassed": 62,
+  "guiTestsPassed": 67,
+  "guiFailures": 0,
+  "typecheck": "passed",
+  "diffCheck": "passed",
+  "scope": "Required stages were completed; GUI failures from obsolete fixtures were corrected and rerun separately. See TCR."
+}

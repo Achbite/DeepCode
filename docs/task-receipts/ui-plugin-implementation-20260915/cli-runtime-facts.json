@@ -1,0 +1,2121 @@
+{
+  "sessionId": "session:9eb8d5ee274b0de310b949af8c7f0e9e",
+  "events": [
+    {
+      "sequence": 1,
+      "type": "session.created",
+      "runId": null,
+      "callId": null,
+      "payload": {
+        "displayTitle": "新对话",
+        "profileId": "deepseek-v4-flash-openai",
+        "workspaceBindings": [
+          {
+            "displayName": "runtime-check",
+            "workspaceId": "workspace:c795a1a2688f2c0590f5c2010cbe00e6"
+          }
+        ]
+      }
+    },
+    {
+      "sequence": 2,
+      "type": "session.model-settings.updated",
+      "runId": null,
+      "callId": null,
+      "payload": {
+        "commandId": "command:58963:18d589d5cbf20f30:3",
+        "settings": {
+          "profileId": "deepseek-v4-flash-openai",
+          "reasoningEffortOverride": null
+        }
+      }
+    },
+    {
+      "sequence": 3,
+      "type": "input.accepted",
+      "runId": null,
+      "callId": null,
+      "payload": {
+        "commandId": "command:58963:18d589d5cbf20f30:3",
+        "messageId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:message:mu2uxt14:1",
+        "pluginSelections": [
+          {
+            "label": "PDF 阅读",
+            "selectionId": "plugin-selection:58963:18d589d5cbf20378:1",
+            "uri": "plugin://pdf@first-party"
+          },
+          {
+            "label": "GitHub",
+            "selectionId": "plugin-selection:58963:18d589d5cbf20760:2",
+            "uri": "plugin://github@first-party"
+          }
+        ],
+        "text": "这是本次基础运行验证。请分别调用已选的 pdf.read 读取附件第 1 页，以及 github.search 查询 repo:deepseek-ai/DeepSeek-V3，kind 为 repositories、limit 为 1。只报告 PDF 的原文和查询所得仓库名称、网址；不要修改文件，不要调用其他工具。"
+      }
+    },
+    {
+      "sequence": 4,
+      "type": "message.committed",
+      "runId": null,
+      "callId": null,
+      "payload": {
+        "content": "这是本次基础运行验证。请分别调用已选的 pdf.read 读取附件第 1 页，以及 github.search 查询 repo:deepseek-ai/DeepSeek-V3，kind 为 repositories、limit 为 1。只报告 PDF 的原文和查询所得仓库名称、网址；不要修改文件，不要调用其他工具。",
+        "filesystemReferences": [
+          {
+            "byteLength": 608,
+            "displayName": "cli-check.pdf",
+            "kind": "file",
+            "logicalPath": "cli-check.pdf",
+            "mediaType": "application/pdf",
+            "referenceId": "filesystem-reference:70ef9aa7de012f24d667f4f9414599be",
+            "workspaceId": "workspace:2e665763a9000e2134a39193548dffc6"
+          }
+        ],
+        "messageId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:message:mu2uxt14:1",
+        "pluginSelections": [
+          {
+            "label": "PDF 阅读",
+            "selectionId": "plugin-selection:58963:18d589d5cbf20378:1",
+            "uri": "plugin://pdf@first-party"
+          },
+          {
+            "label": "GitHub",
+            "selectionId": "plugin-selection:58963:18d589d5cbf20760:2",
+            "uri": "plugin://github@first-party"
+          }
+        ],
+        "role": "user"
+      }
+    },
+    {
+      "sequence": 5,
+      "type": "run.started",
+      "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+      "callId": null,
+      "payload": {
+        "inputMessageId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:message:mu2uxt14:1",
+        "runtimeSnapshot": {
+          "environment": {
+            "arch": "aarch64",
+            "configuration": {
+              "executionTarget": {
+                "kind": "native"
+              },
+              "gitBashPath": "",
+              "responseLanguage": "auto",
+              "revision": 0,
+              "windowsShell": "auto"
+            },
+            "developerCommands": [
+              "git",
+              "rg",
+              "node",
+              "npm",
+              "pnpm",
+              "python3",
+              "java",
+              "make",
+              "gcc",
+              "clang",
+              "docker"
+            ],
+            "executionTarget": {
+              "kind": "native"
+            },
+            "locale": "zh-Hans-CN",
+            "os": "macos",
+            "responseLanguage": "zh-Hans-CN",
+            "shell": {
+              "dialect": "bash",
+              "executable": "/bin/bash",
+              "tool": "bash"
+            },
+            "shellAvailable": true,
+            "userShell": "/bin/zsh",
+            "workspaceSandbox": {
+              "available": true,
+              "backend": "sandbox-exec",
+              "reason": null
+            },
+            "workspaceShellSupported": true
+          },
+          "extensionGenerationRef": "extension-generation:sha256:0209048989ea2bbe03439af82d20569f1b253ae668a75a8d469f52e0ebb0acdd",
+          "instructions": [
+            {
+              "id": "deepcode.coding-agent",
+              "text": "You are DeepCode, a coding agent. Follow the user's current request and applicable project instructions; stay within the authorized scope and available capabilities.\n\nFor substantial work, prefer a brief statement of the immediate next step before extended analysis. Inspect relevant evidence and act incrementally within the authorized scope. Share meaningful findings or changes of direction; related tool calls may continue without repeated narration. Re-read to resolve a concrete uncertainty or failure. Prefer targeted edits to repeated full-file reconstruction.\n\nPreserve failures and input rejections. Rejected input was not executed: correct the reported fields without repeating successful peer calls. Only successful tool results support completed Todo. Express expected nonzero shell outcomes explicitly; a failed overall command remains failed. When blocked, report completed work and blockers in the final answer, leaving unfinished Todo open. Never claim unperformed work as complete.\n\nUse the project's declared build and test entrypoints, including its required container workflow. Determine service availability with a permitted service check, not executable presence. If the required environment or authority is unavailable, request it or report the blocker; do not substitute another toolchain. Keep verbose logs in files and inspect the relevant result without repeating successful work.\n\nBe concise and use standard Markdown with clear file paths. Preserve technical terms, code and quotations in their original form. Use $...$ for inline LaTeX and $$...$$ for display math; show literal formula source only when requested. Avoid emojis unless requested or needed for meaning."
+            },
+            {
+              "id": "deepcode.session-environment",
+              "text": "Session environment:\n{\"os\":\"macos\",\"arch\":\"aarch64\",\"locale\":\"zh-Hans-CN\",\"userShell\":\"/bin/zsh\",\"executionTarget\":{\"kind\":\"native\"},\"shell\":{\"dialect\":\"bash\",\"executable\":\"/bin/bash\",\"tool\":\"bash\"},\"shellAvailable\":true,\"developerCommands\":[\"git\",\"rg\",\"node\",\"npm\",\"pnpm\",\"python3\",\"java\",\"make\",\"gcc\",\"clang\",\"docker\"],\"workspaceShellSupported\":true,\"workspaceSandbox\":{\"available\":true,\"backend\":\"sandbox-exec\",\"reason\":null}}\nUse zh-Hans-CN for all user-facing text, including progress updates, unless the user explicitly requests another language. Installed commands do not imply service readiness or permission."
+            },
+            {
+              "id": "deepcode.workspace-autonomy",
+              "text": "Before workspace mutation, call plan_publish and wait for confirmation. Then execute within its file and execution scope. Routine command or edit details do not require reconfirmation. Use interaction_request only for a required decision. Read-only workspace tools do not require a Plan.\nAsk the user before materially changing requirements, public contracts, fact ownership, or the engineering approach."
+            },
+            {
+              "id": "plugin.github.first-party",
+              "text": "The `GitHub` plugin is activated for this request by structured user input.\n\nAvailable capabilities:\nProvides source-native GitHub repository, code, and issue search plus repository contents reads.\n\nUse only the listed capabilities for this request. The plugin name is not itself a callable tool."
+            },
+            {
+              "id": "plugin.pdf.first-party",
+              "text": "The `PDF 阅读` plugin is activated for this request by structured user input.\n\nAvailable capabilities:\nReads bounded page ranges from PDF files attached through the current workspace binding.\n\nUse only the listed capabilities for this request. The plugin name is not itself a callable tool."
+            }
+          ],
+          "kernelCatalogSnapshotRef": "kernel-catalog:sha256:5ef6c196689cb8f94d96d484a7f5f3edd4faaef6e6462c0987d536ca1a623bdc",
+          "provider": {
+            "apiSurface": "responses",
+            "contextWindowTokens": 1000000,
+            "hostedWebSearch": "none",
+            "maxOutputTokens": 384000,
+            "profileId": "deepseek-v4-flash-openai",
+            "providerRuntimeRef": "provider-runtime:sha256:cfd6a949921301a81b0133c9bee0c8839a5af0a6387b030b3d0cfd0bd78a230b",
+            "reasoningEffort": "max",
+            "thinking": "enabled"
+          },
+          "providerToolAliases": [
+            {
+              "canonicalName": "bash",
+              "wireName": "bash"
+            },
+            {
+              "canonicalName": "doc.read",
+              "wireName": "doc_read"
+            },
+            {
+              "canonicalName": "document.render",
+              "wireName": "document_render"
+            },
+            {
+              "canonicalName": "fs.delete",
+              "wireName": "fs_delete"
+            },
+            {
+              "canonicalName": "fs.edit",
+              "wireName": "fs_edit"
+            },
+            {
+              "canonicalName": "fs.read",
+              "wireName": "fs_read"
+            },
+            {
+              "canonicalName": "fs.write",
+              "wireName": "fs_write"
+            },
+            {
+              "canonicalName": "github.read",
+              "wireName": "github_read"
+            },
+            {
+              "canonicalName": "github.search",
+              "wireName": "github_search"
+            },
+            {
+              "canonicalName": "interaction.request",
+              "wireName": "interaction_request"
+            },
+            {
+              "canonicalName": "pdf.read",
+              "wireName": "pdf_read"
+            },
+            {
+              "canonicalName": "plan.progress",
+              "wireName": "plan_progress"
+            },
+            {
+              "canonicalName": "plan.publish",
+              "wireName": "plan_publish"
+            },
+            {
+              "canonicalName": "session.read",
+              "wireName": "session_read"
+            },
+            {
+              "canonicalName": "skill.read",
+              "wireName": "skill_read"
+            },
+            {
+              "canonicalName": "web.fetch",
+              "wireName": "web_fetch"
+            },
+            {
+              "canonicalName": "web.search",
+              "wireName": "web_search"
+            }
+          ],
+          "runRuntimeSnapshotRef": "run-runtime:session:9eb8d5ee274b0de310b949af8c7f0e9e:session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+          "selectedPlugins": {
+            "catalogRevision": "plugin-catalog:sha256:3bdae208a580c71fec10357d2bb83b4878f464b813ec69dd696223107272cb69",
+            "plugins": [
+              {
+                "capabilityRefs": [
+                  "github:search",
+                  "github:contents-read"
+                ],
+                "extensionGenerationRef": "extension-generation:sha256:0209048989ea2bbe03439af82d20569f1b253ae668a75a8d469f52e0ebb0acdd",
+                "pluginArtifactRef": "plugin-artifact:sha256:ae8d39a9dd92147f10aab68a7d5a432b3de282c798063cf4cbfedf0bfac2af1f",
+                "pluginInstanceRef": "plugin-instance:cf2b70f78025f7b467309580ddb4a97d",
+                "uri": "plugin://github@first-party"
+              },
+              {
+                "capabilityRefs": [
+                  "pdf:paged-text-read"
+                ],
+                "extensionGenerationRef": "extension-generation:sha256:0209048989ea2bbe03439af82d20569f1b253ae668a75a8d469f52e0ebb0acdd",
+                "pluginArtifactRef": "plugin-artifact:sha256:b7211672c589ecfc786860751dc72f1af517c7d1d341f112cdb1f2d23fb8a097",
+                "pluginInstanceRef": "plugin-instance:eff0ab956d7ad570cb1233cd5ac92c6c",
+                "uri": "plugin://pdf@first-party"
+              }
+            ]
+          },
+          "toolPromptContributions": [
+            {
+              "canonicalToolName": "fs.read",
+              "contributionRef": "tool-prompt-contribution:core:fs.read",
+              "origin": "coreBuiltin",
+              "preparedToolBindingRef": "tool-binding:sha256:4c0611a370800fdf42f4efd32d8900421dc8914d189c321541174e138b213898",
+              "promptSnippet": "Read bounded UTF-8 text from a workspace file. Do not use for PDFs or binary files. The content field contains the selected source text, including whitespace. Check the returned truncation fields and line range before requesting more content.",
+              "usageGuidelines": [
+                "Use this to inspect the contents of a known workspace text file instead of shell commands such as cat or sed.",
+                "Use startLine and maxLines for a line range; startByte and maxBytes for byte bounds."
+              ]
+            },
+            {
+              "canonicalToolName": "bash",
+              "contributionRef": "tool-prompt-contribution:core:bash",
+              "origin": "coreBuiltin",
+              "preparedToolBindingRef": "tool-binding:sha256:e8347fc4be78fd152e7c6f315859203a79d75b95d38c70b0dc1ac6ee53fa26f0",
+              "promptSnippet": "Execute one bounded Bash command from the bound workspace. executionScope \"workspace\" uses the selected environment's workspace sandbox; \"host\" uses the host environment and requires external-effect authority. Check the execution environment snapshot for sandbox availability. Use workspaceMode \"write\" for mutations. terminal supplies optional one-call PTY input; otherwise stdin is closed. The result preserves the command's final exit status.",
+              "usageGuidelines": [
+                "Use this for discovery, search, builds and commands. 检查命令独立执行；需要追加报告时，先保存退出码、最后 exit 原退出码。预期文件不存在用条件分支；管道中需要保留的失败用 pipefail 传播。",
+                "Do not use this as the default way to read a known UTF-8 workspace text file.",
+                "Use the project's declared build/test scripts in their required environment. Finding docker or another executable does not establish service availability; use an actual permitted service check and report its error.",
+                "A Plan denial means this call was not executed. Stay within confirmed targets and executionScope; routine command details do not require reconfirmation. Revise the Plan only when the authorized scope must change.",
+                "Output is limited to the last 2000 lines or 50 KiB. When truncated, fullOutput contains Session-owned log paths; inspect bounded sections with a read-only Bash command instead of repeating the original command."
+              ]
+            },
+            {
+              "canonicalToolName": "web.search",
+              "contributionRef": "tool-prompt-contribution:core:web.search",
+              "origin": "coreBuiltin",
+              "preparedToolBindingRef": "tool-binding:sha256:a291a393ef18f14d4a90e044048e5346c090b6cf61eda2d0c15e59af7eea619b",
+              "promptSnippet": "Search the web by keyword and return sources.",
+              "usageGuidelines": [
+                "Cite returned sources and report search errors."
+              ]
+            },
+            {
+              "canonicalToolName": "web.fetch",
+              "contributionRef": "tool-prompt-contribution:core:web.fetch",
+              "origin": "coreBuiltin",
+              "preparedToolBindingRef": "tool-binding:sha256:83edfd13a415249bc042d4d1f527926be14b484dfeaf4f00ddc3a82905ae8f73",
+              "promptSnippet": "Read bounded text from a known HTTP or HTTPS URL.",
+              "usageGuidelines": [
+                "Read URLs supplied by the user or returned by search."
+              ]
+            },
+            {
+              "canonicalToolName": "github.read",
+              "contributionRef": "tool-prompt-contribution:first-party:github.read",
+              "origin": "extension",
+              "pluginUri": "plugin://github@first-party",
+              "preparedToolBindingRef": "tool-binding:sha256:3ae8d3edb30446950bd15f49b4e98346819ba0e045982dff137af60d5feefaa1",
+              "promptSnippet": "Read a repository directory or UTF-8 file through GitHub's native Contents API.",
+              "usageGuidelines": [
+                "Use the repository and path returned by GitHub search when source contents are needed."
+              ]
+            },
+            {
+              "canonicalToolName": "github.search",
+              "contributionRef": "tool-prompt-contribution:first-party:github.search",
+              "origin": "extension",
+              "pluginUri": "plugin://github@first-party",
+              "preparedToolBindingRef": "tool-binding:sha256:c977fe8d9106a00b2a30a89dbd742b4aefdeb50fd7c52a57cae3f297ef4dd0e2",
+              "promptSnippet": "Search GitHub repositories, code, and issues through GitHub's native API.",
+              "usageGuidelines": [
+                "Use this for GitHub-specific discovery instead of routing GitHub queries through the general web search tool.",
+                "Code search requires the GitHub token exposed to the selected plugin process."
+              ]
+            },
+            {
+              "canonicalToolName": "pdf.read",
+              "contributionRef": "tool-prompt-contribution:first-party:pdf.read",
+              "origin": "extension",
+              "pluginUri": "plugin://pdf@first-party",
+              "preparedToolBindingRef": "tool-binding:sha256:2d8183397a1a8df5a885ad2dca56363e8b62c1a8b38e03371e5f4ebf6fd7ba93",
+              "promptSnippet": "Read bounded page ranges from a PDF attached to the current workspace binding.",
+              "usageGuidelines": [
+                "Use the logical workspace handle and workspace-relative path shown in the message's filesystem references.",
+                "Read another bounded page range when the result reports remaining pages or truncated output."
+              ]
+            }
+          ],
+          "tools": [
+            {
+              "availability": "callable",
+              "description": "Execute one bounded Bash command from the bound workspace. executionScope \"workspace\" uses the selected environment's workspace sandbox; \"host\" uses the host environment and requires external-effect authority. Check the execution environment snapshot for sandbox availability. Use workspaceMode \"write\" for mutations. terminal supplies optional one-call PTY input; otherwise stdin is closed. The result preserves the command's final exit status.",
+              "inputSchema": {
+                "additionalProperties": false,
+                "properties": {
+                  "command": {
+                    "description": "Bash script with newlines; use cd for subdirectories and quoted heredocs for literal input. Each-step success: set -e and pipefail in the shell owning the pipeline (including outside docker): set -o pipefail; command 2>&1 | tail -60. For expected nonzero: if command; then rc=0; else rc=$?; fi; inspect rc explicitly.",
+                    "maxLength": 16384,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "executionScope": {
+                    "default": "workspace",
+                    "description": "Defaults to workspace, which requires a registered platform workspace sandbox and fails explicitly when unavailable. Explicit host uses the host user environment and requires external-effect authority.",
+                    "enum": [
+                      "workspace",
+                      "host"
+                    ],
+                    "type": "string"
+                  },
+                  "terminal": {
+                    "additionalProperties": false,
+                    "description": "Optional one-call PTY. When omitted, stdin is closed. No persistent terminal session is created.",
+                    "properties": {
+                      "stdin": {
+                        "description": "Exact bounded input written once to a temporary PTY. Include commands that terminate the interactive program and shell.",
+                        "maxLength": 65536,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "stdin"
+                    ],
+                    "type": "object"
+                  },
+                  "timeout": {
+                    "description": "Optional wall-clock timeout in seconds. Defaults to 120.",
+                    "maximum": 600,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "workspaceMode": {
+                    "default": "read",
+                    "description": "Defaults to read. In workspace scope, read denies workspace writes; write requires Plan mutation authority. Host scope has its separate external-effect authority.",
+                    "enum": [
+                      "read",
+                      "write"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "command"
+                ],
+                "type": "object"
+              },
+              "name": "bash",
+              "origin": "coreBuiltin",
+              "possibleEffects": [
+                "process",
+                "workspaceMutation",
+                "external"
+              ],
+              "toolBindingRef": "tool-binding:sha256:e8347fc4be78fd152e7c6f315859203a79d75b95d38c70b0dc1ac6ee53fa26f0"
+            },
+            {
+              "availability": "callable",
+              "description": "Read bundled DeepCode product documentation in English Markdown. Docs explain product behavior, configuration and known limitations; Skills describe task workflows. Available documents: operations.md, execution-environments.md, ui-plugins.md.",
+              "inputSchema": {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "enum": [
+                      "operations.md",
+                      "execution-environments.md",
+                      "ui-plugins.md"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "type": "object"
+              },
+              "name": "doc.read",
+              "origin": "coreBuiltin",
+              "possibleEffects": [
+                "localRead"
+              ],
+              "toolBindingRef": "tool-binding:sha256:a7bb6ff859bc9843b7a1c34cf99d367f41c765516f91472871c5250bc3efea33"
+            },
+            {
+              "availability": "callable",
+              "description": "Create a polished document artifact in the workspace. Write complete HTML or Markdown, or render self-contained HTML to PDF with WeasyPrint. Read deepcode-documents via skill.read for templates and typography when needed. Output is a workspace mutation; the existing Plan and permission policy applies. PDF requires a configured Python environment with WeasyPrint. Source limit: 1 MiB; PDF limit: 32 MiB.",
+              "inputSchema": {
+                "additionalProperties": false,
+                "properties": {
+                  "content": {
+                    "description": "Complete self-contained HTML for html/pdf, or Markdown source for markdown. Up to 1 MiB UTF-8.",
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "format": {
+                    "enum": [
+                      "html",
+                      "pdf",
+                      "markdown"
+                    ],
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "Workspace-relative output filename, ending in .html, .pdf or .md.",
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "format",
+                  "content"
+                ],
+                "type": "object"
+              },
+              "name": "document.render",
+              "origin": "coreBuiltin",
+              "possibleEffects": [
+                "workspaceMutation"
+              ],
+              "toolBindingRef": "tool-binding:sha256:b936cad3ac8b73accb11dcb6362818e25402a6cd47f80df0ba6c4debcf0db589"
+            },
+            {
+              "availability": "callable",
+              "description": "Delete one explicitly named workspace file or directory tree.",
+              "inputSchema": {
+                "additionalProperties": false,
+                "properties": {
+                  "path": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "targetKind": {
+                    "description": "Required exact deletion target kind.",
+                    "enum": [
+                      "file",
+                      "directoryTree"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "targetKind"
+                ],
+                "type": "object"
+              },
+              "name": "fs.delete",
+              "origin": "coreBuiltin",
+              "possibleEffects": [
+                "workspaceMutation"
+              ],
+              "toolBindingRef": "tool-binding:sha256:7a1c779e8ac78d0b0c98cf3fc0f3132fb5e118f6812f77566642d9f092316726"
+            },
+            {
+              "availability": "callable",
+              "description": "Apply exact, non-overlapping text replacements to one existing workspace file. Every oldText must match a unique region of the original file; later edits do not see earlier replacements. Keep oldText as small as possible while still unique, and do not include large unchanged regions. Combine disjoint changes to the same file in one call. All replacements are applied atomically.",
+              "inputSchema": {
+                "additionalProperties": false,
+                "properties": {
+                  "edits": {
+                    "description": "Non-overlapping replacements matched against the original file and applied atomically.",
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "newText": {
+                          "description": "Exact replacement, including any boundary newline that should remain. Empty text deletes the region. After editing shell syntax, bash -n each changed script before running it.",
+                          "type": "string"
+                        },
+                        "oldText": {
+                          "description": "Copy a small, exact, unique region from the original file. Preserve whitespace. Include only enough context to distinguish this occurrence; do not copy large unchanged regions.",
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "oldText",
+                        "newText"
+                      ],
+                      "type": "object"
+                    },
+                    "maxItems": 128,
+                    "minItems": 1,
+                    "type": "array"
+                  },
+                  "path": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "edits"
+                ],
+                "type": "object"
+              },
+              "name": "fs.edit",
+              "origin": "coreBuiltin",
+              "possibleEffects": [
+                "workspaceMutation"
+              ],
+              "toolBindingRef": "tool-binding:sha256:c608b0e9a112b0a77f2bc102ef7aec241860d5676807ba98d0b5f6ee894e285b"
+            },
+            {
+              "availability": "callable",
+              "description": "Read bounded UTF-8 text from a workspace file. Do not use for PDFs or binary files. The content field contains the selected source text, including whitespace. Check the returned truncation fields and line range before requesting more content.",
+              "inputSchema": {
+                "additionalProperties": false,
+                "properties": {
+                  "maxBytes": {
+                    "description": "Maximum UTF-8 output bytes. Defaults to 262144.",
+                    "maximum": 1048576,
+                    "minimum": 1024,
+                    "type": "integer"
+                  },
+                  "maxLines": {
+                    "description": "Maximum number of lines to return. Defaults to 2000.",
+                    "maximum": 5000,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "path": {
+                    "description": "Workspace-relative UTF-8 text file path.",
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "startByte": {
+                    "description": "Resume at nextByte from the previous read, including within long lines. Takes precedence over startLine.",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "startLine": {
+                    "description": "First one-based line to return. Defaults to 1.",
+                    "maximum": 4294967295,
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ],
+                "type": "object"
+              },
+              "name": "fs.read",
+              "origin": "coreBuiltin",
+              "possibleEffects": [
+                "workspaceRead"
+              ],
+              "toolBindingRef": "tool-binding:sha256:4c0611a370800fdf42f4efd32d8900421dc8914d189c321541174e138b213898"
+            },
+            {
+              "availability": "callable",
+              "description": "Create or replace one workspace file and any missing parent directories.",
+              "inputSchema": {
+                "additionalProperties": false,
+                "properties": {
+                  "content": {
+                    "type": "string"
+                  },
+                  "executable": {
+                    "description": "Optional executable state. New files default to false; existing files preserve their mode when omitted.",
+                    "type": "boolean"
+                  },
+                  "path": {
+                    "description": "Workspace-relative file path. Missing parent directories are created automatically.",
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "content"
+                ],
+                "type": "object"
+              },
+              "name": "fs.write",
+              "origin": "coreBuiltin",
+              "possibleEffects": [
+                "workspaceMutation"
+              ],
+              "toolBindingRef": "tool-binding:sha256:8bf6526c3cf02e6499c12daff03c58e10ad53e6ad36448a618bb991c7db111fe"
+            },
+            {
+              "availability": "callable",
+              "description": "Read a GitHub repository directory listing or UTF-8 file through the Contents API.",
+              "inputSchema": {
+                "additionalProperties": false,
+                "properties": {
+                  "maxBytes": {
+                    "default": 262144,
+                    "maximum": 262144,
+                    "minimum": 1024,
+                    "type": "integer"
+                  },
+                  "path": {
+                    "default": ".",
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "ref": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "repository": {
+                    "description": "Repository in owner/name form.",
+                    "minLength": 3,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "repository"
+                ],
+                "type": "object"
+              },
+              "name": "github.read",
+              "origin": "extension",
+              "pluginUri": "plugin://github@first-party",
+              "possibleEffects": [
+                "network"
+              ],
+              "toolBindingRef": "tool-binding:sha256:3ae8d3edb30446950bd15f49b4e98346819ba0e045982dff137af60d5feefaa1"
+            },
+            {
+              "availability": "callable",
+              "description": "Search GitHub repositories, code, or issues with GitHub's native Search API.",
+              "inputSchema": {
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "default": "repositories",
+                    "enum": [
+                      "repositories",
+                      "code",
+                      "issues"
+                    ],
+                    "type": "string"
+                  },
+                  "limit": {
+                    "default": 10,
+                    "maximum": 30,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "page": {
+                    "default": 1,
+                    "maximum": 100,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "query": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "query"
+                ],
+                "type": "object"
+              },
+              "name": "github.search",
+              "origin": "extension",
+              "pluginUri": "plugin://github@first-party",
+              "possibleEffects": [
+                "network"
+              ],
+              "toolBindingRef": "tool-binding:sha256:c977fe8d9106a00b2a30a89dbd742b4aefdeb50fd7c52a57cae3f297ef4dd0e2"
+            },
+            {
+              "availability": "callable",
+              "description": "Extract text from a bounded page range of a PDF in the current workspace binding.",
+              "inputSchema": {
+                "additionalProperties": false,
+                "properties": {
+                  "endPage": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "path": {
+                    "description": "Workspace-relative path from an attached filesystem reference.",
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "startPage": {
+                    "default": 1,
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "path"
+                ],
+                "type": "object"
+              },
+              "name": "pdf.read",
+              "origin": "extension",
+              "pluginUri": "plugin://pdf@first-party",
+              "possibleEffects": [
+                "workspaceRead"
+              ],
+              "toolBindingRef": "tool-binding:sha256:2d8183397a1a8df5a885ad2dca56363e8b62c1a8b38e03371e5f4ebf6fd7ba93"
+            },
+            {
+              "availability": "blocked",
+              "description": "Execute a bounded PowerShell script in the selected native Windows environment. Use PowerShell syntax. Each call starts a fresh noninteractive process with no user profile and UTF-8 output. Scope and Plan authority are the same as other process tools. Check $LASTEXITCODE for native programs and use exit to preserve a failed command status.",
+              "inputSchema": {
+                "additionalProperties": false,
+                "properties": {
+                  "command": {
+                    "description": "PowerShell script with newlines. Use literal single-quoted strings or here-strings. Native programs expose $LASTEXITCODE; preserve it explicitly when later commands print diagnostics. PowerShell 5.1 does not support && or ||.",
+                    "maxLength": 16384,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "executionScope": {
+                    "default": "workspace",
+                    "description": "Defaults to workspace, which requires a registered platform workspace sandbox and fails explicitly when unavailable. Explicit host uses the host user environment and requires external-effect authority.",
+                    "enum": [
+                      "workspace",
+                      "host"
+                    ],
+                    "type": "string"
+                  },
+                  "terminal": {
+                    "additionalProperties": false,
+                    "description": "Optional one-call PTY. When omitted, stdin is closed. No persistent terminal session is created.",
+                    "properties": {
+                      "stdin": {
+                        "description": "Exact bounded input written once to a temporary PTY. Include commands that terminate the interactive program and shell.",
+                        "maxLength": 65536,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "stdin"
+                    ],
+                    "type": "object"
+                  },
+                  "timeout": {
+                    "description": "Optional wall-clock timeout in seconds. Defaults to 120.",
+                    "maximum": 600,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "workspaceMode": {
+                    "default": "read",
+                    "description": "Defaults to read. In workspace scope, read denies workspace writes; write requires Plan mutation authority. Host scope has its separate external-effect authority.",
+                    "enum": [
+                      "read",
+                      "write"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "command"
+                ],
+                "type": "object"
+              },
+              "name": "powershell",
+              "origin": "coreBuiltin",
+              "possibleEffects": [
+                "process",
+                "workspaceMutation",
+                "external"
+              ],
+              "toolBindingRef": "tool-binding:sha256:3b7abfde1764af27d86615362ab8c69f154cd068200cf3591b607212915afd01"
+            },
+            {
+              "availability": "callable",
+              "description": "Read persisted DeepCode conversation facts without resuming the session. Query directly; no prior Skill read is required. Start with summary; use messages, tools, plans or context for details. before is an exclusive event-sequence cursor; nextBefore continues older items. Excerpts report truncation. A session ID is required.",
+              "inputSchema": {
+                "additionalProperties": false,
+                "properties": {
+                  "before": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "limit": {
+                    "maximum": 50,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "offset": {
+                    "description": "Character offset for a bounded reasoning page.",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "providerRequestId": {
+                    "description": "Exact Provider request ID; requires view=context or reasoning.",
+                    "type": "string"
+                  },
+                  "recordId": {
+                    "description": "Exact ToolRecord ID; requires view=tools.",
+                    "type": "string"
+                  },
+                  "sessionId": {
+                    "description": "Exact complete ID from the user or DeepCode. Preserve it verbatim, including prefixes such as session:.",
+                    "type": "string"
+                  },
+                  "view": {
+                    "enum": [
+                      "summary",
+                      "messages",
+                      "tools",
+                      "plans",
+                      "context",
+                      "reasoning"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "sessionId"
+                ],
+                "type": "object"
+              },
+              "name": "session.read",
+              "origin": "coreBuiltin",
+              "possibleEffects": [
+                "localRead"
+              ],
+              "toolBindingRef": "tool-binding:sha256:61c87a61691bd0bd030a871438b68baa879c43493189ee75725c413a5d990695"
+            },
+            {
+              "availability": "callable",
+              "description": "Read a DeepCode product Skill or its reference when guidance is needed. Read only content relevant to the current question. Available: deepcode-session — Read DeepCode conversations and investigate incomplete steps or failures when the user supplies a session ID or asks to continue existing work.; deepcode-product — Explain DeepCode tools, Plans, execution environments, settings and plugins; diagnose Windows shell, missing developer tools and product issues using the recorded facts.; deepcode-documents — Beautify and typeset documents for HTML, PDF or Markdown delivery when the user asks for a polished report, brief, guide, resume or other formatted document.. Omit path to read SKILL.md.",
+              "inputSchema": {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "enum": [
+                      "deepcode-session",
+                      "deepcode-product",
+                      "deepcode-documents"
+                    ],
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "SKILL.md or a reference path linked by that Skill.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "type": "object"
+              },
+              "name": "skill.read",
+              "origin": "coreBuiltin",
+              "possibleEffects": [
+                "localRead"
+              ],
+              "toolBindingRef": "tool-binding:sha256:73b2834b12e752a53779d9b70597b1bdd323c0cb27f7a0812712e4b8243fd020"
+            },
+            {
+              "availability": "callable",
+              "description": "Read bounded text from a known HTTP or HTTPS URL.",
+              "inputSchema": {
+                "additionalProperties": false,
+                "properties": {
+                  "maxBytes": {
+                    "description": "Maximum response body bytes. Defaults to 98304.",
+                    "maximum": 262144,
+                    "minimum": 1024,
+                    "type": "integer"
+                  },
+                  "url": {
+                    "description": "HTTP or HTTPS URL without user-info.",
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "url"
+                ],
+                "type": "object"
+              },
+              "name": "web.fetch",
+              "origin": "coreBuiltin",
+              "possibleEffects": [
+                "network"
+              ],
+              "toolBindingRef": "tool-binding:sha256:83edfd13a415249bc042d4d1f527926be14b484dfeaf4f00ddc3a82905ae8f73"
+            },
+            {
+              "availability": "callable",
+              "description": "Search the web by keyword and return sources.",
+              "inputSchema": {
+                "additionalProperties": false,
+                "properties": {
+                  "limit": {
+                    "description": "Maximum result count. Defaults to 5.",
+                    "maximum": 10,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "query": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "query"
+                ],
+                "type": "object"
+              },
+              "name": "web.search",
+              "origin": "coreBuiltin",
+              "possibleEffects": [
+                "network"
+              ],
+              "toolBindingRef": "tool-binding:sha256:a291a393ef18f14d4a90e044048e5346c090b6cf61eda2d0c15e59af7eea619b"
+            }
+          ],
+          "webSearch": {
+            "owner": "kernelAdapter",
+            "toolName": "web.search"
+          }
+        },
+        "workspaceBindings": [
+          {
+            "displayName": "runtime-check",
+            "workspaceId": "workspace:c795a1a2688f2c0590f5c2010cbe00e6"
+          },
+          {
+            "displayName": "cli-check.pdf",
+            "workspaceId": "workspace:2e665763a9000e2134a39193548dffc6"
+          }
+        ]
+      }
+    },
+    {
+      "sequence": 6,
+      "type": "context.composed",
+      "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+      "callId": null,
+      "payload": {
+        "baseToolSchemaHash": "context-hash-v1:68d580dd2bf3f6e5",
+        "dynamicInstructionBytes": 5467,
+        "kernelCatalogSnapshotRef": "kernel-catalog:sha256:5ef6c196689cb8f94d96d484a7f5f3edd4faaef6e6462c0987d536ca1a623bdc",
+        "messages": [
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "instruction:deepcode.coding-agent",
+            "contributionKind": "instructions",
+            "filesystemReferences": [],
+            "label": "deepcode.coding-agent",
+            "messageIndex": 0,
+            "role": "system"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "instruction:deepcode.tool-guidance",
+            "contributionKind": "instructions",
+            "filesystemReferences": [],
+            "label": "deepcode.tool-guidance",
+            "messageIndex": 1,
+            "role": "system"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "instruction:deepcode.session-environment",
+            "contributionKind": "instructions",
+            "filesystemReferences": [],
+            "label": "deepcode.session-environment",
+            "messageIndex": 2,
+            "role": "system"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "instruction:deepcode.workspace-autonomy",
+            "contributionKind": "instructions",
+            "filesystemReferences": [],
+            "label": "deepcode.workspace-autonomy",
+            "messageIndex": 3,
+            "role": "system"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "instruction:plugin.github.first-party",
+            "contributionKind": "instructions",
+            "filesystemReferences": [],
+            "label": "plugin.github.first-party",
+            "messageIndex": 4,
+            "role": "system"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "instruction:plugin.pdf.first-party",
+            "contributionKind": "instructions",
+            "filesystemReferences": [],
+            "label": "plugin.pdf.first-party",
+            "messageIndex": 5,
+            "role": "system"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "session:controls",
+            "contributionKind": "sessionControls",
+            "filesystemReferences": [],
+            "label": "Session control contract",
+            "messageIndex": 6,
+            "role": "system"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "session:workspace-bindings",
+            "contributionKind": "workspaceBindings",
+            "filesystemReferences": [],
+            "label": "当前运行的目录索引",
+            "messageIndex": 7,
+            "role": "system"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "message:session:9eb8d5ee274b0de310b949af8c7f0e9e:message:mu2uxt14:1",
+            "contributionKind": "journalMessages",
+            "filesystemReferences": [
+              {
+                "itemId": "filesystem-reference:70ef9aa7de012f24d667f4f9414599be",
+                "label": "cli-check.pdf"
+              }
+            ],
+            "label": "用户消息",
+            "messageIndex": 8,
+            "role": "user"
+          }
+        ],
+        "partitions": [
+          {
+            "itemCount": 6,
+            "kind": "instructions",
+            "requestShapeUnits": 6648
+          },
+          {
+            "itemCount": 4,
+            "kind": "sessionControls",
+            "requestShapeUnits": 6777
+          },
+          {
+            "itemCount": 14,
+            "kind": "tools",
+            "requestShapeUnits": 11872
+          },
+          {
+            "itemCount": 2,
+            "kind": "workspaceBindings",
+            "requestShapeUnits": 211
+          },
+          {
+            "itemCount": 0,
+            "kind": "contextProviders",
+            "requestShapeUnits": 0
+          },
+          {
+            "itemCount": 1,
+            "kind": "journalMessages",
+            "requestShapeUnits": 548
+          },
+          {
+            "itemCount": 1,
+            "kind": "filesystemReferences",
+            "requestShapeUnits": 103
+          }
+        ],
+        "providerRequestId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:provider-request:mu2uxt1s:3",
+        "purpose": "agent",
+        "responseConstraint": "normal",
+        "selectedPluginSnapshotHash": "context-hash-v1:835e5f924e17c555",
+        "stableCoreHash": "context-hash-v1:e3339b029cb3f006",
+        "tools": [
+          {
+            "availability": "callable",
+            "canonicalName": "fs.read",
+            "itemId": "fs.read",
+            "label": "fs_read",
+            "origin": "coreBuiltin",
+            "wireName": "fs_read"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "fs.write",
+            "itemId": "fs.write",
+            "label": "fs_write",
+            "origin": "coreBuiltin",
+            "wireName": "fs_write"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "fs.edit",
+            "itemId": "fs.edit",
+            "label": "fs_edit",
+            "origin": "coreBuiltin",
+            "wireName": "fs_edit"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "fs.delete",
+            "itemId": "fs.delete",
+            "label": "fs_delete",
+            "origin": "coreBuiltin",
+            "wireName": "fs_delete"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "bash",
+            "itemId": "bash",
+            "label": "bash",
+            "origin": "coreBuiltin",
+            "wireName": "bash"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "web.search",
+            "itemId": "web.search",
+            "label": "web_search",
+            "origin": "coreBuiltin",
+            "wireName": "web_search"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "web.fetch",
+            "itemId": "web.fetch",
+            "label": "web_fetch",
+            "origin": "coreBuiltin",
+            "wireName": "web_fetch"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "session.read",
+            "itemId": "session.read",
+            "label": "session_read",
+            "origin": "coreBuiltin",
+            "wireName": "session_read"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "skill.read",
+            "itemId": "skill.read",
+            "label": "skill_read",
+            "origin": "coreBuiltin",
+            "wireName": "skill_read"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "doc.read",
+            "itemId": "doc.read",
+            "label": "doc_read",
+            "origin": "coreBuiltin",
+            "wireName": "doc_read"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "document.render",
+            "itemId": "document.render",
+            "label": "document_render",
+            "origin": "coreBuiltin",
+            "wireName": "document_render"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "interaction.request",
+            "itemId": "interaction.request",
+            "label": "interaction_request",
+            "origin": "sessionControl",
+            "wireName": "interaction_request"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "plan.progress",
+            "itemId": "plan.progress",
+            "label": "plan_progress",
+            "origin": "sessionControl",
+            "wireName": "plan_progress"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "plan.publish",
+            "itemId": "plan.publish",
+            "label": "plan_publish",
+            "origin": "sessionControl",
+            "wireName": "plan_publish"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "github.read",
+            "itemId": "github.read",
+            "label": "github_read",
+            "origin": "extension",
+            "pluginUri": "plugin://github@first-party",
+            "wireName": "github_read"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "github.search",
+            "itemId": "github.search",
+            "label": "github_search",
+            "origin": "extension",
+            "pluginUri": "plugin://github@first-party",
+            "wireName": "github_search"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "pdf.read",
+            "itemId": "pdf.read",
+            "label": "pdf_read",
+            "origin": "extension",
+            "pluginUri": "plugin://pdf@first-party",
+            "wireName": "pdf_read"
+          }
+        ],
+        "workspaceBindings": [
+          {
+            "itemId": "workspace:c795a1a2688f2c0590f5c2010cbe00e6",
+            "label": "runtime-check"
+          },
+          {
+            "itemId": "workspace:2e665763a9000e2134a39193548dffc6",
+            "label": "cli-check.pdf"
+          }
+        ]
+      }
+    },
+    {
+      "sequence": 7,
+      "type": "tool.requested",
+      "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+      "callId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:4",
+      "payload": {
+        "attemptId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:attempt:mu2uxugv:6",
+        "input": {
+          "endPage": 1,
+          "path": "cli-check.pdf",
+          "startPage": 1,
+          "workspaceId": "workspace:2e665763a9000e2134a39193548dffc6"
+        },
+        "providerCallId": "call_00_eIjry71nXbBrsNLpjDEd5777",
+        "toolName": "pdf.read"
+      }
+    },
+    {
+      "sequence": 8,
+      "type": "tool.requested",
+      "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+      "callId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:5",
+      "payload": {
+        "attemptId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:attempt:mu2uxugv:7",
+        "input": {
+          "kind": "repositories",
+          "limit": 1,
+          "query": "repo:deepseek-ai/DeepSeek-V3"
+        },
+        "providerCallId": "call_01_vFAKelynoZu3BXb0XwJr8067",
+        "toolName": "github.search"
+      }
+    },
+    {
+      "sequence": 9,
+      "type": "provider.turn.settled",
+      "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+      "callId": null,
+      "payload": {
+        "orderedCallIds": [
+          "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:4",
+          "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:5"
+        ],
+        "orderedOutputBlocks": [
+          {
+            "item": {
+              "content": [
+                {
+                  "text": "The user wants me to call pdf.read for page 1 of the attached PDF and github.search for repo:deepseek-ai/DeepSeek-V3. Read-only, no plan needed. Let me make both calls in parallel.",
+                  "type": "reasoning_text"
+                }
+              ],
+              "encrypted_content": "c465f699-7892-42c1-8556-cda52488f23f-0",
+              "id": "91361b9c-302f-4eae-b23e-e5bfa202c55d",
+              "status": "completed",
+              "summary": [],
+              "type": "reasoning"
+            },
+            "kind": "reasoning",
+            "outputIndex": 0
+          },
+          {
+            "callId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:4",
+            "item": {
+              "arguments": "{\"path\": \"cli-check.pdf\", \"workspace\": \"workspace2\", \"startPage\": 1, \"endPage\": 1}",
+              "call_id": "call_00_eIjry71nXbBrsNLpjDEd5777",
+              "id": "68f4a68c-a8b3-4c1f-bda1-26740c4a7f73",
+              "name": "pdf_read",
+              "status": "completed",
+              "type": "function_call"
+            },
+            "kind": "toolCall",
+            "outputIndex": 1,
+            "providerCallId": "call_00_eIjry71nXbBrsNLpjDEd5777",
+            "toolName": "pdf.read"
+          },
+          {
+            "callId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:5",
+            "item": {
+              "arguments": "{\"query\": \"repo:deepseek-ai/DeepSeek-V3\", \"kind\": \"repositories\", \"limit\": 1}",
+              "call_id": "call_01_vFAKelynoZu3BXb0XwJr8067",
+              "id": "8a1845c2-3da4-4784-a10c-c859afc71575",
+              "name": "github_search",
+              "status": "completed",
+              "type": "function_call"
+            },
+            "kind": "toolCall",
+            "outputIndex": 2,
+            "providerCallId": "call_01_vFAKelynoZu3BXb0XwJr8067",
+            "toolName": "github.search"
+          }
+        ],
+        "outcome": "completed",
+        "providerRequestId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:provider-request:mu2uxt1s:3",
+        "providerRuntimeRef": "provider-runtime:sha256:cfd6a949921301a81b0133c9bee0c8839a5af0a6387b030b3d0cfd0bd78a230b",
+        "purpose": "agent",
+        "reasoningContent": "The user wants me to call pdf.read for page 1 of the attached PDF and github.search for repo:deepseek-ai/DeepSeek-V3. Read-only, no plan needed. Let me make both calls in parallel."
+      }
+    },
+    {
+      "sequence": 10,
+      "type": "context.updated",
+      "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+      "callId": null,
+      "payload": {
+        "cacheMissInputTokens": 1964,
+        "cacheReadInputTokens": 4608,
+        "contextWindowTokens": 1000000,
+        "inputTokens": 6572,
+        "outputTokens": 213,
+        "providerRequestId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:provider-request:mu2uxt1s:3",
+        "providerRuntimeRef": "provider-runtime:sha256:cfd6a949921301a81b0133c9bee0c8839a5af0a6387b030b3d0cfd0bd78a230b"
+      }
+    },
+    {
+      "sequence": 11,
+      "type": "tool.started",
+      "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+      "callId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:4",
+      "payload": {
+        "attemptId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:attempt:mu2uxugv:6",
+        "startedAt": "1789487980176"
+      }
+    },
+    {
+      "sequence": 12,
+      "type": "tool.completed",
+      "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+      "callId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:4",
+      "payload": {
+        "record": {
+          "attemptId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:attempt:mu2uxugv:6",
+          "authority": {
+            "decision": "allow",
+            "source": "workspaceBinding",
+            "workspaceId": "workspace:2e665763a9000e2134a39193548dffc6"
+          },
+          "callId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:4",
+          "completedAt": "1789487980691",
+          "extensionGenerationRef": "extension-generation:sha256:0209048989ea2bbe03439af82d20569f1b253ae668a75a8d469f52e0ebb0acdd",
+          "input": {
+            "endPage": 1,
+            "path": "cli-check.pdf",
+            "startPage": 1,
+            "workspaceId": "workspace:2e665763a9000e2134a39193548dffc6"
+          },
+          "kernelCatalogSnapshotRef": "kernel-catalog:sha256:5ef6c196689cb8f94d96d484a7f5f3edd4faaef6e6462c0987d536ca1a623bdc",
+          "outcome": "completed",
+          "output": {
+            "adapter": "pdf_extract",
+            "endPage": 1,
+            "hasMorePages": false,
+            "path": "cli-check.pdf",
+            "sizeBytes": 608,
+            "startPage": 1,
+            "text": "\n--- page 1 ---\n\n\nDeepCode CLI plugin verification.",
+            "totalPages": 1,
+            "truncatedOutput": false,
+            "truncatedPages": false,
+            "workspaceId": "workspace:2e665763a9000e2134a39193548dffc6"
+          },
+          "preparedEffect": {
+            "attemptId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:attempt:mu2uxugv:6",
+            "callId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:4",
+            "canonicalInvocation": {
+              "arguments": {
+                "endPage": 1,
+                "path": "cli-check.pdf",
+                "startPage": 1
+              },
+              "toolName": "pdf.read"
+            },
+            "contributionRef": "tool-contribution:first-party:pdf.read",
+            "extensionGenerationRef": "extension-generation:sha256:0209048989ea2bbe03439af82d20569f1b253ae668a75a8d469f52e0ebb0acdd",
+            "kernelCatalogSnapshotRef": "kernel-catalog:sha256:5ef6c196689cb8f94d96d484a7f5f3edd4faaef6e6462c0987d536ca1a623bdc",
+            "logicalTargets": [
+              "cli-check.pdf"
+            ],
+            "operation": "pdf.read",
+            "origin": "extension",
+            "pluginInstanceRef": "plugin-instance:eff0ab956d7ad570cb1233cd5ac92c6c",
+            "providerRef": "tool-provider:first-party:pdf",
+            "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+            "sessionId": "session:9eb8d5ee274b0de310b949af8c7f0e9e",
+            "toolBindingRef": "tool-binding:sha256:2d8183397a1a8df5a885ad2dca56363e8b62c1a8b38e03371e5f4ebf6fd7ba93",
+            "toolName": "pdf.read",
+            "workspaceId": "workspace:2e665763a9000e2134a39193548dffc6"
+          },
+          "recordId": "record:6da4f27355d0f831facea3b1e8e477ff",
+          "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+          "sessionId": "session:9eb8d5ee274b0de310b949af8c7f0e9e",
+          "startedAt": "1789487980176",
+          "toolBindingRef": "tool-binding:sha256:2d8183397a1a8df5a885ad2dca56363e8b62c1a8b38e03371e5f4ebf6fd7ba93",
+          "toolName": "pdf.read"
+        }
+      }
+    },
+    {
+      "sequence": 13,
+      "type": "tool.started",
+      "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+      "callId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:5",
+      "payload": {
+        "attemptId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:attempt:mu2uxugv:7",
+        "startedAt": "1789487980699"
+      }
+    },
+    {
+      "sequence": 14,
+      "type": "tool.completed",
+      "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+      "callId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:5",
+      "payload": {
+        "record": {
+          "attemptId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:attempt:mu2uxugv:7",
+          "authority": {
+            "authorityId": "user-setting:agent.permissions.networkRead",
+            "decision": "allow",
+            "source": "userSetting"
+          },
+          "callId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:5",
+          "completedAt": "1789487981564",
+          "extensionGenerationRef": "extension-generation:sha256:0209048989ea2bbe03439af82d20569f1b253ae668a75a8d469f52e0ebb0acdd",
+          "input": {
+            "kind": "repositories",
+            "limit": 1,
+            "query": "repo:deepseek-ai/DeepSeek-V3"
+          },
+          "kernelCatalogSnapshotRef": "kernel-catalog:sha256:5ef6c196689cb8f94d96d484a7f5f3edd4faaef6e6462c0987d536ca1a623bdc",
+          "outcome": "completed",
+          "output": {
+            "backendId": "github",
+            "incomplete": false,
+            "kind": "repositories",
+            "nextPage": null,
+            "page": 1,
+            "query": "repo:deepseek-ai/DeepSeek-V3",
+            "rateLimit": {
+              "limit": 10,
+              "remaining": 9,
+              "resetAtEpochSeconds": 1789488041,
+              "resource": "search",
+              "used": 1
+            },
+            "results": [
+              {
+                "backendId": "github",
+                "path": null,
+                "repository": "deepseek-ai/DeepSeek-V3",
+                "snippet": null,
+                "sourceId": "https://github.com/deepseek-ai/DeepSeek-V3",
+                "title": "deepseek-ai/DeepSeek-V3",
+                "updatedAt": "2026-09-15T14:01:22Z",
+                "url": "https://github.com/deepseek-ai/DeepSeek-V3"
+              }
+            ],
+            "retrievedAtMs": 1789487981557,
+            "sourceUrl": "https://api.github.com/search/repositories?q=repo%3Adeepseek-ai%2FDeepSeek-V3&page=1&per_page=1",
+            "totalCount": 1
+          },
+          "preparedEffect": {
+            "attemptId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:attempt:mu2uxugv:7",
+            "callId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:5",
+            "canonicalInvocation": {
+              "arguments": {
+                "kind": "repositories",
+                "limit": 1,
+                "query": "repo:deepseek-ai/DeepSeek-V3"
+              },
+              "toolName": "github.search"
+            },
+            "contributionRef": "tool-contribution:first-party:github.search",
+            "extensionGenerationRef": "extension-generation:sha256:0209048989ea2bbe03439af82d20569f1b253ae668a75a8d469f52e0ebb0acdd",
+            "kernelCatalogSnapshotRef": "kernel-catalog:sha256:5ef6c196689cb8f94d96d484a7f5f3edd4faaef6e6462c0987d536ca1a623bdc",
+            "logicalTargets": [
+              "https://api.github.com"
+            ],
+            "operation": "github.search",
+            "origin": "extension",
+            "pluginInstanceRef": "plugin-instance:cf2b70f78025f7b467309580ddb4a97d",
+            "providerRef": "tool-provider:first-party:github",
+            "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+            "sessionId": "session:9eb8d5ee274b0de310b949af8c7f0e9e",
+            "toolBindingRef": "tool-binding:sha256:c977fe8d9106a00b2a30a89dbd742b4aefdeb50fd7c52a57cae3f297ef4dd0e2",
+            "toolName": "github.search"
+          },
+          "recordId": "record:666e060cc6ddc9e763e33a93aa06233d",
+          "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+          "sessionId": "session:9eb8d5ee274b0de310b949af8c7f0e9e",
+          "startedAt": "1789487980699",
+          "toolBindingRef": "tool-binding:sha256:c977fe8d9106a00b2a30a89dbd742b4aefdeb50fd7c52a57cae3f297ef4dd0e2",
+          "toolName": "github.search"
+        }
+      }
+    },
+    {
+      "sequence": 15,
+      "type": "context.composed",
+      "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+      "callId": null,
+      "payload": {
+        "baseToolSchemaHash": "context-hash-v1:68d580dd2bf3f6e5",
+        "dynamicInstructionBytes": 5467,
+        "kernelCatalogSnapshotRef": "kernel-catalog:sha256:5ef6c196689cb8f94d96d484a7f5f3edd4faaef6e6462c0987d536ca1a623bdc",
+        "messages": [
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "instruction:deepcode.coding-agent",
+            "contributionKind": "instructions",
+            "filesystemReferences": [],
+            "label": "deepcode.coding-agent",
+            "messageIndex": 0,
+            "role": "system"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "instruction:deepcode.tool-guidance",
+            "contributionKind": "instructions",
+            "filesystemReferences": [],
+            "label": "deepcode.tool-guidance",
+            "messageIndex": 1,
+            "role": "system"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "instruction:deepcode.session-environment",
+            "contributionKind": "instructions",
+            "filesystemReferences": [],
+            "label": "deepcode.session-environment",
+            "messageIndex": 2,
+            "role": "system"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "instruction:deepcode.workspace-autonomy",
+            "contributionKind": "instructions",
+            "filesystemReferences": [],
+            "label": "deepcode.workspace-autonomy",
+            "messageIndex": 3,
+            "role": "system"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "instruction:plugin.github.first-party",
+            "contributionKind": "instructions",
+            "filesystemReferences": [],
+            "label": "plugin.github.first-party",
+            "messageIndex": 4,
+            "role": "system"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "instruction:plugin.pdf.first-party",
+            "contributionKind": "instructions",
+            "filesystemReferences": [],
+            "label": "plugin.pdf.first-party",
+            "messageIndex": 5,
+            "role": "system"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "session:controls",
+            "contributionKind": "sessionControls",
+            "filesystemReferences": [],
+            "label": "Session control contract",
+            "messageIndex": 6,
+            "role": "system"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "session:workspace-bindings",
+            "contributionKind": "workspaceBindings",
+            "filesystemReferences": [],
+            "label": "当前运行的目录索引",
+            "messageIndex": 7,
+            "role": "system"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "text"
+              }
+            ],
+            "contributionId": "message:session:9eb8d5ee274b0de310b949af8c7f0e9e:message:mu2uxt14:1",
+            "contributionKind": "journalMessages",
+            "filesystemReferences": [
+              {
+                "itemId": "filesystem-reference:70ef9aa7de012f24d667f4f9414599be",
+                "label": "cli-check.pdf"
+              }
+            ],
+            "label": "用户消息",
+            "messageIndex": 8,
+            "role": "user"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "reasoning"
+              },
+              {
+                "blockIndex": 1,
+                "callId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:4",
+                "kind": "toolCall",
+                "toolName": "pdf.read"
+              },
+              {
+                "blockIndex": 2,
+                "callId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:5",
+                "kind": "toolCall",
+                "toolName": "github.search"
+              }
+            ],
+            "contributionId": "provider-output:session:9eb8d5ee274b0de310b949af8c7f0e9e:provider-request:mu2uxt1s:3",
+            "contributionKind": "journalMessages",
+            "filesystemReferences": [],
+            "label": "Provider output",
+            "messageIndex": 9,
+            "role": "assistant"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "toolResult",
+                "resultForCallId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:4"
+              }
+            ],
+            "contributionId": "tool-result:session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:4",
+            "contributionKind": "journalMessages",
+            "filesystemReferences": [],
+            "label": "pdf.read 结果",
+            "messageIndex": 10,
+            "role": "tool"
+          },
+          {
+            "blocks": [
+              {
+                "blockIndex": 0,
+                "kind": "toolResult",
+                "resultForCallId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:5"
+              }
+            ],
+            "contributionId": "tool-result:session:9eb8d5ee274b0de310b949af8c7f0e9e:call:mu2uxugv:5",
+            "contributionKind": "journalMessages",
+            "filesystemReferences": [],
+            "label": "github.search 结果",
+            "messageIndex": 11,
+            "role": "tool"
+          }
+        ],
+        "partitions": [
+          {
+            "itemCount": 6,
+            "kind": "instructions",
+            "requestShapeUnits": 6648
+          },
+          {
+            "itemCount": 4,
+            "kind": "sessionControls",
+            "requestShapeUnits": 6777
+          },
+          {
+            "itemCount": 14,
+            "kind": "tools",
+            "requestShapeUnits": 11872
+          },
+          {
+            "itemCount": 2,
+            "kind": "workspaceBindings",
+            "requestShapeUnits": 211
+          },
+          {
+            "itemCount": 0,
+            "kind": "contextProviders",
+            "requestShapeUnits": 0
+          },
+          {
+            "itemCount": 4,
+            "kind": "journalMessages",
+            "requestShapeUnits": 3429
+          },
+          {
+            "itemCount": 1,
+            "kind": "filesystemReferences",
+            "requestShapeUnits": 103
+          }
+        ],
+        "providerRequestId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:provider-request:mu2uxvk5:a",
+        "purpose": "agent",
+        "responseConstraint": "normal",
+        "selectedPluginSnapshotHash": "context-hash-v1:835e5f924e17c555",
+        "stableCoreHash": "context-hash-v1:e3339b029cb3f006",
+        "tools": [
+          {
+            "availability": "callable",
+            "canonicalName": "fs.read",
+            "itemId": "fs.read",
+            "label": "fs_read",
+            "origin": "coreBuiltin",
+            "wireName": "fs_read"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "fs.write",
+            "itemId": "fs.write",
+            "label": "fs_write",
+            "origin": "coreBuiltin",
+            "wireName": "fs_write"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "fs.edit",
+            "itemId": "fs.edit",
+            "label": "fs_edit",
+            "origin": "coreBuiltin",
+            "wireName": "fs_edit"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "fs.delete",
+            "itemId": "fs.delete",
+            "label": "fs_delete",
+            "origin": "coreBuiltin",
+            "wireName": "fs_delete"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "bash",
+            "itemId": "bash",
+            "label": "bash",
+            "origin": "coreBuiltin",
+            "wireName": "bash"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "web.search",
+            "itemId": "web.search",
+            "label": "web_search",
+            "origin": "coreBuiltin",
+            "wireName": "web_search"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "web.fetch",
+            "itemId": "web.fetch",
+            "label": "web_fetch",
+            "origin": "coreBuiltin",
+            "wireName": "web_fetch"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "session.read",
+            "itemId": "session.read",
+            "label": "session_read",
+            "origin": "coreBuiltin",
+            "wireName": "session_read"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "skill.read",
+            "itemId": "skill.read",
+            "label": "skill_read",
+            "origin": "coreBuiltin",
+            "wireName": "skill_read"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "doc.read",
+            "itemId": "doc.read",
+            "label": "doc_read",
+            "origin": "coreBuiltin",
+            "wireName": "doc_read"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "document.render",
+            "itemId": "document.render",
+            "label": "document_render",
+            "origin": "coreBuiltin",
+            "wireName": "document_render"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "interaction.request",
+            "itemId": "interaction.request",
+            "label": "interaction_request",
+            "origin": "sessionControl",
+            "wireName": "interaction_request"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "plan.progress",
+            "itemId": "plan.progress",
+            "label": "plan_progress",
+            "origin": "sessionControl",
+            "wireName": "plan_progress"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "plan.publish",
+            "itemId": "plan.publish",
+            "label": "plan_publish",
+            "origin": "sessionControl",
+            "wireName": "plan_publish"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "github.read",
+            "itemId": "github.read",
+            "label": "github_read",
+            "origin": "extension",
+            "pluginUri": "plugin://github@first-party",
+            "wireName": "github_read"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "github.search",
+            "itemId": "github.search",
+            "label": "github_search",
+            "origin": "extension",
+            "pluginUri": "plugin://github@first-party",
+            "wireName": "github_search"
+          },
+          {
+            "availability": "callable",
+            "canonicalName": "pdf.read",
+            "itemId": "pdf.read",
+            "label": "pdf_read",
+            "origin": "extension",
+            "pluginUri": "plugin://pdf@first-party",
+            "wireName": "pdf_read"
+          }
+        ],
+        "workspaceBindings": [
+          {
+            "itemId": "workspace:c795a1a2688f2c0590f5c2010cbe00e6",
+            "label": "runtime-check"
+          },
+          {
+            "itemId": "workspace:2e665763a9000e2134a39193548dffc6",
+            "label": "cli-check.pdf"
+          }
+        ]
+      }
+    },
+    {
+      "sequence": 16,
+      "type": "provider.turn.settled",
+      "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+      "callId": null,
+      "payload": {
+        "orderedCallIds": [],
+        "orderedOutputBlocks": [
+          {
+            "item": {
+              "content": [
+                {
+                  "annotations": [],
+                  "logprobs": [],
+                  "text": "兩项调用均已完成，结果如下。\n\n**PDF 原文（cli-check.pdf 第 1 页，共 1 页）**\n\n```\n--- page 1 ---\n\nDeepCode CLI plugin verification.\n```\n\n**github.search 查询结果（query: repo:deepseek-ai/DeepSeek-V3，kind: repositories，limit: 1）**\n\n- 仓库名称：deepseek-ai/DeepSeek-V3\n- 网址：https://github.com/deepseek-ai/DeepSeek-V3\n\n未修改任何文件，也未调用其他工具。",
+                  "type": "output_text"
+                }
+              ],
+              "id": "94a546c2-153c-4d45-af72-287fd9b2fb4c",
+              "phase": "final_answer",
+              "role": "assistant",
+              "status": "completed",
+              "type": "message"
+            },
+            "kind": "finalMessage",
+            "messageId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:message:mu2uxwau:b",
+            "outputIndex": 0
+          }
+        ],
+        "outcome": "completed",
+        "providerRequestId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:provider-request:mu2uxvk5:a",
+        "providerRuntimeRef": "provider-runtime:sha256:cfd6a949921301a81b0133c9bee0c8839a5af0a6387b030b3d0cfd0bd78a230b",
+        "purpose": "agent"
+      }
+    },
+    {
+      "sequence": 17,
+      "type": "context.updated",
+      "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+      "callId": null,
+      "payload": {
+        "cacheMissInputTokens": 382,
+        "cacheReadInputTokens": 6784,
+        "contextWindowTokens": 1000000,
+        "inputTokens": 7166,
+        "outputTokens": 124,
+        "providerRequestId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:provider-request:mu2uxvk5:a",
+        "providerRuntimeRef": "provider-runtime:sha256:cfd6a949921301a81b0133c9bee0c8839a5af0a6387b030b3d0cfd0bd78a230b"
+      }
+    },
+    {
+      "sequence": 18,
+      "type": "message.committed",
+      "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+      "callId": null,
+      "payload": {
+        "content": "兩项调用均已完成，结果如下。\n\n**PDF 原文（cli-check.pdf 第 1 页，共 1 页）**\n\n```\n--- page 1 ---\n\nDeepCode CLI plugin verification.\n```\n\n**github.search 查询结果（query: repo:deepseek-ai/DeepSeek-V3，kind: repositories，limit: 1）**\n\n- 仓库名称：deepseek-ai/DeepSeek-V3\n- 网址：https://github.com/deepseek-ai/DeepSeek-V3\n\n未修改任何文件，也未调用其他工具。",
+        "messageId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:message:mu2uxwau:b",
+        "providerRequestId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:provider-request:mu2uxvk5:a",
+        "role": "assistant"
+      }
+    },
+    {
+      "sequence": 19,
+      "type": "run.finishing",
+      "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+      "callId": null,
+      "payload": {
+        "finalMessageId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:message:mu2uxwau:b",
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": 20,
+      "type": "run.runtime.released",
+      "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+      "callId": null,
+      "payload": {
+        "alreadyReleased": false,
+        "extensionGenerationRef": "extension-generation:sha256:0209048989ea2bbe03439af82d20569f1b253ae668a75a8d469f52e0ebb0acdd",
+        "kernelCatalogSnapshotRef": "kernel-catalog:sha256:5ef6c196689cb8f94d96d484a7f5f3edd4faaef6e6462c0987d536ca1a623bdc",
+        "pluginInstanceRefs": [
+          "plugin-instance:cf2b70f78025f7b467309580ddb4a97d",
+          "plugin-instance:eff0ab956d7ad570cb1233cd5ac92c6c"
+        ],
+        "providerRuntimeRef": "provider-runtime:sha256:cfd6a949921301a81b0133c9bee0c8839a5af0a6387b030b3d0cfd0bd78a230b",
+        "runRuntimeSnapshotRef": "run-runtime:session:9eb8d5ee274b0de310b949af8c7f0e9e:session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2"
+      }
+    },
+    {
+      "sequence": 21,
+      "type": "run.settled",
+      "runId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:run:mu2uxt14:2",
+      "callId": null,
+      "payload": {
+        "finalMessageId": "session:9eb8d5ee274b0de310b949af8c7f0e9e:message:mu2uxwau:b",
+        "outcome": "completed"
+      }
+    }
+  ]
+}

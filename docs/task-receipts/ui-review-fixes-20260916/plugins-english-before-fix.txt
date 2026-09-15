@@ -1,0 +1,31 @@
+Window: "DeepCode-GUI", App: DeepCode-GUI.
+0 standard window DeepCode-GUI, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: DeepCode-GUI, URL: deepcode-gui://localhost/index.html
+			3 container DeepCode Settings
+				4 button Close settings
+				5 container DeepCode Settings
+					6 text DEEPCODE SETTINGS
+					7 container Search settings
+						8 text SEARCH
+						9 text field (settable) Search settings
+					10 button General
+					11 button Appearance
+					12 button Agent behavior
+					13 button Execution environment
+					14 button Tool permissions
+					15 button Models & services
+					16 button Plugins
+					17 button About
+	18 close button
+	19 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	20 minimize button
+21 menu bar
+	22 DeepCode-GUI
+	23 File
+	24 Edit
+	25 View
+	26 Window
+	27 Help
+
+The focused UI element is 3 container DeepCode Settings

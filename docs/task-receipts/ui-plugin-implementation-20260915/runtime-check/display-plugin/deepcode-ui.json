@@ -1,0 +1,1 @@
+{"id":"tcr.display-check","name":"TCR 展示检查","description":"用于本次组件加载与局部更新检查。","entry":"index.js","slots":["message.markdown"]}

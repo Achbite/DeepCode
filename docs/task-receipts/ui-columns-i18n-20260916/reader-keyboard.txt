@@ -1,0 +1,56 @@
+Left:
+Window: "DeepCode-GUI", App: DeepCode-GUI.
+0 standard window DeepCode-GUI, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: DeepCode-GUI, URL: deepcode-gui://localhost/index.html
+			3 container
+				4 text 根据当前DeepCode的前端制作一个预览我要检查批注
+				5 container Completed
+					6 text Completed
+				7 tab group (selectable) Open previews
+					8 tab (selected) deepcode-frontend-annotated-preview-2026-09-15.html, Value: on
+					9 button Close deepcode-frontend-annotated-preview-2026-09-15.html
+					10 tab (selectable) deepcode-frontend-annotated-preview-2026-09-15.png
+					11 button Close deepcode-frontend-annotated-preview-2026-09-15.png
+				12 button Open preview
+				13 button Expand preview
+				14 toggle button Browser and preview, Value: on
+			15 container
+				16 text DC DeepCode-GUI
+				17 button New chat
+				18 text Projects
+				19 pop up button New project
+				20 button (expanded) DeepCode, Secondary Actions: Collapse
+				21 button New chat in project
+				22 button Project actions
+				23 button 根据当前DeepCode的前端制作一个预览我要检查批注
+				24 button Chat actions
+				25 button 分析一下你自己的源代码
+End:
+Window: "DeepCode-GUI", App: DeepCode-GUI.
+0 standard window DeepCode-GUI, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: DeepCode-GUI, URL: deepcode-gui://localhost/index.html
+			3 container
+				4 text 根据当前DeepCode的前端制作一个预览我要检查批注
+				5 container Completed
+					6 text Completed
+				7 tab group (selectable) Open previews
+					8 tab (selectable) deepcode-frontend-annotated-preview-2026-09-15.html
+					9 button Close deepcode-frontend-annotated-preview-2026-09-15.html
+					10 tab (selected) deepcode-frontend-annotated-preview-2026-09-15.png, Value: on
+					11 button Close deepcode-frontend-annotated-preview-2026-09-15.png
+				12 button Open preview
+				13 button Expand preview
+				14 toggle button Browser and preview, Value: on
+			15 container
+				16 text DC DeepCode-GUI
+				17 button New chat
+				18 text Projects
+				19 pop up button New project
+				20 button (expanded) DeepCode, Secondary Actions: Collapse
+				21 button New chat in project
+				22 button Project actions
+				23 button 根据当前DeepCode的前端制作一个预览我要检查批注
+				24 button Chat actions
+				25 button 分析一下你自己的源代码

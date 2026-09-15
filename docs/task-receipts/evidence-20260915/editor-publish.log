@@ -1,0 +1,26 @@
+/Users/wangdi/Desktop/Project/DeepCode/DeepCode-dev-main/bin/macos-arm64/DeepCode.app: replacing existing signature
+{
+  "updated": [
+    {
+      "path": "/Users/wangdi/Desktop/Project/DeepCode/DeepCode-dev-main/bin/macos-arm64/DeepCode.app/Contents/Resources/web",
+      "frontend": {
+        "productVersion": "0.5.60",
+        "surface": "editor",
+        "buildCommit": "0369515d93eeb45d674207127a86847954076e15",
+        "sourceDirty": true,
+        "buildTimeUtc": "2026-09-15T09:18:57.159489+00:00"
+      }
+    },
+    {
+      "path": "/Users/wangdi/Desktop/Project/DeepCode/DeepCode-dev-main/bin/macos-arm64/web",
+      "frontend": {
+        "productVersion": "0.5.60",
+        "surface": "editor",
+        "buildCommit": "0369515d93eeb45d674207127a86847954076e15",
+        "sourceDirty": true,
+        "buildTimeUtc": "2026-09-15T09:18:57.159489+00:00"
+      }
+    }
+  ]
+}
+UI assets updated. Reload or reopen the window to use them. Kernel and Session runtime were retained.

@@ -1,0 +1,57 @@
+Window: "DeepCode-GUI", App: DeepCode-GUI.
+0 standard window DeepCode-GUI, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: DeepCode-GUI, URL: deepcode-gui://localhost/index.html
+			3 container DeepCode Settings
+				4 button Close settings
+				5 container DeepCode Settings
+					6 text DEEPCODE SETTINGS
+					7 container Search settings
+						8 text SEARCH
+						9 text field (settable) Search settings
+					10 button General
+					11 button Appearance
+					12 button Agent behavior
+					13 button Execution environment
+					14 button Tool permissions
+					15 button Models & services
+					16 button Plugins
+					17 button About
+				18 container
+					19 heading Plugins, Value: 2
+						20 text Plugins
+					21 text Manage tools and display extensions.
+					22 button Add…
+					23 container Filter plugins
+						24 toggle button All 3, Value: on
+						25 toggle button Enabled 3, Value: off
+					26 text field (settable) Search plugins
+					27 button Refresh list
+					28 button (collapsed) arXiv Find papers, abstracts and sources., Secondary Actions: Expand
+					29 container Available when selected
+					30 switch (settable, boolean) Enable arXiv, Value: on
+					31 button (collapsed) arXiv details, Secondary Actions: Expand
+					32 button (collapsed) GitHub Find repositories, read code and issues., Secondary Actions: Expand
+					33 container Available when selected
+					34 switch (settable, boolean) Enable GitHub, Value: on
+					35 button (collapsed) GitHub details, Secondary Actions: Expand
+					36 button (collapsed) PDF Reader Extract document text and read by page., Secondary Actions: Expand
+					37 container Available when selected
+					38 switch (settable, boolean) Enable PDF Reader, Value: on
+					39 button (collapsed) PDF Reader details, Secondary Actions: Expand
+					40 summary Enter a location, Value: off
+						41 text Enter a location
+					42 summary Connect external tools, Value: off
+						43 text Connect external tools
+	44 close button
+	45 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	46 minimize button
+47 menu bar
+	48 DeepCode-GUI
+	49 File
+	50 Edit
+	51 View
+	52 Window
+	53 Help
+
+The focused UI element is 3 container DeepCode Settings

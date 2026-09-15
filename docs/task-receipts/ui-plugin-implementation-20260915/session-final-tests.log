@@ -1,0 +1,394 @@
+
+> @deepcode/session-core@0.5.60 test /workspace/userspace/session-core
+> pnpm run build && node --test tests/local-agent.test.mjs
+
+
+> @deepcode/session-core@0.5.60 build /workspace/userspace/session-core
+> pnpm run clean && tsc -p tsconfig.json
+
+
+> @deepcode/session-core@0.5.60 clean /workspace/userspace/session-core
+> rm -rf dist tsconfig.tsbuildinfo
+
+TAP version 13
+# Subtest: queued input joins the same run after complete tool results and keeps late input before settlement
+ok 1 - queued input joins the same run after complete tool results and keeps late input before settlement
+  ---
+  duration_ms: 95.360423
+  type: 'test'
+  ...
+# Subtest: request-boundary refresh retains the starting selection when another tool is queued
+ok 2 - request-boundary refresh retains the starting selection when another tool is queued
+  ---
+  duration_ms: 50.431689
+  type: 'test'
+  ...
+# Subtest: waiting input stays separate from the decision and explicit cancel retains unconsumed text
+ok 3 - waiting input stays separate from the decision and explicit cancel retains unconsumed text
+  ---
+  duration_ms: 43.950766
+  type: 'test'
+  ...
+# Subtest: Kernel stream delivers progress before the terminal reply and rejects a missing reply
+ok 4 - Kernel stream delivers progress before the terminal reply and rejects a missing reply
+  ---
+  duration_ms: 43.416871
+  type: 'test'
+  ...
+# Subtest: local Provider streams resume after silence, cancel immediately and close their connection
+ok 5 - local Provider streams resume after silence, cancel immediately and close their connection
+  ---
+  duration_ms: 110.571469
+  type: 'test'
+  ...
+# Subtest: an interrupted local Provider response preserves its transport cause without retry
+ok 6 - an interrupted local Provider response preserves its transport cause without retry
+  ---
+  duration_ms: 12.042532
+  type: 'test'
+  ...
+# Subtest: Provider error causes survive Session indeterminate settlement
+ok 7 - Provider error causes survive Session indeterminate settlement
+  ---
+  duration_ms: 8.326102
+  type: 'test'
+  ...
+# Subtest: lost Kernel reply closes tool history after release (late record: false)
+ok 8 - lost Kernel reply closes tool history after release (late record: false)
+  ---
+  duration_ms: 61.872349
+  type: 'test'
+  ...
+# Subtest: lost Kernel reply closes tool history after release (late record: true)
+ok 9 - lost Kernel reply closes tool history after release (late record: true)
+  ---
+  duration_ms: 15.658071
+  type: 'test'
+  ...
+# Subtest: snapshot reads only new journal events and matches full replay
+ok 10 - snapshot reads only new journal events and matches full replay
+  ---
+  duration_ms: 2.391746
+  type: 'test'
+  ...
+# Subtest: transport: oversized Unicode replies preserve content within bounded frames
+ok 11 - transport: oversized Unicode replies preserve content within bounded frames
+  ---
+  duration_ms: 93.571927
+  type: 'test'
+  ...
+# Subtest: message uses one prepared runtime through composition, completion, cache projection, settlement, and release
+ok 12 - message uses one prepared runtime through composition, completion, cache projection, settlement, and release
+  ---
+  duration_ms: 10.878392
+  type: 'test'
+  ...
+# Subtest: Session environment survives new runs, restart and compaction without changing the Provider prefix
+ok 13 - Session environment survives new runs, restart and compaction without changing the Provider prefix
+  ---
+  duration_ms: 193.315151
+  type: 'test'
+  ...
+# Subtest: run binding exposes hosted search once and replays its Provider item unchanged
+ok 14 - run binding exposes hosted search once and replays its Provider item unchanged
+  ---
+  duration_ms: 13.733866
+  type: 'test'
+  ...
+# Subtest: Responses output items preserve narrative, hosted activity, and final-message order
+ok 15 - Responses output items preserve narrative, hosted activity, and final-message order
+  ---
+  duration_ms: 42.425992
+  type: 'test'
+  ...
+# Subtest: explicit commentary streams before settlement and continues the same run without changing the prefix
+ok 16 - explicit commentary streams before settlement and continues the same run without changing the prefix
+  ---
+  duration_ms: 101.184043
+  type: 'test'
+  ...
+# Subtest: native function_call identity survives settlement, execution, and replay
+ok 17 - native function_call identity survives settlement, execution, and replay
+  ---
+  duration_ms: 11.724829
+  type: 'test'
+  ...
+# Subtest: filesystem references reach Provider as logical metadata without embedded file content
+ok 18 - filesystem references reach Provider as logical metadata without embedded file content
+  ---
+  duration_ms: 10.189113
+  type: 'test'
+  ...
+# Subtest: the current RunRuntimeSnapshot contract rejects missing Provider aliases explicitly
+ok 19 - the current RunRuntimeSnapshot contract rejects missing Provider aliases explicitly
+  ---
+  duration_ms: 1.155961
+  type: 'test'
+  ...
+# Subtest: the current RunRuntimeSnapshot contract rejects missing tool prompt contributions explicitly
+ok 20 - the current RunRuntimeSnapshot contract rejects missing tool prompt contributions explicitly
+  ---
+  duration_ms: 0.873973
+  type: 'test'
+  ...
+# Subtest: tool prompt preparation binds exact callable tools and rejects invalid ownership
+ok 21 - tool prompt preparation binds exact callable tools and rejects invalid ownership
+  ---
+  duration_ms: 4.624618
+  type: 'test'
+  ...
+# Subtest: Session renders one run-scoped tool guidance message with Provider aliases
+ok 22 - Session renders one run-scoped tool guidance message with Provider aliases
+  ---
+  duration_ms: 9.05936
+  type: 'test'
+  ...
+# Subtest: read-only bash result projects its real write scope and continues the Loop
+ok 23 - read-only bash result projects its real write scope and continues the Loop
+  ---
+  duration_ms: 9.686458
+  type: 'test'
+  ...
+# Subtest: pre-spawn shell failure settles and replays without invented process output (bash, null)
+ok 24 - pre-spawn shell failure settles and replays without invented process output (bash, null)
+  ---
+  duration_ms: 45.923639
+  type: 'test'
+  ...
+# Subtest: pre-spawn shell failure settles and replays without invented process output (bash, diagnostic)
+ok 25 - pre-spawn shell failure settles and replays without invented process output (bash, diagnostic)
+  ---
+  duration_ms: 44.263608
+  type: 'test'
+  ...
+# Subtest: pre-spawn shell failure settles and replays without invented process output (powershell, null)
+ok 26 - pre-spawn shell failure settles and replays without invented process output (powershell, null)
+  ---
+  duration_ms: 19.92075
+  type: 'test'
+  ...
+# Subtest: pre-spawn shell failure settles and replays without invented process output (powershell, diagnostic)
+ok 27 - pre-spawn shell failure settles and replays without invented process output (powershell, diagnostic)
+  ---
+  duration_ms: 44.899786
+  type: 'test'
+  ...
+# Subtest: a run without workspace bindings never exposes workspace-scoped tools
+ok 28 - a run without workspace bindings never exposes workspace-scoped tools
+  ---
+  duration_ms: 33.859609
+  type: 'test'
+  ...
+# Subtest: explicit /focus and same-runtime pressure compact only after a successful summary turn
+ok 29 - explicit /focus and same-runtime pressure compact only after a successful summary turn
+  ---
+  duration_ms: 43.720203
+  type: 'test'
+  ...
+# Subtest: cancel and service disposal close their owned runtime boundaries in order
+ok 30 - cancel and service disposal close their owned runtime boundaries in order
+  ---
+  duration_ms: 20.275647
+  type: 'test'
+  ...
+# Subtest: Session service owns Host activity through background completion
+ok 31 - Session service owns Host activity through background completion
+  ---
+  duration_ms: 27.632057
+  type: 'test'
+  ...
+# Subtest: deletion remains available while an unloadable actor rolls back cleanly
+ok 32 - deletion remains available while an unloadable actor rolls back cleanly
+  ---
+  duration_ms: 2.127818
+  type: 'test'
+  ...
+# Subtest: an escaped Loop fault remains Session-local and releases its runtime
+ok 33 - an escaped Loop fault remains Session-local and releases its runtime
+  ---
+  duration_ms: 79.369227
+  type: 'test'
+  ...
+# Subtest: one Plan confirmation resumes the same run into Todo-backed execution
+ok 34 - one Plan confirmation resumes the same run into Todo-backed execution
+  ---
+  duration_ms: 22.971122
+  type: 'test'
+  ...
+# Subtest: confirmed Host Bash uses composite authority and only a successful retry completes Todo
+ok 35 - confirmed Host Bash uses composite authority and only a successful retry completes Todo
+  ---
+  duration_ms: 48.642371
+  type: 'test'
+  ...
+# Subtest: confirmed fs.delete reads targetKind from canonical arguments and completes Todo
+ok 36 - confirmed fs.delete reads targetKind from canonical arguments and completes Todo
+  ---
+  duration_ms: 33.114601
+  type: 'test'
+  ...
+# Subtest: unfinished Plan preserves final explanation and pending Todo without reporting success
+ok 37 - unfinished Plan preserves final explanation and pending Todo without reporting success
+  ---
+  duration_ms: 76.291543
+  type: 'test'
+  ...
+# Subtest: scope-only proposals preserve phase definitions and cannot silently rewrite the Plan
+ok 38 - scope-only proposals preserve phase definitions and cannot silently rewrite the Plan
+  ---
+  duration_ms: 1.490719
+  type: 'test'
+  ...
+# Subtest: execution-time Plan revisions retain Todo identity and rejected progress cannot consume final output
+ok 39 - execution-time Plan revisions retain Todo identity and rejected progress cannot consume final output
+  ---
+  duration_ms: 47.968524
+  type: 'test'
+  ...
+# Subtest: built-in runtime and control prompts stay concise and policy-scoped
+ok 40 - built-in runtime and control prompts stay concise and policy-scoped
+  ---
+  duration_ms: 0.918196
+  type: 'test'
+  ...
+# Subtest: plan rejection names the invalid manifest field and preserves the Provider prefix for correction
+ok 41 - plan rejection names the invalid manifest field and preserves the Provider prefix for correction
+  ---
+  duration_ms: 26.362212
+  type: 'test'
+  ...
+# Subtest: an explicit Provider failure remains failed with its original error
+ok 42 - an explicit Provider failure remains failed with its original error
+  ---
+  duration_ms: 44.606713
+  type: 'test'
+  ...
+# Subtest: Provider cache fields are absent together or exactly partition one call input
+ok 43 - Provider cache fields are absent together or exactly partition one call input
+  ---
+  duration_ms: 198.438433
+  type: 'test'
+  ...
+# Subtest: current Todo state precedes later inserted user input without splitting its tool result
+ok 44 - current Todo state precedes later inserted user input without splitting its tool result
+  ---
+  duration_ms: 1.210305
+  type: 'test'
+  ...
+# Subtest: an interaction response is inserted after its tool result and a stale second response is durable
+ok 45 - an interaction response is inserted after its tool result and a stale second response is durable
+  ---
+  duration_ms: 151.762075
+  type: 'test'
+  ...
+# Subtest: phase plans and progress accept lists beyond the former item counts while retaining semantic validation
+ok 46 - phase plans and progress accept lists beyond the former item counts while retaining semantic validation
+  ---
+  duration_ms: 3.646578
+  type: 'test'
+  ...
+# Subtest: Plan title schema advertises the same single-line boundary enforced during publication
+ok 47 - Plan title schema advertises the same single-line boundary enforced during publication
+  ---
+  duration_ms: 0.76352
+  type: 'test'
+  ...
+# Subtest: missing completion stays indeterminate; a completed unknown alias fails without correction or execution
+ok 48 - missing completion stays indeterminate; a completed unknown alias fails without correction or execution
+  ---
+  duration_ms: 116.997086
+  type: 'test'
+  ...
+# Subtest: Kernel infrastructure errors remain run failures rather than correctable input results
+ok 49 - Kernel infrastructure errors remain run failures rather than correctable input results
+  ---
+  duration_ms: 9.677701
+  type: 'test'
+  ...
+# Subtest: the real Session bridge persists model commands and passes effort through message and focus preparation
+ok 50 - the real Session bridge persists model commands and passes effort through message and focus preparation
+  ---
+  duration_ms: 507.577759
+  type: 'test'
+  ...
+# Subtest: reopening a run waiting for Plan confirmation restores its original effort rather than newer Session settings
+ok 51 - reopening a run waiting for Plan confirmation restores its original effort rather than newer Session settings
+  ---
+  duration_ms: 18.799085
+  type: 'test'
+  ...
+# Subtest: first request reserves output budget before calling a Provider and preserves original input
+ok 52 - first request reserves output budget before calling a Provider and preserves original input
+  ---
+  duration_ms: 12.518041
+  type: 'test'
+  ...
+# Subtest: new file inputs preserve the existing Provider prefix and keep historical files readable
+ok 53 - new file inputs preserve the existing Provider prefix and keep historical files readable
+  ---
+  duration_ms: 66.115356
+  type: 'test'
+  ...
+# Subtest: workspace Bash Plan declares paths without locking its command text
+ok 54 - workspace Bash Plan declares paths without locking its command text
+  ---
+  duration_ms: 0.598647
+  type: 'test'
+  ...
+# Subtest: reasoning display bounds real text and summary independently without changing replay data
+ok 55 - reasoning display bounds real text and summary independently without changing replay data
+  ---
+  duration_ms: 4.300535
+  type: 'test'
+  ...
+# Subtest: Kernel changes produce ordered round references while display evidence stays out of Provider context
+ok 56 - Kernel changes produce ordered round references while display evidence stays out of Provider context
+  ---
+  duration_ms: 11.391605
+  type: 'test'
+  ...
+# Subtest: plan preview streams formed fields at the same revision and publishes only after complete validation
+ok 57 - plan preview streams formed fields at the same revision and publishes only after complete validation
+  ---
+  duration_ms: 245.147317
+  type: 'test'
+  ...
+# Subtest: an unfinished plan preview is cleared when its request is failed
+ok 58 - an unfinished plan preview is cleared when its request is failed
+  ---
+  duration_ms: 161.627633
+  type: 'test'
+  ...
+# Subtest: an unfinished plan preview is cleared when its request is cancelled
+ok 59 - an unfinished plan preview is cleared when its request is cancelled
+  ---
+  duration_ms: 44.86598
+  type: 'test'
+  ...
+# Subtest: plan preview reads complete JSON fields and keeps its display buffer bounded
+ok 60 - plan preview reads complete JSON fields and keeps its display buffer bounded
+  ---
+  duration_ms: 8.474177
+  type: 'test'
+  ...
+# Subtest: aggregate input admission preserves raw errors, permits correction, and never replays an executed peer
+ok 61 - aggregate input admission preserves raw errors, permits correction, and never replays an executed peer
+  ---
+  duration_ms: 80.019414
+  type: 'test'
+  ...
+# Subtest: mixed Plan batches are rejected before any effect and can be corrected to an independently confirmed plan
+ok 62 - mixed Plan batches are rejected before any effect and can be corrected to an independently confirmed plan
+  ---
+  duration_ms: 15.193123
+  type: 'test'
+  ...
+1..62
+# tests 62
+# suites 0
+# pass 62
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 3544.385422

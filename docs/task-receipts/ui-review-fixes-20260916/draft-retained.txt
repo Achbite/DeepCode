@@ -1,0 +1,71 @@
+Window: "DeepCode-GUI", App: DeepCode-GUI.
+0 standard window DeepCode-GUI, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: DeepCode-GUI, URL: deepcode-gui://localhost/index.html
+			3 container DeepCode 设置
+				4 button 关闭设置
+				5 container DeepCode 设置
+					6 text DEEPCODE 设置
+					7 container 搜索设置
+						8 text 搜索
+						9 text field (settable) 搜索设置
+					10 button 通用
+					11 button 外观
+					12 button Agent 行为
+					13 button 执行环境
+					14 button 工具权限
+					15 button 模型与服务
+					16 button 插件
+					17 button 关于
+				18 container
+					19 heading 执行环境, Value: 2
+						20 text 执行环境
+					21 heading PDF 生成环境, Value: 3
+						22 text PDF 生成环境
+					23 text PDF 渲染 Python
+					24 text 默认
+					25 container
+						26 text field (settable) PDF 渲染 Python, Value: /tmp/deepcode-review-unsaved
+						27 button 保存
+						28 button 撤销编辑
+					29 heading 项目执行环境, Value: 3
+						30 text 项目执行环境
+					31 text 项目
+					32 pop up button 项目, Value: Test
+					33 text 运行位置
+					34 pop up button 运行位置, Value: 本机（使用全局 Shell 设置）
+					35 text 环境变更从下一次运行生效。WSL 仅在 Windows 主机可选，不会在工具失败后自动切换。
+					36 button 保存项目环境
+					37 heading 工作区 Shell, Value: 3
+						38 text 工作区 Shell
+					39 text 可用
+					40 text  · sandbox-exec
+					41 text 读取已安装的开发工具，写入限定在已授权范围与临时目录。工作区 Shell 不使用网络。
+					42 heading 环境上下文, Value: 3
+						43 text 环境上下文
+					44 text 稳定的执行环境
+					45 text 会话复用已保存的环境。修改设置或刷新后，后续运行重新检测；当前任务保持原环境。
+					46 button 刷新环境
+					47 text 本机检测
+					48 text : 
+					49 text macos
+					50 text  · 
+					51 text aarch64
+					52 text  · 
+					53 text bash
+					54 text /bin/bash
+					55 text 可用开发命令
+					56 text : 
+					57 text git · node · npm · pnpm · python3 · java · make · gcc · clang · docker
+	58 close button
+	59 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	60 minimize button
+61 menu bar
+	62 DeepCode-GUI
+	63 File
+	64 Edit
+	65 View
+	66 Window
+	67 Help
+
+The focused UI element is 3 container DeepCode 设置

@@ -1,0 +1,19 @@
+{
+  "platform": {
+    "buildCommit": "0369515",
+    "buildTimeUtc": "2026-09-15T15:56:37Z",
+    "sourceDirty": 1,
+    "sourceStatusHash": "ccc19e7e2c726df95a6038cabd5834ccd705f1ad6a88d21013614510ab9f7615",
+    "sourceFingerprint": "f07723f8643867f9cf2c5c5f60019ca06576c254b0b0b2a002281b0be4ed8db8",
+    "sessionBridge": "sessionServiceBridge.js",
+    "product": "macos-arm64",
+    "productVersion": "0.5.60"
+  },
+  "gui": {
+    "productVersion": "0.5.60",
+    "surface": "gui",
+    "buildCommit": "0369515d93eeb45d674207127a86847954076e15",
+    "sourceDirty": true,
+    "buildTimeUtc": "2026-09-15T16:21:14.840061+00:00"
+  }
+}

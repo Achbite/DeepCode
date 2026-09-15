@@ -1,0 +1,26 @@
+Clicked row trailing area at (181,742), away from icon and label.
+Window: "DeepCode-GUI", App: DeepCode-GUI.
+0 standard window DeepCode-GUI, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: DeepCode-GUI, URL: deepcode-gui://localhost/index.html
+			3 container DeepCode 设置
+				4 button 关闭设置
+				5 container DeepCode 设置
+					6 text DEEPCODE 设置
+					7 container 搜索设置
+						8 text 搜索
+						9 text field (settable) 搜索设置
+					10 button 通用
+					11 button 外观
+					12 button Agent 行为
+					13 button 执行环境
+					14 button 工具权限
+					15 button 模型与服务
+					16 button 插件
+					17 button 关于
+				18 container
+					19 heading 外观, Value: 2
+						20 text 外观
+					21 heading 主题, Value: 3
+						22 text 主题
+					23 text 主

@@ -1,0 +1,20 @@
+
+> deepcode@0.5.60 typecheck /workspace
+> pnpm --filter @deepcode/protocol typecheck && pnpm --filter @deepcode/presentation-core typecheck && pnpm --filter @deepcode/session-core typecheck && pnpm --filter @deepcode/client typecheck
+
+
+> @deepcode/protocol@0.5.60 typecheck /workspace/userspace/protocol
+> tsc --noEmit
+
+
+> @deepcode/presentation-core@0.5.60 typecheck /workspace/userspace/presentation-core
+> tsc --noEmit
+
+
+> @deepcode/session-core@0.5.60 typecheck /workspace/userspace/session-core
+> tsc --noEmit
+
+
+> @deepcode/client@0.5.60 typecheck /workspace/userspace/gui
+> tsc --noEmit
+

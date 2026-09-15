@@ -142,6 +142,35 @@ ARM64 Linux 产物改用 `bin/linux-arm64`。
 
 然后打开 [http://127.0.0.1:31245/](http://127.0.0.1:31245/)。Windows 可打开 `DeepCode.exe` 或 `DeepCode-GUI.exe`；目标系统需要 Microsoft Edge WebView2 Evergreen Runtime。
 
+## 独立更新前端
+
+纯界面修改可以单独构建两个前端，复用现有 Kernel、Session runtime 和原生程序：
+
+```bash
+make ui
+python3 scripts/update-ui.py --package bin/macos-arm64
+# 合并为一个命令：
+make ui-update UI_PACKAGE=bin/macos-arm64
+```
+
+`make ui` 在 Docker 内进行前端依赖、类型检查与 Vite 构建，输出 `bin/ui/web` 和 `bin/ui/web-deepcode-gui`，不编译 Rust 或 Session runtime。更新脚本只替换指定本地包中的 Web 资源；Windows / Linux 将目标换成 `bin/win64` 或对应 Linux 目录。也可以传入单个 `.app`，或用 `--surface gui` / `--surface editor` 只更新一个界面。Windows 开发构建继续通过 WSL / Docker；更新脚本仅使用 Python 标准库。
+
+macOS 更新需在宿主执行，脚本会重新签署 App 的资源封印并验证签名。完成后，在设置的“外观 / 常用设置 → 运行信息”点击“重新加载界面”，或关闭后重新打开窗口。重新加载前保存编辑内容与未发送输入。更新不会修改用户配置、历史会话和原包 `build-info.json`；每个前端自己的 `frontend-build-info.json` 记录本次源码与构建时间。版本和提交仅用于追溯，不作为与内核锁步更新的门禁。
+
+此入口适用于既有 Host / Session 接口下的页面、样式和渲染修改。新增后端接口或工具执行能力仍需正常构建相应服务；本次文档工具和资源 API 首次安装也需要包含这些服务的完整版本。
+
+UI 插件支持在窗口内热替换。在 **设置 → 插件 → 界面插件** 添加本地目录，保存入口代码后只更新对应展示区域；首批插槽覆盖正文、文档预览和主题，不开放 Session、Provider 或底层工具端口。见[插件接口与示例](docs/product/ui-plugins.md)。
+
+## 文档排版与预览
+
+内置 [deepcode-documents Skill](skills/deepcode-documents/SKILL.md) 在用户要求美化、排版或导出文档时按需读取，包含来自 Kami 排版思路的设计参考、HTML 模板和格式说明。普通对话不自动导出文件。可以直接要求 Agent：
+
+> 把这份分析排成简洁的中文报告，输出 HTML、PDF 和 Markdown，保存在当前工作区。
+
+`document.render` 使用现有工作区写入权限和 Plan 范围，成功写入后才把真实产物交给 Session 投影。HTML / Markdown 无额外生成依赖；PDF 将自包含 HTML 交给 WeasyPrint。到“设置 → 插件 → 文档排版”指定安装了 [WeasyPrint](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html) 的 Python 路径；Python 依赖范围见 [requirements.txt](skills/deepcode-documents/scripts/requirements.txt)。开发容器已提供该环境。原生使用环境需自行具备对应平台的 WeasyPrint 运行依赖，配置错误会保留原错误，不覆盖已有文件。
+
+点击 GUI / Editor 的产物或消息中的工作区链接可预览文档：HTML 在独立静态页面内显示，可切换源码；PDF 使用本地 PDF.js 阅读，支持翻页、缩放、文字选择和下载；Markdown 复用现有渲染器。读取 PDF 不依赖 Python，也不使用在线预览服务。输出 HTML 应内嵌图片、SVG 和样式，PDF 不执行 JavaScript；普通文本的分页读取保持原行为。
+
 ## 配置模型
 
 首次运行任务前：
