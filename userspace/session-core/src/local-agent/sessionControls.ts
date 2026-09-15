@@ -68,7 +68,7 @@ const PLAN_OPERATION_SCHEMA: JsonObject = {
         workspace: { type: 'string', minLength: 1 },
         operation: {
           type: 'string',
-          enum: ['fs.write', 'fs.edit'],
+          enum: ['fs.write', 'fs.edit', 'document.render', 'browser.capture'],
         },
         target: { type: 'string', minLength: 1 },
         targetKind: { type: 'string', enum: ['file', 'directoryTree'], description: 'Omit or use file for one file. directoryTree explicitly permits creating and editing descendant files; it does not permit deletion.' },
@@ -195,7 +195,7 @@ export function sessionControlToolDefinitions(): readonly ProviderToolDefinition
     },
     {
       name: SESSION_CONTROL_PLAN_PUBLISH,
-      description: 'Propose a Plan for user confirmation. Steps are stable outcome phases, not files, commands or implementation recipes; new tasks need not repeat completed history. For scope additions only, use mode=extendScope with summary explaining why and mutationManifest containing additions; Session preserves the current phases, verification and progress. If the task needs a rewritten Plan, omit mode, retain existing stepIds and submit title, summary, steps and the full effective manifest. Scope expansion and Plan rewrites take effect only after user confirmation. fs.edit/fs.write share file or explicit directoryTree scope; deletion is separate. When creating a module, propose its specific directoryTree scope upfront so new implementation files within that approved directory need no extra confirmation; list unrelated root files separately. Bash command is an optional example, not an exact script lock. Routine fixes within confirmed scope need no reconfirmation. Titles use inline Markdown; other text uses Markdown.',
+      description: 'Propose a Plan for user confirmation. Steps are stable outcome phases, not files, commands or implementation recipes; new tasks need not repeat completed history. For scope additions only, use mode=extendScope with summary explaining why and mutationManifest containing additions; Session preserves the current phases, verification and progress. If the task needs a rewritten Plan, omit mode, retain existing stepIds and submit title, summary, steps and the full effective manifest. Scope expansion and Plan rewrites take effect only after user confirmation. fs.edit/fs.write/document.render/browser.capture share file or explicit directoryTree scope; deletion is separate. When creating a module, propose its specific directoryTree scope upfront so new implementation files within that approved directory need no extra confirmation; list unrelated root files separately. Bash command is an optional example, not an exact script lock. Routine fixes within confirmed scope need no reconfirmation. Titles use inline Markdown; other text uses Markdown.',
       inputSchema: structuredClone(PLAN_SCHEMA) as JsonObject,
     },
     {
@@ -435,7 +435,7 @@ function decodePlanOperation(value: unknown, index: number): PlanOperation {
   if (value.targetKind !== undefined && value.targetKind !== 'file' && value.targetKind !== 'directoryTree') {
     throw new SessionControlError('session_control_plan_target_kind_invalid', '写入范围的 targetKind 必须是 file 或 directoryTree。');
   }
-  if (!['fs.write', 'fs.edit'].includes(String(operation))) {
+  if (!['fs.write', 'fs.edit', 'document.render', 'browser.capture'].includes(String(operation))) {
     throw new SessionControlError(
       'session_control_plan_operation_unknown',
       'Plan operation 不属于 v2 闭合集合。',

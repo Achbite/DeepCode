@@ -6,6 +6,7 @@ export type SettingCatalogDomain =
   | 'agent'
   | 'skills'
   | 'mcp'
+  | 'plugins'
   | 'editor'
   | 'workbench'
   | 'files'
@@ -40,11 +41,13 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'workbench.colorTheme': 'vs-dark',
   'workbench.language': 'zh-CN',
   'workbench.styleTokenOverrides': '{}',
+  'workbench.uiPlugins': '[]',
   'gui.colorTheme': 'light',
   'gui.accentColor': 'blue',
   'gui.navigationDensity': 'comfortable',
   'gui.showContextRail': true,
   'gui.showReasoning': false,
+  'gui.defaultFileOpen': 'reader',
   'gui.sidebarOrder': '{"projects":[],"sessions":[]}',
   'terminal.integrated.defaultProfile.windows': 'wsl',
   'terminal.integrated.prewarm': 'afterStartup',
@@ -62,16 +65,19 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'agent.web.search.endpointTemplate': '',
   'agent.web.search.authHeaderName': 'Authorization',
   'agent.web.search.authSecretRef': '',
+  'agent.documents.pythonPath': '',
   'skills.autoLoad': true,
   'skills.mounts': '[]',
   'mcp.autoLoad': false,
   'mcp.servers': '[]',
+  'plugins.sources': '[]',
+  'plugins.disabled': '[]',
 };
 
 const SHARED_AGENT_PREFIX = 'agent.';
-const PLUGIN_SETTING_PREFIXES = ['skills.', 'mcp.'];
+const PLUGIN_SETTING_PREFIXES = ['skills.', 'mcp.', 'plugins.'];
 const NON_SHELL_SETTING_PREFIXES = [SHARED_AGENT_PREFIX, ...PLUGIN_SETTING_PREFIXES];
-const WORKSPACE_OVERRIDABLE_KEYS = new Set(['skills.mounts', 'mcp.servers']);
+const WORKSPACE_OVERRIDABLE_KEYS = new Set(['skills.mounts', 'mcp.servers', 'plugins.sources']);
 
 export const SETTING_CATALOG: readonly SettingCatalogEntry[] = Object.freeze(
   Object.keys(DEFAULT_USER_SETTINGS).map((key) => ({
@@ -116,12 +122,13 @@ function domainForKey(key: string): SettingCatalogDomain {
 
 function isDomain(value: string): value is SettingCatalogDomain {
   return [
-    'agent', 'skills', 'mcp', 'editor', 'workbench', 'files', 'keyboard',
+    'agent', 'skills', 'mcp', 'plugins', 'editor', 'workbench', 'files', 'keyboard',
     'explorer', 'terminal', 'gui', 'cli', 'tui',
   ].includes(value);
 }
 
 function surfacesForKey(key: string): SettingsSurface[] {
+  if (key === 'workbench.uiPlugins') return ['editor', 'gui'];
   const domain = domainForKey(key);
   if (NON_SHELL_SETTING_PREFIXES.some((prefix) => key.startsWith(prefix))) {
     return ['editor', 'gui', 'cli', 'tui'];

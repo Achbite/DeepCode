@@ -350,6 +350,7 @@ fn assert_executor_bindings_match_tool_registry(
 
 #[path = "executors/file_changes.rs"]
 mod file_changes;
+pub use file_changes::{capture_side as capture_file_change_side, change_fact as file_change_fact};
 #[path = "executors/fs.rs"]
 mod filesystem;
 mod process;

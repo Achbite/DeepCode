@@ -91,6 +91,12 @@ export type FilesystemReference = {
 export type PluginUri = `plugin://${string}@${string}`;
 
 export interface PluginCatalogItem {
+  source: 'builtin' | 'mounted';
+  category: 'functional' | 'reference';
+  management?: {key: 'plugins.disabled' | 'plugins.sources' | 'mcp.servers' | 'skills.mounts'; id: string; path?: string};
+  contributionKind: 'skill' | 'mcp' | 'cli';
+  discovery: 'default' | 'searchOnly';
+  reference?: {toolName:'skill.read'|'doc.read';name:string};
   uri: PluginUri;
   displayName: string;
   shortDescription: string;
@@ -104,6 +110,10 @@ export interface PluginCatalogItem {
 export interface PluginCatalogProjection {
   revision: string;
   plugins: PluginCatalogItem[];
+}
+
+export interface GuidanceReference {
+  referenceId: string; uri: string; label: string; toolName: 'skill.read' | 'doc.read'; name: string;
 }
 
 export interface PluginSelectionInput {
@@ -126,6 +136,8 @@ export interface SelectedPluginSnapshot {
 export type PlanOperationName =
   | 'fs.write'
   | 'fs.edit'
+  | 'document.render'
+  | 'browser.capture'
   | 'fs.delete'
   | 'bash'
   | 'powershell';
@@ -215,6 +227,8 @@ export type ConversationCommand =
       reasoningEffortOverride?: LlmReasoningEffort | null;
       pluginCatalogRevision?: string;
       pluginSelections?: PluginSelectionInput[];
+      guidanceReferences?: GuidanceReference[];
+      hostBinding?: { hostInstanceId: string; windowLabel: string };
     }
   | {
       schemaVersion: typeof CONVERSATION_COMMAND_VERSION;
@@ -227,6 +241,8 @@ export type ConversationCommand =
       reasoningEffortOverride?: LlmReasoningEffort | null;
       pluginCatalogRevision?: string;
       pluginSelections?: PluginSelectionInput[];
+      guidanceReferences?: GuidanceReference[];
+      hostBinding?: { hostInstanceId: string; windowLabel: string };
     }
   | {
       schemaVersion: typeof CONVERSATION_COMMAND_VERSION;
@@ -484,6 +500,7 @@ export interface ContextCompositionPartitionProjection
 export type ProviderResponseConstraint = 'normal' | 'toolRequired' | 'answerOnly';
 
 export interface ContextCompositionReceipt {
+  kernelCatalogSnapshotRef?: string;
   providerRequestId: string;
   purpose: 'agent' | 'contextCompaction';
   responseConstraint: ProviderResponseConstraint;
@@ -507,6 +524,7 @@ interface ContextCompositionProjectionBase {
 }
 
 export interface ContextCompositionProjection extends ContextCompositionProjectionBase {
+  kernelCatalogSnapshotRef?: string;
   stableCoreHash: string;
   baseToolSchemaHash: string;
   selectedPluginSnapshotHash: string;
@@ -589,11 +607,13 @@ export type SessionEvent =
       type: 'input.queued';
       runId: string;
       payload: {
+        pluginCatalogRevision?: string;
         commandId: string;
         messageId: string;
         text: string;
         filesystemReferences?: FilesystemReference[];
         pluginSelections?: PluginSelectionInput[];
+      guidanceReferences?: GuidanceReference[];
       };
     })
   | (SessionEventBase & {
@@ -603,7 +623,13 @@ export type SessionEvent =
         messageId: string;
         text: string;
         pluginSelections?: PluginSelectionInput[];
+      guidanceReferences?: GuidanceReference[];
       };
+    })
+  | (SessionEventBase & {
+      type: 'run.tools.prepared';
+      runId: string;
+      payload: { toolView: PreparedRequestToolView };
     })
   | (SessionEventBase & {
       type: 'run.started';
@@ -624,6 +650,7 @@ export type SessionEvent =
         content: string;
         filesystemReferences?: FilesystemReference[];
         pluginSelections?: PluginSelectionInput[];
+      guidanceReferences?: GuidanceReference[];
         providerRequestId: string;
       };
     })
@@ -637,6 +664,7 @@ export type SessionEvent =
         content: string;
         filesystemReferences?: FilesystemReference[];
         pluginSelections?: PluginSelectionInput[];
+      guidanceReferences?: GuidanceReference[];
       };
     })
   | (SessionEventBase & {
@@ -866,6 +894,7 @@ interface ProjectionMessageBase {
   content: string;
   filesystemReferences: FilesystemReference[];
   pluginSelections: PluginSelectionInput[];
+  guidanceReferences?: GuidanceReference[];
   feedback: MessageFeedback | null;
   sequence: number;
   createdAt: string;
@@ -1146,6 +1175,14 @@ export interface ShellExecutionEnvironmentProjection {
 export interface ArtifactProjection {
   artifactId: string;
   label: string;
+  sessionId: string;
+  runId: string;
+  callId: string;
+  recordId: string;
+  contentType: string;
+  contentMode: 'fixed' | 'live';
+  createdAt: string;
+  sourcePage?: JsonObject;
   workspaceId?: string;
   logicalPath?: string;
   uri?: string;
@@ -1161,12 +1198,14 @@ export interface SessionModelSettings {
 }
 
 export interface QueuedInputProjection {
+  pluginCatalogRevision?: string;
   commandId: string;
   messageId: string;
   runId: string;
   text: string;
   filesystemReferences: FilesystemReference[];
   pluginSelections: PluginSelectionInput[];
+  guidanceReferences?: GuidanceReference[];
   sequence: number;
   createdAt: string;
   /** A terminal run retains unconsumed input visibly without starting another run. */
@@ -1438,8 +1477,16 @@ export interface RunRuntimeSnapshot {
   selectedPlugins: SelectedPluginSnapshot;
 }
 
+/** Immutable tool contribution view; Provider and workspace settings remain run-owned. */
+export type PreparedRequestToolView = Pick<RunRuntimeSnapshot,
+  'extensionGenerationRef' | 'kernelCatalogSnapshotRef' | 'instructions' | 'tools'
+  | 'toolPromptContributions' | 'providerToolAliases' | 'selectedPlugins'>;
+
 export interface PrepareRunRuntimeRequest {
+  /** Refresh previously selected sources; disabled/removed sources withdraw at this request boundary. */
+  refreshPlugins?: boolean;
   environment?: JsonObject;
+  hostBinding?: { hostInstanceId: string; windowLabel: string };
   restoreEnvironment?: boolean;
   sessionId: string;
   runId: string;
@@ -1447,6 +1494,7 @@ export interface PrepareRunRuntimeRequest {
   reasoningEffortOverride?: LlmReasoningEffort;
   pluginCatalogRevision?: string;
   pluginSelections?: PluginSelectionInput[];
+      guidanceReferences?: GuidanceReference[];
 }
 
 export interface PreparedRunRuntime {

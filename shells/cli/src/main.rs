@@ -1146,9 +1146,11 @@ fn print_plugin_catalog(
 ) {
     let query = query.to_lowercase();
     let matches = catalog.plugins.iter().filter(|plugin| {
-        query.is_empty()
-            || plugin.display_name.to_lowercase().contains(&query)
-            || plugin.uri.to_lowercase().contains(&query)
+        (query.is_empty() && plugin.discovery == "default")
+            || (!query.is_empty()
+                && (plugin.display_name.to_lowercase().contains(&query)
+                    || plugin.uri.to_lowercase().contains(&query)
+                    || plugin.short_description.to_lowercase().contains(&query)))
     });
     let mut found = false;
     for plugin in matches {
@@ -1337,10 +1339,11 @@ mod tests {
     #[test]
     fn unavailable_plugin_selection_preserves_the_catalog_error() {
         let catalog: PluginCatalogProjection = serde_json::from_value(json!({"revision":"catalog:test", "plugins":[{
-            "uri":"plugin://broken", "displayName":"Broken", "shortDescription":"Broken entry", "activationMediaTypes":[],
+            "source":"mounted","category":"functional","contributionKind":"mcp","discovery":"default",
+            "uri":"plugin://broken@mcp", "displayName":"Broken", "shortDescription":"Broken entry", "activationMediaTypes":[],
             "enabled":false,"available":false,"error":{"code":"plugin_manifest_invalid","message":"manifest parse failed"}
         }]})).unwrap();
-        let error = plugin_binding_from_catalog(catalog, &["plugin://broken".into()])
+        let error = plugin_binding_from_catalog(catalog, &["plugin://broken@mcp".into()])
             .err()
             .unwrap();
         assert!(error.contains("plugin_manifest_invalid"));

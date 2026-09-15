@@ -36,6 +36,7 @@ deepcode-kernel-runtime = { path = "crates/deepcode-kernel-runtime" }
 deepcode-kernel-daemon = { path = "crates/deepcode-kernel-daemon" }
 deepcode-kernel-client = { path = "crates/deepcode-kernel-client" }
 deepcode-host-connection = { path = "crates/deepcode-host-connection" }
+deepcode-first-party-tools = { path = "crates/deepcode-first-party-tools" }
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

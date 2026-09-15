@@ -4,7 +4,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 const SESSION_STORE_SCHEMA: &str = include_str!("../../../contracts/agent-runtime/session.sql");
-const SESSION_STORE_VERSION: u32 = 7;
 const EVENT_VERSION: &str = "deepcode.session-event.v4";
 const COMMAND_VERSION: &str = "deepcode.command.v3";
 const REPLY_VERSION: &str = "deepcode.command-reply.v3";
@@ -55,36 +54,20 @@ impl LocalAgentJournal {
             })?;
         }
         let existed = path.exists();
-        let connection = Connection::open(path).map_err(sql_open_error)?;
+        let mut connection = Connection::open(path).map_err(sql_open_error)?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(sql_error("session_store_busy_timeout_failed"))?;
         connection
             .execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;")
             .map_err(sql_error("session_store_pragma_failed"))?;
-        let version: u32 = connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .map_err(sql_error("session_store_version_read_failed"))?;
-        match version {
-            0 if !existed || sqlite_is_empty(&connection)? => {
-                connection
-                    .execute_batch(SESSION_STORE_SCHEMA)
-                    .map_err(sql_error("session_store_schema_create_failed"))?;
-                verify_session_store(&connection)?;
-                verify_session_store_version(&connection)?;
-            }
-            SESSION_STORE_VERSION => {
-                verify_session_store(&connection)?;
-                verify_session_store_version(&connection)?;
-                verify_current_event_constraint(&connection)?;
-            }
-            other => {
-                return Err(LocalAgentStoreError::new(
-                    "session_store_version_unsupported",
-                    format!("Session Store schema {other} 不受支持；当前只接受 schema {SESSION_STORE_VERSION}。"),
-                ))
-            }
+        if !existed || sqlite_is_empty(&connection)? {
+            connection
+                .execute_batch(SESSION_STORE_SCHEMA)
+                .map_err(sql_error("session_store_schema_create_failed"))?;
         }
+        verify_session_store(&connection)?;
+        extend_event_storage(&mut connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
@@ -694,6 +677,7 @@ fn validate_new_event(
         "session.directory-index.detached",
         "input.accepted",
         "input.queued",
+        "run.tools.prepared",
         "run.started",
         "message.committed",
         "message.feedback.updated",
@@ -902,9 +886,14 @@ fn validate_new_event(
                 payload,
                 &["commandId", "messageId", "text"],
                 if event_type == "input.queued" {
-                    &["filesystemReferences", "pluginSelections"]
+                    &[
+                        "filesystemReferences",
+                        "pluginSelections",
+                        "pluginCatalogRevision",
+                        "guidanceReferences",
+                    ]
                 } else {
-                    &["pluginSelections"]
+                    &["pluginSelections", "guidanceReferences"]
                 },
             )?;
             validate_id("commandId", required_string(payload, "commandId")?)?;
@@ -940,6 +929,23 @@ fn validate_new_event(
             validate_id("commandId", required_string(payload, "commandId")?)?;
             validate_id("workspaceId", required_string(payload, "workspaceId")?)?;
         }
+        "run.tools.prepared" => {
+            let payload = event.get("payload").expect("validated payload");
+            exact_object(payload, &["toolView"], &[])?;
+            exact_object(
+                &payload["toolView"],
+                &[
+                    "extensionGenerationRef",
+                    "kernelCatalogSnapshotRef",
+                    "instructions",
+                    "tools",
+                    "toolPromptContributions",
+                    "providerToolAliases",
+                    "selectedPlugins",
+                ],
+                &[],
+            )?;
+        }
         "run.started" => {
             let payload = event.get("payload").expect("validated payload");
             exact_object(
@@ -971,6 +977,7 @@ fn validate_new_event(
                 &[
                     "filesystemReferences",
                     "pluginSelections",
+                    "guidanceReferences",
                     "providerRequestId",
                 ],
             )?;
@@ -1338,7 +1345,7 @@ fn validate_new_event(
                     "tools",
                     "partitions",
                 ],
-                &[],
+                &["kernelCatalogSnapshotRef"],
             )?;
             validate_id(
                 "providerRequestId",
@@ -1745,6 +1752,7 @@ fn validate_event_facts(
         || matches!(
             event_type,
             "input.queued"
+                | "run.tools.prepared"
                 | "narrative.committed"
                 | "plan.published"
                 | "plan.confirmed"
@@ -2236,10 +2244,42 @@ fn validate_event_facts(
                 ));
             }
         }
+        "run.tools.prepared" => {
+            let run_id = required_string(event, "runId")?;
+            if pending_provider_composition_exists(transaction, session_id, run_id)? {
+                return Err(LocalAgentStoreError::new(
+                    "provider_turn_still_active",
+                    "工具视图只能在 Provider 请求之间生效。",
+                ));
+            }
+            let mut runtime = run_runtime_snapshot_fact(transaction, session_id, run_id)?;
+            let view = &event["payload"]["toolView"];
+            for (field, value) in view.as_object().expect("validated tool view") {
+                runtime[field] = value.clone();
+            }
+            validate_run_runtime_snapshot(&runtime)?;
+        }
         "context.composed" => {
             let run_id = required_string(event, "runId")?;
             let payload = event.get("payload").expect("validated payload");
             let provider_request_id = required_string(payload, "providerRequestId")?;
+            if let Some(catalog) = payload
+                .get("kernelCatalogSnapshotRef")
+                .and_then(Value::as_str)
+            {
+                let valid: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2 AND
+                    ((event_type='run.started' AND json_extract(payload_json,'$.runtimeSnapshot.kernelCatalogSnapshotRef')=?3)
+                    OR (event_type='run.tools.prepared' AND json_extract(payload_json,'$.toolView.kernelCatalogSnapshotRef')=?3)))",
+                    params![session_id, run_id, catalog], |row| row.get(0),
+                ).map_err(sql_error("session_event_fact_read_failed"))?;
+                if !valid {
+                    return Err(LocalAgentStoreError::new(
+                        "tool_request_binding_missing",
+                        "Provider 请求缺少所属 run 的准备工具视图。",
+                    ));
+                }
+            }
             let pending_composition: bool = transaction
                 .query_row(
                     "SELECT EXISTS(
@@ -2636,7 +2676,19 @@ fn validate_event_facts(
                 }
             }
             if event_type == "run.runtime.released" {
-                let expected = runtime
+                let latest_tool_view: Option<String> = transaction.query_row(
+                    "SELECT json_extract(payload_json,'$.toolView') FROM session_events WHERE session_id=?1 AND run_id=?2 AND event_type='run.tools.prepared' ORDER BY sequence DESC LIMIT 1",
+                    params![session_id,run_id],|row|row.get(0),
+                ).optional().map_err(sql_error("session_event_fact_read_failed"))?;
+                let latest_tool_view: Option<Value> = latest_tool_view
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()
+                    .map_err(|error| {
+                        LocalAgentStoreError::new("session_event_invalid", error.to_string())
+                    })?;
+                let expected = latest_tool_view
+                    .as_ref()
+                    .unwrap_or(&runtime)
                     .pointer("/selectedPlugins/plugins")
                     .and_then(Value::as_array)
                     .expect("validated selected plugins")
@@ -3068,8 +3120,45 @@ fn validate_command(command: &Value) -> Result<(), LocalAgentStoreError> {
                 "reasoningEffortOverride",
                 "pluginCatalogRevision",
                 "pluginSelections",
+                "guidanceReferences",
+                "hostBinding",
             ],
         )?;
+        if let Some(references) = command.get("guidanceReferences") {
+            let references = references.as_array().ok_or_else(|| {
+                LocalAgentStoreError::new(
+                    "guidance_references_invalid",
+                    "Guidance references must be an array.",
+                )
+            })?;
+            for reference in references {
+                exact_object(
+                    reference,
+                    &["referenceId", "uri", "label", "toolName", "name"],
+                    &[],
+                )?;
+                for field in ["referenceId", "uri", "label", "name"] {
+                    required_string(reference, field)?;
+                }
+                if !matches!(
+                    reference["toolName"].as_str(),
+                    Some("skill.read" | "doc.read")
+                ) {
+                    return Err(LocalAgentStoreError::new(
+                        "guidance_reference_invalid",
+                        "Unsupported guidance reader.",
+                    ));
+                }
+            }
+        }
+        if let Some(binding) = command.get("hostBinding") {
+            exact_object(binding, &["hostInstanceId", "windowLabel"], &[])?;
+            validate_id(
+                "hostInstanceId",
+                required_string(binding, "hostInstanceId")?,
+            )?;
+            validate_id("windowLabel", required_string(binding, "windowLabel")?)?;
+        }
         if let Some(run_id) = command.get("runId") {
             if command_type != "message.submit" {
                 return Err(LocalAgentStoreError::new(
@@ -3379,7 +3468,10 @@ fn validate_plan_operations(value: &Value) -> Result<(), LocalAgentStoreError> {
                     "文件写入范围的 targetKind 必须是 file 或 directoryTree。",
                 ));
             }
-            if !matches!(name, "fs.write" | "fs.edit") {
+            if !matches!(
+                name,
+                "fs.write" | "fs.edit" | "document.render" | "browser.capture"
+            ) {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
                     "Plan operation 不属于闭合 mutation 集合。",
@@ -5150,18 +5242,10 @@ fn strip_null_object_fields(mut value: Value) -> Value {
     value
 }
 
-fn verify_current_event_constraint(connection: &Connection) -> Result<(), LocalAgentStoreError> {
-    let table_sql = SESSION_STORE_SCHEMA
-        .split(';')
-        .map(str::trim)
-        .find(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS session_events ("))
-        .expect("canonical session_events table definition");
-    let normalize = |sql: &str| {
-        sql.replace(" IF NOT EXISTS", "")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
+// Event kinds belong to validate_new_event, not a database-version gate. Older
+// stores embedded an enum CHECK; expand only that constraint in one transaction.
+// Keep the stored DDL, rowids, payload bytes, indexes and triggers unchanged otherwise.
+fn extend_event_storage(connection: &mut Connection) -> Result<(), LocalAgentStoreError> {
     let stored_sql: String = connection
         .query_row(
             "SELECT sql FROM sqlite_schema WHERE type='table' AND name='session_events'",
@@ -5169,48 +5253,82 @@ fn verify_current_event_constraint(connection: &Connection) -> Result<(), LocalA
             |row| row.get(0),
         )
         .map_err(sql_error("session_store_verify_failed"))?;
-    if normalize(&stored_sql) == normalize(table_sql) {
+    let event_constraint = regex::Regex::new(
+        r"(?is)CHECK\s*\(\s*event_type\s+IN\s*\(\s*(?:'[^']*'\s*,\s*)*'[^']*'\s*\)\s*\)",
+    )
+    .expect("event type constraint pattern");
+    if !event_constraint.is_match(&stored_sql) {
         return Ok(());
     }
-    Err(LocalAgentStoreError::new(
-        "session_store_event_schema_mismatch",
-        "Session event 表与当前合同不一致；未修改数据库结构或历史记录。",
-    ))
+    let expanded_sql = event_constraint.replace(&stored_sql, "CHECK(length(event_type) > 0)");
+    let new_table_sql = expanded_sql.replacen("session_events", "session_events_expanded", 1);
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sql_error("session_store_event_extension_failed"))?;
+    let definitions = transaction
+        .prepare("SELECT sql FROM sqlite_schema WHERE tbl_name='session_events' AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY type,name")
+        .and_then(|mut statement| statement.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>())
+        .map_err(sql_error("session_store_event_extension_failed"))?;
+    let columns = transaction
+        .prepare("PRAGMA table_info(session_events)")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(sql_error("session_store_event_extension_failed"))?;
+    let columns = columns
+        .iter()
+        .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(",");
+    transaction
+        .execute_batch(&new_table_sql)
+        .map_err(sql_error("session_store_event_extension_failed"))?;
+    transaction.execute_batch(&format!(
+        "INSERT INTO session_events_expanded(rowid,{columns}) SELECT rowid,{columns} FROM session_events;
+         DROP TABLE session_events;
+         ALTER TABLE session_events_expanded RENAME TO session_events;"
+    )).map_err(sql_error("session_store_event_extension_failed"))?;
+    for definition in definitions {
+        transaction
+            .execute_batch(&definition)
+            .map_err(sql_error("session_store_event_extension_failed"))?;
+    }
+    transaction
+        .commit()
+        .map_err(sql_error("session_store_event_extension_failed"))
 }
 
 fn verify_session_store(connection: &Connection) -> Result<(), LocalAgentStoreError> {
-    for name in [
-        "sessions",
-        "session_workspace_bindings",
-        "session_events",
-        "session_commands",
+    // Probe the fields actually consumed by the journal. Neither SQL formatting,
+    // additional columns nor a historical user_version imply incompatibility.
+    for (table, columns) in [
+        (
+            "sessions",
+            "session_id,display_title,initial_profile_id,created_at",
+        ),
+        (
+            "session_workspace_bindings",
+            "session_id,position,workspace_id,display_name",
+        ),
+        (
+            "session_events",
+            "session_id,sequence,event_id,event_type,run_id,call_id,payload_json,occurred_at",
+        ),
+        (
+            "session_commands",
+            "session_id,command_id,command_json,reply_json,committed_revision,committed_at",
+        ),
     ] {
-        let present: bool = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
-                params![name],
-                |row| row.get(0),
-            )
-            .map_err(sql_error("session_store_verify_failed"))?;
-        if !present {
-            return Err(LocalAgentStoreError::new(
-                "session_store_schema_incomplete",
-                format!("Session Store 缺少 {name} 表。"),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn verify_session_store_version(connection: &Connection) -> Result<(), LocalAgentStoreError> {
-    let version: u32 = connection
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .map_err(sql_error("session_store_version_read_failed"))?;
-    if version != SESSION_STORE_VERSION {
-        return Err(LocalAgentStoreError::new(
-            "session_store_version_mismatch",
-            format!("Session Store schema {version} 不是当前 schema {SESSION_STORE_VERSION}。"),
-        ));
+        connection
+            .prepare(&format!("SELECT {columns} FROM {table} LIMIT 0"))
+            .map_err(|error| {
+                LocalAgentStoreError::new(
+                    "session_store_schema_incomplete",
+                    format!("Session Store 无法读取 {table} 的必需字段：{error}"),
+                )
+            })?;
     }
     Ok(())
 }
@@ -5625,20 +5743,19 @@ mod tests {
     }
 
     #[test]
-    fn journal_rejects_incorrect_event_constraint_without_rewriting_history() {
+    fn journal_extends_event_storage_without_rewriting_history() {
         let path = std::env::temp_dir().join(format!(
             "deepcode-session-constraint-{}.sqlite3",
             random_id("test").unwrap().replace(':', "-")
         ));
         let connection = Connection::open(&path).unwrap();
-        // Reproduce the exact schema-7 omission observed in the installed app.
         connection
-            .execute_batch(
-                &SESSION_STORE_SCHEMA
-                    .replace("        'session.model-settings.updated',\n", "")
-                    .replace("        'tool.input-rejected',\n", ""),
-            )
+            .execute_batch(&SESSION_STORE_SCHEMA.replace(
+                "CHECK(length(event_type) > 0)",
+                "CHECK(event_type IN ('session.created','input.accepted'))",
+            ))
             .unwrap();
+        connection.execute_batch("PRAGMA user_version=7;").unwrap();
         let journal = LocalAgentJournal {
             connection: Arc::new(Mutex::new(connection)),
         };
@@ -5694,14 +5811,7 @@ mod tests {
         let before_table = read_table(&journal);
         let before_schema_revision = read_schema_revision(&journal);
         drop(journal);
-        let error = LocalAgentJournal::open(&path)
-            .err()
-            .expect("invalid event table must fail open");
-        assert_eq!(error.code, "session_store_event_schema_mismatch");
-        // Inspect the original database directly after the rejected open.
-        let unchanged = LocalAgentJournal {
-            connection: Arc::new(Mutex::new(Connection::open(&path).unwrap())),
-        };
+        let unchanged = LocalAgentJournal::open(&path).expect("extend the event constraint");
         assert_eq!(
             unchanged.read_events("session:loop", 0).unwrap(),
             before_events
@@ -5713,16 +5823,48 @@ mod tests {
             before_command
         );
         assert_eq!(read_indexes(&unchanged), before_indexes);
-        assert_eq!(read_table(&unchanged), before_table);
-        assert_eq!(read_schema_revision(&unchanged), before_schema_revision);
+        assert_ne!(read_table(&unchanged), before_table);
+        assert!(read_schema_revision(&unchanged) > before_schema_revision);
+        assert_eq!(
+            unchanged
+                .lock()
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            7
+        );
         assert_eq!(unchanged.lock().unwrap().query_row(
             "SELECT display_name FROM session_workspace_bindings WHERE session_id='session:loop'", [],
             |row| row.get::<_, String>(0)
         ).unwrap(), "Test");
-        assert!(unchanged.lock().unwrap().execute(
-            "INSERT INTO session_events(session_id,sequence,event_id,event_type,payload_json,occurred_at)
-             VALUES ('session:loop',999,'event:invalid','undeclared.event','{}','2026-09-07T00:00:00Z')", []
-        ).is_err(), "undeclared events must still fail the database CHECK");
+        assert!(
+            unchanged
+                .append(&json!({
+                    "type":"undeclared.event", "sessionId":"session:loop", "payload":{}
+                }))
+                .is_err(),
+            "unknown events must still fail at the journal write boundary"
+        );
+        append_model_settings_and_rejected_call(&unchanged);
+        let runtime = runtime_snapshot();
+        let view: Map<String, Value> = [
+            "extensionGenerationRef",
+            "kernelCatalogSnapshotRef",
+            "instructions",
+            "tools",
+            "toolPromptContributions",
+            "providerToolAliases",
+            "selectedPlugins",
+        ]
+        .into_iter()
+        .map(|field| (field.to_string(), runtime[field].clone()))
+        .collect();
+        unchanged
+            .append(&json!({
+                "type":"run.tools.prepared", "sessionId":"session:loop", "runId":"run:loop",
+                "payload":{"toolView":view}
+            }))
+            .expect("write the newly introduced event to the existing conversation");
         assert_eq!(
             unchanged
                 .lock()
@@ -5731,8 +5873,120 @@ mod tests {
                 .unwrap(),
             "ok"
         );
+        let after_events = unchanged.read_events("session:loop", 0).unwrap();
+        let after_schema_revision = read_schema_revision(&unchanged);
         drop(unchanged);
+        let reopened = LocalAgentJournal::open(&path).unwrap();
+        assert_eq!(
+            reopened.read_events("session:loop", 0).unwrap(),
+            after_events
+        );
+        assert_eq!(read_schema_revision(&reopened), after_schema_revision);
+        drop(reopened);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn journal_uses_required_fields_instead_of_a_version_gate() {
+        let path = std::env::temp_dir().join(format!(
+            "deepcode-session-shape-{}.sqlite3",
+            random_id("test").unwrap().replace(':', "-")
+        ));
+        let journal = LocalAgentJournal::open(&path).unwrap();
+        journal
+            .create_session("session:shape", "History", &json!([]), None)
+            .unwrap();
+        let before = journal.read_events("session:shape", 0).unwrap();
+        assert_eq!(
+            journal
+                .lock()
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+        journal
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA user_version=8;")
+            .unwrap();
+        drop(journal);
+        let reopened = LocalAgentJournal::open(&path)
+            .expect("compatible fields with a historical version marker");
+        assert_eq!(reopened.read_events("session:shape", 0).unwrap(), before);
+        assert_eq!(
+            reopened
+                .lock()
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            8
+        );
+        reopened
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE session_events RENAME COLUMN payload_json TO unavailable_payload;",
+            )
+            .unwrap();
+        drop(reopened);
+        let error = LocalAgentJournal::open(&path)
+            .err()
+            .expect("missing required column");
+        assert_eq!(error.code, "session_store_schema_incomplete");
+        assert!(error.message.contains("payload_json"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn journal_event_extension_rolls_back_on_invalid_stored_content() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(&SESSION_STORE_SCHEMA.replace(
+                "CHECK(length(event_type) > 0)",
+                "CHECK(event_type IN ('session.created',''))",
+            ))
+            .unwrap();
+        connection.execute_batch("INSERT INTO sessions VALUES ('session:bad','History',NULL,'time');
+            INSERT INTO session_events VALUES ('session:bad',1,'event:bad','',NULL,NULL,'{}','time');").unwrap();
+        let before: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='session_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let error = extend_event_storage(&mut connection).unwrap_err();
+        assert_eq!(error.code, "session_store_event_extension_failed");
+        assert!(error.message.contains("CHECK constraint failed"));
+        let after: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='session_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT event_type FROM session_events WHERE event_id='event:bad'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            ""
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE name='session_events_expanded'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
     }
 
     fn append_model_settings_and_rejected_call(journal: &LocalAgentJournal) {

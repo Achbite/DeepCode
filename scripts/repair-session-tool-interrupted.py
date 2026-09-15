@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit, one-time repair of a confirmed schema-7 event CHECK omission.
+"""Explicit offline expansion of an old Session event CHECK constraint.
 
 Run only against an idle config root. This is an operator action, never a
 daemon startup migration. The supplied backup path must not already exist.
@@ -12,12 +12,17 @@ from contextlib import closing
 from itertools import zip_longest
 import json
 import os
+import re
 from pathlib import Path
 import sqlite3
 
 
 SCHEMA = Path(__file__).resolve().parents[1] / "contracts/agent-runtime/session.sql"
 REPAIR_EVENTS = ("tool.interrupted", "input.queued")
+EVENT_TYPE_ENUM = re.compile(
+    r"CHECK\s*\(\s*event_type\s+IN\s*\(\s*(?:'[^']*'\s*,\s*)*'[^']*'\s*\)\s*\)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def normalize(sql: str) -> str:
@@ -63,15 +68,6 @@ def repair(config_root: Path, backup: Path, event: str = "tool.interrupted") -> 
     runtime = config_root.resolve(strict=True) / "runtime" / "agent-runtime"
     database = (runtime / "session.sqlite3").resolve(strict=True)
     backup = backup.resolve()
-    table_sql = next(
-        statement.strip() for statement in SCHEMA.read_text().split(";")
-        if statement.strip().startswith("CREATE TABLE IF NOT EXISTS session_events (")
-    )
-    event_line = f"        '{event}',\n"
-    if table_sql.count(event_line) != 1:
-        raise RuntimeError("Current contract no longer matches this one-time repair")
-    previous_sql = table_sql.replace(event_line, "")
-
     # Same SQLite lease as ConfigRootLease; no PID guessing or process killing.
     with closing(sqlite3.connect(runtime / "root-owner.lock", timeout=0)) as lease:
         lease.execute("PRAGMA journal_mode=DELETE")
@@ -81,16 +77,16 @@ def repair(config_root: Path, backup: Path, event: str = "tool.interrupted") -> 
             connection.execute("PRAGMA synchronous=FULL")
             connection.execute("BEGIN IMMEDIATE")
             try:
-                if connection.execute("PRAGMA user_version").fetchone() != (7,):
-                    raise RuntimeError("This repair only accepts the confirmed schema-7 omission")
                 stored = connection.execute(
                     "SELECT sql FROM sqlite_schema WHERE type='table' AND name='session_events'"
                 ).fetchone()
-                if stored and normalize(stored[0]) == normalize(table_sql):
+                if stored and "CHECK(length(event_type) > 0)" in normalize(stored[0]):
                     connection.rollback()
                     return {"status": "already_current", "database": str(database)}
-                if not stored or normalize(stored[0]) != normalize(previous_sql):
+                if not stored or not EVENT_TYPE_ENUM.search(stored[0]):
                     raise RuntimeError("Unexpected event table difference; database was not modified")
+                connection.execute("SELECT session_id,sequence,event_id,event_type,run_id,call_id,payload_json,occurred_at FROM session_events LIMIT 0")
+                table_sql = EVENT_TYPE_ENUM.sub("CHECK(length(event_type) > 0)", stored[0], count=1)
 
                 # A reserved write lock prevents changes while another read-only
                 # connection makes the backup (backing up a writer can deadlock).

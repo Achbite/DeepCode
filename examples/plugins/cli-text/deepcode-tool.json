@@ -1,0 +1,13 @@
+{
+  "id": "text-helper",
+  "name": "文本统计",
+  "description": "统计文本的字符、词语和行数。",
+  "command": "python3",
+  "entry": "main.py",
+  "args": [],
+  "tools": [{
+    "name": "count",
+    "description": "Count characters, whitespace-separated words and lines in supplied text.",
+    "inputSchema": {"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}
+  }]
+}

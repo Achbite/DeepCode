@@ -349,10 +349,6 @@ export class SessionActor {
         !run.workspaceBindings.some((binding) => binding.workspaceId === reference.workspaceId)
       ))) {
         incompatible = '当前运行的目录绑定已固定，无法在排队消息中新增目录。';
-      } else if (command.pluginSelections?.some((selection) => (
-        !runtime.selectedPlugins.plugins.some((plugin) => plugin.uri === selection.uri)
-      ))) {
-        incompatible = '当前运行的插件已固定，无法在排队消息中激活新插件。';
       } else if (
         command.profileId !== undefined && command.profileId !== runtime.provider.profileId
         || command.reasoningEffortOverride !== undefined
@@ -370,6 +366,8 @@ export class SessionActor {
         type: 'input.queued', sessionId: this.sessionId, runId: run.runId,
         payload: {
           commandId: command.commandId, messageId: this.#nextId('message'), text: submittedText,
+          ...(command.guidanceReferences?.length ? {guidanceReferences:structuredClone(command.guidanceReferences)} : {}),
+          ...(command.pluginCatalogRevision ? { pluginCatalogRevision: command.pluginCatalogRevision } : {}),
           ...(command.filesystemReferences?.length ? { filesystemReferences: command.filesystemReferences.map((reference) => ({ ...reference })) } : {}),
           ...(command.pluginSelections?.length ? { pluginSelections: command.pluginSelections.map((selection) => ({ ...selection })) } : {}),
         },
@@ -402,6 +400,7 @@ export class SessionActor {
       sessionId: this.sessionId,
       runId,
       environment: savedSessionEnvironment(before.events),
+      ...(command.hostBinding ? { hostBinding: { ...command.hostBinding } } : {}),
       ...(profileId ? { profileId } : {}),
       ...(reasoningEffortOverride ? { reasoningEffortOverride } : {}),
       ...(command.pluginCatalogRevision
@@ -425,6 +424,7 @@ export class SessionActor {
           commandId: command.commandId,
           messageId,
           text: submittedText,
+          ...(command.guidanceReferences?.length ? {guidanceReferences:structuredClone(command.guidanceReferences)} : {}),
           ...(command.pluginSelections?.length
             ? { pluginSelections: command.pluginSelections.map((selection) => ({ ...selection })) }
             : {}),
@@ -437,6 +437,7 @@ export class SessionActor {
           messageId,
           role: 'user',
           content: submittedText,
+          ...(command.guidanceReferences?.length ? {guidanceReferences:structuredClone(command.guidanceReferences)} : {}),
           ...(command.filesystemReferences?.length
             ? {
                 filesystemReferences: command.filesystemReferences.map((reference) => ({
@@ -838,16 +839,45 @@ export class SessionActor {
           const current = await this.loadSnapshot();
           if (signal.aborted) return current;
           const queued = current.state.queuedInputs.filter((input) => input.runId === runId);
-          const events = queued.flatMap<NewSessionEvent>((input) => [{
+          const runtime = current.state.runRuntimeSnapshots[runId];
+          if (!runtime) throw new Error('run_runtime_snapshot_missing');
+          const activeView = current.state.runToolViews[runId] ?? runtime;
+          const initialSelections = recoveryPluginSelection(current, runId, runtime).pluginSelections ?? [];
+          const previousSelections = current.events.flatMap((event) => (
+            event.type === 'message.committed' && event.runId === runId && event.payload.role === 'user'
+              ? event.payload.pluginSelections ?? [] : []
+          ));
+          const selections = [...new Map([...initialSelections, ...previousSelections, ...queued.flatMap((input) => input.pluginSelections)]
+            .map((selection) => [selection.uri, selection])).values()];
+          const events: NewSessionEvent[] = [];
+          if (selections.length || activeView.selectedPlugins.plugins.length) {
+            const catalogRevision = queued.filter((input) => input.pluginSelections.length).at(-1)?.pluginCatalogRevision;
+            const prepared = await this.#composition.runPreparation.prepare({
+              sessionId: this.sessionId, runId, profileId: runtime.provider.profileId,
+              environment: runtime.environment,
+              ...(runtime.provider.reasoningEffortOverride ? { reasoningEffortOverride: runtime.provider.reasoningEffortOverride } : {}),
+              pluginSelections: selections,
+              refreshPlugins: !queued.some(input=>input.pluginSelections.length),
+              ...(catalogRevision ? { pluginCatalogRevision: catalogRevision } : {}),
+            });
+            const { extensionGenerationRef, kernelCatalogSnapshotRef, instructions, tools, toolPromptContributions,
+              providerToolAliases, selectedPlugins } = prepared.runtimeSnapshot;
+            if (kernelCatalogSnapshotRef !== activeView.kernelCatalogSnapshotRef) events.push({ type: 'run.tools.prepared', sessionId: this.sessionId, runId,
+              payload: { toolView: { extensionGenerationRef, kernelCatalogSnapshotRef, instructions, tools,
+                toolPromptContributions, providerToolAliases, selectedPlugins } } });
+          }
+          events.push(...queued.flatMap<NewSessionEvent>((input) => [{
             type: 'input.accepted', sessionId: this.sessionId,
             payload: { commandId: input.commandId, messageId: input.messageId, text: input.text,
+              ...(input.guidanceReferences?.length ? {guidanceReferences:structuredClone(input.guidanceReferences)} : {}),
               ...(input.pluginSelections.length ? { pluginSelections: input.pluginSelections } : {}) },
           }, {
             type: 'message.committed', sessionId: this.sessionId, runId,
             payload: { messageId: input.messageId, role: 'user', content: input.text,
+              ...(input.guidanceReferences?.length ? {guidanceReferences:structuredClone(input.guidanceReferences)} : {}),
               ...(input.filesystemReferences.length ? { filesystemReferences: input.filesystemReferences } : {}),
               ...(input.pluginSelections.length ? { pluginSelections: input.pluginSelections } : {}) },
-          }]);
+          }]));
           if (events.length) await this.appendEvents(events, current);
           return await this.loadSnapshot();
         }),
@@ -1004,7 +1034,7 @@ export class SessionActor {
           extensionGenerationRef: runtime.extensionGenerationRef,
           kernelCatalogSnapshotRef: released.kernelCatalogSnapshotRef,
           providerRuntimeRef: runtime.provider.providerRuntimeRef,
-          pluginInstanceRefs: runtime.selectedPlugins.plugins.map((plugin) => (
+          pluginInstanceRefs: (snapshot.state.runToolViews[runId] ?? runtime).selectedPlugins.plugins.map((plugin) => (
             plugin.pluginInstanceRef
           )),
           alreadyReleased: released.alreadyReleased,

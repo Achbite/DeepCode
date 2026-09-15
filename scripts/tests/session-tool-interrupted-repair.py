@@ -24,7 +24,10 @@ class RepairTests(unittest.TestCase):
         runtime.mkdir(parents=True)
         self.database = runtime / "session.sqlite3"
         self.backup = self.root / "before.sqlite3"
-        self.original_schema = repair.SCHEMA.read_text().replace("        'tool.interrupted',\n", "")
+        self.original_schema = repair.SCHEMA.read_text().replace(
+            "CHECK(length(event_type) > 0)",
+            "CHECK(event_type IN ('session.created','input.accepted','tool.input-rejected'))",
+        ) + "\nPRAGMA user_version=7;"
         with sqlite3.connect(self.database) as con:
             con.executescript(self.original_schema)
             con.execute("INSERT INTO sessions VALUES ('session:test','Keep this conversation',NULL,'2026-09-12')")
@@ -70,7 +73,7 @@ class RepairTests(unittest.TestCase):
         with sqlite3.connect(self.database) as con:
             events = con.execute("SELECT rowid,* FROM session_events ORDER BY rowid").fetchall()
             con.execute("DROP TABLE session_events")
-            con.executescript(repair.SCHEMA.read_text().replace("        'input.queued',\n", ""))
+            con.executescript(self.original_schema.replace("'tool.input-rejected'", "'tool.input-rejected','tool.interrupted'"))
             con.executemany("INSERT INTO session_events(rowid,session_id,sequence,event_id,event_type,run_id,call_id,payload_json,occurred_at) VALUES (?,?,?,?,?,?,?,?,?)", events)
         before = self.snapshot(self.database)
         result = repair.repair(self.root, self.backup, "input.queued")
@@ -97,10 +100,13 @@ class RepairTests(unittest.TestCase):
         self.assertEqual(self.snapshot(self.database), self.before)
         self.assertFalse(self.backup.exists())
 
-    def test_refuses_other_event_constraint_differences(self):
+    def test_refuses_unrecognized_event_constraint_without_modifying_history(self):
         with sqlite3.connect(self.database) as con:
             con.execute("DROP TABLE session_events")
-            con.executescript(self.original_schema.replace("        'tool.input-rejected',\n", ""))
+            con.executescript(self.original_schema.replace(
+                "CHECK(event_type IN ('session.created','input.accepted','tool.input-rejected'))",
+                "CHECK(event_type != '')",
+            ))
         before = self.snapshot(self.database)
         with self.assertRaisesRegex(RuntimeError, "Unexpected event table difference"):
             repair.repair(self.root, self.backup)

@@ -1212,10 +1212,11 @@ mod input_tests {
     #[test]
     fn unavailable_plugin_selection_preserves_the_catalog_error() {
         let catalog: PluginCatalogProjection = serde_json::from_value(json!({"revision":"catalog:test", "plugins":[{
-            "uri":"plugin://broken", "displayName":"Broken", "shortDescription":"Broken entry", "activationMediaTypes":[],
+            "uri":"plugin://broken@mcp", "displayName":"Broken", "shortDescription":"Broken entry", "activationMediaTypes":[],
+            "source":"mounted","category":"functional","contributionKind":"mcp","discovery":"default",
             "enabled":false,"available":false,"error":{"code":"plugin_manifest_invalid","message":"manifest parse failed"}
         }]})).unwrap();
-        let error = plugin_selections_from_uris(&catalog, &["plugin://broken".into()])
+        let error = plugin_selections_from_uris(&catalog, &["plugin://broken@mcp".into()])
             .err()
             .unwrap();
         assert!(error.contains("plugin_manifest_invalid"));

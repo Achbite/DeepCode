@@ -1,4 +1,5 @@
 mod arxiv;
+pub mod documents;
 mod github;
 mod pdf;
 
@@ -51,9 +52,9 @@ impl PluginKind {
 }
 
 #[derive(Debug)]
-pub(crate) struct ToolError {
-    code: &'static str,
-    message: String,
+pub struct ToolError {
+    pub code: &'static str,
+    pub message: String,
 }
 
 impl ToolError {
@@ -69,13 +70,28 @@ pub(crate) type ToolResult<T> = Result<T, ToolError>;
 
 pub fn run_from_args(arguments: impl Iterator<Item = String>) -> Result<(), String> {
     let arguments = arguments.collect::<Vec<_>>();
-    if arguments.len() != 2 || arguments[0] != "--plugin" {
-        return Err("usage: deepcode-first-party-provider --plugin <github|arxiv|pdf>".to_string());
+    if arguments.len() < 2 || arguments[0] != "--plugin" {
+        return Err(
+            "usage: deepcode-first-party-provider --plugin <github|arxiv|pdf> [--call]".to_string(),
+        );
     }
     let plugin = PluginKind::parse(&arguments[1])?;
-    let manifest: Value = serde_json::from_str(plugin.manifest())
-        .map_err(|error| format!("invalid embedded plugin manifest: {error}"))?;
-    serve(plugin, &manifest)
+    let manifest: Value =
+        serde_json::from_str(plugin.manifest()).map_err(|error| error.to_string())?;
+    match arguments.get(2).map(String::as_str) {
+        None if arguments.len() == 2 => serve(plugin, &manifest),
+        Some("--call") if arguments.len() == 3 => {
+            let request: Value = serde_json::from_reader(std::io::stdin().take(4 * 1024 * 1024))
+                .map_err(|error| format!("decode CLI input: {error}"))?;
+            let name = request["name"].as_str().ok_or("CLI input requires name")?;
+            let output = match plugin.call(name, &request["arguments"], request.get("context")) {
+                Ok(value) => value,
+                Err(error) => json!({"error":{"code":error.code,"message":error.message}}),
+            };
+            serde_json::to_writer(std::io::stdout(), &output).map_err(|error| error.to_string())
+        }
+        _ => Err("unknown CLI arguments".into()),
+    }
 }
 
 fn serve(plugin: PluginKind, manifest: &Value) -> Result<(), String> {

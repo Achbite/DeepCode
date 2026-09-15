@@ -32,5 +32,7 @@
   "agent.windows.shell": "auto",
   "agent.windows.gitBashPath": "",
   "agent.environmentRevision": 0,
-  "agent.projectEnvironments": "{}"
+  "agent.projectEnvironments": "{}",
+  "plugins.sources": "[]",
+  "plugins.disabled": "[]"
 }

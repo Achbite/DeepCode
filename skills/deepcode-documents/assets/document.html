@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>文档标题</title>
+  <style>
+    :root { color-scheme: light; --ink: #252923; --muted: #65665d; --accent: #1b365d; --line: #deddd3; --paper: #fff; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f5f4ed; color: var(--ink); font-family: "Noto Serif CJK SC", "Songti SC", "SimSun", Georgia, serif; font-size: 16px; line-height: 1.65; overflow-wrap: anywhere; }
+    main { max-width: 820px; margin: 40px auto; padding: 52px 60px; background: var(--paper); }
+    header { border-bottom: 1px solid var(--line); padding-bottom: 24px; margin-bottom: 32px; }
+    h1, h2, h3 { color: var(--accent); line-height: 1.25; break-after: avoid; }
+    h1 { font-size: 2.2rem; margin: 0 0 16px; }
+    h2 { font-size: 1.45rem; margin: 2rem 0 1rem; }
+    h3 { font-size: 1.1rem; margin: 1.5rem 0 .75rem; }
+    p, ul, ol, blockquote, figure, pre, table { margin: 0 0 1.1rem; }
+    p, li { orphans: 3; widows: 3; }
+    .subtitle, figcaption, footer { color: var(--muted); font-size: .9rem; }
+    a { color: var(--accent); text-underline-offset: .15em; }
+    table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+    th, td { padding: .7rem .8rem; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+    th { background: #f5f4ed; font-weight: 600; }
+    thead { display: table-header-group; }
+    tr, figure { break-inside: avoid; }
+    blockquote { margin-left: 0; padding: .4rem 1rem; border-left: 3px solid var(--accent); }
+    code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: .87em; }
+    pre { padding: 1rem; background: #f4f3ed; white-space: pre-wrap; overflow-wrap: anywhere; }
+    img, svg { max-width: 100%; height: auto; }
+    footer { border-top: 1px solid var(--line); padding-top: 1rem; margin-top: 2rem; }
+    @page { size: A4; margin: 20mm 19mm 22mm; @bottom-center { content: counter(page); font-size: 9pt; color: #65665d; } }
+    @media print { body { background: white; font-size: 10.5pt; } main { max-width: none; margin: 0; padding: 0; } a { text-decoration: none; } }
+    @media screen and (max-width: 680px) { main { margin: 0; padding: 28px 22px; } h1 { font-size: 1.8rem; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>文档标题</h1>
+      <p class="subtitle">与读者和用途相关的简短说明</p>
+    </header>
+    <section>
+      <h2>章节标题</h2>
+      <p>替换为用户要求的正文。根据实际内容增删章节，不保留示例文字。</p>
+    </section>
+  </main>
+</body>
+</html>

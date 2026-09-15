@@ -1,3 +1,4 @@
+use crate::local_agent_cli::CliClient;
 use crate::local_agent_first_party_plugins::{
     self, FirstPartyPluginDescriptor, FirstPartyToolBinding, FirstPartyToolDescriptor,
     FirstPartyToolEffect,
@@ -32,6 +33,7 @@ pub(crate) struct McpPluginDescriptor {
     pub(crate) tool_prompt_provider: Option<Value>,
     pub(crate) enabled: bool,
     pub(crate) error: Option<McpRuntimeError>,
+    pub(crate) management: Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +56,7 @@ pub(crate) struct McpRuntimeError {
 }
 
 impl McpRuntimeError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -75,7 +77,7 @@ pub(crate) struct McpTool {
     pub(crate) contribution_ref: String,
     pub(crate) effect_scope: McpToolEffectScope,
     pub(crate) binding_requirement: McpToolBindingRequirement,
-    client: McpClient,
+    client: ToolClient,
 }
 
 #[derive(Debug)]
@@ -113,8 +115,12 @@ impl McpTool {
                 }))
             }
         };
-        self.client
-            .call_tool(&self.remote_name, input, metadata, &context.cancellation)
+        match &self.client {
+            ToolClient::Mcp(client) => {
+                client.call_tool(&self.remote_name, input, metadata, &context.cancellation)
+            }
+            ToolClient::Cli(client) => client.call(&self.remote_name, input, metadata, context),
+        }
     }
 
     pub(crate) fn logical_targets(&self, input: &Value) -> Result<Vec<String>, McpRuntimeError> {
@@ -140,7 +146,7 @@ impl McpTool {
 #[derive(Clone)]
 pub(crate) struct McpRuntime {
     tools: Arc<BTreeMap<String, McpTool>>,
-    clients: Arc<Vec<McpClient>>,
+    clients: Arc<Vec<ToolClient>>,
     configuration_identity: Arc<Value>,
 }
 
@@ -155,6 +161,66 @@ impl Default for McpRuntime {
 }
 
 impl McpRuntime {
+    /// Reuse unchanged instances and prepare selected replacements; old views stay pinned.
+    pub(crate) fn extend_selected_settings(
+        &self,
+        settings: &Value,
+        selected: &BTreeMap<String, String>,
+    ) -> Result<Self, McpRuntimeError> {
+        let additions = selected
+            .iter()
+            .filter(|(uri, instance)| {
+                !self
+                    .tools
+                    .values()
+                    .any(|tool| &tool.plugin_uri == *uri && &tool.plugin_instance_ref == *instance)
+            })
+            .map(|(uri, instance)| (uri.clone(), instance.clone()))
+            .collect();
+        let added = Self::from_selected_settings(settings, &additions)?;
+        let mut tools = self
+            .tools
+            .iter()
+            .filter(|(_, tool)| selected.get(&tool.plugin_uri) == Some(&tool.plugin_instance_ref))
+            .map(|(name, tool)| (name.clone(), tool.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for (name, tool) in added.tools.iter() {
+            if tools.insert(name.clone(), tool.clone()).is_some() {
+                return Err(McpRuntimeError::new(
+                    "plugin_tool_duplicate",
+                    format!("工具名称重复：{name}"),
+                ));
+            }
+        }
+        let clients = tools.values().map(|tool| tool.client.clone()).collect();
+        let mut identity = self
+            .configuration_identity
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|item| {
+                item["uri"]
+                    .as_str()
+                    .is_some_and(|uri| selected.contains_key(uri) && !additions.contains_key(uri))
+            })
+            .collect::<Vec<_>>();
+        identity.extend(
+            added
+                .configuration_identity
+                .as_array()
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
+        identity.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+        Ok(Self {
+            tools: Arc::new(tools),
+            clients: Arc::new(clients),
+            configuration_identity: Arc::new(Value::Array(identity)),
+        })
+    }
+
     pub(crate) fn from_selected_settings(
         settings: &Value,
         selected_plugin_instances: &BTreeMap<String, String>,
@@ -223,8 +289,37 @@ impl McpRuntime {
         let mut tools = BTreeMap::new();
         let mut clients = Vec::new();
         for (_, server) in servers_by_id {
-            let client = McpClient::start(&server.setting)?;
-            let definitions = client.list_tools()?;
+            let (client, definitions) = if server.setting.transport == "cli" {
+                let definitions = match &server.contract {
+                    McpServerContract::FirstParty(tools) => tools
+                        .iter()
+                        .map(|tool| RemoteToolDefinition {
+                            name: tool.remote_name.clone(),
+                            description: Some(tool.description.clone()),
+                            input_schema: tool.input_schema.clone(),
+                        })
+                        .collect(),
+                    McpServerContract::LocalCli(tools) => tools.clone(),
+                    McpServerContract::External => {
+                        return Err(McpRuntimeError::new(
+                            "cli_manifest_missing",
+                            "CLI tools require a local manifest",
+                        ))
+                    }
+                };
+                (
+                    ToolClient::Cli(CliClient {
+                        command: server.setting.command.clone(),
+                        args: split_args(&server.setting.args)?,
+                        entry: server.cli_entry.clone(),
+                    }),
+                    definitions,
+                )
+            } else {
+                let client = McpClient::start(&server.setting)?;
+                let definitions = client.list_tools()?;
+                (ToolClient::Mcp(client), definitions)
+            };
             validate_first_party_tool_set(&server, &definitions)?;
             let plugin_instance_ref = selected_plugin_instances
                 .get(&server.descriptor.uri)
@@ -312,9 +407,11 @@ pub(crate) fn available_plugins(
         .map(|server| {
             let mut descriptor = server.descriptor;
             if server.setting.enabled {
-                descriptor.error = validate_server(&server.setting)
-                    .and_then(|()| split_args(&server.setting.args).map(|_| ()))
-                    .err();
+                if descriptor.error.is_none() {
+                    descriptor.error = validate_server(&server.setting)
+                        .and_then(|()| split_args(&server.setting.args).map(|_| ()))
+                        .err();
+                }
             }
             descriptor
         })
@@ -326,11 +423,13 @@ struct McpServerSource {
     setting: McpServerSetting,
     descriptor: McpPluginDescriptor,
     contract: McpServerContract,
+    cli_entry: Option<(String, Vec<u8>)>,
 }
 
 #[derive(Clone)]
 enum McpServerContract {
     External,
+    LocalCli(Vec<RemoteToolDefinition>),
     FirstParty(Vec<FirstPartyToolDescriptor>),
 }
 
@@ -361,7 +460,27 @@ fn available_server_sources(settings: &Value) -> Result<Vec<McpServerSource>, Mc
     for descriptor in local_agent_first_party_plugins::descriptors()
         .map_err(|message| McpRuntimeError::new("first_party_manifest_invalid", message))?
     {
-        sources.push(first_party_server_source(descriptor, provider_binary));
+        let mut source = first_party_server_source(descriptor, provider_binary);
+        let disabled: Vec<String> = serde_json::from_str(
+            settings
+                .get("plugins.disabled")
+                .and_then(Value::as_str)
+                .unwrap_or("[]"),
+        )
+        .map_err(|error| McpRuntimeError::new("plugin_config_invalid", error.to_string()))?;
+        source.setting.enabled = !disabled.contains(&source.descriptor.uri);
+        source.descriptor.enabled = source.setting.enabled;
+        sources.push(source);
+    }
+    let local: Vec<LocalPluginSource> = serde_json::from_str(
+        settings
+            .get("plugins.sources")
+            .and_then(Value::as_str)
+            .unwrap_or("[]"),
+    )
+    .map_err(|error| McpRuntimeError::new("plugin_config_invalid", error.to_string()))?;
+    for source in local {
+        sources.push(local_cli_source(source));
     }
     let mut ids = BTreeSet::new();
     let mut uris = BTreeSet::new();
@@ -397,9 +516,10 @@ fn external_server_source(setting: McpServerSetting) -> Result<McpServerSource, 
         )
     })?;
     let descriptor = McpPluginDescriptor {
+        management:json!({"key":"mcp.servers","id":setting.id}),
         uri: mcp_plugin_uri(&setting.id),
         name: setting.name.clone(),
-        short_description: format!("MCP service {}", setting.name),
+        short_description: "连接的外部工具".to_string(),
         activation_media_types: Vec::new(),
         plugin_artifact_ref: format!(
             "plugin-artifact:{}",
@@ -416,6 +536,7 @@ fn external_server_source(setting: McpServerSetting) -> Result<McpServerSource, 
         setting,
         descriptor,
         contract: McpServerContract::External,
+        cli_entry: None,
     })
 }
 
@@ -447,6 +568,7 @@ fn first_party_server_source(
         })
         .collect::<Vec<_>>();
     let descriptor = McpPluginDescriptor {
+        management: json!({"key":"plugins.disabled","id":uri}),
         uri: uri.clone(),
         name: display_name.clone(),
         short_description,
@@ -468,13 +590,14 @@ fn first_party_server_source(
         setting: McpServerSetting {
             id: format!("first-party.{id}"),
             name: display_name,
-            transport: "stdio".to_string(),
+            transport: "cli".to_string(),
             command: provider_binary.to_string(),
-            args: format!("--plugin {id}"),
+            args: format!("--plugin {id} --call"),
             enabled: true,
         },
         descriptor,
         contract: McpServerContract::FirstParty(tools),
+        cli_entry: None,
     }
 }
 
@@ -524,14 +647,18 @@ fn tool_contract(
     definition: &RemoteToolDefinition,
 ) -> Result<McpToolContract, McpRuntimeError> {
     match &server.contract {
-        McpServerContract::External => Ok(McpToolContract {
-            public_name: public_tool_name(&server.setting.id, &definition.name)?,
+        McpServerContract::External | McpServerContract::LocalCli(_) => Ok(McpToolContract {
+            public_name: if server.setting.transport == "cli" {
+                format!("{}.{}", server.setting.id, definition.name)
+            } else {
+                public_tool_name(&server.setting.id, &definition.name)?
+            },
             description: definition
                 .description
                 .clone()
                 .unwrap_or_else(|| format!("MCP tool {}", definition.name)),
             input_schema: definition.input_schema.clone(),
-            provider_ref: "tool-provider:mcp".to_string(),
+            provider_ref: server.descriptor.provider_ref.clone(),
             contribution_ref: format!(
                 "tool-contribution:mcp:{}",
                 public_tool_name(&server.setting.id, &definition.name)?
@@ -632,13 +759,147 @@ struct McpServerSetting {
     enabled: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RemoteToolDefinition {
     name: String,
     description: Option<String>,
     #[serde(default = "default_input_schema")]
     input_schema: Value,
+}
+
+#[derive(Clone, Debug)]
+enum ToolClient {
+    Mcp(McpClient),
+    Cli(CliClient),
+}
+impl ToolClient {
+    fn shutdown(&self) -> Result<(), McpRuntimeError> {
+        match self {
+            Self::Mcp(client) => client.shutdown(),
+            Self::Cli(_) => Ok(()),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LocalPluginSource {
+    id: String,
+    path: String,
+    #[serde(default = "enabled_by_default")]
+    enabled: bool,
+}
+#[derive(Deserialize)]
+struct LocalCliManifest {
+    id: String,
+    name: String,
+    description: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    entry: String,
+    tools: Vec<RemoteToolDefinition>,
+}
+fn local_cli_source(source: LocalPluginSource) -> McpServerSource {
+    let mut result = McpServerSource {
+        setting: McpServerSetting {
+            id: source.id.clone(),
+            name: source.id.clone(),
+            transport: "cli".into(),
+            command: String::new(),
+            args: String::new(),
+            enabled: source.enabled,
+        },
+        descriptor: McpPluginDescriptor {
+            management: json!({"key":"plugins.sources","id":source.id,"path":source.path}),
+            uri: format!("plugin://{}@cli", source.id),
+            name: source.id.clone(),
+            short_description: "本地工具".into(),
+            activation_media_types: vec![],
+            plugin_artifact_ref: String::new(),
+            provider_ref: format!("tool-provider:cli:{}", source.id),
+            capability_refs: vec![],
+            capability_summary: String::new(),
+            tool_prompt_provider: None,
+            enabled: source.enabled,
+            error: None,
+        },
+        contract: McpServerContract::LocalCli(vec![]),
+        cli_entry: None,
+    };
+    let loaded = (|| -> Result<(), String> {
+        let root = std::path::Path::new(&source.path);
+        if !root.is_absolute() {
+            return Err("插件目录必须是绝对路径".into());
+        }
+        let encoded = std::fs::read(root.join("deepcode-tool.json"))
+            .map_err(|error| format!("{}: {error}", root.display()))?;
+        let manifest: LocalCliManifest =
+            serde_json::from_slice(&encoded).map_err(|error| error.to_string())?;
+        if manifest.id != source.id
+            || manifest.id.is_empty()
+            || normalized_name(&manifest.id) != manifest.id
+            || manifest.name.trim().is_empty()
+            || manifest.description.trim().is_empty()
+            || manifest.tools.is_empty()
+            || manifest.command.trim().is_empty()
+        {
+            return Err("插件需要有效的 id、name、description、command 和 tools".into());
+        }
+        let entry = std::path::Path::new(&manifest.entry);
+        if entry.components().count() != 1
+            || !matches!(
+                entry.components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            return Err("CLI entry 必须是插件目录中的单文件构建产物".into());
+        }
+        let bytes = std::fs::read(root.join(entry)).map_err(|error| error.to_string())?;
+        if bytes.is_empty() || bytes.len() > 4 * 1024 * 1024 {
+            return Err("CLI entry 必须是非空且不超过 4 MiB 的文件".into());
+        }
+        let mut names = BTreeSet::new();
+        for tool in &manifest.tools {
+            if tool.name.is_empty()
+                || normalized_name(&tool.name) != tool.name
+                || !names.insert(&tool.name)
+                || !tool.input_schema.is_object()
+                || tool.description.as_deref().is_none_or(str::is_empty)
+            {
+                return Err("工具需要唯一名称、用途和 inputSchema".into());
+            }
+        }
+        let mut identity = encoded;
+        identity.extend_from_slice(&bytes);
+        result.descriptor.plugin_artifact_ref = format!(
+            "plugin-artifact:{}",
+            deepcode_kernel_tools::hash_bytes(&identity)
+        );
+        result.descriptor.name = manifest.name.clone();
+        result.descriptor.short_description = manifest.description.clone();
+        result.descriptor.capability_summary = manifest.description;
+        result.descriptor.capability_refs = manifest
+            .tools
+            .iter()
+            .map(|tool| format!("{}.{}", source.id, tool.name))
+            .collect();
+        result.setting.name = manifest.name;
+        result.setting.command = manifest.command;
+        result.setting.args = manifest
+            .args
+            .iter()
+            .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        result.cli_entry = Some((manifest.entry, bytes));
+        result.contract = McpServerContract::LocalCli(manifest.tools);
+        Ok(())
+    })();
+    if let Err(message) = loaded {
+        result.descriptor.error = Some(McpRuntimeError::new("local_plugin_unavailable", message));
+    }
+    result
 }
 
 #[derive(Clone, Debug)]
@@ -1062,7 +1323,7 @@ fn validate_server(server: &McpServerSetting) -> Result<(), McpRuntimeError> {
             "MCP Server id 无效。",
         ));
     }
-    if server.transport != "stdio" {
+    if !matches!(server.transport.as_str(), "stdio" | "cli") {
         return Err(McpRuntimeError::new(
             "mcp_transport_unsupported",
             format!("首版本地 MCP 仅支持 stdio：{}", server.id),
@@ -1072,6 +1333,16 @@ fn validate_server(server: &McpServerSetting) -> Result<(), McpRuntimeError> {
         return Err(McpRuntimeError::new(
             "mcp_server_command_missing",
             format!("MCP Server {} 缺少 command。", server.id),
+        ));
+    }
+    let command = std::path::Path::new(&server.command);
+    if command.is_absolute() && !command.is_file() {
+        return Err(McpRuntimeError::new(
+            "mcp_server_command_unavailable",
+            format!(
+                "MCP Server {} 启动命令不存在：{}",
+                server.id, server.command
+            ),
         ));
     }
     Ok(())
@@ -1245,6 +1516,69 @@ mod tests {
             Some(&json!("edoCpeeD"))
         );
         runtime.shutdown().expect("shutdown MCP runtime");
+    }
+
+    #[test]
+    fn cli_generations_execute_pinned_entries_without_a_server() {
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = Directory(std::env::temp_dir().join(format!(
+            "deepcode-cli-plugin-{}-{stamp}",
+            std::process::id()
+        )));
+        std::fs::create_dir(&root.0).unwrap();
+        std::fs::write(root.0.join("deepcode-tool.json"),serde_json::to_vec(&json!({"id":"sample","name":"Sample","description":"Report implementation","command":"python3","entry":"main.py","tools":[{"name":"version","description":"Read implementation","inputSchema":{"type":"object"}}]})).unwrap()).unwrap();
+        let write = |version: &str| {
+            std::fs::write(root.0.join("main.py"),format!("import json,sys\njson.load(sys.stdin)\njson.dump({{\"version\":\"{version}\"}},sys.stdout)\n")).unwrap()
+        };
+        write("first");
+        let settings = json!({"plugins.sources":serde_json::to_string(&json!([{"id":"sample","path":root.0,"enabled":true}])).unwrap()});
+        let selected = |instance: &str| {
+            BTreeMap::from([("plugin://sample@cli".to_string(), instance.to_string())])
+        };
+        let first =
+            McpRuntime::from_selected_settings(&settings, &selected("instance:first")).unwrap();
+        write("second");
+        let second = first
+            .extend_selected_settings(&settings, &selected("instance:second"))
+            .unwrap();
+        let context = |attempt: &str| KernelToolExecutionContext {
+            output_directory: Some(root.0.join(attempt)),
+            workspace_root: None,
+            workspace_id: None,
+            private_resolved_targets: vec![],
+            workspace_write_targets: None,
+            cancellation: KernelCancellationToken::default(),
+            progress: Default::default(),
+        };
+        let old = first
+            .tools()
+            .next()
+            .unwrap()
+            .call(json!({}), &context("old"))
+            .unwrap();
+        let new = second
+            .tools()
+            .next()
+            .unwrap()
+            .call(json!({}), &context("new"))
+            .unwrap();
+        assert!(old.failure.is_none() && new.failure.is_none());
+        assert_eq!(old.output["version"], "first");
+        assert_eq!(new.output["version"], "second");
+        assert_ne!(first.extension_identity(), second.extension_identity());
+        assert!(matches!(
+            second.tools().next().unwrap().client,
+            ToolClient::Cli(_)
+        ));
     }
 
     #[test]

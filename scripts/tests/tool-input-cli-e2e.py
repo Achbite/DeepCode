@@ -87,7 +87,7 @@ class ProviderState:
                 require("workspace" not in function["parameters"]["required"], "workspace 缺省未开放")
             elif "edits" in properties:
                 names["edit"] = function["name"]
-            elif "path" in properties and "content" in properties:
+            elif "path" in properties and "content" in properties and "format" not in properties:
                 names["write"] = function["name"]
             elif "command" in properties and "timeout" in properties:
                 names["bash"] = function["name"]

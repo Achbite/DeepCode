@@ -36,6 +36,8 @@ struct PublicPluginCatalogItem {
     short_description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     icon_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    management: Option<Value>,
     activation_media_types: Vec<String>,
     enabled: bool,
     available: bool,
@@ -115,6 +117,21 @@ pub(crate) struct ResolvedPluginSelection {
 }
 
 impl ResolvedPluginSelection {
+    pub(crate) fn retain_prepared(&mut self, previous: &Self) {
+        for plugin in &mut self.plugins {
+            if let Some(existing) = previous.plugins.iter().find(|entry| {
+                entry.public.uri == plugin.public.uri
+                    && entry.plugin_artifact_ref == plugin.plugin_artifact_ref
+            }) {
+                *plugin = existing.clone();
+                if let PluginContribution::Mcp { plugin_uri } = &plugin.contribution {
+                    self.mcp_plugin_instances
+                        .insert(plugin_uri.clone(), plugin.plugin_instance_ref.clone());
+                }
+            }
+        }
+    }
+
     pub(crate) fn mcp_plugin_instances(&self) -> &BTreeMap<String, String> {
         &self.mcp_plugin_instances
     }
@@ -129,10 +146,48 @@ impl ResolvedPluginSelection {
 
 pub(crate) fn plugin_catalog_projection(settings: &Value) -> Result<Value, String> {
     let (revision, sources) = plugin_catalog(settings)?;
-    Ok(json!({
-        "revision": revision,
-        "plugins": sources.into_values().map(PluginCatalogEntry::into_public).collect::<Vec<_>>(),
-    }))
+    let mut plugins: Vec<Value> = sources
+        .into_values()
+        .map(|source| {
+            let kind = match &source {
+                PluginCatalogEntry::Skill(_) => "skill",
+                PluginCatalogEntry::Loaded(source)
+                    if matches!(source.contribution, PluginContribution::Skill) =>
+                {
+                    "skill"
+                }
+                _ if source.public().uri.ends_with("@cli")
+                    || source.public().uri.ends_with("@first-party") =>
+                {
+                    "cli"
+                }
+                _ => "mcp",
+            };
+            let mut item =
+                serde_json::to_value(source.into_public()).expect("catalog item serializes");
+            item["source"] = json!("mounted");
+            item["category"] = json!("functional");
+            item["discovery"] = json!("default");
+            item["contributionKind"] = json!(kind);
+            item
+        })
+        .collect();
+    for skill in crate::local_agent_product_tools::bundled_skill_settings() {
+        let id = skill["id"].as_str().expect("bundled Skill id");
+        let functional = id == "deepcode-documents";
+        plugins.push(json!({"uri":format!("plugin://{id}@builtin"),"displayName":skill["displayName"],"shortDescription":skill["description"],
+            "source":"builtin","category":if functional {"functional"} else {"reference"},"contributionKind":"skill","discovery":if functional {"default"} else {"searchOnly"},
+            "activationMediaTypes":[],"enabled":true,"available":true,"reference":{"toolName":"skill.read","name":id}}));
+    }
+    for name in [
+        "operations.md",
+        "execution-environments.md",
+        "ui-plugins.md",
+    ] {
+        plugins.push(json!({"uri":format!("plugin://doc-{name}@builtin"),"displayName":name,"shortDescription":"DeepCode product documentation",
+            "source":"builtin","category":"reference","contributionKind":"skill","discovery":"searchOnly","activationMediaTypes":[],"enabled":true,"available":true,"reference":{"toolName":"doc.read","name":name}}));
+    }
+    Ok(json!({"revision":revision,"plugins":plugins}))
 }
 
 /// Settings inspects text Skills through the same loader used for run preparation.
@@ -164,10 +219,9 @@ pub(crate) fn plugin_uri_for_activation_media_type(
                 .iter()
                 .any(|candidate| candidate == media_type)
         {
-            let source = entry.into_public();
-            if let Some(error) = &source.error {
-                return Err(format!("{}: {}", error.code, error.message));
-            }
+            // Attachment selection depends on the declared activation owner.
+            // Readiness is checked by resolve_plugin_selection before preparation;
+            // looking up the owner must not launch or require its executable.
             return Ok(Some(source.uri.clone()));
         }
     }
@@ -227,7 +281,7 @@ pub(crate) fn resolve_plugin_selection(
         }
         plugins.push(source);
     }
-    if catalog_revision != Some(revision.as_str()) {
+    if catalog_revision.is_some_and(|requested| requested != revision) {
         return Err("plugin_selection_stale: 插件目录已经变化，请刷新后重新选择。".to_string());
     }
     plugins.sort_by(|left, right| left.public.uri.cmp(&right.public.uri));
@@ -285,10 +339,14 @@ pub(crate) fn selected_plugin_snapshot(
 
 pub(crate) fn extension_generation_ref(
     plugin_config: &Value,
+    selection: &ResolvedPluginSelection,
     mcp: &crate::local_agent_mcp::McpRuntime,
 ) -> Result<String, String> {
     let shape = json!({
         "selectedPlugins": plugin_config.get("selectedPlugins"),
+        "implementations": selection.plugins.iter().map(|plugin| json!({
+            "uri":plugin.public.uri,"artifactRef":plugin.plugin_artifact_ref,
+        })).collect::<Vec<_>>(),
         "mcp": mcp.extension_identity(),
     });
     let encoded = serde_json::to_vec(&shape)
@@ -315,12 +373,41 @@ pub(crate) fn kernel_runtime_generation_key(
             "authHeaderName": settings.get("agent.web.search.authHeaderName"),
             "authSecretRef": settings.get("agent.web.search.authSecretRef"),
         },
+        "documentPython": settings.get("agent.documents.pythonPath"),
     });
     let encoded = serde_json::to_vec(&shape)
         .map_err(|error| format!("编码 Kernel runtime generation key 失败：{error}"))?;
     Ok(format!(
         "kernel-runtime:{}",
         deepcode_kernel_tools::hash_bytes(&encoded)
+    ))
+}
+
+pub(crate) fn current_plugin_catalog_revision(
+    settings: &Value,
+    selected: &[PluginSelectionInput],
+) -> Result<String, String> {
+    let (revision, sources) = plugin_catalog(settings)?;
+    let implementations = selected
+        .iter()
+        .map(|selection| {
+            let identity = match sources.get(&selection.uri) {
+                Some(PluginCatalogEntry::Skill(locator)) => match skill_plugin(locator) {
+                    Ok(source) => json!(source.plugin_artifact_ref),
+                    Err(error) => json!({"error":error}),
+                },
+                Some(PluginCatalogEntry::Loaded(source)) => json!(source.plugin_artifact_ref),
+                Some(PluginCatalogEntry::Unavailable(source)) => {
+                    json!({"enabled":source.enabled,"error":source.error})
+                }
+                None => Value::Null,
+            };
+            json!({"uri":selection.uri,"implementation":identity})
+        })
+        .collect::<Vec<_>>();
+    Ok(deepcode_kernel_tools::hash_bytes(
+        &serde_json::to_vec(&json!({"catalog":revision,"selected":implementations}))
+            .map_err(|error| error.to_string())?,
     ))
 }
 
@@ -339,6 +426,7 @@ fn plugin_catalog(
             display_name: descriptor.name.clone(),
             short_description: descriptor.short_description,
             icon_ref: None,
+            management: Some(descriptor.management),
             activation_media_types: descriptor.activation_media_types,
             enabled: descriptor.enabled,
             available: descriptor.enabled && descriptor.error.is_none(),
@@ -407,6 +495,8 @@ fn plugin_catalog(
         "entries": identity,
         "skillMounts": settings.get("skills.mounts"),
         "mcpServers": settings.get("mcp.servers"),
+        "pluginSources": settings.get("plugins.sources"),
+        "disabledPlugins": settings.get("plugins.disabled"),
     }))
     .map_err(|error| format!("编码 PluginCatalog revision 失败：{error}"))?;
     let revision = format!(
@@ -439,9 +529,13 @@ fn skill_catalog_entries(settings: &Value) -> Result<Vec<PluginCatalogEntry>, St
     for mount in mounts {
         let mut public = PublicPluginCatalogItem {
             uri: format!("plugin://{}@skill-mount", plugin_slug(&mount.id)),
-            display_name: format!("Skill 挂载：{}", mount.id),
-            short_description: format!("Skill mount {}", mount.path),
+            display_name: Path::new(&mount.path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| mount.id.clone()),
+            short_description: "任务方法与指导资料。".into(),
             icon_ref: None,
+            management: Some(json!({"key":"skills.mounts","id":mount.id,"path":mount.path})),
             activation_media_types: Vec::new(),
             enabled: mount.enabled,
             available: false,
@@ -491,6 +585,7 @@ fn skill_catalog_entries(settings: &Value) -> Result<Vec<PluginCatalogEntry>, St
                 display_name: skill_display_name(&path, ""),
                 short_description: format!("Skill file {}", path.display()),
                 icon_ref: None,
+                management: Some(json!({"key":"skills.mounts","id":mount_id,"path":path})),
                 activation_media_types,
                 enabled: true,
                 available: false,

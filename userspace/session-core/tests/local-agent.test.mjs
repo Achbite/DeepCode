@@ -123,6 +123,43 @@ test('queued input joins the same run after complete tool results and keeps late
   assert.deepEqual(projectSession(state), await actor.snapshot());
 });
 
+test('request-boundary refresh retains the starting selection when another tool is queued', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:selected-boundaries';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation({ tools: [{
+    toolBindingRef:'binding:selection-read',name:'fs.read',description:'Read a file.',
+    inputSchema:{type:'object',required:['path'],properties:{path:{type:'string'}}},
+    possibleEffects:['workspaceRead'],availability:'callable',origin:'coreBuiltin',
+  }] });
+  const first = {selectionId:'selection:first',uri:'plugin://first@local',label:'First'};
+  const second = {selectionId:'selection:second',uri:'plugin://second@local',label:'Second'};
+  let finishTool;
+  const gate = new Promise(resolve=>{finishTool=resolve;});
+  let toolStarted=false, requests=0;
+  const kernel=emptyKernel({async execute(request){
+    toolStarted=true;await gate;return completedExecutionReply(request,{content:'Read complete.'});
+  }});
+  const actor=actorWith(journal,sessionId,{async *stream(request){
+    if(++requests===1) yield providerEvent(request.requestId,'tool.call',{
+      callId:'provider-call:selection-read',name:request.tools.find(tool=>tool.inputSchema.properties?.path).name,
+      input:{workspace:'primary',path:'README.md'},
+    });
+    else yield providerEvent(request.requestId,'assistant.message',{messageId:'answer:selection',content:'Done.'});
+    yield providerEvent(request.requestId,'completed',{});
+  }},kernel,preparation.port,'selected-boundaries');
+  t.after(async()=>{finishTool();await actor.dispose();});
+  await actor.submit({...messageCommand(sessionId,'command:selection-start','Read.'),pluginCatalogRevision:'catalog:first',pluginSelections:[first]});
+  await waitUntil(()=>toolStarted,'tool executing');
+  assert.deepEqual(preparation.prepared.at(-1).pluginSelections,[first]);
+  await actor.submit({...messageCommand(sessionId,'command:selection-next','Use Second too.'),pluginCatalogRevision:'catalog:second',pluginSelections:[second]});
+  finishTool();
+  await waitForProjection(actor,value=>value.run?.status==='completed');
+  assert.equal(requests,2);
+  assert.deepEqual(preparation.prepared.at(-1).pluginSelections,[first,second]);
+  assert.equal(preparation.prepared.at(-1).runId,preparation.prepared[0].runId);
+});
+
 test('waiting input stays separate from the decision and explicit cancel retains unconsumed text', async (t) => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:queued-decision';

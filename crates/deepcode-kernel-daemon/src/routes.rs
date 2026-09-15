@@ -9,6 +9,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/api/host/client", get(host_client))
         .route("/api/health", get(health))
         .route("/api/host/shutdown", post(host_shutdown))
+        .route(
+            "/api/host/native-browser",
+            post(crate::browser_tools::register),
+        )
         .route("/api/workspaces/current", get(workspace_current))
         .route("/api/workspaces/default-path", get(workspace_default_path))
         .route("/api/workspaces/open", post(workspace_open))
@@ -155,6 +159,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/api/conversation/sessions/:session_id/resources/read",
             post(conversation_resource_read),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/artifacts/:artifact_id/content",
+            get(conversation_artifact_read),
         )
         .route("/api/runtime/shell", get(runtime_shell))
         .route("/api/terminal/capabilities", get(terminal_capabilities))

@@ -3,12 +3,14 @@ import type {
   ActivityProjection,
   AssistantDraftProjection,
   ArtifactProjection,
+  JsonObject,
   PendingPlanProjection,
   PlanProjection,
   ProviderOutputBlock,
   ProviderToolCallInput,
   RunSettlement,
   RunRuntimeSnapshot,
+  PreparedRequestToolView,
   SessionEvent,
   SessionProjection,
   ShellExecutionEnvironmentProjection,
@@ -44,6 +46,7 @@ export interface SessionState {
   tokenUsage: SessionProjection['tokenUsage'];
   tokenUsageHistory: Record<string, SessionProjection['tokenUsageHistory'][number]>;
   runRuntimeSnapshots: Record<string, RunRuntimeSnapshot>;
+  runToolViews: Record<string, PreparedRequestToolView>;
   pendingRunSettlements: Record<string, RunSettlement>;
   runRuntimeReleases: Record<
     string,
@@ -115,6 +118,7 @@ export function emptySessionState(sessionId: string): SessionState {
     },
     tokenUsageHistory: {},
     runRuntimeSnapshots: {},
+    runToolViews: {},
     pendingRunSettlements: {},
     runRuntimeReleases: {},
     providerTurns: {},
@@ -185,6 +189,10 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         createdAt: event.occurredAt,
         status: 'queued',
       }];
+      break;
+    case 'run.tools.prepared':
+      assertRunningRun(next, event.runId, 'run_tool_view_run_not_active');
+      next.runToolViews = { ...next.runToolViews, [event.runId]: structuredClone(event.payload.toolView) };
       break;
     case 'input.accepted':
       next.acceptedInputs[event.payload.commandId] = { messageId: event.payload.messageId };
@@ -276,6 +284,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         const common = {
           messageId: event.payload.messageId,
           content: event.payload.content,
+          ...(event.payload.guidanceReferences?.length ? {guidanceReferences:structuredClone(event.payload.guidanceReferences)} : {}),
           filesystemReferences: (event.payload.filesystemReferences ?? []).map((reference) => ({
             ...reference,
           })),
@@ -744,6 +753,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       next.contextCompositions.push({
         runId: event.runId,
         providerRequestId: event.payload.providerRequestId,
+        ...(event.payload.kernelCatalogSnapshotRef ? { kernelCatalogSnapshotRef: event.payload.kernelCatalogSnapshotRef } : {}),
         purpose: event.payload.purpose,
         responseConstraint: event.payload.responseConstraint,
         stableCoreHash: event.payload.stableCoreHash,
@@ -1049,7 +1059,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         || event.payload.providerRuntimeRef !== runtime.provider.providerRuntimeRef
         || new Set(event.payload.pluginInstanceRefs).size !== event.payload.pluginInstanceRefs.length
         || event.payload.pluginInstanceRefs.some((pluginInstanceRef) => (
-          !runtime.selectedPlugins.plugins.some((plugin) => (
+          !(next.runToolViews[event.runId] ?? runtime).selectedPlugins.plugins.some((plugin) => (
             plugin.pluginInstanceRef === pluginInstanceRef
           ))
         ))
@@ -2058,17 +2068,27 @@ function artifactsFromRecord(record: ToolExecutionRecord): ArtifactProjection[] 
   if (!Array.isArray(artifacts)) return [];
   return artifacts.flatMap((candidate) => {
     if (!isRecord(candidate)) return [];
-    const { artifactId, label, workspaceId, logicalPath, uri } = candidate;
-    if (typeof artifactId !== 'string' || typeof label !== 'string') return [];
+    const { artifactId, label, workspaceId, logicalPath, uri, contentType, contentMode, sourcePage } = candidate;
+    if (typeof artifactId !== 'string' || typeof label !== 'string'
+      || typeof contentType !== 'string' || !contentType
+      || !['fixed', 'live'].includes(String(contentMode))) throw new Error('tool_artifact_invalid');
     if (
       workspaceId !== undefined && typeof workspaceId !== 'string'
       || logicalPath !== undefined && typeof logicalPath !== 'string'
       || uri !== undefined && typeof uri !== 'string'
       || logicalPath === undefined && uri === undefined
-    ) return [];
+    ) throw new Error('tool_artifact_resource_invalid');
     return [{
       artifactId,
       label,
+      sessionId: record.sessionId,
+      runId: record.runId,
+      callId: record.callId,
+      recordId: record.recordId,
+      createdAt: record.completedAt,
+      contentType,
+      contentMode: contentMode as 'fixed' | 'live',
+      ...(isRecord(sourcePage) ? { sourcePage: structuredClone(sourcePage) as JsonObject } : {}),
       ...(typeof workspaceId === 'string' ? { workspaceId } : {}),
       ...(typeof logicalPath === 'string' ? { logicalPath } : {}),
       ...(typeof uri === 'string' ? { uri } : {}),

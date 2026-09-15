@@ -11,4 +11,6 @@ A Plan describes intended changes, scope and validation. Once confirmed, command
 
 For product behavior and configuration, use `doc.read` with `name="operations.md"` or `name="execution-environments.md"`. Product docs are English Markdown and are separate from this workflow Skill.
 
+For UI display plugins and hot replacement, read `doc.read` with `name="ui-plugins.md"`. Write against the documented display slots and lifecycle; adding files does not activate a plugin. The user selects the plugin folder in Settings. Do not expose or replace the Agent Loop or underlying tools through a display plugin.
+
 For Windows shell selection, missing developer tools and platform differences, read [references/windows-environment.md](references/windows-environment.md).

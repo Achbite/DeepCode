@@ -277,6 +277,7 @@ struct KernelGeneration {
 struct RunCatalogKey {
     session_id: String,
     run_id: String,
+    snapshot_ref: String,
 }
 
 struct KernelGenerationState {
@@ -432,11 +433,12 @@ impl LocalAgentKernel {
         ] {
             validate_id(field, value)?;
         }
+        let generation = prepared.generation;
         let key = RunCatalogKey {
             session_id: request.session_id.clone(),
             run_id: request.run_id.clone(),
+            snapshot_ref: generation.catalog.snapshot_ref().to_string(),
         };
-        let generation = prepared.generation;
         {
             let mut state = self.lock_generations()?;
             if state.released_run_bindings.contains_key(&key) {
@@ -485,6 +487,7 @@ impl LocalAgentKernel {
         let key = RunCatalogKey {
             session_id: request.session_id.clone(),
             run_id: request.run_id.clone(),
+            snapshot_ref: request.kernel_catalog_snapshot_ref.clone(),
         };
         let has_live_binding = {
             let state = self.lock_generations()?;
@@ -517,11 +520,21 @@ impl LocalAgentKernel {
             let runtime = self
                 .journal
                 .run_runtime_snapshot(&request.session_id, &request.run_id)?;
-            if runtime
+            let initial_binding = runtime
                 .get("kernelCatalogSnapshotRef")
                 .and_then(Value::as_str)
-                != Some(request.kernel_catalog_snapshot_ref.as_str())
-            {
+                == Some(request.kernel_catalog_snapshot_ref.as_str());
+            let prepared_binding = self
+                .journal
+                .read_events(&request.session_id, 0)?
+                .iter()
+                .any(|event| {
+                    event["runId"].as_str() == Some(request.run_id.as_str())
+                        && event["type"] == "run.tools.prepared"
+                        && event["payload"]["toolView"]["kernelCatalogSnapshotRef"].as_str()
+                            == Some(request.kernel_catalog_snapshot_ref.as_str())
+                });
+            if !initial_binding && !prepared_binding {
                 return Err(LocalAgentKernelError::new(
                     "tool_catalog_release_identity_conflict",
                     "KernelCatalogSnapshotRef 与持久化 run.runtime snapshot 不一致。",
@@ -949,7 +962,10 @@ impl LocalAgentKernel {
                 format!("Kernel 工具 {} 当前被阻止，不能执行。", request.tool_name),
             ));
         }
-        let scope = match binding.effect_scope() {
+        let scope = match binding
+            .effect_scope(&request.input)
+            .map_err(catalog_error)?
+        {
             CatalogEffectScope::LocalRead => PreparedEffectScope::LocalRead,
             CatalogEffectScope::WorkspaceRead => PreparedEffectScope::WorkspaceRead,
             CatalogEffectScope::WorkspaceMutation => PreparedEffectScope::WorkspaceMutation,
@@ -1478,6 +1494,7 @@ impl LocalAgentKernel {
         let key = RunCatalogKey {
             session_id: request.session_id.clone(),
             run_id: request.run_id.clone(),
+            snapshot_ref: request.kernel_catalog_snapshot_ref.clone(),
         };
         let state = self.lock_generations()?;
         let generation = state.run_bindings.get(&key).ok_or_else(|| {
@@ -1982,11 +1999,13 @@ fn authority_covers(authority: &Value, prepared: &PreparedEffect) -> bool {
                     == prepared.workspace_id.as_deref()
                     && (object.get("operation").and_then(Value::as_str)
                         == Some(prepared.operation.as_str())
-                        || matches!(prepared.operation.as_str(), "fs.write" | "fs.edit")
-                            && matches!(
-                                object.get("operation").and_then(Value::as_str),
-                                Some("fs.write" | "fs.edit")
-                            ));
+                        || matches!(
+                            prepared.operation.as_str(),
+                            "fs.write" | "fs.edit" | "document.render" | "browser.capture"
+                        ) && matches!(
+                            object.get("operation").and_then(Value::as_str),
+                            Some("fs.write" | "fs.edit" | "document.render" | "browser.capture")
+                        ));
                 if !base {
                     return false;
                 }
@@ -2578,6 +2597,11 @@ mod attempt_control_tests {
         effect.logical_targets = vec!["src/pool.hpp".into()];
         let file = json!({"coveredOperations":[{"workspaceId":"workspace:scope", "operation":"fs.edit", "target":"src/pool.hpp"}]});
         assert!(authority_covers(&file, &effect));
+        effect.operation = "document.render".into();
+        assert!(authority_covers(&file, &effect));
+        effect.logical_targets = vec!["reports/output.pdf".into()];
+        assert!(!authority_covers(&file, &effect));
+        effect.operation = "fs.write".into();
         effect.logical_targets = vec!["src/other.hpp".into()];
         assert!(!authority_covers(&file, &effect));
         let directory = json!({"coveredOperations":[{"workspaceId":"workspace:scope", "operation":"fs.edit", "target":"src", "targetKind":"directoryTree"}]});

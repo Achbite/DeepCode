@@ -33,7 +33,7 @@ LONG_INPUT = "  原始任务约束与资料🙂\n" * 4000
 PDF_CONTENT = "DEEPCODE_FIRST_PARTY_PDF_BINDING_OK"
 CORE_TOOL_NAMES = [
     "fs.read", "fs.write", "fs.edit", "fs.delete",
-    "bash", "web.search", "web.fetch", "session.read", "skill.read", "doc.read",
+    "bash", "web.search", "web.fetch", "session.read", "skill.read", "doc.read", "document.render",
 ]
 FIRST_PARTY_TOOL_OWNERS = {
     "github.search": "plugin://github@first-party",
@@ -1095,7 +1095,7 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
         require(
             [tool.get("name") for tool in runtime_core_tools]
             == sorted(CORE_TOOL_NAMES),
-            "Kernel runtime snapshot 未包含精确九项基础工具",
+            "Kernel runtime snapshot 未包含当前完整基础工具",
         )
         runtime_tools_by_name = {
             tool.get("name"): tool for tool in runtime_tools if isinstance(tool, dict)

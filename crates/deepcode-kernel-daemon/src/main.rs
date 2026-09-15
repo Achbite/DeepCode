@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod api_response;
 mod browser_api;
 mod config_root_lease;
@@ -15,6 +17,7 @@ mod llm_provider_transport;
 mod llm_stream_parser;
 mod llm_transport;
 mod local_agent_api;
+mod local_agent_cli;
 mod local_agent_first_party_plugins;
 mod local_agent_kernel;
 mod local_agent_mcp;
@@ -42,6 +45,7 @@ pub(crate) use api_response::*;
 pub(crate) use browser_api::*;
 pub(crate) use config_root_lease::*;
 pub(crate) use conversation_api::*;
+mod browser_tools;
 pub(crate) use host_connection::*;
 pub(crate) use host_lifecycle::*;
 pub(crate) use host_services::*;

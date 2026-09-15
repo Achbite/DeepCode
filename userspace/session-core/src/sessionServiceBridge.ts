@@ -184,7 +184,7 @@ function decodeCommand(value: unknown): ConversationCommand {
           value,
           ['schemaVersion', 'type', 'commandId', 'sessionId', 'text'],
           [
-            'runId', 'filesystemReferences', 'profileId', 'reasoningEffortOverride', 'pluginCatalogRevision', 'pluginSelections',
+            'runId', 'filesystemReferences', 'profileId', 'reasoningEffortOverride', 'pluginCatalogRevision', 'pluginSelections', 'guidanceReferences', 'hostBinding',
           ],
         )
         || (value.runId !== undefined && !validId(value.runId))
@@ -194,6 +194,8 @@ function decodeCommand(value: unknown): ConversationCommand {
         || (value.profileId !== undefined && !validId(value.profileId))
         || (value.reasoningEffortOverride !== undefined && !validReasoningOverride(value.reasoningEffortOverride))
         || !validPluginSelections(value.pluginCatalogRevision, value.pluginSelections)
+        || !validGuidanceReferences(value.guidanceReferences)
+        || !validHostBinding(value.hostBinding)
       ) throw new Error('conversation_command_invalid');
       return value as unknown as ConversationCommand;
     case 'context.focus':
@@ -202,7 +204,7 @@ function decodeCommand(value: unknown): ConversationCommand {
           value,
           ['schemaVersion', 'type', 'commandId', 'sessionId', 'task'],
           [
-            'filesystemReferences', 'profileId', 'reasoningEffortOverride', 'pluginCatalogRevision', 'pluginSelections',
+            'filesystemReferences', 'profileId', 'reasoningEffortOverride', 'pluginCatalogRevision', 'pluginSelections', 'guidanceReferences', 'hostBinding',
           ],
         )
         || typeof value.task !== 'string'
@@ -212,6 +214,8 @@ function decodeCommand(value: unknown): ConversationCommand {
         || (value.profileId !== undefined && !validId(value.profileId))
         || (value.reasoningEffortOverride !== undefined && !validReasoningOverride(value.reasoningEffortOverride))
         || !validPluginSelections(value.pluginCatalogRevision, value.pluginSelections)
+        || !validGuidanceReferences(value.guidanceReferences)
+        || !validHostBinding(value.hostBinding)
       ) throw new Error('conversation_command_invalid');
       return value as unknown as ConversationCommand;
     case 'message.feedback.set':
@@ -346,6 +350,18 @@ function validLogicalPath(value: string): boolean {
   if (value === '.') return true;
   if (value.startsWith('/') || value.endsWith('/')) return false;
   return value.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
+}
+
+function validHostBinding(value:unknown):boolean {
+  return value===undefined || isRecord(value) && hasExactKeys(value,['hostInstanceId','windowLabel'])
+    && validId(value.hostInstanceId) && validId(value.windowLabel);
+}
+
+function validGuidanceReferences(value:unknown):boolean {
+  return value===undefined || Array.isArray(value) && value.length<=16 && value.every((reference)=>
+    isRecord(reference) && hasExactKeys(reference,['referenceId','uri','label','toolName','name'])
+    && ['referenceId','uri','label','name'].every((key)=>typeof reference[key]==='string' && Boolean(reference[key]))
+    && ['skill.read','doc.read'].includes(String(reference.toolName)));
 }
 
 function validPluginSelections(revision: unknown, value: unknown): boolean {

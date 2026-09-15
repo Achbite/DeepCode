@@ -21,7 +21,7 @@ pub(crate) struct LocalAgentRuntime {
     pub(crate) kernel: LocalAgentKernel,
     provider_runtimes: ProviderRuntimeRegistry,
     runtime_transition: Arc<Mutex<()>>,
-    prepared_runs: Arc<Mutex<HashMap<PreparedRunKey, PreparedRunRecord>>>,
+    prepared_runs: Arc<Mutex<HashMap<PreparedRunKey, Vec<PreparedRunRecord>>>>,
     active_runtime_settings: Arc<Mutex<Value>>,
     session_store_path: Arc<std::path::PathBuf>,
     tool_record_store_path: Arc<std::path::PathBuf>,
@@ -95,7 +95,7 @@ impl LocalAgentRuntime {
         &self,
         gui: &Arc<Mutex<GuiState>>,
         session_service: SessionServiceProcess,
-        request: PrepareRunRuntimeRequest,
+        mut request: PrepareRunRuntimeRequest,
     ) -> Result<Value, RunPreparationError> {
         for (field, value) in [
             ("sessionId", request.session_id.as_str()),
@@ -115,8 +115,27 @@ impl LocalAgentRuntime {
             session_id: request.session_id.clone(),
             run_id: request.run_id.clone(),
         };
+        let gui = gui.lock().map_err(|_| {
+            RunPreparationError::new("gui_state_lock_failed", "GUI state 锁已损坏。")
+        })?;
+        let settings = &gui.user_settings;
+        let current_revision = if request.plugin_selections.is_empty() {
+            None
+        } else {
+            Some(
+                crate::local_agent_plugins::current_plugin_catalog_revision(
+                    settings,
+                    &request.plugin_selections,
+                )
+                .map_err(|message| {
+                    RunPreparationError::new("extension_snapshot_prepare_failed", message)
+                })?,
+            )
+        };
         let requested_plugin_identity = json!({
             "pluginCatalogRevision": request.plugin_catalog_revision.clone(),
+            "pluginImplementationRevision":current_revision,
+            "refreshPlugins":request.refresh_plugins,
             "pluginSelections": request.plugin_selections.clone(),
         });
         let mut prepared_runs = self.prepared_runs.lock().map_err(|_| {
@@ -125,7 +144,11 @@ impl LocalAgentRuntime {
                 "Prepared run registry 锁已损坏。",
             )
         })?;
-        if let Some(prepared) = prepared_runs.get(&key) {
+        let previous = prepared_runs
+            .get(&key)
+            .and_then(|views| views.last())
+            .cloned();
+        if let Some(prepared) = &previous {
             let effective_profile_id = prepared
                 .response
                 .pointer("/provider/profileId")
@@ -157,18 +180,14 @@ impl LocalAgentRuntime {
                     "当前 run 已使用不同推理强度完成运行时准备。",
                 ));
             }
-            if prepared.requested_plugin_identity != requested_plugin_identity {
-                return Err(RunPreparationError::new(
-                    "run_runtime_identity_conflict",
-                    "当前 run 已使用不同的插件选择完成运行时准备。",
-                ));
+            if let Some(existing) = prepared_runs.get(&key).and_then(|views| {
+                views
+                    .iter()
+                    .find(|view| view.requested_plugin_identity == requested_plugin_identity)
+            }) {
+                return Ok(existing.response.clone());
             }
-            return Ok(prepared.response.clone());
         }
-        let gui = gui.lock().map_err(|_| {
-            RunPreparationError::new("gui_state_lock_failed", "GUI state 锁已损坏。")
-        })?;
-        let settings = &gui.user_settings;
         let mut environment_settings = settings.clone();
         if let Some(project_id) = gui
             .conversation_catalog
@@ -183,23 +202,62 @@ impl LocalAgentRuntime {
                 environment_settings["_executionTarget"] = target.clone();
             }
         }
-        let environment = crate::session_environment::prepare(
+        let mut environment = crate::session_environment::prepare(
             &environment_settings,
             request.environment.as_ref(),
             request.restore_environment,
         )
         .map_err(|message| RunPreparationError::new("session_environment_invalid", message))?;
+        // A new task binds its own originating window; it never inherits the
+        // preceding task's GUI capability from the saved execution environment.
+        environment
+            .as_object_mut()
+            .expect("prepared environment")
+            .remove("hostBinding");
+        if let Some(binding) = request.host_binding.as_ref() {
+            if binding["hostInstanceId"].as_str().is_none_or(str::is_empty)
+                || binding["windowLabel"].as_str().is_none_or(str::is_empty)
+            {
+                return Err(RunPreparationError::new(
+                    "session_host_binding_invalid",
+                    "Host and window identity are required.",
+                ));
+            }
+            environment["hostBinding"] = binding.clone();
+        }
         // Validate and freeze the requested Provider before starting any new
         // out-of-process plugin generation. A bad Profile must not replace the
         // currently usable tool generation or leave an unused MCP process set.
-        let provider_binding = ProviderRuntimeRegistry::prepare(
-            &gui,
-            request.profile_id.as_deref(),
-            request.reasoning_effort_override.as_deref(),
-        )
-        .map_err(|message| RunPreparationError::new("provider_runtime_prepare_failed", message))?;
+        let provider_binding = if let Some(previous) = &previous {
+            previous.provider_binding.clone()
+        } else {
+            ProviderRuntimeRegistry::prepare(
+                &gui,
+                request.profile_id.as_deref(),
+                request.reasoning_effort_override.as_deref(),
+            )
+            .map_err(|message| {
+                RunPreparationError::new("provider_runtime_prepare_failed", message)
+            })?
+        };
         let provider_runtime = provider_binding.snapshot().clone();
-        let plugin_selection = crate::local_agent_plugins::resolve_plugin_selection(
+        if let Some(previous) = &previous {
+            environment = previous.response["environment"].clone();
+        }
+        if request.refresh_plugins {
+            let catalog = crate::local_agent_plugins::plugin_catalog_projection(settings).map_err(
+                |message| RunPreparationError::new("extension_snapshot_prepare_failed", message),
+            )?;
+            // Disabling/removing a source withdraws it only from the next request. Existing bindings remain leased.
+            request.plugin_selections.retain(|selection| {
+                catalog["plugins"].as_array().is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| item["uri"] == selection.uri && item["enabled"] == true)
+                })
+            });
+        }
+        let mut plugin_selection = crate::local_agent_plugins::resolve_plugin_selection(
             settings,
             request.plugin_catalog_revision.as_deref(),
             &request.plugin_selections,
@@ -207,20 +265,33 @@ impl LocalAgentRuntime {
         .map_err(|message| {
             RunPreparationError::new("extension_snapshot_prepare_failed", message)
         })?;
+        if let Some(previous) = &previous {
+            plugin_selection.retain_prepared(&previous.plugin_selection);
+        }
         let mut plugin_config =
             crate::local_agent_plugins::local_agent_plugin_config(settings, &plugin_selection)
                 .map_err(|message| {
                     RunPreparationError::new("extension_snapshot_prepare_failed", message)
                 })?;
-        let mcp = crate::local_agent_mcp::McpRuntime::from_selected_settings(
-            settings,
-            plugin_selection.mcp_plugin_instances(),
-        )
+        let mcp = if let Some(previous) = &previous {
+            previous
+                .mcp
+                .extend_selected_settings(settings, plugin_selection.mcp_plugin_instances())
+        } else {
+            crate::local_agent_mcp::McpRuntime::from_selected_settings(
+                settings,
+                plugin_selection.mcp_plugin_instances(),
+            )
+        }
         .map_err(|error| RunPreparationError::new(error.code, error.message))?;
-        let extension_generation_ref =
-            crate::local_agent_plugins::extension_generation_ref(&plugin_config, &mcp).map_err(
-                |message| RunPreparationError::new("extension_identity_prepare_failed", message),
-            )?;
+        let extension_generation_ref = crate::local_agent_plugins::extension_generation_ref(
+            &plugin_config,
+            &plugin_selection,
+            &mcp,
+        )
+        .map_err(|message| {
+            RunPreparationError::new("extension_identity_prepare_failed", message)
+        })?;
         let next_kernel_runtime_key = crate::local_agent_plugins::kernel_runtime_generation_key(
             &extension_generation_ref,
             settings,
@@ -278,12 +349,24 @@ impl LocalAgentRuntime {
             &next_kernel_runtime_key,
             executor_config,
             Arc::new(secrets),
-            mcp,
+            mcp.clone(),
             permissions,
             enable_kernel_web_search,
-            Arc::new(crate::local_agent_product_tools::ProductTools::new(
-                Arc::new(session_service),
-            )),
+            Arc::new(
+                crate::local_agent_product_tools::ProductTools::new(Arc::new(session_service))
+                    .with_browser_binding(environment.get("hostBinding").cloned().map(
+                        |mut binding| {
+                            binding["sessionId"] = json!(request.session_id);
+                            binding["runId"] = json!(request.run_id);
+                            binding
+                        },
+                    ))
+                    .with_document_python(
+                        settings
+                            .get("agent.documents.pythonPath")
+                            .and_then(Value::as_str),
+                    ),
+            ),
         )
         .map_err(RunPreparationError::from)?;
         *self.active_runtime_settings.lock().map_err(|_| {
@@ -313,10 +396,11 @@ impl LocalAgentRuntime {
                 )
             })?
             .to_string();
-        if let Err(message) =
-            self.provider_runtimes
-                .bind(&request.session_id, &request.run_id, provider_binding)
-        {
+        if let Err(message) = self.provider_runtimes.bind(
+            &request.session_id,
+            &request.run_id,
+            provider_binding.clone(),
+        ) {
             let _ = self.kernel.release_catalog(ReleaseToolCatalogRequest::new(
                 &request.session_id,
                 &request.run_id,
@@ -349,14 +433,17 @@ impl LocalAgentRuntime {
             "selectedPlugins": selected_plugins,
             "environment": environment,
         });
-        prepared_runs.insert(
-            key,
-            PreparedRunRecord {
+        prepared_runs
+            .entry(key)
+            .or_default()
+            .push(PreparedRunRecord {
                 kernel_catalog_snapshot_ref,
                 requested_plugin_identity,
                 response: response.clone(),
-            },
-        );
+                provider_binding,
+                plugin_selection,
+                mcp,
+            });
         Ok(response)
     }
 
@@ -378,11 +465,26 @@ impl LocalAgentRuntime {
             )
         })?;
         if let Some(prepared) = prepared_runs.get(&key) {
-            if prepared.kernel_catalog_snapshot_ref != request.kernel_catalog_snapshot_ref() {
+            if !prepared.iter().any(|view| {
+                view.kernel_catalog_snapshot_ref == request.kernel_catalog_snapshot_ref()
+            }) {
                 return Err(RunPreparationError::new(
                     "tool_catalog_release_identity_conflict",
                     "KernelCatalogSnapshotRef 与当前 prepared run 不一致。",
                 ));
+            }
+        }
+        if let Some(views) = prepared_runs.get(&key) {
+            for view in views.iter().filter(|view| {
+                view.kernel_catalog_snapshot_ref != request.kernel_catalog_snapshot_ref()
+            }) {
+                self.kernel
+                    .release_catalog(ReleaseToolCatalogRequest::new(
+                        &key.session_id,
+                        &key.run_id,
+                        &view.kernel_catalog_snapshot_ref,
+                    ))
+                    .map_err(RunPreparationError::from)?;
             }
         }
         let response = self
@@ -444,8 +546,11 @@ struct PreparedRunKey {
     run_id: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct PreparedRunRecord {
+    provider_binding: crate::local_agent_provider_runtime::ProviderRuntimeBinding,
+    plugin_selection: crate::local_agent_plugins::ResolvedPluginSelection,
+    mcp: crate::local_agent_mcp::McpRuntime,
     kernel_catalog_snapshot_ref: String,
     requested_plugin_identity: Value,
     response: Value,
@@ -486,9 +591,12 @@ pub(crate) struct PrepareRunRuntimeRequest {
     profile_id: Option<String>,
     reasoning_effort_override: Option<String>,
     environment: Option<Value>,
+    host_binding: Option<Value>,
     #[serde(default)]
     restore_environment: bool,
     plugin_catalog_revision: Option<String>,
+    #[serde(default)]
+    refresh_plugins: bool,
     #[serde(default)]
     plugin_selections: Vec<crate::local_agent_plugins::PluginSelectionInput>,
 }

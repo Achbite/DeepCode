@@ -1,5 +1,6 @@
 use crate::local_agent_mcp::{McpRuntime, McpTool, McpToolBindingRequirement, McpToolEffectScope};
 use crate::local_agent_product_tools::ProductTools;
+use deepcode_first_party_tools::documents::{self, DocumentContext};
 use deepcode_kernel_runtime::executors::{
     builtin_executors, web_search_availability, KernelExecutorConfig, KernelExecutorRegistry,
     KernelToolExecutionContext, KernelToolExecutionFailure, KernelToolExecutionOutcome,
@@ -49,6 +50,10 @@ enum ToolExecutorBinding {
     },
     Mcp(Box<McpTool>),
     Product(Arc<ProductTools>),
+    Browser(Value),
+    Document {
+        python: Option<std::path::PathBuf>,
+    },
 }
 
 struct PendingToolContribution {
@@ -81,9 +86,37 @@ trait ToolProvider: Send {
 
 struct ProductToolProvider(Arc<ProductTools>);
 
+struct DocumentToolProvider {
+    python: Option<std::path::PathBuf>,
+}
+
+impl ToolProvider for DocumentToolProvider {
+    fn install(self: Box<Self>) -> Result<InstalledToolProvider, ToolCatalogError> {
+        Ok(InstalledToolProvider {
+            tools: vec![PendingToolContribution {
+                origin: "coreBuiltin",
+                provider_ref: "deepcode:documents".into(),
+                plugin_uri: None,
+                plugin_instance_ref: None,
+                contribution_ref: "deepcode:documents/document.render".into(),
+                binding_identity: format!("documents:{}", self.python.as_ref().map(|path| path.to_string_lossy().into_owned()).unwrap_or_default()),
+                name: "document.render".into(),
+                description: "Create a polished document artifact in the workspace. Write complete HTML or Markdown, or render self-contained HTML to PDF with WeasyPrint. Read deepcode-documents via skill.read for templates and typography when needed. Output is a workspace mutation; the existing Plan and permission policy applies. PDF requires a configured Python environment with WeasyPrint. Source limit: 1 MiB; PDF limit: 32 MiB.".into(),
+                input_schema: documents::input_schema(),
+                effect_class: None,
+                effect_scope: CatalogEffectScope::WorkspaceMutation,
+                availability: ToolAvailability::Callable,
+                logical_target: None,
+                binding: ToolExecutorBinding::Document { python: self.python },
+            }],
+            dispose: Box::new(|| Ok(())),
+        })
+    }
+}
+
 impl ToolProvider for ProductToolProvider {
     fn install(self: Box<Self>) -> Result<InstalledToolProvider, ToolCatalogError> {
-        let tools = ProductTools::definitions()
+        let mut tools: Vec<_> = ProductTools::definitions()
             .into_iter()
             .map(
                 |(name, description, input_schema)| PendingToolContribution {
@@ -104,6 +137,38 @@ impl ToolProvider for ProductToolProvider {
                 },
             )
             .collect();
+        if let Some(binding) = self.0.browser_binding.as_ref() {
+            let status = crate::browser_tools::call(binding, &json!({"action":"hostStatus"}));
+            for (name, description, input_schema) in crate::browser_tools::definitions() {
+                tools.push(PendingToolContribution {
+                    origin: "coreBuiltin",
+                    provider_ref: "deepcode:browser".into(),
+                    plugin_uri: None,
+                    plugin_instance_ref: None,
+                    contribution_ref: format!("deepcode:browser/{name}"),
+                    binding_identity: format!("browser:{binding}:{name}"),
+                    name: name.into(),
+                    description: match &status {
+                        Ok(_) => description.into(),
+                        Err(reason) => format!("{description} Currently unavailable: {reason}"),
+                    },
+                    input_schema,
+                    effect_class: None,
+                    effect_scope: if name == "browser.capture" {
+                        CatalogEffectScope::WorkspaceMutation
+                    } else {
+                        CatalogEffectScope::External
+                    },
+                    availability: if status.is_ok() {
+                        ToolAvailability::Callable
+                    } else {
+                        ToolAvailability::Blocked
+                    },
+                    logical_target: None,
+                    binding: ToolExecutorBinding::Browser(binding.clone()),
+                });
+            }
+        }
         Ok(InstalledToolProvider {
             tools,
             dispose: Box::new(|| Ok(())),
@@ -362,6 +427,9 @@ impl ToolCatalogSnapshot {
                 enable_web_search,
             )?),
             Box::new(McpToolProvider::prepare(mcp)?),
+            Box::new(DocumentToolProvider {
+                python: product.document_python.clone(),
+            }),
             Box::new(ProductToolProvider(product)),
         ];
         Self::from_providers(
@@ -604,8 +672,55 @@ impl PreparedCatalogBinding {
         &self.entry().name
     }
 
-    pub(crate) fn effect_scope(&self) -> CatalogEffectScope {
-        self.entry().effect_scope
+    pub(crate) fn effect_scope(
+        &self,
+        input: &Value,
+    ) -> Result<CatalogEffectScope, ToolCatalogError> {
+        if let ToolExecutorBinding::Browser(host) = &self.entry().binding {
+            let action = input["action"].as_str().unwrap_or("");
+            let network = |url: &str| {
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    CatalogEffectScope::Network
+                } else {
+                    CatalogEffectScope::LocalRead
+                }
+            };
+            match (self.tool_name(), action) {
+                ("browser.page", "openSelf" | "list" | "status" | "close") => {
+                    return Ok(CatalogEffectScope::LocalRead)
+                }
+                ("browser.page", "reload") => {
+                    let page = crate::browser_tools::call(
+                        host,
+                        &json!({"action":"status","previewId":input["previewId"]}),
+                    )
+                    .map_err(|error| ToolCatalogError::new("native_browser_failed", error))?;
+                    let url = page["url"].as_str().ok_or_else(|| {
+                        ToolCatalogError::new(
+                            "native_browser_page_invalid",
+                            "Browser status is missing its URL",
+                        )
+                    })?;
+                    return Ok(network(url));
+                }
+                ("browser.page", "act")
+                    if matches!(input["operation"].as_str(), Some("inspect" | "scroll")) =>
+                {
+                    return Ok(CatalogEffectScope::LocalRead)
+                }
+                ("browser.page", "open" | "navigate") => {
+                    return Ok(input["url"]
+                        .as_str()
+                        .map(network)
+                        .unwrap_or(CatalogEffectScope::LocalRead))
+                }
+                ("browser.service", "list" | "status" | "stop") => {
+                    return Ok(CatalogEffectScope::LocalRead)
+                }
+                _ => {}
+            }
+        }
+        Ok(self.entry().effect_scope)
     }
 
     pub(crate) fn availability(&self) -> ToolAvailability {
@@ -635,6 +750,15 @@ impl PreparedCatalogBinding {
                     }
                 }),
             ToolExecutorBinding::Mcp(_) => Ok(raw_arguments),
+            ToolExecutorBinding::Browser(_) => {
+                browser_targets(self.tool_name(), &raw_arguments)?;
+                Ok(raw_arguments)
+            }
+            ToolExecutorBinding::Document { .. } => {
+                documents::logical_targets(&raw_arguments)
+                    .map_err(|error| ToolCatalogError::new(error.code, error.message))?;
+                Ok(raw_arguments)
+            }
             ToolExecutorBinding::Product(_) => {
                 product_logical_targets(self.tool_name(), &raw_arguments)?;
                 Ok(raw_arguments)
@@ -648,6 +772,12 @@ impl PreparedCatalogBinding {
     ) -> Result<Option<Vec<String>>, ToolCatalogError> {
         match &self.entry().binding {
             ToolExecutorBinding::Builtin { .. } => Ok(None),
+            ToolExecutorBinding::Browser(_) => {
+                browser_targets(self.tool_name(), arguments).map(Some)
+            }
+            ToolExecutorBinding::Document { .. } => documents::logical_targets(arguments)
+                .map(Some)
+                .map_err(|error| ToolCatalogError::new(error.code, error.message)),
             ToolExecutorBinding::Product(_) => {
                 product_logical_targets(self.tool_name(), arguments).map(Some)
             }
@@ -665,6 +795,116 @@ impl PreparedCatalogBinding {
         context: KernelToolExecutionContext,
     ) -> Result<KernelToolExecutionResult, ToolCatalogError> {
         match &self.entry().binding {
+            ToolExecutorBinding::Browser(binding) => {
+                let result = crate::browser_tools::execute(
+                    binding,
+                    self.tool_name(),
+                    input,
+                    &context,
+                    invocation_id,
+                );
+                Ok(match result {
+                    Ok(output) => KernelToolExecutionResult {
+                        invocation_id: invocation_id.into(),
+                        outcome: KernelToolExecutionOutcome::Completed,
+                        output,
+                        error: None,
+                    },
+                    Err(message) => KernelToolExecutionResult {
+                        invocation_id: invocation_id.into(),
+                        outcome: KernelToolExecutionOutcome::Failed,
+                        output: Value::Null,
+                        error: Some(KernelToolExecutionFailure {
+                            code: "native_browser_failed".into(),
+                            message,
+                        }),
+                    },
+                })
+            }
+            ToolExecutorBinding::Document { python } => {
+                let workspace_id = context.workspace_id.as_deref().ok_or_else(|| {
+                    ToolCatalogError::new(
+                        "workspace_binding_required",
+                        "Document output requires a prepared workspace.",
+                    )
+                })?;
+                let [target] = context.private_resolved_targets.as_slice() else {
+                    return Err(ToolCatalogError::new(
+                        "workspace_binding_invalid",
+                        "Document output requires exactly one prepared destination.",
+                    ));
+                };
+                let before = deepcode_kernel_runtime::executors::capture_file_change_side(
+                    std::path::Path::new(target),
+                    &context,
+                    0,
+                    "before",
+                );
+                let result = documents::render(
+                    &input,
+                    DocumentContext {
+                        invocation_id,
+                        workspace_id,
+                        target: std::path::Path::new(target),
+                        python: python.as_deref(),
+                        cancelled: &|| context.cancellation.is_cancelled(),
+                    },
+                );
+                Ok(match result {
+                    Ok(mut output) => {
+                        let archived = context.output_directory.as_ref().ok_or_else(|| {
+                            ToolCatalogError::new(
+                                "artifact_storage_unavailable",
+                                "Document archive is unavailable.",
+                            )
+                        })?;
+                        let filename =
+                            std::path::Path::new(target).file_name().ok_or_else(|| {
+                                ToolCatalogError::new(
+                                    "artifact_target_invalid",
+                                    "Document filename is missing.",
+                                )
+                            })?;
+                        let archived = archived.join(filename);
+                        std::fs::create_dir_all(archived.parent().expect("artifact parent"))
+                            .and_then(|_| std::fs::copy(target, &archived))
+                            .map_err(|error| {
+                                ToolCatalogError::new("artifact_archive_failed", error.to_string())
+                            })?;
+                        output["artifacts"][0]["contentRef"] = json!(archived);
+                        output["artifacts"][0]["contentMode"] = json!("fixed");
+                        output["artifacts"][0]["uri"] =
+                            json!(format!("artifact://artifact:{invocation_id}"));
+                        let after = json!({"exists":true,"contentRef":archived,"sizeBytes":output["sizeBytes"]});
+                        output["fileChanges"] =
+                            json!([deepcode_kernel_runtime::executors::file_change_fact(
+                                &context,
+                                input["path"].as_str().expect("validated document path"),
+                                before,
+                                after
+                            )
+                            .map_err(|error| ToolCatalogError::new(
+                                "file_change_failed",
+                                error.to_string()
+                            ))?]);
+                        KernelToolExecutionResult {
+                            invocation_id: invocation_id.into(),
+                            outcome: KernelToolExecutionOutcome::Completed,
+                            output,
+                            error: None,
+                        }
+                    }
+                    Err(error) => KernelToolExecutionResult {
+                        invocation_id: invocation_id.into(),
+                        outcome: KernelToolExecutionOutcome::Failed,
+                        output: Value::Null,
+                        error: Some(KernelToolExecutionFailure {
+                            code: error.code.into(),
+                            message: error.message,
+                        }),
+                    },
+                })
+            }
             ToolExecutorBinding::Builtin { executors, .. } => executors
                 .invoke(
                     self.tool_name(),
@@ -761,6 +1001,136 @@ impl Drop for PhysicalAttemptLease {
         let previous = self.snapshot.active_attempts.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "physical attempt lease underflow");
     }
+}
+
+fn browser_targets(name: &str, input: &Value) -> Result<Vec<String>, ToolCatalogError> {
+    let text = |key: &str| {
+        input[key]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ToolCatalogError::new("tool_input_invalid", format!("{key} is required"))
+            })
+    };
+    let object = input.as_object().ok_or_else(|| {
+        ToolCatalogError::new("tool_input_invalid", "Browser arguments must be an object.")
+    })?;
+    if name == "browser.service" {
+        if object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "action" | "serviceId" | "directory" | "command" | "args" | "url"
+            )
+        }) {
+            return Err(ToolCatalogError::new(
+                "tool_input_invalid",
+                "Unsupported service argument.",
+            ));
+        }
+        let action = text("action")?;
+        if !matches!(action, "start" | "stop" | "list" | "status") {
+            return Err(ToolCatalogError::new(
+                "tool_input_invalid",
+                "Unsupported service action.",
+            ));
+        }
+        if action == "start" {
+            text("command")?;
+            text("directory")?;
+            text("url")?;
+            if !input["args"]
+                .as_array()
+                .is_some_and(|args| args.iter().all(Value::is_string))
+            {
+                return Err(ToolCatalogError::new(
+                    "tool_input_invalid",
+                    "args must be an array of strings.",
+                ));
+            }
+        } else if action != "list" {
+            text("serviceId")?;
+        }
+        return Ok(vec![format!(
+            "browser:service:{}",
+            input["serviceId"].as_str().unwrap_or(action)
+        )]);
+    }
+    if name == "browser.capture" {
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "previewId" | "path"))
+        {
+            return Err(ToolCatalogError::new(
+                "tool_input_invalid",
+                "Unsupported capture argument.",
+            ));
+        }
+        text("previewId")?;
+        let path = text("path")?;
+        if !path.to_ascii_lowercase().ends_with(".png") {
+            return Err(ToolCatalogError::new(
+                "tool_input_invalid",
+                "Screenshot path must end in .png.",
+            ));
+        }
+        return Ok(vec![path.into()]);
+    }
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "action"
+                | "previewId"
+                | "url"
+                | "filePath"
+                | "serviceId"
+                | "operation"
+                | "selector"
+                | "text"
+                | "x"
+                | "y"
+        )
+    }) {
+        return Err(ToolCatalogError::new(
+            "tool_input_invalid",
+            "Unsupported browser argument.",
+        ));
+    }
+    let action = text("action")?;
+    if !matches!(
+        action,
+        "open" | "openSelf" | "list" | "status" | "navigate" | "reload" | "act" | "close"
+    ) {
+        return Err(ToolCatalogError::new(
+            "tool_input_invalid",
+            "Unsupported browser action.",
+        ));
+    }
+    if matches!(action, "open" | "navigate") && !input["serviceId"].is_string() {
+        if input["filePath"].is_string() {
+            text("filePath")?;
+        } else {
+            text("url")?;
+        }
+    }
+    if !matches!(action, "open" | "openSelf" | "list") {
+        text("previewId")?;
+    }
+    if action == "act" {
+        let operation = text("operation")?;
+        if matches!(operation, "click" | "type") {
+            text("selector")?;
+        }
+        if operation == "type" && !input["text"].is_string() {
+            return Err(ToolCatalogError::new(
+                "tool_input_invalid",
+                "text is required",
+            ));
+        }
+    }
+    Ok(vec![format!(
+        "browser:{}",
+        input["previewId"].as_str().unwrap_or("pages")
+    )])
 }
 
 fn product_logical_targets(name: &str, input: &Value) -> Result<Vec<String>, ToolCatalogError> {

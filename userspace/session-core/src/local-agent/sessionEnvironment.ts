@@ -19,7 +19,12 @@ export function environmentInstruction(value: unknown): RunRuntimeSnapshot['inst
       throw new Error('session_environment_invalid');
     }
   }
-  const fields = ['os', 'arch', 'locale', 'responseLanguage', 'userShell', 'configuration', 'executionTarget', 'shellAvailable', 'shell', 'developerCommands', 'workspaceShellSupported', 'workspaceSandbox'];
+  const fields = ['os', 'arch', 'locale', 'responseLanguage', 'userShell', 'configuration', 'executionTarget', 'shellAvailable', 'shell', 'developerCommands', 'workspaceShellSupported', 'workspaceSandbox', 'hostBinding'];
+  if (data.hostBinding !== undefined) {
+    const binding = data.hostBinding as Record<string, unknown> | null;
+    if (!binding || typeof binding.hostInstanceId !== 'string' || !binding.hostInstanceId
+      || typeof binding.windowLabel !== 'string' || !binding.windowLabel) throw new Error('session_host_binding_invalid');
+  }
   if (Object.keys(data).some((key) => !fields.includes(key))
     || ['os', 'arch'].some((key) => typeof data[key] !== 'string' || !data[key])
     || ['locale', 'responseLanguage', 'userShell'].some((key) => data[key] !== null && typeof data[key] !== 'string')) {
@@ -32,6 +37,7 @@ export function environmentInstruction(value: unknown): RunRuntimeSnapshot['inst
       arch: data.arch,
       locale: data.locale,
       userShell: data.userShell,
+      ...(data.hostBinding ? { hostBinding: data.hostBinding } : {}),
       ...(data.executionTarget ? { executionTarget: data.executionTarget, shell: data.shell, shellAvailable: data.shellAvailable, developerCommands: data.developerCommands, workspaceShellSupported: data.workspaceShellSupported, ...(data.workspaceSandbox ? { workspaceSandbox: data.workspaceSandbox } : {}) } : {}),
     })}\nUse ${data.responseLanguage ?? "the user's language"} for all user-facing text, including progress updates, unless the user explicitly requests another language. Installed commands do not imply service readiness or permission.`,
   };

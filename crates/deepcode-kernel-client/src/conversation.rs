@@ -58,8 +58,6 @@ impl PluginCatalogProjection {
                     !valid_media_type(media_type)
                         || !activation_media_types.insert(media_type.as_str())
                 })
-                || !plugin.enabled
-                || !plugin.available
                 || !uris.insert(plugin.uri.as_str())
         }) {
             return Err("plugin catalog entries are invalid".to_string());
@@ -71,6 +69,12 @@ impl PluginCatalogProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginCatalogItem {
+    pub management: Option<Value>,
+    pub source: String,
+    pub category: String,
+    pub contribution_kind: String,
+    pub discovery: String,
+    pub reference: Option<Value>,
     pub uri: String,
     pub display_name: String,
     pub short_description: String,
@@ -125,6 +129,8 @@ pub struct SessionProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueuedInputProjection {
+    pub guidance_references: Option<Vec<GuidanceReference>>,
+    pub plugin_catalog_revision: Option<String>,
     pub command_id: String,
     pub message_id: String,
     pub run_id: String,
@@ -1032,6 +1038,7 @@ pub struct WorkspaceBindingDisplay {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProjectionMessage {
+    pub guidance_references: Option<Vec<GuidanceReference>>,
     pub message_id: String,
     pub run_id: Option<String>,
     pub provider_request_id: Option<String>,
@@ -1050,6 +1057,16 @@ pub struct ProjectionMessage {
 pub struct InteractionReplyContext {
     pub interaction_id: String,
     pub prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GuidanceReference {
+    pub reference_id: String,
+    pub uri: String,
+    pub label: String,
+    pub tool_name: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1474,6 +1491,7 @@ pub struct TokenUsageRoundProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ContextCompositionProjection {
+    pub kernel_catalog_snapshot_ref: Option<String>,
     pub provider_request_id: String,
     pub purpose: String,
     pub run_id: String,
@@ -1705,6 +1723,14 @@ pub struct ActivityResourceProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactProjection {
+    pub session_id: String,
+    pub run_id: String,
+    pub call_id: String,
+    pub record_id: String,
+    pub content_type: String,
+    pub content_mode: String,
+    pub created_at: String,
+    pub source_page: Option<serde_json::Value>,
     pub artifact_id: String,
     pub label: String,
     pub workspace_id: Option<String>,
@@ -2018,7 +2044,7 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                             && operation.terminal.is_none()
                             && operation.writable_paths.is_none()
                     }
-                    "fs.write" | "fs.edit" => {
+                    "fs.write" | "fs.edit" | "document.render" | "browser.capture" => {
                         operation
                             .target
                             .as_deref()

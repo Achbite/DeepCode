@@ -3,7 +3,7 @@ use deepcode_kernel_abi::{
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fmt;
 use std::time::Duration;
 use thiserror::Error;
@@ -240,6 +240,34 @@ impl HttpKernelClient {
             _ => None,
         };
         if let Some(field) = field {
+            if let Some(selections) = command["pluginSelections"]
+                .as_array()
+                .filter(|items| !items.is_empty())
+            {
+                let catalog = self.conversation_plugin_catalog().await?;
+                let mut execution = Vec::new();
+                let mut guidance = command["guidanceReferences"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                for selection in selections {
+                    let reference = catalog
+                        .plugins
+                        .iter()
+                        .find(|item| Some(item.uri.as_str()) == selection["uri"].as_str())
+                        .and_then(|item| item.reference.as_ref());
+                    if let Some(reference) = reference {
+                        guidance.push(json!({"referenceId":selection["selectionId"],"uri":selection["uri"],
+                            "label":selection["label"],"toolName":reference["toolName"],"name":reference["name"]}));
+                    } else {
+                        execution.push(selection.clone());
+                    }
+                }
+                command["pluginSelections"] = json!(execution);
+                if !guidance.is_empty() {
+                    command["guidanceReferences"] = json!(guidance);
+                }
+            }
             if command
                 .get("filesystemReferences")
                 .is_some_and(|value| !value.is_array())

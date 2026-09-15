@@ -62,6 +62,8 @@ pub(crate) struct ReadConversationResourceRequest {
 enum ResourceReadFormat {
     Text,
     Image,
+    Document,
+    Path,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,6 +209,30 @@ pub(crate) async fn conversation_resource_read(
         Ok(path) => path,
         Err(error) => return ApiResponse::error(error.code, &error.message).into_response(),
     };
+    if matches!(body.format, Some(ResourceReadFormat::Path)) {
+        return ApiResponse::ok(json!({"path":target})).into_response();
+    }
+    if matches!(body.format, Some(ResourceReadFormat::Document)) {
+        if body.start_byte.is_some() {
+            return ApiResponse::error(
+                "conversation_document_range_invalid",
+                "文档预览不接受文本游标。",
+            )
+            .into_response();
+        }
+        return match tokio::task::spawn_blocking(move || read_document_resource(&target)).await {
+            Ok(Ok((media_type, bytes))) => {
+                ([(axum::http::header::CONTENT_TYPE, media_type)], bytes).into_response()
+            }
+            Ok(Err(error)) => {
+                ApiResponse::error("conversation_document_read_failed", error).into_response()
+            }
+            Err(error) => {
+                ApiResponse::error("conversation_document_read_failed", error.to_string())
+                    .into_response()
+            }
+        };
+    }
     if matches!(body.format, Some(ResourceReadFormat::Image)) {
         if body.start_byte.is_some() {
             return ApiResponse::error(
@@ -239,6 +265,134 @@ pub(crate) async fn conversation_resource_read(
         Err(error) => ApiResponse::error("conversation_resource_read_failed", &error),
     }
     .into_response()
+}
+
+pub(crate) async fn conversation_artifact_read(
+    State(state): State<AppState>,
+    Path((session_id, artifact_id)): Path<(String, String)>,
+) -> Response {
+    let projection = match request_service(
+        state.session_service.clone(),
+        "snapshot",
+        json!({"sessionId":session_id}),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return session_service_error(error).into_response(),
+    };
+    let Some(artifact) = projection["artifacts"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["artifactId"] == artifact_id))
+    else {
+        return ApiResponse::error(
+            "artifact_not_found",
+            "This session does not contain the requested artifact.",
+        )
+        .into_response();
+    };
+    let Some(call_id) = artifact["callId"].as_str() else {
+        return ApiResponse::error(
+            "artifact_source_missing",
+            "Artifact has no execution reference.",
+        )
+        .into_response();
+    };
+    let record = match state.local_agent.kernel.read_record(call_id) {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return ApiResponse::error(
+                "artifact_record_missing",
+                "Artifact execution record is missing.",
+            )
+            .into_response()
+        }
+        Err(error) => return ApiResponse::error(error.code, error.message).into_response(),
+    };
+    let source = record["output"]["artifacts"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["artifactId"] == artifact_id));
+    let Some(source) = source.filter(|_| {
+        record["sessionId"] == session_id && record["recordId"] == artifact["recordId"]
+    }) else {
+        return ApiResponse::error(
+            "artifact_source_invalid",
+            "Artifact execution ownership does not match.",
+        )
+        .into_response();
+    };
+    let (Some(path), Some(content_type)) = (
+        source["contentRef"].as_str(),
+        source["contentType"].as_str(),
+    ) else {
+        return ApiResponse::error(
+            "artifact_content_unavailable",
+            "This artifact has no archived content; its live target may be opened explicitly.",
+        )
+        .into_response();
+    };
+    let content_type = content_type.to_owned();
+    let path = path.to_owned();
+    match tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&path).map_err(|error| format!("{path}: {error}"))?;
+        let mut bytes = Vec::new();
+        file.take(32 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() > 32 * 1024 * 1024 {
+            return Err("artifact_preview_limit_exceeded: 32 MiB".into());
+        }
+        Ok::<_, String>(bytes)
+    })
+    .await
+    {
+        Ok(Ok(bytes)) => (
+            [
+                (axum::http::header::CONTENT_TYPE, content_type),
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    "private, immutable".into(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(Err(error)) => ApiResponse::error("artifact_read_failed", error).into_response(),
+        Err(error) => ApiResponse::error("artifact_read_failed", error.to_string()).into_response(),
+    }
+}
+
+fn read_document_resource(path: &StdPath) -> Result<(&'static str, Vec<u8>), String> {
+    const MAX_DOCUMENT_BYTES: u64 = 32 * 1024 * 1024;
+    let suffix = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let media_type = match suffix.as_str() {
+        "pdf" => "application/pdf",
+        "html" | "htm" => "text/html; charset=utf-8",
+        "md" | "markdown" => "text/markdown; charset=utf-8",
+        _ => return Err("文档预览支持 HTML、PDF 和 Markdown 文件。".into()),
+    };
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .map_err(|error| error.to_string())?
+        .take(MAX_DOCUMENT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+        return Err("文档超过 32 MiB 读取限额。".into());
+    }
+    if suffix == "pdf" {
+        if !bytes.starts_with(b"%PDF-") {
+            return Err("当前文件不是 PDF 文档。".into());
+        }
+    } else {
+        std::str::from_utf8(&bytes)
+            .map_err(|error| format!("文档不是有效的 UTF-8 文本：{error}"))?;
+    }
+    Ok((media_type, bytes))
 }
 
 // Image presentation uses the same Session/workspace binding check as text.
@@ -1195,7 +1349,7 @@ pub(crate) async fn conversation_command_submit(
         }
     }
     let reply = match request_service(
-        state.session_service,
+        state.session_service.clone(),
         "submit",
         json!({ "command": command.clone() }),
     )
@@ -1205,12 +1359,27 @@ pub(crate) async fn conversation_command_submit(
         Err(error) => return session_service_error(error),
     };
     if reply.get("status").and_then(Value::as_str) == Some("accepted") {
-        let chosen_profile = match command["type"].as_str() {
-            Some("session.model-settings.set") => command["settings"]["profileId"].as_str(),
-            Some("message.submit" | "context.focus") => command["profileId"].as_str(),
-            _ => None,
+        let submitted_task = matches!(
+            command["type"].as_str(),
+            Some("message.submit" | "context.focus")
+        );
+        let chosen_profile = if submitted_task {
+            match request_service(
+                state.session_service.clone(),
+                "snapshot",
+                json!({"sessionId":session_id}),
+            )
+            .await
+            {
+                Ok(projection) => projection["modelSettings"]["profileId"]
+                    .as_str()
+                    .map(str::to_string),
+                Err(error) => return session_service_error(error),
+            }
+        } else {
+            None
         };
-        if let Some(profile_id) = chosen_profile {
+        if let Some(profile_id) = chosen_profile.as_deref() {
             let result = (|| {
                 let _transition = state.local_agent.runtime_transition()?;
                 let mut gui = state.gui.lock().expect("gui state lock");
@@ -1966,6 +2135,36 @@ fn random_id(prefix: &str) -> Result<String, SessionServiceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_resource_preserves_full_text_and_rejects_invalid_pdf_bytes() {
+        let tree = TemporaryTree::new("document-read");
+        for (name, media, content) in [
+            (
+                "报告.html",
+                "text/html; charset=utf-8",
+                "<!doctype html><h1>报告</h1>",
+            ),
+            (
+                "report.md",
+                "text/markdown; charset=utf-8",
+                "# Report\n\n中文内容",
+            ),
+        ] {
+            let path = tree.0.join(name);
+            std::fs::write(&path, content).unwrap();
+            let (actual_media, bytes) = read_document_resource(&path).unwrap();
+            assert_eq!(actual_media, media);
+            assert_eq!(bytes, content.as_bytes());
+        }
+        let pdf = tree.0.join("invalid.pdf");
+        std::fs::write(&pdf, b"not a PDF").unwrap();
+        assert!(read_document_resource(&pdf).is_err());
+        assert!(read_document_resource(&tree.0.join("missing.html")).is_err());
+        let text = tree.0.join("invalid.md");
+        std::fs::write(&text, [0xff, 0xfe]).unwrap();
+        assert!(read_document_resource(&text).is_err());
+    }
 
     struct TemporaryTree(PathBuf);
 

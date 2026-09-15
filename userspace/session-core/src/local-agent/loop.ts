@@ -245,7 +245,7 @@ export async function runAgentLoop(
     ]);
     return finishingResult(runId, settlement);
   }
-  const runtime = runRuntimeSnapshot(snapshot, runId);
+  let runtime = runRuntimeSnapshot(snapshot, runId);
   try {
     for (const requestEvent of pendingToolRequests(snapshot.events, runId)) {
       const existing = await deps.composition.kernel.readRecord(requestEvent.callId);
@@ -298,6 +298,7 @@ export async function runAgentLoop(
       }
       const pending = pendingToolRequests(snapshot.events, runId);
       for (const requestEvent of pending) {
+        const runtime = runtimeForToolRequest(snapshot, requestEvent);
         const approval = latestApproval(snapshot.events, runId, requestEvent.callId);
         if (approval.requested && !approval.resolved) {
           return { status: 'waiting', runId, reason: 'approval', callId: requestEvent.callId };
@@ -384,6 +385,7 @@ export async function runAgentLoop(
 
       throwIfAborted(signal);
       snapshot = await deps.takeQueuedInputs(runId);
+      runtime = runRuntimeSnapshot(snapshot, runId);
       throwIfAborted(signal);
       const completedPlan = completedPlanAwaitingLifecycle(snapshot.state, runId);
       if (completedPlan) {
@@ -1918,6 +1920,7 @@ function expectedToolRecordIdentity(
   runtime: RunRuntimeSnapshot,
   requestEvent: Extract<SessionEvent, { type: 'tool.requested' }>,
 ): ExpectedToolRecordIdentity {
+  runtime = runtimeForToolRequest(snapshot, requestEvent);
   return {
     sessionId: snapshot.state.sessionId,
     runId: requestEvent.runId,
@@ -2116,7 +2119,19 @@ function uncompletedProviderComposition(
 function runRuntimeSnapshot(snapshot: LoopSnapshot, runId: string): RunRuntimeSnapshot {
   const runtime = snapshot.state.runRuntimeSnapshots[runId];
   if (!runtime) throw new LoopFailure('run_runtime_snapshot_missing', '当前 run 缺少运行时快照。');
-  return runtime;
+  return { ...runtime, ...snapshot.state.runToolViews[runId] };
+}
+
+function runtimeForToolRequest(snapshot: LoopSnapshot, request: Extract<SessionEvent, { type: 'tool.requested' }>): RunRuntimeSnapshot {
+  const turn = Object.values(snapshot.state.providerTurns).find((turn) => turn.orderedCallIds?.includes(request.callId));
+  const receipt = snapshot.state.contextCompositions.find((item) => item.providerRequestId === turn?.providerRequestId);
+  const base = snapshot.state.runRuntimeSnapshots[request.runId];
+  if (!base || !receipt) throw new LoopFailure('tool_request_binding_missing', '工具调用缺少所属 Provider 请求视图。');
+  if (!receipt.kernelCatalogSnapshotRef || receipt.kernelCatalogSnapshotRef === base.kernelCatalogSnapshotRef) return base;
+  const prepared = snapshot.events.find((event) => event.type === 'run.tools.prepared'
+    && event.runId === request.runId && event.payload.toolView.kernelCatalogSnapshotRef === receipt.kernelCatalogSnapshotRef);
+  if (prepared?.type !== 'run.tools.prepared') throw new LoopFailure('tool_request_binding_missing', '工具请求引用的准备视图不存在。');
+  return { ...base, ...prepared.payload.toolView };
 }
 
 function runtimeTool(runtime: RunRuntimeSnapshot, name: string): PreparedToolDescriptor {

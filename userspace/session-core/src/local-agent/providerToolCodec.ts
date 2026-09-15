@@ -27,6 +27,10 @@ export const CORE_TOOL_ORDER = [
   'session.read',
   'skill.read',
   'doc.read',
+  'document.render',
+  'browser.page',
+  'browser.service',
+  'browser.capture',
 ] as const;
 
 export interface ProviderToolCodec {
@@ -277,55 +281,57 @@ export function encodeProviderMessage(
   return encoded;
 }
 
-/** Reconstructs each journal call with the immutable alias and workspace handles of its owner run. */
+/** Calls retain the aliases and workspace handles from the request that produced them. */
 export function providerMessageCodecsByCallId(
   events: readonly SessionEvent[],
 ): ReadonlyMap<string, ProviderMessageToolCodec> {
-  const codecsByRunId = new Map<string, ProviderMessageToolCodec>();
-  for (const event of events) {
-    if (event.type !== 'run.started') continue;
-    const wireByCanonical = new Map(event.payload.runtimeSnapshot.providerToolAliases.map((alias) => (
-      [alias.canonicalName, alias.wireName]
-    )));
-    const workspaceIdByHandle = new Map<string, string>();
-    const workspaceHandleById = new Map<string, string>();
-    event.payload.workspaceBindings.forEach((binding, index) => {
-      const handle = index === 0 ? 'primary' : `workspace${index + 1}`;
-      workspaceIdByHandle.set(handle, binding.workspaceId);
-      workspaceHandleById.set(binding.workspaceId, handle);
-    });
-    codecsByRunId.set(event.runId, {
-      wireByCanonical,
-      workspaceIdByHandle,
-      workspaceHandleById,
-      workspaceToolNames: new Set(event.payload.runtimeSnapshot.tools
-        .filter(isWorkspaceScopedTool)
-        .map((tool) => tool.name)),
-    });
-  }
-
+  const runtimes = new Map<string, Extract<SessionEvent, { type: 'run.started' }>['payload']>();
+  const views = new Map<string, RunRuntimeSnapshot>();
+  const requests = new Map<string, ProviderMessageToolCodec>();
+  const currentRequests = new Map<string, ProviderMessageToolCodec>();
   const result = new Map<string, ProviderMessageToolCodec>();
   for (const event of events) {
-    const callIds = event.type === 'provider.turn.settled' && event.payload.outcome === 'completed'
-      ? (event.payload.toolCallInputs ?? []).map((call) => call.callId)
+    if (event.type === 'run.started') {
+      runtimes.set(event.runId, event.payload);
+      views.set(event.payload.runtimeSnapshot.kernelCatalogSnapshotRef, event.payload.runtimeSnapshot);
+      continue;
+    }
+    if (event.type === 'run.tools.prepared') {
+      const base = runtimes.get(event.runId);
+      if (!base) throw new LoopFailure('provider_tool_call_runtime_missing', '工具视图缺少所属 run。');
+      views.set(event.payload.toolView.kernelCatalogSnapshotRef, { ...base.runtimeSnapshot, ...event.payload.toolView });
+      continue;
+    }
+    if (event.type === 'context.composed') {
+      const base = runtimes.get(event.runId);
+      const runtime = event.payload.kernelCatalogSnapshotRef
+        ? views.get(event.payload.kernelCatalogSnapshotRef) : base?.runtimeSnapshot;
+      if (!base || !runtime) throw new LoopFailure('provider_tool_call_runtime_missing', 'Provider 请求缺少工具视图。');
+      const workspaceIdByHandle = new Map<string, string>();
+      const workspaceHandleById = new Map<string, string>();
+      base.workspaceBindings.forEach((binding, index) => {
+        const handle = index === 0 ? 'primary' : `workspace${index + 1}`;
+        workspaceIdByHandle.set(handle, binding.workspaceId);
+        workspaceHandleById.set(binding.workspaceId, handle);
+      });
+      const codec = {
+        wireByCanonical: new Map(runtime.providerToolAliases.map((alias) => [alias.canonicalName, alias.wireName])),
+        workspaceIdByHandle, workspaceHandleById,
+        workspaceToolNames: new Set(runtime.tools.filter(isWorkspaceScopedTool).map((tool) => tool.name)),
+      };
+      requests.set(event.payload.providerRequestId, codec);
+      currentRequests.set(event.runId, codec);
+      continue;
+    }
+    const completed = event.type === 'provider.turn.settled' && event.payload.outcome === 'completed';
+    const callIds = event.type === 'provider.turn.settled' && event.payload.outcome === 'completed' ? event.payload.toolCallInputs?.map((call) => call.callId) ?? []
       : 'callId' in event && event.callId ? [event.callId] : [];
     if (!callIds.length || !('runId' in event) || !event.runId) continue;
-    const ownerCodec = codecsByRunId.get(event.runId);
-    if (!ownerCodec) {
-      throw new LoopFailure(
-        'provider_tool_call_runtime_missing',
-        `工具调用缺少所属 run runtime snapshot：${event.runId}`,
-      );
-    }
+    const codec = completed ? requests.get(event.payload.providerRequestId) : currentRequests.get(event.runId);
     for (const callId of callIds) {
-      const existing = result.get(callId);
-      if (existing && existing !== ownerCodec) {
-        throw new LoopFailure(
-          'provider_tool_call_runtime_conflict',
-          `LogicalCallId 关联了多个 run runtime snapshot：${callId}`,
-        );
-      }
-      result.set(callId, ownerCodec);
+      if (result.has(callId)) continue;
+      if (!codec) throw new LoopFailure('provider_tool_call_runtime_missing', `调用缺少请求工具视图：${callId}`);
+      result.set(callId, codec);
     }
   }
   return result;
