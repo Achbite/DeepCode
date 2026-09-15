@@ -61,6 +61,8 @@ run_required() {
   cargo test --workspace
   printf '[test] Session 事件约束显式修复\n'
   python3 -I -S ./scripts/tests/session-tool-interrupted-repair.py
+  printf '[test] 独立 UI 资源发布\n'
+  python3 -I -S ./scripts/tests/ui-update.py
   printf '[test] Userspace 共享依赖\n'
   bash ./build.sh --stage deps
   pnpm build:userspace-shared
@@ -84,12 +86,12 @@ case "$profile" in
   full)
     run_required
     printf '[test] CLI、TUI 与 GUI 正式包入口\n'
-    cargo build -p deepcode-first-party-tools -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui
+    cargo build -p deepcode-first-party-tools -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui -p deepcode-host-web
     pnpm build:deepcode-gui
-    pnpm --filter @deepcode/deepcode-gui-shell prepare:dist
     printf '[test] 本地 Agent 真实链路与共享投影壳\n'
     python3 -I -S ./scripts/tests/tool-input-cli-e2e.py
     python3 -I -S ./scripts/tests/local-agent-e2e.py
+    python3 -I -S ./scripts/tests/document-render-e2e.py
     ;;
 esac
 

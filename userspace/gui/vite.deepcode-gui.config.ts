@@ -1,6 +1,7 @@
 import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import { monacoHostWorkers } from './vite.monaco';
+import { pdfDocumentAssets } from './vite.pdf';
 
 function deepcodeGuiDevelopmentEntry(): Plugin {
   return {
@@ -45,7 +46,7 @@ export default defineConfig(({ command }) => {
     },
   };
   return {
-    plugins: [deepcodeGuiDevelopmentEntry(), react(), monacoHostWorkers()],
+    plugins: [deepcodeGuiDevelopmentEntry(), react(), monacoHostWorkers(), pdfDocumentAssets()],
     base: './',
     build: {
       outDir: 'dist-deepcode-gui',

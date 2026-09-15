@@ -1,0 +1,6 @@
+{
+  "id": "deepcode.reading-style",
+  "name": "Reading Style",
+  "entry": "index.js",
+  "slots": ["theme", "document.html"]
+}

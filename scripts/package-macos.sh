@@ -505,15 +505,6 @@ configure_cargo_network_mode() {
   fi
 }
 
-prepare_tauri_dist() {
-  [ -f "$CLIENT_DIST_DIR/index.html" ] || fail "GUI dist missing at $CLIENT_DIST_DIR"
-  validate_frontend_dist "$CLIENT_DIST_DIR" "$PRODUCT"
-  log "prepare Tauri embedded dist"
-  rm -rf "$TAURI_DIR/dist"
-  mkdir -p "$TAURI_DIR/dist"
-  cp -R "$CLIENT_DIST_DIR/." "$TAURI_DIR/dist/"
-}
-
 validate_frontend_dist() {
   local dist_dir="$1"
   local label="$2"
@@ -599,20 +590,19 @@ refresh_gui_dists_with_docker() {
     bash -c "bash ./build.sh --stage '$stages'"
 }
 
-prepare_all_tauri_dists() {
+validate_gui_dists() {
   local original_product="$PRODUCT"
   local product
   for product in "${REQUESTED_PRODUCTS[@]}"; do
     configure_product "$product"
     validate_frontend_dist "$CLIENT_DIST_DIR" "$PRODUCT"
-    prepare_tauri_dist
   done
   configure_product "$original_product"
 }
 
 ensure_gui_dists() {
   refresh_gui_dists_with_docker
-  prepare_all_tauri_dists
+  validate_gui_dists
 }
 
 build_rust_bins() {
@@ -965,7 +955,7 @@ write_readme() {
   if [ "$COPY_ROOT_WEB_DIST" = "1" ]; then
     root_web_entry="  $WEB_DIR_NAME/             React GUI static assets served by the Kernel daemon."
   else
-    root_web_entry="  $APP_NAME.app/Contents/MacOS/$WEB_DIR_NAME/
+    root_web_entry="  $APP_NAME.app/Contents/Resources/$WEB_DIR_NAME/
 	                         Bundled conversational GUI assets; the shared root web/ is not replaced."
   fi
   asset_entries="$root_web_entry"
@@ -990,12 +980,12 @@ write_readme() {
   if [ "$PRODUCT" = "DeepCode" ] || [ -d "$BIN_DIR/DeepCode.app" ]; then
     app_entries="  DeepCode.app              Native macOS Editor shell. Starts its bundled Kernel and private Host proxy."
     gui_section="  open DeepCode.app"
-    note_assets="  DeepCode.app contains deepcode-kernel, deepcode-host-web, and web/ under Contents/MacOS."
+    note_assets="  DeepCode.app stores executables under Contents/MacOS and web/ under Contents/Resources."
   fi
   if [ "$PRODUCT" = "DeepCode-GUI" ] || [ -d "$BIN_DIR/DeepCode-GUI.app" ]; then
     if [ "$WEB_DIR_NAME" != "web-deepcode-gui" ]; then
       asset_entries="$asset_entries
-  DeepCode-GUI.app/Contents/MacOS/web-deepcode-gui/
+  DeepCode-GUI.app/Contents/Resources/web-deepcode-gui/
                          Bundled conversational GUI assets."
     fi
     if [ -n "$app_entries" ]; then
@@ -1004,11 +994,11 @@ write_readme() {
       gui_section="$gui_section
   open DeepCode-GUI.app"
       note_assets="$note_assets
-  DeepCode-GUI.app contains deepcode-kernel, deepcode-host-web, and web-deepcode-gui/ under Contents/MacOS."
+  DeepCode-GUI.app stores executables under Contents/MacOS and web-deepcode-gui/ under Contents/Resources."
     else
       app_entries="  DeepCode-GUI.app          Native macOS conversational GUI shell. Starts its bundled Kernel and private Host proxy."
       gui_section="  open DeepCode-GUI.app"
-      note_assets="  DeepCode-GUI.app contains deepcode-kernel, deepcode-host-web, and web-deepcode-gui/ under Contents/MacOS."
+      note_assets="  DeepCode-GUI.app stores executables under Contents/MacOS and web-deepcode-gui/ under Contents/Resources."
     fi
   fi
 
@@ -1102,8 +1092,8 @@ stage_product_app() {
   copy_required_file "$CARGO_TARGET_ROOT/release/deepcode-host-web" "$app_macos_dir/deepcode-host-web" 755
   write_build_info "$app_macos_dir/build-info.json"
 
-  copy_web_dist "$app_macos_dir/$WEB_DIR_NAME"
-  verify_copied_web_dist "$app_macos_dir/$WEB_DIR_NAME"
+  copy_web_dist "$app_resources_dir/$WEB_DIR_NAME"
+  verify_copied_web_dist "$app_resources_dir/$WEB_DIR_NAME"
   sign_app_bundle "$stage_app"
 }
 

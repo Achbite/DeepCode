@@ -102,6 +102,14 @@ RUN --mount=type=cache,target=/workspace/target,sharing=locked \
     mkdir -p /workspace/target /workspace/.build-cache/sccache
 
 # ---- 5. 入口脚本 ----
+COPY skills/deepcode-documents/scripts/requirements.txt /opt/deepcode-documents-requirements.txt
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends python3-venv fonts-noto-cjk \
+ && python3 -m venv /opt/deepcode-documents \
+ && /opt/deepcode-documents/bin/pip install --no-cache-dir -r /opt/deepcode-documents-requirements.txt
+ENV DEEPCODE_DOCUMENT_PYTHON=/opt/deepcode-documents/bin/python
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

@@ -9,6 +9,7 @@
 #     Linux/Windows 在 Docker 内构建；macOS 使用宿主机或已启动的打包服务。
 #
 # 分阶段入口：
+#   bash ./build.sh --stage ui       # only web UI assets -> bin/ui; no native/Session runtime build
 #   bash ./build.sh --stage gui      # pnpm + React GUI + Tauri embedded dist
 #   bash ./build.sh --stage deepcode-gui # pnpm + DeepCode-GUI dist
 #   bash ./build.sh --stage macos-package-service # macOS host: start package worker
@@ -143,7 +144,7 @@ cd "$ROOT_DIR"
 usage() {
   cat <<'USAGE'
 Usage:
-  bash ./build.sh [--stage all|gui|deepcode-gui|deepcode-gui-tauri|macos-package-service|package-macos|package-macos-deepcode-gui|package-linux|package-windows|daemon|cli|tui|tauri|package|verify-package-runtime]...
+  bash ./build.sh [--stage all|ui|ui-gui|ui-editor|gui|deepcode-gui|deepcode-gui-tauri|macos-package-service|package-macos|package-macos-deepcode-gui|package-linux|package-windows|daemon|cli|tui|tauri|package|verify-package-runtime]...
   bash ./build.sh --stage macos-package-service
   bash ./build.sh --full
   bash ./build.sh --stage package-macos --clean-cache
@@ -260,6 +261,7 @@ fi
 run_deps=0
 run_gui=0
 run_deepcode_gui=0
+run_ui_only=0
 run_package_macos=0
 run_package_macos_deepcode_gui=0
 run_macos_package_service=0
@@ -297,6 +299,22 @@ enable_stage() {
       ;;
     deps)
       run_deps=1
+      ;;
+    ui-gui)
+      run_deps=1
+      run_deepcode_gui=1
+      run_ui_only=1
+      ;;
+    ui-editor)
+      run_deps=1
+      run_gui=1
+      run_ui_only=1
+      ;;
+    ui)
+      run_deps=1
+      run_gui=1
+      run_deepcode_gui=1
+      run_ui_only=1
       ;;
     gui)
       run_deps=1
@@ -348,6 +366,11 @@ enable_stage() {
 for stage in "${requested_stages[@]}"; do
   enable_stage "$stage"
 done
+
+if [ "$run_ui_only" = "1" ] && [ "${#requested_stages[@]}" -ne 1 ]; then
+  echo "==[build][error]== ui is an independent frontend-only stage; run it by itself." >&2
+  exit 2
+fi
 
 build_started_at() {
   if date -Is >/dev/null 2>&1; then
@@ -683,32 +706,6 @@ run_pnpm_install() {
     --fetch-timeout "$PNPM_FETCH_TIMEOUT_MS"
 }
 
-prepare_tauri_dist() {
-  local tauri_gui_dist="$ROOT_DIR/shells/tauri/dist"
-  test -d "$CLIENT_DIR/dist" || {
-    echo "==[build][error]== userspace/gui/dist missing; run bash ./build.sh --stage gui first" >&2
-    exit 1
-  }
-  validate_frontend_dist "$CLIENT_DIR/dist" "DeepCode" "gui"
-  mkdir -p "$tauri_gui_dist"
-  find "$tauri_gui_dist" -mindepth 1 -delete 2>/dev/null || true
-  cp -r "$CLIENT_DIR/dist/." "$tauri_gui_dist/"
-}
-
-prepare_deepcode_gui_tauri_dist() {
-  local deepcode_gui_dist="$CLIENT_DIR/dist-deepcode-gui"
-  local tauri_gui_dist="$ROOT_DIR/shells/deepcode-gui/dist"
-  normalize_deepcode_gui_dist
-  test -d "$deepcode_gui_dist" || {
-    echo "==[build][error]== userspace/gui/dist-deepcode-gui missing; run bash ./build.sh --stage deepcode-gui first" >&2
-    exit 1
-  }
-  validate_frontend_dist "$deepcode_gui_dist" "DeepCode-GUI" "deepcode-gui"
-  mkdir -p "$tauri_gui_dist"
-  find "$tauri_gui_dist" -mindepth 1 -delete 2>/dev/null || true
-  cp -r "$deepcode_gui_dist/." "$tauri_gui_dist/"
-}
-
 sync_deepcode_gui_runtime_assets() {
   local runtime_dist="$1"
   normalize_deepcode_gui_dist
@@ -749,7 +746,12 @@ build_frontend_shared() {
     return
   fi
   echo "==[build][frontend-shared]== build shared userspace packages and check client types"
-  pnpm build:userspace-shared
+  if [ "$run_ui_only" = "1" ]; then
+    pnpm --filter @deepcode/protocol build
+    pnpm --filter @deepcode/presentation-core build
+  else
+    pnpm build:userspace-shared
+  fi
   pnpm --filter @deepcode/client typecheck
   FRONTEND_SHARED_READY=1
 }
@@ -758,8 +760,8 @@ build_gui() {
   build_frontend_shared
   echo "==[build][gui]== build DeepCode web assets"
   pnpm --filter @deepcode/client build:web
-  echo "==[build][gui]== prepare Tauri embedded GUI dist"
-  prepare_tauri_dist
+  write_frontend_build_info "$CLIENT_DIR/dist" editor
+  validate_frontend_dist "$CLIENT_DIR/dist" "DeepCode" "gui"
 }
 
 build_deepcode_gui() {
@@ -767,8 +769,40 @@ build_deepcode_gui() {
   echo "==[build][deepcode-gui]== build DeepCode-GUI web assets"
   pnpm --filter @deepcode/client build:deepcode-gui:web
   normalize_deepcode_gui_dist
-  echo "==[build][deepcode-gui]== prepare DeepCode-GUI Tauri embedded dist"
-  prepare_deepcode_gui_tauri_dist
+  write_frontend_build_info "$CLIENT_DIR/dist-deepcode-gui" gui
+  validate_frontend_dist "$CLIENT_DIR/dist-deepcode-gui" "DeepCode-GUI" "deepcode-gui"
+}
+
+write_frontend_build_info() {
+  python3 - "$ROOT_DIR" "$1" "$2" "$(deepcode_source_commit "$ROOT_DIR")" "$(deepcode_source_dirty "$ROOT_DIR")" <<'PY'
+import datetime, json, pathlib, sys
+root, output, surface, commit, dirty = sys.argv[1:]
+version = json.loads((pathlib.Path(root) / 'package.json').read_text())['version']
+identity = dict(productVersion=version, surface=surface, buildCommit=commit,
+                sourceDirty=dirty == '1', buildTimeUtc=datetime.datetime.now(datetime.timezone.utc).isoformat())
+(pathlib.Path(output) / 'frontend-build-info.json').write_text(json.dumps(identity, indent=2) + '\n')
+PY
+}
+
+assemble_ui_assets() {
+  python3 - "$BIN_ROOT" "$CLIENT_DIR" "$run_gui" "$run_deepcode_gui" <<'PYUI'
+import pathlib, shutil, sys, tempfile
+root, client = map(pathlib.Path, sys.argv[1:3])
+output=root/'ui'
+output.mkdir(parents=True,exist_ok=True)
+for enabled,source,name in [(sys.argv[3],client/'dist','web'),(sys.argv[4],client/'dist-deepcode-gui','web-deepcode-gui')]:
+    if enabled!='1': continue
+    with tempfile.TemporaryDirectory(prefix='.ui-build-',dir=root) as scratch:
+        scratch=pathlib.Path(scratch)
+        shutil.copytree(source,scratch/'next')
+        target=output/name
+        if target.exists(): target.rename(scratch/'previous')
+        try: (scratch/'next').rename(target)
+        except OSError:
+            if (scratch/'previous').exists(): (scratch/'previous').rename(target)
+            raise
+    print(f'==[build][ui]== {target}')
+PYUI
 }
 
 build_rust_products() {
@@ -1472,7 +1506,7 @@ verify_macos_package_runtime() {
     verify_runtime_executable "$macos_dir/DeepCode.app/Contents/MacOS/deepcode-kernel" "macOS DeepCode bundled kernel" || missing=1
     verify_runtime_executable "$macos_dir/DeepCode.app/Contents/MacOS/deepcode-first-party-provider" "macOS DeepCode bundled first-party provider" || missing=1
     verify_runtime_executable "$macos_dir/DeepCode.app/Contents/MacOS/deepcode-host-web" "macOS DeepCode private Host proxy" || missing=1
-    verify_frontend_package_assets "$macos_dir/DeepCode.app/Contents/MacOS/web" "macOS DeepCode bundled web" || missing=1
+    verify_frontend_package_assets "$macos_dir/DeepCode.app/Contents/Resources/web" "macOS DeepCode bundled web" || missing=1
     verify_macos_app_identity "$macos_dir/DeepCode.app" "DeepCode" || missing=1
   fi
   if [ -d "$macos_dir/DeepCode-GUI.app" ]; then
@@ -1481,7 +1515,7 @@ verify_macos_package_runtime() {
     verify_runtime_executable "$macos_dir/DeepCode-GUI.app/Contents/MacOS/deepcode-kernel" "macOS DeepCode-GUI bundled kernel" || missing=1
     verify_runtime_executable "$macos_dir/DeepCode-GUI.app/Contents/MacOS/deepcode-first-party-provider" "macOS DeepCode-GUI bundled first-party provider" || missing=1
     verify_runtime_executable "$macos_dir/DeepCode-GUI.app/Contents/MacOS/deepcode-host-web" "macOS DeepCode-GUI private Host proxy" || missing=1
-    verify_frontend_package_assets "$macos_dir/DeepCode-GUI.app/Contents/MacOS/web-deepcode-gui" "macOS DeepCode-GUI bundled web" || missing=1
+    verify_frontend_package_assets "$macos_dir/DeepCode-GUI.app/Contents/Resources/web-deepcode-gui" "macOS DeepCode-GUI bundled web" || missing=1
     verify_macos_app_identity "$macos_dir/DeepCode-GUI.app" "DeepCode-GUI" || missing=1
   fi
   if [ "$checked_app" = "0" ]; then
@@ -1776,6 +1810,10 @@ fi
 
 if [ "$run_deepcode_gui" = "1" ]; then
   build_deepcode_gui
+fi
+
+if [ "$run_ui_only" = "1" ]; then
+  assemble_ui_assets
 fi
 
 if [ "$run_daemon" = "1" ]; then

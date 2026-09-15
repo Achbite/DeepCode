@@ -26,6 +26,9 @@ WORKDIR_IN_CTNR  ?= /workspace
 DEEPCODE_PROJECT_ROOT := $(realpath $(CURDIR))
 DEEPCODE_BUILD_HOST_OS := $(shell uname -s)
 DEEPCODE_BUILD_STAGES ?= all
+UI_SURFACE ?= all
+UI_PLUGIN ?= ui-plugins/template
+UI_PACKAGE ?=
 CONTAINER_NAME ?= deepcode-dev
 CONTAINER_HOSTNAME ?= deepcode-dev
 DEEPCODE_HOST_PORT ?= 31246
@@ -117,7 +120,7 @@ RUN_ARGS := \
 	-e PATH=/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
 	$(NETWORK_ENV_ARGS)
 
-.PHONY: help docker-info branch-audit branch-hooks shell build build-deepcode-gui build-deepcode-gui-tauri dev-deepcode-gui reset-dev clean macos-package-service macos-package-service-status macos-package-service-stop package-macos package-macos-clean package-macos-deepcode-gui _validate_config _print_image _ensure_image _ensure_container _build_in_container
+.PHONY: help docker-info branch-audit branch-hooks shell build ui ui-update build-deepcode-gui build-deepcode-gui-tauri dev-deepcode-gui reset-dev clean macos-package-service macos-package-service-status macos-package-service-stop package-macos package-macos-clean package-macos-deepcode-gui _validate_config _print_image _ensure_image _ensure_container _build_in_container
 
 # ---- help：默认目标，列出可用入口 ----
 help:
@@ -125,6 +128,8 @@ help:
 	@echo ""
 	@echo "  make shell          进入唯一开发容器（自动更新镜像并收敛容器）"
 	@echo "  make build          尝试 Linux、Windows、macOS 全平台打包；缺少支持环境时跳过"
+	@echo "  make ui             仅在 Docker 内构建两个前端，输出 bin/ui"
+	@echo "  make ui-update UI_PACKAGE=bin/macos-arm64  构建并更新指定本地包的 UI，随后重新加载窗口"
 	@echo "  make build-deepcode-gui  在 Docker 内构建 DeepCode-GUI dist"
 	@echo "  make build-deepcode-gui-tauri  在 Docker 内构建 Windows DeepCode-GUI.exe"
 	@echo "  make docker-info    显示当前项目的容器、挂载、端口、工具链和 volume 配置"
@@ -267,6 +272,16 @@ build:
 _build_in_container: _ensure_container
 	@docker exec $(NETWORK_ENV_ARGS) -e DEEPCODE_BUILD_HOST_OS=$(DEEPCODE_BUILD_HOST_OS) $(CONTAINER_NAME) bash ./build.sh --stage "$(DEEPCODE_BUILD_STAGES)"
 
+ui:
+	@case "$(UI_SURFACE)" in all|gui|editor) ;; *) echo "UI_SURFACE must be all, gui or editor" >&2; exit 2 ;; esac
+	@bash ./build.sh --stage "$(if $(filter all,$(UI_SURFACE)),ui,ui-$(UI_SURFACE))"
+
+ui-update:
+	@test -n "$(UI_PACKAGE)" || { echo '请指定 UI_PACKAGE，例如 bin/macos-arm64 或 bin/win64' >&2; exit 2; }
+	@case "$(UI_SURFACE)" in all|gui|editor) ;; *) echo "UI_SURFACE must be all, gui or editor" >&2; exit 2 ;; esac
+	@bash ./build.sh --stage "$(if $(filter all,$(UI_SURFACE)),ui,ui-$(UI_SURFACE))"
+	@python3 ./scripts/update-ui.py --package "$(UI_PACKAGE)" --surface "$(UI_SURFACE)"
+
 build-deepcode-gui: _ensure_container
 	@echo "[make] Docker 内构建 DeepCode-GUI dist ..."
 	@docker exec $(NETWORK_ENV_ARGS) $(CONTAINER_NAME) bash -c 'bash ./build.sh --stage deepcode-gui'
@@ -296,3 +311,9 @@ clean:
 	done
 	@echo "[make] 清理完成。下次 'make shell' 将重建当前配置需要的容器环境。"
 	@echo "[make] 注意：宿主机 ./bin、./node_modules（如存在于宿主端）未被本目标修改。"
+
+.PHONY: ui-plugin ui-plugin-watch
+ui-plugin: _ensure_container
+	@docker exec -e DEEPCODE_UI_PLUGIN_ROOT="/workspace/$(UI_PLUGIN)" $(CONTAINER_NAME) pnpm --filter @deepcode/client exec vite build --config vite.ui-plugin.config.ts
+ui-plugin-watch: _ensure_container
+	@docker exec -e DEEPCODE_UI_PLUGIN_ROOT="/workspace/$(UI_PLUGIN)" $(CONTAINER_NAME) pnpm --filter @deepcode/client exec vite build --config vite.ui-plugin.config.ts --watch

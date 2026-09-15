@@ -1,9 +1,10 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { monacoHostWorkers } from './vite.monaco';
+import { pdfDocumentAssets } from './vite.pdf';
 
 export default defineConfig({
-  plugins: [react(), monacoHostWorkers()],
+  plugins: [react(), monacoHostWorkers(), pdfDocumentAssets()],
   base: './',
   build: {
     chunkSizeWarningLimit: 650,

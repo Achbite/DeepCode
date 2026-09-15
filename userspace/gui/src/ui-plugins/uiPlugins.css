@@ -1,0 +1,5 @@
+.ui-plugin-view { min-width: 0; overflow-anchor: none; }
+.ui-plugin-error { padding: 12px; color: var(--color-error, #b42318); background: var(--color-surface, transparent); border: 1px solid currentColor; border-radius: 8px; }
+.ui-plugin-error pre { font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 0; }
+.ui-plugin-loading { color: var(--text-muted, #737373); padding: 8px 0; }
+.settings-ui-plugin__status { font-size: 12px; color: var(--text-muted, #737373); }

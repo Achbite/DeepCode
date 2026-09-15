@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom/client';
 import App from './app/App';
 import { installNativeContextMenuGuard } from './utils/nativeContextMenuGuard';
 import { activeT } from './i18n';
+import { UiPluginsProvider } from './ui-plugins/UiPlugins';
 
 const ROOT_EL_ID = 'root';
 
@@ -143,7 +144,7 @@ try {
   root.render(
     <React.StrictMode>
       <ErrorBoundary>
-        <App />
+        <UiPluginsProvider><App /></UiPluginsProvider>
       </ErrorBoundary>
     </React.StrictMode>
   );
