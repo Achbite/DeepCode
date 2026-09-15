@@ -354,6 +354,7 @@ const DeepCodeGuiApp: React.FC = () => {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || document.querySelector('dialog[open]')) return;
       const ctrl = event.ctrlKey || event.metaKey;
       if (!ctrl) return;
       const key = event.key.toLowerCase();
@@ -384,7 +385,7 @@ const DeepCodeGuiApp: React.FC = () => {
   }, []);
 
   return (<>
-    <HostStartupDiagnostic status={apiStatus === 'connected' ? null : hostStartup} language={language} />
+    <HostStartupDiagnostic status={apiStatus === 'connected' ? null : hostStartup} language={language} busy={kernelStartBusy} onRetry={() => void retryKernelStart()} />
     <Suspense fallback={<BootFallback language={language} />}>
       <DeepCodeWorkbenchLayout
         apiStatus={apiStatus}

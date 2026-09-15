@@ -8,7 +8,8 @@ type TauriCoreApi = {
 
 declare global {
   interface Window {
-    __TAURI__?: { core?: TauriCoreApi };
+    __TAURI__?: { core?: TauriCoreApi; event?: {listen<T>(name:string,listener:(event:{payload:T})=>void):Promise<()=>void>} };
+    __DEEPCODE_SELF_PREVIEW__?: boolean;
   }
 }
 
@@ -38,6 +39,7 @@ export interface HostStartupStatusV1 {
 }
 
 function tauriInvoke(): TauriCoreApi['invoke'] | null {
+  if (window.__DEEPCODE_SELF_PREVIEW__) return null;
   return window.__TAURI__?.core?.invoke ?? null;
 }
 

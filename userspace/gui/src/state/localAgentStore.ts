@@ -769,6 +769,11 @@ async function submitNewRun(
       filesystemReferences.push(await uploadConversationPastedText(sessionId, paste.inputId, paste.text));
     }
     if (generation !== submissionGeneration || get().sessionId !== sessionId) throw new Error('conversation_session_changed');
+    const guidanceReferences = effectivePluginSelections.flatMap((selection) => {
+      const reference = pluginCatalog.plugins.find((item)=>item.uri===selection.uri)?.reference;
+      return reference ? [{referenceId:selection.selectionId,uri:selection.uri,label:selection.label,...reference}] : [];
+    });
+    const executionSelections = effectivePluginSelections.filter((selection)=>!pluginCatalog.plugins.find((item)=>item.uri===selection.uri)?.reference);
     const common = {
       schemaVersion: CONVERSATION_COMMAND_VERSION,
       commandId: nextId('command'),
@@ -781,10 +786,11 @@ async function submitNewRun(
           }
         : {}),
       ...(!queuedMessage ? { profileId: messageProfileId!, reasoningEffortOverride } : {}),
-      ...(effectivePluginSelections.length
+      ...(guidanceReferences.length ? {guidanceReferences} : {}),
+      ...(executionSelections.length
         ? {
             pluginCatalogRevision: pluginCatalog.revision,
-            pluginSelections: effectivePluginSelections.map((selection) => ({ ...selection })),
+            pluginSelections: executionSelections.map((selection) => ({ ...selection })),
           }
         : {}),
     };
@@ -851,8 +857,7 @@ async function submitCommandAndReconcile(
   const commandGeneration = generation;
   const reply = await submitLocalAgentCommand(command);
   if (reply.status === 'accepted') {
-    const profileId = command.type === 'session.model-settings.set' ? command.settings.profileId
-      : command.type === 'message.submit' || command.type === 'context.focus' ? command.profileId : undefined;
+    const profileId = command.type === 'message.submit' || command.type === 'context.focus' ? command.profileId : undefined;
     if (profileId) set({ defaultProfileId: profileId });
   }
   const rejection = reply.status === 'rejected' ? commandRejectionMessage(reply) : null;
@@ -901,11 +906,6 @@ async function saveModelSettings(set: StoreSet, get: StoreGet, settings: Session
   set({ modelSettingsBusy: true });
   try {
     if (!sessionId) {
-      if (get().selectedProfileId !== settings.profileId) {
-        const result = await patchLlmProfiles({ defaultProfileId: settings.profileId });
-        if (!result.ok || !result.data) throw new Error(result.message ?? result.error ?? 'llm_profiles_unavailable');
-        set({ defaultProfileId: result.data.defaultProfileId ?? null, profiles: result.data.profiles });
-      }
       if (generation === settingsGeneration && !get().sessionId) {
         set({ selectedProfileId: settings.profileId, reasoningEffortOverride: settings.reasoningEffortOverride,
           error: null, errorSource: null });

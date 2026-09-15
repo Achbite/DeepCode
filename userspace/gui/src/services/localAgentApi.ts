@@ -238,6 +238,11 @@ export async function submitLocalAgentCommand(
   signal?: AbortSignal,
 ): Promise<CommandReply> {
   if (command.type === 'message.submit' || command.type === 'context.focus') {
+    if (command.type === 'context.focus' || !command.runId) {
+      const { nativeHostBinding } = await import('./nativeBrowser');
+      const hostBinding = await nativeHostBinding();
+      if (hostBinding) command = { ...command, hostBinding };
+    }
     const content = command.type === 'message.submit' ? command.text : command.task;
     if (new TextEncoder().encode(content).byteLength > 32 * 1024) {
       const reference = await uploadConversationPastedText(command.sessionId, command.commandId, content, signal);
@@ -297,6 +302,26 @@ export async function readConversationResource(
   return value as unknown as ConversationResourceReadResult;
 }
 
+export async function resolveConversationResourcePath(sessionId: string, workspaceId: string, logicalPath: string): Promise<string> {
+  const result = await request<{path: string}>(`${API_BASE}/conversation/sessions/${encodeURIComponent(sessionId)}/resources/read`, {
+    method: 'POST', body: JSON.stringify({workspaceId, logicalPath, format:'path'}),
+  });
+  return result.path;
+}
+
+export async function readConversationArtifact(sessionId: string, artifactId: string, signal?: AbortSignal): Promise<Blob> {
+  const response = await fetch(`${API_BASE}/conversation/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactId)}/content`, {
+    signal, headers: getHostConnectionHeaders(),
+  });
+  if (!response.ok || response.headers.get('content-type')?.startsWith('application/json')) {
+    const detail = await response.text();
+    let message = detail;
+    try { const error = JSON.parse(detail) as ApiEnvelope<never>; message = error.message ?? error.error ?? detail; } catch { /* Keep the original response. */ }
+    throw new Error(message || `artifact_read_failed:HTTP ${response.status}`);
+  }
+  return response.blob();
+}
+
 export async function readConversationImage(sessionId: string, workspaceId: string, logicalPath: string, signal?: AbortSignal): Promise<Blob> {
   const response = await fetch(`${API_BASE}/conversation/sessions/${encodeURIComponent(sessionId)}/resources/read`, {
     method: 'POST', signal,
@@ -306,6 +331,25 @@ export async function readConversationImage(sessionId: string, workspaceId: stri
   if (!response.ok || !response.headers.get('content-type')?.startsWith('image/')) {
     const error = await response.json() as ApiEnvelope<never>;
     throw new Error(error.message ?? error.error ?? `conversation_image_read_failed:HTTP ${response.status}`);
+  }
+  return response.blob();
+}
+
+export async function readConversationDocument(sessionId: string, workspaceId: string, logicalPath: string, signal?: AbortSignal): Promise<Blob> {
+  const response = await fetch(`${API_BASE}/conversation/sessions/${encodeURIComponent(sessionId)}/resources/read`, {
+    method: 'POST', signal,
+    headers: { 'Content-Type': 'application/json', ...getHostConnectionHeaders() },
+    body: JSON.stringify({ workspaceId, logicalPath, format: 'document' }),
+  });
+  const mediaType = response.headers.get('content-type')?.split(';', 1)[0].trim();
+  if (!response.ok || !['application/pdf', 'text/html', 'text/markdown'].includes(mediaType ?? '')) {
+    const detail = await response.text();
+    let message = detail;
+    try {
+      const error = JSON.parse(detail) as ApiEnvelope<never>;
+      message = error.message ?? error.error ?? detail;
+    } catch { /* Preserve a non-JSON transport error. */ }
+    throw new Error(message || `conversation_document_read_failed:HTTP ${response.status}`);
   }
   return response.blob();
 }
@@ -482,7 +526,7 @@ function isTimelineItem(value: unknown): boolean {
 }
 
 function isQueuedInput(value: unknown): boolean {
-  return isExactRecord(value, ['commandId', 'messageId', 'runId', 'text', 'filesystemReferences', 'pluginSelections', 'sequence', 'createdAt', 'status'])
+  return isExactRecord(value, ['commandId', 'messageId', 'runId', 'text', 'filesystemReferences', 'pluginSelections', 'sequence', 'createdAt', 'status'], ['pluginCatalogRevision','guidanceReferences'])
     && isIdentifier(value.commandId) && isIdentifier(value.messageId) && isIdentifier(value.runId)
     && typeof value.text === 'string'
     && isArrayOf(value.filesystemReferences, isFilesystemReference)
@@ -622,9 +666,9 @@ function decodePluginCatalog(value: unknown): PluginCatalogProjection {
         plugin,
         [
           'uri', 'displayName', 'shortDescription', 'activationMediaTypes',
-          'enabled', 'available',
+          'enabled', 'available', 'source', 'category', 'contributionKind', 'discovery',
         ],
-        ['iconRef', 'error'],
+        ['iconRef', 'error', 'reference', 'management'],
       )
       || typeof plugin.uri !== 'string'
       || !/^plugin:\/\/[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(plugin.uri)
@@ -634,6 +678,11 @@ function decodePluginCatalog(value: unknown): PluginCatalogProjection {
       || (plugin.iconRef !== undefined && !isNonEmptyText(plugin.iconRef))
       || !isArrayOf(plugin.activationMediaTypes, isMediaType)
       || new Set(plugin.activationMediaTypes).size !== plugin.activationMediaTypes.length
+      || !['builtin', 'mounted'].includes(String(plugin.source))
+      || !['functional', 'reference'].includes(String(plugin.category))
+      || !['skill', 'mcp', 'cli'].includes(String(plugin.contributionKind))
+      || !['default', 'searchOnly'].includes(String(plugin.discovery))
+      || (plugin.management !== undefined && (!isRecord(plugin.management) || !['plugins.disabled','plugins.sources','mcp.servers','skills.mounts'].includes(String(plugin.management.key)) || !isNonEmptyText(plugin.management.id)))
       || typeof plugin.enabled !== 'boolean'
       || typeof plugin.available !== 'boolean'
       || (plugin.error !== undefined && !isLocalAgentError(plugin.error))
@@ -677,7 +726,7 @@ function isProjectionMessage(value: unknown): boolean {
   if (!isExactRecord(value, [
     'messageId', 'role', 'content', 'filesystemReferences',
     'pluginSelections', 'feedback', 'sequence', 'createdAt',
-  ], ['runId', 'providerRequestId', 'replyToInteraction'])) return false;
+  ], ['runId', 'providerRequestId', 'replyToInteraction', 'guidanceReferences'])) return false;
   const hasRunId = value.runId !== undefined;
   const hasProviderRequestId = value.providerRequestId !== undefined;
   return isIdentifier(value.messageId)
@@ -957,7 +1006,7 @@ function isPlanOperation(value: unknown): boolean {
   }
   return isExactRecord(value, ['workspaceId', 'operation', 'target'], ['targetKind'])
     && (value.targetKind === undefined || ['file', 'directoryTree'].includes(String(value.targetKind)))
-    && ['fs.write', 'fs.edit']
+    && ['fs.write', 'fs.edit', 'document.render', 'browser.capture']
       .includes(String(value.operation));
 }
 
@@ -1049,7 +1098,8 @@ function isContextComposition(value: unknown): boolean {
     'partitions',
     'sequence',
     'createdAt',
-  ])
+  ], ['kernelCatalogSnapshotRef'])
+    && (value.kernelCatalogSnapshotRef === undefined || isIdentifier(value.kernelCatalogSnapshotRef))
     && isIdentifier(value.providerRequestId)
     && ['agent', 'contextCompaction'].includes(String(value.purpose))
     && ['normal', 'toolRequired', 'answerOnly'].includes(String(value.responseConstraint))
@@ -1394,9 +1444,14 @@ function isActivityResource(value: unknown): boolean {
 }
 
 function isArtifact(value: unknown): boolean {
-  return isExactRecord(value, ['artifactId', 'label'], ['workspaceId', 'logicalPath', 'uri'])
+  return isExactRecord(value, ['artifactId', 'label', 'sessionId', 'runId', 'callId', 'recordId', 'contentType', 'contentMode', 'createdAt'], ['workspaceId', 'logicalPath', 'uri', 'sourcePage'])
     && isIdentifier(value.artifactId)
     && isNonEmptyText(value.label)
+    && ['sessionId', 'runId', 'callId', 'recordId'].every((key) => isIdentifier(value[key]))
+    && isNonEmptyText(value.contentType)
+    && (value.contentMode === 'fixed' || value.contentMode === 'live')
+    && isNonEmptyText(value.createdAt)
+    && (value.sourcePage === undefined || isRecord(value.sourcePage))
     && (value.workspaceId === undefined || isIdentifier(value.workspaceId))
     && (value.logicalPath === undefined || isNonEmptyText(value.logicalPath))
     && (value.uri === undefined || isNonEmptyText(value.uri));

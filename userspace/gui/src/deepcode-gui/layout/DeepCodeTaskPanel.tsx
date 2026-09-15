@@ -1,5 +1,7 @@
 import { MarkdownInline } from '../../components/local-agent/BufferedMarkdown';
 import React from 'react';
+import { ArtifactLinks } from '../../components/local-agent/ArtifactLinks';
+import { requestWorkspacePreview } from '../../components/local-agent/readerState';
 import type { SessionProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 
@@ -9,7 +11,11 @@ interface DeepCodeTaskPanelProps {
 }
 
 const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, projection }) => {
-  const artifacts = projection?.artifacts ?? [];
+  // Each fixed delivery is immutable; its execution timestamp is the last
+  // content change of that version. Keep all versions in this Session.
+  const artifacts = [...(projection?.artifacts ?? [])].sort(
+    (left, right) => artifactTimestamp(right.createdAt) - artifactTimestamp(left.createdAt),
+  );
   const todos = projection?.todoList?.items ?? [];
   return (
     <aside className="deepcode-gui-context-panel">
@@ -54,20 +60,15 @@ const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, project
           <div className="deepcode-gui-task-list-card__empty">
             {t(language, 'deepcodeGui.outputs.empty')}
           </div>
-        ) : artifacts.map((artifact) => (
-          <div
-            className="deepcode-gui-output-item"
-            key={artifact.artifactId}
-            title={artifact.logicalPath ?? artifact.uri ?? ''}
-          >
-            <strong>{artifact.label}</strong>
-            <span>{artifact.logicalPath ?? artifact.uri ?? ''}</span>
-          </div>
-        ))}
+        ) : <ArtifactLinks key={projection?.sessionId} artifacts={artifacts} onOpen={(workspaceId,path)=>requestWorkspacePreview(projection!.sessionId,workspaceId,path)} />}
       </section>
     </aside>
   );
 };
+
+function artifactTimestamp(value: string): number {
+  return /^\d+$/u.test(value) ? Number(value) : Date.parse(value);
+}
 
 function todoStatus(status: 'pending' | 'inProgress' | 'completed', language: UiLanguage): string {
   return t(language, `deepcodeGui.tasks.status.${status}`);

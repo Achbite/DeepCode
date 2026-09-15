@@ -103,7 +103,7 @@ details:not([open]) > summary > .conversation-disclosure-chevron, .conversation-
 .conversation-changes-heading strong { font-weight: 600; }
 .conversation-changes-heading small { display: block; font-size: 11px; color: var(--dc-muted); margin-top: 3px; }
 .local-agent .conversation-changes button:hover { background: var(--dc-surface-hover); }
-.conversation-change-list { padding: 6px 10px 10px; border-top: 1px solid var(--dc-border); }
+.conversation-change-list { padding: 6px 10px 10px; }
 .local-agent .conversation-change-file { display: flex; gap: 12px; align-items: center; width: 100%; text-align: left; padding: 9px 6px; border-radius: 6px; min-width: 0; }
 .conversation-change-file > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-change-file > small { flex: none; color: var(--dc-muted); font-size: 11px; }

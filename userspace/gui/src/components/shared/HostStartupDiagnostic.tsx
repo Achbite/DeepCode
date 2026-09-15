@@ -3,7 +3,7 @@ import type { HostStartupStatusV1 } from '../../services/runtimeAdapter';
 import { t, type UiLanguage } from '../../i18n';
 import './hostStartupDiagnostic.css';
 
-export function HostStartupDiagnostic({ status, language }: { status: HostStartupStatusV1 | null; language: UiLanguage }) {
+export function HostStartupDiagnostic({ status, language, onRetry, busy = false }: { status: HostStartupStatusV1 | null; language: UiLanguage; onRetry?: () => void; busy?: boolean }) {
   if (!status || !['failed', 'blocked'].includes(status.phase)) return null;
   return <section className="host-startup-diagnostic" role="alert">
     <h3>{t(language, 'host.startup.failed')}</h3>
@@ -15,5 +15,6 @@ export function HostStartupDiagnostic({ status, language }: { status: HostStartu
     {status.diagnosticRef && <div className="host-startup-diagnostic__log">
       <span>{t(language, 'host.startup.log')}</span><code>{status.diagnosticRef}</code>
     </div>}
+    {onRetry && <button type="button" className="settings-button" disabled={busy} onClick={onRetry}>{t(language, busy ? 'deepcodeGui.statusAction.starting' : 'deepcodeGui.statusAction.retry')}</button>}
   </section>;
 }

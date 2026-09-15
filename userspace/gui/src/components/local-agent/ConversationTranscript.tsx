@@ -1,10 +1,14 @@
+import { localReference } from './resourceLinks';
+import { resolveConversationResourcePath } from '../../services/localAgentApi';
 import React, { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { MessageFeedback, SessionProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { useConversationHost } from './ConversationHost';
+import { workspaceResourceLink } from './documentResources';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import type { PresentedCommittedContent } from '../../presentation/PresentationRuntime';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
+import { ArtifactLinks } from './ArtifactLinks';
 import { FileChanges, roundChangeActivities } from './FileChanges';
 import { ReasoningHistory } from './ReasoningDetails';
 import { PlanPreviewCard } from './PlanPreviewCard';
@@ -124,6 +128,27 @@ export function ConversationTranscript({
       : null;
     if (!anchor || !event.currentTarget.contains(anchor)) return;
     const href = anchor.getAttribute('href') ?? '';
+    const resource = workspaceResourceLink(href);
+    if (resource) {
+      event.preventDefault();
+      void openWorkspaceResource(resource.workspaceId, resource.logicalPath).catch(reason=>setUiActionError(String(reason)));
+      return;
+    }
+    const localPath=localReference(href);
+    if(localPath&&projection) {
+      event.preventDefault();
+      const requestedView=currentSessionRef.current;
+      void (async()=>{
+        const candidates=await Promise.all(projection.workspaceBindings.map(async binding=>({workspaceId:binding.workspaceId,root:await resolveConversationResourcePath(projection.sessionId,binding.workspaceId,'.')})));
+        const normalize=(value:string)=>value.replace(/\\/gu,'/').replace(/\/$/u,'');
+        const path=normalize(localPath).replace(/:\d+(?::\d+)?$/u,'');
+        const bound=candidates.sort((a,b)=>b.root.length-a.root.length).find(candidate=>path.startsWith(normalize(candidate.root)+'/'));
+        if(!bound)throw new Error(t(language, 'agent.resource.unbound', { path: localPath }));
+        if(currentSessionRef.current!==requestedView)return;
+        await openWorkspaceResource(bound.workspaceId,path.slice(normalize(bound.root).length+1));
+      })().catch(reason=>{if(currentSessionRef.current===requestedView)setUiActionError(String(reason));});
+      return;
+    }
     if (!/^https?:\/\//i.test(href)) return;
     event.preventDefault();
     const requestedView = currentSessionRef.current;
@@ -337,7 +362,8 @@ export function ConversationTranscript({
         }));
         if (current && !completed) rows.push({ key: `${round.key}:provider-status`, process: true, required: false, live: true, content: () => providerStatus });
         if (showReasoning && projection && completed) rows.push({ key: `${round.key}:reasoning-history`, process: true, required: false, live: false, content: () => <ReasoningHistory sessionId={projection.sessionId} runId={round.runId} /> });
-        return <ConversationRoundView key={`${projection?.sessionId}:${round.key}`} roundKey={round.key} virtualizer={virtualizer} eagerRows={eagerRows} completed={completed} followingLatest={viewport.followingLatest} rows={rows}>
+        return <ConversationRoundView language={language} key={`${projection?.sessionId}:${round.key}`} roundKey={round.key} virtualizer={virtualizer} eagerRows={eagerRows} completed={completed} followingLatest={viewport.followingLatest} rows={rows}>
+          {projection && <ArtifactLinks artifacts={projection.artifacts.filter((artifact)=>artifact.runId===round.runId)} onOpen={openWorkspaceResource} />}
           {(completed || terminal) && <FileChanges activities={roundChangeActivities(projection, round.runId)} />}
         </ConversationRoundView>;
       })}
@@ -360,8 +386,8 @@ function samePlanReference(
   return reference?.planId === plan.planId && reference.revision === plan.revision;
 }
 
-function ConversationRoundView({ roundKey, virtualizer, eagerRows, completed, followingLatest, rows, children }: {
-  roundKey: string; virtualizer: ConversationVirtualizer; eagerRows: Set<string>;
+function ConversationRoundView({ language, roundKey, virtualizer, eagerRows, completed, followingLatest, rows, children }: {
+  language: UiLanguage; roundKey: string; virtualizer: ConversationVirtualizer; eagerRows: Set<string>;
   completed: boolean; followingLatest: boolean;
   rows: Array<{ key: string; process: boolean; required: boolean; live: boolean; content(): React.ReactNode }>;
   children: React.ReactNode;
@@ -375,7 +401,7 @@ function ConversationRoundView({ roundKey, virtualizer, eagerRows, completed, fo
   return <section className="conversation-round">
     {rows.map((row) => <React.Fragment key={row.key}>
       {completed && row.key === firstProcess && <button className="conversation-process-toggle" type="button" aria-expanded={expanded} onClick={() => setDisclosure({ completed, open: !expanded })}>
-        <DeepCodeShellIcon name="tool" /><span>{expanded ? '执行过程' : '查看执行过程'}</span><DeepCodeShellIcon name="chevronDown" className="conversation-disclosure-chevron" />
+        <DeepCodeShellIcon name="tool" /><span>{t(language, expanded ? 'agent.process.expanded' : 'agent.process.open')}</span><DeepCodeShellIcon name="chevronDown" className="conversation-disclosure-chevron" />
       </button>}
       <ConversationVirtualRow rowKey={row.key} virtualizer={virtualizer} eager={eagerRows.has(row.key)} live={row.live || row.required}
         hidden={row.process && !expanded && !row.required}>{row.content}</ConversationVirtualRow>

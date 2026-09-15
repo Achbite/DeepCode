@@ -1,3 +1,4 @@
+import ModalDialog from '../shared/ModalDialog';
 import React, { useEffect, useRef, useState } from 'react';
 import { t, type UiLanguage } from '../../i18n';
 import { pickNativePath, type NativePathOptions, type NativePathSelection } from '../../services/runtimeAdapter';
@@ -31,18 +32,9 @@ export default function NativePathDialog(props: NativePathDialogProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => {
-    if (!error) return;
-    const dismiss = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') { event.stopPropagation(); callbacks.current.onCancel(); }
-    };
-    window.addEventListener('keydown', dismiss, true);
-    return () => window.removeEventListener('keydown', dismiss, true);
-  }, [error]);
-
   if (!error) return null;
-  return <div className="ws-open-dialog__backdrop" onClick={props.onCancel}>
-    <div className="ws-open-dialog ws-open-dialog--native" role="dialog" aria-modal="true"
+  return <ModalDialog className="ws-open-dialog__backdrop" onClose={props.onCancel} aria-label={props.title}>
+    <div className="ws-open-dialog ws-open-dialog--native"
       aria-label={props.title} onClick={(event) => event.stopPropagation()}>
       <div className="ws-open-dialog__header"><strong>{props.title}</strong></div>
       <p className="ws-open-dialog__error" role="alert">{error}</p>
@@ -52,5 +44,5 @@ export default function NativePathDialog(props: NativePathDialogProps) {
         </button>
       </div>
     </div>
-  </div>;
+  </ModalDialog>;
 }

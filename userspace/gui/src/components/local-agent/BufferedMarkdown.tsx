@@ -7,6 +7,7 @@ import { StreamingMarkdownParser, type MarkdownBlock } from './streamingMarkdown
 import { StreamingTextBuffer } from './streamingText';
 import type { ElementContent, Root, RootContent } from 'hast';
 import './richContent.css';
+import { readableResourceLinks } from './resourceLinks';
 import 'katex/dist/katex.min.css';
 
 const StreamingContext = createContext(false);
@@ -25,7 +26,7 @@ const COMPONENTS = {
 };
 
 const RenderedBlock = memo(function RenderedBlock({ block }: { block: MarkdownBlock }) {
-  return <StreamingContext.Provider value={block.streaming}>{toJsxRuntime(block.tree, { Fragment, jsx, jsxs, components: COMPONENTS })}</StreamingContext.Provider>;
+  return <StreamingContext.Provider value={block.streaming}>{toJsxRuntime(readableResourceLinks(block.tree), { Fragment, jsx, jsxs, components: COMPONENTS })}</StreamingContext.Provider>;
 });
 
 export const MarkdownContent = memo(function MarkdownContent({ children, streaming = false }: { children: string; streaming?: boolean }) {

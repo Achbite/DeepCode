@@ -1,7 +1,8 @@
-import React, { useLayoutEffect } from 'react';
+import React, { useId, useLayoutEffect } from 'react';
 import { t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import SessionModelSelector from './SessionModelSelector';
+import TotalCacheUsage from './TotalCacheUsage';
 import { ComposerDecisionPanels } from './ComposerDecisionPanels';
 import { ComposerPermissionControl } from './ComposerPermissionControl';
 import type { AgentComposer } from './useAgentComposer';
@@ -58,6 +59,8 @@ export function ConversationComposer({
     endComposition,
     submitOnComposerEnter,
     filteredPlugins,
+    pluginQuery,
+    setPluginQuery,
     selectPlugin,
     focusCommandSuggestionVisible,
     selectFocusCommand,
@@ -68,8 +71,11 @@ export function ConversationComposer({
     canSend,
     showStopAction,
   } = composer;
+  const pickerId = useId();
   const inputMode = pendingPlan ? 'plan' : pendingInteraction ? 'interaction' : 'message';
   const compactInput = inputMode !== 'message';
+  const currentRequest = projection?.contextCompositions.filter((item)=>item.runId===projection.run?.runId).at(-1);
+  const readyPlugins = new Set(currentRequest?.tools.filter((tool)=>tool.availability==='callable').map((tool)=>tool.pluginUri));
 
   useLayoutEffect(() => {
     if (textareaRef.current) resizeComposerTextarea(textareaRef.current);
@@ -134,21 +140,26 @@ export function ConversationComposer({
           <div
             ref={pluginPickerRef}
             className="local-agent__plugin-picker"
-            role="listbox"
+            role="group"
             aria-label={t(language, 'agent.plugin.picker')}
+            data-native-overlay
           >
             <div className="local-agent__plugin-picker-heading">
               {t(language, 'agent.plugin.picker')}
             </div>
+            <input className="local-agent__plugin-search" aria-label={language === 'zh-CN' ? '搜索工具' : 'Search tools'} placeholder={language === 'zh-CN' ? '搜索工具' : 'Search tools'} value={pluginQuery} onChange={(event) => setPluginQuery(event.target.value)} role="combobox" aria-expanded="true" aria-autocomplete="list" aria-controls={pickerId} aria-activedescendant={pluginActiveIndex >= 0 ? `${pickerId}-${pluginActiveIndex}` : undefined} onKeyDown={(event) => composer.handlePluginPickerKey(event)} />
+            <div id={pickerId} role="listbox" aria-label={t(language, 'agent.plugin.picker')}>
             {filteredPlugins.length ? filteredPlugins.map((plugin, index) => (
               <button
                 type="button"
                 role="option"
-                aria-selected={index === pluginActiveIndex}
+                id={`${pickerId}-${index}`} tabIndex={-1}
+                data-active={index === pluginActiveIndex}
+                aria-selected={pluginSelections.some((selection) => selection.uri === plugin.uri)}
                 key={plugin.uri}
                 disabled={!plugin.enabled || !plugin.available}
                 onClick={() => selectPlugin(plugin)}
-                onMouseEnter={() => setPluginActiveIndex(index)}
+                onMouseEnter={() => { if (plugin.enabled && plugin.available) setPluginActiveIndex(index); }}
               >
                 <DeepCodeShellIcon name="extension" />
                 <span>
@@ -158,13 +169,14 @@ export function ConversationComposer({
                     ? `${plugin.error.code}: ${plugin.error.message}`
                     : language === 'zh-CN' ? '插件未启用' : 'Plugin disabled'}</small>}
                 </span>
-                <code>{plugin.uri}</code>
+                <span className="plugin-selection-mark" title={readyPlugins.has(plugin.uri) ? (language==='zh-CN'?'当前任务已就绪':'Ready in this task') : pluginSelections.some(selection=>selection.uri===plugin.uri) ? (language==='zh-CN'?'已选择，发送后加入任务':'Selected; prepared on send') : undefined}>{pluginSelections.some(selection=>selection.uri===plugin.uri)||readyPlugins.has(plugin.uri)?'✓':''}</span>
               </button>
             )) : (
               <div className="local-agent__plugin-picker-empty">
                 {t(language, 'agent.plugin.empty')}
               </div>
             )}
+            </div>
           </div>
         )}
         {focusCommandSuggestionVisible && (
@@ -196,12 +208,12 @@ export function ConversationComposer({
             <div className="local-agent__pasted-text-header">
               <DeepCodeShellIcon name="artifact" />
               <span><strong>{pastedTextTitle(paste.text)}</strong><small>TXT · {(new TextEncoder().encode(paste.text).byteLength / 1024).toFixed(1)} KiB</small></span>
-              <button type="button" aria-label="移除粘贴文本" onClick={() => composer.setPastedTexts((current) => current.filter((item) => item.inputId !== paste.inputId))}>×</button>
+              <button type="button" aria-label={t(language, 'agent.paste.remove')} onClick={() => composer.setPastedTexts((current) => current.filter((item) => item.inputId !== paste.inputId))}>×</button>
             </div>
             <button type="button" className="local-agent__paste-toggle" aria-expanded={paste.expanded} onClick={() => composer.setPastedTexts((current) => current.map((item) => item.inputId === paste.inputId ? { ...item, expanded: !item.expanded } : item))}>
-              {paste.expanded ? '收起原文' : '在文本框中显示'}
+              {t(language, paste.expanded ? 'agent.paste.collapse' : 'agent.paste.expand')}
             </button>
-            {paste.expanded && <textarea aria-label="粘贴文本原文" value={paste.text} onChange={(event) => composer.editPastedText(paste.inputId, event.target.value)} rows={8} />}
+            {paste.expanded && <textarea aria-label={t(language, 'agent.paste.original')} value={paste.text} onChange={(event) => composer.editPastedText(paste.inputId, event.target.value)} rows={8} />}
           </div>
         ))}
         <textarea
@@ -392,7 +404,7 @@ export function ConversationComposer({
       </div>
       {!pendingPlan && !pendingInteraction && !pendingApproval && (
         <div className="local-agent__composer-hint">
-          {t(language, 'agent.composer.hint')}
+          <TotalCacheUsage projection={projection} language={language} />
         </div>
       )}
     </footer>

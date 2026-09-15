@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
-import { readConversation, readConversationResource, readConversationImage, readFileChange } from '../../services/localAgentApi';
+import { readConversation, readConversationResource, readConversationImage, readConversationDocument, readFileChange, resolveConversationResourcePath, readConversationArtifact } from '../../services/localAgentApi';
 import { openExternalUrl } from '../../services/runtimeAdapter';
 
 /** Web conversation content receives host operations here; it owns no native shell API. */
@@ -7,6 +7,8 @@ export interface ConversationHost {
   copyText(text: string): Promise<void>;
   openExternalLink(url: string): Promise<void>;
   readResource: typeof readConversationResource;
+  readDocument: typeof readConversationDocument;
+  readArtifact: typeof readConversationArtifact;
   readChange: typeof readFileChange;
   readConversation: typeof readConversation;
   loadImage(sessionId: string | null, source: string, signal: AbortSignal): Promise<{ url: string; release?(): void }>;
@@ -18,9 +20,22 @@ const defaultHost: ConversationHost = {
   copyText: async (text) => navigator.clipboard.writeText(text),
   openExternalLink: openExternalUrl,
   readResource: readConversationResource,
+  readDocument: readConversationDocument,
+  readArtifact: readConversationArtifact,
+  openFile: async (sessionId, workspaceId, logicalPath) => {
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (!invoke) throw new Error('Open in VS Code requires the desktop Host.');
+    const path = await resolveConversationResourcePath(sessionId, workspaceId, logicalPath);
+    await invoke('deepcode_open_file', {path});
+  },
   readChange: readFileChange,
   readConversation,
   loadImage: async (sessionId, source, signal) => {
+    if (sessionId && source.startsWith('artifact://')) {
+      const blob = await readConversationArtifact(sessionId, source.slice('artifact://'.length), signal);
+      const url = URL.createObjectURL(blob);
+      return {url, release: () => URL.revokeObjectURL(url)};
+    }
     if (/^https?:\/\//i.test(source)) return { url: source };
     const resource = /^workspace:\/\/([^/]+)\/(.+)$/.exec(source);
     if (!sessionId || !resource) throw new Error('图片需要 HTTP(S) 地址或 workspace://<workspaceId>/<logicalPath> 资源引用。');

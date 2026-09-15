@@ -24,7 +24,7 @@ const WorkspaceSection: React.FC = () => {
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
 
   const handleWorkspaceSettingChange = (key: string, value: UserSettingValue) => {
-    void patchWorkspaceSetting(key, value);
+    return patchWorkspaceSetting(key, value);
   };
 
   const handleSaveWorkspaceFile = async () => {

@@ -4,6 +4,7 @@
   min-width: 0;
   min-height: 0;
   grid-template-columns: 232px minmax(0, 1fr) 276px;
+  grid-template-rows: minmax(0, 1fr);
   background: var(--dc-surface);
 }
 
@@ -16,6 +17,8 @@
 }
 
 .deepcode-gui-left-rail {
+  grid-column: 1;
+  grid-row: 1;
   display: flex;
   min-width: 0;
   min-height: 0;
@@ -52,6 +55,9 @@
   text-align: left;
   transition: background-color 140ms ease, color 140ms ease;
 }
+
+.deepcode-gui-sidebar-footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 0; flex: none; }
+.deepcode-gui-sidebar-footer .deepcode-gui-sidebar-settings { margin: 0; width: 100%; flex: 1 1 auto; gap: 9px; padding-inline: 10px; }
 
 .deepcode-gui-sidebar-action svg,
 .deepcode-gui-session-entry svg,
@@ -297,25 +303,10 @@
 }
 
 .deepcode-local-agent-overlay {
-  position: fixed;
-  inset: 36px 0 0;
-  z-index: 100;
-  display: grid;
-  place-items: center;
-  padding: 24px;
-  background: color-mix(in srgb, #111 34%, transparent);
-  backdrop-filter: blur(3px);
+  position:fixed;inset:36px 0 0;z-index:100;display:flex;background:var(--dc-surface);
 }
-
 .deepcode-local-agent-settings {
-  position: relative;
-  width: min(1080px, 96vw);
-  height: min(750px, 92vh);
-  overflow: hidden;
-  border: 1px solid var(--dc-border-strong);
-  border-radius: 16px;
-  background: var(--dc-surface);
-  box-shadow: 0 24px 70px rgba(20, 24, 28, 0.24);
+  position:relative;width:100%;height:100%;min-height:0;overflow:hidden;background:var(--dc-surface);
 }
 
 .deepcode-local-agent-settings__close {
@@ -356,17 +347,17 @@
 
 /* dev-main 工作台信息架构：左侧项目/对话，中间会话，右侧任务与产出。 */
 .deepcode-gui-shell {
-  grid-template-columns: 244px minmax(560px, 1fr) 296px;
+  grid-template-columns: var(--dc-sidebar-width) minmax(0, 1fr) var(--dc-context-width);
   background: var(--dc-surface);
 }
 
 .deepcode-gui-shell--no-context {
-  grid-template-columns: 244px minmax(560px, 1fr);
+  grid-template-columns: var(--dc-sidebar-width) minmax(0, 1fr);
 }
 
 .deepcode-gui-left-rail {
-  width: 244px;
-  max-width: 244px;
+  width: var(--dc-sidebar-width);
+  max-width: var(--dc-sidebar-width);
   gap: 12px;
   padding: 12px 10px 10px;
 }
@@ -711,6 +702,8 @@
 }
 
 .deepcode-gui-session-main {
+  grid-column: 2;
+  grid-row: 1;
   position: relative;
   min-width: 0;
   min-height: 0;
@@ -718,7 +711,14 @@
   background: var(--dc-surface);
 }
 
+.deepcode-gui-session-header {
+  min-width: 0;
+  height: 100%;
+}
+
 .deepcode-gui-context-panel {
+  grid-column: 3;
+  grid-row: 1;
   min-width: 0;
   min-height: 0;
   display: flex;
@@ -1144,7 +1144,7 @@
   );
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--dc-border-strong) 78%, transparent);
   color: var(--dc-muted);
-  font-size: 7px;
+  font-size: 10px;
   font-weight: var(--dc-weight-semibold);
   font-variant-numeric: tabular-nums;
   isolation: isolate;
@@ -1694,13 +1694,14 @@
 }
 
 @media (max-width: 1120px) {
+  .deepcode-gui-workbench { --dc-sidebar-width: 224px; --dc-context-width: auto; }
   .deepcode-gui-shell {
-    grid-template-columns: 224px minmax(0, 1fr);
+    grid-template-columns: var(--dc-sidebar-width) minmax(0, 1fr);
   }
 
   .deepcode-gui-left-rail {
-    width: 224px;
-    max-width: 224px;
+    width: var(--dc-sidebar-width);
+    max-width: var(--dc-sidebar-width);
   }
 
   .deepcode-gui-context-panel {
@@ -1718,6 +1719,8 @@
   }
 
   .deepcode-gui-session-main {
+    grid-column: 1;
     border-left: 0;
   }
+  .deepcode-gui-session-header { grid-column: 1; }
 }

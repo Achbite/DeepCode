@@ -7,45 +7,32 @@ export function ComposerPermissionControl({ language, composer }: { language: Ui
   const { permissionControlRef, permissionMenuOpen, setPermissionMenuOpen, setAttachmentMenuOpen } = composer;
   const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
   const runtimeEffectiveSettings = useSettingsStore((state) => state.runtimeEffectiveSettings);
-  const settingsPendingNextRunActivation = useSettingsStore(
-    (state) => state.pendingNextRunActivation,
-  );
   const patchUserSetting = useSettingsStore((state) => state.patchUserSetting);
+  const summary = t(language,
+    runtimeEffectiveSettings['agent.permissions.workspaceMutation'] === 'allow'
+      ? 'agent.permission.summary.allow' : 'agent.permission.summary.plan',
+    { external: t(language,
+      runtimeEffectiveSettings['agent.permissions.external'] === 'allow' ? 'agent.permission.allow'
+        : runtimeEffectiveSettings['agent.permissions.external'] === 'deny' ? 'agent.permission.deny' : 'agent.permission.ask') },
+  );
   return (
     <div ref={permissionControlRef} className="local-agent__permission-control">
       <button
         type="button"
         className="local-agent__permission-summary"
+        aria-label={t(language, 'settings.nav.permissions')}
+        title={summary}
         aria-expanded={permissionMenuOpen}
         onClick={() => {
           setPermissionMenuOpen((open) => !open);
           setAttachmentMenuOpen(false);
         }}
       >
-        {t(
-          language,
-          runtimeEffectiveSettings['agent.permissions.workspaceMutation'] === 'allow'
-            ? 'agent.permission.summary.allow'
-            : 'agent.permission.summary.plan',
-          {
-            external: t(
-              language,
-              runtimeEffectiveSettings['agent.permissions.external'] === 'allow'
-                ? 'agent.permission.allow'
-                : runtimeEffectiveSettings['agent.permissions.external'] === 'deny'
-                  ? 'agent.permission.deny'
-                  : 'agent.permission.ask',
-            ),
-          },
-        )}
+        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><path d="M12 3 4 6v6c0 4 4 7 8 9 4-2 8-5 8-9V6Z"/><path d="m8 12 3 3 5-6"/></svg>
+        <span>{summary}</span>
       </button>
       {permissionMenuOpen && (
         <div className="local-agent__permission-menu">
-          {settingsPendingNextRunActivation && (
-            <div className="local-agent__permission-activation-notice">
-              {t(language, 'agent.permission.nextRunActivationPending')}
-            </div>
-          )}
           <div className="local-agent__permission-invariant">
             <span>{t(language, 'agent.permission.workspaceRead')}</span>
             <strong>{t(language, 'agent.permission.workspaceReadAllowed')}</strong>

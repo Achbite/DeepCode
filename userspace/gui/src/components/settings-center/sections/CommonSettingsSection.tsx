@@ -102,7 +102,7 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
   );
 
   const handleChange = (key: string, value: UserSettingValue) => {
-    void patchUserSetting(key, value);
+    return patchUserSetting(key, value);
   };
 
   return (
@@ -139,6 +139,11 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
             </tr>
           </tbody>
         </table>
+        <div className="settings-card__body">
+          <button type="button" className="settings-button" onClick={() => window.location.reload()}>
+            {language === 'zh-CN' ? '重新加载界面' : 'Reload interface'}
+          </button>
+        </div>
         {errorMessage && <div className="settings-error">{errorMessage}</div>}
       </div>
 
@@ -154,13 +159,6 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
         <div className="settings-card" key={group}>
           <h3 className="settings-card__title">{groupTitle(group, language)}</h3>
           <div className="settings-card__body">
-            {group === 'workbench' && (
-              <div className="settings-card__inline-placeholder">
-                {t(language, 'settings.workbench.i18n.prefix')}
-                <code>config/i18n/*.json</code>
-                {t(language, 'settings.workbench.i18n.suffix')}
-              </div>
-            )}
             {(grouped[group] ?? []).map((definition) => (
               <SettingsField
                 key={definition.key}
@@ -170,12 +168,9 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
                 language={language}
                 disabled={loading || sources[definition.key] === 'workspace'}
                 onChange={handleChange}
-                onReset={(key) => void resetUserSetting(key)}
+                onReset={(key) => resetUserSetting(key)}
               />
             ))}
-          </div>
-          <div className="settings-card__hint">
-            {t(language, 'settings.workspaceHint')}
           </div>
         </div>
       ))}

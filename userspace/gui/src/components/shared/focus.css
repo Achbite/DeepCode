@@ -3,3 +3,11 @@
   outline: 2px solid var(--dc-focus-ring, var(--accent, Highlight));
   outline-offset: 2px;
 }
+
+/* Buttons use a surface change for keyboard focus, including body-portalled dialogs. */
+:root[data-product='deepcode-gui'] body :is(button, [role='button'], [role='tab'], summary):focus-visible {
+  outline: none;
+  box-shadow: none;
+  background-color: var(--dc-surface-hover);
+  color: var(--dc-foreground);
+}

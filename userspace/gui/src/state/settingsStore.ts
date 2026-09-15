@@ -89,7 +89,7 @@ interface SettingsActions {
   patchUserSettingsBatch: (
     patches: Record<string, UserSettingValue>,
   ) => Promise<UserSettingsActivation | null>;
-  patchWorkspaceSetting: (key: string, value: UserSettingValue) => Promise<void>;
+  patchWorkspaceSetting: (key: string, value: UserSettingValue) => Promise<boolean>;
   resetUserSetting: (key: string) => Promise<UserSettingsActivation | null>;
   getSettingSource: (key: string) => SettingSource;
 }
@@ -308,6 +308,7 @@ const SETTING_DEFINITION_SCHEMAS: SettingDefinitionSchema[] = [
     group: 'skills',
     control: 'text',
   },
+  { key: 'agent.documents.pythonPath', group: 'agent', control: 'text' },
   {
     key: 'mcp.servers',
     group: 'mcp',
@@ -603,7 +604,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
     patchWorkspaceSetting: async (key, value) => {
       if (!WORKSPACE_OVERRIDABLE_SETTING_KEYS.has(key)) {
         set({ errorMessage: activeT('settings.error.protectedWorkspaceKey', { key }) });
-        return;
+        return false;
       }
       const normalized = normalizeSettingValue(key, value);
       const result = await patchWorkspaceSettings({
@@ -613,7 +614,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
         set({
           errorMessage: result.message ?? activeT('settings.error.saveWorkspace', { key }),
         });
-        return;
+        return false;
       }
       const next = buildEffectiveSettings(
         get().userSettings,
@@ -626,6 +627,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
         sources: next.sources,
         errorMessage: null,
       });
+      return true;
     },
 
     resetUserSetting: async (key) => {

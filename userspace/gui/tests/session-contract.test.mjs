@@ -27,6 +27,190 @@ import {
   waitUntil,
 } from '../../session-core/tests/local-agent-fixtures.mjs';
 
+test('UI plugin replacement releases styles and effects and retires failed renderers', async (t) => {
+  const { UiPluginRuntime } = await loadGuiModule(t, '/src/ui-plugins/runtime.ts');
+  const styles = new Set();
+  const signals = [];
+  const disposed = [];
+  const renderer = () => ({ update() {}, dispose() {} });
+  const runtime = new UiPluginRuntime(async (code) => {
+    if (code === 'broken') throw new Error('original module syntax failure');
+    return { apply(ctx) {
+      signals.push(ctx.signal);
+      ctx.addStyle(code);
+      ctx.onDispose(() => disposed.push(code));
+      ctx.register('message.markdown', renderer);
+    } };
+  }, (css) => { styles.add(css); return () => styles.delete(css); });
+  t.after(() => runtime.dispose());
+  const file = (source) => ({ path: '/plugins/reader', enabled: true, manifest: { id: 'reader', name: 'Reader', entry: 'index.js', slots: ['message.markdown'] }, source, error: null });
+  await runtime.replace([file('first')]);
+  assert.equal(runtime.getSnapshot()[0].renderers.get('message.markdown'), renderer);
+  const firstGeneration = runtime.getSnapshot()[0].generation;
+  await runtime.replace([file('second')]);
+  assert.deepEqual([...styles], ['second']);
+  assert.deepEqual(disposed, ['first']);
+  assert.equal(signals[0].aborted, true);
+  assert.ok(runtime.getSnapshot()[0].generation > firstGeneration);
+  await runtime.replace([file('broken')]);
+  assert.equal(styles.size, 0);
+  assert.equal(runtime.getSnapshot()[0].status, 'error');
+  assert.match(runtime.getSnapshot()[0].error, /original module syntax failure/);
+  assert.equal(runtime.getSnapshot()[0].renderers.size, 0);
+  await runtime.replace([file('third')]);
+  await runtime.report(runtime.getSnapshot()[0], new Error('view update failed'));
+  assert.equal(styles.size, 0);
+  assert.match(runtime.getSnapshot()[0].error, /view update failed/);
+  await runtime.replace([{ ...file(null), enabled: false }]);
+  assert.equal(runtime.getSnapshot()[0].status, 'disabled');
+});
+
+test('UI module imports finishing late cannot replace a newer generation', async (t) => {
+  const { UiPluginRuntime } = await loadGuiModule(t, '/src/ui-plugins/runtime.ts');
+  const activated = [];
+  let finishOld;
+  const runtime = new UiPluginRuntime((source) => source === 'old' ? new Promise((resolve) => { finishOld = resolve; })
+    : Promise.resolve({ apply() { activated.push(source); } }), () => () => {});
+  t.after(() => runtime.dispose());
+  const file = (source) => ({ path: '/plugins/theme', enabled: true, manifest: { id: 'theme', name: 'Theme', entry: 'index.js', slots: ['theme'] }, source, error: null });
+  const oldLoad = runtime.replace([file('old')]);
+  await waitUntil(() => Boolean(finishOld));
+  const newLoad = runtime.replace([file('new')]);
+  finishOld({ apply() { activated.push('old'); } });
+  await Promise.all([oldLoad, newLoad]);
+  assert.deepEqual(activated, ['new']);
+  assert.equal(runtime.getSnapshot()[0].status, 'active');
+  await runtime.replace([]);
+  assert.deepEqual(runtime.getSnapshot(), []);
+});
+
+test('UI plugin scopes release all resources even if one disposer fails', async (t) => {
+  const { createPluginScope } = await loadGuiModule(t, '/src/ui-plugins/runtime.ts');
+  const calls = [];
+  const scope = createPluginScope((css) => () => calls.push(css), (error) => { throw error; });
+  scope.addStyle('stylesheet');
+  scope.onDispose(() => { throw new Error('dispose failure'); });
+  scope.onDispose(() => calls.push('event listener'));
+  await assert.rejects(scope.dispose(), /dispose failure/);
+  assert.equal(scope.signal.aborted, true);
+  assert.deepEqual(calls, ['event listener', 'stylesheet']);
+  await assert.rejects(scope.dispose(), /dispose failure/);
+});
+
+test('UI replacement waits for asynchronous views and module disposal', async (t) => {
+  const { UiPluginRuntime } = await loadGuiModule(t, '/src/ui-plugins/runtime.ts');
+  const order = []; let releaseView;
+  const runtime = new UiPluginRuntime(async source => ({ apply(ctx) {
+    order.push(`apply:${source}`); ctx.onDispose(async () => { await Promise.resolve(); order.push(`dispose:${source}`); });
+  } }), () => () => {});
+  t.after(() => runtime.dispose());
+  const file = source => ({path:'/plugins/theme',enabled:true,manifest:{id:'theme',name:'Theme',entry:'index.js',slots:['theme']},source,error:null});
+  await runtime.replace([file('first')]);
+  runtime.attachView(runtime.getSnapshot()[0], () => new Promise(resolve => {releaseView = () => {order.push('view:disposed');resolve();};}));
+  const replacement = runtime.replace([file('second')]);
+  await waitUntil(() => Boolean(releaseView));
+  assert.deepEqual(order, ['apply:first']);
+  releaseView(); await replacement;
+  assert.deepEqual(order, ['apply:first','view:disposed','dispose:first','apply:second']);
+});
+
+test('conflicting display slots are explicit and unload when the selection changes', async (t) => {
+  const { UiPluginRuntime } = await loadGuiModule(t, '/src/ui-plugins/runtime.ts');
+  const runtime = new UiPluginRuntime(async () => ({ apply(ctx) { ctx.register('document.html', () => ({ update() {}, dispose() {} })); } }), () => () => {});
+  t.after(() => runtime.dispose());
+  const file = (id) => ({ path: `/plugins/${id}`, enabled: true, manifest: { id, name: id, entry: 'index.js', slots: ['document.html'] }, source: 'module', error: null });
+  await runtime.replace([file('a')]);
+  await runtime.replace([file('a'), file('b')]);
+  assert.ok(runtime.getSnapshot().every((entry) => entry.status === 'error'));
+  await runtime.replace([file('b')]);
+  assert.equal(runtime.getSnapshot()[0].status, 'active');
+});
+
+test('document preview requests preserve workspace identity, full bytes and read failures', async (t) => {
+  const { readConversationDocument } = await loadGuiModule(t, '/src/services/localAgentApi.ts');
+  let failure = false;
+  const body = '<!doctype html><h1>中文报告</h1>';
+  installGuiFetch(t, (url, init) => {
+    assert.equal(url.pathname, '/api/conversation/sessions/session%3Adoc/resources/read');
+    assert.deepEqual(JSON.parse(init.body), { workspaceId: 'workspace:docs', logicalPath: '报告.html', format: 'document' });
+    return failure ? Response.json({ ok: false, error: 'conversation_document_read_failed', message: 'original read error' })
+      : new Response(body, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  });
+  assert.equal(await (await readConversationDocument('session:doc', 'workspace:docs', '报告.html')).text(), body);
+  failure = true;
+  await assert.rejects(readConversationDocument('session:doc', 'workspace:docs', '报告.html'), /original read error/);
+});
+
+test('document links retain Unicode paths and choose the appropriate reader', async (t) => {
+  const { documentFormat, workspaceResourceLink } = await loadGuiModule(t, '/src/components/local-agent/documentResources.ts');
+  assert.equal(documentFormat('Reports/REPORT.PDF'), 'pdf');
+  assert.equal(documentFormat('报告.html'), 'html');
+  assert.equal(documentFormat('notes.markdown'), 'markdown');
+  assert.equal(documentFormat('src/main.rs'), null);
+  assert.deepEqual(workspaceResourceLink('workspace://workspace%3Adoc/reports%2F%E6%8A%A5%E5%91%8A%20a.pdf'), { workspaceId: 'workspace:doc', logicalPath: 'reports/报告 a.pdf' });
+  assert.equal(workspaceResourceLink('https://example.com/report.pdf'), null);
+  assert.equal(workspaceResourceLink('workspace://workspace:doc/%FF'), null);
+});
+
+test('document Plan scope and completed artifacts pass through Session to the GUI reader', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:document-artifact';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const tool = {
+    toolBindingRef: 'tool-binding:document:g1', name: 'document.render', description: 'Render a document.',
+    inputSchema: { type: 'object', required: ['path', 'format', 'content'], properties: {
+      path: { type: 'string' }, format: { type: 'string', enum: ['pdf'] }, content: { type: 'string' },
+    } }, possibleEffects: ['workspaceMutation'], availability: 'callable', origin: 'coreBuiltin',
+  };
+  const artifact = { artifactId: 'artifact:document', label: '报告.pdf', workspaceId: workspaceBinding.workspaceId, logicalPath: '报告.pdf', contentType:'application/pdf', contentMode:'fixed' };
+  let calls = 0;
+  let documentRecordId;
+  let documentRecord;
+  const provider = { async *stream(request) {
+    if (++calls === 1) {
+      const plan = request.tools.find((entry) => entry.inputSchema.properties?.mutationManifest);
+      yield providerEvent(request.requestId, 'tool.call', { callId: 'provider-call:document-plan', name: plan.name, input: {
+        title: 'Document', summary: 'Publish the requested report.', steps: [{ stepId: 'report', title: 'Report', details: 'Render the report.' }],
+        mutationManifest: [{ workspace: 'primary', operation: 'document.render', target: '报告.pdf' }],
+      } });
+    } else if (calls === 2) {
+      const renderer = request.tools.find((entry) => entry.inputSchema.properties?.format?.enum?.includes('pdf'));
+      yield providerEvent(request.requestId, 'tool.call', { callId: 'provider-call:document-render', name: renderer.name,
+        input: { workspace: 'primary', path: '报告.pdf', format: 'pdf', content: '<h1>Report</h1>' } });
+    } else if (calls === 3) {
+      const current = await actor.snapshot();
+      const progress = request.tools.find((entry) => entry.inputSchema.properties?.sourceFactRef);
+      yield providerEvent(request.requestId, 'tool.call', { callId: 'provider-call:document-progress', name: progress.name,
+        input: { sourceFactRef: documentRecordId, updates: [{ todoId: current.todoList.items[0].todoId, status: 'completed' }] } });
+    } else {
+      yield providerEvent(request.requestId, 'assistant.message', { messageId: 'provider-message:document-done', content: 'Report is ready.' });
+    }
+    yield providerEvent(request.requestId, 'completed', {});
+  } };
+  const kernel = emptyKernel({ async execute(request) {
+    assert.equal(request.toolName, 'document.render');
+    assert.equal(request.input.workspaceId, workspaceBinding.workspaceId);
+    assert.deepEqual(request.planAuthorities[0].coveredOperations, [{ workspaceId: workspaceBinding.workspaceId, operation: 'document.render', target: '报告.pdf' }]);
+    const reply = completedExecutionReply(request, { artifacts: [artifact] });
+    documentRecordId = reply.record.recordId;
+    documentRecord = reply.record;
+    return reply;
+  } });
+  const actor = actorWith(journal, sessionId, provider, kernel, fakeRunPreparation({ tools: [tool] }).port, 'document-artifact');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:document-start', 'Render a report.'));
+  const waiting = await waitForProjection(actor, (value) => value.pendingPlan !== null);
+  assert.equal(waiting.pendingPlan.mutationManifest[0].operation, 'document.render');
+  await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'plan.respond', commandId: 'command:document-confirm', sessionId,
+    runId: waiting.run.runId, planId: waiting.pendingPlan.planId, revision: waiting.pendingPlan.revision, response: { kind: 'confirm' } });
+  const completed = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.deepEqual((await decodeGuiProjection(completed)).artifacts, [{ ...artifact,
+    sessionId, runId:documentRecord.runId, callId:documentRecord.callId,
+    recordId:documentRecord.recordId, createdAt:documentRecord.completedAt,
+  }]);
+  assert.equal(completed.activities.find((activity) => activity.kind === 'tool').status, 'completed');
+});
+
 test('sidebar reordering preserves project ownership and ignores stale drag targets', async (t) => {
   const { moveSidebarItem } = await loadGuiModule(t, '/src/deepcode-gui/layout/sidebarOrder.ts');
   const projects = [{ id: 'p:a' }, { id: 'p:b' }, { id: 'p:c' }];
@@ -1053,7 +1237,7 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
     throw new Error(`unexpected_gui_request:${init.method ?? 'GET'}:${url.pathname}`);
   });
   const store = await loadGuiModelStore(t);
-  store.setState({ profiles });
+  await store.getState().refreshProfiles();
   await store.getState().selectProfile('profile:one');
   await store.getState().selectReasoningEffort('max');
   assert.equal(commands, 0, 'draft preference is saved without creating a Session');
@@ -1065,7 +1249,7 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
   assert.equal(store.getState().selectedProfileId, 'profile:two');
   assert.equal(store.getState().reasoningEffortOverride, null);
   assert.equal((await actor.snapshot()).modelSettings.profileId, 'profile:two');
-  assert.equal(store.getState().defaultProfileId, 'profile:two');
+  assert.equal(store.getState().defaultProfileId, 'profile:one', 'selecting a model does not change the last actually used model');
   failSave = true;
   await store.getState().selectReasoningEffort('high');
   assert.equal(store.getState().reasoningEffortOverride, null);
@@ -1079,13 +1263,13 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
   assert.equal(store.getState().reasoningEffortOverride, null);
   assert.equal((await actor.snapshot()).run, null);
   store.getState().startNewSession();
-  assert.equal(store.getState().selectedProfileId, 'profile:off');
+  assert.equal(store.getState().selectedProfileId, 'profile:one');
   await store.getState().selectProfile('profile:two');
   store.getState().startNewSession();
-  assert.equal(store.getState().selectedProfileId, 'profile:two');
+  assert.equal(store.getState().selectedProfileId, 'profile:one');
   const reopened = await loadGuiModelStore(t);
   await reopened.getState().refreshProfiles();
-  assert.equal(reopened.getState().selectedProfileId, 'profile:two');
+  assert.equal(reopened.getState().selectedProfileId, 'profile:one');
 });
 
 test('starting a draft during initialization preserves navigation and still loads usable model configuration', async (t) => {
@@ -1225,7 +1409,7 @@ test('continuous conversation keeps every message anchor while mounting nearby c
   const { ConversationTranscript } = await loadGuiModule(t, '/src/components/local-agent/ConversationTranscript.tsx');
   const props = {
     language: 'zh-CN', loading: false, completedRuns: new Set(), onDisplayed() {},
-    projection: { sessionId: 'session:long', run: null, plans: [], activities: [], fileChangeRounds: [] },
+    projection: { sessionId: 'session:long', run: null, plans: [], activities: [], fileChangeRounds: [], artifacts:[] },
     hasConversationContent: true, draftItems: [],
     conversationItems: rows.map((row, index) => ({ ...row.item, sequence: index, streamId: `stream:${index}`, value: { ...row.item.value, messageId: row.key, runId: 'run:long' } })),
     presentation: { content: (id) => id },
@@ -2050,7 +2234,7 @@ test('pending approvals preserve ordinary input with one primary action', async 
   const { ConversationComposer } = await loadGuiModule(t, '/src/components/local-agent/ConversationComposer.tsx');
   const composer = {
     pendingApproval: { approvalId: 'approval:one', preview: { summary: 'Write the requested file', effects: [], logicalTargets: [] } },
-    projection: { queuedInputs: [{ commandId: 'queued:one', text: 'Keep the public API unchanged', status: 'queued', filesystemReferences: [] }] },
+    projection: { contextCompositions:[], queuedInputs: [{ commandId: 'queued:one', text: 'Keep the public API unchanged', status: 'queued', filesystemReferences: [] }] },
     profiles: [], selectedProfileId: null, draft: 'Second request', pastedTexts: [], failedDrafts: [],
     pendingFilesystemPaths: [], pluginSelections: [], filteredPlugins: [], showStopAction: false, canSend: false, submitting: true,
     textareaRef: { current: null }, respondApproval() {},
@@ -2114,14 +2298,27 @@ test('questions and Plan revisions share the main input and render a single prim
   assert.doesNotMatch(editing, /local-agent__send--stop|local-agent__interaction-secondary/);
 });
 
-test('resource preview uses the native dialog while committed content projects only displayed text', async (t) => {
+test('resource preview keeps expansion beside the shared sidebar control while committed content projects only displayed text', async (t) => {
   const { createElement } = await import('react');
   const { renderToStaticMarkup } = await import('react-dom/server');
-  const { ResourcePreview } = await loadGuiModule(t, '/src/components/local-agent/ResourcePreview.tsx');
+  const { ResourcePreview, ReaderControls } = await loadGuiModule(t, '/src/components/local-agent/ResourcePreview.tsx');
   const html = renderToStaticMarkup(createElement(ResourcePreview, { language: 'zh-CN', preview: {
-    resourcePreview: { workspaceId: 'workspace:one', logicalPath: 'README.md', status: 'loading' }, closeResourcePreview() {},
+    sessionId:'session:reader', tabs:[{id:'readme',target:{kind:'workspace',workspaceId:'workspace:one',logicalPath:'README.md'}}],
+    activeId:'readme', visible:true, expanded:false, width:55, error:null,
+    selectTab(){},closeTab(){},newPage(){},expand(){},resize(){},openTarget(){},
   } }));
-  assert.match(html, /^<dialog\b/);
+  assert.match(html, /<aside[^>]*class="local-agent__reader"/);
+  assert.match(html, /role="separator"/);
+  assert.doesNotMatch(html, /aria-label="铺满工作区"|aria-label="浏览器与预览"/);
+  for (const expanded of [false, true]) {
+    const controls = renderToStaticMarkup(createElement(ReaderControls, { language: 'zh-CN', disabled: false,
+      preview: { visible: true, expanded, expand() {}, toggle() {} } }));
+    const label = expanded ? '返回并排' : '铺满工作区';
+    assert.equal((controls.match(/<button\b/g) ?? []).length, 2);
+    assert.ok(controls.indexOf(`aria-label="${label}"`) < controls.indexOf('aria-label="浏览器与预览"'));
+    assert.match(controls, /aria-pressed="true"/);
+  }
+  assert.doesNotMatch(html, /<dialog\b/);
   assert.match(html, /README.md/);
   const { projectCommittedText } = await import('../../presentation-core/dist/index.js');
   const projection = { messages: [
@@ -2141,6 +2338,7 @@ test('unavailable plugins preserve their source error and cannot be selected in 
   globalThis.self = {};
   t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
   const plugin = { uri: 'plugin://broken@1', displayName: 'Broken plugin', shortDescription: 'Optional extension',
+    source:'mounted',category:'functional',contributionKind:'mcp',discovery:'default',
     activationMediaTypes: [], enabled: true, available: false, error: { code: 'plugin_load_failed', message: 'Manifest cannot be read' } };
   installGuiFetch(t, () => Response.json({ ok: true, data: { revision: 'catalog:one', plugins: [plugin] } }));
   const { getPluginCatalog } = await loadGuiModule(t, '/src/services/localAgentApi.ts');
@@ -2383,4 +2581,97 @@ test('saving valid profiles enables an unbound draft and clears its profile erro
   assert.deepEqual(store.getState().profiles, [profile]);
   assert.equal(store.getState().error, null);
   assert.equal(store.getState().errorSource, null);
+});
+
+test('settings drafts survive refreshes and failed saves without converting an empty number to zero', async (t) => {
+  const [{ reconcileSettingDraft, parseSettingDraft }, { useSettingsStore }] = await loadGuiModules(t, ['/src/components/settings-center/settingDraft.ts', '/src/state/settingsStore.ts']);
+  let draft = { saved: 'old prompt', text: 'new prompt\nwith a second line' };
+  const saved = draft.saved;
+  useSettingsStore.setState({ effectiveSettings: { ...useSettingsStore.getState().effectiveSettings, 'agent.systemPrompt': saved } });
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  installGuiFetch(t, async (url, init) => {
+    assert.equal(url.pathname, '/api/user-settings');
+    assert.equal(init.method, 'PATCH');
+    assert.equal(JSON.parse(init.body).patches['agent.systemPrompt'], draft.text);
+    await gate;
+    return Response.json({ ok: false, message: 'settings_write_failed: read-only directory' });
+  });
+  const saving = useSettingsStore.getState().patchUserSetting('agent.systemPrompt', draft.text);
+  assert.equal(useSettingsStore.getState().effectiveSettings['agent.systemPrompt'], saved);
+  release();
+  assert.equal(await saving, null);
+  assert.equal(useSettingsStore.getState().errorMessage, 'settings_write_failed: read-only directory');
+  assert.equal(useSettingsStore.getState().effectiveSettings['agent.systemPrompt'], saved);
+  draft = reconcileSettingDraft(draft, saved);
+  assert.equal(draft.text, 'new prompt\nwith a second line');
+  draft = reconcileSettingDraft(draft, 'updated by another window');
+  assert.equal(draft.text, 'new prompt\nwith a second line');
+  assert.equal(draft.saved, 'updated by another window');
+  assert.deepEqual(reconcileSettingDraft({ saved: 'old', text: 'old' }, 'new'), { saved: 'new', text: 'new' });
+  assert.equal(parseSettingDraft('', true), null);
+  assert.equal(parseSettingDraft('12', true), 12);
+  assert.equal(parseSettingDraft('', false), '');
+});
+
+test('settings search matches words across field and model metadata without order dependence', async (t) => {
+  const { matchesSettingsQuery } = await loadGuiModule(t, '/src/components/settings-center/settingsSearch.tsx');
+  assert.equal(matchesSettingsQuery('PDF Python', 'PDF 生成环境', 'WeasyPrint Python'), true);
+  assert.equal(matchesSettingsQuery('flash deepseek', 'DeepSeek Flash', 'deepseek-v4-flash'), true);
+  assert.equal(matchesSettingsQuery('shell windows', 'Windows Shell'), true);
+  assert.equal(matchesSettingsQuery('github python', 'GitHub', 'Read repositories'), false);
+});
+
+test('environment settings use the Host platform for Windows controls without changing persisted values', async (t) => {
+  const [{ AgentSettingsSection }, { useSettingsStore }] = await loadGuiModules(t, [
+    '/src/components/settings-center/sections/CategorizedSettingsSections.tsx',
+    '/src/state/settingsStore.ts',
+  ]);
+  const React = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const settings = { ...useSettingsStore.getState().effectiveSettings, 'agent.windows.shell': 'gitBash', 'agent.windows.gitBashPath': 'C:\\Git\\bin\\bash.exe' };
+  // React's server renderer reads Zustand's initial snapshot, not getState().
+  const initialSnapshot = useSettingsStore.getInitialState();
+  const original = { effectiveSettings: initialSnapshot.effectiveSettings, environment: initialSnapshot.environment };
+  t.after(() => { Object.assign(initialSnapshot, original); });
+  Object.assign(initialSnapshot, { effectiveSettings: settings, environment: { os: 'macos' } });
+  useSettingsStore.setState({ effectiveSettings: settings, environment: initialSnapshot.environment });
+  const mac = renderToStaticMarkup(React.createElement(AgentSettingsSection, { category: 'environment' }));
+  assert.doesNotMatch(mac, /aria-label="Windows Shell"/);
+  assert.doesNotMatch(mac, /aria-label="Git Bash (路径|path)"/);
+  assert.match(mac, /WeasyPrint/);
+  initialSnapshot.environment = { os: 'windows' };
+  useSettingsStore.setState({ environment: initialSnapshot.environment });
+  const windows = renderToStaticMarkup(React.createElement(AgentSettingsSection, { category: 'environment' }));
+  assert.match(windows, /aria-label="Windows Shell"/);
+  assert.match(windows, /aria-label="Git Bash (路径|path)"/);
+  assert.equal(useSettingsStore.getState().effectiveSettings, settings);
+});
+
+test('picker navigation skips unavailable tools and supports wrapping and tab endpoints', async (t) => {
+  const { nextEnabledIndex } = await loadGuiModule(t, '/src/components/shared/keyboardNavigation.ts');
+  const tools = [false, true, false, true];
+  assert.equal(nextEnabledIndex(tools, -1, 'ArrowDown'), 1);
+  assert.equal(nextEnabledIndex(tools, 1, 'ArrowDown'), 3);
+  assert.equal(nextEnabledIndex(tools, 3, 'ArrowDown'), 1);
+  assert.equal(nextEnabledIndex(tools, 1, 'ArrowUp'), 3);
+  assert.equal(nextEnabledIndex([false], 0, 'Home'), -1);
+  assert.equal(nextEnabledIndex([true, true], 1, 'Home'), 0);
+  assert.equal(nextEnabledIndex([true, true], 0, 'End'), 1);
+});
+
+test('UI update detection compares entry resources and retains the original load failure', async (t) => {
+  const { interfaceResourcesChanged, interfaceUpdateSnapshot, reportInterfaceLoadError, subscribeInterfaceUpdates } = await loadGuiModule(t, '/src/services/interfaceUpdates.ts');
+  assert.equal(interfaceResourcesChanged(['entry-a.js', 'style-a.css'], ['style-a.css', 'entry-a.js']), false);
+  assert.equal(interfaceResourcesChanged(['entry-a.js'], ['entry-b.js']), true);
+  assert.equal(interfaceResourcesChanged(['entry-a.js'], ['entry-a.js', 'style-b.css']), true);
+  let notifications = 0;
+  const unsubscribe = subscribeInterfaceUpdates(() => notifications++);
+  reportInterfaceLoadError(new Error('Importing a module script failed: SettingsCenter-old.js'));
+  assert.equal(interfaceUpdateSnapshot().error, 'Importing a module script failed: SettingsCenter-old.js');
+  assert.equal(interfaceUpdateSnapshot().available, false);
+  assert.equal(notifications, 1);
+  unsubscribe();
+  reportInterfaceLoadError(new Error('second failure'));
+  assert.equal(notifications, 1);
 });

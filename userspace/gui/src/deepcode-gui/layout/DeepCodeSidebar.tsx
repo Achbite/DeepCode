@@ -160,6 +160,7 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || document.querySelector('dialog[open]')) return;
       if (event.key === 'Meta' || event.metaKey) setCommandPressed(true);
       if (!event.metaKey || event.altKey || event.ctrlKey || event.shiftKey || busy) return;
       const match = /^Digit([1-9])$/u.exec(event.code);
@@ -405,12 +406,14 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
       </section>
 
       <div className="deepcode-gui-sidebar-spacer" />
+      <footer className="deepcode-gui-sidebar-footer">
       <button type="button" className="deepcode-gui-sidebar-settings" onClick={onOpenSettings}>
         <span className="deepcode-gui-sidebar-settings__icon">
           <DeepCodeShellIcon name="settings" />
         </span>
-        <span>{t(language, 'settings.title')}</span>
+        <span>{t(language, 'deepcodeGui.settings.entry')}</span>
       </button>
+      </footer>
     </aside>
   );
 };

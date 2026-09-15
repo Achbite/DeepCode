@@ -5,6 +5,7 @@ export type DeepCodeShellIconName =
   | 'close'
   | 'terminal'
   | 'folder'
+  | 'browser'
   | 'paperclip'
   | 'plus'
   | 'more'
@@ -21,6 +22,13 @@ export type DeepCodeShellIconName =
   | 'thumbUp'
   | 'thumbDown'
   | 'stop'
+  | 'sidebar'
+  | 'expand'
+  | 'collapse'
+  | 'refresh'
+  | 'code'
+  | 'download'
+  | 'info'
   | 'arrowUp';
 
 interface DeepCodeShellIconProps {
@@ -42,6 +50,20 @@ const DeepCodeShellIcon: React.FC<DeepCodeShellIconProps> = ({ name, className }
     'aria-hidden': true,
   };
   switch (name) {
+    case 'sidebar':
+      return <svg {...common}><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M15 4v16"/></svg>;
+    case 'expand':
+      return <svg {...common}><path d="M14 4h6v6M20 4l-7 7M4 14v6h6M4 20l7-7"/></svg>;
+    case 'collapse':
+      return <svg {...common}><path d="M20 4l-7 7m0-6v6h6M4 20l7-7m-6 0h6v6"/></svg>;
+    case 'refresh':
+      return <svg {...common}><path d="M20 7v5h-5M19 12a7 7 0 1 0-1.5 5M20 12a8 8 0 0 0-2-6"/></svg>;
+    case 'code':
+      return <svg {...common}><path d="m8 7-5 5 5 5m8-10 5 5-5 5m-3-13-2 16"/></svg>;
+    case 'download':
+      return <svg {...common}><path d="M12 3v12m-5-5 5 5 5-5M4 16v4h16v-4"/></svg>;
+    case 'info':
+      return <svg {...common}><circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><circle cx="12" cy="7" r="1" fill="currentColor" stroke="none"/></svg>;
     case 'close':
       return <svg {...common}><path d="m6 6 12 12M18 6 6 18" /></svg>;
     case 'terminal':
@@ -50,6 +72,8 @@ const DeepCodeShellIcon: React.FC<DeepCodeShellIconProps> = ({ name, className }
       return <svg {...common}><path d="M4 20h4l11-11-4-4L4 16v4Z" /><path d="m13.5 6.5 4 4" /></svg>;
     case 'folder':
       return <svg {...common}><path d="M3 7.5h7l2-2h9v13H3v-11Z" /></svg>;
+    case 'browser':
+      return <svg {...common}><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18"/></svg>;
     case 'paperclip':
       return <svg {...common}><path d="m8.4 12.8 6.9-6.9a3.25 3.25 0 0 1 4.6 4.6l-8.6 8.6a5 5 0 0 1-7.1-7.1l8.2-8.2" /><path d="m7.1 14.1 8.2-8.2" /></svg>;
     case 'plus':

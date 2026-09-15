@@ -12,12 +12,15 @@ import GuiAppearanceSettings from '../GuiAppearanceSettings';
 import SettingsField from '../SettingsField';
 import ProjectEnvironmentSettings from './ProjectEnvironmentSettings';
 import WorkspaceSandboxSettings from './WorkspaceSandboxSettings';
+import DocumentEnvironmentSettings from './DocumentEnvironmentSettings';
+import FileOpeningSettings from './FileOpeningSettings';
 
 interface RuntimeProps {
   apiStatus: string;
   wsStatus: string;
   serverVersion?: string;
   query?: string;
+  category?: 'general' | 'appearance' | 'about';
 }
 
 const APPEARANCE_KEYS = ['gui.colorTheme', 'gui.accentColor'] as const;
@@ -73,11 +76,25 @@ function definitionsFor(
   });
 }
 
+export function settingsSearchDefinitions(language: ReturnType<typeof normalizeUiLanguage>, os: unknown) {
+  const available = [...guiDefinitions(), ...agentSettingDefinitions()];
+  const groups = {
+    general: ['workbench.language', 'gui.defaultFileOpen'],
+    gui: [...APPEARANCE_KEYS, ...INTERFACE_KEYS.filter((key) => key !== 'workbench.language')],
+    agent: [...AGENT_INSTRUCTION_KEYS, ...AGENT_RESPONSE_KEYS],
+    environment: [...(os === 'windows' ? AGENT_SHELL_KEYS : []), 'agent.documents.pythonPath'],
+    permissions: AGENT_PERMISSION_KEYS,
+    llm: AGENT_WEB_KEYS,
+  };
+  return Object.entries(groups).flatMap(([category, keys]) => definitionsFor(keys, available, language, '').map((definition) => ({ id: definition.key, title: definition.label, keywords: `${definition.key} ${definition.description}`, category })));
+}
+
 export const GuiSettingsSection: React.FC<RuntimeProps> = ({
   apiStatus,
   wsStatus,
   serverVersion,
   query = '',
+  category = 'appearance',
 }) => {
   const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
   const sources = useSettingsStore((state) => state.sources);
@@ -92,17 +109,18 @@ export const GuiSettingsSection: React.FC<RuntimeProps> = ({
     [language, query],
   );
   const preferences = useMemo(
-    () => definitionsFor(INTERFACE_KEYS, guiDefinitions(), language, query),
-    [language, query],
+    () => definitionsFor(category === 'general' ? ['workbench.language'] : category === 'appearance' ? INTERFACE_KEYS.filter((key) => key !== 'workbench.language') : [], guiDefinitions(), language, query),
+    [category, language, query],
   );
   const onChange = (key: string, value: UserSettingValue) => {
-    void patchUserSetting(key, value);
+    return patchUserSetting(key, value);
   };
 
   return (
     <div>
-      <h2 className="settings-title">{t(language, 'settings.gui.title')}</h2>
-      <GuiAppearanceSettings definitions={appearance} language={language} />
+      <h2 className="settings-title">{category === 'general' ? (language === 'zh-CN' ? '通用' : 'General') : category === 'about' ? (language === 'zh-CN' ? '关于 DeepCode' : 'About DeepCode') : t(language, 'settings.gui.title')}</h2>
+      {category === 'general' && <FileOpeningSettings language={language} query={query} />}
+      {category === 'appearance' && <GuiAppearanceSettings definitions={appearance} language={language} />}
       {preferences.length > 0 && (
         <div className="settings-card">
           <h3 className="settings-card__title">{t(language, 'settings.gui.preferences')}</h3>
@@ -117,13 +135,13 @@ export const GuiSettingsSection: React.FC<RuntimeProps> = ({
                 disabled={loading}
                 compact
                 onChange={onChange}
-                onReset={(key) => void resetUserSetting(key)}
+                onReset={(key) => resetUserSetting(key)}
               />
             ))}
           </div>
         </div>
       )}
-      {!query.trim() && (
+      {category === 'about' && !query.trim() && (
         <div className="settings-card settings-runtime-card">
           <h3 className="settings-card__title">{t(language, 'settings.runtime.title')}</h3>
           <table className="settings-kv">
@@ -140,9 +158,14 @@ export const GuiSettingsSection: React.FC<RuntimeProps> = ({
               </tr>
             </tbody>
           </table>
-          {errorMessage && <div className="settings-error">{errorMessage}</div>}
+          <div className="settings-card__body">
+            <button type="button" className="settings-button" onClick={() => window.location.reload()}>
+              {language === 'zh-CN' ? '重新加载界面' : 'Reload interface'}
+            </button>
+          </div>
         </div>
       )}
+      {errorMessage && <div className="settings-error" role="alert">{errorMessage}</div>}
     </div>
   );
 };
@@ -156,9 +179,6 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
   const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
   const sources = useSettingsStore((state) => state.sources);
   const loading = useSettingsStore((state) => state.loading);
-  const pendingNextRunActivation = useSettingsStore(
-    (state) => state.pendingNextRunActivation,
-  );
   const errorMessage = useSettingsStore((state) => state.errorMessage);
   const patchUserSetting = useSettingsStore((state) => state.patchUserSetting);
   const resetUserSetting = useSettingsStore((state) => state.resetUserSetting);
@@ -189,7 +209,7 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
     : category === 'environment' ? [shellSettings]
       : category === 'permissions' ? [permissions] : [web];
   const onChange = (key: string, value: UserSettingValue) => {
-    void patchUserSetting(key, value);
+    return patchUserSetting(key, value);
   };
   const renderCard = (title: string | null, definitions: readonly SettingDefinition[]) => {
     if (definitions.length === 0) return null;
@@ -207,7 +227,7 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
               disabled={loading}
               compact
               onChange={onChange}
-              onReset={(key) => void resetUserSetting(key)}
+              onReset={(key) => resetUserSetting(key)}
             />
           ))}
         </div>
@@ -218,13 +238,9 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
   return (
     <div>
       <h2 className="settings-title">{t(language, category === 'services' ? 'settings.agent.webTools' : `settings.nav.${category}`)}</h2>
-      {pendingNextRunActivation && (
-        <div className="settings-activation-notice">
-          {t(language, 'settings.agent.nextRunActivationPending')}
-        </div>
-      )}
       {category === 'agent' && renderCard(null, response)}
-      {category === 'environment' && renderCard('Windows Shell', shellSettings)}
+      {category === 'environment' && environment?.os === 'windows' && renderCard('Windows Shell', shellSettings)}
+      {category === 'environment' && <DocumentEnvironmentSettings language={language} query={query} />}
       {category === 'environment' && !query && <ProjectEnvironmentSettings chinese={chinese} />}
       {category === 'environment' && !query && <WorkspaceSandboxSettings chinese={chinese} />}
       {category === 'environment' && !query && <div className="settings-card">
@@ -232,8 +248,7 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
         <div className="settings-card__body">
           <div className="settings-field settings-field--compact">
             <div className="settings-field__main">
-              <div className="settings-field__label">{chinese ? '稳定的执行环境' : 'Stable execution environment'}</div>
-              <p className="settings-field__description">{chinese ? '会话复用已保存的环境。修改设置或刷新后，后续运行重新检测；当前任务保持原环境。' : 'Sessions reuse saved observations. Settings changes or refresh apply to subsequent runs; active work keeps its environment.'}</p>
+              <div className="settings-field__label">{chinese ? '本机环境' : 'Local environment'}</div>
             </div>
             <button className="settings-button" disabled={loading} onClick={() => void patchUserSetting('agent.environmentRevision', Number(effectiveSettings['agent.environmentRevision'] ?? 0) + 1)}>{chinese ? '刷新环境' : 'Refresh environment'}</button>
           </div>
@@ -249,7 +264,7 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
       {category === 'permissions' && renderCard(null, permissions)}
       {category === 'services' && renderCard(null, web)}
       {errorMessage && <div className="settings-error">{errorMessage}</div>}
-      {groups.every((group) => group.length === 0) && (
+      {category !== 'environment' && groups.every((group) => group.length === 0) && (
         <div className="settings-card">
           <div className="settings-card__body">{t(language, 'settings.noSearchMatch')}</div>
         </div>
