@@ -1,3 +1,5 @@
+import { failureSnapshotEvent } from './failureSnapshot.js';
+import { errorFact } from './loopFailure.js';
 import { LiveReasoning } from './reasoningRead.js';
 import { LiveToolOutput } from './liveToolOutput.js';
 import { todoItemsForPlan } from './planStage.js';
@@ -100,7 +102,6 @@ export class SessionActor {
   }
 
   async snapshot(): Promise<SessionProjection> {
-    this.assertOperational();
     const projection = projectSession((await this.loadSnapshot()).state, this.#assistantDraft);
     for (const activity of projection.activities) {
       if (activity.status === 'active' && activity.callId) {
@@ -116,6 +117,7 @@ export class SessionActor {
   }
 
   async hasActiveWork(): Promise<boolean> {
+    if (this.#loopFailure) return false;
     const run = (await this.loadSnapshot()).state.run;
     return this.#active !== undefined
       || (run != null && run.status !== 'waiting' && !isTerminal(run.status));
@@ -931,6 +933,7 @@ export class SessionActor {
           }
           this.#assistantDraft = draft ? structuredClone(draft) : null;
         },
+        resetReasoning: () => this.liveReasoning.reset(),
         updateReasoning: (requestId, runId, text, kind) => this.liveReasoning.append(requestId, runId, text, kind),
         updateToolProgress: (callId, progress) => this.#liveToolOutput.update(callId, progress),
         nextId: this.#nextId,
@@ -941,12 +944,17 @@ export class SessionActor {
       const current = await this.loadSnapshot();
       const settlement = current.state.pendingRunSettlements[command.runId];
       if (!settlement) throw new Error('run_finishing_settlement_missing');
-      await this.finalizeRunRuntime(current, command.runId, settlement);
+      if (settlement.outcome === 'failed' || settlement.outcome === 'indeterminate') {
+        await this.withWrite(async () => { const state = await this.loadSnapshot();
+          await this.appendEvents([failureSnapshotEvent(state, command.runId, settlement.error)], state);
+        });
+      }
+      await this.finalizeRunRuntime(await this.loadSnapshot(), command.runId, settlement);
     }
   }
 
   private async containLoopFailure(runId: string, error: unknown): Promise<Error> {
-    const failure = asError(error);
+    let failure = asError(error);
     let snapshot: LoopSnapshot;
     try {
       snapshot = await this.loadSnapshot();
@@ -956,6 +964,11 @@ export class SessionActor {
         failure.message,
       );
     }
+    try {
+      await this.withWrite(async () => { const current = await this.loadSnapshot();
+        await this.appendEvents([failureSnapshotEvent(current, runId, errorFact(failure))], current);
+      });
+    } catch (snapshotError) { failure = new AggregateError([failure, asError(snapshotError)], failure.message); }
     const runtime = snapshot.state.runRuntimeSnapshots[runId];
     if (!runtime || snapshot.state.runRuntimeReleases[runId]) return failure;
     try {

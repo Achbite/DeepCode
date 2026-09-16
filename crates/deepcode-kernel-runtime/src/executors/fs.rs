@@ -14,8 +14,17 @@ impl KernelToolExecutor for FsReadExecutor {
     ) -> KernelResult<KernelToolExecutionResult> {
         let path = get_string(&invocation.input, "path").unwrap_or_default();
         let target = prepared_workspace_target(&context)?;
-        if !target.is_file() {
-            return Err(KernelError::InvalidCommand(format!("{path} is not a file")));
+        let metadata = std::fs::metadata(&target).map_err(|error| KernelError::Structured {
+            code: "fs_read_metadata_failed", stage: "metadata", message: format!("Cannot inspect {path}: {error}"),
+            details: serde_json::json!({"path":path,"ioKind":format!("{:?}",error.kind()),"osCode":error.raw_os_error()}),
+        })?;
+        if !metadata.is_file() {
+            return Err(KernelError::Structured {
+                code: "fs_read_not_file",
+                stage: "metadata",
+                message: format!("{path} is not a regular file"),
+                details: serde_json::json!({"path":path}),
+            });
         }
         let mut output = deepcode_kernel_tools::text_range::read_text_range(
             &target,

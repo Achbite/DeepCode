@@ -803,11 +803,12 @@ fn provider_request_url(profile: &ResolvedLlmProfile, kind: ProviderStreamKind) 
 }
 
 fn build_provider_request(
+    client: &reqwest::Client,
     profile: &ResolvedLlmProfile,
     prepared: &PreparedProviderRequest,
 ) -> Result<reqwest::RequestBuilder, ProviderTransportError> {
     let url = provider_request_url(profile, prepared.kind);
-    let mut request = reqwest::Client::new()
+    let mut request = client
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(prepared.body.clone());
@@ -944,14 +945,16 @@ fn trimmed_payload(raw: &[u8]) -> Option<Vec<u8>> {
 }
 
 pub(crate) async fn probe_llm_profile_stream(
+    client: &reqwest::Client,
     profile: &ResolvedLlmProfile,
 ) -> Result<LlmStreamProbeResult, ProviderTransportError> {
-    tokio::time::timeout(LLM_PROFILE_PROBE_TIMEOUT, probe_profile(profile))
+    tokio::time::timeout(LLM_PROFILE_PROBE_TIMEOUT, probe_profile(client, profile))
         .await
         .unwrap_or_else(|_| Err(ProviderTransportError::new("provider_probe_timeout")))
 }
 
 async fn probe_profile(
+    client: &reqwest::Client,
     profile: &ResolvedLlmProfile,
 ) -> Result<LlmStreamProbeResult, ProviderTransportError> {
     let prepared = prepare_provider_request(
@@ -964,7 +967,7 @@ async fn probe_profile(
         }),
     )?;
     let kind = prepared.kind;
-    let mut response = build_provider_request(profile, &prepared)?
+    let mut response = build_provider_request(client, profile, &prepared)?
         .send()
         .await
         .map_err(|_| ProviderTransportError::new("provider_transport_failed"))?;
@@ -1011,6 +1014,8 @@ async fn probe_profile(
 }
 
 pub(crate) fn local_agent_provider_stream_response(
+    client: reqwest::Client,
+    provider_attempt_id: Option<String>,
     profile: ResolvedLlmProfile,
     request_envelope: Value,
     request_id: String,
@@ -1018,6 +1023,7 @@ pub(crate) fn local_agent_provider_stream_response(
     archive_identity: Value,
 ) -> Response {
     let response_request_id = request_id.clone();
+    let response_attempt_id = provider_attempt_id.clone();
     let stream = async_stream::stream! {
         let mut archive = match deepcode_kernel_runtime::execution_archive::ExecutionArchive::open(
             Some(&archive_directory),
@@ -1026,7 +1032,7 @@ pub(crate) fn local_agent_provider_stream_response(
             Ok(archive) => archive,
             Err(error) => {
                 yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(
-                    &request_id,
+                    &request_id, provider_attempt_id.as_deref(),
                     "failed",
                     json!({"code": "execution_archive_failed", "message": error.to_string()}),
                 )));
@@ -1038,7 +1044,7 @@ pub(crate) fn local_agent_provider_stream_response(
             Err(error) => {
                 let (packet, archive_failed) = archived_provider_event(
                     &mut archive,
-                    &request_id,
+                    &request_id, provider_attempt_id.as_deref(),
                     "failed",
                     json!({ "code": error.code, "message": error.safe_message() }),
                 );
@@ -1062,18 +1068,18 @@ pub(crate) fn local_agent_provider_stream_response(
             .and_then(|()| archive.bytes("request.body", &prepared.body))
         {
             yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(
-                &request_id,
+                &request_id, provider_attempt_id.as_deref(),
                 "failed",
                 json!({"code": "execution_archive_failed", "message": error.to_string()}),
             )));
             return;
         }
-        let request = match build_provider_request(&profile, &prepared) {
+        let request = match build_provider_request(&client, &profile, &prepared) {
             Ok(request) => request,
             Err(error) => {
                 let (packet, archive_failed) = archived_provider_event(
                     &mut archive,
-                    &request_id,
+                    &request_id, provider_attempt_id.as_deref(),
                     "failed",
                     json!({ "code": error.code, "message": error.safe_message() }),
                 );
@@ -1089,12 +1095,9 @@ pub(crate) fn local_agent_provider_stream_response(
             Err(error) => {
                 let (packet, archive_failed) = archived_provider_event(
                     &mut archive,
-                    &request_id,
+                    &request_id, provider_attempt_id.as_deref(),
                     "failed",
-                    json!({
-                        "code": "provider_transport_failed",
-                        "message": format!("Provider 连接失败：{error}"),
-                    }),
+                    crate::provider_transport::network_failure(error, "send", profile.api_key.as_deref()),
                 );
                 yield Ok::<Bytes, Infallible>(Bytes::from(packet));
                 if archive_failed {
@@ -1105,34 +1108,34 @@ pub(crate) fn local_agent_provider_stream_response(
         };
         if let Err(error) = archive.record("response.headers", json!({
                 "statusCode": response.status().as_u16(),
-                "url": response.url().as_str(),
+                "url": crate::provider_transport::safe_detail(response.url().as_str(), profile.api_key.as_deref()),
                 "contentType": response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
             })) {
-                yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(&request_id, "failed",
+                yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(&request_id, provider_attempt_id.as_deref(), "failed",
                     json!({"code": "execution_archive_failed", "message": error.to_string()}))));
                 return;
             }
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let message = match provider_http_error_message(&mut response, status, &mut archive).await {
+            let (message, body_error) = match provider_http_error_message(&mut response, status, &mut archive, profile.api_key.as_deref()).await {
                 Ok(message) => message,
                 Err(error) => {
                     yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(
-                        &request_id,
+                        &request_id, provider_attempt_id.as_deref(),
                         "failed",
-                        json!({"code": "execution_archive_failed", "message": error.to_string()}),
+                        crate::provider_transport::secondary_failure(
+                            json!({"code":"provider_http_failed", "message":format!("Provider 返回 HTTP {status}。")}),
+                            "execution_archive_failed", error.to_string()),
                     )));
                     return;
                 }
             };
             let (packet, archive_failed) = archived_provider_event(
                 &mut archive,
-                &request_id,
+                &request_id, provider_attempt_id.as_deref(),
                 "failed",
-                json!({
-                    "code": "provider_http_failed",
-                    "message": message,
-                }),
+                { let mut failure = json!({"code":"provider_http_failed", "message":crate::provider_transport::safe_detail(&message, profile.api_key.as_deref())});
+                  if let Some(error) = body_error { failure["diagnostics"] = error["diagnostics"].clone(); failure["diagnostics"]["retryable"] = json!(false); } failure },
             );
             yield Ok::<Bytes, Infallible>(Bytes::from(packet));
             if archive_failed {
@@ -1147,7 +1150,7 @@ pub(crate) fn local_agent_provider_stream_response(
                 Ok(Some(chunk)) => {
                     if let Err(error) = archive.bytes("response.chunk", &chunk) {
                         yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(
-                            &request_id,
+                            &request_id, provider_attempt_id.as_deref(),
                             "failed",
                             json!({"code": "execution_archive_failed", "message": error.to_string()}),
                         )));
@@ -1158,7 +1161,7 @@ pub(crate) fn local_agent_provider_stream_response(
                         Err(error) => {
                             let (packet, archive_failed) = archived_provider_event(
                                 &mut archive,
-                                &request_id,
+                                &request_id, provider_attempt_id.as_deref(),
                                 "failed",
                                 json!({ "code": error.code, "message": error.safe_message() }),
                             );
@@ -1175,7 +1178,7 @@ pub(crate) fn local_agent_provider_stream_response(
                     Err(error) => {
                         let (packet, archive_failed) = archived_provider_event(
                             &mut archive,
-                            &request_id,
+                            &request_id, provider_attempt_id.as_deref(),
                             "failed",
                             json!({ "code": error.code, "message": error.safe_message() }),
                         );
@@ -1189,12 +1192,9 @@ pub(crate) fn local_agent_provider_stream_response(
                 Err(error) => {
                     let (packet, archive_failed) = archived_provider_event(
                         &mut archive,
-                        &request_id,
+                        &request_id, provider_attempt_id.as_deref(),
                         "failed",
-                        json!({
-                            "code": "provider_stream_read_failed",
-                            "message": format!("读取 Provider 流失败：{error}"),
-                        }),
+                        crate::provider_transport::network_failure(error, "responseBody", profile.api_key.as_deref()),
                     );
                     yield Ok::<Bytes, Infallible>(Bytes::from(packet));
                     if archive_failed {
@@ -1209,7 +1209,7 @@ pub(crate) fn local_agent_provider_stream_response(
                     Err(error) => {
                         let (packet, archive_failed) = archived_provider_event(
                             &mut archive,
-                            &request_id,
+                            &request_id, provider_attempt_id.as_deref(),
                             "failed",
                             json!({ "code": error.code, "message": error.message }),
                         );
@@ -1230,7 +1230,7 @@ pub(crate) fn local_agent_provider_stream_response(
                                 .remove("type");
                             let (packet, archive_failed) = archived_provider_event(
                                 &mut archive,
-                                &request_id,
+                                &request_id, provider_attempt_id.as_deref(),
                                 "tool.call.delta",
                                 data,
                             );
@@ -1260,7 +1260,7 @@ pub(crate) fn local_agent_provider_stream_response(
                                 data["kind"] = json!("summary");
                             }
                             let (packet, archive_failed) =
-                                archived_provider_event(&mut archive, &request_id, provider_type, data);
+                                archived_provider_event(&mut archive, &request_id, provider_attempt_id.as_deref(), provider_type, data);
                             yield Ok::<Bytes, Infallible>(Bytes::from(packet));
                             if archive_failed {
                                 return;
@@ -1272,7 +1272,7 @@ pub(crate) fn local_agent_provider_stream_response(
                             else {
                                 let (packet, archive_failed) = archived_provider_event(
                                     &mut archive,
-                                    &request_id,
+                                    &request_id, provider_attempt_id.as_deref(),
                                     "failed",
                                     json!({
                                         "code": "provider_stream_emission_invalid",
@@ -1288,7 +1288,7 @@ pub(crate) fn local_agent_provider_stream_response(
                             let Some(item) = emission.event.get("item") else {
                                 let (packet, archive_failed) = archived_provider_event(
                                     &mut archive,
-                                    &request_id,
+                                    &request_id, provider_attempt_id.as_deref(),
                                     "failed",
                                     json!({
                                         "code": "provider_stream_emission_invalid",
@@ -1306,7 +1306,7 @@ pub(crate) fn local_agent_provider_stream_response(
                             {
                                 let (packet, archive_failed) = archived_provider_event(
                                     &mut archive,
-                                    &request_id,
+                                    &request_id, provider_attempt_id.as_deref(),
                                     "failed",
                                     json!({
                                         "code": "provider_hosted_search_unrequested",
@@ -1321,7 +1321,7 @@ pub(crate) fn local_agent_provider_stream_response(
                             }
                             let (packet, archive_failed) = archived_provider_event(
                                 &mut archive,
-                                &request_id,
+                                &request_id, provider_attempt_id.as_deref(),
                                 "output.item.completed",
                                 json!({
                                     "outputIndex": output_index,
@@ -1346,7 +1346,7 @@ pub(crate) fn local_agent_provider_stream_response(
             Err(error) => {
                 let (packet, archive_failed) = archived_provider_event(
                     &mut archive,
-                    &request_id,
+                    &request_id, provider_attempt_id.as_deref(),
                     "failed",
                     json!({ "code": error.code, "message": error.message }),
                 );
@@ -1360,7 +1360,7 @@ pub(crate) fn local_agent_provider_stream_response(
         if !prepared.hosted_web_search_enabled && !result.output.hosted_web_search_calls.is_empty() {
             let (packet, archive_failed) = archived_provider_event(
                 &mut archive,
-                &request_id,
+                &request_id, provider_attempt_id.as_deref(),
                 "failed",
                 json!({
                     "code": "provider_hosted_search_unrequested",
@@ -1403,7 +1403,7 @@ pub(crate) fn local_agent_provider_stream_response(
                 message["reasoningSignature"] = json!(signature);
             }
             let (packet, archive_failed) =
-                archived_provider_event(&mut archive, &request_id, "assistant.message", message);
+                archived_provider_event(&mut archive, &request_id, provider_attempt_id.as_deref(), "assistant.message", message);
             yield Ok::<Bytes, Infallible>(Bytes::from(packet));
             if archive_failed {
                 return;
@@ -1430,7 +1430,7 @@ pub(crate) fn local_agent_provider_stream_response(
             for call in result.output.tool_calls {
                 let (packet, archive_failed) = archived_provider_event(
                     &mut archive,
-                    &request_id,
+                    &request_id, provider_attempt_id.as_deref(),
                     "tool.call",
                     json!({
                         "callId": call.id,
@@ -1446,7 +1446,7 @@ pub(crate) fn local_agent_provider_stream_response(
             for item in result.output.hosted_web_search_calls {
                 let (packet, archive_failed) = archived_provider_event(
                     &mut archive,
-                    &request_id,
+                    &request_id, provider_attempt_id.as_deref(),
                     "hosted.web-search.completed",
                     json!({ "item": item }),
                 );
@@ -1457,7 +1457,7 @@ pub(crate) fn local_agent_provider_stream_response(
             }
         }
         let (packet, archive_failed) =
-            archived_provider_event(&mut archive, &request_id, "completed", completed_data);
+            archived_provider_event(&mut archive, &request_id, provider_attempt_id.as_deref(), "completed", completed_data);
         yield Ok::<Bytes, Infallible>(Bytes::from(packet));
         if archive_failed {
             return;
@@ -1470,6 +1470,7 @@ pub(crate) fn local_agent_provider_stream_response(
         .unwrap_or_else(|_| {
             Response::new(Body::from(provider_event(
                 &response_request_id,
+                response_attempt_id.as_deref(),
                 "failed",
                 json!({
                     "code": "provider_response_build_failed",
@@ -1484,9 +1485,18 @@ pub(crate) fn local_agent_provider_stream_response(
 fn archived_provider_event(
     archive: &mut deepcode_kernel_runtime::execution_archive::ExecutionArchive,
     request_id: &str,
+    provider_attempt_id: Option<&str>,
     event_type: &str,
-    data: Value,
+    mut data: Value,
 ) -> (String, bool) {
+    if event_type == "failed" {
+        if !data["diagnostics"].is_object() {
+            data["diagnostics"] = json!({"source":"providerTransport", "phase":"response", "category":"protocol", "retryable":false, "causes":[]});
+        }
+        if let Some(path) = archive.path() {
+            data["diagnostics"]["archivePath"] = json!(path.to_string_lossy());
+        }
+    }
     let written = archive
         .record("session.event", json!({"type": event_type, "data": &data}))
         .and_then(|()| {
@@ -1497,14 +1507,24 @@ fn archived_provider_event(
             }
         });
     match written {
-        Ok(()) => (provider_event(request_id, event_type, data), false),
+        Ok(()) => (
+            provider_event(request_id, provider_attempt_id, event_type, data),
+            false,
+        ),
         Err(error) => (
             provider_event(
                 request_id,
+                provider_attempt_id,
                 "failed",
-                json!({
-                    "code": "execution_archive_failed", "message": error.to_string(),
-                }),
+                if event_type == "failed" {
+                    crate::provider_transport::secondary_failure(
+                        data,
+                        "execution_archive_failed",
+                        error.to_string(),
+                    )
+                } else {
+                    json!({"code":"execution_archive_failed","message":error.to_string()})
+                },
             ),
             true,
         ),
@@ -1515,8 +1535,10 @@ async fn provider_http_error_message(
     response: &mut reqwest::Response,
     status: u16,
     archive: &mut deepcode_kernel_runtime::execution_archive::ExecutionArchive,
-) -> std::io::Result<String> {
+    secret: Option<&str>,
+) -> std::io::Result<(String, Option<Value>)> {
     let mut body = Vec::new();
+    let mut body_error = None;
     while body.len() < PROVIDER_ERROR_BODY_LIMIT {
         match response.chunk().await {
             Ok(Some(chunk)) => {
@@ -1524,7 +1546,15 @@ async fn provider_http_error_message(
                 let remaining = PROVIDER_ERROR_BODY_LIMIT - body.len();
                 body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
             }
-            Ok(None) | Err(_) => break,
+            Ok(None) => break,
+            Err(error) => {
+                body_error = Some(crate::provider_transport::network_failure(
+                    error,
+                    "errorBody",
+                    secret,
+                ));
+                break;
+            }
         }
     }
     archive.record(
@@ -1534,10 +1564,13 @@ async fn provider_http_error_message(
             "limitReached": body.len() == PROVIDER_ERROR_BODY_LIMIT,
         }),
     )?;
-    Ok(match provider_http_error_detail(&body) {
-        Some(detail) => format!("Provider 返回 HTTP {status}：{detail}"),
-        None => format!("Provider 返回 HTTP {status}。"),
-    })
+    Ok((
+        match provider_http_error_detail(&body) {
+            Some(detail) => format!("Provider 返回 HTTP {status}：{detail}"),
+            None => format!("Provider 返回 HTTP {status}。"),
+        },
+        body_error,
+    ))
 }
 
 fn provider_http_error_detail(body: &[u8]) -> Option<String> {
@@ -1559,16 +1592,22 @@ fn provider_http_error_detail(body: &[u8]) -> Option<String> {
     )
 }
 
-fn provider_event(request_id: &str, event_type: &str, data: Value) -> String {
-    sse_json_event(
-        "provider_event",
-        json!({
-            "schemaVersion": "deepcode.provider-event",
-            "requestId": request_id,
-            "type": event_type,
-            "data": data,
-        }),
-    )
+fn provider_event(
+    request_id: &str,
+    provider_attempt_id: Option<&str>,
+    event_type: &str,
+    data: Value,
+) -> String {
+    let mut event = json!({
+        "schemaVersion": "deepcode.provider-event",
+        "requestId": request_id,
+        "type": event_type,
+        "data": data,
+    });
+    if let Some(attempt) = provider_attempt_id {
+        event["providerAttemptId"] = json!(attempt);
+    }
+    sse_json_event("provider_event", event)
 }
 
 fn token_limit_u32(value: &Value) -> Option<u32> {
@@ -2081,6 +2120,10 @@ mod tests {
                 request[start..start + length].to_vec()
             });
             let response = local_agent_provider_stream_response(
+                crate::provider_transport::ProviderTransport::new()
+                    .unwrap()
+                    .client,
+                None,
                 profile,
                 json!({
                     "messages":[{"role":"user","content":"归档检查"}], "tools":[], "hostedTools":[], "requireToolCall":false,
@@ -2125,6 +2168,7 @@ mod tests {
                 .map(|line| {
                     provider_event(
                         "request:archive",
+                        None,
                         line["data"]["type"].as_str().unwrap(),
                         line["data"]["data"].clone(),
                     )

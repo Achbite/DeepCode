@@ -1,6 +1,7 @@
 import type { ArtifactProjection } from '@deepcode/protocol';
 import type { SourcePosition } from './resourceLinks';
 export type ReaderTarget = ({ kind: 'workspace'; workspaceId: string; logicalPath: string } & SourcePosition)
+  | { kind: 'file'; path: string }
   | { kind: 'artifact'; artifact: ArtifactProjection }
   | { kind: 'browser'; previewId?: string; url?: string; filePath?: string; selfPreview?: boolean };
 export const READER_OPEN_EVENT = 'deepcode:reader-open';

@@ -19,11 +19,11 @@ export function conversationDisplay(
     const ready = caughtUp && (message.runId !== current?.runId || (terminal && !projection?.assistantDraft));
     readiness.set(message.runId, ready && readiness.get(message.runId) !== false);
   }
-  const completedRuns = new Set([...readiness].filter(([, ready]) => ready).map(([runId]) => runId));
+  const displaySettledRunIds = new Set([...readiness].filter(([, ready]) => ready).map(([runId]) => runId));
   const artifacts = (projection?.artifacts ?? []).filter((artifact) => {
     if (artifact.runId === current?.runId && !terminal) return false;
-    if (readiness.has(artifact.runId)) return completedRuns.has(artifact.runId);
+    if (readiness.has(artifact.runId)) return displaySettledRunIds.has(artifact.runId);
     return artifact.runId !== current?.runId || current?.status !== 'completed';
   });
-  return { completedRuns, artifacts };
+  return { displaySettledRunIds, artifacts };
 }

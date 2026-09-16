@@ -23,13 +23,14 @@ import { conversationNavigation } from './conversationWindow';
 import { ConversationLayoutCache, ConversationVirtualizer } from './conversationVirtualizer';
 import { ConversationVirtualRow, useConversationRowState } from './ConversationVirtualRow';
 import { MessageActions } from './MessageActions';
+import { RunFailureDetails, ProviderRetryStatus } from './RunFailureDetails';
 import { ApprovalActivity } from './ApprovalActivity';
 
 interface ConversationTranscriptProps {
   language: UiLanguage;
   loading: boolean;
   showReasoning?: boolean;
-  completedRuns: Set<string>;
+  displaySettledRunIds: Set<string>;
   artifacts: SessionProjection['artifacts'];
   onDisplayed(identity: string, text: string): void;
   projection: SessionProjection | null;
@@ -48,7 +49,7 @@ interface ConversationTranscriptProps {
 export function ConversationTranscript({
   language,
   showReasoning = false,
-  completedRuns,
+  displaySettledRunIds,
   artifacts,
   onDisplayed,
   loading,
@@ -286,7 +287,9 @@ export function ConversationTranscript({
         />
       );
   const providerStatus = <>
-      {projection?.run && projection.run.status !== 'completed' && (
+      {projection?.run?.status === 'running' && projection.providerAttempts?.at(-1)?.phase === 'retryWaiting'
+        ? <ProviderRetryStatus projection={projection} language={language} />
+        : projection?.run && projection.run.status !== 'completed' && (
         <ProviderStageStatus run={projection.run} language={language}
           reasoning={showReasoning && assistantDraft ? { sessionId: projection.sessionId, requestId: assistantDraft.turnId } : undefined}
           key={`${projection.run.runId}:${assistantDraft?.turnId ?? 'idle'}`}
@@ -342,28 +345,23 @@ export function ConversationTranscript({
       )}
       {rounds.map((round) => {
         const current = projection?.run?.runId === round.runId;
-        const completed = completedRuns.has(round.runId);
+        const displaySettled = displaySettledRunIds.has(round.runId);
         const terminal = current && ['failed', 'cancelled', 'indeterminate'].includes(projection!.run!.status);
         const rows = round.rows.map((row) => ({
           key: row.key,
           process: row.item ? !['message', 'approval'].includes(row.item.type) : row.draft?.type !== 'text' || row.draft.block.kind === 'narrative',
           required: row.item?.type === 'plan' && samePlanReference(projection?.pendingPlan, row.item.value),
-          live: Boolean(row.draft) || (current && !completed && row.item?.type === 'message' && row.item.value.role === 'assistant'),
+          live: Boolean(row.draft) || (current && !displaySettled && row.item?.type === 'message' && row.item.value.role === 'assistant'),
           content: () => row.item ? renderItem(row.item) : renderDraft(row.draft!),
         }));
-        if (current && !completed) rows.push({ key: `${round.key}:provider-status`, process: true, required: false, live: true, content: () => providerStatus });
-        if (showReasoning && projection && completed) rows.push({ key: `${round.key}:reasoning-history`, process: true, required: false, live: false, content: () => <ReasoningHistory sessionId={projection.sessionId} runId={round.runId} /> });
-        return <ConversationRoundView language={language} key={`${projection?.sessionId}:${round.key}`} roundKey={round.key} virtualizer={virtualizer} eagerRows={eagerRows} completed={completed} followingLatest={viewport.followingLatest} rows={rows}>
+        if (current && !displaySettled) rows.push({ key: `${round.key}:provider-status`, process: true, required: false, live: true, content: () => providerStatus });
+        if (showReasoning && projection && displaySettled) rows.push({ key: `${round.key}:reasoning-history`, process: true, required: false, live: false, content: () => <ReasoningHistory sessionId={projection.sessionId} runId={round.runId} /> });
+        return <ConversationRoundView language={language} key={`${projection?.sessionId}:${round.key}`} roundKey={round.key} virtualizer={virtualizer} eagerRows={eagerRows} displaySettled={displaySettled} followingLatest={viewport.followingLatest} rows={rows}>
           <ArtifactLinks artifacts={artifacts.filter((artifact) => artifact.runId === round.runId)} onOpen={openWorkspaceResource} />
-          {(completed || terminal) && <FileChanges activities={roundChangeActivities(projection, round.runId)} />}
+          {(displaySettled || terminal) && <FileChanges activities={roundChangeActivities(projection, round.runId)} />}
         </ConversationRoundView>;
       })}
-      {projection?.terminalError && (
-        <article className="local-agent__terminal-error">
-          <strong>{projection.terminalError.code}</strong>
-          <span>{projection.terminalError.message}</span>
-        </article>
-      )}
+      {projection && <RunFailureDetails projection={projection} language={language} onError={setUiActionError} />}
       <div ref={messageEndRef} />
     </div>
     </>
@@ -377,21 +375,21 @@ function samePlanReference(
   return reference?.planId === plan.planId && reference.revision === plan.revision;
 }
 
-function ConversationRoundView({ language, roundKey, virtualizer, eagerRows, completed, followingLatest, rows, children }: {
+function ConversationRoundView({ language, roundKey, virtualizer, eagerRows, displaySettled, followingLatest, rows, children }: {
   language: UiLanguage; roundKey: string; virtualizer: ConversationVirtualizer; eagerRows: Set<string>;
-  completed: boolean; followingLatest: boolean;
+  displaySettled: boolean; followingLatest: boolean;
   rows: Array<{ key: string; process: boolean; required: boolean; live: boolean; content(): React.ReactNode }>;
   children: React.ReactNode;
 }) {
   const state = virtualizer.layout(`${roundKey}:disclosure`).state;
-  const [disclosure, updateDisclosure] = useState(() => (state.get('process') as { completed: boolean; open: boolean } | undefined) ?? { completed, open: false });
+  const [disclosure, updateDisclosure] = useState(() => (state.get('process') as { displaySettled: boolean; open: boolean } | undefined) ?? { displaySettled, open: false });
   const setDisclosure = (value: typeof disclosure) => { state.set('process', value); updateDisclosure(value); };
-  if (disclosure.completed !== completed) setDisclosure({ completed, open: completed && !followingLatest });
-  const expanded = !completed || disclosure.open;
+  if (disclosure.displaySettled !== displaySettled) setDisclosure({ displaySettled, open: displaySettled && !followingLatest });
+  const expanded = !displaySettled || disclosure.open;
   const firstProcess = rows.find((row) => row.process)?.key;
   return <section className="conversation-round">
     {rows.map((row) => <React.Fragment key={row.key}>
-      {completed && row.key === firstProcess && <button className="conversation-process-toggle" type="button" aria-expanded={expanded} onClick={() => setDisclosure({ completed, open: !expanded })}>
+      {displaySettled && row.key === firstProcess && <button className="conversation-process-toggle" type="button" aria-expanded={expanded} onClick={() => setDisclosure({ displaySettled, open: !expanded })}>
         <DeepCodeShellIcon name="tool" /><span>{t(language, expanded ? 'agent.process.expanded' : 'agent.process.open')}</span><DeepCodeShellIcon name="chevronDown" className="conversation-disclosure-chevron" />
       </button>}
       <ConversationVirtualRow rowKey={row.key} virtualizer={virtualizer} eager={eagerRows.has(row.key)} live={row.live || row.required}

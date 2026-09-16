@@ -9,3 +9,5 @@ export * from './llm.js';
 export * from './runtime.js';
 export * from './browser.js';
 export * from './localAgent.js';
+
+export { isErrorDiagnostics, isLocalAgentErrorValue } from './errorDiagnostics.js';

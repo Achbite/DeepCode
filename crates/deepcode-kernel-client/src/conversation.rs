@@ -34,6 +34,65 @@ pub struct CommandReply {
 pub struct ConversationError {
     pub code: String,
     pub message: String,
+    pub diagnostics: Option<ErrorDiagnostics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ErrorDiagnostics {
+    pub source: String,
+    pub phase: String,
+    pub category: String,
+    pub retryable: bool,
+    pub causes: Vec<DiagnosticCause>,
+    pub is_connect: Option<bool>,
+    pub is_timeout: Option<bool>,
+    pub is_body: Option<bool>,
+    pub stop_reason: Option<String>,
+    pub archive_path: Option<String>,
+    #[serde(default)]
+    pub secondary: Vec<DiagnosticSecondary>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiagnosticCause {
+    pub message: String,
+    pub kind: Option<String>,
+    pub os_code: Option<i64>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiagnosticSecondary {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderAttemptProjection {
+    pub provider_request_id: String,
+    pub provider_attempt_id: String,
+    pub attempt: u8,
+    pub purpose: String,
+    pub phase: String,
+    pub run_id: String,
+    pub updated_at: String,
+    pub error: Option<ConversationError>,
+    pub retry_at: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunFailureSnapshot {
+    pub revision: u64,
+    pub phase: String,
+    pub error: ConversationError,
+    pub provider_request_id: Option<String>,
+    pub provider_attempt_ids: Vec<String>,
+    pub last_message_id: Option<String>,
+    pub tool_record_ids: Vec<String>,
+    pub pending_call_ids: Vec<String>,
+    pub queued_message_ids: Vec<String>,
+    pub plan_ref: Option<PlanRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -124,6 +183,9 @@ pub struct SessionProjection {
     pub file_change_rounds: Vec<FileChangeRound>,
     pub artifacts: Vec<ArtifactProjection>,
     pub terminal_error: Option<ConversationError>,
+    #[serde(default)]
+    pub provider_attempts: Vec<ProviderAttemptProjection>,
+    pub failure_snapshot: Option<RunFailureSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -166,6 +228,19 @@ impl SessionProjection {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != SESSION_PROJECTION_VERSION || self.session_id.is_empty() {
             return Err("shared Session projection identity is invalid".to_string());
+        }
+        if self.provider_attempts.iter().any(|attempt| {
+            !(1..=5).contains(&attempt.attempt)
+                || !matches!(attempt.purpose.as_str(), "agent" | "contextCompaction")
+                || !matches!(
+                    attempt.phase.as_str(),
+                    "started" | "completed" | "failed" | "retryWaiting"
+                )
+                || matches!(attempt.phase.as_str(), "failed" | "retryWaiting")
+                    != attempt.error.is_some()
+                || (attempt.phase == "retryWaiting") != attempt.retry_at.is_some()
+        }) {
+            return Err("shared Provider attempt projection is invalid".into());
         }
         let mut workspace_ids = HashSet::new();
         if self.workspace_bindings.iter().any(|binding| {
@@ -2802,5 +2877,30 @@ impl FileChangeContent {
             line(' ', value);
         }
         output
+    }
+}
+
+#[cfg(test)]
+mod provider_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn optional_transport_details_preserve_old_errors_and_new_attempts() {
+        let old: ConversationError = serde_json::from_value(
+            serde_json::json!({"code":"provider_transport_failed","message":"Failed"}),
+        )
+        .unwrap();
+        assert!(old.diagnostics.is_none());
+        let attempt: ProviderAttemptProjection = serde_json::from_value(serde_json::json!({
+            "providerRequestId":"request:1", "providerAttemptId":"attempt:1", "attempt":1,
+            "purpose":"agent", "phase":"failed", "runId":"run:1", "updatedAt":"2026-09-16T00:00:00Z",
+            "error":{"code":"provider_transport_failed","message":"Failed", "diagnostics":{
+                "source":"providerTransport","phase":"send","category":"network","retryable":true,
+                "isConnect":true,"causes":[{"message":"Connection reset","osCode":104,"kind":"ConnectionReset"}]
+            }}
+        })).unwrap();
+        assert_eq!(
+            attempt.error.unwrap().diagnostics.unwrap().causes[0].os_code,
+            Some(104)
+        );
     }
 }

@@ -786,6 +786,8 @@ fn validate_new_event(
         "context.compaction.requested",
         "context.compacted",
         "context.composed",
+        "provider.attempt.updated",
+        "run.failure.recorded",
         "provider.turn.settled",
         "context.updated",
         "run.waiting",
@@ -888,6 +890,101 @@ fn validate_new_event(
         }
     }
     match event_type {
+        "provider.attempt.updated" => {
+            let payload = &event["payload"];
+            exact_object(
+                payload,
+                &[
+                    "providerRequestId",
+                    "providerAttemptId",
+                    "attempt",
+                    "purpose",
+                    "phase",
+                ],
+                &["error", "retryAt"],
+            )?;
+            for field in ["providerRequestId", "providerAttemptId"] {
+                validate_id(field, required_string(payload, field)?)?;
+            }
+            let phase = required_string(payload, "phase")?;
+            if !payload["attempt"]
+                .as_u64()
+                .is_some_and(|n| (1..=5).contains(&n))
+                || !matches!(
+                    payload["purpose"].as_str(),
+                    Some("agent" | "contextCompaction")
+                )
+                || !matches!(phase, "started" | "completed" | "failed" | "retryWaiting")
+                || matches!(phase, "failed" | "retryWaiting") != payload.get("error").is_some()
+                || (phase == "retryWaiting") != payload.get("retryAt").is_some()
+            {
+                return Err(LocalAgentStoreError::new(
+                    "provider_attempt_invalid",
+                    "Provider 尝试字段无效。",
+                ));
+            }
+            if let Some(error) = payload.get("error") {
+                validate_local_agent_error(error)?;
+            }
+            if payload.get("retryAt").is_some() {
+                required_string(payload, "retryAt")?
+                    .parse::<u64>()
+                    .map_err(|_| {
+                        LocalAgentStoreError::new("provider_retry_time_invalid", "重试时刻无效。")
+                    })?;
+            }
+        }
+        "run.failure.recorded" => {
+            let payload = &event["payload"];
+            exact_object(
+                payload,
+                &[
+                    "revision",
+                    "phase",
+                    "error",
+                    "providerAttemptIds",
+                    "toolRecordIds",
+                    "pendingCallIds",
+                    "queuedMessageIds",
+                    "planRef",
+                ],
+                &["providerRequestId", "lastMessageId"],
+            )?;
+            if !payload["revision"].is_u64() {
+                return Err(LocalAgentStoreError::new(
+                    "failure_snapshot_invalid",
+                    "失败快照 revision 无效。",
+                ));
+            }
+            required_string(payload, "phase")?;
+            validate_local_agent_error(&payload["error"])?;
+            for field in [
+                "providerAttemptIds",
+                "toolRecordIds",
+                "pendingCallIds",
+                "queuedMessageIds",
+            ] {
+                validate_unique_ids(payload, field)?;
+            }
+            for field in ["providerRequestId", "lastMessageId"] {
+                if payload.get(field).is_some() {
+                    validate_id(field, required_string(payload, field)?)?;
+                }
+            }
+            if !payload["planRef"].is_null() {
+                exact_object(&payload["planRef"], &["planId", "revision"], &[])?;
+                validate_id("planId", required_string(&payload["planRef"], "planId")?)?;
+                if !payload["planRef"]["revision"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0)
+                {
+                    return Err(LocalAgentStoreError::new(
+                        "failure_snapshot_invalid",
+                        "计划 revision 无效。",
+                    ));
+                }
+            }
+        }
         "tool.started" => {
             let payload = &event["payload"];
             exact_object(payload, &["attemptId", "startedAt"], &[])?;
@@ -905,7 +1002,7 @@ fn validate_new_event(
             let payload = &event["payload"];
             exact_object(payload, &["attemptId", "error"], &[])?;
             validate_id("attemptId", required_string(payload, "attemptId")?)?;
-            exact_object(&payload["error"], &["code", "message"], &[])?;
+            validate_local_agent_error(&payload["error"])?;
             required_string(&payload["error"], "code")?;
             required_string(&payload["error"], "message")?;
         }
@@ -1324,7 +1421,7 @@ fn validate_new_event(
                 ));
             }
             let error = payload.get("error").expect("validated error");
-            exact_object(error, &["code", "message"], &[])?;
+            validate_local_agent_error(error)?;
             required_string(error, "code")?;
             required_string(error, "message")?;
         }
@@ -1883,6 +1980,8 @@ fn validate_event_facts(
                 | "context.compaction.requested"
                 | "context.compacted"
                 | "context.composed"
+                | "provider.attempt.updated"
+                | "run.failure.recorded"
                 | "provider.turn.settled"
                 | "context.updated"
                 | "run.finishing"
@@ -2374,6 +2473,72 @@ fn validate_event_facts(
                 runtime[field] = value.clone();
             }
             validate_run_runtime_snapshot(&runtime)?;
+        }
+        "provider.attempt.updated" => {
+            let run_id = required_string(event, "runId")?;
+            let payload = &event["payload"];
+            let request_id = required_string(payload, "providerRequestId")?;
+            let composition: Option<String> = transaction.query_row(
+                "SELECT payload_json FROM session_events WHERE session_id=?1 AND run_id=?2 AND event_type='context.composed' AND json_extract(payload_json,'$.providerRequestId')=?3",
+                params![session_id,run_id,request_id], |row| row.get(0),
+            ).optional().map_err(sql_error("provider_attempt_fact_read_failed"))?;
+            let valid_composition = composition
+                .as_deref()
+                .map(|value| decode_json(value, "session_event_fact_corrupt"))
+                .transpose()?
+                .is_some_and(|value| value["purpose"] == payload["purpose"]);
+            let previous: Option<String> = transaction.query_row(
+                "SELECT payload_json FROM session_events WHERE session_id=?1 AND run_id=?2 AND event_type='provider.attempt.updated' AND json_extract(payload_json,'$.providerRequestId')=?3 ORDER BY sequence DESC LIMIT 1",
+                params![session_id,run_id,request_id], |row| row.get(0),
+            ).optional().map_err(sql_error("provider_attempt_fact_read_failed"))?;
+            let previous = previous
+                .as_deref()
+                .map(|value| decode_json(value, "session_event_fact_corrupt"))
+                .transpose()?;
+            let phase = required_string(payload, "phase")?;
+            let valid_transition = match previous {
+                None => phase == "started" && payload["attempt"] == 1,
+                Some(previous) if phase == "started" => {
+                    previous["phase"] == "retryWaiting"
+                        && previous["providerAttemptId"] != payload["providerAttemptId"]
+                        && previous["attempt"].as_u64().map(|n| n + 1)
+                            == payload["attempt"].as_u64()
+                }
+                Some(previous) => {
+                    previous["providerAttemptId"] == payload["providerAttemptId"]
+                        && previous["attempt"] == payload["attempt"]
+                        && if phase == "retryWaiting" {
+                            previous["phase"] == "failed"
+                        } else {
+                            previous["phase"] == "started"
+                                && matches!(phase, "completed" | "failed")
+                        }
+                }
+            };
+            if !valid_composition || !valid_transition {
+                return Err(LocalAgentStoreError::new(
+                    "provider_attempt_transition_invalid",
+                    "Provider 尝试必须属于同一逻辑请求并按顺序推进。",
+                ));
+            }
+        }
+        "run.failure.recorded" => {
+            let revision: i64 = transaction
+                .query_row(
+                    "SELECT MAX(sequence) FROM session_events WHERE session_id=?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error("session_event_fact_read_failed"))?;
+            if event["payload"]["revision"]
+                .as_u64()
+                .is_none_or(|value| value > revision as u64)
+            {
+                return Err(LocalAgentStoreError::new(
+                    "run_failure_revision_invalid",
+                    "失败快照引用了尚未提交的事件。",
+                ));
+            }
         }
         "context.composed" => {
             let run_id = required_string(event, "runId")?;
@@ -5288,7 +5453,16 @@ fn valid_tool_prompt_line(value: &str, max_length: usize) -> bool {
 }
 
 fn validate_local_agent_error(value: &Value) -> Result<(), LocalAgentStoreError> {
-    exact_object(value, &["code", "message"], &[])?;
+    exact_object(value, &["code", "message"], &["diagnostics"])?;
+    if value
+        .get("diagnostics")
+        .is_some_and(|value| !crate::provider_transport::valid_diagnostics(value))
+    {
+        return Err(LocalAgentStoreError::new(
+            "error_diagnostics_invalid",
+            "错误诊断字段无效。",
+        ));
+    }
     let code = required_string(value, "code")?;
     let message = required_string(value, "message")?;
     if code.trim() != code || message.trim().is_empty() || message.contains('\0') {

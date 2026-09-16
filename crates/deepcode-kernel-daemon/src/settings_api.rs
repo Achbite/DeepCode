@@ -349,7 +349,7 @@ pub(crate) async fn llm_probe(
             }))
         }
     };
-    match probe_llm_profile_stream(&profile).await {
+    match probe_llm_profile_stream(&state.local_agent.provider_transport.client, &profile).await {
         Ok(output) => ApiResponse::ok(json!({
             "ok": output.response_present,
             "provider": profile.kind,

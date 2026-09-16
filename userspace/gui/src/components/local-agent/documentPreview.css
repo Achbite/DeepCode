@@ -10,16 +10,13 @@
 .document-preview__markdown { padding: 24px clamp(18px, 4vw, 48px); overflow-wrap: anywhere; }
 .local-agent__resource-body .document-preview__source { min-width: 0; padding: 18px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .document-preview__markdown pre { min-width: 0; }
-.document-pdf { min-width: 0; }
-.document-pdf__viewport { overflow: auto; max-height: 62dvh; min-height: 300px; padding: 18px; background: var(--dc-surface, var(--bg-app)); }
-.document-pdf__page { position: relative; margin: 0 auto; background: var(--dc-document-paper); box-shadow: 0 2px 12px color-mix(in srgb, var(--dc-shadow-color) 13.33%, transparent); }
-.document-pdf__page canvas { display: block; }
-.document-pdf__text { position: absolute; inset: 0; overflow: clip; opacity: 1; line-height: 1; text-align: initial; text-size-adjust: none; forced-color-adjust: none; transform-origin: 0 0; caret-color: CanvasText; }
-.document-pdf__text :is(span, br) { position: absolute; color: transparent; white-space: pre; cursor: text; transform-origin: 0 0; }
-.document-pdf__text { --min-font-size: 1; --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size)); --min-font-size-inv: calc(1 / var(--min-font-size)); letter-spacing: normal; word-spacing: normal; }
-.document-pdf__text > :not(.markedContent), .document-pdf__text .markedContent span:not(.markedContent) { z-index: 1; --font-height: 0; --scale-x: 1; --rotate: 0deg; font-size: calc(var(--text-scale-factor) * var(--font-height)); transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv)); }
-.document-pdf__text .markedContent { display: contents; }
-.document-pdf__text ::selection { background: var(--dc-accent-border); }
+.document-pdf { display: flex; flex-direction: column; min-width: 0; min-height: 0; flex: 1; }
+.document-pdf__controls { flex: none; }
+.document-pdf__surface { position: relative; flex: 1; min-height: 300px; height: 62dvh; }
+.document-pdf__viewport { position: absolute; inset: 0; overflow: auto; overscroll-behavior: contain; background: var(--dc-surface, var(--bg-app)); }
+.document-pdf .pdfViewer { padding: 12px 0; --page-margin: 0 auto 12px; }
+.document-pdf .pdfViewer .page { box-shadow: 0 2px 8px color-mix(in srgb, var(--dc-shadow-color) 12%, transparent); }
+.document-pdf__viewport:focus-visible { outline: 2px solid var(--dc-focus-ring); outline-offset: -2px; }
 .local-agent__resource-dialog:has(.document-preview) { width: min(1100px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); }
 .local-agent__resource-body:has(> .document-preview) { padding: 0; }
 .document-artifacts { display: grid; gap: 8px; }
@@ -65,7 +62,7 @@
 .local-agent__reader .document-preview {height:100%;min-height:0;}
 .local-agent__reader .document-preview__html {flex:1;height:100%;min-height:0;}
 .local-agent__reader .document-pdf {display:flex;flex-direction:column;flex:1;min-height:0;}
-.local-agent__reader .document-pdf__viewport {flex:1;min-height:0;max-height:none;}
+.local-agent__reader .document-pdf__surface {min-height:0;height:auto;}
 .reader-start {width:min(480px,100%);margin:auto;padding:24px;font-size:var(--dc-font-body,14px);}
 .reader-start__entries {display:grid;gap:6px;}
 .local-agent .reader-start__entry {display:flex;align-items:center;gap:12px;min-height:44px;width:100%;padding:10px 12px;border:0;border-radius:var(--dc-radius-control,8px);background:transparent;color:var(--dc-foreground);text-align:left;font:inherit;cursor:pointer;}
@@ -126,3 +123,9 @@
 .document-preview__actions .reader-icon-button svg { width: 16px; height: 16px; }
 .document-preview__actions .reader-icon-button:is(:hover,[aria-pressed=true]) { color: var(--dc-accent); background: var(--dc-surface-hover); }
 .document-preview__actions .reader-icon-button:focus-visible { outline: 2px solid var(--dc-focus-ring); outline-offset: -2px; }
+
+.local-agent__reader .reader-source-body { display: flex; flex-direction: column; overflow: hidden; }
+.reader-source-editor { flex: 1; min-height: 0; min-width: 0; width: 100%; }
+.reader-source-body > small, .reader-source-body > button { flex: none; }
+.document-preview__actions .reader-wrap-button { min-height: 28px; padding: 4px 8px; border: 0; background: transparent; white-space: nowrap; }
+.document-preview__actions .reader-wrap-button[aria-pressed=true] { color: var(--dc-accent); background: var(--dc-surface-hover); }

@@ -1,3 +1,4 @@
+import { isLocalAgentErrorValue } from '@deepcode/protocol';
 import type {
   JsonObject,
   CommandJournalPort,
@@ -35,7 +36,7 @@ import {
   SESSION_CONTROL_PLAN_PROGRESS,
 } from '@deepcode/protocol';
 import { createProviderToolAliases } from './providerToolCodec.js';
-import { LoopFailure } from './loopFailure.js';
+import { LoopFailure, errorFact } from './loopFailure.js';
 import { postLocalStream } from './localHttpStream.js';
 import { sessionControlToolDefinitions } from './sessionControls.js';
 import { environmentInstruction } from './sessionEnvironment.js';
@@ -327,13 +328,19 @@ export class HttpProviderPort extends LocalAgentHttpPort implements ProviderPort
       }
       if (!(response.headers.get('content-type') ?? '').startsWith('text/event-stream')) {
         await response.body.cancel();
-        throw new Error('provider_content_type_invalid');
+        throw new LoopFailure('provider_content_type_invalid', 'Provider 本地流响应 Content-Type 无效。');
       }
-      yield* decodeProviderEvents(response.body, request.requestId, signal);
+      yield* decodeProviderEvents(response.body, request.requestId, signal, request.providerAttemptId);
     } catch (error) {
       if (signal.aborted) throw signal.reason ?? error;
       if (error instanceof LoopFailure) throw error;
-      throw new LoopFailure('provider_stream_failed', transportErrorMessage(error));
+      const fact = errorFact(error);
+      if (error instanceof AggregateError && error.errors[0] instanceof LoopFailure) throw new LoopFailure(fact.code, fact.message, fact.diagnostics);
+      throw new LoopFailure('provider_stream_failed', transportErrorMessage(error), {
+        source: 'sessionTransport', phase: 'localStream', category: 'transport', retryable: false,
+        causes: fact.diagnostics?.causes ?? [{ message: fact.message }],
+        ...(fact.diagnostics?.secondary ? { secondary: fact.diagnostics.secondary } : {}),
+      });
     }
   }
 }
@@ -618,11 +625,13 @@ async function* decodeProviderEvents(
   body: ReadableStream<Uint8Array>,
   requestId: string,
   signal: AbortSignal,
+  attemptId?: string,
 ): AsyncIterable<ProviderEvent> {
   const reader = body.getReader();
   const decoder = new TextDecoder('utf-8', { fatal: true });
   let buffer = '';
   let exhausted = false;
+  let primaryFailure: unknown;
   try {
     while (true) {
       if (signal.aborted) throw signal.reason ?? new Error('provider_cancelled');
@@ -630,7 +639,7 @@ async function* decodeProviderEvents(
       if (chunk.done) {
         exhausted = true;
         buffer += decoder.decode();
-        if (buffer.trim()) throw new Error('provider_sse_truncated');
+        if (buffer.trim()) throw new LoopFailure('provider_sse_truncated', 'Provider SSE 帧未完整结束。');
         return;
       }
       buffer += decoder.decode(chunk.value, { stream: true });
@@ -642,13 +651,19 @@ async function* decodeProviderEvents(
         buffer = buffer.slice(boundary + (match?.[0].length ?? 2));
         if (!frame.trim()) continue;
         const event = decodeProviderFrame(frame);
-        if (event.requestId !== requestId) throw new Error('provider_request_identity_mismatch');
+        if (event.requestId !== requestId) throw new LoopFailure('provider_request_identity_mismatch', 'Provider 请求身份不一致。');
+        if (attemptId && event.providerAttemptId !== attemptId && !(event.type === 'failed' && event.providerAttemptId === undefined)) throw new LoopFailure('provider_attempt_identity_mismatch', 'Provider 尝试身份不一致。');
         yield event;
       }
     }
-  } finally {
-    if (!exhausted) await reader.cancel().catch(() => undefined);
-    reader.releaseLock();
+  } catch (error) { primaryFailure = error; throw error; }
+  finally {
+    try { if (!exhausted) await reader.cancel(); }
+    catch (cleanupError) {
+      if (cleanupError === primaryFailure) throw primaryFailure;
+      if (primaryFailure !== undefined) throw new AggregateError([primaryFailure, cleanupError], errorFact(primaryFailure).message);
+      throw cleanupError;
+    } finally { reader.releaseLock(); }
   }
 }
 
@@ -658,16 +673,17 @@ function decodeProviderFrame(frame: string): ProviderEvent {
     .filter((line) => line.startsWith('data:'))
     .map((line) => line.slice(5).trimStart())
     .join('\n');
-  if (!data) throw new Error('provider_sse_data_missing');
-  const value = JSON.parse(data) as unknown;
-  if (!isExactRecord(value, ['schemaVersion', 'requestId', 'type', 'data'])) {
-    throw new Error('provider_event_invalid');
+  if (!data) throw new LoopFailure('provider_sse_data_missing', 'Provider SSE 帧缺少 data。');
+  let value: unknown;
+  try { value = JSON.parse(data); } catch { throw new LoopFailure('provider_event_json_invalid', 'Provider SSE data 不是有效的 JSON。'); }
+  if (!isExactRecord(value, ['schemaVersion', 'requestId', 'type', 'data'], ['providerAttemptId'])) {
+    throw new LoopFailure('provider_event_invalid', 'Provider 事件字段不符合协议。');
   }
   if (
     value.schemaVersion !== 'deepcode.provider-event'
     || !isNonEmptyText(value.requestId)
     || !isRecord(value.data)
-  ) throw new Error('provider_event_invalid');
+  ) throw new LoopFailure('provider_event_invalid', 'Provider 事件字段不符合协议。');
   switch (value.type) {
     case 'tool.call.delta': {
       const fields = ['callIndex', 'callId', 'name', 'argumentsDelta'];
@@ -677,7 +693,7 @@ function decodeProviderFrame(frame: string): ProviderEvent {
         || !isNonEmptyText(value.data.callId) || !isNonEmptyText(value.data.name)
         || typeof value.data.argumentsDelta !== 'string'
         || value.data.outputIndex !== undefined && (!Number.isSafeInteger(value.data.outputIndex) || Number(value.data.outputIndex) < 0)) {
-        throw new Error('provider_event_invalid');
+        throw new LoopFailure('provider_event_invalid', 'Provider 事件字段不符合协议。');
       }
       break;
     }
@@ -687,7 +703,7 @@ function decodeProviderFrame(frame: string): ProviderEvent {
         const fields = ['text'];
         if (Object.hasOwn(value.data, 'outputIndex')) fields.push('outputIndex');
         if (value.type === 'reasoning.delta' && Object.hasOwn(value.data, 'kind')) {
-          if (!['text', 'summary'].includes(String(value.data.kind))) throw new Error('provider_event_invalid');
+          if (!['text', 'summary'].includes(String(value.data.kind))) throw new LoopFailure('provider_event_invalid', 'Provider 事件字段不符合协议。');
           fields.push('kind');
         }
         if (
@@ -696,7 +712,7 @@ function decodeProviderFrame(frame: string): ProviderEvent {
           || value.data.outputIndex !== undefined
             && (!Number.isSafeInteger(value.data.outputIndex) || Number(value.data.outputIndex) < 0)
         ) {
-          throw new Error('provider_event_invalid');
+          throw new LoopFailure('provider_event_invalid', 'Provider 事件字段不符合协议。');
         }
       }
       break;
@@ -708,7 +724,7 @@ function decodeProviderFrame(frame: string): ProviderEvent {
         || !isRecord(value.data.item)
         || !['message', 'reasoning', 'function_call', 'web_search_call']
           .includes(String(value.data.item.type))
-      ) throw new Error('provider_event_invalid');
+      ) throw new LoopFailure('provider_event_invalid', 'Provider 事件字段不符合协议。');
       break;
     case 'assistant.message':
       {
@@ -725,7 +741,7 @@ function decodeProviderFrame(frame: string): ProviderEvent {
           && !isNonEmptyText(value.data.reasoningSignature)
         || value.data.reasoningSignature !== undefined
           && value.data.reasoningContent === undefined
-      ) throw new Error('provider_event_invalid');
+      ) throw new LoopFailure('provider_event_invalid', 'Provider 事件字段不符合协议。');
       break;
       }
     case 'tool.call':
@@ -734,7 +750,7 @@ function decodeProviderFrame(frame: string): ProviderEvent {
           || isExactRecord(value.data, ['callId', 'name', 'arguments']) && typeof value.data.arguments === 'string')
         || !isNonEmptyText(value.data.callId)
         || !isNonEmptyText(value.data.name)
-      ) throw new Error('provider_event_invalid');
+      ) throw new LoopFailure('provider_event_invalid', 'Provider 事件字段不符合协议。');
       break;
     case 'hosted.web-search.completed':
       if (
@@ -745,19 +761,19 @@ function decodeProviderFrame(frame: string): ProviderEvent {
         || value.data.item.status !== 'completed'
           && value.data.item.status !== 'failed'
         || !isRecord(value.data.item.action)
-      ) throw new Error('provider_event_invalid');
+      ) throw new LoopFailure('provider_event_invalid', 'Provider 事件字段不符合协议。');
       break;
     case 'completed':
       break;
     case 'failed':
       if (
-        !isExactRecord(value.data, ['code', 'message'])
+        !isLocalAgentErrorValue(value.data)
         || !isNonEmptyText(value.data.code)
         || !isNonEmptyText(value.data.message)
-      ) throw new Error('provider_event_invalid');
+      ) throw new LoopFailure('provider_event_invalid', 'Provider 事件字段不符合协议。');
       break;
     default:
-      throw new Error('provider_event_invalid');
+      throw new LoopFailure('provider_event_invalid', 'Provider 事件字段不符合协议。');
   }
   return value as unknown as ProviderEvent;
 }

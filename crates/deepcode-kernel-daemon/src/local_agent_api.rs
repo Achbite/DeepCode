@@ -20,6 +20,7 @@ pub(crate) struct LocalAgentRuntime {
     pub(crate) journal: LocalAgentJournal,
     pub(crate) kernel: LocalAgentKernel,
     provider_runtimes: ProviderRuntimeRegistry,
+    pub(crate) provider_transport: crate::provider_transport::ProviderTransport,
     runtime_transition: Arc<Mutex<()>>,
     prepared_runs: Arc<Mutex<HashMap<PreparedRunKey, Vec<PreparedRunRecord>>>>,
     active_runtime_settings: Arc<Mutex<Value>>,
@@ -50,6 +51,8 @@ impl LocalAgentRuntime {
             journal,
             kernel,
             provider_runtimes: ProviderRuntimeRegistry::default(),
+            provider_transport: crate::provider_transport::ProviderTransport::new()
+                .map_err(|error| format!("provider_client_init_failed: {error}"))?,
             runtime_transition: Arc::new(Mutex::new(())),
             prepared_runs: Arc::new(Mutex::new(HashMap::new())),
             active_runtime_settings: Arc::new(Mutex::new(settings.clone())),
@@ -625,6 +628,8 @@ impl From<LocalAgentKernelError> for RunPreparationError {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LocalProviderRequest {
+    provider_attempt_id: Option<String>,
+    attempt: Option<u8>,
     protocol_version: String,
     request_id: String,
     session_id: String,
@@ -1087,7 +1092,16 @@ pub(crate) async fn local_agent_provider_stream(
             "provider-{}",
             crate::local_agent_kernel::output_directory_key(&request_id)
         ));
+    let archive_directory = if let Some(attempt) = &body.provider_attempt_id {
+        archive_directory.join(format!(
+            "attempt-{}",
+            crate::local_agent_kernel::output_directory_key(attempt)
+        ))
+    } else {
+        archive_directory
+    };
     let archive_identity = json!({
+        "providerAttemptId": body.provider_attempt_id, "attempt": body.attempt,
         "sessionId": body.session_id,
         "runId": body.run_id,
         "requestId": request_id,
@@ -1095,6 +1109,8 @@ pub(crate) async fn local_agent_provider_stream(
         "profileId": body.profile_id,
     });
     local_agent_provider_stream_response(
+        state.local_agent.provider_transport.client.clone(),
+        body.provider_attempt_id,
         runtime.profile(),
         request_envelope,
         request_id,
@@ -1119,6 +1135,16 @@ fn valid_provider_tool_name(value: &str) -> bool {
 }
 
 fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), String> {
+    if body.provider_attempt_id.is_some() != body.attempt.is_some()
+        || body
+            .provider_attempt_id
+            .as_deref()
+            .is_some_and(|id| !valid_provider_text(id))
+        || body.attempt.is_some_and(|n| !(1..=5).contains(&n))
+    {
+        return Err("Provider 尝试身份或序号无效。".into());
+    }
+
     for (name, value) in [
         ("requestId", body.request_id.as_str()),
         ("sessionId", body.session_id.as_str()),

@@ -13,7 +13,7 @@ import type {
 import { SessionActor } from './actor.js';
 import type { AgentComposition } from './plugins.js';
 import { decodeConversationReadQuery, readConversation, readSessionEvents } from './conversationRead.js';
-import { emptySessionState, recoverSession, reduceSession, type SessionState } from './reducer.js';
+import { emptySessionState, projectSession, recoverSession, reduceSession, type SessionState } from './reducer.js';
 
 export interface SessionCompositionFactory {
   create(input: {
@@ -79,7 +79,11 @@ export class SessionService implements ConversationPort {
   }
 
   async snapshot(sessionId: string): Promise<SessionProjection> {
-    return await (await this.actor(sessionId)).snapshot();
+    const live = this.#actors.get(sessionId);
+    if (live) return (await live).snapshot();
+    const events = await readSessionEvents(this.journal, sessionId);
+    if (!events.length) throw new Error('session_not_found');
+    return projectSession(recoverSession(sessionId, events));
   }
 
   async activity(): Promise<{ active: boolean }> {

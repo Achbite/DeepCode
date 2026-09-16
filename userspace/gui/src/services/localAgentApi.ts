@@ -1,3 +1,4 @@
+import { isLocalAgentErrorValue } from '@deepcode/protocol';
 import type {
   AssistantDraftBlockProjection,
   CommandReply,
@@ -429,7 +430,9 @@ function decodeProjection(value: unknown): SessionProjection {
       'activities',
       'artifacts',
       'terminalError',
-    ], ['fileChangeRounds'])
+    ], ['fileChangeRounds', 'providerAttempts', 'failureSnapshot'])
+    || (value.providerAttempts !== undefined && !isArrayOf(value.providerAttempts, isProviderAttempt))
+    || (value.failureSnapshot !== undefined && !isFailureSnapshot(value.failureSnapshot))
     || (value.fileChangeRounds !== undefined && !isArrayOf(value.fileChangeRounds, (round) => isRecord(round) && isIdentifier(round.runId) && isArrayOf(round.recordIds, isIdentifier)))
     || value.schemaVersion !== SESSION_PROJECTION_VERSION
     || !isIdentifier(value.sessionId)
@@ -1471,9 +1474,7 @@ function isArtifact(value: unknown): boolean {
 }
 
 function isLocalAgentError(value: unknown): boolean {
-  return isExactRecord(value, ['code', 'message'])
-    && isIdentifier(value.code)
-    && isNonEmptyText(value.message);
+  return isLocalAgentErrorValue(value);
 }
 
 function isNullable(value: unknown, predicate: (candidate: unknown) => boolean): boolean {
@@ -1540,4 +1541,23 @@ export async function readFileChange(sessionId: string, recordId: string, index:
     || ![value.before, value.after].every((side) => side === null || typeof side === 'string')
     || (value.before === null && value.after === null)) throw new Error('file_change_response_invalid');
   return value as { before: string | null; after: string | null; path: string; workspaceId: string };
+}
+
+function isProviderAttempt(value: unknown): boolean {
+  return isExactRecord(value, ['providerRequestId', 'providerAttemptId', 'attempt', 'purpose', 'phase', 'runId', 'updatedAt'], ['error', 'retryAt'])
+    && ['providerRequestId', 'providerAttemptId', 'runId'].every((key) => isIdentifier(value[key]))
+    && Number.isInteger(value.attempt) && Number(value.attempt) >= 1 && Number(value.attempt) <= 5
+    && ['agent', 'contextCompaction'].includes(String(value.purpose))
+    && ['started', 'completed', 'failed', 'retryWaiting'].includes(String(value.phase))
+    && isNonEmptyText(value.updatedAt)
+    && (['failed', 'retryWaiting'].includes(String(value.phase)) ? isLocalAgentError(value.error) : value.error === undefined)
+    && (value.phase === 'retryWaiting' ? isNonEmptyText(value.retryAt) && Number.isFinite(Number(value.retryAt)) : value.retryAt === undefined);
+}
+
+function isFailureSnapshot(value: unknown): boolean {
+  return isExactRecord(value, ['revision', 'phase', 'error', 'providerAttemptIds', 'toolRecordIds', 'pendingCallIds', 'queuedMessageIds', 'planRef'], ['providerRequestId', 'lastMessageId'])
+    && isNaturalNumber(value.revision) && isNonEmptyText(value.phase) && isLocalAgentError(value.error)
+    && ['providerAttemptIds', 'toolRecordIds', 'pendingCallIds', 'queuedMessageIds'].every((key) => isArrayOf(value[key], isIdentifier))
+    && ['providerRequestId', 'lastMessageId'].every((key) => value[key] === undefined || isIdentifier(value[key]))
+    && isNullable(value.planRef, isPlanReference);
 }

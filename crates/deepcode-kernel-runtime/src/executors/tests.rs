@@ -743,3 +743,41 @@ fn fs_edit_rejections_name_the_failing_edit_index_and_shape() {
     assert!(message.contains("edits[0]"), "{message}");
     assert_eq!(details["editIndex"], 0);
 }
+
+#[test]
+fn fs_read_distinguishes_missing_metadata_from_a_directory() {
+    let workspace = TempWorkspace::new("read-failure-facts");
+    fs::create_dir(workspace.0.join("directory")).unwrap();
+    let tool_registry = KernelToolRegistry::default();
+    let registry = KernelExecutorRegistry::from_executors(builtin_executors(
+        &tool_registry,
+        KernelExecutorConfig::default(),
+        Arc::new(EmptySecretProvider),
+    ));
+    for (path, expected) in [
+        ("missing", "fs_read_metadata_failed"),
+        ("directory", "fs_read_not_file"),
+    ] {
+        let error = registry
+            .invoke(
+                "fs.read",
+                KernelToolInvocation {
+                    id: format!("invocation:{path}"),
+                    tool_id: "fs.read".into(),
+                    input: serde_json::json!({"path":path}),
+                },
+                context_with_target(&workspace.0, path),
+            )
+            .unwrap_err();
+        match error {
+            KernelError::Structured { code, details, .. } => {
+                assert_eq!(code, expected);
+                if path == "missing" {
+                    assert_eq!(details["ioKind"], "NotFound");
+                    assert!(details["osCode"].is_number());
+                }
+            }
+            error => panic!("unexpected read error: {error}"),
+        }
+    }
+}

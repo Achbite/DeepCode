@@ -1510,7 +1510,7 @@ test('continuous conversation keeps every message anchor while mounting nearby c
   t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
   const { ConversationTranscript } = await loadGuiModule(t, '/src/components/local-agent/ConversationTranscript.tsx');
   const props = {
-    language: 'zh-CN', loading: false, completedRuns: new Set(), artifacts: [], onDisplayed() {},
+    language: 'zh-CN', loading: false, displaySettledRunIds: new Set(), artifacts: [], onDisplayed() {},
     projection: { sessionId: 'session:long', run: null, plans: [], activities: [], fileChangeRounds: [], artifacts:[] },
     hasConversationContent: true, draftItems: [],
     conversationItems: rows.map((row, index) => ({ ...row.item, sequence: index, streamId: `stream:${index}`, value: { ...row.item.value, messageId: row.key, runId: 'run:long' } })),
@@ -3022,4 +3022,30 @@ test('theme library and UI fonts persist without changing active colors or appea
   assert.equal(reloaded.getState().effectiveSettings[fonts.UI_FONT_FAMILY_SETTING], 'system');
   assert.equal(reloaded.getState().effectiveSettings[fonts.UI_FONT_SIZE_SETTING], 14);
   assert.deepEqual(library.decodeThemeLibrary(reloaded.getState().effectiveSettings[library.THEME_LIBRARY_SETTING]), saved);
+});
+
+test('GUI consumes diagnostic attempts and failure snapshots while rejecting malformed facts', async (t) => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:gui-diagnostic';
+  await createSession(journal, sessionId);
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    yield providerEvent(request.requestId, 'failed', { code: 'provider_http_failed', message: 'HTTP 401', diagnostics: {
+      source: 'providerTransport', phase: 'response', category: 'http', retryable: false,
+      causes: [{ message: 'Authentication rejected' }], archivePath: '/test/attempt/timeline.jsonl',
+    } });
+  } }, emptyKernel(), fakeRunPreparation().port, 'gui-diag');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:diag', 'Test failure.'));
+  const projection = await waitForProjection(actor, (value) => value.run?.status === 'failed');
+  assert.equal(projection.providerAttempts.length, 1);
+  assert.equal(projection.failureSnapshot.error.diagnostics.retryable, false);
+  assert.deepEqual(await decodeGuiProjection(projection), projection);
+  for (const mutate of [
+    (p) => { p.providerAttempts[0].attempt = 6; },
+    (p) => { p.terminalError.diagnostics.retryable = 'yes'; },
+    (p) => { p.failureSnapshot.error.diagnostics.causes[0].osCode = 'unknown'; },
+    (p) => { p.failureSnapshot.revision = -1; },
+  ]) {
+    const malformed = structuredClone(projection); mutate(malformed);
+    await assert.rejects(decodeGuiProjection(malformed), /conversation_projection_invalid/);
+  }
 });

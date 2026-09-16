@@ -31,10 +31,12 @@ import './documentPreview.css';
 const DocumentPreview = lazy(() =>
   loadInterfaceModule(() => import('./DocumentPreview').then((module) => ({ default: module.DocumentPreview }))),
 );
+const SourceFileView = lazy(() => loadInterfaceModule(() => import('./SourceFileView')));
 type ReaderTab = { id: string; target: ReaderTarget; page?: NativePage };
 type DocumentState =
   | { status: 'loading' }
   | { status: 'document'; blob: Blob; format: DocumentFormat | 'image' }
+  | { status: 'source'; content: string }
   | { status: 'text'; result: ConversationResourceReadResult }
   | { status: 'error'; error: string };
 export function readerFilename(path: string): string {
@@ -56,6 +58,7 @@ export function readerPageName(url: string): string {
   }
 }
 function targetKey(target: ReaderTarget): string {
+  if (target.kind === 'file') return 'file:' + target.path;
   if (target.kind === 'workspace')
     return 'workspace:' + target.workspaceId + ':' + target.logicalPath;
   if (target.kind === 'artifact') return 'artifact:' + target.artifact.artifactId;
@@ -69,6 +72,7 @@ function targetKey(target: ReaderTarget): string {
 }
 function tabName(tab: ReaderTab, language: UiLanguage): string {
   if (tab.page) return readerPageName(tab.page.url);
+  if (tab.target.kind === 'file') return readerFilename(tab.target.path);
   if (tab.target.kind === 'workspace') return readerFilename(tab.target.logicalPath);
   if (tab.target.kind === 'artifact') return readerFilename(tab.target.artifact.label);
   return tab.target.selfPreview
@@ -433,7 +437,7 @@ function ReaderStart({
   const [url, setUrl] = useState(''),
     [pages, setPages] = useState<NativePage[]>([]),
     [error, setError] = useState<string | null>(null),
-    [choosing, setChoosing] = useState(false);
+    [choosing, setChoosing] = useState<'file' | 'browser' | null>(null);
   useEffect(() => {
     let active = true;
     void (async () => {
@@ -456,9 +460,9 @@ function ReaderStart({
       {hasNativeBrowser() ? (
         <>
           <div className="reader-start__entries">
-            <button type="button" className="reader-start__entry" onClick={() => setChoosing(true)}>
+            <button type="button" className="reader-start__entry" onClick={() => setChoosing('file')}>
               <DeepCodeShellIcon name="folder" />
-              <span>{t(language, 'reader.start.files')}</span>
+              <span>{language === 'zh-CN' ? '打开文件' : 'Open file'}</span>
               <DeepCodeShellIcon name="chevronRight" />
             </button>
             <button
@@ -474,6 +478,9 @@ function ReaderStart({
               <DeepCodeShellIcon name={enteringAddress ? 'chevronDown' : 'chevronRight'} />
             </button>
           </div>
+          {enteringAddress && <button type="button" className="settings-button" onClick={() => setChoosing('browser')}>
+            {language === 'zh-CN' ? '在浏览器中打开本地 HTML' : 'Open local HTML in browser'}
+          </button>}
           {enteringAddress && (
             <form
               id={addressId}
@@ -523,7 +530,7 @@ function ReaderStart({
         </>
       ) : (
         <p>
-          {t(language, 'reader.start.fileHint')}
+          {language === 'zh-CN' ? '文件按原始内容阅读；网页和本地 HTML 可在浏览器中运行。' : 'Read original file contents, or run a web page or local HTML in the browser.'}
         </p>
       )}
       {error && (
@@ -534,13 +541,14 @@ function ReaderStart({
       {choosing && (
         <ProjectFolderDialog
           language={language}
-          selectionMode="path"
-          filters={[{ name: 'HTML', extensions: ['html', 'htm'] }]}
-          title={t(language, 'reader.start.chooseFile')}
-          onCancel={() => setChoosing(false)}
-          onSelect={(path) => {
-            setChoosing(false);
-            openTarget({ kind: 'browser', filePath: path });
+          selectionMode="file"
+          filters={choosing === 'browser' ? [{ name: 'HTML', extensions: ['html', 'htm'] }] : undefined}
+          title={language === 'zh-CN' ? (choosing === 'browser' ? '选择要运行的 HTML' : '打开文件') : 'Open file'}
+          onCancel={() => setChoosing(null)}
+          onSelect={(path, kind) => {
+            if (kind !== 'file') { setError(language === 'zh-CN' ? '请选择文件。' : 'Select a file.'); setChoosing(null); return; }
+            setChoosing(null);
+            openTarget(choosing === 'browser' ? { kind: 'browser', filePath: path } : { kind: 'file', path });
           }}
         />
       )}
@@ -567,10 +575,12 @@ function ReaderDocument({
   const [location, setLocation] = useState<string | null>(null),
     [locationError, setLocationError] = useState<string | null>(null);
   const scroll = useRef<HTMLDivElement>(null);
-  const path = target.kind === 'workspace' ? target.logicalPath : target.artifact.label,
+  const path = target.kind === 'workspace' ? target.logicalPath : target.kind === 'file' ? target.path : target.artifact.label,
     key = sessionId + ':' + targetKey(target) + (target.kind === 'workspace' && target.line ? `:${target.line}:${target.column ?? 1}` : '');
   const sourceLine = target.kind === 'workspace' ? target.line : undefined;
   const sourceColumn = target.kind === 'workspace' ? target.column : undefined;
+  const [wrap, setWrap] = useState(() => readViewState(key + ':wrap', true));
+  useEffect(() => setWrap(readViewState(key + ':wrap', true)), [key]);
   const columnOffset = state.status === 'text' && sourceLine && sourceColumn && startByte === undefined
     ? Math.min(sourceColumn - 1, state.result.content.split('\n', 1)[0].length)
     : undefined;
@@ -579,6 +589,19 @@ function ReaderDocument({
     const controller = new AbortController();
     setState({ status: 'loading' });
     void (async () => {
+      if (target.kind === 'file') {
+        if (!host.readLocalFile) throw new Error('Local file reading requires the desktop Host.');
+        const blob = await host.readLocalFile(target.path);
+        if (/\.pdf$/i.test(path)) {
+          const header = await blob.slice(0, 5).text();
+          if (header !== '%PDF-') throw new Error('当前文件不是 PDF 文档。');
+          if (!controller.signal.aborted) setState({ status: 'document', blob, format: 'pdf' });
+        } else {
+          const content = await readLiteralText(blob);
+          if (!controller.signal.aborted) setState({ status: 'source', content });
+        }
+        return;
+      }
       if (target.kind === 'artifact') {
         const a = target.artifact,
           blob = await readConversationArtifact(sessionId, a.artifactId, controller.signal);
@@ -591,6 +614,11 @@ function ReaderDocument({
               : a.contentType === 'text/markdown'
                 ? 'markdown'
                 : null;
+        if (format === 'markdown' || format === 'html' || a.contentType.startsWith('text/') || a.contentType === 'application/json') {
+          const content = await readLiteralText(blob);
+          if (!controller.signal.aborted) setState({ status: 'source', content });
+          return;
+        }
         if (!format) throw new Error('Unsupported artifact media type: ' + a.contentType);
         if (!controller.signal.aborted) setState({ status: 'document', blob, format });
         return;
@@ -604,7 +632,7 @@ function ReaderDocument({
           controller.signal,
         );
         if (!controller.signal.aborted) setState({ status: 'document', blob, format: 'image' });
-      } else if (format) {
+      } else if (format === 'pdf') {
         const blob = await host.readDocument(
           sessionId,
           target.workspaceId,
@@ -632,11 +660,17 @@ function ReaderDocument({
     if (scroll.current) scroll.current.scrollTop = sourceLine ? 0 : readViewState(key + ':scroll', 0);
   }, [key, state.status, sourceLine]);
   const resolve = async () => {
+    if (target.kind === 'file') return target.path;
     if (target.kind !== 'workspace')
       return target.artifact.logicalPath ?? target.artifact.uri ?? target.artifact.artifactId;
     return resolveConversationResourcePath(sessionId, target.workspaceId, path);
   };
   const actions = <>
+        {(state.status === 'source' || state.status === 'text') && <button
+          className="reader-wrap-button" type="button" aria-pressed={wrap}
+          onClick={() => { const next = !wrap; setWrap(next); saveViewState(key + ':wrap', next); }}
+          title={chinese ? '按面板宽度折行，保留原文与行号' : 'Wrap to panel width without changing the source'}
+        >{chinese ? '自动换行' : 'Word wrap'}</button>}
         <details
           className="reader-location"
           data-native-overlay
@@ -667,7 +701,7 @@ function ReaderDocument({
             )}
           </div>
         </details>
-        {target.kind === 'workspace' && hasNativeBrowser() && /\.html?$/i.test(path) && (
+        {target.kind !== 'artifact' && hasNativeBrowser() && /\.html?$/i.test(path) && (
           <button
             className="settings-button"
             onClick={() =>
@@ -676,7 +710,7 @@ function ReaderDocument({
                 .catch((reason) => setLocationError(String(reason)))
             }
           >
-            {chinese ? '运行页面' : 'Run page'}
+            {chinese ? '在浏览器中打开' : 'Open in browser'}
           </button>
         )}
         <button
@@ -702,7 +736,7 @@ function ReaderDocument({
       )}
       <div
         ref={scroll}
-        className="local-agent__resource-body"
+        className={`local-agent__resource-body${state.status === 'source' || state.status === 'text' ? ' reader-source-body' : ''}`}
         onScroll={() => {
           if (scroll.current) saveViewState(key + ':scroll', scroll.current.scrollTop);
         }}
@@ -713,6 +747,10 @@ function ReaderDocument({
           <p role="alert" className="local-agent__resource-error">
             {state.error}
           </p>
+        ) : state.status === 'source' ? (
+          <InterfaceLoadBoundary><Suspense fallback={<p>{t(language, 'agent.resource.reading')}</p>}>
+            <SourceFileView viewKey={key} content={state.content} filename={path} wrap={wrap} />
+          </Suspense></InterfaceLoadBoundary>
         ) : state.status === 'document' ? (
           <InterfaceLoadBoundary><Suspense fallback={<p>{t(language, 'agent.resource.reading')}</p>}>
             <DocumentPreview
@@ -727,9 +765,9 @@ function ReaderDocument({
         ) : (
           <>
             {sourceLine && <small>{chinese ? '起始行' : 'Starting line'} {state.result.startLine}{target.kind === 'workspace' && target.column ? ` · ${chinese ? '列' : 'column'} ${target.column}` : ''}</small>}
-            <pre>{columnOffset !== undefined
-              ? <>{state.result.content.slice(0, columnOffset)}<mark>{state.result.content.slice(columnOffset, columnOffset + 1)}</mark>{state.result.content.slice(columnOffset + 1)}</>
-              : state.result.content}</pre>
+            <InterfaceLoadBoundary><Suspense fallback={<p>{t(language, 'agent.resource.reading')}</p>}>
+              <SourceFileView viewKey={key} content={state.result.content} filename={path} startLine={state.result.startLine} column={columnOffset === undefined ? 1 : columnOffset + 1} wrap={wrap} />
+            </Suspense></InterfaceLoadBoundary>
             {state.result.truncated && (
               <small>{chinese ? '当前为部分内容。' : 'Partial content.'}</small>
             )}
@@ -746,4 +784,12 @@ function ReaderDocument({
       </div>
     </>
   );
+}
+
+async function readLiteralText(blob: Blob): Promise<string> {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const encoding = bytes[0] === 0xff && bytes[1] === 0xfe ? 'utf-16le' : bytes[0] === 0xfe && bytes[1] === 0xff ? 'utf-16be' : 'utf-8';
+  const content = new TextDecoder(encoding, { fatal: true }).decode(bytes);
+  if (content.includes('\0')) throw new Error('file_encoding_unsupported: 当前文件不是支持的文本文件。');
+  return content;
 }

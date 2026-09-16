@@ -29,6 +29,7 @@ mod local_agent_store;
 mod local_agent_tool_catalog;
 mod local_agent_tool_prompts;
 mod prelude;
+mod provider_transport;
 mod routes;
 mod session_environment;
 mod session_service;

@@ -9,6 +9,7 @@ export interface ConversationHost {
   openExternalLink(url: string): Promise<void>;
   readResource: typeof readConversationResource;
   readDocument: typeof readConversationDocument;
+  readLocalFile?(path: string): Promise<Blob>;
   readArtifact: typeof readConversationArtifact;
   readChange: typeof readFileChange;
   readConversation: typeof readConversation;
@@ -23,6 +24,12 @@ const defaultHost: ConversationHost = {
   copyText: async (text) => navigator.clipboard.writeText(text),
   openExternalLink: openExternalUrl,
   readResource: readConversationResource,
+  readLocalFile: async (path) => {
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (!invoke) throw new Error('Local file reading requires the desktop Host.');
+    const bytes = await invoke<ArrayBuffer>('deepcode_read_local_file', { path });
+    return new Blob([bytes]);
+  },
   readDocument: readConversationDocument,
   readArtifact: readConversationArtifact,
   resolveResource: resolveConversationResource,

@@ -1,3 +1,4 @@
+import { withProviderAttempts } from './providerAttempts.js';
 import type {
   AssistantDraftBlockProjection,
   AssistantDraftProjection,
@@ -40,7 +41,7 @@ import {
   type ContextCompactionRequestEvent,
 } from './compaction.js';
 import { buildAgentProviderRequest } from './contextComposer.js';
-import { LoopFailure, ProviderCompletedFailure, ProviderReportedFailure } from './loopFailure.js';
+import { errorFact, LoopFailure, ProviderCompletedFailure, ProviderReportedFailure } from './loopFailure.js';
 import {
   canonicalJsonValue,
   decodeProviderToolInput,
@@ -97,6 +98,7 @@ export interface AgentLoopDeps {
   commit(event: NewSessionEvent | readonly NewSessionEvent[] | ((current: LoopSnapshot) => readonly NewSessionEvent[])): Promise<LoopSnapshot>;
   takeQueuedInputs(runId: string): Promise<LoopSnapshot>;
   updateAssistantDraft(draft: AssistantDraftProjection | null): void;
+  resetReasoning?(): void;
   updateReasoning?(requestId: string, runId: string, text: string, kind: 'text' | 'summary'): void;
   updateToolProgress?(callId: string, progress: ToolExecutionProgress): void;
   nextId(kind: string): string;
@@ -213,6 +215,8 @@ export async function runAgentLoop(
   signal: AbortSignal,
 ): Promise<LoopResult> {
   let snapshot = initial;
+  const persist = deps.commit;
+  deps = { ...deps, commit: async (event) => { snapshot = await persist(event); return snapshot; } };
   const runId = command.runId;
   const commit = async (
     event: NewSessionEvent | readonly NewSessionEvent[] | ((current: LoopSnapshot) => readonly NewSessionEvent[]),
@@ -645,7 +649,10 @@ export async function runAgentLoop(
         outcome: 'indeterminate',
         error: {
           code: 'provider_turn_outcome_unknown',
-          message: `Provider request ${unknownTurn.providerRequestId} 的完成结果不可判定；原始错误 ${cause.code}：${cause.message}`,
+          message: signal.reason === 'user_cancelled' ? '已收到取消请求，本次生成未完成；Provider 最终完成结果未知。'
+            : `Provider request ${unknownTurn.providerRequestId} 的完成结果不可判定；原始错误 ${cause.code}：${cause.message}`,
+          diagnostics: { source: 'session', phase: 'provider', category: signal.aborted ? 'cancelled' : 'unknown', retryable: false,
+            causes: [{ message: `${cause.code}: ${cause.message}` }], ...(signal.aborted ? { stopReason: String(signal.reason) } : {}) },
         },
       };
       await commit([
@@ -742,7 +749,11 @@ async function performContextCompaction(
   await commit(facts);
 }
 
-async function consumeCompactionProvider(
+async function consumeCompactionProvider(request: ProviderRequest, deps: AgentLoopDeps, signal: AbortSignal) {
+  return withProviderAttempts(request, deps, signal, (attempt) => consumeCompactionAttempt(attempt, deps, signal));
+}
+
+async function consumeCompactionAttempt(
   request: ProviderRequest,
   deps: AgentLoopDeps,
   signal: AbortSignal,
@@ -826,7 +837,7 @@ async function consumeCompactionProvider(
         completed = true;
         break;
       case 'failed':
-        throw new ProviderReportedFailure(event.data.code, event.data.message);
+        throw new ProviderReportedFailure(event.data.code, event.data.message, event.data.diagnostics);
     }
   }
   if (!completed) {
@@ -898,9 +909,9 @@ async function consumeProvider(
 ): Promise<ProviderTurn> {
   let completed = false;
   try {
-    return await consumeProviderOutput(request, toolCodec, runId, deps, signal, () => {
+    return await withProviderAttempts(request, deps, signal, (attempt) => consumeProviderOutput(attempt, toolCodec, runId, deps, signal, () => {
       completed = true;
-    });
+    }));
   } catch (error) {
     if (completed && !signal.aborted && !(error instanceof ProviderReportedFailure)) {
       const failure = localAgentError(error);
@@ -1039,7 +1050,7 @@ async function consumeProviderOutput(
         contextUsage = decodeContextUsage(event.data);
         break;
       case 'failed':
-        throw new ProviderReportedFailure(event.data.code, event.data.message);
+        throw new ProviderReportedFailure(event.data.code, event.data.message, event.data.diagnostics);
     }
   }
   if (!completed) throw new LoopFailure('provider_stream_incomplete', 'Provider 流未产生完成事件。');
@@ -2285,12 +2296,9 @@ function throwIfAborted(signal: AbortSignal): void {
 }
 
 function localAgentError(error: unknown): LocalAgentError {
-  if (error instanceof LoopFailure) return { code: error.code, message: error.message };
+  if (error instanceof LoopFailure) return errorFact(error);
   if (error instanceof SessionControlError) return { code: error.code, message: error.message };
-  return {
-    code: 'agent_loop_failed',
-    message: error instanceof Error ? error.message : String(error),
-  };
+  return errorFact(error);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

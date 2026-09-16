@@ -25,6 +25,8 @@ import {
 } from '@deepcode/protocol';
 
 export interface SessionState {
+  providerAttempts: Record<string, NonNullable<SessionProjection['providerAttempts']>[number]>;
+  failureSnapshots: Record<string, NonNullable<SessionProjection['failureSnapshot']>>;
   modelSettings: SessionProjection['modelSettings'];
   sessionId: string;
   revision: number;
@@ -87,6 +89,7 @@ export interface ProviderCallFactState {
 
 export function emptySessionState(sessionId: string): SessionState {
   return {
+    providerAttempts: {}, failureSnapshots: {},
     modelSettings: null,
     sessionId,
     revision: 0,
@@ -175,6 +178,26 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
   };
 
   switch (event.type) {
+    case 'provider.attempt.updated': {
+      assertRunningRun(next, event.runId, 'provider_attempt_run_not_active');
+      const fact = event.payload;
+      const previousAttempt = next.providerAttempts[fact.providerAttemptId];
+      const related = Object.values(next.providerAttempts).filter((item) => item.providerRequestId === fact.providerRequestId);
+      if (!next.contextCompositions.some((item) => item.providerRequestId === fact.providerRequestId && item.runId === event.runId && item.purpose === fact.purpose)) throw new Error('provider_attempt_composition_missing');
+      if (fact.phase === 'started') {
+        if (previousAttempt || fact.attempt !== related.length + 1 || fact.attempt > 5
+          || related.some((item) => !['retryWaiting'].includes(item.phase))) throw new Error('provider_attempt_start_invalid');
+      } else if (!previousAttempt || previousAttempt.runId !== event.runId || previousAttempt.providerRequestId !== fact.providerRequestId
+        || previousAttempt.attempt !== fact.attempt
+        || (fact.phase === 'retryWaiting' ? previousAttempt.phase !== 'failed' : previousAttempt.phase !== 'started')) throw new Error('provider_attempt_transition_invalid');
+      next.providerAttempts = { ...next.providerAttempts, [fact.providerAttemptId]: { ...structuredClone(fact), runId: event.runId, updatedAt: event.occurredAt } };
+      break;
+    }
+    case 'run.failure.recorded':
+      assertCurrentRun(next, event.runId, 'failure_snapshot_run_mismatch');
+      if (event.payload.revision > previous.revision) throw new Error('failure_snapshot_revision_invalid');
+      next.failureSnapshots = { ...next.failureSnapshots, [event.runId]: structuredClone(event.payload) };
+      break;
     case 'input.queued':
       assertCurrentRun(next, event.runId, 'queued_input_run_not_current');
       if (!['running', 'waiting'].includes(next.run!.status)) throw new Error('queued_input_run_not_active');
@@ -1154,6 +1177,9 @@ export function projectSession(
     records.push(activity.tool.recordId); rounds.set(activity.runId, records);
   }
   return {
+    ...(Object.keys(state.providerAttempts).length ? { providerAttempts: Object.values(state.providerAttempts)
+      .filter((attempt) => attempt.runId === state.run?.runId).map((attempt) => structuredClone(attempt)) } : {}),
+    ...(state.run && state.failureSnapshots[state.run.runId] ? { failureSnapshot: structuredClone(state.failureSnapshots[state.run.runId]) } : {}),
     schemaVersion: SESSION_PROJECTION_VERSION,
     ...(rounds.size ? { fileChangeRounds: [...rounds].map(([runId, recordIds]) => ({ runId, recordIds })) } : {}),
     sessionId: state.sessionId,

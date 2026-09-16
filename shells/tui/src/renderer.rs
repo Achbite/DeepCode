@@ -9,12 +9,335 @@ use ratatui::{
     prelude::Frame,
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarState, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarState, Wrap},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    cell::RefCell,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
-#[derive(Clone, Default)]
-pub struct Renderer;
+#[derive(Clone)]
+pub struct Renderer {
+    animation_started: Instant,
+    transcript: RefCell<Option<TranscriptCache>>,
+}
+
+#[derive(Clone, PartialEq)]
+struct TranscriptKey {
+    session: Option<(String, u64)>,
+    draft: Option<AssistantDraftProjection>,
+    live_output: Vec<(String, deepcode_kernel_client::ToolOutputProjection)>,
+    reasoning: bool,
+    width: u16,
+    height: u16,
+}
+
+#[derive(Clone)]
+struct TranscriptCache {
+    key: TranscriptKey,
+    text: Text<'static>,
+}
+
+impl Default for Renderer {
+    fn default() -> Self {
+        Self {
+            animation_started: Instant::now(),
+            transcript: RefCell::new(None),
+        }
+    }
+}
+
+pub(crate) fn working_indicator(app: &TuiApp, tick: usize) -> Option<String> {
+    if app.connection_error().is_some() {
+        return None;
+    }
+    let projection = app.projection()?;
+    let run = projection.run.as_ref()?;
+    if !matches!(run.status.as_str(), "running" | "releasing") {
+        return None;
+    }
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mut label = run_label(Some(projection));
+    if run.status == "running" {
+        if let Some(activity) = projection.activities.iter().rev().find(|activity| {
+            activity.kind == "tool" && activity.status == "active" && activity.run_id == run.run_id
+        }) {
+            label.push_str(&format!(
+                " · {}",
+                activity
+                    .tool
+                    .as_ref()
+                    .map(|tool| tool.operation.as_str())
+                    .unwrap_or(&activity.label)
+            ));
+        }
+    }
+    Some(format!(
+        "{} {label} · /cancel 停止",
+        frames[tick % frames.len()]
+    ))
+}
+
+fn clipped(text: &str, width: u16) -> String {
+    let text = text.replace(['\n', '\r', '\t'], " ");
+    let source = Line::from(text.as_str());
+    let limit = usize::from(width);
+    if source.width() <= limit {
+        return text;
+    }
+    if limit == 0 {
+        return String::new();
+    }
+    let mut result = String::new();
+    let mut used = 0;
+    for grapheme in source.styled_graphemes(Style::default()) {
+        let cells = Span::raw(grapheme.symbol).width();
+        if used + cells >= limit {
+            break;
+        }
+        result.push_str(grapheme.symbol);
+        used += cells;
+    }
+    result.push('…');
+    result
+}
+
+fn run_label(projection: Option<&SessionProjection>) -> String {
+    let Some(projection) = projection else {
+        return "初始化".into();
+    };
+    let Some(run) = &projection.run else {
+        return "就绪".into();
+    };
+    if run.status == "running" {
+        if let Some(attempt) = projection
+            .provider_attempts
+            .last()
+            .filter(|item| item.run_id == run.run_id)
+        {
+            if attempt.phase == "retryWaiting" {
+                return format!("网络重试 · 等待第 {}/5 次尝试", attempt.attempt + 1);
+            }
+            if attempt.phase == "started" && attempt.attempt > 1 {
+                return format!("正在连接 · 第 {}/5 次尝试", attempt.attempt);
+            }
+        }
+    }
+    match run.status.as_str() {
+        "running" => "运行中",
+        "waiting" => match run.waiting_reason.as_deref() {
+            Some("approval") => "等待授权",
+            Some("plan") => "等待计划确认",
+            Some("userInput") => "等待回答",
+            _ => "等待中",
+        },
+        "releasing" => "正在结束",
+        "releaseFailed" => "资源释放失败",
+        "completed" => "已完成",
+        "failed" => "失败 · /error",
+        "cancelled" => "已取消",
+        "indeterminate" => "结果未确定 · /error",
+        other => other,
+    }
+    .into()
+}
+
+fn decision_lines(projection: Option<&SessionProjection>) -> Vec<Line<'static>> {
+    let Some(projection) = projection else {
+        return vec![];
+    };
+    let (title, actions, summary) = if let Some(approval) = &projection.pending_approval {
+        (
+            "等待授权 · /decision 查看完整范围",
+            if approval.preview.authorization_scope.as_deref() == Some("runHostShell") {
+                "/reply 1 允许一次 · /reply 2 拒绝 · /reply 3 允许本轮"
+            } else {
+                "/reply 1 允许 · /reply 2 拒绝"
+            },
+            approval.preview.summary.clone(),
+        )
+    } else if let Some(interaction) = &projection.pending_interaction {
+        (
+            "等待回答 · /decision 查看选项",
+            "/reply <内容或选项编号> 回答",
+            interaction.prompt.clone(),
+        )
+    } else if let Some(plan) = &projection.pending_plan {
+        (
+            "等待计划确认 · /decision 查看计划",
+            "/reply 1 确认 · /reply <意见> 修订 · /cancel-plan 取消",
+            plan.title.clone(),
+        )
+    } else {
+        return vec![];
+    };
+    vec![
+        Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(actions),
+        Line::from(Span::raw(summary)),
+        Line::from(Span::styled(
+            "普通输入会排队为后续消息",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]
+}
+
+pub(crate) fn decision_details(projection: Option<&SessionProjection>) -> String {
+    let Some(projection) = projection else {
+        return "Session 尚未初始化。".into();
+    };
+    if let Some(approval) = &projection.pending_approval {
+        let mut text = format!("授权请求\n{}\n", approval.preview.summary);
+        for target in &approval.preview.logical_targets {
+            text.push_str(&format!("\n{target}"));
+        }
+        if approval.preview.authorization_scope.as_deref() == Some("sessionBrowser") {
+            text.push_str("\n允许后覆盖当前对话的浏览器页面操作。");
+        }
+        text.push('\n');
+        text.push_str(
+            &decision_lines(Some(projection))
+                .iter()
+                .take(2)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        return text;
+    }
+    if let Some(plan) = &projection.pending_plan {
+        let mut text = String::new();
+        render_plan_plain(&mut text, plan);
+        return text;
+    }
+    if let Some(interaction) = &projection.pending_interaction {
+        let mut text = format!("{}\n/reply <内容或选项编号> 回答\n", interaction.prompt);
+        for (index, option) in interaction.options.iter().flatten().enumerate() {
+            text.push_str(&format!("\n{}. {}", index + 1, option.label));
+        }
+        return text;
+    }
+    "当前没有待处理决策。".into()
+}
+
+pub(crate) fn failure_details(projection: Option<&SessionProjection>) -> String {
+    let Some(projection) = projection else {
+        return "Session 尚未初始化。".into();
+    };
+    let error = projection.terminal_error.as_ref().or_else(|| {
+        projection
+            .failure_snapshot
+            .as_ref()
+            .map(|snapshot| &snapshot.error)
+    });
+    let Some(error) = error else {
+        return "当前没有失败诊断。".into();
+    };
+    let mut text = format!("{}: {}\n", error.code, error.message);
+    if let Some(details) = &error.diagnostics {
+        text.push_str(&format!(
+            "\n来源 {} · 阶段 {} · 分类 {}\n",
+            details.source, details.phase, details.category
+        ));
+        for cause in &details.causes {
+            text.push_str(&format!(
+                "\n{}{}",
+                cause.message,
+                cause
+                    .os_code
+                    .map(|code| format!(" [OS {code}]"))
+                    .unwrap_or_default()
+            ));
+        }
+        if let Some(path) = &details.archive_path {
+            text.push_str(&format!("\n\n请求归档：{path}"));
+        }
+        for secondary in &details.secondary {
+            text.push_str(&format!(
+                "\n附加错误 {}: {}",
+                secondary.code, secondary.message
+            ));
+        }
+    }
+    if let Some(snapshot) = &projection.failure_snapshot {
+        text.push_str(&format!(
+            "\n\n最近失败快照 · revision {} · 阶段 {}\n尝试 {} 次 · 工具记录 {} · 未结调用 {}",
+            snapshot.revision,
+            snapshot.phase,
+            snapshot.provider_attempt_ids.len(),
+            snapshot.tool_record_ids.len(),
+            snapshot.pending_call_ids.len()
+        ));
+        if let Some(request) = &snapshot.provider_request_id {
+            text.push_str(&format!("\n请求：{request}"));
+        }
+    }
+    text
+}
+
+fn push_tool_summary(lines: &mut Vec<Line<'_>>, activity: &ActivityProjection) {
+    let operation = activity
+        .tool
+        .as_ref()
+        .map(|tool| tool.operation.as_str())
+        .unwrap_or(&activity.label);
+    lines.push(Line::from(Span::styled(
+        format!("工具 {operation} [{}]", activity.status),
+        Style::default().fg(activity_color(&activity.status)),
+    )));
+    for error in tool_error_lines(activity) {
+        lines.push(Line::from(Span::styled(
+            error,
+            Style::default().fg(Color::Red),
+        )));
+    }
+    if activity.status == "active" {
+        if let Some(output) = &activity.live_output {
+            for line in output
+                .stdout
+                .lines()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                lines.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            if let Some(line) = output.stderr.lines().last() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        format!("  /tool {} 查看详情", activity.activity_id),
+        Style::default().fg(Color::DarkGray),
+    )));
+}
+
+pub(crate) fn tool_details(projection: Option<&SessionProjection>, activity_id: &str) -> String {
+    let Some(activity) = projection.and_then(|p| {
+        p.activities
+            .iter()
+            .find(|activity| activity.activity_id == activity_id)
+    }) else {
+        return format!("工具记录不存在：{activity_id}");
+    };
+    let mut text = String::new();
+    render_tool_plain(&mut text, activity);
+    text
+}
 
 fn multiline_text(lines: Vec<Line<'_>>) -> Text<'static> {
     let mut result = Vec::new();
@@ -148,7 +471,7 @@ mod layout_tests {
         .unwrap();
         let mut app = TuiApp::new(
             client,
-            Renderer,
+            Renderer::default(),
             TuiHostOptions {
                 workspace_path: None,
                 session_id: None,
@@ -161,7 +484,7 @@ mod layout_tests {
             .draw(|frame| app.renderer().draw(frame, &app))
             .unwrap();
         let contents = format!("{:?}", terminal.backend().buffer());
-        assert!(contents.contains("DC  DeepCode"));
+        assert!(contents.contains("DeepCode"));
         assert!(contents.contains("最后一行"));
         assert!(!contents.contains("本对话暂无任务"));
         let cursor = terminal.get_cursor_position().unwrap();
@@ -173,31 +496,51 @@ mod layout_tests {
 
     #[test]
     fn transcript_preserves_newlines_and_scrolls_wrapped_rows() {
-        let paragraph = Paragraph::new(multiline_text(vec![Line::from(
-            "abcdefghijklmnop\n最终正文",
-        )]))
-        .wrap(Wrap { trim: false });
+        let paragraph =
+            Paragraph::new(Text::raw("abcdefghijklmnop\n最终正文")).wrap(Wrap { trim: false });
         assert_eq!(paragraph.line_count(8), 3);
         let mut terminal = Terminal::new(TestBackend::new(8, 1)).unwrap();
         terminal
             .draw(|frame| frame.render_widget(paragraph.clone().scroll((2, 0)), frame.area()))
             .unwrap();
         assert!(format!("{:?}", terminal.backend().buffer()).contains("最终正文"));
+        let short = Paragraph::new(Text::raw("短行\n\n第二段\n末行"));
+        assert_eq!(
+            short.line_count(80),
+            4,
+            "explicit newlines must survive even when no wrapping is needed"
+        );
+        terminal
+            .draw(|frame| frame.render_widget(short.clone().scroll((2, 0)), frame.area()))
+            .unwrap();
+        assert!(format!("{:?}", terminal.backend().buffer()).contains("第二段"));
     }
 }
 
 impl Renderer {
     pub fn draw(&self, frame: &mut Frame<'_>, app: &TuiApp) {
         let area = frame.area().inner(Margin::new(1, 0));
-        let input_height = input_lines(app.input(), area.width.saturating_sub(2))
+        let input_height = input_lines(app.input(), area.width.saturating_sub(4))
             .len()
             .clamp(1, 4) as u16
             + 2;
+        let decision = decision_lines(app.projection());
+        let working = working_indicator(
+            app,
+            (self.animation_started.elapsed().as_millis() / 150) as usize,
+        );
+        let decision_height = if decision.is_empty() {
+            0
+        } else {
+            (decision.len() as u16 + 2).min(if area.height < 20 { 4 } else { 6 })
+        };
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
+                Constraint::Length(if area.height < 18 { 1 } else { 2 }),
                 Constraint::Min(1),
+                Constraint::Length(decision_height),
+                Constraint::Length(u16::from(working.is_some())),
                 Constraint::Length(input_height),
                 Constraint::Length(2),
             ])
@@ -212,11 +555,30 @@ impl Renderer {
         } else {
             self.draw_projection(frame, rows[1], app);
         }
-        self.draw_input(frame, rows[2], app);
+        if !decision.is_empty() {
+            frame.render_widget(
+                Paragraph::new(multiline_text(decision))
+                    .block(
+                        Block::default()
+                            .borders(Borders::LEFT)
+                            .border_style(Style::default().fg(Color::Yellow)),
+                    )
+                    .wrap(Wrap { trim: false }),
+                rows[2],
+            );
+        }
+        if let Some(working) = working {
+            frame.render_widget(
+                Paragraph::new(clipped(&working, rows[3].width))
+                    .style(Style::default().fg(Color::Cyan)),
+                rows[3],
+            );
+        }
+        self.draw_input(frame, rows[4], app);
         if app.plugin_picker_open() {
             self.draw_plugin_picker(frame, rows[1], app);
         }
-        self.draw_footer(frame, rows[3], app);
+        self.draw_footer(frame, rows[5], app);
     }
 
     pub fn render_plain(&self, app: &TuiApp) -> String {
@@ -349,10 +711,12 @@ impl Renderer {
             }
             render_todo_plain(&mut output, projection);
             if !app.context_open() {
-                output.push_str(&format!("缓存命中 {}\n", cache_hit_label(projection)));
+                output.push_str(&format!("总缓存命中 {}\n", cache_hit_label(projection)));
             }
-            if let Some(error) = projection.terminal_error.as_ref() {
-                output.push_str(&format!("{}: {}\n", error.code, error.message));
+            output.push_str(&format!("{}\n", run_label(Some(projection))));
+            if projection.terminal_error.is_some() {
+                output.push_str(&failure_details(Some(projection)));
+                output.push('\n');
             }
         } else {
             output.push_str("Session 尚未初始化。\n");
@@ -401,24 +765,66 @@ impl Renderer {
     }
 
     fn draw_header(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-        let title = app
-            .projection()
-            .map(|projection| projection.display.creation_title.as_str())
+        let projection = app.projection();
+        let model = projection
+            .and_then(|p| {
+                p.run
+                    .as_ref()
+                    .map(|run| run.profile_id.as_str())
+                    .or_else(|| {
+                        p.model_settings
+                            .as_ref()
+                            .map(|settings| settings.profile_id.as_str())
+                    })
+            })
             .unwrap_or("");
+        let effort = projection.and_then(|p| {
+            p.run
+                .as_ref()
+                .and_then(|run| run.reasoning_effort.as_deref())
+                .or_else(|| {
+                    p.model_settings
+                        .as_ref()
+                        .and_then(|settings| settings.reasoning_effort_override.as_deref())
+                })
+        });
+        let model = format!(
+            "{model}{}",
+            effort
+                .map(|value| format!(" · {value}"))
+                .unwrap_or_default()
+        );
+        let status = run_label(projection);
+        let left = format!("DeepCode  ·  {status}");
+        let available = area
+            .width
+            .saturating_sub(Line::from(left.as_str()).width() as u16 + 2);
+        let right = clipped(&model, available);
+        let gap = usize::from(area.width)
+            .saturating_sub(Line::from(left.as_str()).width() + Line::from(right.as_str()).width());
+        let workspace = projection
+            .map(|p| {
+                p.session_directory_indexes
+                    .iter()
+                    .map(|binding| binding.display_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            })
+            .unwrap_or_default();
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(vec![
                     Span::styled(
-                        "DC",
+                        left,
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw("  DeepCode"),
-                    Span::styled(format!("  {title}"), Style::default().fg(Color::DarkGray)),
+                    Span::raw(" ".repeat(gap)),
+                    Span::raw(right),
                 ]),
                 Line::from(Span::styled(
-                    "/help 命令 · @ 插件 · /tasks 任务 · PgUp/PgDn 滚动",
+                    clipped(&workspace, area.width),
                     Style::default().fg(Color::DarkGray),
                 )),
             ]),
@@ -427,28 +833,37 @@ impl Renderer {
     }
 
     fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-        let projection = app.projection();
-        let workspace = projection
-            .map(|projection| {
-                projection
-                    .session_directory_indexes
-                    .iter()
-                    .map(|index| index.display_name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" · ")
-            })
-            .unwrap_or_default();
-        let cache = projection
-            .map(cache_hit_label)
-            .unwrap_or_else(|| "--%".into());
-        let model = projection
-            .and_then(|projection| projection.model_settings.as_ref())
-            .map(|settings| settings.profile_id.as_str())
-            .unwrap_or("");
+        let mut metrics = Vec::new();
+        if let Some(projection) = app.projection() {
+            if let Some(usage) = projection.context_usage.as_ref() {
+                metrics.push(format!(
+                    "上下文 {}",
+                    percent_label(
+                        usage.input_tokens.saturating_add(usage.output_tokens),
+                        usage.context_window_tokens
+                    )
+                ));
+            }
+            metrics.push(format!(
+                "输入 {} · 输出 {}",
+                format_number(projection.token_usage.input_tokens),
+                format_number(projection.token_usage.output_tokens)
+            ));
+            if projection.token_usage.cache_available {
+                metrics.push(format!("总缓存命中 {}", cache_hit_label(projection)));
+            }
+        }
+        let metrics = metrics.join(" · ");
+        let hint = if area.width >= 84 {
+            "  /help · @ 插件 · PgUp/PgDn / 滚轮"
+        } else {
+            "  /help"
+        };
+        let metrics = clipped(&format!("{metrics}{hint}"), area.width);
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(format!("{workspace}  ·  缓存 {cache}  ·  {model}")),
-                Line::from(app.status()),
+                Line::from(metrics),
+                Line::from(clipped(app.status(), area.width)),
             ])
             .style(Style::default().fg(Color::DarkGray)),
             area,
@@ -545,6 +960,65 @@ impl Renderer {
     }
 
     fn draw_projection(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+        let body = Rect {
+            width: area.width.saturating_sub(1),
+            ..area
+        };
+        let key = TranscriptKey {
+            session: app
+                .projection()
+                .map(|projection| (projection.session_id.clone(), projection.revision)),
+            // Drafts and tool output are live overlays; they need not advance journal revision.
+            draft: app
+                .projection()
+                .and_then(|projection| projection.assistant_draft.clone()),
+            live_output: app
+                .projection()
+                .into_iter()
+                .flat_map(|projection| &projection.activities)
+                .filter_map(|activity| {
+                    activity
+                        .live_output
+                        .clone()
+                        .map(|output| (activity.activity_id.clone(), output))
+                })
+                .collect(),
+            reasoning: app.reasoning_enabled(),
+            width: body.width,
+            height: body.height,
+        };
+        let mut cache = self.transcript.borrow_mut();
+        if cache.as_ref().is_none_or(|cache| cache.key != key) {
+            *cache = Some(TranscriptCache {
+                key,
+                text: self.transcript_text(body, app),
+            });
+        }
+        let paragraph =
+            Paragraph::new(cache.as_ref().unwrap().text.clone()).wrap(Wrap { trim: false });
+        let height = paragraph.line_count(body.width);
+        let maximum = height.saturating_sub(usize::from(body.height));
+        let offset = app.transcript_offset(maximum);
+        frame.render_widget(
+            paragraph.scroll((offset.min(u16::MAX as usize) as u16, 0)),
+            body,
+        );
+        if maximum > 0 {
+            frame.render_stateful_widget(
+                Scrollbar::default()
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .track_symbol(Some("│"))
+                    .thumb_symbol("┃")
+                    .track_style(Style::default().fg(Color::DarkGray))
+                    .thumb_style(Style::default().fg(Color::Gray)),
+                area,
+                &mut ScrollbarState::new(maximum + 1).position(offset),
+            );
+        }
+    }
+
+    fn transcript_text(&self, area: Rect, app: &TuiApp) -> Text<'static> {
         let mut lines = Vec::new();
         if let Some(projection) = app.projection() {
             let items = timeline_items(projection);
@@ -563,14 +1037,28 @@ impl Renderer {
                         let color = if message.role == "user" {
                             Color::Blue
                         } else if message.role == "assistant" {
-                            Color::White
+                            Color::Reset
                         } else {
                             Color::DarkGray
                         };
+                        let role = match message.role.as_str() {
+                            "user" => "你",
+                            "assistant" => "DeepCode",
+                            other => other,
+                        };
                         lines.push(Line::from(Span::styled(
-                            format!("{}: {}", message.role, message.content),
-                            Style::default().fg(color),
+                            role.to_string(),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
                         )));
+                        if message.role == "assistant" {
+                            lines.extend(crate::markdown::render(
+                                &message.content,
+                                area.width,
+                                Style::default(),
+                            ));
+                        } else {
+                            lines.extend(Text::raw(message.content.clone()).lines);
+                        }
                         if !message.filesystem_references.is_empty() {
                             lines.push(Line::from(Span::styled(
                                 format!(
@@ -589,17 +1077,18 @@ impl Renderer {
                     TimelineItem::Narrative {
                         value: narrative, ..
                     } => {
-                        lines.push(Line::from(Span::styled(
-                            narrative.content.as_str(),
-                            Style::default().fg(Color::DarkGray),
-                        )));
+                        lines.extend(crate::markdown::render(
+                            &narrative.content,
+                            area.width,
+                            Style::default().fg(Color::Gray),
+                        ));
                     }
                     TimelineItem::Plan { value: plan, .. } => {
                         push_timeline_plan_lines(&mut lines, plan);
                     }
                     TimelineItem::ToolGroup { activities, .. } => {
                         for activity in activities {
-                            push_tool_lines(&mut lines, activity);
+                            push_tool_summary(&mut lines, activity);
                         }
                     }
                 }
@@ -613,7 +1102,11 @@ impl Renderer {
                 lines.push(Line::from(""));
             }
             for input in &projection.queued_inputs {
-                lines.extend(queued_input_lines(input).into_iter().map(Line::from));
+                lines.extend(
+                    queued_input_lines(input)
+                        .into_iter()
+                        .flat_map(|line| Text::raw(line).lines),
+                );
             }
             if app.reasoning_enabled() {
                 if let Some(draft) = projection.assistant_draft.as_ref() {
@@ -626,7 +1119,7 @@ impl Renderer {
             if let Some(draft) = visible_assistant_draft(projection) {
                 if let Some(preview) = draft.plan_preview.as_ref() {
                     lines.push(Line::from(format!("正在生成计划 · {}", preview.title)));
-                    lines.push(Line::from(preview.summary.clone()));
+                    lines.extend(Text::raw(preview.summary.clone()).lines);
                     for (index, title) in preview.steps.iter().enumerate() {
                         lines.push(Line::from(format!("{}. {title}", index + 1)));
                     }
@@ -634,90 +1127,27 @@ impl Renderer {
                 }
                 for block in &draft.blocks {
                     if let Some((_, content)) = block.text() {
+                        lines.extend(crate::markdown::render(
+                            content,
+                            area.width,
+                            Style::default(),
+                        ));
                         lines.push(Line::from(Span::styled(
-                            format!("{content}▋"),
-                            Style::default().fg(Color::White),
+                            "▋",
+                            Style::default().fg(Color::Cyan),
                         )));
                         lines.push(Line::from(""));
                     }
                 }
             }
-            if let Some(plan) = projection.pending_plan.as_ref() {
-                lines.push(Line::from(Span::styled(
-                    format!("Plan · revision {}", plan.revision),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                lines.push(Line::from(Span::styled(
-                    plan.title.as_str(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )));
-                lines.push(Line::from(plan.summary.as_str()));
-                for (index, step) in plan.steps.iter().enumerate() {
-                    lines.push(Line::from(format!("{}. {}", index + 1, step.title)));
-                    lines.push(Line::from(Span::styled(
-                        format!("   {}", step.details),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                    if let Some(verification) = step.verification.as_ref() {
-                        for item in verification {
-                            lines.push(Line::from(Span::styled(
-                                format!("   验证：{item}"),
-                                Style::default().fg(Color::DarkGray),
-                            )));
-                        }
-                    }
-                }
-                lines.push(Line::from(
-                    "输入 /reply 1 确认；/reply <意见> 修订；普通消息排队；/cancel-plan 明确取消。",
-                ));
-                lines.push(Line::from(""));
-            }
-            if let Some(interaction) = projection.pending_interaction.as_ref() {
-                lines.push(Line::from(Span::styled(
-                    format!("需要你回答（/reply <内容>）：{}", interaction.prompt),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                if let Some(options) = interaction.options.as_ref() {
-                    for (index, option) in options.iter().enumerate() {
-                        lines.push(Line::from(format!("  {}. {}", index + 1, option.label)));
-                    }
-                }
-            }
-            if let Some(approval) = projection.pending_approval.as_ref() {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "需要你批准（/reply 1 或 /reply 2）：{}",
-                        approval.preview.summary
-                    ),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                if approval.preview.authorization_scope.as_deref() == Some("sessionBrowser") {
-                    lines.push(Line::from(
-                        "允许后，当前对话内的浏览器页面操作无需重复确认。",
-                    ));
-                }
-                if approval.preview.authorization_scope.as_deref() == Some("runHostShell") {
-                    lines.push(Line::from(
-                        "/reply 3 允许本轮相同工作目录和执行环境的宿主 Shell。",
-                    ));
-                }
-                for target in &approval.preview.logical_targets {
-                    lines.push(Line::from(format!("  - {target}")));
-                }
-                lines.push(Line::from("输入 /reply 1 允许或 /reply 2 拒绝。"));
-                lines.push(Line::from(""));
-            }
-            for activity in projection
-                .activities
-                .iter()
-                .filter(|activity| activity.kind != "tool")
-            {
+            for activity in projection.activities.iter().filter(|activity| {
+                activity.kind != "tool"
+                    && !(activity.kind == "run"
+                        && matches!(
+                            activity.status.as_str(),
+                            "requested" | "active" | "completed"
+                        ))
+            }) {
                 lines.push(Line::from(Span::styled(
                     format!(
                         "{} [{}] · {}",
@@ -733,52 +1163,58 @@ impl Renderer {
                 )));
             }
         }
-        if lines.is_empty() {
+        if let Some(error) = app.projection().and_then(|p| p.terminal_error.as_ref()) {
             lines.push(Line::from(Span::styled(
-                "输入一条消息开始本地编码任务。",
+                format!("{}: {}", error.code, error.message),
+                Style::default().fg(Color::Red),
+            )));
+            lines.push(Line::from(Span::styled(
+                "/error 查看诊断和失败快照",
                 Style::default().fg(Color::DarkGray),
             )));
         }
-        let body = Rect {
-            width: area.width.saturating_sub(1),
-            ..area
-        };
-        let paragraph = Paragraph::new(multiline_text(lines)).wrap(Wrap { trim: false });
-        let height = paragraph.line_count(body.width);
-        let maximum = height.saturating_sub(usize::from(body.height));
-        let offset = app.transcript_offset(maximum);
-        frame.render_widget(
-            paragraph.scroll((offset.min(u16::MAX as usize) as u16, 0)),
-            body,
-        );
-        if maximum > 0 {
-            frame.render_stateful_widget(
-                Scrollbar::default().begin_symbol(None).end_symbol(None),
-                area,
-                &mut ScrollbarState::new(maximum + 1).position(offset),
+        if lines.is_empty() {
+            let logo = if area.width >= 62 && area.height >= 14 {
+                vec![
+                    r"  ____                  ____          _",
+                    r" |  _ \  ___  ___ _ __ / ___|___   __| | ___",
+                    r" | | | |/ _ \/ _ \ '_ \ |   / _ \ / _` |/ _ \",
+                    r" | |_| |  __/  __/ |_) | |__| (_) | (_| |  __/",
+                    r" |____/ \___|\___| .__/ \____\___/ \__,_|\___|",
+                    r"                |_|",
+                ]
+            } else {
+                vec!["", "  DeepCode", ""]
+            };
+            lines.extend(
+                logo.into_iter()
+                    .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Cyan)))),
             );
+            lines.push(Line::from(""));
+            lines.push(Line::from("  输入消息开始工作，或使用 @ 选择插件。"));
+            lines.push(Line::from(Span::styled(
+                "  /help 帮助 · /tasks 任务 · /context 上下文",
+                Style::default().fg(Color::DarkGray),
+            )));
         }
+        multiline_text(lines)
     }
 
     fn draw_input(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         let selected_plugins = app.selected_plugin_labels();
-        let title = if app
-            .projection()
-            .is_some_and(|projection| projection.pending_plan.is_some())
-        {
-            " 确认计划 · /reply 1 确认，/reply <意见> 修订；普通消息排队 ".to_string()
-        } else if app
-            .projection()
-            .is_some_and(|projection| projection.pending_approval.is_some())
-        {
-            " 等待审批 · /reply 1 允许 / /reply 2 拒绝 ".to_string()
-        } else if selected_plugins.is_empty() {
-            " 输入消息 · @ 插件 ".to_string()
+        let mut title = " 输入消息".to_string();
+        if let Some(profile) = app.next_message_profile() {
+            title.push_str(&format!(" · 下次 {profile}"));
+        }
+        if selected_plugins.is_empty() {
+            title.push_str(" · @ 插件 ");
         } else {
-            format!(" Message · plugins: {} ", selected_plugins.join(", "))
-        };
+            title.push_str(&format!(" · 插件 {} ", selected_plugins.join(", ")));
+        }
+        let title = clipped(&title, area.width.saturating_sub(2));
         let block = Block::default()
-            .borders(Borders::TOP | Borders::BOTTOM)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .title(title)
             .border_style(Style::default().fg(Color::DarkGray));
         let inner = block.inner(area).inner(Margin::new(1, 0));
@@ -833,7 +1269,7 @@ impl Renderer {
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(Color::Reset)
                 };
                 lines.push(Line::from(Span::styled(
                     format!("{marker} {}{selected}", entry.display_name),
@@ -896,57 +1332,28 @@ fn context_lines(projection: Option<&SessionProjection>, bar_width: usize) -> Ve
         ]));
         lines.push(context_usage_bar(usage, bar_width));
         lines.push(context_usage_legend(usage));
-        lines.push(Line::from(""));
-        let cache = &projection.token_usage;
-        if cache.cache_available {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "Cache ",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(cache_detail_label(cache)),
-            ]));
-            lines.push(cache_bar(cache.cache_hit_ratio, bar_width));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled("Cache N/A", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!(
-                        " · reports {}/{} ({})",
-                        cache.reported_call_count,
-                        cache.provider_call_count,
-                        cache_coverage_label(cache),
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-        }
     } else {
         lines.push(Line::from(Span::styled(
             "Context N/A",
             Style::default().fg(Color::DarkGray),
         )));
-        let cache = &projection.token_usage;
-        if cache.cache_available {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "Cache ",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(cache_detail_label(cache)),
-            ]));
-            lines.push(cache_bar(cache.cache_hit_ratio, bar_width));
-        } else {
-            lines.push(Line::from(Span::styled(
-                "Cache N/A",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
     }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "总缓存命中 ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(cache_detail_label(&projection.token_usage)),
+    ]));
+    let (detail, ratio) = last_request_cache_summary(projection.context_usage.as_ref());
+    lines.push(Line::from(vec![
+        Span::styled("最近一次请求 · 输入缓存 ", Style::default().fg(Color::Cyan)),
+        Span::raw(detail),
+    ]));
+    lines.push(cache_bar(ratio, bar_width));
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -1140,17 +1547,12 @@ fn render_context_plain(output: &mut String, projection: &SessionProjection) {
     } else {
         output.push_str("Context N/A\n");
     }
-    let cache = &projection.token_usage;
-    if cache.cache_available {
-        output.push_str(&format!("Cache {}\n", cache_detail_label(cache)));
-    } else {
-        output.push_str(&format!(
-            "Cache N/A · reports {}/{} ({})\n",
-            cache.reported_call_count,
-            cache.provider_call_count,
-            cache_coverage_label(cache),
-        ));
-    }
+    output.push_str(&format!(
+        "总缓存命中 {}\n",
+        cache_detail_label(&projection.token_usage)
+    ));
+    let (detail, _) = last_request_cache_summary(projection.context_usage.as_ref());
+    output.push_str(&format!("最近一次请求 · 输入缓存 {detail}\n"));
     output.push_str("Request\n");
     if let Some(receipt) = current_context_receipt(projection) {
         let metrics = context_partition_metrics(receipt);
@@ -1315,7 +1717,7 @@ fn push_tool_lines(lines: &mut Vec<Line<'_>>, activity: &ActivityProjection) {
         .unwrap_or(activity.label.as_str());
     let color = activity_color(&activity.status);
     lines.push(Line::from(Span::styled(
-        format!("🔧 {operation} [{}]", activity.status),
+        format!("工具 {operation} [{}]", activity.status),
         Style::default().fg(color),
     )));
     for error in tool_error_lines(activity) {
@@ -1420,7 +1822,7 @@ fn push_timeline_plan_lines(lines: &mut Vec<Line<'_>>, plan: &PlanProjection) {
         plan.title.clone(),
         Style::default().add_modifier(Modifier::BOLD),
     )));
-    lines.push(Line::from(plan.summary.clone()));
+    lines.extend(Text::raw(plan.summary.clone()).lines);
     for (index, step) in plan.steps.iter().enumerate() {
         lines.push(Line::from(format!("{}. {}", index + 1, step.title)));
         lines.push(Line::from(format!("   {}", step.details)));
@@ -1599,16 +2001,62 @@ fn cache_hit_label(projection: &SessionProjection) -> String {
     }
     usage
         .cache_hit_ratio
-        .map(|ratio| format!("{:.0}%", ratio * 100.0))
+        .map(format_cache_percent)
         .unwrap_or_else(|| "--%".to_string())
 }
 
+fn format_cache_percent(ratio: f64) -> String {
+    let rounded = (ratio * 100.0 * 10.0).round() / 10.0;
+    if rounded.fract() == 0.0 {
+        format!("{rounded:.0}%")
+    } else {
+        format!("{rounded:.1}%")
+    }
+}
+
+fn last_request_cache_summary(usage: Option<&ContextUsageProjection>) -> (String, Option<f64>) {
+    let Some(usage) = usage else {
+        return ("N/A".into(), None);
+    };
+    let (Some(hit), Some(miss)) = (usage.cache_read_input_tokens, usage.cache_miss_input_tokens)
+    else {
+        return (
+            format!(
+                "N/A · 输入 {} · 缓存用量未提供",
+                format_number(usage.input_tokens)
+            ),
+            None,
+        );
+    };
+    let ratio = (usage.input_tokens > 0).then(|| hit as f64 / usage.input_tokens as f64);
+    (
+        format!(
+            "{} · 输入 {} · 命中 {} · 未命中 {}",
+            ratio
+                .map(format_cache_percent)
+                .unwrap_or_else(|| "N/A".into()),
+            format_number(usage.input_tokens),
+            format_number(hit),
+            format_number(miss)
+        ),
+        ratio,
+    )
+}
+
 fn cache_detail_label(usage: &TokenUsageProjection) -> String {
+    if !usage.cache_available {
+        return format!(
+            "N/A · reports {}/{} ({})",
+            usage.reported_call_count,
+            usage.provider_call_count,
+            cache_coverage_label(usage)
+        );
+    }
     format!(
         "{} · hit {} · miss {} · reports {}/{} ({})",
         usage
             .cache_hit_ratio
-            .map(|ratio| format!("{:.1}%", ratio * 100.0))
+            .map(format_cache_percent)
             .unwrap_or_else(|| "N/A".to_string()),
         format_number(usage.cache_read_input_tokens),
         format_number(usage.cache_miss_input_tokens),

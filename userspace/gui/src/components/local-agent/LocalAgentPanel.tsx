@@ -49,7 +49,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
   const conversationItems = useMemo(() => projectionItems(projection), [projection?.sessionId, projection?.revision]);
   const assistantDraft = projection?.assistantDraft ?? null;
   const display = useDisplayedConversation();
-  const showChangeBar = projection?.run && !display.completedRuns.has(projection.run.runId)
+  const showChangeBar = projection?.run && !display.displaySettledRunIds.has(projection.run.runId)
     && !['failed', 'cancelled', 'indeterminate'].includes(projection.run.status);
   const draftItems = useMemo(
     () => assistantDraftItems(assistantDraft),
@@ -125,7 +125,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
       <div className="local-agent__viewport">
       <div ref={bodyRef} className="local-agent__body" aria-live="polite" {...bodyHandlers}>
         <ConversationTranscript
-          completedRuns={display.completedRuns}
+          displaySettledRunIds={display.displaySettledRunIds}
           artifacts={display.artifacts}
           onDisplayed={display.onDisplayed}
           showReasoning={showReasoning}

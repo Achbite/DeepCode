@@ -172,7 +172,7 @@ export function NativeBrowserPreview({
       window.removeEventListener('resize', layout);
       window.removeEventListener('scroll', layout, true);
     };
-  }, [page?.previewId, active]);
+  }, [page?.previewId, page?.status, active]);
   const act = async (action: Record<string, unknown>) => {
     setBusy(true);
     setError(null);

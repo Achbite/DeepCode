@@ -14,10 +14,50 @@ export const SESSION_CONTROL_PLAN_PROGRESS = 'plan.progress' as const;
 
 export type JsonObject = Record<string, unknown>;
 
+export interface ErrorDiagnostics {
+  source: string;
+  phase: string;
+  category: string;
+  retryable: boolean;
+  causes: Array<{ message: string; kind?: string; osCode?: number }>;
+  isConnect?: boolean;
+  isTimeout?: boolean;
+  isBody?: boolean;
+  stopReason?: string;
+  archivePath?: string;
+  secondary?: Array<{ code: string; message: string }>;
+}
+
 export interface LocalAgentError {
   code: string;
   message: string;
+  /** Absent on historical records whose producer did not collect diagnostics. */
+  diagnostics?: ErrorDiagnostics;
 }
+
+export interface ProviderAttemptFact {
+  providerRequestId: string;
+  providerAttemptId: string;
+  attempt: number;
+  purpose: 'agent' | 'contextCompaction';
+  phase: 'started' | 'completed' | 'failed' | 'retryWaiting';
+  error?: LocalAgentError;
+  retryAt?: string;
+}
+
+export interface RunFailureSnapshot {
+  revision: number;
+  phase: string;
+  error: LocalAgentError;
+  providerRequestId?: string;
+  providerAttemptIds: string[];
+  lastMessageId?: string;
+  toolRecordIds: string[];
+  pendingCallIds: string[];
+  queuedMessageIds: string[];
+  planRef: { planId: string; revision: number } | null;
+}
+
 
 /** Ordinary catalog and projection views deliberately omit canonicalRoot. */
 export interface WorkspaceBindingDisplay {
@@ -598,6 +638,8 @@ export interface EffectPreview {
 }
 
 export type SessionEvent =
+  | (SessionEventBase & { type: 'provider.attempt.updated'; runId: string; payload: ProviderAttemptFact })
+  | (SessionEventBase & { type: 'run.failure.recorded'; runId: string; payload: RunFailureSnapshot })
   | (SessionEventBase & {
       type: 'conversation.revised';
       payload: { commandId: string; messageId: string; fromSequence: number; throughSequence: number };
@@ -1233,6 +1275,8 @@ export interface QueuedInputProjection {
 }
 
 export interface SessionProjection {
+  providerAttempts?: Array<ProviderAttemptFact & { runId: string; updatedAt: string }>;
+  failureSnapshot?: RunFailureSnapshot;
   modelSettings: SessionModelSettings | null;
   schemaVersion: typeof SESSION_PROJECTION_VERSION;
   sessionId: string;
@@ -1342,6 +1386,8 @@ export interface ProviderHostedToolDefinition {
 }
 
 export interface ProviderRequest {
+  providerAttemptId?: string;
+  attempt?: number;
   protocolVersion: typeof LOCAL_AGENT_PROTOCOL_VERSION;
   requestId: string;
   sessionId: string;
@@ -1357,7 +1403,7 @@ export interface ProviderRequest {
   hostedTools: readonly ProviderHostedToolDefinition[];
 }
 
-export type ProviderEvent =
+export type ProviderEvent = { providerAttemptId?: string } & (
   | {
       schemaVersion: typeof PROVIDER_EVENT_VERSION;
       requestId: string;
@@ -1416,7 +1462,7 @@ export type ProviderEvent =
       requestId: string;
       type: 'failed';
       data: LocalAgentError;
-    };
+    });
 
 export interface ProviderPort {
   stream(request: ProviderRequest, signal: AbortSignal): AsyncIterable<ProviderEvent>;

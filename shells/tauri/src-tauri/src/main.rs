@@ -2,6 +2,8 @@
 
 #[path = "../../../shared/open_file.rs"]
 mod open_file;
+#[path = "../../../shared/file_reader.rs"]
+mod file_reader;
 
 #[path = "../../../shared/native_path_dialog/mod.rs"]
 mod native_path_dialog;
@@ -89,6 +91,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             native_path_dialog::deepcode_pick_path,
             open_file::deepcode_open_file,
+            file_reader::deepcode_read_local_file,
             open_file::deepcode_locate_path,
             deepcode_boot_target,
             deepcode_host_startup_status,

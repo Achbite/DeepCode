@@ -2314,3 +2314,12 @@
 }
 .local-agent__path-menu button { color: inherit; background: transparent; border: 0; padding: 8px 16px; cursor: pointer; }
 .local-agent__error pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.local-agent__error-details { overflow-wrap:anywhere; font-size:12px; line-height:1.6; }
+.local-agent__error-details summary { cursor:pointer; }
+.local-agent__error-details dl { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; }
+.local-agent__error-details dd { margin:0; }
+.local-agent__retry-status { padding:12px 0; color:var(--dc-muted); }
+.local-agent__recovery-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+.local-agent__recovery-actions button { font:inherit; color:inherit; background:var(--dc-surface); border:1px solid var(--dc-border); border-radius:8px; padding:6px 12px; cursor:pointer; }
+.local-agent__recovery-actions button:disabled { opacity:0.5; cursor:default; }

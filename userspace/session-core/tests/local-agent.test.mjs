@@ -2242,7 +2242,7 @@ test('deletion remains available while an unloadable actor rolls back cleanly', 
     },
   });
 
-  const snapshot = service.snapshot(sessionId);
+  const snapshot = service.submit(messageCommand(sessionId, 'command:open-for-delete', 'Start explicitly.'));
   await recoveryStarted;
   const deletion = service.deleteSession(sessionId);
   releaseRecoveryResolve();
@@ -2303,10 +2303,11 @@ test('an escaped Loop fault remains Session-local and releases its runtime', asy
   ));
   await waitUntil(() => failingActor.hasLoopFailure(), 'contained Loop failure');
   assert.equal(failingPreparation.released.length, 1);
-  await assert.rejects(
-    failingActor.snapshot(),
-    /session_loop_failed:fixture_journal_settlement_failed/u,
-  );
+  const failedHistory = await failingActor.snapshot();
+  assert.equal(failedHistory.failureSnapshot.error.message, 'fixture_journal_settlement_failed');
+  assert.ok(failedHistory.messages.length > 0, 'saved history stays readable after an escaped failure');
+  await assert.rejects(failingActor.submit(messageCommand(failingSessionId, 'command:failed-actor', 'Continue.')),
+    /session_loop_failed:fixture_journal_settlement_failed/u);
 
   const healthyPreparation = fakeRunPreparation();
   const healthyActor = actorWith(
@@ -4359,7 +4360,7 @@ test('plan preview streams formed fields at the same revision and publishes only
     const encoder = new TextEncoder();
     return new Response(new ReadableStream({ async start(controller) {
       try {
-        for await (const event of provider.stream(request, init.signal)) controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+        for await (const event of provider.stream(request, init.signal)) controller.enqueue(encoder.encode(`data: ${JSON.stringify({ ...event, providerAttemptId: request.providerAttemptId })}\n\n`));
         controller.close();
       } catch (error) { controller.error(error); }
     } }), { headers: { 'content-type': 'text/event-stream' } });
@@ -4551,5 +4552,103 @@ test('mixed Plan batches are rejected before any effect and can be corrected to 
     const events = await readEvents(journal, sessionId);
     assert.equal(events.filter((event) => event.type === 'plan.published').length, 1);
     assert.equal(events.some((event) => event.type === 'tool.requested' || event.type === 'plan.confirmed'), false);
+  }
+});
+
+test('transient provider attempts keep one request, discard partial output, and execute no partial tools', async (t) => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:network-retry';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const requests = [];
+  const failure = { code: 'provider_transport_failed', message: 'Connection reset.', diagnostics: {
+    source: 'providerTransport', phase: 'send', category: 'network', retryable: true,
+    isConnect: true, isTimeout: false, causes: [{ message: 'Connection reset by peer', kind: 'ConnectionReset', osCode: 104 }],
+  } };
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    requests.push(structuredClone(request));
+    if (requests.length === 1) {
+      yield providerEvent(request.requestId, 'text.delta', { text: 'Discard this incomplete answer.' });
+      yield providerEvent(request.requestId, 'tool.call', { callId: 'partial:call', name: 'partial_tool', input: {} });
+      yield providerEvent(request.requestId, 'failed', failure);
+    } else {
+      yield providerEvent(request.requestId, 'text.delta', { text: 'Recovered answer.' });
+      yield providerEvent(request.requestId, 'completed', {});
+    }
+  } }, emptyKernel(), fakeRunPreparation().port, 'retry');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:retry', 'Continue despite a network fluctuation.'));
+  const result = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].requestId, requests[1].requestId);
+  assert.notEqual(requests[0].providerAttemptId, requests[1].providerAttemptId);
+  assert.deepEqual(requests[0].messages, requests[1].messages);
+  assert.deepEqual(requests[0].tools, requests[1].tools);
+  assert.deepEqual(result.providerAttempts.map((value) => value.phase), ['retryWaiting', 'completed']);
+  assert.equal(result.messages.at(-1).content, 'Recovered answer.');
+  const events = await readEvents(journal, sessionId);
+  assert.equal(events.some((event) => event.type === 'tool.requested'), false);
+  assert.equal(events.filter((event) => event.type === 'context.composed').length, 1);
+  assert.deepEqual(events.find((event) => event.type === 'provider.attempt.updated' && event.payload.phase === 'failed').payload.error, failure);
+});
+
+test('five total network sends stop the run, retain a snapshot, and allow an explicit continuation', { timeout: 25000 }, async (t) => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:retry-exhausted';
+  await createSession(journal, sessionId);
+  let count = 0, recover = false;
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    count++;
+    yield providerEvent(request.requestId, recover ? 'text.delta' : 'failed', recover ? { text: 'Continued.' } : {
+      code: 'provider_transport_failed', message: 'Refused.', diagnostics: {
+        source: 'providerTransport', phase: 'send', category: 'network', retryable: true,
+        causes: [{ message: 'Connection refused', kind: 'ConnectionRefused' }],
+      },
+    });
+    if (recover) yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel(), fakeRunPreparation().port, 'exhausted');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:fail-five', 'Run.'));
+  const deadline = Date.now() + 21000;
+  let result;
+  while (Date.now() < deadline) {
+    result = await actor.snapshot();
+    if (['failed', 'indeterminate'].includes(result.run?.status)) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(count, 5);
+  assert.ok(['failed', 'indeterminate'].includes(result.run?.status));
+  assert.equal(result.failureSnapshot.providerAttemptIds.length, 5);
+  assert.equal(result.failureSnapshot.error.code, 'provider_transport_failed');
+  assert.equal(result.providerAttempts.at(-1).phase, 'failed');
+  const reader = new SessionService(journal, { async create() { throw new Error('history_read_must_not_start_runtime'); } });
+  t.after(() => reader.dispose());
+  assert.deepEqual(await reader.snapshot(sessionId), result);
+  recover = true;
+  await actor.submit(messageCommand(sessionId, 'command:continue-after-five', 'Continue.'));
+  const continued = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.equal(count, 6);
+  assert.equal(continued.messages.at(-1).content, 'Continued.');
+  assert.equal(continued.failureSnapshot, undefined);
+});
+
+test('protocol failures and cancellation never enter a network retry loop', async (t) => {
+  const { withProviderAttempts } = await import('../dist/local-agent/providerAttempts.js');
+  const { ProviderReportedFailure } = await import('../dist/local-agent/loopFailure.js');
+  for (const purpose of ['agent', 'contextCompaction']) {
+    const controller = new AbortController(), events = [];
+    let calls = 0;
+    const request = { requestId: 'request:single', sessionId: 'session:single', runId: 'run:single', purpose };
+    const deps = { nextId: () => 'attempt:single', updateAssistantDraft() {}, commit: async (event) => { events.push(event); } };
+    await assert.rejects(withProviderAttempts(request, deps, controller.signal, async () => {
+      calls++;
+      throw new ProviderReportedFailure('provider_invalid_json', 'Malformed frame.');
+    }), /Malformed frame/);
+    assert.equal(calls, 1);
+    assert.equal(events.some((event) => event.payload.phase === 'retryWaiting'), false);
+    const original = new ProviderReportedFailure('provider_transport_failed', 'Reset.', {
+      source: 'providerTransport', phase: 'send', category: 'network', retryable: true, causes: [],
+    });
+    calls = 0;
+    deps.commit = async (event) => { if (event.payload.phase === 'retryWaiting') controller.abort(new Error('user_cancelled')); };
+    await assert.rejects(withProviderAttempts(request, deps, controller.signal, async () => { calls++; throw original; }), /user_cancelled/);
+    assert.equal(calls, 1);
   }
 });
