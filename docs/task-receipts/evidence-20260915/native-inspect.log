@@ -1,8 +1,0 @@
-session: session:eb263eaa0e2af08fa2139336f3e9ec55
-工具 browser.page [completed]
-  browser:preview-2
-页面就绪且可见。现在输入 Reviewed。
-工具 browser.page [requested]
-需要你批准：执行 browser.page：browser:preview-2
-  - browser:preview-2
-继续：输入 /reply 1 允许或 /reply 2 拒绝。

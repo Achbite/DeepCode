@@ -1,9 +1,0 @@
-session: session:eb263eaa0e2af08fa2139336f3e9ec55
-工具 browser.service [completed]
-  browser:service:start
-服务已启动（`development-5`，PID 61626）。现在实际访问其 URL 验证可用性。
-工具 browser.page [requested]
-工具 browser.service [requested]
-需要你批准：执行 browser.page：browser:pages
-  - browser:pages
-继续：输入 /reply 1 允许或 /reply 2 拒绝。

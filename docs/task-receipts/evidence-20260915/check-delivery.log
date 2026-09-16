@@ -1,5 +1,0 @@
-    Checking deepcode-first-party-tools v0.5.60 (/workspace/crates/deepcode-first-party-tools)
-    Checking deepcode-kernel-runtime v0.5.60 (/workspace/crates/deepcode-kernel-runtime)
-    Checking deepcode-kernel-daemon v0.5.60 (/workspace/crates/deepcode-kernel-daemon)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.61s
-==[architecture]== 分层依赖检查通过

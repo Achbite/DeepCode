@@ -1,3 +1,0 @@
-Final macOS package: DeepCode-TUI.command --session session:9eb8d5ee274b0de310b949af8c7f0e9e
-PTY displayed PDF text, GitHub result, run [completed] and ready composer.
-Ctrl-C exited with code 0. No input was submitted.
