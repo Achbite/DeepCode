@@ -2,7 +2,7 @@ import { localizePlugin } from '../../pluginLocalization';
 import { nextEnabledIndex } from '../shared/keyboardNavigation';
 import type React from 'react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { PlanResponse, PluginSelectionInput } from '@deepcode/protocol';
+import type { PlanResponse, PluginSelectionInput, ProjectionMessage } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import { shouldOfferFocusCommand, shouldSubmitComposerKey } from './composerKeyboard';
@@ -46,16 +46,19 @@ export function useAgentComposer(
   )), pendingPlan) : null;
   const textDecision = Boolean(pendingPlan || pendingInteraction);
   const conversationKey = sessionId ?? `new:${draftProjectId ?? 'independent'}`;
+  const [messageEdit, setMessageEdit] = useState<{ sessionId: string; message: ProjectionMessage; revision: number } | null>(null);
+  const editingMessage = messageEdit?.sessionId === sessionId ? messageEdit : null;
   const composerStateKey = pendingPlan
     ? `${conversationKey}:plan:${pendingPlan.planId}:${pendingPlan.revision}`
     : pendingInteraction
       ? `${conversationKey}:interaction:${pendingInteraction.interactionId}`
-      : conversationKey;
+      : editingMessage ? `${conversationKey}:edit:${editingMessage.message.messageId}` : conversationKey;
   const loading = useLocalAgentStore((state) => state.loading);
   const submitting = useLocalAgentStore((state) => state.submitting);
   const catalogBusy = useLocalAgentStore((state) => state.catalogBusy);
   const error = useLocalAgentStore((state) => state.error);
   const sendMessage = useLocalAgentStore((state) => state.sendMessage);
+  const editMessage = useLocalAgentStore((state) => state.editMessage);
   const focusContext = useLocalAgentStore((state) => state.focusContext);
   const respondInteraction = useLocalAgentStore((state) => state.respondInteraction);
   const respondApproval = useLocalAgentStore((state) => state.respondApproval);
@@ -129,6 +132,19 @@ export function useAgentComposer(
     setPluginSelections(copy.pluginSelections);
     pendingComposerRestoreRef.current = { key, state: copy };
   };
+
+  const canEditMessage = Boolean(sessionId && projection && !loading && !submitting && !catalogBusy
+    && !pendingPlan && !pendingInteraction && !pendingApproval
+    && (!projection.run || ['completed', 'failed', 'cancelled', 'indeterminate'].includes(projection.run.status)));
+  const beginMessageEdit = (message: ProjectionMessage) => {
+    if (!canEditMessage || !sessionId || !projection || message.role !== 'user' || message.replyToInteraction || message.runId) return;
+    const key = `${conversationKey}:edit:${message.messageId}`;
+    // The ordinary composer keeps its own draft, attachments and selection.
+    setComposerStateForKey(key, { ...emptyComposerState(), draft: message.content,
+      selectionStart: message.content.length, selectionEnd: message.content.length, focused: true });
+    setMessageEdit({ sessionId, message, revision: projection.revision });
+  };
+  const cancelMessageEdit = () => { if (!submitting) setMessageEdit(null); };
 
   useLayoutEffect(() => {
     const previousKey = activeComposerStateKeyRef.current;
@@ -260,6 +276,10 @@ export function useAgentComposer(
       write: (_key, state) => setComposerStateForKey(submission.key, state),
       retainFailed: (_key, state) => setFailedDrafts((current) => ({ ...current, [submission.key]: [...(current[submission.key] ?? []), state] })),
       send: async () => {
+        if (editingMessage && !textDecision) {
+          await editMessage(editingMessage.message.messageId, submittedText, editingMessage.revision);
+          return;
+        }
         if (pendingPlan) {
           await respondPlan({ kind: 'requestRevision', text: submittedText });
           return;
@@ -276,7 +296,10 @@ export function useAgentComposer(
         }
       },
     });
-    if (sent && activeComposerStateKeyRef.current === submission.key) setAttachmentError(null);
+    if (sent && activeComposerStateKeyRef.current === submission.key) {
+      setAttachmentError(null);
+      if (editingMessage) setMessageEdit(null);
+    }
   };
 
   const beginComposition = () => {
@@ -347,7 +370,7 @@ export function useAgentComposer(
   const updateDraft = (value: string, cursor: number) => {
     pendingComposerRestoreRef.current = null;
     setDraft(value);
-    if (textDecision) return;
+    if (textDecision || editingMessage) return;
     setPluginSelections((current) => current.filter((selection) => (
       value.includes(`@${selection.label}`)
     )));
@@ -518,7 +541,7 @@ export function useAgentComposer(
   );
   const pasteText = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
     pendingComposerRestoreRef.current = null;
-    if (textDecision) return;
+    if (textDecision || editingMessage) return;
     const text = event.clipboardData.getData('text/plain');
     if (!isLongPastedText(text)) return;
     event.preventDefault();
@@ -536,9 +559,9 @@ export function useAgentComposer(
   const editPastedText = (inputId: string, text: string) => setPastedTexts((current) => current.map((item) => (
     item.inputId === inputId ? { ...item, inputId: nextPanelId('paste'), text } : item
   )));
-  const canSend = !loading && !submitting && (textDecision
+  const canSend = !loading && !submitting && (!editingMessage || canEditMessage) && (textDecision
     ? Boolean(draft.trim()) && (!pendingInteraction || pendingInteraction.allowFreeform)
-    : Boolean(draft.trim() || pastedTexts.length)
+    : Boolean(draft.trim() || pastedTexts.length || editingMessage?.message.filesystemReferences.length)
       && !modelSettingsBusy && !catalogBusy
       && Boolean(canCancel || profiles.some((profile) => profile.id === selectedProfileId && profile.enabled)));
   const showStopAction = canCancel && !textDecision && !draft.trim() && !pastedTexts.length;
@@ -551,6 +574,10 @@ export function useAgentComposer(
   };
 
   return {
+    editingMessage,
+    canEditMessage,
+    beginMessageEdit,
+    cancelMessageEdit,
     textDecision,
     pendingPlan,
     pendingScopeAddition,

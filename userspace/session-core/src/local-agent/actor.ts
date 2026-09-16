@@ -167,6 +167,8 @@ export class SessionActor {
         return await this.handleDirectoryIndexDetach(command);
       case 'message.submit':
         return await this.handleMessage(command);
+      case 'message.edit':
+        return await this.handleMessageEdit(command);
       case 'context.focus':
         return await this.handleFocus(command);
       case 'message.feedback.set':
@@ -296,11 +298,44 @@ export class SessionActor {
     return await this.handleRunInput(command, command.task, command.task);
   }
 
+  private async handleMessageEdit(command: Extract<ConversationCommand, { type: 'message.edit' }>): Promise<CommandReply> {
+    const snapshot = await this.loadSnapshot();
+    if (snapshot.state.run && !isTerminal(snapshot.state.run.status)) {
+      return await this.recordRejection(command, 'message_edit_run_active', '请等待当前任务结束后再编辑重跑。');
+    }
+    if (command.expectedRevision !== snapshot.state.revision) {
+      return await this.recordRejection(command, 'message_edit_stale', '会话内容已变化，请重新选择要编辑的消息。');
+    }
+    const original = snapshot.state.messages.find((message) => message.messageId === command.messageId);
+    const accepted = snapshot.events.find((event) => event.type === 'input.accepted'
+      && event.payload.messageId === command.messageId);
+    const started = snapshot.events.find((event) => event.type === 'run.started'
+      && event.payload.inputMessageId === command.messageId);
+    if (!original || original.role !== 'user' || original.replyToInteraction || !accepted || !started) {
+      return await this.recordRejection(command, 'message_edit_target_invalid', '只能编辑已结束任务的起始用户消息。');
+    }
+    const revised: Extract<NewSessionEvent, { type: 'conversation.revised' }> = {
+      type: 'conversation.revised', sessionId: this.sessionId,
+      payload: { commandId: command.commandId, messageId: command.messageId,
+        fromSequence: accepted.sequence, throughSequence: snapshot.state.revision },
+    };
+    return await this.handleRunInput({
+      schemaVersion: command.schemaVersion, type: 'message.submit', commandId: command.commandId,
+      sessionId: this.sessionId, text: command.text,
+      filesystemReferences: original.filesystemReferences,
+      pluginSelections: original.pluginSelections,
+      ...(original.guidanceReferences ? { guidanceReferences: original.guidanceReferences } : {}),
+      ...(command.hostBinding ? { hostBinding: command.hostBinding } : {}),
+    }, command.text, null, { command, revised });
+  }
+
   private async handleRunInput(
     command: Extract<ConversationCommand, { type: 'message.submit' | 'context.focus' }>,
     submittedText: string,
     focusTask: string | null,
+    edit?: { command: Extract<ConversationCommand, { type: 'message.edit' }>; revised: Extract<NewSessionEvent, { type: 'conversation.revised' }> },
   ): Promise<CommandReply> {
+    const journalCommand = edit?.command ?? command;
     if (!submittedText.trim() && (command.type === 'context.focus' || !command.filesystemReferences?.length)) {
       if (command.type === 'context.focus') {
         return await this.recordRejection(
@@ -309,7 +344,7 @@ export class SessionActor {
           '/focus 后必须提供新的任务正文。',
         );
       }
-      return await this.recordRejection(command, 'message_empty', '用户消息不能为空。');
+      return await this.recordRejection(journalCommand, 'message_empty', '用户消息不能为空。');
     }
     if (command.profileId !== undefined && !validProfileId(command.profileId)) {
       return await this.recordRejection(command, 'llm_profile_invalid', '模型 Profile 标识无效。');
@@ -377,7 +412,11 @@ export class SessionActor {
     // A final turn may already be releasing its runtime; wait for that owned task
     // before admitting the next run, without blocking other Sessions.
     if (this.#active) await this.#active.task;
-    const before = await this.loadSnapshot();
+    const current = await this.loadSnapshot();
+    const before = edit ? loopSnapshot(this.sessionId, [...current.journalEvents, {
+      ...edit.revised, schemaVersion: SESSION_EVENT_VERSION, eventId: `preflight:${command.commandId}`,
+      sequence: current.state.revision + 1, occurredAt: '1970-01-01T00:00:00.000Z',
+    }]) : current;
     if (before.state.run && !isTerminal(before.state.run.status)) {
       return await this.recordRejection(command, 'run_release_pending', '当前运行尚未完成资源释放。');
     }
@@ -412,6 +451,7 @@ export class SessionActor {
     });
     const runtimeSnapshot = retainSessionEnvironment(prepared.runtimeSnapshot, before.events);
     const events: NewSessionEvent[] = [
+      ...(edit ? [edit.revised] : []),
       {
         type: 'session.model-settings.updated',
         sessionId: this.sessionId,
@@ -479,7 +519,7 @@ export class SessionActor {
     let reply: CommandReply;
     try {
       reply = await this.commitCommand(
-        command,
+        journalCommand,
         events,
         acceptedReply(command),
       );
@@ -1102,12 +1142,11 @@ export class SessionActor {
     const read = this.#snapshotReads.then(async () => {
       const current = this.#snapshot ?? loopSnapshot(this.sessionId, this.#initialEvents ?? []);
       const added: SessionEvent[] = [];
-      let state = current.state;
-      for await (const event of this.#journal.read(this.sessionId, state.revision)) {
-        state = reduceSession(state, event);
-        added.push(event);
-      }
-      const snapshot = added.length ? { events: [...current.events, ...added], state } : current;
+      for await (const event of this.#journal.read(this.sessionId, current.state.revision)) added.push(event);
+      const snapshot = !added.length ? current : added.some((event) => event.type === 'conversation.revised')
+        ? loopSnapshot(this.sessionId, [...current.journalEvents, ...added])
+        : { journalEvents: [...current.journalEvents, ...added], events: [...current.events, ...added],
+          state: added.reduce(reduceSession, current.state) };
       this.#snapshot = snapshot;
       this.#initialEvents = undefined;
       return snapshot;

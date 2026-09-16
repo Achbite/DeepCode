@@ -27,6 +27,82 @@ import {
   waitUntil,
 } from '../../session-core/tests/local-agent-fixtures.mjs';
 
+test('GUI message editing submits a revision-bound Session command and reconciles its projection', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:gui-message-edit';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    yield providerEvent(request.requestId, 'text.delta', { text: 'Completed answer.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel(), fakeRunPreparation().port, 'gui-message-edit');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:original', 'Original message.'));
+  const initial = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  const commands = [];
+  installGuiFetch(t, async (url, init) => {
+    if (url.pathname.endsWith('/commands')) {
+      const command = JSON.parse(init.body);
+      commands.push(command);
+      return Response.json({ ok: true, data: await actor.submit(command) });
+    }
+    if (url.pathname.endsWith('/projection')) return Response.json({ ok: true, data: await actor.snapshot() });
+    throw new Error(`Unexpected request: ${url.pathname}`);
+  });
+  const store = await loadGuiModelStore(t);
+  store.setState({ sessionId, projection: initial, loading: false });
+  await store.getState().editMessage(initial.messages[0].messageId, 'Edited text.', initial.revision);
+  assert.equal(commands.length, 1);
+  assert.equal(commands[0].type, 'message.edit');
+  assert.equal(commands[0].messageId, initial.messages[0].messageId);
+  assert.equal(commands[0].expectedRevision, initial.revision);
+  assert.equal(commands[0].text, 'Edited text.');
+  assert.deepEqual(store.getState().projection.messages.filter((message) => message.role === 'user').map((message) => message.content), ['Edited text.']);
+  assert.equal(store.getState().submitting, false);
+  await waitForProjection(actor, (value) => value.run?.status === 'completed');
+});
+
+test('permission requests remain distinct transcript records after the tool completes', async (t) => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:permission-history';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation({ tools: [{
+    toolBindingRef: 'binding:permission', name: 'web.fetch', description: 'Fetch', origin: 'coreBuiltin', availability: 'callable',
+    possibleEffects: ['network'], inputSchema: { type: 'object', properties: { url: { type: 'string' } } },
+  }] });
+  let calls = 0;
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    if (++calls === 1) yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:permission',
+      name: request.tools.find((tool) => tool.inputSchema.properties?.url).name, input: { url: 'https://example.test' } });
+    else yield providerEvent(request.requestId, 'text.delta', { text: 'Finished.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel({ async execute(request) {
+    if (!request.nonWorkspaceAuthority) return { schemaVersion: 'deepcode.kernel-reply', type: 'tool.execution',
+      requestId: request.requestId, callId: request.callId, status: 'approvalRequired', approvalId: 'approval:history',
+      preview: { summary: 'Allow access to https://example.test?', effects: ['external'], logicalTargets: ['https://example.test'] } };
+    const reply = completedExecutionReply(request, { content: 'Result' });
+    reply.record.preparedEffect.logicalTargets = [request.input.url];
+    return reply;
+  } }), preparation.port, 'permission-history');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:start', 'Fetch the page.'));
+  const waiting = await waitForProjection(actor, (state) => state.pendingApproval !== null);
+  const { projectionItems } = await loadGuiModule(t, '/src/components/local-agent/conversationItems.ts');
+  const pendingRows = projectionItems(await decodeGuiProjection(waiting));
+  const record = pendingRows.find((row) => row.type === 'approval');
+  assert.equal(record.value.label, 'Allow access to https://example.test?');
+  assert.equal(record.value.status, 'waiting');
+  assert.equal(pendingRows.at(-1).type, 'toolGroup');
+  const { approvalId, callId, runId } = waiting.pendingApproval;
+  await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'approval.respond', commandId: 'command:allow',
+    sessionId, approvalId, callId, runId, decision: 'allow' });
+  const completed = await waitForProjection(actor, (state) => state.run?.status === 'completed');
+  const rows = projectionItems(await decodeGuiProjection(completed));
+  const accepted = rows.find((row) => row.type === 'approval');
+  assert.equal(accepted.value.activityId, record.value.activityId);
+  assert.equal(accepted.value.status, 'completed');
+  assert.equal(completed.pendingApproval, null);
+  assert.equal(rows.filter((row) => row.type === 'approval').length, 1);
+});
+
 test('UI plugin replacement releases styles and effects and retires failed renderers', async (t) => {
   const { UiPluginRuntime } = await loadGuiModule(t, '/src/ui-plugins/runtime.ts');
   const styles = new Set();

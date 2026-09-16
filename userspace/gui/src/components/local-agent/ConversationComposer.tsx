@@ -124,6 +124,11 @@ export function ConversationComposer({
       <div
         className={`local-agent__composer local-agent__composer--${inputMode}`}
         onKeyDown={(event) => {
+          if (composer.editingMessage && event.key === 'Escape' && !event.repeat
+            && !event.nativeEvent.isComposing && !event.defaultPrevented) {
+            event.preventDefault();
+            composer.cancelMessageEdit();
+          }
           if (pendingPlan && event.target !== textareaRef.current && event.key === 'Escape'
             && !event.repeat && !event.nativeEvent.isComposing && !event.defaultPrevented) {
             event.preventDefault();
@@ -139,6 +144,17 @@ export function ConversationComposer({
       >
         <ComposerDecisionPanels language={language} composer={composer} />
         {!pendingApproval && <>
+        {composer.editingMessage && !composer.textDecision && <>
+          <div className="local-agent__message-edit-notice">
+            <div><strong>{t(language, 'agent.message.edit')}</strong><p>{t(language, 'agent.message.editDescription')}</p></div>
+            <button type="button" disabled={submitting} onClick={composer.cancelMessageEdit} aria-keyshortcuts="Escape">
+              {t(language, 'agent.message.cancelEdit')}
+            </button>
+          </div>
+          <div className="local-agent__message-edit-references">
+            {composer.editingMessage.message.filesystemReferences.map((reference) => <span key={reference.referenceId}>{reference.displayName}</span>)}
+          </div>
+        </>}
         {pluginPickerOpen && (
           <div
             ref={pluginPickerRef}
@@ -226,7 +242,7 @@ export function ConversationComposer({
           rows={compactInput ? 1 : 3}
           placeholder={t(language, pendingPlan ? 'agent.composer.placeholder.plan'
             : pendingInteraction ? 'agent.composer.placeholder.interaction' : 'agent.composer.placeholder.task')}
-          disabled={Boolean(pendingInteraction && !pendingInteraction.allowFreeform)}
+          disabled={Boolean(pendingInteraction && !pendingInteraction.allowFreeform || composer.editingMessage && submitting)}
           onChange={(event) => updateDraft(
             event.target.value,
             event.target.selectionStart ?? event.target.value.length,
@@ -288,7 +304,7 @@ export function ConversationComposer({
           </div>
         )}
         <div className="local-agent__composer-footer">
-          {!composer.textDecision && <div className="local-agent__composer-tools">
+          {!composer.textDecision && !composer.editingMessage && <div className="local-agent__composer-tools">
             <div ref={attachmentControlRef} className="local-agent__attachment-control">
               <button
                 type="button"
@@ -349,7 +365,7 @@ export function ConversationComposer({
             <ComposerPermissionControl language={language} composer={composer} />
           </div>}
           <div className="local-agent__composer-actions">
-            {!composer.textDecision && <SessionModelSelector
+            {!composer.textDecision && !composer.editingMessage && <SessionModelSelector
               language={language}
               profiles={profiles}
               selectedProfileId={selectedProfileId}
@@ -389,17 +405,17 @@ export function ConversationComposer({
               ><DeepCodeShellIcon name="stop" /></button>}
               {!showStopAction && <button
                 type="button"
-                className={`local-agent__send${composer.textDecision ? ' local-agent__send--decision' : ''}`}
+                className={`local-agent__send${composer.textDecision || composer.editingMessage ? ' local-agent__send--decision' : ''}`}
                 aria-label={submitting
                     ? t(language, 'agent.composer.sending')
                     : pendingInteraction ? (language === 'zh-CN' ? '回答' : 'Answer')
                       : pendingPlan ? (language === 'zh-CN' ? '提交修改意见' : 'Request changes')
-                        : t(language, 'agent.composer.send')}
+                        : t(language, composer.editingMessage ? 'agent.message.regenerate' : 'agent.composer.send')}
                 title={t(language, 'agent.composer.sendEnter')}
                 disabled={!canSend}
                 onClick={() => void submitDraft()}
               >
-                {composer.textDecision ? t(language, 'agent.composer.send') : <DeepCodeShellIcon name="arrowUp" />}
+                {composer.editingMessage ? t(language, 'agent.message.regenerate') : composer.textDecision ? t(language, 'agent.composer.send') : <DeepCodeShellIcon name="arrowUp" />}
               </button>}
             </div>
           </div>

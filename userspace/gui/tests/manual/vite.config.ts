@@ -8,5 +8,6 @@ export default defineConfig({
     rollupOptions: { input: {
       composer: fileURLToPath(new URL('./composer.html', import.meta.url)),
       viewport: fileURLToPath(new URL('./viewport.html', import.meta.url)),
+      messages: fileURLToPath(new URL('./messages.html', import.meta.url)),
     } } },
 });

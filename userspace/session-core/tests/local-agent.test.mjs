@@ -27,6 +27,81 @@ import { responseFrames } from '../dist/responseFrames.js';
 import { environmentInstruction } from '../dist/local-agent/sessionEnvironment.js';
 import { createProviderToolAliases } from '../dist/local-agent/providerToolCodec.js';
 
+test('editing a settled message replaces active history while retaining journal facts and attachments', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:message-edit';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation();
+  const requests = [];
+  let releaseEdit;
+  const editGate = new Promise((resolve) => { releaseEdit = resolve; });
+  t.after(() => releaseEdit());
+  const provider = { async *stream(request) {
+    requests.push(structuredClone(request));
+    if (requests.length === 4) await editGate;
+    yield providerEvent(request.requestId, 'text.delta', { text: `Answer ${requests.length}.` });
+    yield providerEvent(request.requestId, 'completed', { usage: {
+      inputTokens: 100, outputTokens: 20, contextWindowTokens: 4_096,
+      cacheReadInputTokens: 75, cacheMissInputTokens: 25,
+    } });
+  } };
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'message-edit');
+  t.after(() => actor.dispose());
+  const reference = { referenceId: 'reference:original', workspaceId: workspaceBinding.workspaceId,
+    logicalPath: 'notes.txt', displayName: 'notes.txt', kind: 'file', mediaType: 'text/plain', byteLength: 8 };
+  for (const [index, text] of ['Keep this first question.', 'Replace this second question.', 'Remove this third question.'].entries()) {
+    await actor.submit({ ...messageCommand(sessionId, `command:edit-seed:${index}`, text),
+      ...(index === 1 ? { filesystemReferences: [reference] } : {}) });
+    await waitForProjection(actor, (value) => value.run?.status === 'completed' && requests.length === index + 1);
+  }
+  const original = await actor.snapshot();
+  const saved = await readEvents(journal, sessionId);
+  const statusReader = new SessionService(journal, { async create() { throw new Error('status_read_must_not_open_an_actor'); } });
+  t.after(() => statusReader.dispose());
+  await statusReader.statuses([sessionId]);
+  const command = { schemaVersion: 'deepcode.command.v3', type: 'message.edit', sessionId,
+    commandId: 'command:edit', messageId: original.messages[2].messageId, expectedRevision: original.revision, text: 'Revised second question.' };
+  const stale = await actor.submit({ ...command, commandId: 'command:stale', expectedRevision: original.revision - 1 });
+  assert.equal(stale.error.code, 'message_edit_stale');
+  const invalid = await actor.submit({ ...command, commandId: 'command:invalid', messageId: original.messages[1].messageId });
+  assert.equal(invalid.error.code, 'message_edit_target_invalid');
+  const reply = await actor.submit(command);
+  assert.equal(reply.status, 'accepted');
+  await waitUntil(() => requests.length === 4, 'edited provider input');
+  const active = await actor.submit({ ...command, commandId: 'command:active' });
+  assert.equal(active.error.code, 'message_edit_run_active');
+  releaseEdit();
+  const edited = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.deepEqual(edited.messages.map((message) => message.content), ['Keep this first question.', 'Answer 1.', 'Revised second question.', 'Answer 4.']);
+  assert.deepEqual(edited.messages[2].filesystemReferences, [reference]);
+  assert.equal(edited.tokenUsage.providerCallCount, 4, 'superseded calls still consumed Provider usage');
+  assert.equal(edited.tokenUsage.inputTokens, 400);
+  assert.equal(edited.tokenUsage.cacheReadInputTokens, 300);
+  const input = JSON.stringify(requests[3].messages);
+  assert.ok(input.includes('Keep this first question.'));
+  assert.ok(input.includes('Revised second question.'));
+  assert.equal(/Replace this second|Remove this third|Answer 2\.|Answer 3\./u.test(input), false);
+  const after = await readEvents(journal, sessionId);
+  assert.deepEqual(after.slice(0, saved.length), saved, 'the original journal is never rewritten');
+  assert.equal(after.filter((event) => event.type === 'conversation.revised').length, 1);
+  assert.equal((await actor.submit(command)).status, 'replayed');
+  assert.equal(requests.length, 4, 'replayed edits cannot start another run');
+  assert.deepEqual((await statusReader.statuses([sessionId]))[0].run, { runId: edited.run.runId, status: 'completed' });
+  const read = await statusReader.read({ sessionId, view: 'messages' });
+  assert.equal(/Replace this second|Remove this third|Answer 2\.|Answer 3\./u.test(JSON.stringify(read)), false);
+  assert.deepEqual(projectSession(loopSnapshot(sessionId, after).state), edited);
+  await actor.dispose();
+  const restored = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'message-edit-reopened');
+  t.after(() => restored.dispose());
+  await restored.recover();
+  assert.deepEqual(await restored.snapshot(), edited);
+  await restored.submit({ ...command, commandId: 'command:edit-again', messageId: edited.messages[2].messageId,
+    expectedRevision: edited.revision, text: 'Second revision.' });
+  const second = await waitForProjection(restored, (value) => value.run?.status === 'completed' && requests.length === 5);
+  assert.deepEqual(second.messages.map((message) => message.content), ['Keep this first question.', 'Answer 1.', 'Second revision.', 'Answer 5.']);
+  assert.equal(second.tokenUsage.inputTokens, 500);
+});
+
 test('browser authorization scope survives reducer snapshots and projection copies', () => {
   const sessionId = 'session:browser-scope';
   const event = { type: 'approval.requested', sessionId, runId: 'run:browser', callId: 'call:browser',
@@ -50,6 +125,11 @@ test('browser authorization scope survives reducer snapshots and projection copi
     payload: { approvalId: 'approval:browser', commandId: 'command:allow', authorityId: 'authority:browser', decision: 'allow' },
   });
   assert.equal(projectSession(resolved).pendingApproval, null);
+  assert.equal(projectSession(resolved).activities.find((activity) => activity.kind === 'approval').status, 'completed');
+  const denied = reduceSession(state, { ...event, type: 'approval.resolved', sequence: 4, eventId: 'event:deny',
+    payload: { approvalId: 'approval:browser', commandId: 'command:deny', authorityId: 'authority:denied', decision: 'deny' },
+  });
+  assert.equal(projectSession(denied).activities.find((activity) => activity.kind === 'approval').status, 'denied');
   assert.equal(state.pendingApproval.preview.authorizationScope, 'sessionBrowser');
 });
 

@@ -237,6 +237,11 @@ export async function submitLocalAgentCommand(
   command: ConversationCommand,
   signal?: AbortSignal,
 ): Promise<CommandReply> {
+  if (command.type === 'message.edit') {
+    const { nativeHostBinding } = await import('./nativeBrowser');
+    const hostBinding = await nativeHostBinding();
+    if (hostBinding) command = { ...command, hostBinding };
+  }
   if (command.type === 'message.submit' || command.type === 'context.focus') {
     if (command.type === 'context.focus' || !command.runId) {
       const { nativeHostBinding } = await import('./nativeBrowser');
@@ -594,7 +599,7 @@ function timelineReferencesAreValid(
           addUnique(activityIds, activityId)
           && activities.some((activity) => (
             activity.activityId === activityId
-            && ['tool', 'providerHosted'].includes(String(activity.kind))
+            && ['tool', 'providerHosted', 'approval'].includes(String(activity.kind))
           ))
         ));
       default:
@@ -608,7 +613,7 @@ function timelineReferencesAreValid(
     && narrativeIds.size === narratives.length
     && planRefs.size === plans.length
     && activityIds.size === activities.filter((activity) => (
-      ['tool', 'providerHosted'].includes(String(activity.kind))
+      ['tool', 'providerHosted', 'approval'].includes(String(activity.kind))
     )).length;
 }
 

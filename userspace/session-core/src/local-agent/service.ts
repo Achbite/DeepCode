@@ -94,6 +94,10 @@ export class SessionService implements ConversationPort {
       // Sidebar reads must not open Actors or resume waiting/running conversations.
       let state = this.#statusStates.get(sessionId) ?? emptySessionState(sessionId);
       for await (const event of this.journal.read(sessionId, state.revision)) {
+        if (event.type === 'conversation.revised') {
+          state = recoverSession(sessionId, await readSessionEvents(this.journal, sessionId));
+          break;
+        }
         state = reduceSession(state, event);
       }
       if (state.revision === 0) throw new Error('session_not_found');

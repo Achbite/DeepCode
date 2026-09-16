@@ -134,10 +134,6 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
             <code>{pendingApproval.preview.summary}</code>
           </pre>}
           <div className="local-agent__decision-controls">
-          {runHostShell && <button type="button" disabled={submitting}
-            title={language === 'zh-CN' ? '本轮内相同工作目录和执行环境的宿主 Shell' : 'Host shell in this workspace and environment for this run'}
-            onClick={() => void answerApproval('allow', 'runHostShell')}
-          >{language === 'zh-CN' ? '允许本轮' : 'Allow this run'}</button>}
           {(sessionBrowser || pendingApproval.preview.effects.length > 0
             || pendingApproval.preview.logicalTargets.length > 0) ? (
             <details className="local-agent__decision-scope">
@@ -173,7 +169,11 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
               </dl>
             </details>
           ) : <span />}
-          <div className="local-agent__decision-actions">
+          <div className={`local-agent__decision-actions${runHostShell ? ' local-agent__decision-actions--run' : ''}`}>
+            {runHostShell && <button type="button" className="local-agent__decision-run" disabled={submitting}
+              title={language === 'zh-CN' ? '本轮内相同工作目录和执行环境的宿主 Shell' : 'Host shell in this workspace and environment for this run'}
+              onClick={() => void answerApproval('allow', 'runHostShell')}
+            >{language === 'zh-CN' ? '允许本轮' : 'Allow this run'}</button>}
             <button
               type="button"
               aria-label={t(language, 'agent.approval.deny')}

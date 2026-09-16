@@ -14,6 +14,7 @@ export type ProjectionItem =
       value: SessionProjection['narratives'][number];
     }
   | { type: 'plan'; sequence: number; value: SessionProjection['plans'][number] }
+  | { type: 'approval'; sequence: number; value: ActivityProjection }
   | {
       type: 'toolGroup';
       sequence: number;
@@ -121,7 +122,20 @@ export function projectionItems(projection: SessionProjection | null): Projectio
     }
   });
   const grouped: ProjectionItem[] = [];
-  for (const item of items) {
+  const displayItems = items.flatMap((item): ProjectionItem[] => {
+    if (item.type !== 'toolGroup' || !item.values.some((activity) => activity.kind === 'approval')) return [item];
+    const rows: ProjectionItem[] = [];
+    for (const activity of item.values) {
+      if (activity.kind === 'approval') rows.push({ type: 'approval', sequence: activity.sequence, value: activity });
+      else {
+        const previous = rows.at(-1);
+        if (previous?.type === 'toolGroup') previous.values.push(activity);
+        else rows.push({ ...item, groupId: `${item.groupId}:${activity.activityId}`, values: [activity] });
+      }
+    }
+    return rows;
+  });
+  for (const item of displayItems) {
     const previous = grouped.at(-1);
     if (item.type === 'toolGroup' && previous?.type === 'toolGroup'
       && item.values[0]?.runId === previous.values[0]?.runId) {

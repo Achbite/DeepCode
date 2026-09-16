@@ -207,6 +207,11 @@ function decodeCommand(value: unknown): ConversationCommand {
         || !validHostBinding(value.hostBinding)
       ) throw new Error('conversation_command_invalid');
       return value as unknown as ConversationCommand;
+    case 'message.edit':
+      if (!hasExactKeys(value, ['schemaVersion', 'type', 'commandId', 'sessionId', 'messageId', 'expectedRevision', 'text'], ['hostBinding'])
+        || !validId(value.messageId) || !positiveInteger(value.expectedRevision)
+        || typeof value.text !== 'string' || !validHostBinding(value.hostBinding)) throw new Error('conversation_command_invalid');
+      return value as unknown as ConversationCommand;
     case 'message.feedback.set':
       if (
         !hasExactKeys(value, [

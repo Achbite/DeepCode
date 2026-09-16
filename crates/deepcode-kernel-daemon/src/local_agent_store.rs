@@ -538,6 +538,12 @@ impl LocalAgentJournal {
                AND json_extract(requested.payload_json, '$.approvalId')=json_extract(resolved.payload_json, '$.approvalId')
              WHERE resolved.session_id=?1 AND resolved.event_type='approval.resolved'
                AND json_extract(requested.payload_json, '$.preview.authorizationScope')='sessionBrowser'
+               AND NOT EXISTS (
+                 SELECT 1 FROM session_events revision
+                 WHERE revision.session_id=resolved.session_id AND revision.event_type='conversation.revised'
+                   AND (resolved.sequence BETWEEN json_extract(revision.payload_json, '$.fromSequence') AND json_extract(revision.payload_json, '$.throughSequence')
+                     OR requested.sequence BETWEEN json_extract(revision.payload_json, '$.fromSequence') AND json_extract(revision.payload_json, '$.throughSequence'))
+               )
              ORDER BY resolved.sequence DESC LIMIT 1",
             params![session_id],
             |row| row.get(0),
@@ -745,6 +751,7 @@ fn validate_new_event(
         ));
     }
     let allowed = [
+        "conversation.revised",
         "session.created",
         "session.model-settings.updated",
         "session.directory-index.attached",
@@ -796,6 +803,7 @@ fn validate_new_event(
     let needs_run = !matches!(
         event_type,
         "session.created"
+            | "conversation.revised"
             | "session.model-settings.updated"
             | "session.directory-index.attached"
             | "session.directory-index.detached"
@@ -900,6 +908,24 @@ fn validate_new_event(
             exact_object(&payload["error"], &["code", "message"], &[])?;
             required_string(&payload["error"], "code")?;
             required_string(&payload["error"], "message")?;
+        }
+        "conversation.revised" => {
+            let payload = &event["payload"];
+            exact_object(
+                payload,
+                &["commandId", "messageId", "fromSequence", "throughSequence"],
+                &[],
+            )?;
+            validate_id("commandId", required_string(payload, "commandId")?)?;
+            validate_id("messageId", required_string(payload, "messageId")?)?;
+            let from = payload["fromSequence"].as_u64().unwrap_or(0);
+            let through = payload["throughSequence"].as_u64().unwrap_or(0);
+            if from < 2 || through < from || through > 9_007_199_254_740_991 {
+                return Err(LocalAgentStoreError::new(
+                    "conversation_revision_range_invalid",
+                    "编辑重跑范围无效。",
+                ));
+            }
         }
         "session.model-settings.updated" => {
             let payload = event.get("payload").expect("validated payload");
@@ -1816,6 +1842,22 @@ fn validate_event_facts(
         return Ok(());
     }
     let session_id = required_string(event, "sessionId")?;
+    if event_type == "conversation.revised" {
+        let payload = &event["payload"];
+        let valid: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND sequence=?2
+               AND event_type='input.accepted' AND run_id IS NULL AND json_extract(payload_json, '$.messageId')=?3)
+             AND (SELECT MAX(sequence) FROM session_events WHERE session_id=?1)=?4",
+            params![session_id, payload["fromSequence"].as_i64(), payload["messageId"].as_str(), payload["throughSequence"].as_i64()],
+            |row| row.get(0),
+        ).map_err(sql_error("conversation_revision_fact_read_failed"))?;
+        if !valid {
+            return Err(LocalAgentStoreError::new(
+                "conversation_revision_range_invalid",
+                "编辑重跑范围与当前 journal 不一致。",
+            ));
+        }
+    }
     let provider_message = event_type == "message.committed"
         && event
             .get("payload")
@@ -3128,6 +3170,7 @@ fn validate_command(command: &Value) -> Result<(), LocalAgentStoreError> {
         "session.directory-index.attach",
         "session.directory-index.detach",
         "message.submit",
+        "message.edit",
         "context.focus",
         "message.feedback.set",
         "run.cancel",
@@ -3155,6 +3198,40 @@ fn validate_command(command: &Value) -> Result<(), LocalAgentStoreError> {
             &[],
         )?;
         validate_model_settings(&command["settings"])?;
+    }
+    if command_type == "message.edit" {
+        exact_object(
+            command,
+            &[
+                "schemaVersion",
+                "type",
+                "commandId",
+                "sessionId",
+                "messageId",
+                "expectedRevision",
+                "text",
+            ],
+            &["hostBinding"],
+        )?;
+        validate_id("messageId", required_string(command, "messageId")?)?;
+        if !command["text"].is_string()
+            || !command["expectedRevision"]
+                .as_u64()
+                .is_some_and(|revision| revision > 0 && revision <= 9_007_199_254_740_991)
+        {
+            return Err(LocalAgentStoreError::new(
+                "session_command_invalid",
+                "编辑正文或会话 revision 无效。",
+            ));
+        }
+        if let Some(binding) = command.get("hostBinding") {
+            exact_object(binding, &["hostInstanceId", "windowLabel"], &[])?;
+            validate_id(
+                "hostInstanceId",
+                required_string(binding, "hostInstanceId")?,
+            )?;
+            validate_id("windowLabel", required_string(binding, "windowLabel")?)?;
+        }
     }
     if command_type == "message.feedback.set" {
         exact_object(
@@ -5621,6 +5698,71 @@ mod tests {
         );
         drop(reopened);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn revised_conversation_excludes_browser_grants_but_keeps_journal_facts() {
+        let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
+        journal
+            .create_session("session:loop", "Loop", &json!([]), Some("profile:test"))
+            .unwrap();
+        journal.append(&json!({"type":"input.accepted","sessionId":"session:loop",
+            "payload":{"commandId":"command:first","messageId":"message:loop","text":"First message"}})).unwrap();
+        append_model_settings_and_rejected_call(&journal);
+        let grant = |id: &str| {
+            journal.append(&json!({"type":"approval.requested", "sessionId":"session:loop", "runId":"run:loop", "callId":id,
+                "payload":{"approvalId":id,"preview":{"summary":"Use browser","effects":["external"],"logicalTargets":["browser:test"],"authorizationScope":"sessionBrowser"}}})).unwrap();
+            journal.append(&json!({"type":"approval.resolved", "sessionId":"session:loop", "runId":"run:loop", "callId":id,
+                "payload":{"approvalId":id,"commandId":id,"authorityId":id,"decision":"allow"}})).unwrap();
+        };
+        grant("call:before");
+        let input = journal.append(&json!({"type":"input.accepted","sessionId":"session:loop",
+            "payload":{"commandId":"command:input","messageId":"message:edit","text":"Edit this message"}})).unwrap();
+        grant("call:after");
+        assert_eq!(
+            journal
+                .session_browser_authority("session:loop")
+                .unwrap()
+                .as_deref(),
+            Some("call:after")
+        );
+        let before = journal.read_events("session:loop", 0).unwrap();
+        let edit_command = json!({"schemaVersion":COMMAND_VERSION,"type":"message.edit","sessionId":"session:loop",
+            "commandId":"command:edit","messageId":"message:edit","expectedRevision":before.last().unwrap()["sequence"],"text":"Revised message"});
+        journal.commit_command(&json!({"command":edit_command,
+            "events":[{"type":"conversation.revised","sessionId":"session:loop",
+                "payload":{"commandId":"command:edit","messageId":"message:edit","fromSequence":input["sequence"],"throughSequence":before.last().unwrap()["sequence"]}}],
+            "reply":{"schemaVersion":REPLY_VERSION,"sessionId":"session:loop","commandId":"command:edit","status":"accepted","revision":0}
+        })).unwrap();
+        assert_eq!(
+            journal
+                .read_command("session:loop", "command:edit")
+                .unwrap()
+                .unwrap()["command"],
+            edit_command
+        );
+        assert_eq!(
+            journal
+                .session_browser_authority("session:loop")
+                .unwrap()
+                .as_deref(),
+            Some("call:before")
+        );
+        assert_eq!(
+            &journal.read_events("session:loop", 0).unwrap()[..before.len()],
+            before.as_slice()
+        );
+        let first_input = before
+            .iter()
+            .find(|event| event["type"] == "input.accepted")
+            .unwrap();
+        let latest = journal.read_events("session:loop", 0).unwrap();
+        journal.append(&json!({"type":"conversation.revised","sessionId":"session:loop",
+            "payload":{"commandId":"command:edit-first","messageId":first_input["payload"]["messageId"],"fromSequence":first_input["sequence"],"throughSequence":latest.last().unwrap()["sequence"]}})).unwrap();
+        assert_eq!(
+            journal.session_browser_authority("session:loop").unwrap(),
+            None
+        );
     }
 
     #[test]

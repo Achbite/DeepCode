@@ -1,4 +1,5 @@
 import { providerTextStreamId } from './streamIdentity.js';
+import { activeConversationEvents } from './conversationHistory.js';
 import type {
   ActivityProjection,
   AssistantDraftProjection,
@@ -671,7 +672,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         || next.pendingApproval.runId !== event.runId
       ) throw new Error('approval_request_missing');
       next.pendingApproval = null;
-      settleActivity(next, approvalActivityId(event.payload.approvalId), 'completed');
+      settleActivity(next, approvalActivityId(event.payload.approvalId), event.payload.decision === 'allow' ? 'completed' : 'denied');
       resumeRun(next, event.runId);
       break;
     case 'tool.input-rejected':
@@ -1122,7 +1123,24 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
 }
 
 export function recoverSession(sessionId: string, events: readonly SessionEvent[]): SessionState {
-  return events.reduce(reduceSession, emptySessionState(sessionId));
+  for (const [index, event] of events.entries()) {
+    if (event.sessionId !== sessionId) throw new Error('session_event_identity_mismatch');
+    if (event.sequence !== index + 1) throw new Error('session_event_sequence_gap');
+  }
+  let state = emptySessionState(sessionId);
+  const active = activeConversationEvents(events);
+  for (const event of active) {
+    // Only explicitly superseded journal ranges may create a gap in active history.
+    state = reduceSession({ ...state, revision: event.sequence - 1 }, event);
+  }
+  // Editing changes model history, but cannot erase usage already incurred.
+  const activeSequences = new Set(active.map((event) => event.sequence));
+  for (const event of events) {
+    if (activeSequences.has(event.sequence)) continue;
+    if (event.type === 'provider.turn.settled') state.tokenUsage = withProviderCompletion(state.tokenUsage);
+    if (event.type === 'context.updated') state.tokenUsage = withProviderUsage(state.tokenUsage, event.payload);
+  }
+  return { ...state, revision: events.at(-1)?.sequence ?? 0 };
 }
 
 export function projectSession(
@@ -1462,7 +1480,7 @@ function projectTimeline(state: SessionState): SessionProjection['timeline'] {
       const activity = Object.values(state.activities).find((candidate) => (
         candidate.kind === 'tool' && candidate.callId === callId
       ));
-      return activity ? [activity] : [];
+      return activity ? [...approvalActivities(state, callId), activity] : [];
     });
     if (toolActivities.length > 0) {
       items.push({
@@ -1569,13 +1587,19 @@ function projectOrderedProviderTurnTimeline(
         const activity = Object.values(state.activities).find((candidate) => (
           candidate.kind === 'tool' && candidate.callId === block.callId
         ));
-        if (activity) groupedActivities.push(activity);
+        if (activity) groupedActivities.push(...approvalActivities(state, block.callId), activity);
         break;
       }
     }
   }
   flushActivities();
   return items;
+}
+
+function approvalActivities(state: SessionState, callId: string): ActivityProjection[] {
+  return Object.values(state.activities)
+    .filter((activity) => activity.kind === 'approval' && activity.callId === callId)
+    .sort((left, right) => left.sequence - right.sequence);
 }
 
 function cloneApproval(

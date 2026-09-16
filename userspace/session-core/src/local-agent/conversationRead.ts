@@ -3,6 +3,7 @@ import type {
 } from '@deepcode/protocol';
 import { reasoningReadItem } from './reasoningRead.js';
 import { recoverSession } from './reducer.js';
+import { activeConversationEvents } from './conversationHistory.js';
 
 const encoder = new TextEncoder();
 const MAX_PAGE_BYTES = 48 * 1024;
@@ -33,8 +34,9 @@ export async function readSessionEvents(journal: CommandJournalPort, sessionId: 
 
 export async function readConversation(journal: CommandJournalPort, input: ConversationReadQuery): Promise<ConversationReadResult> {
   const query = decodeConversationReadQuery(input);
-  const events = await readSessionEvents(journal, query.sessionId);
-  const state = recoverSession(query.sessionId, events);
+  const journalEvents = await readSessionEvents(journal, query.sessionId);
+  const state = recoverSession(query.sessionId, journalEvents);
+  const events = activeConversationEvents(journalEvents);
   const view = query.view ?? 'summary';
   const result: ConversationReadResult = {
     sessionId: query.sessionId, revision: state.revision, view, items: [], nextBefore: null,

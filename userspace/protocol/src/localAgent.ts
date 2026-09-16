@@ -246,6 +246,16 @@ export type ConversationCommand =
     }
   | {
       schemaVersion: typeof CONVERSATION_COMMAND_VERSION;
+      type: 'message.edit';
+      commandId: string;
+      sessionId: string;
+      messageId: string;
+      expectedRevision: number;
+      text: string;
+      hostBinding?: { hostInstanceId: string; windowLabel: string };
+    }
+  | {
+      schemaVersion: typeof CONVERSATION_COMMAND_VERSION;
       type: 'message.feedback.set';
       commandId: string;
       sessionId: string;
@@ -588,6 +598,10 @@ export interface EffectPreview {
 }
 
 export type SessionEvent =
+  | (SessionEventBase & {
+      type: 'conversation.revised';
+      payload: { commandId: string; messageId: string; fromSequence: number; throughSequence: number };
+    })
   | (SessionEventBase & {
       type: 'session.model-settings.updated';
       payload: { commandId: string; settings: SessionModelSettings };

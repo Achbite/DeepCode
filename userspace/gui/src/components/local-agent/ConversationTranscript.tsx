@@ -22,6 +22,8 @@ import { ConversationNavigation } from './ConversationNavigation';
 import { conversationNavigation } from './conversationWindow';
 import { ConversationLayoutCache, ConversationVirtualizer } from './conversationVirtualizer';
 import { ConversationVirtualRow, useConversationRowState } from './ConversationVirtualRow';
+import { MessageActions } from './MessageActions';
+import { ApprovalActivity } from './ApprovalActivity';
 
 interface ConversationTranscriptProps {
   language: UiLanguage;
@@ -39,6 +41,8 @@ interface ConversationTranscriptProps {
   viewport: ConversationViewport;
   openWorkspaceResource: (workspaceId: string, logicalPath: string, position?: SourcePosition) => Promise<void>;
   setUiActionError: React.Dispatch<React.SetStateAction<string | null>>;
+  canEditMessage?: boolean;
+  onEditMessage?: (message: SessionProjection['messages'][number]) => void;
 }
 
 export function ConversationTranscript({
@@ -57,6 +61,8 @@ export function ConversationTranscript({
   viewport,
   openWorkspaceResource,
   setUiActionError,
+  canEditMessage = false,
+  onEditMessage,
 }: ConversationTranscriptProps) {
   const host = useConversationHost();
   const { transcriptRef, messageEndRef, setLatestFollowMode } = viewport;
@@ -99,7 +105,7 @@ export function ConversationTranscript({
     return <BufferedMarkdown text={content} streamIdentity={identity} streaming={false} onDisplayed={onDisplayed} />;
   };
 
-  const copyAssistantMessage = async (messageId: string, content: string) => {
+  const copyMessage = async (messageId: string, content: string) => {
     const requestedView = currentSessionRef.current;
     try {
       await host.copyText(content);
@@ -215,57 +221,11 @@ export function ConversationTranscript({
               </div>
             )}
           </div>
-          {item.value.role === 'assistant' && (
-            <div
-              className="local-agent__message-actions"
-              aria-label={t(language, 'agent.message.actions')}
-            >
-              <button
-                type="button"
-                className="conversation-copy-button"
-                aria-label={copiedMessageId === item.value.messageId
-                  ? t(language, 'agent.message.copied')
-                  : t(language, 'agent.message.copyResponse')}
-                onClick={() => void copyAssistantMessage(item.value.messageId, item.value.content)}
-              >
-                <DeepCodeShellIcon name="copy" />
-                <span className="conversation-copy-hint" role="status">{copiedMessageId === item.value.messageId
-                  ? t(language, 'agent.message.copied')
-                  : t(language, 'agent.message.copy')}</span>
-              </button>
-              <button
-                    type="button"
-                    className={item.value.feedback === 'up' ? 'is-selected' : ''}
-                    aria-pressed={item.value.feedback === 'up'}
-                    aria-label={t(language, 'agent.message.helpful')}
-                    disabled={submitting}
-                    onClick={() => void updateMessageFeedback(
-                      item.value.messageId,
-                      item.value.feedback === 'up' ? null : 'up',
-                    )}
-                  >
-                    <DeepCodeShellIcon name="thumbUp" />
-                    <span className="local-agent__message-action-hint" aria-hidden="true">
-                      {t(language, 'agent.message.helpful')}
-                    </span>
-              </button>
-              <button
-                    type="button"
-                    className={item.value.feedback === 'down' ? 'is-selected' : ''}
-                    aria-pressed={item.value.feedback === 'down'}
-                    aria-label={t(language, 'agent.message.notHelpful')}
-                    disabled={submitting}
-                    onClick={() => void updateMessageFeedback(
-                      item.value.messageId,
-                      item.value.feedback === 'down' ? null : 'down',
-                    )}
-                  >
-                    <DeepCodeShellIcon name="thumbDown" />
-                    <span className="local-agent__message-action-hint" aria-hidden="true">
-                      {t(language, 'agent.message.notHelpful')}
-                    </span>
-              </button>
-            </div>
+          {(item.value.role === 'assistant' || item.value.role === 'user') && (
+            <MessageActions message={item.value} language={language} copied={copiedMessageId === item.value.messageId}
+              busy={submitting} canEdit={canEditMessage} onCopy={() => void copyMessage(item.value.messageId, item.value.content)}
+              onFeedback={(feedback) => void updateMessageFeedback(item.value.messageId, feedback)}
+              onEdit={() => onEditMessage?.(item.value)} />
           )}
         </article>
       ) : item.type === 'narrative' ? (
@@ -288,6 +248,10 @@ export function ConversationTranscript({
           language={language}
           onToggle={onPlanToggle}
         />
+      ) : item.type === 'approval' ? (
+        <ApprovalActivity activity={item.value} language={language}
+          pending={projection?.pendingApproval?.callId === item.value.callId}
+          onExpand={() => setLatestFollowMode(false)} />
       ) : (
         <ToolActivityGroup
           activities={item.values}
@@ -382,7 +346,7 @@ export function ConversationTranscript({
         const terminal = current && ['failed', 'cancelled', 'indeterminate'].includes(projection!.run!.status);
         const rows = round.rows.map((row) => ({
           key: row.key,
-          process: row.item ? row.item.type !== 'message' : row.draft?.type !== 'text' || row.draft.block.kind === 'narrative',
+          process: row.item ? !['message', 'approval'].includes(row.item.type) : row.draft?.type !== 'text' || row.draft.block.kind === 'narrative',
           required: row.item?.type === 'plan' && samePlanReference(projection?.pendingPlan, row.item.value),
           live: Boolean(row.draft) || (current && !completed && row.item?.type === 'message' && row.item.value.role === 'assistant'),
           content: () => row.item ? renderItem(row.item) : renderDraft(row.draft!),

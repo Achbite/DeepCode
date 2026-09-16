@@ -96,6 +96,7 @@ export interface LocalAgentState {
     onSessionCreated?: (sessionId: string) => void,
   ): Promise<CommandReply>;
   setMessageFeedback(messageId: string, feedback: MessageFeedback | null): Promise<CommandReply>;
+  editMessage(messageId: string, text: string, expectedRevision: number): Promise<CommandReply>;
   attachSessionDirectory(canonicalRoot: string): Promise<void>;
   detachSessionDirectory(workspaceId: string): Promise<void>;
   respondInteraction(response: string): Promise<CommandReply>;
@@ -533,6 +534,17 @@ const store = create<LocalAgentState>((set, get) => ({
       sessionId,
       messageId,
       feedback,
+    });
+  },
+
+  editMessage: async (messageId, text, expectedRevision) => {
+    const state = get();
+    const sessionId = requiredSession(state);
+    const target = state.projection?.messages.find((message) => message.messageId === messageId);
+    if (!target || target.role !== 'user' || target.replyToInteraction) throw new Error('message_edit_target_invalid');
+    return await submitExisting(set, get, {
+      schemaVersion: CONVERSATION_COMMAND_VERSION, type: 'message.edit', commandId: nextId('command'),
+      sessionId, messageId, text, expectedRevision,
     });
   },
 

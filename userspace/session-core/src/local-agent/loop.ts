@@ -47,6 +47,7 @@ import {
   type ProviderToolCodec,
 } from './providerToolCodec.js';
 import { recoverSession, type SessionState } from './reducer.js';
+import { activeConversationEvents } from './conversationHistory.js';
 import { providerTextStreamId } from './streamIdentity.js';
 import { PlanPreviewBuffer } from './planPreview.js';
 import { completedPlanAwaitingLifecycle, planFinalSettlement, planProgressFact, publishPlan } from './planStage.js';
@@ -59,6 +60,7 @@ import {
 } from './sessionControls.js';
 
 export interface LoopSnapshot {
+  journalEvents: readonly SessionEvent[];
   events: readonly SessionEvent[];
   state: SessionState;
 }
@@ -2252,7 +2254,7 @@ function finishingResult(runId: string, settlement: RunSettlement): LoopResult {
 }
 
 export function loopSnapshot(sessionId: string, events: readonly SessionEvent[]): LoopSnapshot {
-  return { events: [...events], state: recoverSession(sessionId, events) };
+  return { journalEvents: [...events], events: activeConversationEvents(events), state: recoverSession(sessionId, events) };
 }
 
 function runWorkspaceBindings(
