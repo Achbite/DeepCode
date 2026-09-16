@@ -17,7 +17,6 @@ import FileOpeningSettings from './FileOpeningSettings';
 
 interface RuntimeProps {
   apiStatus: string;
-  wsStatus: string;
   serverVersion?: string;
   query?: string;
   category?: 'general' | 'appearance' | 'about';
@@ -91,7 +90,6 @@ export function settingsSearchDefinitions(language: ReturnType<typeof normalizeU
 
 export const GuiSettingsSection: React.FC<RuntimeProps> = ({
   apiStatus,
-  wsStatus,
   serverVersion,
   query = '',
   category = 'appearance',
@@ -149,7 +147,6 @@ export const GuiSettingsSection: React.FC<RuntimeProps> = ({
               <tr><td>{t(language, 'settings.runtime.product')}</td><td>DeepCode</td></tr>
               <tr><td>{t(language, 'settings.runtime.serverVersion')}</td><td>{serverVersion ?? '-'}</td></tr>
               <tr><td>{t(language, 'settings.runtime.apiStatus')}</td><td>{apiStatus}</td></tr>
-              <tr><td>{t(language, 'settings.runtime.wsStatus')}</td><td>{wsStatus}</td></tr>
               <tr>
                 <td>{t(language, 'settings.runtime.userSettingsFile')}</td>
                 <td>{storePath

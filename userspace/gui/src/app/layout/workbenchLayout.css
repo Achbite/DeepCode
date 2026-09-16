@@ -1,43 +1,43 @@
 :root,
 :root[data-theme='vs-dark'] {
-  --bg-app: #0a0a0c;
-  --bg-panel: #131316;
-  --bg-surface: #1c1c20;
-  --bg-elevated: #222228;
-  --bg-header: rgba(19, 19, 22, 0.88);
-  --terminal-bg: #000000;
+  --bg-app: var(--dc-editor-dark-bg-app);
+  --bg-panel: var(--dc-editor-dark-bg-panel);
+  --bg-surface: var(--dc-editor-dark-bg-surface);
+  --bg-elevated: var(--dc-editor-dark-bg-elevated);
+  --bg-header: var(--dc-editor-dark-bg-header);
+  --terminal-bg: var(--dc-editor-dark-terminal-bg);
 
-  --line: rgba(255, 255, 255, 0.08);
-  --line-soft: rgba(255, 255, 255, 0.04);
-  --line-strong: rgba(255, 255, 255, 0.14);
-  --divider-line: rgba(255, 255, 255, 0.075);
-  --divider-highlight: rgba(255, 255, 255, 0.045);
-  --divider-shadow: rgba(0, 0, 0, 0.42);
+  --line: var(--dc-editor-dark-line);
+  --line-soft: var(--dc-editor-dark-line-soft);
+  --line-strong: var(--dc-editor-dark-line-strong);
+  --divider-line: var(--dc-editor-dark-divider-line);
+  --divider-highlight: var(--dc-editor-dark-divider-highlight);
+  --divider-shadow: var(--dc-editor-dark-divider-shadow);
 
-  --text-main: #ededed;
+  --text-main: var(--dc-editor-dark-text-main);
   --text: var(--text-main);
-  --text-strong: #ffffff;
+  --text-strong: var(--dc-editor-dark-text-strong);
   --text-highlight: var(--text-strong);
-  --text-muted: #a1a1aa;
+  --text-muted: var(--dc-editor-dark-text-muted);
   --muted: var(--text-muted);
-  --text-placeholder: #52525b;
+  --text-placeholder: var(--dc-editor-dark-text-placeholder);
 
-  --accent: #0a84ff;
+  --accent: var(--dc-editor-dark-accent);
   --accent-color: var(--accent);
-  --accent-hover: #0070e0;
-  --accent-soft: rgba(10, 132, 255, 0.15);
-  --ok: #34c759;
-  --warn: #ffcc00;
-  --danger: #ff3b30;
-  --status-bg: #0a70d1;
+  --accent-hover: var(--dc-editor-dark-accent-hover);
+  --accent-soft: var(--dc-editor-dark-accent-soft);
+  --ok: var(--dc-editor-dark-ok);
+  --warn: var(--dc-editor-dark-warn);
+  --danger: var(--dc-editor-dark-danger);
+  --status-bg: var(--dc-editor-dark-status-bg);
 
   --radius: 6px;
   --radius-sm: 4px;
   --radius-md: 6px;
   --radius-lg: 8px;
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --shadow-md: 0 12px 30px rgba(0, 0, 0, 0.42);
-  --shadow-inset: inset 0 1px 1px rgba(255, 255, 255, 0.05);
+  --shadow-sm: var(--dc-editor-dark-shadow-sm);
+  --shadow-md: var(--dc-editor-dark-shadow-md);
+  --shadow-inset: var(--dc-editor-dark-shadow-inset);
 
   --bg: var(--bg-app);
   --panel: var(--bg-panel);
@@ -54,44 +54,44 @@
 }
 
 :root[data-theme='vs-light'] {
-  --bg-app: #f5f5f7;
-  --bg-panel: #ffffff;
-  --bg-surface: #f2f2f7;
-  --bg-elevated: #ffffff;
-  --bg-header: rgba(255, 255, 255, 0.88);
-  --terminal-bg: #0a0a0c;
+  --bg-app: var(--dc-editor-light-bg-app);
+  --bg-panel: var(--dc-editor-light-bg-panel);
+  --bg-surface: var(--dc-editor-light-bg-surface);
+  --bg-elevated: var(--dc-editor-light-bg-elevated);
+  --bg-header: var(--dc-editor-light-bg-header);
+  --terminal-bg: var(--dc-editor-light-terminal-bg);
 
-  --line: rgba(0, 0, 0, 0.1);
-  --line-soft: rgba(0, 0, 0, 0.05);
-  --line-strong: rgba(0, 0, 0, 0.16);
-  --divider-line: rgba(0, 0, 0, 0.1);
-  --divider-highlight: rgba(255, 255, 255, 0.72);
-  --divider-shadow: rgba(0, 0, 0, 0.12);
+  --line: var(--dc-editor-light-line);
+  --line-soft: var(--dc-editor-light-line-soft);
+  --line-strong: var(--dc-editor-light-line-strong);
+  --divider-line: var(--dc-editor-light-divider-line);
+  --divider-highlight: var(--dc-editor-light-divider-highlight);
+  --divider-shadow: var(--dc-editor-light-divider-shadow);
 
-  --text-main: #1d1d1f;
+  --text-main: var(--dc-editor-light-text-main);
   --text: var(--text-main);
-  --text-strong: #000000;
+  --text-strong: var(--dc-editor-light-text-strong);
   --text-highlight: var(--text-strong);
-  --text-muted: #6e6e73;
+  --text-muted: var(--dc-editor-light-text-muted);
   --muted: var(--text-muted);
-  --text-placeholder: #8e8e93;
+  --text-placeholder: var(--dc-editor-light-text-placeholder);
 
-  --accent: #007aff;
+  --accent: var(--dc-editor-light-accent);
   --accent-color: var(--accent);
-  --accent-hover: #0066d6;
-  --accent-soft: rgba(0, 122, 255, 0.14);
-  --ok: #248a3d;
-  --warn: #9a7b00;
-  --danger: #d70015;
-  --status-bg: #0a70d1;
+  --accent-hover: var(--dc-editor-light-accent-hover);
+  --accent-soft: var(--dc-editor-light-accent-soft);
+  --ok: var(--dc-editor-light-ok);
+  --warn: var(--dc-editor-light-warn);
+  --danger: var(--dc-editor-light-danger);
+  --status-bg: var(--dc-editor-light-status-bg);
 
   --radius: 6px;
   --radius-sm: 4px;
   --radius-md: 6px;
   --radius-lg: 8px;
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.08);
-  --shadow-md: 0 12px 30px rgba(0, 0, 0, 0.12);
-  --shadow-inset: inset 0 1px 1px rgba(255, 255, 255, 0.6);
+  --shadow-sm: var(--dc-editor-light-shadow-sm);
+  --shadow-md: var(--dc-editor-light-shadow-md);
+  --shadow-inset: var(--dc-editor-light-shadow-inset);
 
   --bg: var(--bg-app);
   --panel: var(--bg-panel);
@@ -147,14 +147,14 @@ button {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.16);
+  background: color-mix(in srgb, var(--dc-foreground) 16%, transparent);
   border: 2px solid transparent;
   border-radius: 999px;
   background-clip: padding-box;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.3);
+  background: color-mix(in srgb, var(--dc-foreground) 30%, transparent);
   border: 2px solid transparent;
   background-clip: padding-box;
 }
@@ -211,7 +211,7 @@ button {
 
 .workbench-resizer:hover,
 .workbench-resizer:active {
-  background: rgba(10, 132, 255, 0.1);
+  background: color-mix(in srgb, var(--dc-accent) 10%, transparent);
 }
 
 .workbench-resizer:hover::before,
@@ -236,12 +236,12 @@ button {
   background: linear-gradient(
     180deg,
     transparent,
-    rgba(10, 132, 255, 0.28) 18%,
-    rgba(10, 132, 255, 0.78) 50%,
-    rgba(10, 132, 255, 0.28) 82%,
+    color-mix(in srgb, var(--dc-accent) 28%, transparent) 18%,
+    color-mix(in srgb, var(--dc-accent) 78%, transparent) 50%,
+    color-mix(in srgb, var(--dc-accent) 28%, transparent) 82%,
     transparent
   );
-  box-shadow: 0 0 10px rgba(10, 132, 255, 0.35);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--dc-accent) 35%, transparent);
 }
 
 .workbench-resizer--agent {
@@ -268,12 +268,12 @@ button {
   background: linear-gradient(
     90deg,
     transparent,
-    rgba(10, 132, 255, 0.34) 18%,
-    rgba(10, 132, 255, 0.92) 50%,
-    rgba(10, 132, 255, 0.34) 82%,
+    color-mix(in srgb, var(--dc-accent) 34%, transparent) 18%,
+    color-mix(in srgb, var(--dc-accent) 92%, transparent) 50%,
+    color-mix(in srgb, var(--dc-accent) 34%, transparent) 82%,
     transparent
   );
-  box-shadow: 0 0 12px rgba(10, 132, 255, 0.42);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--dc-accent) 42%, transparent);
 }
 
 .workbench-layout--no-sidebar .workbench-resizer--sidebar,
@@ -369,7 +369,7 @@ body.workbench-resizing * {
   border: 1px solid var(--line);
   border-radius: 999px;
   padding: 0 8px;
-  background: rgba(255, 255, 255, 0.04);
+  background: color-mix(in srgb, var(--dc-foreground) 4%, transparent);
   color: var(--text-muted);
   font-size: 11px;
   white-space: nowrap;
@@ -377,8 +377,8 @@ body.workbench-resizing * {
 
 .header__save-msg {
   color: var(--ok);
-  border-color: rgba(52, 199, 89, 0.28);
-  background: rgba(52, 199, 89, 0.08);
+  border-color: color-mix(in srgb, var(--dc-success) 28%, transparent);
+  background: color-mix(in srgb, var(--dc-success) 8%, transparent);
 }
 
 .header__heartbeat {
@@ -406,19 +406,19 @@ body.workbench-resizing * {
   flex: 0 0 7px;
   border-radius: 50%;
   background: var(--ok);
-  box-shadow: 0 0 0 2px rgba(52, 199, 89, 0.15), 0 0 8px rgba(52, 199, 89, 0.35);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--dc-success) 15%, transparent), 0 0 8px color-mix(in srgb, var(--dc-success) 35%, transparent);
 }
 
 .status-dot.disconnected,
 .status-dot.error {
   background: var(--danger);
-  box-shadow: 0 0 0 2px rgba(255, 59, 48, 0.16), 0 0 8px rgba(255, 59, 48, 0.28);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--dc-danger) 16%, transparent), 0 0 8px color-mix(in srgb, var(--dc-danger) 28%, transparent);
 }
 
 .status-dot.checking,
 .status-dot.connecting {
   background: var(--warn);
-  box-shadow: 0 0 0 2px rgba(255, 204, 0, 0.16), 0 0 8px rgba(255, 204, 0, 0.25);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--dc-warning) 16%, transparent), 0 0 8px color-mix(in srgb, var(--dc-warning) 25%, transparent);
 }
 
 .activity-bar {
@@ -460,7 +460,7 @@ body.workbench-resizing * {
 }
 
 .activity-icon:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: color-mix(in srgb, var(--dc-foreground) 6%, transparent);
   color: var(--text-strong);
 }
 
@@ -489,7 +489,7 @@ body.workbench-resizing * {
 .activity-icon--disabled:hover {
   cursor: not-allowed;
   background: transparent;
-  color: rgba(161, 161, 170, 0.45);
+  color: color-mix(in srgb, var(--dc-accent) 45%, transparent);
 }
 
 .sidebar {
@@ -558,7 +558,7 @@ body.workbench-resizing * {
 
 .editor-tab:hover {
   color: var(--text-main);
-  background: rgba(255, 255, 255, 0.03);
+  background: color-mix(in srgb, var(--dc-foreground) 3%, transparent);
 }
 
 .editor-tab--active {
@@ -599,7 +599,7 @@ body.workbench-resizing * {
 }
 
 .editor-tab__close:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: color-mix(in srgb, var(--dc-foreground) 8%, transparent);
   color: var(--text-strong);
 }
 
@@ -610,8 +610,8 @@ body.workbench-resizing * {
   align-items: center;
   justify-content: center;
   background:
-    linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+    linear-gradient(color-mix(in srgb, var(--dc-foreground) 1.8%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--dc-foreground) 1.8%, transparent) 1px, transparent 1px),
     var(--bg-app);
   background-size: 28px 28px;
 }
@@ -658,12 +658,12 @@ body.workbench-resizing * {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  border-top: 1px solid rgba(255, 255, 255, 0.18);
+  border-top: 1px solid color-mix(in srgb, var(--dc-foreground) 18%, transparent);
   background: var(--terminal-bg);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.055),
-    0 -1px 0 rgba(0, 0, 0, 0.88),
-    0 -12px 28px -26px rgba(0, 0, 0, 0.9);
+    inset 0 1px 0 color-mix(in srgb, var(--dc-foreground) 5.5%, transparent),
+    0 -1px 0 color-mix(in srgb, var(--dc-shadow-color) 88%, transparent),
+    0 -12px 28px -26px color-mix(in srgb, var(--dc-shadow-color) 90%, transparent);
   overflow: hidden;
 }
 
@@ -691,7 +691,7 @@ body.workbench-resizing * {
 
 .tab:hover {
   color: var(--text-main);
-  background: rgba(255, 255, 255, 0.04);
+  background: color-mix(in srgb, var(--dc-foreground) 4%, transparent);
 }
 
 .tab.active {
@@ -729,8 +729,8 @@ body.workbench-resizing * {
 }
 
 .terminal-expand-button:hover {
-  border-color: rgba(10, 132, 255, 0.65);
-  background: rgba(255, 255, 255, 0.08);
+  border-color: color-mix(in srgb, var(--dc-accent) 65%, transparent);
+  background: color-mix(in srgb, var(--dc-foreground) 8%, transparent);
   color: var(--text-strong);
 }
 
@@ -785,7 +785,7 @@ body.workbench-resizing * {
   height: var(--status-height);
   padding: 0 10px;
   background: var(--status-bg);
-  color: #ffffff;
+  color: var(--dc-foreground-strong);
   font-size: 11px;
   font-weight: 500;
   overflow: hidden;

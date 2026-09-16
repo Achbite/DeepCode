@@ -15,54 +15,20 @@
   border: 0;
   border-radius: var(--radius-sm, 4px);
   background: transparent;
-  color: var(--text-muted, #a1a1aa);
+  color: var(--text-muted);
   cursor: pointer;
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }
 
 .window-control:hover {
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--text-strong, #fff);
+  background: color-mix(in srgb, var(--dc-foreground) 8%, transparent);
+  color: var(--text-strong);
 }
 
 .window-control--close:hover {
-  background: var(--danger, #ff3b30);
-  color: #fff;
+  background: var(--danger);
+  color: var(--dc-foreground-strong);
 }
 
-.window-control::before,
-.window-control::after {
-  content: "";
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
-}
-
-.window-control--minimize::before {
-  width: 12px;
-  height: 1px;
-  background: currentColor;
-}
-
-.window-control--maximize::before {
-  width: 11px;
-  height: 9px;
-  border: 1px solid currentColor;
-}
-
-.window-control--close::before,
-.window-control--close::after {
-  width: 13px;
-  height: 1px;
-  background: currentColor;
-}
-
-.window-control--close::before {
-  transform: translate(-50%, -50%) rotate(45deg);
-}
-
-.window-control--close::after {
-  transform: translate(-50%, -50%) rotate(-45deg);
-}
+.window-control { display: inline-flex; align-items: center; justify-content: center; }

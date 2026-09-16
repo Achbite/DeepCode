@@ -1,3 +1,4 @@
+import UiIcon from '../../icons/registry';
 import React from 'react';
 import type { HostStartupStatusV1 } from '../../services/runtimeAdapter';
 import { t, type UiLanguage } from '../../i18n';
@@ -9,7 +10,7 @@ export function HostStartupDiagnostic({ status, language, onRetry, busy = false 
     <h3>{t(language, 'host.startup.failed')}</h3>
     <p>{status.code}</p>
     <details open>
-      <summary>{t(language, 'agent.tool.detail.error')}<span aria-hidden="true">⌄</span></summary>
+      <summary>{t(language, 'agent.tool.detail.error')}<UiIcon name="chevronDown" size={14} /></summary>
       <pre tabIndex={0}>{status.message}</pre>
     </details>
     {status.diagnosticRef && <div className="host-startup-diagnostic__log">

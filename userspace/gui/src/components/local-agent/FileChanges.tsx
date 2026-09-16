@@ -1,3 +1,4 @@
+import { UI_PALETTE } from '../../theme/palette';
 import { t } from '../../i18n';
 import { useUiLanguage } from '../../useUiLanguage';
 import ModalDialog from '../shared/ModalDialog';
@@ -104,17 +105,7 @@ function FileChangePreview({ sessionId, file, statistic, close }: { sessionId: s
         const diffTheme = `deepcode-diff-${theme}`;
         const dark = theme === 'vs-dark';
         monaco.editor.defineTheme(diffTheme, {
-          base: theme, inherit: true, rules: [], colors: {
-            'diffEditor.insertedLineBackground': dark ? '#1d382a' : '#e7f3e9',
-            'diffEditor.removedLineBackground': dark ? '#402627' : '#fbe9e7',
-            'diffEditor.insertedTextBackground': '#00000000',
-            'diffEditor.removedTextBackground': '#00000000',
-            'diffEditorGutter.insertedLineBackground': dark ? '#1d382a' : '#e7f3e9',
-            'diffEditorGutter.removedLineBackground': dark ? '#402627' : '#fbe9e7',
-            'diffEditor.unchangedRegionBackground': dark ? '#252830' : '#f4f4f5',
-            'diffEditor.unchangedRegionForeground': dark ? '#a8acb5' : '#65676c',
-            'diffEditor.unchangedCodeBackground': '#00000000',
-          },
+          base: theme, inherit: true, rules: [], colors: UI_PALETTE.diff[dark ? 'dark' : 'light'],
         });
         const editor = monaco.editor.createDiffEditor(container.current, {
           readOnly: true, originalEditable: false, automaticLayout: true, renderSideBySide: false, theme: diffTheme,

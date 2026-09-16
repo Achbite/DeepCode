@@ -1,15 +1,15 @@
 .file-tree {
-  --ft-bg: var(--bg-panel, #131316);
-  --ft-bg-2: var(--bg-surface, #1c1c20);
-  --ft-fg: var(--text-main, #ededed);
-  --ft-fg-muted: var(--text-muted, #a1a1aa);
-  --ft-fg-strong: var(--text-strong, #fff);
-  --ft-border: var(--line, rgba(255, 255, 255, 0.08));
-  --ft-hover-bg: rgba(255, 255, 255, 0.04);
-  --ft-selected-bg: var(--accent-soft, rgba(10, 132, 255, 0.15));
-  --ft-accent: var(--accent, #0a84ff);
-  --ft-warn: var(--warn, #ffcc00);
-  --ft-danger: var(--danger, #ff3b30);
+  --ft-bg: var(--bg-panel);
+  --ft-bg-2: var(--bg-surface);
+  --ft-fg: var(--text-main);
+  --ft-fg-muted: var(--text-muted);
+  --ft-fg-strong: var(--text-strong);
+  --ft-border: var(--line);
+  --ft-hover-bg: color-mix(in srgb, var(--dc-foreground) 4%, transparent);
+  --ft-selected-bg: var(--accent-soft);
+  --ft-accent: var(--accent);
+  --ft-warn: var(--warn);
+  --ft-danger: var(--danger);
 
   display: flex;
   flex-direction: column;
@@ -64,7 +64,7 @@
 }
 
 .file-tree__toolbar-btn:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: color-mix(in srgb, var(--dc-foreground) 8%, transparent);
   color: var(--ft-fg-strong);
 }
 
@@ -123,14 +123,14 @@
   padding: 0 12px;
   border: 1px solid var(--ft-border);
   border-radius: var(--radius-md, 6px);
-  background: rgba(255, 255, 255, 0.06);
+  background: color-mix(in srgb, var(--dc-foreground) 6%, transparent);
   color: var(--ft-fg);
   cursor: pointer;
 }
 
 .file-tree__empty-action:hover {
-  border-color: rgba(10, 132, 255, 0.55);
-  background: rgba(255, 255, 255, 0.1);
+  border-color: color-mix(in srgb, var(--dc-accent) 55%, transparent);
+  background: color-mix(in srgb, var(--dc-foreground) 10%, transparent);
   color: var(--ft-fg-strong);
 }
 
@@ -188,7 +188,7 @@
 
 .file-tree__icon {
   width: 16px;
-  color: #c7cad1;
+  color: var(--dc-foreground);
 }
 
 .file-tree__row--selected .file-tree__icon,
@@ -207,10 +207,10 @@
   min-width: 0;
   height: 22px;
   padding: 0 6px;
-  border: 1px solid var(--line, #666);
+  border: 1px solid var(--line);
   border-radius: var(--radius-sm, 4px);
   outline: none;
-  background: rgba(0, 0, 0, 0.22);
+  background: color-mix(in srgb, var(--dc-shadow-color) 22%, transparent);
   color: var(--ft-fg);
   font-size: 12px;
   box-shadow: none;
@@ -223,7 +223,7 @@
 
 .file-tree__notice {
   padding: 3px 12px 5px;
-  color: var(--accent, #0a84ff);
+  color: var(--accent);
   font-size: 11px;
 }
 
@@ -236,14 +236,14 @@
   border: 1px solid var(--ft-border);
   border-radius: var(--radius-md, 6px);
   background: var(--ft-bg-2);
-  box-shadow: var(--shadow-md, 0 12px 30px rgba(0, 0, 0, 0.42));
+  box-shadow: var(--shadow-md);
   color: var(--ft-fg);
   font-size: 12px;
 }
 
 .file-tree__context-title {
   padding: 6px 8px 7px;
-  border-bottom: 1px solid var(--line-soft, rgba(255, 255, 255, 0.04));
+  border-bottom: 1px solid var(--line-soft);
   color: var(--ft-fg-muted);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -263,21 +263,21 @@
 }
 
 .file-tree__context-menu button:hover {
-  background: var(--accent-soft, rgba(10, 132, 255, 0.15));
-  color: #fff;
+  background: var(--accent-soft);
+  color: var(--dc-foreground-strong);
 }
 
 .file-tree__context-menu button.file-tree__context-danger {
-  color: var(--danger, #ff6b6b);
+  color: var(--danger);
 }
 
 .file-tree__context-menu button.file-tree__context-danger:hover {
-  background: rgba(255, 77, 79, 0.16);
-  color: #fff;
+  background: color-mix(in srgb, var(--dc-danger) 16%, transparent);
+  color: var(--dc-foreground-strong);
 }
 
 .file-tree__context-separator {
   height: 1px;
   margin: 4px 2px;
-  background: var(--line-soft, rgba(255, 255, 255, 0.04));
+  background: var(--line-soft);
 }

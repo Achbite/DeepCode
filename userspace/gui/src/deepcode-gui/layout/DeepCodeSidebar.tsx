@@ -185,7 +185,7 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
   }, [busy, onActivateSession, shortcutSessions]);
 
   return (
-    <aside
+    <div
       className="deepcode-gui-left-rail"
       onPointerMove={movePointer}
       onPointerUp={dropPointer}
@@ -414,7 +414,7 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
         <span>{t(language, 'deepcodeGui.settings.entry')}</span>
       </button>
       </footer>
-    </aside>
+    </div>
   );
 };
 

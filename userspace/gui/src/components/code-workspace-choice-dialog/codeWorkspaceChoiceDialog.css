@@ -7,7 +7,7 @@
 .cwc-dialog__backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  background: color-mix(in srgb, var(--dc-shadow-color) 55%, transparent);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -16,11 +16,11 @@
 
 .cwc-dialog__panel {
   width: 420px;
-  background: #252526;
-  color: #cccccc;
-  border: 1px solid #444;
+  background: var(--dc-surface);
+  color: var(--dc-foreground);
+  border: 1px solid var(--dc-border-strong);
   border-radius: 4px;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 4px 24px color-mix(in srgb, var(--dc-shadow-color) 50%, transparent);
   display: flex;
   flex-direction: column;
 }
@@ -29,7 +29,7 @@
   padding: 12px 16px;
   font-size: 13px;
   font-weight: 700;
-  border-bottom: 1px solid #2c2c2c;
+  border-bottom: 1px solid var(--dc-border-strong);
 }
 
 .cwc-dialog__body {
@@ -39,7 +39,7 @@
 
 .cwc-dialog__file {
   margin: 0 0 8px;
-  color: #fff;
+  color: var(--dc-foreground-strong);
   font-family: 'Cascadia Code', 'Fira Code', Consolas, monospace;
   font-size: 13px;
   word-break: break-all;
@@ -47,7 +47,7 @@
 
 .cwc-dialog__hint {
   margin: 0;
-  color: #aaa;
+  color: var(--dc-muted);
   line-height: 1.5;
 }
 
@@ -56,7 +56,7 @@
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  border-top: 1px solid #2c2c2c;
+  border-top: 1px solid var(--dc-border-strong);
 }
 
 .cwc-dialog__btn {
@@ -66,28 +66,28 @@
   cursor: pointer;
   border: 1px solid transparent;
   background: transparent;
-  color: #cccccc;
+  color: var(--dc-foreground);
 }
 
 .cwc-dialog__btn--text:hover {
-  background: rgba(255, 255, 255, 0.05);
+  background: color-mix(in srgb, var(--dc-foreground) 5%, transparent);
 }
 
 .cwc-dialog__btn--secondary {
-  border-color: #555;
+  border-color: var(--dc-border-strong);
 }
 
 .cwc-dialog__btn--secondary:hover {
-  background: rgba(255, 255, 255, 0.05);
+  background: color-mix(in srgb, var(--dc-foreground) 5%, transparent);
 }
 
 .cwc-dialog__btn--primary {
-  background: #007acc;
-  border-color: #007acc;
-  color: #fff;
+  background: var(--dc-accent);
+  border-color: var(--dc-accent);
+  color: var(--dc-foreground-strong);
 }
 
 .cwc-dialog__btn--primary:hover {
-  background: #0a8ad8;
-  border-color: #0a8ad8;
+  background: var(--dc-accent);
+  border-color: var(--dc-accent);
 }

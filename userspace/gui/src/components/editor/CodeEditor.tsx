@@ -1,3 +1,4 @@
+import UiIcon from '../../icons/registry';
 
 import React, { useRef, useCallback, useEffect, useState } from 'react';
 import Editor, { OnMount } from '@monaco-editor/react';
@@ -179,7 +180,7 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
     return (
       <div className="code-editor code-editor--empty">
         <div className="code-editor__empty-inner">
-          <div className="code-editor__empty-icon">📄</div>
+          <div className="code-editor__empty-icon"><UiIcon name="file" size={40} /></div>
           <div>{t(language, 'editor.empty.title')}</div>
           <div className="code-editor__empty-hint">
             {t(language, 'editor.empty.hint')}

@@ -1,11 +1,12 @@
 import '../components/shared/focus.css';
+import { ConversationDisplayProvider } from '../components/local-agent/ConversationDisplayProvider';
 /**
  * App entry.
  *
  * Boot order:
  *   1. Establish canonical runtime readiness.
  *   2. Load workspace, user settings and Session state in parallel.
- *   3. Start heartbeat and optional terminal warmup.
+ *   3. Start optional terminal warmup.
  *   4. Register editor-level shortcuts, auto-save and close guard.
  */
 import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
@@ -113,9 +114,7 @@ async function destroyCurrentWindow(): Promise<void> {
 const App: React.FC = () => {
   const {
     apiStatus,
-    wsStatus,
     serverVersion,
-    lastHeartbeatAt,
     setApiStatus,
     setServerVersion,
     setErrorMessage,
@@ -299,25 +298,6 @@ const App: React.FC = () => {
 
 
   useEffect(() => {
-    if (apiStatus !== 'connected') return;
-    let disconnect: (() => void) | null = null;
-    let cancelled = false;
-    const cancel = afterFirstPaint(() => {
-      void import('../services/heartbeatSocket').then((heartbeat) => {
-        if (cancelled) return;
-        heartbeat.connectHeartbeat();
-        disconnect = heartbeat.disconnectHeartbeat;
-      });
-    });
-    return () => {
-      cancelled = true;
-      cancel();
-      disconnect?.();
-    };
-  }, [apiStatus, connectedIncarnation]);
-
-
-  useEffect(() => {
     if (apiStatus !== 'connected' || terminalPrewarm !== 'afterStartup') return;
     let cancelIdle: (() => void) | null = null;
     const cancelFirstPaint = afterFirstPaint(() => {
@@ -402,14 +382,12 @@ const App: React.FC = () => {
 
   return (
     <>
-      <Suspense fallback={<BootShellFallback />}>
+      <ConversationDisplayProvider><Suspense fallback={<BootShellFallback />}>
         <WorkbenchLayout
           apiStatus={apiStatus}
-          wsStatus={wsStatus}
           serverVersion={serverVersion}
-          lastHeartbeatAt={lastHeartbeatAt}
         />
-      </Suspense>
+      </Suspense></ConversationDisplayProvider>
       <HostStartupDiagnostic status={hostStartup} language={language} />
       {confirmDialog.open && (
         <div className="app-dialog-backdrop" role="presentation">

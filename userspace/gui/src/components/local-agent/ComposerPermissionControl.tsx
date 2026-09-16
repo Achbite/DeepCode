@@ -1,3 +1,4 @@
+import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import React from 'react';
 import { t, type UiLanguage } from '../../i18n';
 import { useSettingsStore } from '../../state/settingsStore';
@@ -28,7 +29,7 @@ export function ComposerPermissionControl({ language, composer }: { language: Ui
           setAttachmentMenuOpen(false);
         }}
       >
-        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><path d="M12 3 4 6v6c0 4 4 7 8 9 4-2 8-5 8-9V6Z"/><path d="m8 12 3 3 5-6"/></svg>
+        <DeepCodeShellIcon name="shield" />
         <span>{summary}</span>
       </button>
       {permissionMenuOpen && (

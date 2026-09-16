@@ -1,3 +1,5 @@
+import { UI_PALETTE } from '../../theme/palette';
+import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { TerminalSession } from '@deepcode/protocol';
 import { FitAddon } from '@xterm/addon-fit';
@@ -270,12 +272,7 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
       fontSize: 12,
       lineHeight: 1.2,
       scrollback: 5000,
-      theme: {
-        background: '#050506',
-        foreground: '#d4d4d4',
-        cursor: '#d4d4d4',
-        selectionBackground: '#264f78',
-      },
+      theme: UI_PALETTE.terminal,
     });
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
@@ -501,9 +498,7 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
                 aria-label={t(language, 'terminal.new')}
                 onClick={() => void createTerminal()}
               >
-                <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                  <path d="M8 3.5v9m-4.5-4.5h9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
-                </svg>
+                <DeepCodeShellIcon name="plus" />
               </button>
               <button
                 className="terminal-panel__icon-btn"
@@ -512,9 +507,7 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
                 aria-label={t(language, 'terminal.minimize')}
                 onClick={onMinimize}
               >
-                <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                  <path d="M4 6l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-                </svg>
+                <DeepCodeShellIcon name="chevronDown" />
               </button>
             </div>
           </div>
@@ -547,9 +540,7 @@ const TerminalPlaceholder: React.FC<TerminalPlaceholderProps> = ({ language, onM
                 title={`${session.name} (${session.status})`}
               >
                 <div className="terminal-panel__session-icon">
-                  <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M3 4.5l4 3.5-4 3.5m5.5 0h4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-                  </svg>
+                  <DeepCodeShellIcon name="terminal" />
                 </div>
                 <div className="terminal-panel__session-content">
                   {renamingId === session.id ? (

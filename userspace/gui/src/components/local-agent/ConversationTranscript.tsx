@@ -29,6 +29,7 @@ interface ConversationTranscriptProps {
   loading: boolean;
   showReasoning?: boolean;
   completedRuns: Set<string>;
+  artifacts: SessionProjection['artifacts'];
   onDisplayed(identity: string, text: string): void;
   projection: SessionProjection | null;
   activeProject: { title: string } | undefined;
@@ -45,6 +46,7 @@ export function ConversationTranscript({
   language,
   showReasoning = false,
   completedRuns,
+  artifacts,
   onDisplayed,
   loading,
   projection,
@@ -363,7 +365,7 @@ export function ConversationTranscript({
         if (current && !completed) rows.push({ key: `${round.key}:provider-status`, process: true, required: false, live: true, content: () => providerStatus });
         if (showReasoning && projection && completed) rows.push({ key: `${round.key}:reasoning-history`, process: true, required: false, live: false, content: () => <ReasoningHistory sessionId={projection.sessionId} runId={round.runId} /> });
         return <ConversationRoundView language={language} key={`${projection?.sessionId}:${round.key}`} roundKey={round.key} virtualizer={virtualizer} eagerRows={eagerRows} completed={completed} followingLatest={viewport.followingLatest} rows={rows}>
-          {projection && <ArtifactLinks artifacts={projection.artifacts.filter((artifact)=>artifact.runId===round.runId)} onOpen={openWorkspaceResource} />}
+          <ArtifactLinks artifacts={artifacts.filter((artifact) => artifact.runId === round.runId)} onOpen={openWorkspaceResource} />
           {(completed || terminal) && <FileChanges activities={roundChangeActivities(projection, round.runId)} />}
         </ConversationRoundView>;
       })}

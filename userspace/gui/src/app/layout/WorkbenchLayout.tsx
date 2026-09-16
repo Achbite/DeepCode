@@ -1,3 +1,4 @@
+import UiIcon from '../../icons/registry';
 import './workbenchLayout.css';
 import React, { Suspense, lazy, useEffect, useState } from 'react';
 import type { InternalBrowserMode } from '@deepcode/protocol';
@@ -15,9 +16,7 @@ import { useSettingsStore } from '../../state/settingsStore';
 
 interface WorkbenchLayoutProps {
   apiStatus: string;
-  wsStatus: string;
   serverVersion?: string;
-  lastHeartbeatAt?: string;
 }
 
 type SidebarPanel = 'explorer' | 'git' | 'search';
@@ -86,7 +85,6 @@ const getLanguageLabel = (filePath: string | null | undefined, language: ReturnT
 
 const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
   apiStatus,
-  wsStatus,
   serverVersion,
 }) => {
   const tabs = useEditorStore((s) => s.tabs);
@@ -359,7 +357,7 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
                       closeTab(id);
                     }}
                   >
-                    x
+                    <UiIcon name="close" size={14} />
                   </span>
                 </button>
               );
@@ -376,7 +374,6 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
           <Suspense fallback={<PanelFallback label={t(language, 'workbench.loading.settings')} />}>
             <SettingsCenter
               apiStatus={apiStatus}
-              wsStatus={wsStatus}
               serverVersion={serverVersion}
             />
           </Suspense>
@@ -434,7 +431,6 @@ const WorkbenchLayout: React.FC<WorkbenchLayoutProps> = ({
         </div>
         <div className="status-bar__group">
           <span>{t(language, 'workbench.status.api')} {apiStatus}</span>
-          <span>{t(language, 'workbench.status.websocket')} {wsStatus}</span>
         </div>
       </footer>
 

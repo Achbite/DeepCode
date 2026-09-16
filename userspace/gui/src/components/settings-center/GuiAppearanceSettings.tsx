@@ -1,3 +1,8 @@
+import AppearanceConfiguration from './AppearanceConfiguration';
+import { PALETTE_SETTING, decodePaletteOverrides, paletteToken } from '../../theme/palette';
+import GuiPaletteSettings from './GuiPaletteSettings';
+import { useSettingsSearchTarget } from './settingsSearch';
+import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import { useSettingsHelp } from './SettingsHelp';
 import React from 'react';
 import { t, type UiLanguage } from '../../i18n';
@@ -52,9 +57,10 @@ const AppearanceSettingHeader: React.FC<AppearanceSettingHeaderProps> = ({
   disabled,
   onReset,
 }) => {
+  const target = useSettingsSearchTarget(definition.key);
   const { helpId, helpEvents, help } = useSettingsHelp(definition.description);
   return (
-  <div id={`setting-${definition.key}`} tabIndex={0} aria-describedby={helpId} {...helpEvents} className="settings-appearance__header">
+  <div ref={target} tabIndex={-1} aria-describedby={helpId} {...helpEvents} className="settings-appearance__header">
     {help}
     <div>
       <div className="settings-field__title-row">
@@ -87,6 +93,7 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
   const sources = useSettingsStore((state) => state.sources);
   const loading = useSettingsStore((state) => state.loading);
   const patchUserSetting = useSettingsStore((state) => state.patchUserSetting);
+  const patchUserSettingsBatch = useSettingsStore((state) => state.patchUserSettingsBatch);
   const resetUserSetting = useSettingsStore((state) => state.resetUserSetting);
   const themeDefinition = definitions.find((definition) => definition.key === 'gui.colorTheme');
   const accentDefinition = definitions.find((definition) => definition.key === 'gui.accentColor');
@@ -102,10 +109,20 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
     if (!disabled && value !== theme) void patchUserSetting('gui.colorTheme', value);
   };
   const selectAccent = (value: GuiAccentColor, disabled: boolean) => {
-    if (!disabled && value !== accent) void patchUserSetting('gui.accentColor', value);
+    if (disabled) return;
+    try {
+      const colors = decodePaletteOverrides(String(effectiveSettings[PALETTE_SETTING] ?? '{}'));
+      delete colors[paletteToken('light', 'accent')];
+      delete colors[paletteToken('dark', 'accent')];
+      void patchUserSettingsBatch({ 'gui.accentColor': value, [PALETTE_SETTING]: JSON.stringify(colors) });
+    } catch (reason) {
+      useSettingsStore.setState({ errorMessage: String(reason) });
+    }
   };
 
   return (
+    <>
+    <AppearanceConfiguration language={language} />
     <div className="settings-card settings-appearance">
       <h3 className="settings-card__title">{t(language, 'settings.gui.appearance')}</h3>
       <div className="settings-appearance__body">
@@ -135,7 +152,7 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
                 >
                   <span className="settings-theme-preview" aria-hidden="true" />
                   <span className="settings-theme-label">
-                    <span className="settings-selection-check" aria-hidden="true">✓</span>
+                    <span className="settings-selection-check" aria-hidden="true"><DeepCodeShellIcon name="check" size={14} /></span>
                     {optionLabel(themeDefinition, value)}
                   </span>
                 </button>
@@ -143,6 +160,7 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
             </div>
           </section>
         )}
+        <GuiPaletteSettings language={language} />
         {accentDefinition && (
         <section className="settings-appearance__setting">
             <AppearanceSettingHeader
@@ -171,7 +189,7 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
                     aria-hidden="true"
                   />
                   <span>{optionLabel(accentDefinition, value)}</span>
-                  <span className="settings-accent-check" aria-hidden="true">✓</span>
+                  <span className="settings-accent-check" aria-hidden="true"><DeepCodeShellIcon name="check" size={14} /></span>
                 </button>
               ))}
             </div>
@@ -179,6 +197,7 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
         )}
       </div>
     </div>
+    </>
   );
 };
 

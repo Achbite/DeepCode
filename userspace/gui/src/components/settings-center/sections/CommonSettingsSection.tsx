@@ -13,7 +13,6 @@ import { localizeSettingDefinition } from '../../../settingsLocalization';
 interface CommonSettingsSectionProps {
   serverVersion?: string;
   apiStatus: string;
-  wsStatus: string;
   query?: string;
   surface?: SettingsSurface;
 }
@@ -82,7 +81,6 @@ function groupDefinitions(query: string, language: UiLanguage, surface: Settings
 const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
   serverVersion,
   apiStatus,
-  wsStatus,
   query = '',
   surface = 'editor',
 }) => {
@@ -126,10 +124,6 @@ const CommonSettingsSection: React.FC<CommonSettingsSectionProps> = ({
             <tr>
               <td>{t(language, 'settings.runtime.apiStatus')}</td>
               <td>{apiStatus}</td>
-            </tr>
-            <tr>
-              <td>{t(language, 'settings.runtime.wsStatus')}</td>
-              <td>{wsStatus}</td>
             </tr>
             <tr>
               <td>{t(language, 'settings.runtime.userSettingsFile')}</td>

@@ -1,33 +1,12 @@
-.deepcode-gui-shell {
-  --dc-navigation-row: 36px;
-  display: grid;
-  min-width: 0;
-  min-height: 0;
-  grid-template-columns: 232px minmax(0, 1fr) 276px;
-  grid-template-rows: minmax(0, 1fr);
-  background: var(--dc-surface);
-}
-
-.deepcode-gui-shell[data-navigation-density='compact'] {
-  --dc-navigation-row: 31px;
-}
-
-.deepcode-gui-shell--no-context {
-  grid-template-columns: 232px minmax(0, 1fr);
-}
-
 .deepcode-gui-left-rail {
-  grid-column: 1;
-  grid-row: 1;
   display: flex;
   min-width: 0;
   min-height: 0;
   flex-direction: column;
-  gap: 3px;
+  gap: 12px;
   overflow: auto;
   padding: 12px 10px 10px;
-  border-right: 1px solid var(--dc-border);
-  background: var(--dc-sidebar);
+
   scrollbar-width: none;
 }
 
@@ -302,12 +281,19 @@
   white-space: nowrap;
 }
 
-.deepcode-local-agent-overlay {
-  position:fixed;inset:36px 0 0;z-index:100;display:flex;background:var(--dc-surface);
-}
 .deepcode-local-agent-settings {
   position:relative;width:100%;height:100%;min-height:0;overflow:hidden;background:var(--dc-surface);
 }
+.deepcode-local-agent-settings .settings-body { padding-top: 56px; }
+.deepcode-local-agent-settings__drag-region {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 40px;
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+.deepcode-local-agent-settings__window-controls { position:absolute;right:8px;top:9px;z-index:2; }
+.deepcode-local-agent-settings:has(.window-controls) .deepcode-local-agent-settings__close { right:120px; }
 
 .deepcode-local-agent-settings__close {
   position: absolute;
@@ -321,45 +307,8 @@
   background: var(--dc-surface-raised);
   color: var(--dc-muted);
   cursor: pointer;
-}
-
-@media (max-width: 1120px) {
-  .deepcode-gui-shell,
-  .deepcode-gui-shell--no-context {
-    grid-template-columns: 220px minmax(0, 1fr);
-  }
-
-  .deepcode-gui-context-rail {
-    display: none;
-  }
-}
-
-@media (max-width: 760px) {
-  .deepcode-gui-shell,
-  .deepcode-gui-shell--no-context {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .deepcode-gui-left-rail {
-    display: none;
-  }
-}
-
-/* dev-main 工作台信息架构：左侧项目/对话，中间会话，右侧任务与产出。 */
-.deepcode-gui-shell {
-  grid-template-columns: var(--dc-sidebar-width) minmax(0, 1fr) var(--dc-context-width);
-  background: var(--dc-surface);
-}
-
-.deepcode-gui-shell--no-context {
-  grid-template-columns: var(--dc-sidebar-width) minmax(0, 1fr);
-}
-
-.deepcode-gui-left-rail {
-  width: var(--dc-sidebar-width);
-  max-width: var(--dc-sidebar-width);
-  gap: 12px;
-  padding: 12px 10px 10px;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 .deepcode-gui-sidebar-actions,
@@ -666,7 +615,7 @@
   border: 0;
   background: transparent;
   color: var(--dc-faint);
-  font: 10px var(--dc-font-ui);
+  font: calc(10px * var(--dc-ui-font-scale, 1)) var(--dc-font-ui);
   animation: deepcode-shortcut-appear 100ms ease-out;
 }
 
@@ -702,8 +651,6 @@
 }
 
 .deepcode-gui-session-main {
-  grid-column: 2;
-  grid-row: 1;
   position: relative;
   min-width: 0;
   min-height: 0;
@@ -717,8 +664,6 @@
 }
 
 .deepcode-gui-context-panel {
-  grid-column: 3;
-  grid-row: 1;
   min-width: 0;
   min-height: 0;
   display: flex;
@@ -955,7 +900,7 @@
   display: grid;
   place-items: center;
   padding: 24px;
-  background: color-mix(in srgb, #111 30%, transparent);
+  background: color-mix(in srgb, var(--dc-shadow-color) 30%, transparent);
   backdrop-filter: blur(3px);
 }
 
@@ -1049,7 +994,7 @@
 }
 
 .deepcode-gui-text-dialog input:focus {
-  border-color: var(--dc-border-strong, var(--line, #666));
+  border-color: var(--dc-border-strong, var(--line));
   box-shadow: none;
 }
 
@@ -1144,7 +1089,7 @@
   );
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--dc-border-strong) 78%, transparent);
   color: var(--dc-muted);
-  font-size: 10px;
+  font-size: calc(10px * var(--dc-ui-font-scale, 1));
   font-weight: var(--dc-weight-semibold);
   font-variant-numeric: tabular-nums;
   isolation: isolate;
@@ -1178,14 +1123,14 @@
 }
 
 .deepcode-session-model__context-popover {
-  --deepcode-context-instructions: light-dark(#626975, #b1b7c2);
-  --deepcode-context-session: light-dark(#7650b8, #a987e0);
-  --deepcode-context-tools: light-dark(#c26d0a, #e0a04f);
-  --deepcode-context-index: light-dark(#216bc1, #69a7e8);
-  --deepcode-context-provider: light-dark(#078b9b, #55bdc8);
-  --deepcode-context-messages: light-dark(#13845f, #59bb91);
-  --deepcode-context-attachments: light-dark(#bd3e75, #df7ca7);
-  --deepcode-context-output: light-dark(#d45132, #ed866d);
+  --deepcode-context-instructions: var(--dc-context-instructions);
+  --deepcode-context-session: var(--dc-context-session);
+  --deepcode-context-tools: var(--dc-context-tools);
+  --deepcode-context-index: var(--dc-context-index);
+  --deepcode-context-provider: var(--dc-context-provider);
+  --deepcode-context-messages: var(--dc-context-messages);
+  --deepcode-context-attachments: var(--dc-context-attachments);
+  --deepcode-context-output: var(--dc-context-output);
   position: absolute;
   right: 0;
   bottom: 38px;
@@ -1351,7 +1296,7 @@
   transform: scaleY(1.29);
   clip-path: inset(0 2px round 3px);
   box-shadow:
-    0 3px 8px light-dark(rgba(34, 30, 26, 0.24), rgba(0, 0, 0, 0.42)),
+    0 3px 8px light-dark(color-mix(in srgb, var(--dc-warning) 24%, transparent), color-mix(in srgb, var(--dc-shadow-color) 42%, transparent)),
     inset 0 -2px 0 color-mix(in srgb, var(--dc-foreground-strong) 17%, transparent);
 }
 
@@ -1670,14 +1615,14 @@
   position: absolute; z-index: 30; right: 0; bottom: 38px;
   width: min(284px, calc(100vw - 40px)); padding: 7px;
   border: 1px solid var(--dc-border); border-radius: 13px;
-  background: var(--dc-surface); box-shadow: 0 12px 36px rgba(0, 0, 0, 0.14);
+  background: var(--dc-surface); box-shadow: 0 12px 36px color-mix(in srgb, var(--dc-shadow-color) 14%, transparent);
 }
-.deepcode-session-model__menu-title { padding: 6px 8px 9px; color: var(--dc-muted); font-size: 11px; }
+.deepcode-session-model__menu-title { padding: 6px 8px 9px; color: var(--dc-muted); font-size: calc(11px * var(--dc-ui-font-scale, 1)); }
 .deepcode-session-model__model-list { max-height: min(300px, 40vh); overflow-y: auto; }
 .deepcode-session-model__menu button {
   display: flex; align-items: center; gap: 9px; width: 100%; min-height: 37px;
   padding: 9px; border: 0; border-radius: 7px; background: transparent;
-  color: var(--dc-foreground); text-align: left; font-size: 12px; cursor: pointer;
+  color: var(--dc-foreground); text-align: left; font-size: calc(12px * var(--dc-ui-font-scale, 1)); cursor: pointer;
 }
 .deepcode-session-model__menu button:hover,
 .deepcode-session-model__menu button:focus-visible,
@@ -1691,36 +1636,4 @@
 .deepcode-session-model__menu .deepcode-session-model__menu-back { border-radius: 0; border-bottom: 1px solid var(--dc-border); margin-bottom: 4px; }
 @media (pointer: coarse) {
   .deepcode-session-model__menu button { min-height: 44px; }
-}
-
-@media (max-width: 1120px) {
-  .deepcode-gui-workbench { --dc-sidebar-width: 224px; --dc-context-width: auto; }
-  .deepcode-gui-shell {
-    grid-template-columns: var(--dc-sidebar-width) minmax(0, 1fr);
-  }
-
-  .deepcode-gui-left-rail {
-    width: var(--dc-sidebar-width);
-    max-width: var(--dc-sidebar-width);
-  }
-
-  .deepcode-gui-context-panel {
-    display: none;
-  }
-}
-
-@media (max-width: 760px) {
-  .deepcode-gui-shell {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .deepcode-gui-left-rail {
-    display: none;
-  }
-
-  .deepcode-gui-session-main {
-    grid-column: 1;
-    border-left: 0;
-  }
-  .deepcode-gui-session-header { grid-column: 1; }
 }

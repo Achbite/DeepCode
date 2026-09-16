@@ -1,5 +1,6 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import type { SessionProjection } from '@deepcode/protocol';
+import { conversationDisplay } from './conversationDisplay';
 
 /** Presentation acknowledgement only; Session still owns every run and message fact. */
 export function useConversationDisplay(projection: SessionProjection | null) {
@@ -14,14 +15,5 @@ export function useConversationDisplay(projection: SessionProjection | null) {
     state.current.displayed.set(identity, text);
     revise((value) => value + 1);
   }, [sessionId]);
-  const streams = useMemo(() => new Map(projection?.timeline.flatMap((item) => item.kind === 'message'
-    ? [[item.messageId, item.streamId] as const] : []) ?? []), [projection?.sessionId, projection?.revision]);
-  const readiness = new Map<string, boolean>();
-  for (const message of projection?.messages ?? []) {
-    if (message.role !== 'assistant') continue;
-    const streamId = streams.get(message.messageId);
-    const ready = !state.current.liveRuns.has(message.runId) || Boolean(streamId && state.current.displayed.get(streamId) === message.content);
-    readiness.set(message.runId, ready && readiness.get(message.runId) !== false);
-  }
-  return { completedRuns: new Set([...readiness].filter(([, ready]) => ready).map(([runId]) => runId)), onDisplayed };
+  return { ...conversationDisplay(projection, state.current.liveRuns, state.current.displayed), onDisplayed };
 }

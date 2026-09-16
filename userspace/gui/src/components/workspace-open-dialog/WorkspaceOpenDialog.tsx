@@ -1,3 +1,5 @@
+import UiIcon from '../../icons/registry';
+import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   browsePath,
@@ -166,7 +168,7 @@ const BrowserWorkspaceOpenDialog: React.FC = () => {
             title={t(language, 'window.close')}
             type="button"
           >
-            x
+            <UiIcon name="close" size={14} />
           </button>
         </div>
 
@@ -218,7 +220,7 @@ const BrowserWorkspaceOpenDialog: React.FC = () => {
                 type="button"
               >
                 <span className="ws-open-dialog__sidebar-icon">
-                  {t(language, `workspaceDialog.locationKind.${location.kind}`)}
+                  <DeepCodeShellIcon name={location.kind === 'home' ? 'account' : 'folder'} size={16} />
                 </span>
                 <span>{location.label}</span>
               </button>

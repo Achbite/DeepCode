@@ -1,9 +1,13 @@
+import PaletteOverrides from './theme/PaletteOverrides';
+import { installPaletteDefaults } from './theme/palette';
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './app/App';
 import { installNativeContextMenuGuard } from './utils/nativeContextMenuGuard';
 import { activeT } from './i18n';
 import { UiPluginsProvider } from './ui-plugins/UiPlugins';
+
+const removePaletteDefaults = installPaletteDefaults();
 
 const ROOT_EL_ID = 'root';
 
@@ -31,17 +35,17 @@ function showBootstrapError(label: string, err: unknown): void {
   root.innerHTML = `
     <div style="
       padding: 24px;
-      color: #fff;
-      background: #1f1111;
+      color: var(--dc-foreground-strong);
+      background: var(--dc-background);
       font-family: Consolas, 'Courier New', monospace;
       font-size: 13px;
       height: 100vh;
       overflow: auto;
       box-sizing: border-box;
     ">
-      <h2 style="color:#ff6b6b;margin:0 0 12px 0;">${escapeHtml(activeT('app.bootstrap.errorTitle', { label }))}</h2>
-      <pre style="white-space:pre-wrap;word-break:break-word;margin:0;color:#ddd;">${escapeHtml(message)}</pre>
-      <p style="margin-top:16px;color:#888;font-size:12px;">
+      <h2 style="color:var(--dc-danger);margin:0 0 12px 0;">${escapeHtml(activeT('app.bootstrap.errorTitle', { label }))}</h2>
+      <pre style="white-space:pre-wrap;word-break:break-word;margin:0;color:var(--dc-foreground);">${escapeHtml(message)}</pre>
+      <p style="margin-top:16px;color:var(--dc-muted);font-size:12px;">
         ${escapeHtml(activeT('app.bootstrap.errorBody'))}
       </p>
     </div>
@@ -85,8 +89,8 @@ class ErrorBoundary extends React.Component<
         <div
           style={{
             padding: 24,
-            color: '#fff',
-            background: '#1f1111',
+            color: 'var(--dc-foreground-strong)',
+            background: 'var(--dc-background)',
             fontFamily: "Consolas, 'Courier New', monospace",
             fontSize: 13,
             height: '100vh',
@@ -94,7 +98,7 @@ class ErrorBoundary extends React.Component<
             boxSizing: 'border-box',
           }}
         >
-          <h2 style={{ color: '#ff6b6b', margin: '0 0 12px 0' }}>
+          <h2 style={{ color: 'var(--dc-danger)', margin: '0 0 12px 0' }}>
             {activeT('app.bootstrap.renderErrorTitle')}
           </h2>
           <pre
@@ -102,14 +106,14 @@ class ErrorBoundary extends React.Component<
               whiteSpace: 'pre-wrap',
               wordBreak: 'break-word',
               margin: 0,
-              color: '#ddd',
+              color: 'var(--dc-foreground)',
             }}
           >
             {err.name}: {err.message}
             {'\n\n'}
             {err.stack}
           </pre>
-          <p style={{ marginTop: 16, color: '#888', fontSize: 12 }}>
+          <p style={{ marginTop: 16, color: 'var(--dc-muted)', fontSize: 12 }}>
             {activeT('app.bootstrap.renderErrorBody')}
           </p>
         </div>
@@ -133,6 +137,7 @@ const disposeComposition = () => {
   compositionDisposed = true;
   window.removeEventListener('pagehide', handlePageHide);
   root.unmount();
+  removePaletteDefaults();
 };
 const handlePageHide = (event: PageTransitionEvent) => {
   if (!event.persisted) disposeComposition();
@@ -144,6 +149,7 @@ try {
   root.render(
     <React.StrictMode>
       <ErrorBoundary>
+        <PaletteOverrides />
         <UiPluginsProvider><App /></UiPluginsProvider>
       </ErrorBoundary>
     </React.StrictMode>

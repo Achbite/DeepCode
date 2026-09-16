@@ -443,7 +443,7 @@ test('scope-only Plan review foregrounds additions and keeps the complete confir
   const { renderToStaticMarkup } = await import('react-dom/server');
   const { PlanCardContent } = await loadGuiModule(t, '/src/components/local-agent/PlanCard.tsx');
   const { planScopeAddition } = await loadGuiModule(t, '/src/components/local-agent/planReview.ts');
-  const { ComposerDecisionPanels } = await loadGuiModule(t, '/src/components/local-agent/ComposerDecisionPanels.tsx');
+  const { ConversationComposer } = await loadGuiModule(t, '/src/components/local-agent/ConversationComposer.tsx');
   const previous = {
     planId: 'plan:scope-review', revision: 1, runId: 'run:scope', callId: 'call:initial', status: 'confirmed',
     title: 'Implement pool', summary: 'Build and verify the pool.',
@@ -470,11 +470,14 @@ test('scope-only Plan review foregrounds additions and keeps the complete confir
   assert.equal(planScopeAddition(previous, { ...current, steps: [{ ...current.steps[0], verification: [] }] }), null);
   assert.equal(planScopeAddition(previous, { ...current, mutationManifest: current.mutationManifest.slice(1) }), null);
   assert.equal(planScopeAddition(previous, { ...current, summary: 'A different objective.' }), null);
-  const decision = renderToStaticMarkup(createElement(ComposerDecisionPanels, { language: 'zh-CN', composer: {
+  const decision = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', uiActionError: null, composer: {
     pendingPlan: current, pendingScopeAddition: addition, textareaRef: { current: null }, draft: '', submitting: false,
+    profiles: [], selectedProfileId: null, pastedTexts: [], failedDrafts: [], pendingFilesystemPaths: [],
+    pluginSelections: [], filteredPlugins: [], textDecision: true,
   } }));
-  assert.ok(decision.includes('确认新增范围'));
+  assert.match(decision, />确认新增范围<\/b>/);
   assert.ok(decision.includes('保留已有进度'));
+  assert.equal((decision.match(/<textarea\b/g) ?? []).length, 1);
 });
 
 test('last-call, per-run, and Session cache rates use their own input token totals', async (t) => {
@@ -1408,7 +1411,7 @@ test('continuous conversation keeps every message anchor while mounting nearby c
   t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
   const { ConversationTranscript } = await loadGuiModule(t, '/src/components/local-agent/ConversationTranscript.tsx');
   const props = {
-    language: 'zh-CN', loading: false, completedRuns: new Set(), onDisplayed() {},
+    language: 'zh-CN', loading: false, completedRuns: new Set(), artifacts: [], onDisplayed() {},
     projection: { sessionId: 'session:long', run: null, plans: [], activities: [], fileChangeRounds: [], artifacts:[] },
     hasConversationContent: true, draftItems: [],
     conversationItems: rows.map((row, index) => ({ ...row.item, sequence: index, streamId: `stream:${index}`, value: { ...row.item.value, messageId: row.key, runId: 'run:long' } })),
@@ -1680,7 +1683,7 @@ test('Plan documents and previews render Markdown entities, code names and verif
   assert.match(question, /<code>Dockerfile<\/code>/);
   assert.match(question, /<code>Makefile<\/code>/);
   assert.ok(question.includes('local-agent__interaction-document-scroll'));
-  const optionButton = question.match(/<button[^>]*>[\s\S]*?<\/button>/)?.[0];
+  const optionButton = question.match(/<ol class="local-agent__interaction-options">[\s\S]*?(<button[^>]*>[\s\S]*?<\/button>)/)?.[1];
   assert.ok(optionButton, 'the option remains a native action button');
   assert.match(optionButton, /disabled=""/);
   assert.match(optionButton, /<code>Makefile<\/code>/, 'the description is part of the option hit target and accessible name');
@@ -2225,7 +2228,32 @@ test('composer submission receipts preserve newer text and retain the complete f
   assert.deepEqual(current, original);
 });
 
-test('pending approvals preserve ordinary input with one primary action', async (t) => {
+test('artifact delivery waits for final text display and keeps historical or interrupted output available', async (t) => {
+  const { conversationDisplay } = await loadGuiModule(t, '/src/components/local-agent/conversationDisplay.ts');
+  const artifacts = [{ artifactId: 'image:old', runId: 'run:old' }, { artifactId: 'image:new', runId: 'run:new' }];
+  const projection = { run: { runId: 'run:new', status: 'running' }, messages: [], timeline: [], artifacts,
+    assistantDraft: { runId: 'run:new', blocks: [{ content: 'Still writing' }] } };
+  const live = new Set(['run:new']);
+  const shown = new Map();
+  assert.deepEqual(conversationDisplay(projection, live, shown).artifacts, [artifacts[0]]);
+  const committed = { ...projection, assistantDraft: null, run: { ...projection.run, status: 'completed' },
+    messages: [{ messageId: 'final', runId: 'run:new', role: 'assistant', content: 'The complete final answer.' }],
+    timeline: [{ kind: 'message', messageId: 'final', streamId: 'stream:final' }],
+  };
+  shown.set('stream:final', 'The complete');
+  assert.deepEqual(conversationDisplay(committed, live, shown).artifacts, [artifacts[0]], 'settlement must not skip the UI display buffer');
+  assert.deepEqual(conversationDisplay({ ...committed, run: { runId: 'run:next', status: 'running' } }, live, shown).artifacts,
+    [artifacts[0]], 'starting the next run does not bypass the previous answer display');
+  shown.set('stream:final', 'The complete final answer.');
+  assert.deepEqual(conversationDisplay(committed, live, shown).artifacts, artifacts);
+  assert.deepEqual(conversationDisplay({ ...committed, run: { ...committed.run, status: 'releasing' } }, live, shown).artifacts, [artifacts[0]], 'showing text does not invent a settled run');
+  assert.deepEqual(conversationDisplay(committed, new Set(), new Map()).artifacts, artifacts, 'settled history does not replay a reveal animation');
+  const interrupted = { ...projection, assistantDraft: null, run: { ...projection.run, status: 'cancelled' } };
+  assert.deepEqual(conversationDisplay(interrupted, live, shown).artifacts, artifacts, 'actual output is retained after cancellation without a final answer');
+  assert.deepEqual(projection.artifacts, artifacts, 'presentation cannot remove canonical artifacts');
+});
+
+test('pending approvals replace ordinary input while preserving its draft for return', async (t) => {
   const previousSelf = globalThis.self;
   globalThis.self = {};
   t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
@@ -2241,12 +2269,27 @@ test('pending approvals preserve ordinary input with one primary action', async 
   };
   const html = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', composer, uiActionError: null }));
   assert.match(html, /Write the requested file/);
-  assert.match(html, /<textarea[^>]*>Second request<\/textarea>/);
-  assert.match(html, /local-agent__composer--message/);
-  assert.match(html, /<textarea[^>]*rows="3"/);
-  assert.doesNotMatch(html, /local-agent__send--stop/);
-  assert.match(html, /class="local-agent__send"/);
-  assert.equal((html.match(/<button[^>]*class="local-agent__send(?: |")/g) ?? []).length, 1);
+  assert.doesNotMatch(html, /<textarea|local-agent__send|local-agent__composer-footer|local-agent__composer-tools/);
+  assert.match(html, /local-agent__composer--approval/);
+  assert.match(html, /aria-label="拒绝" aria-keyshortcuts="Escape"/);
+  assert.match(html, /aria-label="允许" aria-keyshortcuts="Enter"/);
+  assert.equal((html.match(/<button\b/g) ?? []).length, 2);
+  const resumed = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', composer: { ...composer, pendingApproval: null }, uiActionError: null }));
+  assert.match(resumed, /<textarea[^>]*>Second request<\/textarea>/);
+  const browser = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', composer: { ...composer,
+    pendingApproval: { ...composer.pendingApproval, preview: { ...composer.pendingApproval.preview, authorizationScope: 'sessionBrowser' } },
+  }, uiActionError: null }));
+  assert.match(browser, /允许当前对话使用内置浏览器/);
+  assert.match(browser, /aria-label="允许此对话"/);
+  const { emptySessionState, projectSession } = await import('../../session-core/dist/index.js');
+  const wire = projectSession(emptySessionState('session:browser-wire'));
+  wire.pendingApproval = { ...composer.pendingApproval, runId: 'run:browser', callId: 'call:browser', sequence: 3,
+    createdAt: '2026-09-16T00:00:00Z', preview: { ...composer.pendingApproval.preview, authorizationScope: 'sessionBrowser' },
+  };
+  assert.deepEqual(await decodeGuiProjection(wire), wire, 'explicit scope survives the strict GUI wire decoder');
+  const invalidScope = structuredClone(wire);
+  invalidScope.pendingApproval.preview.authorizationScope = 'unknown';
+  await assert.rejects(decodeGuiProjection(invalidScope), /conversation_projection_invalid/);
   assert.match(html, /等待加入当前任务/);
   assert.match(html, /Keep the public API unchanged/);
 });
@@ -2275,12 +2318,14 @@ test('questions and Plan revisions share the main input and render a single prim
     assert.match(html, /保留构建配置<\/textarea>/);
     assert.doesNotMatch(html, /local-agent__send--stop/);
     assert.doesNotMatch(html, /local-agent__interaction-composer/);
-    assert.doesNotMatch(html, /local-agent__interaction-close|local-agent__interaction-secondary-actions/);
+    assert.match(html, /local-agent__interaction-close/);
+    assert.match(html, /local-agent__decision-input-mark/);
+    assert.doesNotMatch(html, /local-agent__interaction-secondary-actions/);
     const secondaryLabel = decision.pendingPlan ? '取消并停止' : '跳过';
-    assert.equal(html.split(secondaryLabel).length - 1, 1);
+    assert.equal(html.split(`<span>${secondaryLabel}</span>`).length - 1, 1);
     const actions = html.slice(html.indexOf('class="local-agent__composer-primary-actions"'));
     assert.ok(actions.includes(secondaryLabel));
-    assert.ok(actions.indexOf(secondaryLabel) < actions.indexOf('class="local-agent__send"'));
+    assert.ok(actions.indexOf(secondaryLabel) < actions.indexOf('class="local-agent__send'));
   }
   const running = renderToStaticMarkup(createElement(ConversationComposer, {
     language: 'zh-CN', composer: { ...base, textDecision: false, draft: '', canSend: false, showStopAction: true }, uiActionError: null,
@@ -2296,6 +2341,13 @@ test('questions and Plan revisions share the main input and render a single prim
   assert.match(editing, /保留构建配置<\/textarea>/);
   assert.match(editing, /aria-label="发送"/);
   assert.doesNotMatch(editing, /local-agent__send--stop|local-agent__interaction-secondary/);
+  const plan = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', uiActionError: null,
+    composer: { ...base, draft: '', canSend: false, pendingPlan: { planId: 'plan:one', revision: 1, title: '清理工作区' } },
+  }));
+  assert.equal((plan.match(/<textarea\b/g) ?? []).length, 1);
+  assert.match(plan, />确认执行<\/b>/);
+  assert.match(plan, /local-agent__send--decision[^>]*disabled=""/);
+  assert.doesNotMatch(plan, /local-agent__composer-tools|session-model-selector/);
 });
 
 test('resource preview keeps expansion beside the shared sidebar control while committed content projects only displayed text', async (t) => {
@@ -2674,4 +2726,115 @@ test('UI update detection compares entry resources and retains the original load
   unsubscribe();
   reportInterfaceLoadError(new Error('second failure'));
   assert.equal(notifications, 1);
+});
+
+test('custom light and dark palettes persist through the shared settings owner and reset independently', async (t) => {
+  const [{ useSettingsStore }, palette] = await loadGuiModules(t, ['/src/state/settingsStore.ts', '/src/theme/palette.ts']);
+  let persisted = { 'gui.colorTheme': 'system', 'gui.accentColor': 'purple' };
+  let fail = false;
+  installGuiFetch(t, (url, init) => {
+    assert.equal(url.pathname, '/api/user-settings');
+    if (init.method === 'PATCH') {
+      const { patches } = JSON.parse(init.body);
+      if (fail) return Response.json({ ok: false, message: 'palette write failed' });
+      for (const [key, value] of Object.entries(patches)) {
+        if (value === null) delete persisted[key]; else persisted[key] = value;
+      }
+      return Response.json({ ok: true, data: { settings: persisted, changedKeys: Object.keys(patches), activation: 'immediate' } });
+    }
+    return Response.json({ ok: true, data: { settings: persisted, runtimeSettings: persisted, overriddenKeys: Object.keys(persisted), storePath: '/test/user-settings.json' } });
+  });
+  await useSettingsStore.getState().loadUserSettings();
+  const custom = { '--dc-theme-light-background': '#f5f1ea', '--dc-theme-dark-background': '#202124', '--dc-custom-dark-accent': '#aaccee' };
+  assert.equal(await useSettingsStore.getState().patchUserSetting(palette.PALETTE_SETTING, JSON.stringify(custom)), 'immediate');
+  const [{ useSettingsStore: reloaded }] = await loadGuiModules(t, ['/src/state/settingsStore.ts']);
+  await reloaded.getState().loadUserSettings();
+  const read = () => palette.decodePaletteOverrides(reloaded.getState().effectiveSettings[palette.PALETTE_SETTING]);
+  assert.deepEqual(read(), custom);
+  assert.equal(palette.paletteColor(read(), 'dark', 'accent', 'purple'), '#aaccee');
+  assert.equal(palette.paletteColor(read(), 'light', 'accent', 'purple'), palette.UI_PALETTE.tokens['--dc-accent-purple-light']);
+  fail = true;
+  assert.equal(await reloaded.getState().patchUserSetting(palette.PALETTE_SETTING, '{}'), null);
+  assert.match(reloaded.getState().errorMessage, /palette write failed/);
+  assert.deepEqual(read(), custom);
+  fail = false;
+  const lightOnly = palette.resetPaletteTheme(read(), 'dark');
+  assert.equal(await reloaded.getState().patchUserSetting(palette.PALETTE_SETTING, JSON.stringify(lightOnly)), 'immediate');
+  await reloaded.getState().loadUserSettings();
+  assert.deepEqual(read(), { '--dc-theme-light-background': '#f5f1ea' });
+  assert.equal(reloaded.getState().effectiveSettings['gui.colorTheme'], 'system');
+  assert.equal(reloaded.getState().effectiveSettings['gui.accentColor'], 'purple');
+  assert.equal(await reloaded.getState().resetUserSetting(palette.PALETTE_SETTING), 'immediate');
+  await reloaded.getState().loadUserSettings();
+  assert.deepEqual(read(), {});
+});
+
+test('palette rejects incomplete input and reset removes custom colors and derived contrast', async (t) => {
+  const { decodePaletteOverrides, paletteOverrideCss, resetPaletteTheme } = await loadGuiModule(t, '/src/theme/palette.ts');
+  for (const encoded of ['{broken', '[]', 'null', '{"unknown":"#112233"}', '{"--dc-theme-dark-background":"#12"}', '{"--dc-theme-dark-background":null}']) {
+    assert.throws(() => decodePaletteOverrides(encoded));
+    assert.throws(() => paletteOverrideCss(encoded));
+  }
+  const custom = { '--dc-custom-dark-accent': '#aabbcc', '--dc-theme-light-border': '#11223322' };
+  const css = paletteOverrideCss(JSON.stringify(custom));
+  assert.match(css, /--dc-custom-dark-accent-contrast:var\(--dc-shadow-color\)/);
+  const reset = paletteOverrideCss(JSON.stringify(resetPaletteTheme(custom, 'dark')));
+  assert.doesNotMatch(reset, /custom-dark/);
+  assert.match(reset, /--dc-theme-light-border:#11223322/);
+  assert.equal(paletteOverrideCss('{}'), ':root{}');
+});
+
+test('named themes validate before import and select light and dark palettes independently', async (t) => {
+  const library = await loadGuiModule(t, '/src/theme/themeLibrary.ts');
+  const palette = await loadGuiModule(t, '/src/theme/palette.ts');
+  const imported = library.importTheme(JSON.stringify({ name: 'Review Theme', light: { background: '#F4F2ED' }, dark: { accent: '#BBAADD' } }));
+  assert.equal(imported.light.background, '#f4f2ed');
+  const themes = [...library.builtinThemes(), { id: 'review', ...imported }];
+  let applied = library.applyThemePalette({}, imported, 'light');
+  assert.equal(library.selectedThemeId(themes, applied, 'light'), 'review');
+  assert.equal(library.selectedThemeId(themes, applied, 'dark'), 'default');
+  applied = library.applyThemePalette(applied, themes[0], 'dark');
+  assert.equal(applied['--dc-theme-light-background'], '#f4f2ed');
+  assert.equal(library.selectedThemeId(themes, applied, 'dark'), themes[0].id);
+  const edited = { ...applied, '--dc-custom-dark-accent': '#abcdef' };
+  assert.equal(library.selectedThemeId(themes, edited, 'dark'), 'custom');
+  assert.deepEqual(library.applyThemePalette(applied, null, 'dark'), { '--dc-theme-light-background': '#f4f2ed' });
+  for (const theme of themes) palette.decodePaletteOverrides(JSON.stringify(library.themeOverrides(theme)));
+  for (const document of [null, [], { name: 'Empty' }, { name: 'Bad', dark: { unknown: '#112233' } }, { name: 'Bad', dark: { accent: '#12' } }]) {
+    assert.throws(() => library.importTheme(JSON.stringify(document)));
+  }
+  assert.throws(() => library.decodeThemeLibrary(JSON.stringify([{ id: 'same', ...imported }, { id: 'same', ...imported }])));
+});
+
+test('theme library and UI fonts persist without changing active colors or appearance mode', async (t) => {
+  const [{ useSettingsStore }, library, fonts] = await loadGuiModules(t, ['/src/state/settingsStore.ts', '/src/theme/themeLibrary.ts', '/src/theme/typography.ts']);
+  let persisted = { 'gui.colorTheme': 'system', 'workbench.styleTokenOverrides': '{"--dc-custom-dark-accent":"#ccbbaa"}' };
+  installGuiFetch(t, (url, init) => {
+    assert.equal(url.pathname, '/api/user-settings');
+    if (init.method === 'PATCH') {
+      const { patches } = JSON.parse(init.body);
+      for (const [key, value] of Object.entries(patches)) { if (value === null) delete persisted[key]; else persisted[key] = value; }
+      return Response.json({ ok: true, data: { settings: persisted, changedKeys: Object.keys(patches), activation: 'immediate' } });
+    }
+    return Response.json({ ok: true, data: { settings: persisted, runtimeSettings: persisted, overriddenKeys: Object.keys(persisted), storePath: '/test/user-settings.json' } });
+  });
+  const saved = [{ id: 'user-theme', name: 'User theme', dark: { background: '#202022' } }];
+  await useSettingsStore.getState().patchUserSetting(library.THEME_LIBRARY_SETTING, JSON.stringify(saved));
+  await useSettingsStore.getState().patchUserSettingsBatch({ [fonts.UI_FONT_FAMILY_SETTING]: 'PingFang SC', [fonts.UI_FONT_SIZE_SETTING]: 16 });
+  const [{ useSettingsStore: reloaded }] = await loadGuiModules(t, ['/src/state/settingsStore.ts']);
+  await reloaded.getState().loadUserSettings();
+  const settings = reloaded.getState().effectiveSettings;
+  assert.deepEqual(library.decodeThemeLibrary(settings[library.THEME_LIBRARY_SETTING]), saved);
+  assert.equal(settings['gui.colorTheme'], 'system');
+  assert.equal(settings['workbench.styleTokenOverrides'], '{"--dc-custom-dark-accent":"#ccbbaa"}');
+  assert.match(fonts.uiFontFamily(settings[fonts.UI_FONT_FAMILY_SETTING]), /^"PingFang SC",/);
+  assert.equal(fonts.uiFontSize(settings[fonts.UI_FONT_SIZE_SETTING]), 16);
+  assert.throws(() => fonts.uiFontFamily(''));
+  assert.throws(() => fonts.uiFontFamily('bad; family'));
+  assert.throws(() => fonts.uiFontSize(0));
+  assert.throws(() => fonts.uiFontSize(14.5));
+  await reloaded.getState().patchUserSettingsBatch({ [fonts.UI_FONT_FAMILY_SETTING]: null, [fonts.UI_FONT_SIZE_SETTING]: null });
+  assert.equal(reloaded.getState().effectiveSettings[fonts.UI_FONT_FAMILY_SETTING], 'system');
+  assert.equal(reloaded.getState().effectiveSettings[fonts.UI_FONT_SIZE_SETTING], 14);
+  assert.deepEqual(library.decodeThemeLibrary(reloaded.getState().effectiveSettings[library.THEME_LIBRARY_SETTING]), saved);
 });

@@ -11,7 +11,7 @@ import { useConversationViewport } from './useConversationViewport';
 import { useProjectionPolling, useProfilesUpdated } from './useProjectionPolling';
 import { useAgentComposer } from './useAgentComposer';
 import { FileChanges, roundChangeActivities } from './FileChanges';
-import { useConversationDisplay } from './useConversationDisplay';
+import { useDisplayedConversation } from './ConversationDisplayProvider';
 import { ConversationComposer } from './ConversationComposer';
 import { ConversationTranscript } from './ConversationTranscript';
 import { ReaderControls, ResourcePreview, useResourcePreview } from './ResourcePreview';
@@ -48,7 +48,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
     || t(language, 'agent.session.newTitle');
   const conversationItems = useMemo(() => projectionItems(projection), [projection?.sessionId, projection?.revision]);
   const assistantDraft = projection?.assistantDraft ?? null;
-  const display = useConversationDisplay(projection);
+  const display = useDisplayedConversation();
   const showChangeBar = projection?.run && !display.completedRuns.has(projection.run.runId)
     && !['failed', 'cancelled', 'indeterminate'].includes(projection.run.status);
   const draftItems = useMemo(
@@ -126,6 +126,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
       <div ref={bodyRef} className="local-agent__body" aria-live="polite" {...bodyHandlers}>
         <ConversationTranscript
           completedRuns={display.completedRuns}
+          artifacts={display.artifacts}
           onDisplayed={display.onDisplayed}
           showReasoning={showReasoning}
           language={language}
@@ -151,10 +152,10 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
             <DeepCodeShellIcon name="chevronDown" />
           </button>
         )}
-        {mode === 'panel' && !!projection?.artifacts.length && <ArtifactLinks artifacts={projection.artifacts} onOpen={resourcePreview.openWorkspaceResource} />}
-        {mode !== 'panel' && !!projection?.artifacts.length && <details className="conversation-artifact-shortcuts">
+        {mode === 'panel' && !!display.artifacts.length && <ArtifactLinks artifacts={display.artifacts} onOpen={resourcePreview.openWorkspaceResource} />}
+        {mode !== 'panel' && !!display.artifacts.length && <details className="conversation-artifact-shortcuts">
           <summary>{t(language, 'deepcodeGui.outputs.title')}</summary>
-          <ArtifactLinks artifacts={projection.artifacts} onOpen={resourcePreview.openWorkspaceResource} />
+          <ArtifactLinks artifacts={display.artifacts} onOpen={resourcePreview.openWorkspaceResource} />
         </details>}
       </div>
       </div>

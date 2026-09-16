@@ -1,5 +1,6 @@
 import { MarkdownInline } from '../../components/local-agent/BufferedMarkdown';
 import React from 'react';
+import { useDisplayedConversation } from '../../components/local-agent/ConversationDisplayProvider';
 import { ArtifactLinks } from '../../components/local-agent/ArtifactLinks';
 import { requestWorkspacePreview } from '../../components/local-agent/readerState';
 import type { SessionProjection } from '@deepcode/protocol';
@@ -13,7 +14,8 @@ interface DeepCodeTaskPanelProps {
 const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, projection }) => {
   // Each fixed delivery is immutable; its execution timestamp is the last
   // content change of that version. Keep all versions in this Session.
-  const artifacts = [...(projection?.artifacts ?? [])].sort(
+  const display = useDisplayedConversation();
+  const artifacts = [...display.artifacts].sort(
     (left, right) => artifactTimestamp(right.createdAt) - artifactTimestamp(left.createdAt),
   );
   const todos = projection?.todoList?.items ?? [];

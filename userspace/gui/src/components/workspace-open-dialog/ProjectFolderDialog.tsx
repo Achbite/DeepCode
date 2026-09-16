@@ -1,3 +1,4 @@
+import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import ModalDialog from '../shared/ModalDialog';
 import React, { useEffect, useMemo, useState } from 'react';
 import type { BrowseEntry, BrowsePathResult, InitialLocation } from '@deepcode/protocol';
@@ -106,7 +107,7 @@ const BrowserProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
             className="ws-open-dialog__close"
             aria-label={t(language, 'workspaceDialog.cancel')}
             onClick={onCancel}
-          >×</button>
+          ><DeepCodeShellIcon name="close" size={14} /></button>
         </div>
         <div className="ws-open-dialog__addressbar">
           <button
@@ -157,7 +158,7 @@ const BrowserProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
                 title={location.absolutePath}
               >
                 <span className="ws-open-dialog__sidebar-icon">
-                  {t(language, `workspaceDialog.locationKind.${location.kind}`)}
+                  <DeepCodeShellIcon name={location.kind === 'home' ? 'account' : 'folder'} size={16} />
                 </span>
                 <span>{location.label}</span>
               </button>
@@ -186,7 +187,7 @@ const BrowserProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
                     title={entry.absolutePath}
                   >
                     <span className="ws-open-dialog__entry-icon">
-                      {t(language, `workspaceDialog.entryKind.${entry.type}`)}
+                      <DeepCodeShellIcon name={entry.type === 'directory' ? 'folder' : 'file'} size={16} />
                     </span>
                     <span className="ws-open-dialog__entry-name">{entry.name}</span>
                   </li>

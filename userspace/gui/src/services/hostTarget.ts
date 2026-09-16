@@ -94,16 +94,6 @@ export function getKernelApiBase(): string {
   return `${getKernelHttpOrigin()}/api`;
 }
 
-export function getKernelWsBase(): string {
-  if (trustedTarget) return `ws://${trustedTarget.host}:${trustedTarget.port}/ws`;
-  if (browserDevelopmentOrigin) {
-    const origin = new URL(browserDevelopmentOrigin);
-    const protocol = origin.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${protocol}//${origin.host}/ws`;
-  }
-  return 'ws://127.0.0.1:0/ws';
-}
-
 export function getHostConnectionHeaders(): Record<string, string> {
   return trustedTarget
     ? { 'x-deepcode-host-ui-token': trustedTarget.uiToken }

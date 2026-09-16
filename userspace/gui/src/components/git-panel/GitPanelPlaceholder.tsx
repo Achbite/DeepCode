@@ -1,3 +1,4 @@
+import UiIcon from '../../icons/registry';
 /**
  * Git panel placeholder.
  * Stage 7 will attach Git status / diff / git.tree data.
@@ -87,7 +88,7 @@ const GitPanelPlaceholder: React.FC<GitPanelPlaceholderProps> = ({ language }) =
           <span>{root || t(language, 'git.noRepository')}</span>
         </div>
         <button type="button" onClick={() => void refresh()} title={t(language, 'git.refresh')}>
-          ↻
+          <UiIcon name="refresh" />
         </button>
       </div>
 

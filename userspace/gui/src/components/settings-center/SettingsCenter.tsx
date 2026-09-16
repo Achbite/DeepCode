@@ -1,3 +1,5 @@
+import { createPortal } from 'react-dom';
+import { UI_ICON_ROLES } from '../../icons/registry';
 import { SettingsSearchContext, SettingsSearchTargets, matchesSettingsQuery, type SettingsSearchEntry } from './settingsSearch';
 import { settingsSearchDefinitions } from './sections/CategorizedSettingsSections';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
@@ -20,16 +22,16 @@ type SettingsKey = 'general' | 'about' | 'workspace' | 'common' | 'gui' | 'agent
 
 interface SettingsCenterProps {
   apiStatus: string;
-  wsStatus: string;
   serverVersion?: string;
   surface?: Extract<SettingsSurface, 'editor' | 'gui'>;
+  navigationTarget?: HTMLElement | null;
 }
 
 const SettingsCenter: React.FC<SettingsCenterProps> = ({
   apiStatus,
-  wsStatus,
   serverVersion,
   surface = 'editor',
+  navigationTarget,
 }) => {
   const [activeKey, setActiveKey] = useState<SettingsKey>(
     surface === 'gui' ? 'gui' : 'workspace',
@@ -47,20 +49,20 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     ? t(language, `deepcodeGui.status.${value}`) : value;
   const items: Array<{ key: SettingsKey; icon: DeepCodeShellIconName; label: string }> = [
     ...(surface === 'editor'
-      ? [{ key: 'workspace' as const, icon: 'folder' as const, label: t(language, 'settings.nav.workspace') }]
+      ? [{ key: 'workspace' as const, icon: UI_ICON_ROLES.settings.workspace, label: t(language, 'settings.nav.workspace') }]
       : []),
-    ...(surface === 'gui' ? [{ key: 'general' as const, icon: 'settings' as const, label: language === 'zh-CN' ? '通用' : 'General' }] : []),
+    ...(surface === 'gui' ? [{ key: 'general' as const, icon: UI_ICON_ROLES.settings.general, label: language === 'zh-CN' ? '通用' : 'General' }] : []),
     {
       key: surface === 'gui' ? 'gui' : 'common',
-      icon: 'settings',
+      icon: UI_ICON_ROLES.settings.appearance,
       label: t(language, surface === 'gui' ? 'settings.nav.gui' : 'settings.nav.common'),
     },
-    { key: 'agent', icon: 'session', label: t(language, 'settings.nav.agent') },
-    { key: 'environment', icon: 'terminal', label: t(language, 'settings.nav.environment') },
-    { key: 'permissions', icon: 'tool', label: t(language, 'settings.nav.permissions') },
-    { key: 'llm', icon: 'activity', label: t(language, 'settings.nav.llm') },
-    { key: 'plugins', icon: 'extension', label: t(language, 'settings.nav.plugins') },
-    ...(surface === 'gui' ? [{ key: 'about' as const, icon: 'activity' as const, label: language === 'zh-CN' ? '关于' : 'About' }] : []),
+    { key: 'agent', icon: UI_ICON_ROLES.settings.agent, label: t(language, 'settings.nav.agent') },
+    { key: 'environment', icon: UI_ICON_ROLES.settings.environment, label: t(language, 'settings.nav.environment') },
+    { key: 'permissions', icon: UI_ICON_ROLES.settings.permissions, label: t(language, 'settings.nav.permissions') },
+    { key: 'llm', icon: UI_ICON_ROLES.settings.models, label: t(language, 'settings.nav.llm') },
+    { key: 'plugins', icon: UI_ICON_ROLES.settings.plugins, label: t(language, 'settings.nav.plugins') },
+    ...(surface === 'gui' ? [{ key: 'about' as const, icon: UI_ICON_ROLES.settings.about, label: language === 'zh-CN' ? '关于' : 'About' }] : []),
   ];
 
   const searching = !!searchQuery.trim();
@@ -94,7 +96,6 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
         return (
           <CommonSettingsSection
             apiStatus={statusText(apiStatus)}
-            wsStatus={statusText(wsStatus)}
             serverVersion={serverVersion}
             query=""
             surface={surface}
@@ -107,7 +108,6 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
           <GuiSettingsSection
             category={key === 'gui' ? 'appearance' : key}
             apiStatus={statusText(apiStatus)}
-            wsStatus={statusText(wsStatus)}
             serverVersion={serverVersion}
             query=""
           />
@@ -123,9 +123,8 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     }
   };
 
-  return (
-    <SettingsSearchTargets.Provider value={targets.current}><SettingsSearchContext.Provider value={register}><div className="settings-center">
-      <nav className="settings-nav" aria-label={t(language, 'settings.title')}>
+  const navigation = (
+    <nav className="settings-nav" aria-label={t(language, 'settings.title')}>
         <div className="settings-nav__title">{t(language, 'settings.title')}</div>
         <label className="settings-search" aria-label={t(language, 'settings.search.placeholder')}>
           <span>{t(language, 'settings.search.label')}</span>
@@ -152,6 +151,12 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
           ))}
         </div>
       </nav>
+  );
+
+  return (
+    <SettingsSearchTargets.Provider value={targets.current}><SettingsSearchContext.Provider value={register}><div className="settings-center">
+      {navigationTarget ? createPortal(navigation, navigationTarget) : navigation}
+
       <section className="settings-body">
         {searching && <div className="settings-search-results">
           <h2 className="settings-title">{t(language, 'settings.search.results')}</h2>

@@ -3,17 +3,17 @@
   grid-template-rows: 38px 1fr 22px;
   width: 100vw;
   height: 100vh;
-  background: #0a0a0c;
-  color: #ededed;
+  background: var(--dc-background);
+  color: var(--dc-foreground);
 }
 
 .app-boot-shell__header {
   display: flex;
   align-items: center;
   padding: 0 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  background: #18181b;
-  color: #fff;
+  border-bottom: 1px solid color-mix(in srgb, var(--dc-foreground) 8%, transparent);
+  background: var(--dc-sidebar);
+  color: var(--dc-foreground-strong);
   font-size: 13px;
   font-weight: 650;
   -webkit-app-region: drag;
@@ -33,33 +33,33 @@
 }
 
 .app-boot-shell__rail {
-  background: #18181b;
-  border-right: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--dc-sidebar);
+  border-right: 1px solid color-mix(in srgb, var(--dc-foreground) 8%, transparent);
 }
 
 .app-boot-shell__side,
 .app-boot-shell__agent {
-  background: #131316;
+  background: var(--dc-sidebar);
 }
 
 .app-boot-shell__side {
-  border-right: 1px solid rgba(255, 255, 255, 0.08);
+  border-right: 1px solid color-mix(in srgb, var(--dc-foreground) 8%, transparent);
 }
 
 .app-boot-shell__agent {
-  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  border-left: 1px solid color-mix(in srgb, var(--dc-foreground) 8%, transparent);
 }
 
 .app-boot-shell__center {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #a1a1aa;
+  color: var(--dc-muted);
   font-size: 12px;
 }
 
 .app-boot-shell__status {
-  background: #0a84ff;
+  background: var(--dc-accent);
 }
 
 .app-dialog-backdrop {
@@ -69,21 +69,21 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.55);
+  background: color-mix(in srgb, var(--dc-shadow-color) 55%, transparent);
 }
 
 .app-dialog {
   width: min(460px, calc(100vw - 40px));
-  border: 1px solid var(--line, #3f4248);
+  border: 1px solid var(--line);
   border-radius: 6px;
-  background: var(--panel, #25262a);
-  color: var(--text, #d9dce2);
-  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.45);
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 24px 70px color-mix(in srgb, var(--dc-shadow-color) 45%, transparent);
   padding: 18px 20px;
 }
 
 .app-dialog__title {
-  color: var(--text-strong, #fff);
+  color: var(--text-strong);
   font-size: 15px;
   font-weight: 650;
   margin-bottom: 10px;
@@ -97,7 +97,7 @@
 
 .app-dialog__detail {
   margin-top: 8px;
-  color: var(--muted, #8d94a3);
+  color: var(--muted);
 }
 
 .app-dialog__actions {
@@ -109,28 +109,28 @@
 
 .app-dialog__button {
   min-height: 28px;
-  border: 1px solid var(--line, #3f4248);
+  border: 1px solid var(--line);
   border-radius: 4px;
-  background: var(--panel-2, #2b2d31);
-  color: var(--text, #d9dce2);
+  background: var(--panel-2);
+  color: var(--text);
   padding: 4px 12px;
   font-size: 12px;
   cursor: pointer;
 }
 
 .app-dialog__button:hover {
-  border-color: rgba(47, 139, 253, 0.55);
-  background: rgba(255, 255, 255, 0.07);
-  color: var(--text-strong, #fff);
+  border-color: color-mix(in srgb, var(--dc-accent) 55%, transparent);
+  background: color-mix(in srgb, var(--dc-foreground) 7%, transparent);
+  color: var(--text-strong);
 }
 
 .app-dialog__button--primary {
-  border-color: var(--accent, #2f8bfd);
-  background: var(--accent, #2f8bfd);
-  color: #fff;
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--dc-accent-contrast);
 }
 
 .app-dialog__button--danger {
-  border-color: rgba(244, 135, 113, 0.5);
-  color: var(--danger, #f48771);
+  border-color: color-mix(in srgb, var(--dc-warning) 50%, transparent);
+  color: var(--danger);
 }

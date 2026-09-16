@@ -1,3 +1,6 @@
+import GuiTypography from '../theme/GuiTypography';
+import PaletteOverrides from '../theme/PaletteOverrides';
+import { installPaletteDefaults } from '../theme/palette';
 import { installInterfaceUpdateMonitor } from '../services/interfaceUpdates';
 import { InterfaceUpdateNotice } from '../components/shared/InterfaceUpdateNotice';
 import React from 'react';
@@ -6,6 +9,8 @@ import DeepCodeGuiApp from './DeepCodeGuiApp';
 import { installNativeContextMenuGuard } from '../utils/nativeContextMenuGuard';
 import { activeT } from '../i18n';
 import { UiPluginsProvider } from '../ui-plugins/UiPlugins';
+
+const removePaletteDefaults = installPaletteDefaults();
 
 function formatBootstrapError(reason: unknown): string {
   if (reason instanceof Error) {
@@ -113,6 +118,7 @@ const disposeComposition = () => {
   window.removeEventListener('pagehide', handlePageHide);
   stopUpdateMonitor();
   root.unmount();
+  removePaletteDefaults();
 };
 const handlePageHide = (event: PageTransitionEvent) => {
   if (!event.persisted) disposeComposition();
@@ -126,6 +132,8 @@ try {
     <React.StrictMode>
       <InterfaceUpdateNotice />
       <ErrorBoundary>
+        <PaletteOverrides />
+        <GuiTypography />
         <UiPluginsProvider><DeepCodeGuiApp /></UiPluginsProvider>
       </ErrorBoundary>
     </React.StrictMode>

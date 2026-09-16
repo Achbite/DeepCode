@@ -1,4 +1,5 @@
 import '../components/shared/focus.css';
+import { ConversationDisplayProvider } from '../components/local-agent/ConversationDisplayProvider';
 import { HostStartupDiagnostic } from '../components/shared/HostStartupDiagnostic';
 import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
 import useAppStatusStore from '../state/appStatusStore';
@@ -121,9 +122,7 @@ const BootFallback: React.FC<{ language: ReturnType<typeof normalizeUiLanguage> 
 const DeepCodeGuiApp: React.FC = () => {
   const {
     apiStatus,
-    wsStatus,
     serverVersion,
-    lastHeartbeatAt,
     setApiStatus,
     setServerVersion,
     setErrorMessage,
@@ -317,24 +316,6 @@ const DeepCodeGuiApp: React.FC = () => {
   ]);
 
   useEffect(() => {
-    if (apiStatus !== 'connected') return;
-    let disconnect: (() => void) | null = null;
-    let cancelled = false;
-    const cancel = afterFirstPaint(() => {
-      void import('../services/heartbeatSocket').then((heartbeat) => {
-        if (cancelled) return;
-        heartbeat.connectHeartbeat();
-        disconnect = heartbeat.disconnectHeartbeat;
-      });
-    });
-    return () => {
-      cancelled = true;
-      cancel();
-      disconnect?.();
-    };
-  }, [apiStatus, connectedIncarnation]);
-
-  useEffect(() => {
     if (apiStatus !== 'connected' || terminalPrewarm !== 'afterStartup') return;
     const id = window.setTimeout(() => {
       void warmupTerminalRuntime();
@@ -386,17 +367,15 @@ const DeepCodeGuiApp: React.FC = () => {
 
   return (<>
     <HostStartupDiagnostic status={apiStatus === 'connected' ? null : hostStartup} language={language} busy={kernelStartBusy} onRetry={() => void retryKernelStart()} />
-    <Suspense fallback={<BootFallback language={language} />}>
+    <ConversationDisplayProvider><Suspense fallback={<BootFallback language={language} />}>
       <DeepCodeWorkbenchLayout
         apiStatus={apiStatus}
-        wsStatus={wsStatus}
         serverVersion={serverVersion}
-        lastHeartbeatAt={lastHeartbeatAt}
         kernelStartBusy={kernelStartBusy}
         kernelStartMessage={kernelStartMessage}
         onRetryKernelStart={retryKernelStart}
       />
-    </Suspense>
+    </Suspense></ConversationDisplayProvider>
   </>);
 };
 
