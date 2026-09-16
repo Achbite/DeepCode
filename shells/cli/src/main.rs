@@ -679,6 +679,11 @@ fn contextual_input_command(
         }
         if let Some(approval) = projection.pending_approval.as_ref() {
             let decision = approval_decision_for_input(response)?;
+            if decision == "allow-run"
+                && approval.preview.authorization_scope.as_deref() != Some("runHostShell")
+            {
+                return Err("当前操作未提供本轮宿主 Shell 授权。".into());
+            }
             return Ok(approval_response_command(
                 &projection.session_id,
                 &new_id("command"),
@@ -770,6 +775,7 @@ fn approval_decision_for_input(input: &str) -> Result<&'static str, String> {
     match input.trim().to_lowercase().as_str() {
         "1" | "allow" | "允许" | "同意" => Ok("allow"),
         "2" | "deny" | "拒绝" | "不同意" => Ok("deny"),
+        "3" | "allow-run" | "允许本轮" => Ok("allow-run"),
         _ => Err("当前等待 effect 裁决：输入 /reply 1（允许）或 /reply 2（拒绝）。".to_string()),
     }
 }

@@ -556,6 +556,46 @@ impl LocalAgentJournal {
         }
     }
 
+    /// A run grant is an explicit user choice bound to the Kernel's prepared
+    /// workspace and execution environment. It never substitutes for Plan admission.
+    pub(crate) fn run_host_shell_authority(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        context: &Value,
+    ) -> Result<Option<String>, LocalAgentStoreError> {
+        validate_id("sessionId", session_id)?;
+        validate_id("runId", run_id)?;
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT resolved.payload_json, requested.payload_json FROM session_events resolved
+             JOIN session_events requested ON requested.session_id=resolved.session_id
+               AND requested.call_id=resolved.call_id AND requested.run_id=resolved.run_id
+               AND requested.event_type='approval.requested'
+               AND json_extract(requested.payload_json, '$.approvalId')=json_extract(resolved.payload_json, '$.approvalId')
+             WHERE resolved.session_id=?1 AND resolved.run_id=?2 AND resolved.event_type='approval.resolved'
+               AND json_extract(resolved.payload_json, '$.authorizationScope')='runHostShell'
+               AND json_extract(requested.payload_json, '$.preview.authorizationScope')='runHostShell'
+             ORDER BY resolved.sequence DESC",
+        ).map_err(sql_error("run_authority_fact_read_failed"))?;
+        let rows = statement
+            .query_map(params![session_id, run_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sql_error("run_authority_fact_read_failed"))?;
+        for row in rows {
+            let (resolved, requested) = row.map_err(sql_error("run_authority_fact_read_failed"))?;
+            let resolved = decode_json(&resolved, "run_authority_fact_corrupt")?;
+            let requested = decode_json(&requested, "run_authority_fact_corrupt")?;
+            if requested["preview"]["authorizationContext"] == *context
+                && resolved["decision"] == "allow"
+            {
+                return Ok(Some(required_string(&resolved, "authorityId")?.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, LocalAgentStoreError> {
         self.connection.lock().map_err(|_| {
             LocalAgentStoreError::new("session_store_lock_failed", "Session Store 锁已损坏。")

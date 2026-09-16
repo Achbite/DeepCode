@@ -176,16 +176,16 @@ fn tool_guidance(tool: KernelToolKind) -> (&'static str, &'static [&'static str]
             &[
                 "Use PowerShell syntax directly. Each call starts without a profile and emits UTF-8. Windows PowerShell 5.1 does not support && or ||; use separate statements and explicit exit handling.",
                 "After a native executable, capture $LASTEXITCODE before running another command and exit with that code when validating a build or test. Do not assume a pipeline preserves the original exit code.",
-                "Use the declared project tools in the observed execution environment. A missing command or service is an environment fact; a nonzero test result is not evidence of shell incompatibility.",
+                "Use the declared project tools. Report observations with their execution scope: denied sandbox access does not prove a host service is stopped. Check status in the intended scope before starting a service. A nonzero test result is not evidence of shell incompatibility.",
                 "Stay within the confirmed Plan targets and execution scope. If the selected environment cannot enforce workspace scope, report that limit and request a permitted host scope or another project environment; changing shell syntax does not grant permission."
             ],
         ),
         KernelToolKind::ProcessShell => (
             "Execute one bounded Bash command from the bound workspace. executionScope \"workspace\" uses the selected environment's workspace sandbox; \"host\" uses the host environment and requires external-effect authority. Check the execution environment snapshot for sandbox availability. Use workspaceMode \"write\" for mutations. terminal supplies optional one-call PTY input; otherwise stdin is closed. The result preserves the command's final exit status.",
             &[
-                "Use this for discovery, search, builds and commands. 检查命令独立执行；需要追加报告时，先保存退出码、最后 exit 原退出码。预期文件不存在用条件分支；管道中需要保留的失败用 pipefail 传播。",
+                "Use this for discovery, search, builds and commands. Run checks independently or save and return their exit status; use conditionals for expected failures and pipefail when pipeline failures must propagate.",
                 "Do not use this as the default way to read a known UTF-8 workspace text file.",
-                "Use the project's declared build/test scripts in their required environment. Finding docker or another executable does not establish service availability; use an actual permitted service check and report its error.",
+                "Use the project's declared build/test scripts in their required environment. Finding an executable does not establish service readiness. A sandbox denial or unreachable socket does not prove a host service is stopped; check status in the intended scope before starting it. Host execution requires Kernel authorization; a confirmed Plan alone does not provide it.",
                 "A Plan denial means this call was not executed. Stay within confirmed targets and executionScope; routine command details do not require reconfirmation. Revise the Plan only when the authorized scope must change.",
                 "Output is limited to the last 2000 lines or 50 KiB. When truncated, fullOutput contains Session-owned log paths; inspect bounded sections with a read-only Bash command instead of repeating the original command."
             ],

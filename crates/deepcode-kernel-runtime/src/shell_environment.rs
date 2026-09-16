@@ -2,6 +2,7 @@
 //! No command is translated or retried in a different shell.
 use deepcode_kernel_abi::{KernelError, KernelResult};
 use serde::{Deserialize, Serialize};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,7 +47,7 @@ pub fn find_command(name: &str) -> Option<PathBuf> {
 }
 
 fn command_candidates(name: &str) -> impl Iterator<Item = PathBuf> + '_ {
-    std::env::var_os("PATH")
+    Some(resolved_agent_shell_path())
         .into_iter()
         .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
         .flat_map(move |directory| {
@@ -324,5 +325,80 @@ mod tests {
         .unwrap();
         assert!(text.ends_with(script));
         assert!(text.starts_with("[Console]::OutputEncoding"));
+    }
+}
+
+pub fn resolved_agent_shell_path() -> OsString {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let host_path = std::env::var_os("PATH");
+    let mut configured_tool_paths = Vec::new();
+    for key in ["PNPM_HOME"] {
+        if let Some(path) = std::env::var_os(key) {
+            configured_tool_paths.push(PathBuf::from(path));
+        }
+    }
+    for key in ["CARGO_HOME", "GOPATH", "JAVA_HOME", "VOLTA_HOME"] {
+        if let Some(path) = std::env::var_os(key) {
+            configured_tool_paths.push(PathBuf::from(path).join("bin"));
+        }
+    }
+    if let Some(path) = std::env::var_os("PYENV_ROOT") {
+        let root = PathBuf::from(path);
+        configured_tool_paths.push(root.join("shims"));
+        configured_tool_paths.push(root.join("bin"));
+    }
+    compose_agent_shell_path(
+        home.as_deref(),
+        host_path.as_deref(),
+        &configured_tool_paths,
+    )
+}
+
+pub(crate) fn compose_agent_shell_path(
+    home: Option<&Path>,
+    host_path: Option<&OsStr>,
+    configured_tool_paths: &[PathBuf],
+) -> OsString {
+    let mut paths = Vec::new();
+    if let Some(home) = home {
+        for relative in ["bin", ".local/bin", ".cargo/bin"] {
+            push_existing_unique_path(&mut paths, home.join(relative));
+        }
+    }
+    for path in configured_tool_paths {
+        push_existing_unique_path(&mut paths, path.clone());
+    }
+    for path in [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+    ] {
+        push_existing_unique_path(&mut paths, PathBuf::from(path));
+    }
+    if let Some(host_path) = host_path {
+        for path in std::env::split_paths(host_path) {
+            push_unique_path(&mut paths, path);
+        }
+    }
+    for path in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        push_existing_unique_path(&mut paths, PathBuf::from(path));
+    }
+    std::env::join_paths(paths).unwrap_or_else(|_| {
+        host_path
+            .map(OsStr::to_os_string)
+            .unwrap_or_else(|| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
+    })
+}
+
+fn push_existing_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if path.is_dir() {
+        push_unique_path(paths, path);
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.contains(&path) {
+        paths.push(path);
     }
 }

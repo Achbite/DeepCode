@@ -19,7 +19,12 @@ export function environmentInstruction(value: unknown): RunRuntimeSnapshot['inst
       throw new Error('session_environment_invalid');
     }
   }
-  const fields = ['os', 'arch', 'locale', 'responseLanguage', 'userShell', 'configuration', 'executionTarget', 'shellAvailable', 'shell', 'developerCommands', 'workspaceShellSupported', 'workspaceSandbox', 'hostBinding'];
+  const fields = ['os', 'arch', 'locale', 'responseLanguage', 'userShell', 'configuration', 'executionTarget', 'shellAvailable', 'shell', 'developerCommands', 'commandPaths', 'executionPath', 'workspaceShellSupported', 'workspaceSandbox', 'hostBinding'];
+  if (data.executionPath !== undefined && typeof data.executionPath !== 'string') throw new Error('session_environment_invalid');
+  if (data.commandPaths !== undefined && (!data.commandPaths || typeof data.commandPaths !== 'object'
+    || Array.isArray(data.commandPaths) || Object.values(data.commandPaths).some((path) => typeof path !== 'string'))) {
+    throw new Error('session_environment_invalid');
+  }
   if (data.hostBinding !== undefined) {
     const binding = data.hostBinding as Record<string, unknown> | null;
     if (!binding || typeof binding.hostInstanceId !== 'string' || !binding.hostInstanceId
@@ -37,9 +42,10 @@ export function environmentInstruction(value: unknown): RunRuntimeSnapshot['inst
       arch: data.arch,
       locale: data.locale,
       userShell: data.userShell,
+      ...(data.executionPath !== undefined ? { executionPath: data.executionPath } : {}),
       ...(data.hostBinding ? { hostBinding: data.hostBinding } : {}),
-      ...(data.executionTarget ? { executionTarget: data.executionTarget, shell: data.shell, shellAvailable: data.shellAvailable, developerCommands: data.developerCommands, workspaceShellSupported: data.workspaceShellSupported, ...(data.workspaceSandbox ? { workspaceSandbox: data.workspaceSandbox } : {}) } : {}),
-    })}\nUse ${data.responseLanguage ?? "the user's language"} for all user-facing text, including progress updates, unless the user explicitly requests another language. Installed commands do not imply service readiness or permission.`,
+      ...(data.executionTarget ? { executionTarget: data.executionTarget, shell: data.shell, shellAvailable: data.shellAvailable, ...(data.commandPaths ? { commandPaths: data.commandPaths } : { developerCommands: data.developerCommands }), workspaceShellSupported: data.workspaceShellSupported, ...(data.workspaceSandbox ? { workspaceSandbox: data.workspaceSandbox } : {}) } : {}),
+    })}\nThese basic facts describe the selected execution environment and remain fixed for this run. Service status has not been probed. Workspace-scoped shell runs under the reported sandbox; host-scoped shell requires Kernel authorization and executes outside that sandbox. A sandbox denial or unreachable socket does not establish that a host service is stopped. Check service status in the intended scope before proposing to start it. Use each tool result's environment and exit status as execution evidence.\nUse ${data.responseLanguage ?? "the user's language"} for all user-facing text, including progress updates, unless the user explicitly requests another language.`,
   };
 }
 

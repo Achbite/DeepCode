@@ -277,6 +277,7 @@ export type ConversationCommand =
       callId: string;
       approvalId: string;
       decision: 'allow' | 'deny';
+      authorizationScope?: 'runHostShell';
     }
   | {
       schemaVersion: typeof CONVERSATION_COMMAND_VERSION;
@@ -581,7 +582,9 @@ export interface EffectPreview {
   effects: EffectKind[];
   logicalTargets: string[];
   /** An explicit browser grant applies to subsequent page operations in this Session. */
-  authorizationScope?: 'sessionBrowser';
+  authorizationScope?: 'sessionBrowser' | 'runHostShell';
+  /** Kernel-owned binding for a reusable Host Shell grant. */
+  authorizationContext?: JsonObject;
 }
 
 export type SessionEvent =
@@ -796,6 +799,7 @@ export type SessionEvent =
         commandId: string;
         decision: 'allow' | 'deny';
         authorityId: string;
+        authorizationScope?: 'runHostShell';
       };
     })
   | (SessionEventBase & {
@@ -1596,7 +1600,7 @@ export type WorkspaceAuthorityDecision =
     };
 
 export type NonWorkspaceAuthorityDecision =
-  | { decision: 'allow'; source: 'user' | 'userSetting'; authorityId: string; authorizationScope?: 'sessionBrowser' }
+  | { decision: 'allow'; source: 'user' | 'userSetting'; authorityId: string; authorizationScope?: 'sessionBrowser' | 'runHostShell' }
   | { decision: 'deny'; source: 'user'; authorityId: string }
   | { decision: 'deny'; source: 'kernel' | 'userSetting'; reason: string };
 

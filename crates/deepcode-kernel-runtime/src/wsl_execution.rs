@@ -229,6 +229,7 @@ impl KernelToolExecutor for WslExecutor {
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
         let cancellation = context.cancellation.clone();
+        let shell_call = matches!(invocation.tool_id.as_str(), "bash" | "powershell");
         let progress = context.progress.clone();
         let timeout = Duration::from_secs(invocation.input["timeout"].as_u64().unwrap_or(120) + 30);
         let shell = self
@@ -246,7 +247,14 @@ impl KernelToolExecutor for WslExecutor {
             timeout,
             progress,
         )?;
-        serde_json::from_value(result)
-            .map_err(|error| failure(&format!("Invalid WSL tool result: {error}")))
+        let mut result: KernelToolExecutionResult = serde_json::from_value(result)
+            .map_err(|error| failure(&format!("Invalid WSL tool result: {error}")))?;
+        if shell_call {
+            if let Some(environment) = result.output.get_mut("environment") {
+                environment["executionTarget"] =
+                    json!({"kind":"wsl", "distribution":self.target.distribution});
+            }
+        }
+        Ok(result)
     }
 }

@@ -1312,6 +1312,18 @@ impl LocalAgentKernel {
                 "authorityId": permission_setting_id(scope),
             }))),
             PermissionMode::Ask => {
+                if let Some(context) = prepared.host_shell_authorization_context() {
+                    if let Some(authority_id) = self.journal.run_host_shell_authority(
+                        &request.session_id,
+                        &request.run_id,
+                        &context,
+                    )? {
+                        return Ok(Admission::Allowed(json!({
+                            "decision": "allow", "source": "user", "authorityId": authority_id,
+                            "authorizationScope": "runHostShell",
+                        })));
+                    }
+                }
                 if prepared.binding.is_browser_page() {
                     if let Some(authority_id) = self
                         .journal
@@ -1679,7 +1691,26 @@ impl PreparedEffect {
         if self.binding.is_browser_page() {
             preview["authorizationScope"] = json!("sessionBrowser");
         }
+        if let Some(context) = self.host_shell_authorization_context() {
+            preview["authorizationScope"] = json!("runHostShell");
+            preview["authorizationContext"] = context;
+        }
         preview
+    }
+
+    fn host_shell_authorization_context(&self) -> Option<Value> {
+        if !is_shell_tool(&self.operation)
+            || self.process_execution_scope.as_deref() != Some("host")
+        {
+            return None;
+        }
+        Some(json!({
+            "workspaceId": self.workspace_id,
+            "workspaceRoot": self.workspace_root,
+            "shell": self.generation.executor_config.shell_program,
+            "wsl": self.generation.executor_config.wsl,
+            "executionPath": deepcode_kernel_runtime::shell_environment::resolved_agent_shell_path().to_string_lossy(),
+        }))
     }
 }
 
@@ -2431,6 +2462,104 @@ mod attempt_control_tests {
             "workspaceBindings":["workspace:test"], "input":input
         })).unwrap();
         (kernel, request, catalog)
+    }
+
+    #[test]
+    fn host_shell_grant_is_explicit_and_bound_to_run_workspace_and_environment() {
+        struct Workspace;
+        impl WorkspaceResolverPort for Workspace {
+            fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
+                Ok(ResolvedWorkspace {
+                    root: std::env::current_dir().unwrap().to_string_lossy().into(),
+                    read_only: false,
+                })
+            }
+        }
+        let (kernel, mut request, _) = kernel_with_request(
+            Arc::new(Workspace),
+            "bash",
+            json!({"workspaceId":"workspace:test","command":"pwd","workspaceMode":"read","executionScope":"host"}),
+        );
+        let effect = kernel.prepare_tool(&request).unwrap();
+        let preview = effect.preview("bash");
+        assert_eq!(preview["authorizationScope"], "runHostShell");
+        let commit = |call: &str, scope: bool| {
+            kernel.journal.append(&json!({"type":"approval.requested","sessionId":"session:reject","runId":"run:reject","callId":call,
+                "payload":{"approvalId":call,"preview":preview}})).unwrap();
+            let mut payload =
+                json!({"approvalId":call,"commandId":call,"authorityId":call,"decision":"allow"});
+            if scope {
+                payload["authorizationScope"] = json!("runHostShell");
+            }
+            kernel.journal.append(&json!({"type":"approval.resolved","sessionId":"session:reject","runId":"run:reject","callId":call,"payload":payload})).unwrap();
+        };
+        commit("call:once", false);
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        commit("call:run-grant", true);
+        request.call_id = "call:later".into();
+        assert!(
+            matches!(kernel.admit(&request, &effect).unwrap(), Admission::Allowed(ref value)
+            if value["externalAuthority"]["authorityId"] == "call:run-grant" && value["externalAuthority"]["authorizationScope"] == "runHostShell")
+        );
+        request.run_id = "run:other".into();
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        request.run_id = "run:reject".into();
+        let mut other = effect.clone();
+        other.workspace_id = Some("workspace:other".into());
+        assert!(matches!(
+            kernel.admit(&request, &other).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        other = effect.clone();
+        let mut config = other.generation.executor_config.clone();
+        config.shell_program = Some(deepcode_kernel_runtime::shell_environment::ShellProgram {
+            tool: "bash".into(),
+            executable: PathBuf::from("/different/bash"),
+            dialect: "bash".into(),
+        });
+        other.generation = Arc::new(KernelGeneration {
+            catalog: effect.generation.catalog.clone(),
+            executor_config: config,
+            permissions: effect.generation.permissions.clone(),
+        });
+        assert!(matches!(
+            kernel.admit(&request, &other).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        other = effect.clone();
+        other.process_workspace_mode = Some("write".into());
+        assert!(
+            matches!(
+                kernel.admit(&request, &other).unwrap(),
+                Admission::Denied { .. }
+            ),
+            "run grant does not replace Plan admission"
+        );
+        other = effect.clone();
+        other.operation = "browser.service".into();
+        other.scope = PreparedEffectScope::External;
+        assert!(
+            matches!(
+                kernel.admit(&request, &other).unwrap(),
+                Admission::ApprovalRequired
+            ),
+            "other tools cannot use the Shell grant"
+        );
+        kernel.journal.append(&json!({"type":"run.finishing","sessionId":"session:reject","runId":"run:reject","payload":{"outcome":"cancelled"}})).unwrap();
+        kernel.journal.append(&json!({"type":"run.runtime.released","sessionId":"session:reject","runId":"run:reject",
+            "payload":{"runRuntimeSnapshotRef":"runtime:test","extensionGenerationRef":"extension:test","kernelCatalogSnapshotRef":request.kernel_catalog_snapshot_ref,
+                "providerRuntimeRef":"provider:test","pluginInstanceRefs":[],"alreadyReleased":false}})).unwrap();
+        kernel.journal.append(&json!({"type":"run.settled","sessionId":"session:reject","runId":"run:reject","payload":{"outcome":"cancelled"}})).unwrap();
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::Denied { .. }
+        ));
     }
 
     #[test]

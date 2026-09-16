@@ -350,7 +350,7 @@ impl SessionProjection {
                     .preview
                     .authorization_scope
                     .as_deref()
-                    .is_some_and(|scope| scope != "sessionBrowser")
+                    .is_some_and(|scope| !matches!(scope, "sessionBrowser" | "runHostShell"))
         }) {
             return Err("shared Session projection has an invalid approval".to_string());
         }
@@ -1332,6 +1332,7 @@ pub struct EffectPreview {
     pub effects: Vec<String>,
     pub logical_targets: Vec<String>,
     pub authorization_scope: Option<String>,
+    pub authorization_context: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1917,7 +1918,7 @@ pub fn approval_response_command(
     approval: &ApprovalProjection,
     decision: &str,
 ) -> Value {
-    json!({
+    let mut command = json!({
         "schemaVersion": CONVERSATION_COMMAND_VERSION,
         "type": "approval.respond",
         "commandId": command_id,
@@ -1925,8 +1926,12 @@ pub fn approval_response_command(
         "runId": approval.run_id,
         "callId": approval.call_id,
         "approvalId": approval.approval_id,
-        "decision": decision,
-    })
+        "decision": if decision == "allow-run" { "allow" } else { decision },
+    });
+    if decision == "allow-run" {
+        command["authorizationScope"] = json!("runHostShell");
+    }
+    command
 }
 
 pub fn plan_confirm_command(

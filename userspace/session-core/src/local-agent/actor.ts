@@ -613,6 +613,9 @@ export class SessionActor {
         '该 effect 裁决已经关闭或不属于当前运行。',
       );
     }
+    if (command.authorizationScope && (command.decision !== 'allow' || approval.preview.authorizationScope !== command.authorizationScope)) {
+      return await this.recordRejection(command, 'approval_scope_invalid', '当前操作未提供该授权范围。');
+    }
     const reply = await this.commitCommand(
       command,
       [{
@@ -625,6 +628,7 @@ export class SessionActor {
           commandId: command.commandId,
           decision: command.decision,
           authorityId: this.#nextId('authority'),
+          ...(command.authorizationScope ? { authorizationScope: command.authorizationScope } : {}),
         },
       }],
       acceptedReply(command),

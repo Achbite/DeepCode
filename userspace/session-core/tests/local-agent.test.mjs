@@ -1738,6 +1738,44 @@ test('Session renders one run-scoped tool guidance message with Provider aliases
   await actor.dispose();
 });
 
+test('explicit run approvals are journaled and only accepted for a Kernel candidate', async (t) => {
+  for (const candidate of [false, true]) {
+    const journal = new InMemoryCommandJournal(), sessionId = `session:run-approval-${candidate}`;
+    await createSession(journal, sessionId, [workspaceBinding]);
+    const preparation = fakeRunPreparation({ tools: [{
+      toolBindingRef: 'binding:approval', name: 'web.fetch', description: 'Read URL', origin: 'coreBuiltin', availability: 'callable',
+      possibleEffects: ['network'], inputSchema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] },
+    }] });
+    const preview = { summary: 'Approval fixture', effects: ['external'], logicalTargets: ['.'],
+      ...(candidate ? { authorizationScope: 'runHostShell', authorizationContext: { workspaceId: workspaceBinding.workspaceId, shell: '/bin/bash' } } : {}) };
+    let calls = 0;
+    const actor = actorWith(journal, sessionId, { async *stream(request) {
+      if (++calls === 1) yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:approval', name: request.tools.find((tool) => tool.inputSchema.properties?.url).name, input: { url: 'https://example.test' } });
+      else yield providerEvent(request.requestId, 'assistant.message', { messageId: 'message:done', content: 'Done.' });
+      yield providerEvent(request.requestId, 'completed', {});
+    } }, emptyKernel({ async execute(request) {
+      if (!request.nonWorkspaceAuthority) return { schemaVersion: 'deepcode.kernel-reply', type: 'tool.execution', requestId: request.requestId, callId: request.callId, status: 'approvalRequired', approvalId: 'approval:run', preview };
+      return completedExecutionReply(request, { content: 'Result' });
+    } }), preparation.port, 'run-approval');
+    t.after(() => actor.dispose());
+    await actor.submit(messageCommand(sessionId, 'command:start', 'Exercise approval.'));
+    const waiting = await waitForProjection(actor, (state) => state.pendingApproval !== null);
+    const approval = waiting.pendingApproval;
+    const command = { schemaVersion: 'deepcode.command.v3', type: 'approval.respond', commandId: 'command:allow-run', sessionId,
+      runId: approval.runId, callId: approval.callId, approvalId: approval.approvalId, decision: 'allow', authorizationScope: 'runHostShell' };
+    const reply = await actor.submit(command);
+    assert.equal(reply.status, candidate ? 'accepted' : 'rejected');
+    if (!candidate) {
+      assert.equal((await actor.snapshot()).pendingApproval.approvalId, approval.approvalId);
+      await actor.submit({ ...command, commandId: 'command:allow-once', authorizationScope: undefined });
+    }
+    await waitForProjection(actor, (state) => state.run?.status === 'completed');
+    const resolved = singleEvent(await readEvents(journal, sessionId), 'approval.resolved');
+    assert.equal(resolved.payload.authorizationScope, candidate ? 'runHostShell' : undefined);
+    assert.equal(resolved.payload.decision, 'allow');
+  }
+});
+
 test('read-only bash result projects its real write scope and continues the Loop', async () => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:bash-read-chain';

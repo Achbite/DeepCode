@@ -329,6 +329,9 @@ impl Renderer {
                 if approval.preview.authorization_scope.as_deref() == Some("sessionBrowser") {
                     output.push_str("允许后，当前对话内的浏览器页面操作无需重复确认。\n");
                 }
+                if approval.preview.authorization_scope.as_deref() == Some("runHostShell") {
+                    output.push_str("/reply 3 允许本轮相同工作目录和执行环境的宿主 Shell。\n");
+                }
                 for target in &approval.preview.logical_targets {
                     output.push_str(&format!("  - {target}\n"));
                 }
@@ -697,6 +700,11 @@ impl Renderer {
                 if approval.preview.authorization_scope.as_deref() == Some("sessionBrowser") {
                     lines.push(Line::from(
                         "允许后，当前对话内的浏览器页面操作无需重复确认。",
+                    ));
+                }
+                if approval.preview.authorization_scope.as_deref() == Some("runHostShell") {
+                    lines.push(Line::from(
+                        "/reply 3 允许本轮相同工作目录和执行环境的宿主 Shell。",
                     ));
                 }
                 for target in &approval.preview.logical_targets {
