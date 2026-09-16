@@ -89,6 +89,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             native_path_dialog::deepcode_pick_path,
             open_file::deepcode_open_file,
+            open_file::deepcode_locate_path,
             deepcode_boot_target,
             deepcode_host_startup_status,
             deepcode_start_kernel_after_permission,

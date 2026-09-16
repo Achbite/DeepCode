@@ -4,6 +4,7 @@ import { loadInterfaceModule } from '../../services/interfaceUpdates';
 import { createPortal } from 'react-dom';
 import React, { useId, lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useConversationHost } from './ConversationHost';
+import type { SourcePosition } from './resourceLinks';
 import { t, type UiLanguage } from '../../i18n';
 import {
   readConversationArtifact,
@@ -113,7 +114,7 @@ export function useResourcePreview(sessionId: string | null) {
         );
         return {
           sessionId,
-          tabs: existing ? tabs : [...tabs, { id: key, target }],
+          tabs: existing ? tabs.map((tab) => tab === existing && target.kind === 'workspace' ? { ...tab, target } : tab) : [...tabs, { id: key, target }],
           activeId: existing?.id ?? key,
           visible: true,
           expanded: old.sessionId === sessionId && old.expanded,
@@ -167,17 +168,24 @@ export function useResourcePreview(sessionId: string | null) {
       unlisten?.();
     };
   }, [sessionId, openTarget]);
-  const openWorkspaceResource = async (workspaceId: string, logicalPath: string) => {
+  const openWorkspaceResource = async (workspaceId: string, logicalPath: string, position?: SourcePosition) => {
     if (!sessionId) return;
+    const resource = await host.resolveResource(sessionId, workspaceId, logicalPath);
+    if (currentSession.current !== sessionId) return;
+    if (resource.kind === 'directory') {
+      if (!host.locatePath) throw new Error('Directory opening requires the desktop Host.');
+      await host.locatePath(resource.path);
+      return;
+    }
     if (
       useSettingsStore.getState().effectiveSettings['gui.defaultFileOpen'] === 'vscode' &&
       !/\.(pdf|png|jpe?g|gif|webp|svg|bmp)$/i.test(logicalPath)
     ) {
       if (!host.openFile) throw new Error('Open in VS Code is unavailable in this Host.');
-      await host.openFile(sessionId, workspaceId, logicalPath);
+      await host.openFile(resource.path, position);
       return;
     }
-    openTarget({ kind: 'workspace', workspaceId, logicalPath });
+    openTarget({ kind: 'workspace', workspaceId, logicalPath, line: position?.line, column: position?.column });
   };
   const removeTab = (id: string) => {
     bindings.current.delete(id);
@@ -368,6 +376,7 @@ export function ResourcePreview({
               ) : (
                 preview.sessionId && (
                   <ReaderDocument
+                    key={tab.target.kind === 'workspace' ? `${tab.id}:${tab.target.line ?? ''}:${tab.target.column ?? ''}` : tab.id}
                     sessionId={preview.sessionId}
                     target={tab.target as Exclude<ReaderTarget, { kind: 'browser' }>}
                     language={language}
@@ -559,7 +568,13 @@ function ReaderDocument({
     [locationError, setLocationError] = useState<string | null>(null);
   const scroll = useRef<HTMLDivElement>(null);
   const path = target.kind === 'workspace' ? target.logicalPath : target.artifact.label,
-    key = sessionId + ':' + targetKey(target);
+    key = sessionId + ':' + targetKey(target) + (target.kind === 'workspace' && target.line ? `:${target.line}:${target.column ?? 1}` : '');
+  const sourceLine = target.kind === 'workspace' ? target.line : undefined;
+  const sourceColumn = target.kind === 'workspace' ? target.column : undefined;
+  const columnOffset = state.status === 'text' && sourceLine && sourceColumn && startByte === undefined
+    ? Math.min(sourceColumn - 1, state.result.content.split('\n', 1)[0].length)
+    : undefined;
+  useEffect(() => { setStartByte(undefined); }, [target]);
   useEffect(() => {
     const controller = new AbortController();
     setState({ status: 'loading' });
@@ -580,7 +595,7 @@ function ReaderDocument({
         if (!controller.signal.aborted) setState({ status: 'document', blob, format });
         return;
       }
-      const format = startByte === undefined ? documentFormat(path) : null;
+      const format = startByte === undefined && sourceLine === undefined ? documentFormat(path) : null;
       if (startByte === undefined && /\.(png|jpe?g|gif|webp|svg|bmp)$/i.test(path)) {
         const blob = await readConversationImage(
           sessionId,
@@ -604,6 +619,7 @@ function ReaderDocument({
           path,
           controller.signal,
           startByte,
+          sourceLine,
         );
         if (!controller.signal.aborted) setState({ status: 'text', result });
       }
@@ -611,10 +627,10 @@ function ReaderDocument({
       if (!controller.signal.aborted) setState({ status: 'error', error: String(reason) });
     });
     return () => controller.abort();
-  }, [sessionId, target, host, path, startByte, revision]);
+  }, [sessionId, target, host, path, startByte, sourceLine, revision]);
   useEffect(() => {
-    if (scroll.current) scroll.current.scrollTop = readViewState(key + ':scroll', 0);
-  }, [key, state.status]);
+    if (scroll.current) scroll.current.scrollTop = sourceLine ? 0 : readViewState(key + ':scroll', 0);
+  }, [key, state.status, sourceLine]);
   const resolve = async () => {
     if (target.kind !== 'workspace')
       return target.artifact.logicalPath ?? target.artifact.uri ?? target.artifact.artifactId;
@@ -710,7 +726,10 @@ function ReaderDocument({
           </Suspense></InterfaceLoadBoundary>
         ) : (
           <>
-            <pre>{state.result.content}</pre>
+            {sourceLine && <small>{chinese ? '起始行' : 'Starting line'} {state.result.startLine}{target.kind === 'workspace' && target.column ? ` · ${chinese ? '列' : 'column'} ${target.column}` : ''}</small>}
+            <pre>{columnOffset !== undefined
+              ? <>{state.result.content.slice(0, columnOffset)}<mark>{state.result.content.slice(columnOffset, columnOffset + 1)}</mark>{state.result.content.slice(columnOffset + 1)}</>
+              : state.result.content}</pre>
             {state.result.truncated && (
               <small>{chinese ? '当前为部分内容。' : 'Partial content.'}</small>
             )}

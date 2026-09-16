@@ -54,6 +54,7 @@ pub(crate) struct ReadConversationResourceRequest {
     workspace_id: String,
     logical_path: String,
     start_byte: Option<u64>,
+    start_line: Option<u64>,
     format: Option<ResourceReadFormat>,
 }
 
@@ -210,7 +211,15 @@ pub(crate) async fn conversation_resource_read(
         Err(error) => return ApiResponse::error(error.code, &error.message).into_response(),
     };
     if matches!(body.format, Some(ResourceReadFormat::Path)) {
-        return ApiResponse::ok(json!({"path":target})).into_response();
+        let kind = if target.is_dir() {
+            "directory"
+        } else if target.is_file() {
+            "file"
+        } else {
+            return ApiResponse::error("conversation_resource_not_found", "目标文件或目录不存在。")
+                .into_response();
+        };
+        return ApiResponse::ok(json!({"path":target,"kind":kind})).into_response();
     }
     if matches!(body.format, Some(ResourceReadFormat::Document)) {
         if body.start_byte.is_some() {
@@ -252,7 +261,7 @@ pub(crate) async fn conversation_resource_read(
     }
     match deepcode_kernel_tools::text_range::read_text_range(
         &target,
-        1,
+        body.start_line.unwrap_or(1),
         body.start_byte,
         2000,
         262144,

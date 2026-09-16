@@ -141,7 +141,13 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
           openWorkspaceResource={resourcePreview.openWorkspaceResource}
           setUiActionError={setUiActionError}
         />
-        {!followingLatest && hasConversationContent && (
+        {mode === 'panel' && !!display.artifacts.length && <ArtifactLinks artifacts={display.artifacts} onOpen={resourcePreview.openWorkspaceResource} />}
+        {mode !== 'panel' && !!display.artifacts.length && <details className="conversation-artifact-shortcuts">
+          <summary>{t(language, 'deepcodeGui.outputs.title')}</summary>
+          <ArtifactLinks artifacts={display.artifacts} onOpen={resourcePreview.openWorkspaceResource} />
+        </details>}
+      </div>
+      {!followingLatest && hasConversationContent && (
           <button
             type="button"
             className="local-agent__jump-latest"
@@ -152,12 +158,6 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
             <DeepCodeShellIcon name="chevronDown" />
           </button>
         )}
-        {mode === 'panel' && !!display.artifacts.length && <ArtifactLinks artifacts={display.artifacts} onOpen={resourcePreview.openWorkspaceResource} />}
-        {mode !== 'panel' && !!display.artifacts.length && <details className="conversation-artifact-shortcuts">
-          <summary>{t(language, 'deepcodeGui.outputs.title')}</summary>
-          <ArtifactLinks artifacts={display.artifacts} onOpen={resourcePreview.openWorkspaceResource} />
-        </details>}
-      </div>
       </div>
 
       <ConversationComposer

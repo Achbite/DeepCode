@@ -101,7 +101,9 @@ export function ConversationComposer({
       : ''}`}>
       {error && <div className="local-agent__error">{error}</div>}
       {attachmentError && <div className="local-agent__error">{attachmentError}</div>}
-      {uiActionError && <div className="local-agent__error">{uiActionError}</div>}
+      {uiActionError && <div className="local-agent__error">{uiActionError.includes('\n')
+        ? <details><summary>{uiActionError.split('\n')[0]}</summary><pre>{uiActionError.slice(uiActionError.indexOf('\n') + 1)}</pre></details>
+        : uiActionError}</div>}
       {composer.failedDrafts.map((failed, index) => <details className="local-agent__failed-draft" key={index}>
         <summary>{language === 'zh-CN' ? '未发送草稿已保留' : 'Unsent draft saved'}</summary>
         <pre>{[failed.draft, ...failed.pastedTexts.map((item) => item.text)].filter(Boolean).join('\n\n')}</pre>

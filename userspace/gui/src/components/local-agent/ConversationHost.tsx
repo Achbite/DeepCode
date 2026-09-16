@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
-import { readConversation, readConversationResource, readConversationImage, readConversationDocument, readFileChange, resolveConversationResourcePath, readConversationArtifact } from '../../services/localAgentApi';
+import { readConversation, readConversationResource, readConversationImage, readConversationDocument, readFileChange, resolveConversationResource, readConversationArtifact } from '../../services/localAgentApi';
 import { openExternalUrl } from '../../services/runtimeAdapter';
+import type { SourcePosition } from './resourceLinks';
 
 /** Web conversation content receives host operations here; it owns no native shell API. */
 export interface ConversationHost {
@@ -12,7 +13,9 @@ export interface ConversationHost {
   readChange: typeof readFileChange;
   readConversation: typeof readConversation;
   loadImage(sessionId: string | null, source: string, signal: AbortSignal): Promise<{ url: string; release?(): void }>;
-  openFile?(sessionId: string, workspaceId: string, logicalPath: string): Promise<void>;
+  resolveResource: typeof resolveConversationResource;
+  openFile?(path: string, position?: SourcePosition): Promise<void>;
+  locatePath?(path: string): Promise<void>;
   openDiff?(sessionId: string, recordId: string, index: number): Promise<void>;
 }
 
@@ -22,11 +25,16 @@ const defaultHost: ConversationHost = {
   readResource: readConversationResource,
   readDocument: readConversationDocument,
   readArtifact: readConversationArtifact,
-  openFile: async (sessionId, workspaceId, logicalPath) => {
+  resolveResource: resolveConversationResource,
+  openFile: async (path, position) => {
     const invoke = window.__TAURI__?.core?.invoke;
     if (!invoke) throw new Error('Open in VS Code requires the desktop Host.');
-    const path = await resolveConversationResourcePath(sessionId, workspaceId, logicalPath);
-    await invoke('deepcode_open_file', {path});
+    await invoke('deepcode_open_file', { path, line: position?.line, column: position?.column });
+  },
+  locatePath: async (path) => {
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (!invoke) throw new Error('Manual file location requires the desktop Host.');
+    await invoke('deepcode_locate_path', { path });
   },
   readChange: readFileChange,
   readConversation,

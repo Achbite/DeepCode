@@ -279,12 +279,13 @@ export async function readConversationResource(
   logicalPath: string,
   signal?: AbortSignal,
   startByte?: number,
+  startLine?: number,
 ): Promise<ConversationResourceReadResult> {
   const value = await request<unknown>(
     `${API_BASE}/conversation/sessions/${encodeURIComponent(sessionId)}/resources/read`,
     {
       method: 'POST',
-      body: JSON.stringify({ workspaceId, logicalPath, ...(startByte !== undefined ? { startByte } : {}) }),
+      body: JSON.stringify({ workspaceId, logicalPath, ...(startByte !== undefined ? { startByte } : startLine !== undefined ? { startLine } : {}) }),
       signal,
     },
   );
@@ -303,10 +304,15 @@ export async function readConversationResource(
 }
 
 export async function resolveConversationResourcePath(sessionId: string, workspaceId: string, logicalPath: string): Promise<string> {
-  const result = await request<{path: string}>(`${API_BASE}/conversation/sessions/${encodeURIComponent(sessionId)}/resources/read`, {
+  return (await resolveConversationResource(sessionId, workspaceId, logicalPath)).path;
+}
+
+export async function resolveConversationResource(sessionId: string, workspaceId: string, logicalPath: string): Promise<{path: string; kind: 'file' | 'directory'}> {
+  const result = await request<{path: string; kind: 'file' | 'directory'}>(`${API_BASE}/conversation/sessions/${encodeURIComponent(sessionId)}/resources/read`, {
     method: 'POST', body: JSON.stringify({workspaceId, logicalPath, format:'path'}),
   });
-  return result.path;
+  if (typeof result.path !== 'string' || !['file', 'directory'].includes(result.kind)) throw new Error('conversation_resource_path_invalid');
+  return result;
 }
 
 export async function readConversationArtifact(sessionId: string, artifactId: string, signal?: AbortSignal): Promise<Blob> {
@@ -898,8 +904,9 @@ function isApproval(value: unknown): boolean {
 
 function isEffectPreview(value: unknown): boolean {
   const effects = ['localRead', 'workspaceRead', 'workspaceMutation', 'process', 'network', 'external'];
-  return isExactRecord(value, ['summary', 'effects', 'logicalTargets'], ['authorizationScope'])
-    && (value.authorizationScope === undefined || value.authorizationScope === 'sessionBrowser')
+  return isExactRecord(value, ['summary', 'effects', 'logicalTargets'], ['authorizationScope', 'authorizationContext'])
+    && (value.authorizationScope === undefined || value.authorizationScope === 'sessionBrowser' || value.authorizationScope === 'runHostShell')
+    && (value.authorizationScope !== 'runHostShell' || isRecord(value.authorizationContext))
     && isNonEmptyText(value.summary)
     && Array.isArray(value.effects)
     && value.effects.every((effect) => effects.includes(String(effect)))

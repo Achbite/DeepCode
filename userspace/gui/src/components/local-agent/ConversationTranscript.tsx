@@ -1,6 +1,5 @@
-import { localReference } from './resourceLinks';
-import { resolveConversationResourcePath } from '../../services/localAgentApi';
-import React, { useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { parseLocalTarget, bindLocalTarget, type SourcePosition } from './resourceLinks';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { MessageFeedback, SessionProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { useConversationHost } from './ConversationHost';
@@ -38,7 +37,7 @@ interface ConversationTranscriptProps {
   draftItems: AssistantDraftItem[];
   presentation: PresentedCommittedContent;
   viewport: ConversationViewport;
-  openWorkspaceResource: (workspaceId: string, logicalPath: string) => Promise<void>;
+  openWorkspaceResource: (workspaceId: string, logicalPath: string, position?: SourcePosition) => Promise<void>;
   setUiActionError: React.Dispatch<React.SetStateAction<string | null>>;
 }
 
@@ -74,14 +73,25 @@ export function ConversationTranscript({
   const submitting = useLocalAgentStore((state) => state.submitting);
   const setMessageFeedback = useLocalAgentStore((state) => state.setMessageFeedback);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [pathMenu, setPathMenu] = useState<{ path: string; x: number; y: number } | null>(null);
   const layouts = useRef(new ConversationLayoutCache());
   const currentSessionRef = useRef({ sessionId: projection?.sessionId });
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   if (currentSessionRef.current.sessionId !== projection?.sessionId) currentSessionRef.current = { sessionId: projection?.sessionId };
   useLayoutEffect(() => {
     setCopiedMessageId(null);
+    setPathMenu(null);
     return () => clearTimeout(copyTimerRef.current);
   }, [projection?.sessionId]);
+  useEffect(() => {
+    if (!pathMenu) return;
+    const dismiss = () => setPathMenu(null);
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') dismiss(); };
+    document.addEventListener('click', dismiss);
+    document.addEventListener('keydown', onKey);
+    window.addEventListener('resize', dismiss);
+    return () => { document.removeEventListener('click', dismiss); document.removeEventListener('keydown', onKey); window.removeEventListener('resize', dismiss); };
+  }, [pathMenu]);
   const committedProviderContent = (identity: string | undefined, content: string, committed: React.ReactNode): React.ReactNode => {
     if (!identity) throw new Error('conversation_timeline_stream_missing');
     // Custom presentation renderers retain their output; the builtin Markdown keeps its stream node.
@@ -136,19 +146,21 @@ export function ConversationTranscript({
       void openWorkspaceResource(resource.workspaceId, resource.logicalPath).catch(reason=>setUiActionError(String(reason)));
       return;
     }
-    const localPath=localReference(href);
-    if(localPath&&projection) {
+    const localTarget=parseLocalTarget(href);
+    if(localTarget&&projection) {
       event.preventDefault();
       const requestedView=currentSessionRef.current;
       void (async()=>{
-        const candidates=await Promise.all(projection.workspaceBindings.map(async binding=>({workspaceId:binding.workspaceId,root:await resolveConversationResourcePath(projection.sessionId,binding.workspaceId,'.')})));
-        const normalize=(value:string)=>value.replace(/\\/gu,'/').replace(/\/$/u,'');
-        const path=normalize(localPath).replace(/:\d+(?::\d+)?$/u,'');
-        const bound=candidates.sort((a,b)=>b.root.length-a.root.length).find(candidate=>path.startsWith(normalize(candidate.root)+'/'));
-        if(!bound)throw new Error(t(language, 'agent.resource.unbound', { path: localPath }));
+        const candidates=await Promise.all(projection.workspaceBindings.map(async binding=>({workspaceId:binding.workspaceId,root:(await host.resolveResource(projection.sessionId,binding.workspaceId,'.')).path})));
+        const bound=bindLocalTarget(localTarget,candidates);
         if(currentSessionRef.current!==requestedView)return;
-        await openWorkspaceResource(bound.workspaceId,path.slice(normalize(bound.root).length+1));
-      })().catch(reason=>{if(currentSessionRef.current===requestedView)setUiActionError(String(reason));});
+        if(bound) await openWorkspaceResource(bound.workspaceId,bound.logicalPath,localTarget);
+        else {
+          if(!host.locatePath)throw new Error('Manual file location requires the desktop Host.');
+          await host.locatePath(localTarget.absolute ? localTarget.path : `${candidates[0].root}/${localTarget.path}`);
+        }
+        if(currentSessionRef.current===requestedView)setUiActionError(null);
+      })().catch(reason=>{if(currentSessionRef.current===requestedView)setUiActionError(`${language === 'zh-CN' ? '无法打开此位置。' : 'Unable to open this location.'}\n${localTarget.path}\n${reason instanceof Error ? reason.message : String(reason)}`);});
       return;
     }
     if (!/^https?:\/\//i.test(href)) return;
@@ -185,7 +197,7 @@ export function ConversationTranscript({
               <div className="local-agent__message-attachments">
                 {item.value.filesystemReferences.map((reference) => (
                   <button type="button"
-                    onClick={() => { if (reference.kind === 'file') void openWorkspaceResource(reference.workspaceId, reference.logicalPath); }}
+                    onClick={() => { void openWorkspaceResource(reference.workspaceId, reference.logicalPath).catch(reason => setUiActionError(String(reason))); }}
                     className={reference.kind === 'directory'
                       ? 'local-agent__message-directory'
                       : undefined}
@@ -338,7 +350,20 @@ export function ConversationTranscript({
       className="local-agent__transcript"
       onClick={openTranscriptLink}
       onAuxClick={openTranscriptLink}
+      onContextMenu={(event) => {
+        const anchor = event.target instanceof Element ? event.target.closest<HTMLAnchorElement>('a[href]') : null;
+        const target = anchor && parseLocalTarget(anchor.getAttribute('href') ?? '');
+        if (!target) return;
+        event.preventDefault();
+        setPathMenu({ path: target.path, x: Math.max(8, Math.min(event.clientX, window.innerWidth - 180)), y: Math.max(8, Math.min(event.clientY, window.innerHeight - 50)) });
+      }}
     >
+      {pathMenu && <div className="local-agent__path-menu" role="menu" style={{ left: pathMenu.x, top: pathMenu.y }}>
+        <button type="button" role="menuitem" autoFocus onClick={() => {
+          const requestedView = currentSessionRef.current;
+          void host.copyText(pathMenu.path).catch((reason) => { if (currentSessionRef.current === requestedView) setUiActionError(String(reason)); });
+        }}>{language === 'zh-CN' ? '复制路径' : 'Copy path'}</button>
+      </div>}
       {loading && !projection && (
         <div className="local-agent__empty">{t(language, 'agent.chat.opening')}</div>
       )}

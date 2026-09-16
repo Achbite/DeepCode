@@ -256,6 +256,7 @@ fn main() {
     let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
             native_path_dialog::deepcode_pick_path,
             open_file::deepcode_open_file,
+            open_file::deepcode_locate_path,
             deepcode_boot_target,
             deepcode_default_workspace_path,
             deepcode_host_startup_status,

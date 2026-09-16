@@ -152,6 +152,29 @@ test('document links retain Unicode paths and choose the appropriate reader', as
   assert.equal(workspaceResourceLink('workspace://workspace:doc/%FF'), null);
 });
 
+test('local links preserve locations, workspace roots and unambiguous readable labels', async (t) => {
+  const { parseLocalTarget, bindLocalTarget, readableResourceLinks } = await loadGuiModule(t, '/src/components/local-agent/resourceLinks.ts');
+  const roots = [{ workspaceId: 'workspace:main', root: '/project/测试 项目' }];
+  const root = parseLocalTarget('deepcode-gui://localhost/project/%E6%B5%8B%E8%AF%95%20%E9%A1%B9%E7%9B%AE');
+  assert.equal(bindLocalTarget(root, roots).logicalPath, '.');
+  assert.deepEqual(parseLocalTarget('file:///project/测试%20项目/src/main.rs#L12C3'), { path: '/project/测试 项目/src/main.rs', absolute: true, line: 12, column: 3 });
+  assert.equal(bindLocalTarget(parseLocalTarget('README.md:12'), roots).logicalPath, 'README.md');
+  assert.equal(bindLocalTarget(parseLocalTarget('./src/../README.md'), roots).logicalPath, 'README.md');
+  assert.equal(bindLocalTarget(parseLocalTarget('/project/测试 项目-other/file'), roots), null);
+  assert.equal(bindLocalTarget(parseLocalTarget('file:///c:/Work'), [{ workspaceId: 'windows', root: 'C:\\Work' }]).logicalPath, '.');
+  assert.equal(bindLocalTarget(parseLocalTarget('/usr/local/bin/c++'), roots), null);
+  assert.throws(() => bindLocalTarget(parseLocalTarget('README.md'), [...roots, { workspaceId: 'second', root: '/other' }]), /unambiguous/);
+  for (const href of ['https://example.com/path', '#section', 'file://remote/path', 'javascript:alert(1)']) assert.equal(parseLocalTarget(href), null);
+  const a = (href, text = href) => ({ type: 'element', tagName: 'a', properties: { href }, children: [{ type: 'text', value: text }] });
+  const tree = readableResourceLinks({ type: 'root', children: [a('/one/src/main.rs:12'), a('/two/lib/main.rs'), a('/project/测试 项目', '项目根目录'),
+    { type: 'element', tagName: 'pre', properties: {}, children: [{ type: 'text', value: '/one/src/main.rs' }] }] });
+  assert.equal(tree.children[0].children[0].value, 'src/main.rs:12');
+  assert.equal(tree.children[1].children[0].value, 'lib/main.rs');
+  assert.equal(tree.children[2].children[0].value, '项目根目录');
+  assert.equal(tree.children[0].properties.title, '/one/src/main.rs:12');
+  assert.equal(tree.children[3].children[0].value, '/one/src/main.rs');
+});
+
 test('document Plan scope and completed artifacts pass through Session to the GUI reader', async (t) => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:document-artifact';
@@ -2104,7 +2127,7 @@ test('desktop startup diagnostics render the Host failure and log reference verb
   assert.equal(renderToStaticMarkup(createElement(HostStartupDiagnostic, { status: { ...status, phase: 'ready' }, language: 'zh-CN' })), '');
 });
 
-test('conversation reading survives native scroll deliveries and layout growth without device flags', async (t) => {
+test('conversation reading intent survives native scroll deliveries and layout growth', async (t) => {
   const { createElement } = await import('react');
   const { renderToStaticMarkup } = await import('react-dom/server');
   const { useConversationViewport } = await loadGuiModule(t, '/src/components/local-agent/useConversationViewport.ts');
@@ -2149,6 +2172,7 @@ test('conversation reading survives native scroll deliveries and layout growth w
   const deliverScroll = () => viewport.bodyHandlers.onScroll({ target: body, currentTarget: body });
   viewport.setLatestFollowMode(true);
   viewport.preserveReadingPosition();
+  viewport.bodyHandlers.onWheel({ target: body, deltaY: -140 });
   body.scrollTop = 860;
   flushFrames();
   assert.equal(top, 860, 'a pending follow frame yields to native movement even before its scroll callback arrives');
@@ -2191,6 +2215,82 @@ test('conversation reading survives native scroll deliveries and layout growth w
   viewport.scrollToLatest();
   flushFrames();
   assert.equal(top, 1_060, 'the explicit latest action resumes following after detached reading');
+  assert.equal(frames.size, 0);
+});
+
+test('conversation follows decision layout changes and final output until the reader moves away', async (t) => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { useConversationViewport } = await loadGuiModule(t, '/src/components/local-agent/useConversationViewport.ts');
+  const previousWindow = globalThis.window;
+  const frames = new Map();
+  let nextFrame = 0;
+  globalThis.window = {
+    requestAnimationFrame(callback) { frames.set(++nextFrame, callback); return nextFrame; },
+    cancelAnimationFrame(id) { frames.delete(id); },
+    getComputedStyle(node) { return node.style; },
+  };
+  t.after(() => { if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow; });
+  const flushFrames = () => {
+    const pending = [...frames.values()]; frames.clear();
+    for (const callback of pending) callback(0);
+  };
+  let viewport;
+  function Probe() {
+    viewport = useConversationViewport({ sessionId: 'session:decisions', loading: false,
+      projection: { sessionId: 'session:decisions' }, presentationLayoutKey: '', assistantDraftLayoutKey: '', timelineExtentKey: '' });
+    return null;
+  }
+  renderToStaticMarkup(createElement(Probe));
+  let top = 1_000, height = 1_500, writes = 0;
+  const body = { clientHeight: 500,
+    get scrollTop() { return top; },
+    set scrollTop(value) { writes++; top = Math.max(0, Math.min(value, height - this.clientHeight)); },
+    get scrollHeight() { return height; },
+    getBoundingClientRect: () => ({ top: 0 }), querySelectorAll: () => [], closest: () => null,
+  };
+  viewport.bodyRef.current = body;
+  viewport.setLatestFollowMode(true);
+  const deliverScroll = () => viewport.bodyHandlers.onScroll({ target: body, currentTarget: body });
+  for (const decision of ['permission', 'plan', 'question']) {
+    // Removing a decision first grows the viewport and clamps native scrollTop;
+    // restoring the input and appending output then changes the extent again.
+    body.clientHeight = 700; top = height - body.clientHeight;
+    body.clientHeight = 500; height += 100;
+    deliverScroll();
+    viewport.preserveReadingPosition(); viewport.preserveReadingPosition();
+    assert.equal(frames.size, 1, `${decision}: resize and scroll share one frame`);
+    flushFrames();
+    assert.equal(top, height - body.clientHeight, `${decision}: layout clamping cannot detach the reader`);
+  }
+  height += 800;
+  viewport.preserveReadingPosition(); flushFrames();
+  assert.equal(top, height - body.clientHeight, 'final output remains visible after completion');
+  const completedWrites = writes;
+  deliverScroll(); viewport.preserveReadingPosition(); flushFrames();
+  assert.equal(writes, completedWrites, 'programmatic feedback does not rewrite an already clamped tail');
+  assert.equal(frames.size, 0, 'idle layout does not keep scheduling itself');
+
+  const code = { parentElement: body, clientHeight: 100, scrollHeight: 400, scrollTop: 100,
+    style: { overflowY: 'auto' } };
+  viewport.bodyHandlers.onWheel({ target: code, deltaY: -20 });
+  height += 100; viewport.preserveReadingPosition(); flushFrames();
+  assert.equal(top, height - body.clientHeight, 'scrolling a code block does not detach the conversation');
+
+  viewport.preserveReadingPosition();
+  viewport.bodyHandlers.onKeyDown({ target: body, currentTarget: body, key: 'PageUp' });
+  top -= 200; const readingTop = top;
+  flushFrames();
+  assert.equal(top, readingTop, 'keyboard intent wins over an already queued follow frame');
+  height += 100; viewport.preserveReadingPosition(); flushFrames();
+  assert.equal(top, readingTop, 'new final content does not steal the history position');
+  viewport.scrollToLatest(); flushFrames();
+  assert.equal(top, height - body.clientHeight, 'explicit latest resumes the tail');
+
+  viewport.bodyHandlers.onTouchStart({ touches: [{ clientY: 200 }] });
+  viewport.bodyHandlers.onTouchMove({ target: body, touches: [{ clientY: 250 }] });
+  top -= 50; deliverScroll(); height += 100; viewport.preserveReadingPosition(); flushFrames();
+  assert.equal(top, height - body.clientHeight - 150, 'touch reading is retained through further output');
   assert.equal(frames.size, 0);
 });
 
@@ -2272,7 +2372,7 @@ test('pending approvals replace ordinary input while preserving its draft for re
   assert.doesNotMatch(html, /<textarea|local-agent__send|local-agent__composer-footer|local-agent__composer-tools/);
   assert.match(html, /local-agent__composer--approval/);
   assert.match(html, /aria-label="拒绝" aria-keyshortcuts="Escape"/);
-  assert.match(html, /aria-label="允许" aria-keyshortcuts="Enter"/);
+  assert.match(html, /aria-label="允许一次" aria-keyshortcuts="Enter"/);
   assert.equal((html.match(/<button\b/g) ?? []).length, 2);
   const resumed = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', composer: { ...composer, pendingApproval: null }, uiActionError: null }));
   assert.match(resumed, /<textarea[^>]*>Second request<\/textarea>/);
@@ -2281,12 +2381,21 @@ test('pending approvals replace ordinary input while preserving its draft for re
   }, uiActionError: null }));
   assert.match(browser, /允许当前对话使用内置浏览器/);
   assert.match(browser, /aria-label="允许此对话"/);
+  const runPreview = { ...composer.pendingApproval.preview, authorizationScope: 'runHostShell', authorizationContext: { workspaceId: 'workspace:one', workspaceRoot: '/project' } };
+  const run = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', composer: { ...composer,
+    pendingApproval: { ...composer.pendingApproval, preview: runPreview },
+  }, uiActionError: null }));
+  assert.match(run, /允许本轮/);
+  assert.match(run, /允许一次/);
+  assert.equal((run.match(/<button\b/g) ?? []).length, 3);
   const { emptySessionState, projectSession } = await import('../../session-core/dist/index.js');
   const wire = projectSession(emptySessionState('session:browser-wire'));
   wire.pendingApproval = { ...composer.pendingApproval, runId: 'run:browser', callId: 'call:browser', sequence: 3,
     createdAt: '2026-09-16T00:00:00Z', preview: { ...composer.pendingApproval.preview, authorizationScope: 'sessionBrowser' },
   };
   assert.deepEqual(await decodeGuiProjection(wire), wire, 'explicit scope survives the strict GUI wire decoder');
+  wire.pendingApproval.preview = runPreview;
+  assert.deepEqual(await decodeGuiProjection(wire), wire, 'run grant and Kernel context survive the GUI decoder');
   const invalidScope = structuredClone(wire);
   invalidScope.pendingApproval.preview.authorizationScope = 'unknown';
   await assert.rejects(decodeGuiProjection(invalidScope), /conversation_projection_invalid/);

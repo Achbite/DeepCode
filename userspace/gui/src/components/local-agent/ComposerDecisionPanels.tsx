@@ -17,12 +17,13 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
   } = composer;
   const approvalRef = useRef<HTMLElement>(null);
   const sessionBrowser = pendingApproval?.preview.authorizationScope === 'sessionBrowser';
+  const runHostShell = pendingApproval?.preview.authorizationScope === 'runHostShell';
   useLayoutEffect(() => {
     if (pendingApproval && document.activeElement === document.body) approvalRef.current?.focus({ preventScroll: true });
   }, [pendingApproval?.approvalId]);
-  const answerApproval = async (decision: 'allow' | 'deny') => {
+  const answerApproval = async (decision: 'allow' | 'deny', scope?: 'runHostShell') => {
     if (!pendingApproval || submitting) return;
-    try { await respondApproval(decision); } catch { /* The store retains the original error. */ }
+    try { await respondApproval(decision, scope); } catch { /* The store retains the original error. */ }
   };
   const sendDecision = async (text: string) => {
     if (!pendingInteraction || !text.trim() || submitting) return;
@@ -133,6 +134,10 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
             <code>{pendingApproval.preview.summary}</code>
           </pre>}
           <div className="local-agent__decision-controls">
+          {runHostShell && <button type="button" disabled={submitting}
+            title={language === 'zh-CN' ? '本轮内相同工作目录和执行环境的宿主 Shell' : 'Host shell in this workspace and environment for this run'}
+            onClick={() => void answerApproval('allow', 'runHostShell')}
+          >{language === 'zh-CN' ? '允许本轮' : 'Allow this run'}</button>}
           {(sessionBrowser || pendingApproval.preview.effects.length > 0
             || pendingApproval.preview.logicalTargets.length > 0) ? (
             <details className="local-agent__decision-scope">
@@ -141,7 +146,14 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
                 <DeepCodeShellIcon name="chevronDown" />
               </summary>
               {sessionBrowser && <pre className="local-agent__decision-command"><code>{pendingApproval.preview.summary}</code></pre>}
+              {runHostShell && <p>{language === 'zh-CN'
+                ? '以宿主用户权限执行命令。本轮授权限于相同工作目录绑定和执行环境，在本轮结束、失败或取消后失效。'
+                : 'Commands run with host-user privileges. This grant applies to the same workspace binding and environment until this run ends, fails or is cancelled.'}</p>}
               <dl>
+                {runHostShell && typeof pendingApproval.preview.authorizationContext?.workspaceRoot === 'string' && <div>
+                  <dt>{language === 'zh-CN' ? '工作目录' : 'Workspace'}</dt>
+                  <dd><code>{pendingApproval.preview.authorizationContext.workspaceRoot}</code></dd>
+                </div>}
                 {pendingApproval.preview.effects.length > 0 && (
                   <div>
                     <dt>{t(language, 'agent.approval.effects')}</dt>
@@ -172,11 +184,11 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
             <button
               type="button"
               className="local-agent__decision-allow"
-              aria-label={sessionBrowser ? (language === 'zh-CN' ? '允许此对话' : 'Allow this conversation') : t(language, 'agent.approval.allow')}
+              aria-label={sessionBrowser ? (language === 'zh-CN' ? '允许此对话' : 'Allow this conversation') : (language === 'zh-CN' ? '允许一次' : 'Allow once')}
               aria-keyshortcuts="Enter"
               disabled={submitting}
               onClick={() => void answerApproval('allow')}
-            ><span>{sessionBrowser ? (language === 'zh-CN' ? '允许此对话' : 'Allow this conversation') : t(language, 'agent.approval.allow')}</span><kbd aria-hidden="true">↵</kbd></button>
+            ><span>{sessionBrowser ? (language === 'zh-CN' ? '允许此对话' : 'Allow this conversation') : (language === 'zh-CN' ? '允许一次' : 'Allow once')}</span><kbd aria-hidden="true">↵</kbd></button>
           </div>
           </div>
         </section>

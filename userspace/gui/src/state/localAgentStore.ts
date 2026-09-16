@@ -99,7 +99,7 @@ export interface LocalAgentState {
   attachSessionDirectory(canonicalRoot: string): Promise<void>;
   detachSessionDirectory(workspaceId: string): Promise<void>;
   respondInteraction(response: string): Promise<CommandReply>;
-  respondApproval(decision: 'allow' | 'deny'): Promise<CommandReply>;
+  respondApproval(decision: 'allow' | 'deny', authorizationScope?: 'runHostShell'): Promise<CommandReply>;
   respondPlan(response: PlanResponse): Promise<CommandReply>;
   cancelRun(): Promise<CommandReply>;
   createProject(title: string, workspacePaths?: string[]): Promise<void>;
@@ -587,7 +587,7 @@ const store = create<LocalAgentState>((set, get) => ({
     );
   },
 
-  respondApproval: async (decision) => {
+  respondApproval: async (decision, authorizationScope) => {
     const state = get();
     const sessionId = requiredSession(state);
     const approval = state.projection?.pendingApproval;
@@ -605,6 +605,7 @@ const store = create<LocalAgentState>((set, get) => ({
         callId: approval.callId,
         approvalId: approval.approvalId,
         decision,
+        ...(authorizationScope ? { authorizationScope } : {}),
       }),
     );
   },
