@@ -522,6 +522,40 @@ impl LocalAgentJournal {
         Ok(false)
     }
 
+    /// Only an explicitly presented Session browser grant can authorize later calls.
+    /// Ordinary one-call approvals are never widened into a browser grant.
+    pub(crate) fn session_browser_authority(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, LocalAgentStoreError> {
+        validate_id("sessionId", session_id)?;
+        let connection = self.lock()?;
+        let payload: Option<String> = connection.query_row(
+            "SELECT resolved.payload_json FROM session_events resolved
+             JOIN session_events requested ON requested.session_id=resolved.session_id
+               AND requested.call_id=resolved.call_id AND requested.run_id=resolved.run_id
+               AND requested.event_type='approval.requested'
+               AND json_extract(requested.payload_json, '$.approvalId')=json_extract(resolved.payload_json, '$.approvalId')
+             WHERE resolved.session_id=?1 AND resolved.event_type='approval.resolved'
+               AND json_extract(requested.payload_json, '$.preview.authorizationScope')='sessionBrowser'
+             ORDER BY resolved.sequence DESC LIMIT 1",
+            params![session_id],
+            |row| row.get(0),
+        ).optional().map_err(sql_error("browser_authority_fact_read_failed"))?;
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let payload = decode_json(&payload, "browser_authority_fact_corrupt")?;
+        match required_string(&payload, "decision")? {
+            "allow" => Ok(Some(required_string(&payload, "authorityId")?.to_string())),
+            "deny" => Ok(None),
+            _ => Err(LocalAgentStoreError::new(
+                "browser_authority_fact_corrupt",
+                "浏览器授权决策无效。",
+            )),
+        }
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, LocalAgentStoreError> {
         self.connection.lock().map_err(|_| {
             LocalAgentStoreError::new("session_store_lock_failed", "Session Store 锁已损坏。")

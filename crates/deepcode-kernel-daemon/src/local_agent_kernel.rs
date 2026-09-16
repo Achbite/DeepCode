@@ -1311,7 +1311,20 @@ impl LocalAgentKernel {
                 "source": "userSetting",
                 "authorityId": permission_setting_id(scope),
             }))),
-            PermissionMode::Ask => Ok(Admission::ApprovalRequired),
+            PermissionMode::Ask => {
+                if prepared.binding.is_browser_page() {
+                    if let Some(authority_id) = self
+                        .journal
+                        .session_browser_authority(&request.session_id)?
+                    {
+                        return Ok(Admission::Allowed(json!({
+                            "decision": "allow", "source": "user", "authorityId": authority_id,
+                            "authorizationScope": "sessionBrowser",
+                        })));
+                    }
+                }
+                Ok(Admission::ApprovalRequired)
+            }
             PermissionMode::Deny => Ok(Admission::Denied {
                 authority: json!({
                     "decision": "deny",
@@ -1658,11 +1671,15 @@ impl PreparedEffect {
     }
 
     fn preview(&self, tool_name: &str) -> Value {
-        json!({
+        let mut preview = json!({
             "summary": effect_summary(tool_name, &self.logical_targets, &self.canonical_arguments),
             "effects": process_effect_names(self),
             "logicalTargets": self.logical_targets,
-        })
+        });
+        if self.binding.is_browser_page() {
+            preview["authorizationScope"] = json!("sessionBrowser");
+        }
+        preview
     }
 }
 
@@ -2349,6 +2366,20 @@ mod attempt_control_tests {
         tool_name: &str,
         input: Value,
     ) -> (LocalAgentKernel, LocalToolExecutionRequest, Value) {
+        kernel_with_product_tools(
+            resolver,
+            tool_name,
+            input,
+            crate::local_agent_product_tools::test_product_tools(),
+        )
+    }
+
+    fn kernel_with_product_tools(
+        resolver: Arc<dyn WorkspaceResolverPort>,
+        tool_name: &str,
+        input: Value,
+        product: Arc<crate::local_agent_product_tools::ProductTools>,
+    ) -> (LocalAgentKernel, LocalToolExecutionRequest, Value) {
         let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
         let bindings = json!([{"workspaceId":"workspace:test", "displayName":"Fixture"}]);
         journal
@@ -2364,7 +2395,7 @@ mod attempt_control_tests {
             McpRuntime::default(),
             LocalAgentPermissionPolicy::from_settings(&json!({})).unwrap(),
             false,
-            crate::local_agent_product_tools::test_product_tools(),
+            product,
         )
         .unwrap();
         let catalog = kernel
@@ -2400,6 +2431,158 @@ mod attempt_control_tests {
             "workspaceBindings":["workspace:test"], "input":input
         })).unwrap();
         (kernel, request, catalog)
+    }
+
+    #[test]
+    fn browser_grant_is_explicit_session_scoped_and_does_not_authorize_services() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct BrowserHost {
+            registration: Value,
+            stop: Arc<AtomicBool>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for BrowserHost {
+            fn drop(&mut self) {
+                let mut registration = self.registration.clone();
+                registration["remove"] = json!(true);
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(crate::browser_tools::register(axum::Json(
+                        serde_json::from_value(registration).unwrap(),
+                    )));
+                self.stop.store(true, Ordering::SeqCst);
+                let _ = TcpStream::connect(self.registration["endpoint"].as_str().unwrap());
+                self.thread.take().unwrap().join().unwrap();
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                if stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let _: Value = serde_json::from_str(&line).unwrap();
+                stream.write_all(b"{\"ok\":true,\"data\":{}}\n").unwrap();
+            }
+        });
+        let host = BrowserHost {
+            registration: json!({"hostInstanceId":format!("dcinstance_{}", "b".repeat(64)),
+            "endpoint":endpoint,"callbackToken":format!("dchost_{}", "b".repeat(64)),"remove":false}),
+            stop,
+            thread: Some(thread),
+        };
+        let response = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::browser_tools::register(axum::Json(
+                serde_json::from_value(host.registration.clone()).unwrap(),
+            )));
+        assert_eq!(response.0["ok"], true);
+        struct NoWorkspace;
+        impl WorkspaceResolverPort for NoWorkspace {
+            fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
+                panic!("page operations do not resolve a workspace");
+            }
+        }
+        let mut product = crate::local_agent_product_tools::test_product_tools();
+        Arc::get_mut(&mut product).unwrap().browser_binding = Some(
+            json!({"hostInstanceId":host.registration["hostInstanceId"],"windowLabel":"main"}),
+        );
+        let (kernel, mut request, catalog) = kernel_with_product_tools(
+            Arc::new(NoWorkspace),
+            "browser.page",
+            json!({"action":"act","previewId":"preview-1","operation":"click","selector":"#button"}),
+            product,
+        );
+        let effect = kernel.prepare_tool(&request).unwrap();
+        let preview = effect.preview("browser.page");
+        assert_eq!(preview["authorizationScope"], "sessionBrowser");
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        let commit = |call: &str, scope: bool, decision: &str| {
+            let mut preview = preview.clone();
+            if !scope {
+                preview
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("authorizationScope");
+            }
+            kernel.journal.append(&json!({"type":"approval.requested","sessionId":request.session_id,"runId":request.run_id,"callId":call,
+                "payload":{"approvalId":call,"preview":preview}})).unwrap();
+            kernel.journal.append(&json!({"type":"approval.resolved","sessionId":request.session_id,"runId":request.run_id,"callId":call,
+                "payload":{"approvalId":call,"commandId":call,"authorityId":call,"decision":decision}})).unwrap();
+        };
+        commit("call:ordinary", false, "allow");
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        commit("call:denied", true, "deny");
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        commit("call:browser", true, "allow");
+        request.call_id = "call:later".into();
+        request.run_id = "run:later".into();
+        let allowed = kernel.admit(&request, &effect).unwrap();
+        assert!(
+            matches!(allowed, Admission::Allowed(ref value) if value["authorityId"] == "call:browser" && value["authorizationScope"] == "sessionBrowser")
+        );
+        request.session_id = "session:other".into();
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        request.session_id = "session:reject".into();
+        request.run_id = "run:reject".into();
+        request.tool_name = "browser.service".into();
+        request.tool_binding_ref = catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "browser.service")
+            .unwrap()["toolBindingRef"]
+            .as_str()
+            .unwrap()
+            .into();
+        request.input = json!({"action":"start","directory":"/tmp","command":"node","args":[],"url":"http://127.0.0.1:3000"});
+        let service = kernel.prepare_tool(&request).unwrap();
+        assert!(matches!(
+            kernel.admit(&request, &service).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        let mut denied = effect.clone();
+        denied.generation = Arc::new(KernelGeneration {
+            catalog: effect.generation.catalog.clone(),
+            executor_config: effect.generation.executor_config.clone(),
+            permissions: LocalAgentPermissionPolicy::from_settings(
+                &json!({"agent.permissions.external":"deny"}),
+            )
+            .unwrap(),
+        });
+        assert!(matches!(
+            kernel.admit(&request, &denied).unwrap(),
+            Admission::Denied { .. }
+        ));
     }
 
     #[test]

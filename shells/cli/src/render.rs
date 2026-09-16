@@ -721,6 +721,9 @@ pub(crate) fn render_approval(
     approval: &ApprovalProjection,
 ) -> io::Result<()> {
     writeln!(out, "需要你批准：{}", approval.preview.summary)?;
+    if approval.preview.authorization_scope.as_deref() == Some("sessionBrowser") {
+        writeln!(out, "允许后，当前对话内的浏览器页面操作无需重复确认。")?;
+    }
     for target in &approval.preview.logical_targets {
         writeln!(out, "  - {target}")?;
     }

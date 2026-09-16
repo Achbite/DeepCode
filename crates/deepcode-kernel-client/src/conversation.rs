@@ -346,6 +346,11 @@ impl SessionProjection {
                 || approval.call_id.is_empty()
                 || approval.run_id.is_empty()
                 || approval.preview.summary.is_empty()
+                || approval
+                    .preview
+                    .authorization_scope
+                    .as_deref()
+                    .is_some_and(|scope| scope != "sessionBrowser")
         }) {
             return Err("shared Session projection has an invalid approval".to_string());
         }
@@ -1326,6 +1331,7 @@ pub struct EffectPreview {
     pub summary: String,
     pub effects: Vec<String>,
     pub logical_targets: Vec<String>,
+    pub authorization_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

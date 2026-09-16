@@ -672,6 +672,11 @@ impl PreparedCatalogBinding {
         &self.entry().name
     }
 
+    pub(crate) fn is_browser_page(&self) -> bool {
+        matches!(&self.entry().binding, ToolExecutorBinding::Browser(_))
+            && self.tool_name() == "browser.page"
+    }
+
     pub(crate) fn effect_scope(
         &self,
         input: &Value,

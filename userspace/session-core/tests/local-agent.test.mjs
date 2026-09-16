@@ -27,6 +27,32 @@ import { responseFrames } from '../dist/responseFrames.js';
 import { environmentInstruction } from '../dist/local-agent/sessionEnvironment.js';
 import { createProviderToolAliases } from '../dist/local-agent/providerToolCodec.js';
 
+test('browser authorization scope survives reducer snapshots and projection copies', () => {
+  const sessionId = 'session:browser-scope';
+  const event = { type: 'approval.requested', sessionId, runId: 'run:browser', callId: 'call:browser',
+    eventId: 'event:browser', sequence: 3, occurredAt: '2026-09-16T00:00:00Z',
+    payload: { approvalId: 'approval:browser', preview: {
+      summary: 'Use the internal browser', effects: ['external'], logicalTargets: ['browser:preview-1'], authorizationScope: 'sessionBrowser',
+    } },
+  };
+  const input = reduceSession(emptySessionState(sessionId), { ...event, type: 'message.committed', sequence: 1, eventId: 'event:input',
+    payload: { messageId: 'message:input', role: 'user', content: 'Test the browser', filesystemReferences: [], pluginSelections: [] },
+  });
+  const running = reduceSession(input, { ...event, type: 'run.started', sequence: 2, eventId: 'event:start',
+    payload: { inputMessageId: 'message:input', workspaceBindings: [], runtimeSnapshot: runtimeSnapshot('run:browser') },
+  });
+  const state = reduceSession(running, event);
+  const projected = projectSession(state);
+  assert.equal(projected.pendingApproval.preview.authorizationScope, 'sessionBrowser');
+  projected.pendingApproval.preview.effects.push('network');
+  assert.deepEqual(state.pendingApproval.preview.effects, ['external']);
+  const resolved = reduceSession(state, { ...event, type: 'approval.resolved', sequence: 4, eventId: 'event:allow',
+    payload: { approvalId: 'approval:browser', commandId: 'command:allow', authorityId: 'authority:browser', decision: 'allow' },
+  });
+  assert.equal(projectSession(resolved).pendingApproval, null);
+  assert.equal(state.pendingApproval.preview.authorizationScope, 'sessionBrowser');
+});
+
 test('queued input joins the same run after complete tool results and keeps late input before settlement', async (t) => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:queued-turns';

@@ -898,7 +898,8 @@ function isApproval(value: unknown): boolean {
 
 function isEffectPreview(value: unknown): boolean {
   const effects = ['localRead', 'workspaceRead', 'workspaceMutation', 'process', 'network', 'external'];
-  return isExactRecord(value, ['summary', 'effects', 'logicalTargets'])
+  return isExactRecord(value, ['summary', 'effects', 'logicalTargets'], ['authorizationScope'])
+    && (value.authorizationScope === undefined || value.authorizationScope === 'sessionBrowser')
     && isNonEmptyText(value.summary)
     && Array.isArray(value.effects)
     && value.effects.every((effect) => effects.includes(String(effect)))

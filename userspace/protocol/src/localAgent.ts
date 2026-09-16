@@ -580,6 +580,8 @@ export interface EffectPreview {
   summary: string;
   effects: EffectKind[];
   logicalTargets: string[];
+  /** An explicit browser grant applies to subsequent page operations in this Session. */
+  authorizationScope?: 'sessionBrowser';
 }
 
 export type SessionEvent =
@@ -1594,7 +1596,7 @@ export type WorkspaceAuthorityDecision =
     };
 
 export type NonWorkspaceAuthorityDecision =
-  | { decision: 'allow'; source: 'user' | 'userSetting'; authorityId: string }
+  | { decision: 'allow'; source: 'user' | 'userSetting'; authorityId: string; authorizationScope?: 'sessionBrowser' }
   | { decision: 'deny'; source: 'user'; authorityId: string }
   | { decision: 'deny'; source: 'kernel' | 'userSetting'; reason: string };
 

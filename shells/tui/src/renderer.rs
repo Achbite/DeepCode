@@ -326,6 +326,9 @@ impl Renderer {
                     "需要你批准（/reply 1 或 /reply 2）：{}\n",
                     approval.preview.summary
                 ));
+                if approval.preview.authorization_scope.as_deref() == Some("sessionBrowser") {
+                    output.push_str("允许后，当前对话内的浏览器页面操作无需重复确认。\n");
+                }
                 for target in &approval.preview.logical_targets {
                     output.push_str(&format!("  - {target}\n"));
                 }
@@ -691,6 +694,11 @@ impl Renderer {
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 )));
+                if approval.preview.authorization_scope.as_deref() == Some("sessionBrowser") {
+                    lines.push(Line::from(
+                        "允许后，当前对话内的浏览器页面操作无需重复确认。",
+                    ));
+                }
                 for target in &approval.preview.logical_targets {
                     lines.push(Line::from(format!("  - {target}")));
                 }

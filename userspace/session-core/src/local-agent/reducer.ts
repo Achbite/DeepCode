@@ -645,6 +645,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         runId: event.runId,
         callId: event.callId,
         preview: {
+          ...event.payload.preview,
           summary: event.payload.preview.summary,
           effects: [...event.payload.preview.effects],
           logicalTargets: [...event.payload.preview.logicalTargets],
@@ -1584,6 +1585,7 @@ function cloneApproval(
   return {
     ...approval,
     preview: {
+      ...approval.preview,
       summary: approval.preview.summary,
       effects: [...approval.preview.effects],
       logicalTargets: [...approval.preview.logicalTargets],
