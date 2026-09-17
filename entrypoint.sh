@@ -33,8 +33,8 @@ print_version "pnpm"     pnpm
 # ---- 2. 准备 named volume 挂载点权限 ----
 # named volume 首次挂载时是空目录，root 拥有；这里显式确保可写
 for d in \
-    /workspace/node_modules \
-    /workspace/target \
+    "$PWD/node_modules" \
+    "$PWD/target" \
     /usr/local/cargo/registry \
     /root/.local/share/pnpm/store
 do
@@ -45,7 +45,7 @@ done
 cat <<'TIP'
 [entrypoint] ----------------------------------------------
 [entrypoint]  容器已就绪。常用命令（项目根目录直接调用）：
-[entrypoint]    bash ./build.sh   按宿主平台构建：Mac 输出 macOS 包，WSL/Linux 输出 Linux 和 Windows 包
+[entrypoint]    bash ./build.sh   构建容器支持的平台；macOS 包请从宿主入口调用
 [entrypoint]    bash ./test.sh    运行 required 登记检查
 [entrypoint]    pnpm install （首次或 lockfile 变更时）
 [entrypoint] ----------------------------------------------

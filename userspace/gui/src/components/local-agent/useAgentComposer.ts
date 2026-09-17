@@ -1,12 +1,25 @@
+import { localizePlugin } from '../../pluginLocalization';
+import { nextEnabledIndex } from '../shared/keyboardNavigation';
 import type React from 'react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { PlanResponse, PluginSelectionInput } from '@deepcode/protocol';
+import type { PlanResponse, PluginSelectionInput, ProjectionMessage } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import { shouldOfferFocusCommand, shouldSubmitComposerKey } from './composerKeyboard';
 import { planScopeAddition } from './planReview';
 import { isLongPastedText, type PastedTextInput } from '../../services/pastedText';
 import { cloneComposerState, composerStateIsEmpty, emptyComposerState, submitComposerState, type ComposerState } from './composerSubmission';
+
+function readComposerDraft(key:string):ComposerState {
+  const saved=sessionStorage.getItem(`deepcode:composer:${key}`);
+  if(!saved)return emptyComposerState();
+  try{return cloneComposerState(JSON.parse(saved) as ComposerState);}
+  catch(error){console.error('Cannot read the saved composer draft.',error);return emptyComposerState();}
+}
+function saveComposerDraft(key:string,state:ComposerState):void {
+  try{sessionStorage.setItem(`deepcode:composer:${key}`,JSON.stringify(state));}
+  catch(error){console.error('Cannot preserve the composer draft across a window reload.',error);}
+}
 
 interface PastedTextDraft extends PastedTextInput { expanded: boolean }
 
@@ -33,16 +46,19 @@ export function useAgentComposer(
   )), pendingPlan) : null;
   const textDecision = Boolean(pendingPlan || pendingInteraction);
   const conversationKey = sessionId ?? `new:${draftProjectId ?? 'independent'}`;
+  const [messageEdit, setMessageEdit] = useState<{ sessionId: string; message: ProjectionMessage; revision: number } | null>(null);
+  const editingMessage = messageEdit?.sessionId === sessionId ? messageEdit : null;
   const composerStateKey = pendingPlan
     ? `${conversationKey}:plan:${pendingPlan.planId}:${pendingPlan.revision}`
     : pendingInteraction
       ? `${conversationKey}:interaction:${pendingInteraction.interactionId}`
-      : conversationKey;
+      : editingMessage ? `${conversationKey}:edit:${editingMessage.message.messageId}` : conversationKey;
   const loading = useLocalAgentStore((state) => state.loading);
   const submitting = useLocalAgentStore((state) => state.submitting);
   const catalogBusy = useLocalAgentStore((state) => state.catalogBusy);
   const error = useLocalAgentStore((state) => state.error);
   const sendMessage = useLocalAgentStore((state) => state.sendMessage);
+  const editMessage = useLocalAgentStore((state) => state.editMessage);
   const focusContext = useLocalAgentStore((state) => state.focusContext);
   const respondInteraction = useLocalAgentStore((state) => state.respondInteraction);
   const respondApproval = useLocalAgentStore((state) => state.respondApproval);
@@ -52,12 +68,13 @@ export function useAgentComposer(
   const selectReasoningEffort = useLocalAgentStore((state) => state.selectReasoningEffort);
   const reasoningEffortOverride = useLocalAgentStore((state) => state.reasoningEffortOverride);
   const modelSettingsBusy = useLocalAgentStore((state) => state.modelSettingsBusy);
-  const [draft, setDraft] = useState('');
-  const [pastedTexts, setPastedTexts] = useState<PastedTextDraft[]>([]);
+  const [initialComposer] = useState(()=>readComposerDraft(composerStateKey));
+  const [draft, setDraft] = useState(initialComposer.draft);
+  const [pastedTexts, setPastedTexts] = useState<PastedTextDraft[]>(initialComposer.pastedTexts);
   const [pendingFilesystemPaths, setPendingFilesystemPaths] = useState<
     PendingFilesystemPath[]
-  >([]);
-  const [pluginSelections, setPluginSelections] = useState<PluginSelectionInput[]>([]);
+  >(initialComposer.filesystemPaths);
+  const [pluginSelections, setPluginSelections] = useState<PluginSelectionInput[]>(initialComposer.pluginSelections);
   const [pluginPickerOpen, setPluginPickerOpen] = useState(false);
   const [pluginQuery, setPluginQuery] = useState('');
   const [pluginTriggerStart, setPluginTriggerStart] = useState<number | null>(null);
@@ -78,6 +95,9 @@ export function useAgentComposer(
     selectionEnd: textareaRef.current?.selectionEnd ?? draft.length,
     focused: typeof document !== 'undefined' && document.activeElement === textareaRef.current };
   const activeComposerStateKeyRef = useRef(composerStateKey);
+  useEffect(()=>{
+    saveComposerDraft(activeComposerStateKeyRef.current,currentComposerStateRef.current);
+  },[draft,pastedTexts,pendingFilesystemPaths,pluginSelections,composerStateKey]);
   const pendingComposerRestoreRef = useRef<{
     key: string;
     state: ComposerState;
@@ -103,6 +123,7 @@ export function useAgentComposer(
   const setComposerStateForKey = (key: string, state: ComposerState) => {
     const copy = cloneComposerState(state);
     composerStatesRef.current.set(key, copy);
+    saveComposerDraft(key,copy);
     if (activeComposerStateKeyRef.current !== key) return;
     currentComposerStateRef.current = copy;
     setDraft(copy.draft);
@@ -111,6 +132,19 @@ export function useAgentComposer(
     setPluginSelections(copy.pluginSelections);
     pendingComposerRestoreRef.current = { key, state: copy };
   };
+
+  const canEditMessage = Boolean(sessionId && projection && !loading && !submitting && !catalogBusy
+    && !pendingPlan && !pendingInteraction && !pendingApproval
+    && (!projection.run || ['completed', 'failed', 'cancelled', 'indeterminate'].includes(projection.run.status)));
+  const beginMessageEdit = (message: ProjectionMessage) => {
+    if (!canEditMessage || !sessionId || !projection || message.role !== 'user' || message.replyToInteraction || message.runId) return;
+    const key = `${conversationKey}:edit:${message.messageId}`;
+    // The ordinary composer keeps its own draft, attachments and selection.
+    setComposerStateForKey(key, { ...emptyComposerState(), draft: message.content,
+      selectionStart: message.content.length, selectionEnd: message.content.length, focused: true });
+    setMessageEdit({ sessionId, message, revision: projection.revision });
+  };
+  const cancelMessageEdit = () => { if (!submitting) setMessageEdit(null); };
 
   useLayoutEffect(() => {
     const previousKey = activeComposerStateKeyRef.current;
@@ -129,9 +163,10 @@ export function useAgentComposer(
           focused: document.activeElement === textarea || previous?.focused === true,
         };
     composerStatesRef.current.set(previousKey, outgoing);
+    saveComposerDraft(previousKey,outgoing);
 
     const incoming = cloneComposerState(
-      composerStatesRef.current.get(composerStateKey) ?? { ...emptyComposerState(), focused: outgoing.focused },
+      composerStatesRef.current.get(composerStateKey) ?? { ...readComposerDraft(composerStateKey), focused: outgoing.focused },
     );
     activeComposerStateKeyRef.current = composerStateKey;
     pendingComposerRestoreRef.current = { key: composerStateKey, state: incoming };
@@ -241,6 +276,10 @@ export function useAgentComposer(
       write: (_key, state) => setComposerStateForKey(submission.key, state),
       retainFailed: (_key, state) => setFailedDrafts((current) => ({ ...current, [submission.key]: [...(current[submission.key] ?? []), state] })),
       send: async () => {
+        if (editingMessage && !textDecision) {
+          await editMessage(editingMessage.message.messageId, submittedText, editingMessage.revision);
+          return;
+        }
         if (pendingPlan) {
           await respondPlan({ kind: 'requestRevision', text: submittedText });
           return;
@@ -257,7 +296,10 @@ export function useAgentComposer(
         }
       },
     });
-    if (sent && activeComposerStateKeyRef.current === submission.key) setAttachmentError(null);
+    if (sent && activeComposerStateKeyRef.current === submission.key) {
+      setAttachmentError(null);
+      if (editingMessage) setMessageEdit(null);
+    }
   };
 
   const beginComposition = () => {
@@ -305,19 +347,16 @@ export function useAgentComposer(
 
   const filteredPlugins = useMemo(() => {
     const query = pluginQuery.trim().toLocaleLowerCase();
-    return pluginCatalog.plugins.filter((plugin) => {
-      if (!query) return true;
+    return pluginCatalog.plugins.map((plugin) => localizePlugin(plugin, language)).filter((plugin) => {
+      if (!query) return plugin.discovery !== 'searchOnly';
       return [plugin.displayName, plugin.shortDescription, plugin.uri]
         .some((value) => value.toLocaleLowerCase().includes(query));
     });
-  }, [pluginCatalog.plugins, pluginQuery]);
+  }, [pluginCatalog.plugins, pluginQuery, language]);
 
   useEffect(() => {
-    setPluginActiveIndex((current) => Math.min(
-      current,
-      Math.max(0, filteredPlugins.length - 1),
-    ));
-  }, [filteredPlugins.length]);
+    setPluginActiveIndex((current) => filteredPlugins[current]?.enabled && filteredPlugins[current]?.available ? current : nextEnabledIndex(filteredPlugins.map((plugin) => plugin.enabled && plugin.available), -1, 'Home'));
+  }, [filteredPlugins]);
 
   const openPluginPicker = () => {
     setAttachmentMenuOpen(false);
@@ -331,7 +370,7 @@ export function useAgentComposer(
   const updateDraft = (value: string, cursor: number) => {
     pendingComposerRestoreRef.current = null;
     setDraft(value);
-    if (textDecision) return;
+    if (textDecision || editingMessage) return;
     setPluginSelections((current) => current.filter((selection) => (
       value.includes(`@${selection.label}`)
     )));
@@ -390,40 +429,32 @@ export function useAgentComposer(
 
   const focusCommandSuggestionVisible = !textDecision && shouldOfferFocusCommand(draft);
 
+  const handlePluginPickerKey = (event: React.KeyboardEvent<HTMLElement>, allowTab = false): boolean => {
+    if (!pluginPickerOpen || event.nativeEvent.isComposing || compositionActiveRef.current || compositionCommitPendingRef.current) return false;
+    if (event.key === 'Escape') {
+      event.preventDefault(); event.stopPropagation(); setPluginPickerOpen(false); textareaRef.current?.focus(); return true;
+    }
+    if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+      event.preventDefault();
+      setPluginActiveIndex((current) => nextEnabledIndex(filteredPlugins.map((plugin) => plugin.enabled && plugin.available), current, event.key));
+      return true;
+    }
+    if ((event.key === 'Enter' && !event.shiftKey) || (allowTab && event.key === 'Tab' && !event.shiftKey)) {
+      event.preventDefault();
+      const plugin = filteredPlugins[pluginActiveIndex];
+      if (plugin?.enabled && plugin.available) selectPlugin(plugin);
+      return true;
+    }
+    return false;
+  };
   const submitOnComposerEnter = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (handlePluginPickerKey(event, true)) return;
     if (pendingPlan && event.key === 'Escape' && !event.repeat
       && !event.nativeEvent.isComposing && !compositionActiveRef.current
       && !compositionCommitPendingRef.current) {
       event.preventDefault();
       void submitPlanDecision({ kind: 'cancel' });
       return;
-    }
-    if (
-      pluginPickerOpen
-      && !event.nativeEvent.isComposing
-      && !compositionActiveRef.current
-      && !compositionCommitPendingRef.current
-    ) {
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        setPluginPickerOpen(false);
-        return;
-      }
-      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-        event.preventDefault();
-        setPluginActiveIndex((current) => {
-          if (filteredPlugins.length === 0) return 0;
-          const delta = event.key === 'ArrowDown' ? 1 : -1;
-          return (current + delta + filteredPlugins.length) % filteredPlugins.length;
-        });
-        return;
-      }
-      if ((event.key === 'Enter' && !event.shiftKey) || event.key === 'Tab') {
-        event.preventDefault();
-        const plugin = filteredPlugins[pluginActiveIndex];
-        if (plugin) selectPlugin(plugin);
-        return;
-      }
     }
     if (!shouldSubmitComposerKey({
       key: event.key,
@@ -510,7 +541,7 @@ export function useAgentComposer(
   );
   const pasteText = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
     pendingComposerRestoreRef.current = null;
-    if (textDecision) return;
+    if (textDecision || editingMessage) return;
     const text = event.clipboardData.getData('text/plain');
     if (!isLongPastedText(text)) return;
     event.preventDefault();
@@ -528,9 +559,9 @@ export function useAgentComposer(
   const editPastedText = (inputId: string, text: string) => setPastedTexts((current) => current.map((item) => (
     item.inputId === inputId ? { ...item, inputId: nextPanelId('paste'), text } : item
   )));
-  const canSend = !loading && !submitting && (textDecision
+  const canSend = !loading && !submitting && (!editingMessage || canEditMessage) && (textDecision
     ? Boolean(draft.trim()) && (!pendingInteraction || pendingInteraction.allowFreeform)
-    : Boolean(draft.trim() || pastedTexts.length)
+    : Boolean(draft.trim() || pastedTexts.length || editingMessage?.message.filesystemReferences.length)
       && !modelSettingsBusy && !catalogBusy
       && Boolean(canCancel || profiles.some((profile) => profile.id === selectedProfileId && profile.enabled)));
   const showStopAction = canCancel && !textDecision && !draft.trim() && !pastedTexts.length;
@@ -543,6 +574,10 @@ export function useAgentComposer(
   };
 
   return {
+    editingMessage,
+    canEditMessage,
+    beginMessageEdit,
+    cancelMessageEdit,
     textDecision,
     pendingPlan,
     pendingScopeAddition,
@@ -591,8 +626,11 @@ export function useAgentComposer(
     beginComposition,
     endComposition,
     submitOnComposerEnter,
+    handlePluginPickerKey,
     submitPlanDecision,
     filteredPlugins,
+    pluginQuery,
+    setPluginQuery,
     selectPlugin,
     focusCommandSuggestionVisible,
     selectFocusCommand,

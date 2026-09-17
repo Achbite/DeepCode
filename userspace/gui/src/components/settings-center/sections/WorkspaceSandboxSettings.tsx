@@ -23,7 +23,6 @@ export default function WorkspaceSandboxSettings({ chinese }: { chinese: boolean
       <div className="settings-field settings-field--compact">
         <div className="settings-field__main">
           <div className="settings-field__label">{sandbox?.available ? (chinese ? '可用' : 'Available') : (chinese ? '尚不可用' : 'Unavailable')}{sandbox?.backend ? ` · ${sandbox.backend}` : ''}</div>
-          <p className="settings-field__description">{chinese ? '读取已安装的开发工具，写入限定在已授权范围与临时目录。工作区 Shell 不使用网络。' : 'Read installed developer tools and write within authorized paths and temporary storage. Workspace Shell runs without network access.'}</p>
           {sandbox?.reason && <p className="settings-field__description">{sandbox.reason}</p>}
         </div>
         {environment?.os === 'windows' && !sandbox?.available && <button className="settings-button" disabled={pending} onClick={() => void initialize()}>{pending ? (chinese ? '正在初始化…' : 'Initializing…') : (chinese ? '初始化 Windows 支持' : 'Initialize Windows support')}</button>}

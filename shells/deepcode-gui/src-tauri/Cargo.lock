@@ -502,8 +502,9 @@ dependencies = [
 
 [[package]]
 name = "deepcode-gui-tauri-shell"
-version = "0.5.60"
+version = "0.6.1"
 dependencies = [
+ "block2",
  "deepcode-host-connection",
  "deepcode-kernel-abi",
  "getrandom 0.3.4",
@@ -512,6 +513,7 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+ "objc2-web-kit",
  "serde",
  "serde_json",
  "tauri",
@@ -524,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "deepcode-host-connection"
-version = "0.5.60"
+version = "0.6.1"
 dependencies = [
  "deepcode-kernel-abi",
  "libc",
@@ -535,11 +537,10 @@ dependencies = [
 
 [[package]]
 name = "deepcode-kernel-abi"
-version = "0.5.60"
+version = "0.6.1"
 dependencies = [
  "serde",
  "serde_json",
- "sha2",
  "thiserror 1.0.69",
 ]
 

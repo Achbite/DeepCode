@@ -18,15 +18,6 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-CONTAINER_NAME="deepcode-dev"
-IMAGE_NAME="deepcode-dev:latest"
-DOCKER_VOLUMES=(
-  "deepcode-pnpm-store"
-  "deepcode-cargo-registry"
-  "deepcode-cargo-target"
-  "deepcode-node-modules"
-)
-
 dry_run=1
 include_docker=1
 include_local=1
@@ -106,13 +97,6 @@ run_command() {
   "$@"
 }
 
-run_optional_command() {
-  if [ "$dry_run" -eq 1 ]; then
-    printf '+ %s || true\n' "$(quote_args "$@")"
-    return 0
-  fi
-  "$@" >/dev/null 2>&1 || true
-}
 
 remove_path() {
   local path="$1"
@@ -123,61 +107,24 @@ remove_path() {
   run_command rm -rf "$path"
 }
 
-clear_directory_contents() {
-  local path="$1"
-  if [ ! -d "$path" ]; then
-    log "skip missing directory: $path"
-    return 0
-  fi
-  run_command find "$path" -mindepth 1 -delete
-}
 
 clean_portable_package_outputs() {
   local package_dir="$1"
   local platform="$2"
-  log "remove $platform package product outputs; preserve config/sessions"
-
-  local generated_dirs=(
-    "$package_dir/web"
-    "$package_dir/web-deepcode-gui"
-    "$package_dir/libexec"
-  )
-
-  local dir
-  for dir in "${generated_dirs[@]}"; do
-    clear_directory_contents "$dir"
-  done
-
-  local paths=(
-    "$package_dir/README.txt"
-    "$package_dir/build-info.json"
-    "$package_dir/deepcode"
-    "$package_dir/deepcode-cli"
-    "$package_dir/deepcode-gui"
-    "$package_dir/deepcode-kernel"
-    "$package_dir/deepcode-tui"
-    "$package_dir/DeepCode-CLI"
-    "$package_dir/DeepCode-TUI"
-    "$package_dir/DeepCode"
-    "$package_dir/deepcode-cli.bat"
-    "$package_dir/deepcode-tui.bat"
-    "$package_dir/DeepCode-CLI.cmd"
-    "$package_dir/DeepCode-TUI.cmd"
-    "$package_dir/deepcode.cmd"
-    "$package_dir/deepcode-cli.exe"
-    "$package_dir/deepcode-kernel.exe"
-    "$package_dir/deepcode-tui.exe"
-    "$package_dir/DeepCode-CLI.exe"
-    "$package_dir/DeepCode-TUI.exe"
-    "$package_dir/DeepCode.exe"
-    "$package_dir/DeepCode-GUI.exe"
-    "$package_dir/WebView2Loader.dll"
-  )
-
-  local path
-  for path in "${paths[@]}"; do
-    remove_path "$path"
-  done
+  log "remove $platform program outputs; preserve user data"
+  local entries entry
+  entries="$(python3 -B - "$ROOT_DIR/scripts/package-runtime.py" <<'PYTHON'
+import importlib.util
+import sys
+spec = importlib.util.spec_from_file_location('package_runtime', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print('\n'.join(sorted(module.PROGRAM_ENTRIES)))
+PYTHON
+)"
+  while IFS= read -r entry; do
+    remove_path "$package_dir/$entry"
+  done <<< "$entries"
 }
 
 command_exists() {
@@ -219,13 +166,8 @@ clean_deepcode_docker() {
     return 0
   fi
 
-  log "remove DeepCode dev container/image/named volumes"
-  run_optional_command docker rm -f "$CONTAINER_NAME"
-  run_optional_command docker rmi -f "$IMAGE_NAME"
-  local volume
-  for volume in "${DOCKER_VOLUMES[@]}"; do
-    run_optional_command docker volume rm "$volume"
-  done
+  log "remove Docker resources selected by the current worktree Makefile"
+  run_command make -C "$ROOT_DIR" clean
 }
 
 clean_repo_local() {
@@ -243,18 +185,17 @@ clean_repo_local() {
     "$ROOT_DIR/userspace/gui/node_modules"
     "$ROOT_DIR/userspace/session-core/node_modules"
     "$ROOT_DIR/userspace/protocol/node_modules"
-    "$ROOT_DIR/shells/tauri/node_modules"
+    "$ROOT_DIR/userspace/presentation-core/node_modules"
     "$ROOT_DIR/shells/deepcode-gui/node_modules"
     "$ROOT_DIR/userspace/gui/dist"
     "$ROOT_DIR/userspace/gui/dist-deepcode-gui"
     "$ROOT_DIR/userspace/session-core/dist"
     "$ROOT_DIR/userspace/protocol/dist"
-    "$ROOT_DIR/shells/tauri/dist"
+    "$ROOT_DIR/userspace/presentation-core/dist"
     "$ROOT_DIR/shells/deepcode-gui/dist"
     "$ROOT_DIR/userspace/gui/tsconfig.tsbuildinfo"
     "$ROOT_DIR/userspace/session-core/tsconfig.tsbuildinfo"
     "$ROOT_DIR/userspace/protocol/tsconfig.tsbuildinfo"
-    "$ROOT_DIR/shells/tauri/tsconfig.tsbuildinfo"
     "$ROOT_DIR/shells/deepcode-gui/tsconfig.tsbuildinfo"
   )
 
@@ -277,26 +218,7 @@ clean_macos_package_outputs() {
     fail_if_macos_package_running
   fi
 
-  log "remove macOS package product outputs; preserve config/sessions"
-  local macos_dir="$ROOT_DIR/bin/macos-arm64"
-  local paths=(
-    "$macos_dir/DeepCode.app"
-    "$macos_dir/DeepCode-GUI.app"
-    "$macos_dir/deepcode-kernel"
-    "$macos_dir/deepcode-cli"
-    "$macos_dir/deepcode-tui"
-    "$macos_dir/DeepCode-TUI.command"
-    "$macos_dir/DeepCode-CLI.command"
-    "$macos_dir/libexec"
-    "$macos_dir/web"
-    "$macos_dir/README.txt"
-    "$macos_dir/build-info.json"
-  )
-
-  local path
-  for path in "${paths[@]}"; do
-    remove_path "$path"
-  done
+  clean_portable_package_outputs "$ROOT_DIR/bin/macos-arm64" "macos-arm64"
 }
 
 clean_host_global() {

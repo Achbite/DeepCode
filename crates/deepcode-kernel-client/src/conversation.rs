@@ -34,6 +34,65 @@ pub struct CommandReply {
 pub struct ConversationError {
     pub code: String,
     pub message: String,
+    pub diagnostics: Option<ErrorDiagnostics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ErrorDiagnostics {
+    pub source: String,
+    pub phase: String,
+    pub category: String,
+    pub retryable: bool,
+    pub causes: Vec<DiagnosticCause>,
+    pub is_connect: Option<bool>,
+    pub is_timeout: Option<bool>,
+    pub is_body: Option<bool>,
+    pub stop_reason: Option<String>,
+    pub archive_path: Option<String>,
+    #[serde(default)]
+    pub secondary: Vec<DiagnosticSecondary>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiagnosticCause {
+    pub message: String,
+    pub kind: Option<String>,
+    pub os_code: Option<i64>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiagnosticSecondary {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderAttemptProjection {
+    pub provider_request_id: String,
+    pub provider_attempt_id: String,
+    pub attempt: u8,
+    pub purpose: String,
+    pub phase: String,
+    pub run_id: String,
+    pub updated_at: String,
+    pub error: Option<ConversationError>,
+    pub retry_at: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunFailureSnapshot {
+    pub revision: u64,
+    pub phase: String,
+    pub error: ConversationError,
+    pub provider_request_id: Option<String>,
+    pub provider_attempt_ids: Vec<String>,
+    pub last_message_id: Option<String>,
+    pub tool_record_ids: Vec<String>,
+    pub pending_call_ids: Vec<String>,
+    pub queued_message_ids: Vec<String>,
+    pub plan_ref: Option<PlanRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -58,8 +117,6 @@ impl PluginCatalogProjection {
                     !valid_media_type(media_type)
                         || !activation_media_types.insert(media_type.as_str())
                 })
-                || !plugin.enabled
-                || !plugin.available
                 || !uris.insert(plugin.uri.as_str())
         }) {
             return Err("plugin catalog entries are invalid".to_string());
@@ -71,6 +128,12 @@ impl PluginCatalogProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginCatalogItem {
+    pub management: Option<Value>,
+    pub source: String,
+    pub category: String,
+    pub contribution_kind: String,
+    pub discovery: String,
+    pub reference: Option<Value>,
     pub uri: String,
     pub display_name: String,
     pub short_description: String,
@@ -120,11 +183,16 @@ pub struct SessionProjection {
     pub file_change_rounds: Vec<FileChangeRound>,
     pub artifacts: Vec<ArtifactProjection>,
     pub terminal_error: Option<ConversationError>,
+    #[serde(default)]
+    pub provider_attempts: Vec<ProviderAttemptProjection>,
+    pub failure_snapshot: Option<RunFailureSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueuedInputProjection {
+    pub guidance_references: Option<Vec<GuidanceReference>>,
+    pub plugin_catalog_revision: Option<String>,
     pub command_id: String,
     pub message_id: String,
     pub run_id: String,
@@ -160,6 +228,19 @@ impl SessionProjection {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != SESSION_PROJECTION_VERSION || self.session_id.is_empty() {
             return Err("shared Session projection identity is invalid".to_string());
+        }
+        if self.provider_attempts.iter().any(|attempt| {
+            !(1..=5).contains(&attempt.attempt)
+                || !matches!(attempt.purpose.as_str(), "agent" | "contextCompaction")
+                || !matches!(
+                    attempt.phase.as_str(),
+                    "started" | "completed" | "failed" | "retryWaiting"
+                )
+                || matches!(attempt.phase.as_str(), "failed" | "retryWaiting")
+                    != attempt.error.is_some()
+                || (attempt.phase == "retryWaiting") != attempt.retry_at.is_some()
+        }) {
+            return Err("shared Provider attempt projection is invalid".into());
         }
         let mut workspace_ids = HashSet::new();
         if self.workspace_bindings.iter().any(|binding| {
@@ -340,6 +421,11 @@ impl SessionProjection {
                 || approval.call_id.is_empty()
                 || approval.run_id.is_empty()
                 || approval.preview.summary.is_empty()
+                || approval
+                    .preview
+                    .authorization_scope
+                    .as_deref()
+                    .is_some_and(|scope| !matches!(scope, "sessionBrowser" | "runHostShell"))
         }) {
             return Err("shared Session projection has an invalid approval".to_string());
         }
@@ -692,7 +778,7 @@ impl SessionProjection {
                                     activity.activity_id != *activity_id
                                         || !matches!(
                                             activity.kind.as_str(),
-                                            "tool" | "providerHosted"
+                                            "tool" | "providerHosted" | "approval"
                                         )
                                 })
                         })
@@ -713,7 +799,7 @@ impl SessionProjection {
                 != self
                     .activities
                     .iter()
-                    .filter(|activity| matches!(activity.kind.as_str(), "tool" | "providerHosted"))
+                    .filter(|activity| matches!(activity.kind.as_str(), "tool" | "providerHosted" | "approval"))
                     .count()
         {
             return Err("shared Session projection canonical timeline is incomplete".to_string());
@@ -804,21 +890,10 @@ impl SessionTimelineItem {
 }
 
 fn invalid_context_composition_shape(receipt: &ContextCompositionProjection) -> bool {
-    !valid_context_hash(&receipt.stable_core_hash)
-        || !valid_context_hash(&receipt.base_tool_schema_hash)
-        || !valid_context_hash(&receipt.selected_plugin_snapshot_hash)
-        || invalid_context_messages(&receipt.messages)
+    invalid_context_messages(&receipt.messages)
         || invalid_context_items(&receipt.workspace_bindings)
         || invalid_context_tools(&receipt.tools)
         || invalid_context_partitions(&receipt.partitions)
-}
-
-fn valid_context_hash(value: &str) -> bool {
-    value
-        .strip_prefix("context-hash-v1:")
-        .is_some_and(|suffix| {
-            suffix.len() == 16 && suffix.chars().all(|value| value.is_ascii_hexdigit())
-        })
 }
 
 fn invalid_context_partitions(partitions: &[ContextCompositionPartitionProjection]) -> bool {
@@ -1032,6 +1107,7 @@ pub struct WorkspaceBindingDisplay {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProjectionMessage {
+    pub guidance_references: Option<Vec<GuidanceReference>>,
     pub message_id: String,
     pub run_id: Option<String>,
     pub provider_request_id: Option<String>,
@@ -1050,6 +1126,16 @@ pub struct ProjectionMessage {
 pub struct InteractionReplyContext {
     pub interaction_id: String,
     pub prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GuidanceReference {
+    pub reference_id: String,
+    pub uri: String,
+    pub label: String,
+    pub tool_name: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1309,6 +1395,8 @@ pub struct EffectPreview {
     pub summary: String,
     pub effects: Vec<String>,
     pub logical_targets: Vec<String>,
+    pub authorization_scope: Option<String>,
+    pub authorization_context: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1474,13 +1562,11 @@ pub struct TokenUsageRoundProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ContextCompositionProjection {
+    pub kernel_catalog_snapshot_ref: Option<String>,
     pub provider_request_id: String,
     pub purpose: String,
     pub run_id: String,
     pub response_constraint: String,
-    pub stable_core_hash: String,
-    pub base_tool_schema_hash: String,
-    pub selected_plugin_snapshot_hash: String,
     pub dynamic_instruction_bytes: u64,
     pub messages: Vec<ContextCompositionMessage>,
     pub workspace_bindings: Vec<ContextCompositionItem>,
@@ -1705,6 +1791,14 @@ pub struct ActivityResourceProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactProjection {
+    pub session_id: String,
+    pub run_id: String,
+    pub call_id: String,
+    pub record_id: String,
+    pub content_type: String,
+    pub content_mode: String,
+    pub created_at: String,
+    pub source_page: Option<serde_json::Value>,
     pub artifact_id: String,
     pub label: String,
     pub workspace_id: Option<String>,
@@ -1885,7 +1979,7 @@ pub fn approval_response_command(
     approval: &ApprovalProjection,
     decision: &str,
 ) -> Value {
-    json!({
+    let mut command = json!({
         "schemaVersion": CONVERSATION_COMMAND_VERSION,
         "type": "approval.respond",
         "commandId": command_id,
@@ -1893,8 +1987,12 @@ pub fn approval_response_command(
         "runId": approval.run_id,
         "callId": approval.call_id,
         "approvalId": approval.approval_id,
-        "decision": decision,
-    })
+        "decision": if decision == "allow-run" { "allow" } else { decision },
+    });
+    if decision == "allow-run" {
+        command["authorizationScope"] = json!("runHostShell");
+    }
+    command
 }
 
 pub fn plan_confirm_command(
@@ -2018,7 +2116,7 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                             && operation.terminal.is_none()
                             && operation.writable_paths.is_none()
                     }
-                    "fs.write" | "fs.edit" => {
+                    "fs.write" | "fs.edit" | "document.render" | "browser.capture" => {
                         operation
                             .target
                             .as_deref()
@@ -2160,7 +2258,7 @@ fn valid_shell_execution_environment(environment: &ShellExecutionEnvironmentProj
     !environment.shell.trim().is_empty()
         && matches!(environment.execution_scope.as_str(), "workspace" | "host")
         && environment.interactive == environment.terminal
-        && environment.path_source == "hostPlusStandardDeveloperPaths"
+        && !environment.path_source.trim().is_empty()
         && if environment.execution_scope == "host" {
             environment.write_scope == "hostUser"
                 && environment.home_writable
@@ -2765,5 +2863,30 @@ impl FileChangeContent {
             line(' ', value);
         }
         output
+    }
+}
+
+#[cfg(test)]
+mod provider_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn optional_transport_details_preserve_old_errors_and_new_attempts() {
+        let old: ConversationError = serde_json::from_value(
+            serde_json::json!({"code":"provider_transport_failed","message":"Failed"}),
+        )
+        .unwrap();
+        assert!(old.diagnostics.is_none());
+        let attempt: ProviderAttemptProjection = serde_json::from_value(serde_json::json!({
+            "providerRequestId":"request:1", "providerAttemptId":"attempt:1", "attempt":1,
+            "purpose":"agent", "phase":"failed", "runId":"run:1", "updatedAt":"2026-09-16T00:00:00Z",
+            "error":{"code":"provider_transport_failed","message":"Failed", "diagnostics":{
+                "source":"providerTransport","phase":"send","category":"network","retryable":true,
+                "isConnect":true,"causes":[{"message":"Connection reset","osCode":104,"kind":"ConnectionReset"}]
+            }}
+        })).unwrap();
+        assert_eq!(
+            attempt.error.unwrap().diagnostics.unwrap().causes[0].os_code,
+            Some(104)
+        );
     }
 }

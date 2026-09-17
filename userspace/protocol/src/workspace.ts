@@ -61,8 +61,6 @@ export interface WorkspaceSpec {
   sourcePath: string | null;
   /** 解析后的 folders 列表；至少包含 1 个 */
   folders: WorkspaceFolderSpec[];
-  /** DeepCode 命名空间下的工作区级设置（透传 .code-workspace.settings 中以 'deepcode.' 开头的键） */
-  settings: Record<string, unknown>;
   /** 不支持但保留的字段，用于 UI 提示 */
   unsupportedFields: UnsupportedField[];
   /** 工作区打开时间（ISO） */
@@ -126,21 +124,6 @@ export interface SaveWorkspaceFileResult {
   created: boolean;
   /** 本次是否覆盖了已有文件 */
   overwritten: boolean;
-}
-
-/** PATCH /api/workspaces/current/settings 请求体 */
-export interface PatchWorkspaceSettingsRequest {
-  /**
-   * 仅允许 DeepCode 命名空间下的键（前缀 'deepcode.'）；
-   * 后端会拒绝其他键，避免误写入通用 VS Code 配置。
-   */
-  settings: Record<string, unknown>;
-}
-
-/** PATCH /api/workspaces/current/settings 成功响应 data 字段 */
-export interface PatchWorkspaceSettingsResult {
-  /** 合并后的最新 settings */
-  settings: Record<string, unknown>;
 }
 
 // ============================================================================

@@ -1,38 +1,17 @@
 import type {
   ApiResponse,
   BrowsePathResult,
-  BrowserRuntimeStatusResult,
-  CodeGrepInput,
-  CodeGrepResult,
-  CreateTerminalSessionRequest,
-  FileReadResult,
-  FileTreeNode,
   GetUserSettingsResult,
-  GitDiffResult,
-  GitStatusResult,
   HealthStatus,
   InitialLocations,
-  KernelHostInspectionQuery,
-  KernelHostInspectionResult,
   LlmProbeRequest,
   LlmProbeResult,
   LlmProfilesResult,
-  OpenBrowserPreviewRequest,
   OpenWorkspaceResult,
   PatchLlmProfilesRequest,
   PatchUserSettingsResult,
-  PatchWorkspaceSettingsResult,
   SaveWorkspaceFileRequest,
   SaveWorkspaceFileResult,
-  SetBrowserInspectModeRequest,
-  ShellEnvironmentStatus,
-  TerminalCapability,
-  TerminalEventsResult,
-  TerminalInputRequest,
-  TerminalResizeRequest,
-  TerminalSession,
-  TerminalSessionsResult,
-  TerminalWarmupStatus,
   UserSettingValue,
   WorkspaceState,
 } from '@deepcode/protocol';
@@ -145,27 +124,6 @@ function queryString(values: Record<string, string | undefined>): string {
   return encoded ? `?${encoded}` : '';
 }
 
-async function inspectHost<T>(query: KernelHostInspectionQuery): Promise<ApiResponse<T>> {
-  const response = await sendJson<KernelHostInspectionResult>(
-    `${API_BASE}/host/inspect`,
-    'POST',
-    query,
-  );
-  const output = response.data?.output;
-  if (!output) return { ...response, data: undefined };
-  if (output.kind !== query.kind) {
-    return {
-      ok: false,
-      error: 'host_inspection_kind_mismatch',
-      message: activeT('api.hostInspectionKindMismatch', {
-        actual: output.kind,
-        expected: query.kind,
-      }),
-    };
-  }
-  return { ...response, data: output.data as T };
-}
-
 export function getHealth(): Promise<ApiResponse<HealthStatus>> {
   return getJson(`${API_BASE}/health`);
 }
@@ -188,56 +146,12 @@ export function saveWorkspaceFile(
   return sendJson(`${API_BASE}/workspaces/save-file`, 'POST', request);
 }
 
-export function patchWorkspaceSettings(
-  settings: Record<string, unknown>,
-): Promise<ApiResponse<PatchWorkspaceSettingsResult>> {
-  return sendJson(`${API_BASE}/workspaces/current/settings`, 'PATCH', { settings });
-}
-
 export function getInitialLocations(): Promise<ApiResponse<InitialLocations>> {
   return getJson(`${API_BASE}/fs/initial-locations`);
 }
 
 export function browsePath(absolutePath?: string): Promise<ApiResponse<BrowsePathResult>> {
   return getJson(`${API_BASE}/fs/browse${queryString({ path: absolutePath })}`);
-}
-
-export function getFileTree(
-  folderId?: string,
-  relativePath?: string,
-): Promise<ApiResponse<FileTreeNode[]>> {
-  return inspectHost({ kind: 'list', folderId, path: relativePath || '.', depth: 2 });
-}
-
-export function readFile(
-  filePath: string,
-  folderId?: string,
-): Promise<ApiResponse<FileReadResult>> {
-  return inspectHost({ kind: 'read', folderId, path: filePath });
-}
-
-export function codeSearch(request: CodeGrepInput): Promise<ApiResponse<CodeGrepResult>> {
-  return inspectHost({
-    kind: 'grep',
-    query: request.query,
-    path: request.path || '.',
-    include: request.include ?? [],
-    exclude: request.exclude ?? [],
-    strategy: request.strategy ?? 'literal',
-    contextLines: request.contextLines ?? 0,
-    maxResults: request.maxResults ?? 200,
-  });
-}
-
-export function getGitStatus(): Promise<ApiResponse<GitStatusResult>> {
-  return inspectHost({ kind: 'gitStatus' });
-}
-
-export function getGitDiff(
-  path?: string,
-  staged = false,
-): Promise<ApiResponse<GitDiffResult>> {
-  return inspectHost({ kind: 'gitDiff', path, staged });
 }
 
 export function getUserSettings(): Promise<ApiResponse<GetUserSettingsResult>> {
@@ -264,113 +178,4 @@ export function probeLlmProfile(
   request: LlmProbeRequest,
 ): Promise<ApiResponse<LlmProbeResult>> {
   return sendJson(`${API_BASE}/llm/probe`, 'POST', request);
-}
-
-export function getShellEnvironment(): Promise<ApiResponse<ShellEnvironmentStatus>> {
-  return getJson(`${API_BASE}/runtime/shell`);
-}
-
-export function getTerminalCapabilities(): Promise<ApiResponse<TerminalCapability>> {
-  return getJson(`${API_BASE}/terminal/capabilities`);
-}
-
-export function getTerminalWarmupStatus(): Promise<ApiResponse<TerminalWarmupStatus>> {
-  return getJson(`${API_BASE}/terminal/warmup`);
-}
-
-export function warmupTerminalRuntime(): Promise<ApiResponse<TerminalWarmupStatus>> {
-  return sendJson(`${API_BASE}/terminal/warmup`, 'POST', {});
-}
-
-export function listTerminalSessions(): Promise<ApiResponse<TerminalSessionsResult>> {
-  return getJson(`${API_BASE}/terminal/sessions`);
-}
-
-export function createTerminalSession(
-  request: CreateTerminalSessionRequest,
-): Promise<ApiResponse<TerminalSession>> {
-  return sendJson(`${API_BASE}/terminal/sessions`, 'POST', request);
-}
-
-export function sendTerminalInput(
-  sessionId: string,
-  request: TerminalInputRequest,
-): Promise<ApiResponse<TerminalSession>> {
-  return sendJson(
-    `${API_BASE}/terminal/sessions/${encodeURIComponent(sessionId)}/input`,
-    'POST',
-    request,
-  );
-}
-
-export function resizeTerminalSession(
-  sessionId: string,
-  request: TerminalResizeRequest,
-): Promise<ApiResponse<TerminalSession>> {
-  return sendJson(
-    `${API_BASE}/terminal/sessions/${encodeURIComponent(sessionId)}/resize`,
-    'POST',
-    request,
-  );
-}
-
-export function updateTerminalSession(
-  sessionId: string,
-  request: Partial<Pick<TerminalSession, 'name' | 'order'>>,
-): Promise<ApiResponse<TerminalSession>> {
-  return sendJson(
-    `${API_BASE}/terminal/sessions/${encodeURIComponent(sessionId)}`,
-    'PATCH',
-    request,
-  );
-}
-
-export function restartTerminalSession(
-  sessionId: string,
-): Promise<ApiResponse<TerminalSession>> {
-  return sendJson(
-    `${API_BASE}/terminal/sessions/${encodeURIComponent(sessionId)}/restart`,
-    'POST',
-    {},
-  );
-}
-
-export function deleteTerminalSession(
-  sessionId: string,
-): Promise<ApiResponse<TerminalSession>> {
-  return sendJson(
-    `${API_BASE}/terminal/sessions/${encodeURIComponent(sessionId)}`,
-    'DELETE',
-    {},
-  );
-}
-
-export function getTerminalEvents(
-  sessionId?: string,
-  after?: number,
-): Promise<ApiResponse<TerminalEventsResult>> {
-  return getJson(`${API_BASE}/terminal/events${queryString({
-    sessionId,
-    after: after === undefined ? undefined : String(after),
-  })}`);
-}
-
-export function getBrowserRuntimeStatus(): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
-  return getJson(`${API_BASE}/browser/runtime-status`);
-}
-
-export function openBrowserPreview(
-  request: OpenBrowserPreviewRequest,
-): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
-  return sendJson(`${API_BASE}/browser/open`, 'POST', request);
-}
-
-export function reloadBrowserPreview(): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
-  return sendJson(`${API_BASE}/browser/reload`, 'POST', {});
-}
-
-export function setBrowserInspectMode(
-  request: SetBrowserInspectModeRequest,
-): Promise<ApiResponse<BrowserRuntimeStatusResult>> {
-  return sendJson(`${API_BASE}/browser/inspect-mode`, 'POST', request);
 }

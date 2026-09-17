@@ -9,17 +9,16 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/api/host/client", get(host_client))
         .route("/api/health", get(health))
         .route("/api/host/shutdown", post(host_shutdown))
+        .route(
+            "/api/host/native-browser",
+            post(crate::browser_tools::register),
+        )
         .route("/api/workspaces/current", get(workspace_current))
         .route("/api/workspaces/default-path", get(workspace_default_path))
         .route("/api/workspaces/open", post(workspace_open))
         .route("/api/workspaces/save-file", post(workspace_save_file))
-        .route(
-            "/api/workspaces/current/settings",
-            patch(workspace_patch_settings),
-        )
         .route("/api/fs/initial-locations", get(fs_initial_locations))
         .route("/api/fs/browse", get(fs_browse))
-        .route("/api/host/inspect", post(host_inspect))
         .route(
             "/api/user-settings",
             get(user_settings_get).patch(user_settings_patch),
@@ -156,37 +155,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
             "/api/conversation/sessions/:session_id/resources/read",
             post(conversation_resource_read),
         )
-        .route("/api/runtime/shell", get(runtime_shell))
-        .route("/api/terminal/capabilities", get(terminal_capabilities))
         .route(
-            "/api/terminal/warmup",
-            get(terminal_warmup).post(terminal_warmup),
+            "/api/conversation/sessions/:session_id/artifacts/:artifact_id/content",
+            get(conversation_artifact_read),
         )
-        .route(
-            "/api/terminal/sessions",
-            get(terminal_sessions).post(terminal_create_session),
-        )
-        .route(
-            "/api/terminal/sessions/:session_id/input",
-            post(terminal_input),
-        )
-        .route(
-            "/api/terminal/sessions/:session_id/resize",
-            post(terminal_resize),
-        )
-        .route(
-            "/api/terminal/sessions/:session_id/restart",
-            post(terminal_restart),
-        )
-        .route(
-            "/api/terminal/sessions/:session_id",
-            patch(terminal_update).delete(terminal_delete),
-        )
-        .route("/api/terminal/events", get(terminal_events))
-        .route("/api/browser/runtime-status", get(browser_status))
-        .route("/api/browser/open", post(browser_open))
-        .route("/api/browser/reload", post(browser_reload))
-        .route("/api/browser/inspect-mode", post(browser_inspect_mode))
         .route("/api/*path", any(api_route_not_found))
         .with_state(state)
         .layer(localhost_cors_layer())

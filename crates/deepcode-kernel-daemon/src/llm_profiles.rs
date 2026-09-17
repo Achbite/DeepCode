@@ -444,19 +444,21 @@ mod tests {
         let root = ConfigRoot::new();
         {
             let mut gui = crate::GuiState::open_at(&root.0).unwrap();
-            gui.conversation_catalog.sessions.push(
-                crate::conversation_catalog::ConversationSessionRecord {
-                    id: "session:existing".into(),
-                    title: "Existing conversation".into(),
-                    workspace_bindings: vec![],
-                    project_id: None,
-                    profile_id: None,
-                    created_at: "2026-09-14T00:00:00Z".into(),
-                    updated_at: "2026-09-14T00:00:00Z".into(),
-                },
-            );
             gui.conversation_catalog
-                .persist(&gui.paths.catalog_store_path)
+                .write_rows(
+                    &gui.paths.catalog_store_path,
+                    vec![],
+                    None,
+                    Some(crate::conversation_catalog::ConversationSessionRecord {
+                        id: "session:existing".into(),
+                        title: "Existing conversation".into(),
+                        workspace_bindings: vec![],
+                        project_id: None,
+                        profile_id: None,
+                        created_at: "2026-09-14T00:00:00Z".into(),
+                        updated_at: "2026-09-14T00:00:00Z".into(),
+                    }),
+                )
                 .unwrap();
         }
         let mut config: Value = serde_json::from_str(DEFAULT_PROFILES).unwrap();

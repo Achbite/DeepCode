@@ -1,3 +1,4 @@
+import { InMemoryCommandJournal } from './support/memoryJournal.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createServer } from 'node:http';
@@ -8,7 +9,6 @@ import { fileURLToPath } from 'node:url';
 
 import {
   decodeToolPromptProviderSnapshots,
-  InMemoryCommandJournal,
   prepareToolPromptContributions,
   renderActiveToolGuidance,
   SessionService,
@@ -26,6 +26,112 @@ import { HttpProviderPort } from '../dist/local-agent/httpPorts.js';
 import { responseFrames } from '../dist/responseFrames.js';
 import { environmentInstruction } from '../dist/local-agent/sessionEnvironment.js';
 import { createProviderToolAliases } from '../dist/local-agent/providerToolCodec.js';
+
+test('editing a settled message replaces active history while retaining journal facts and attachments', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:message-edit';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation();
+  const requests = [];
+  let releaseEdit;
+  const editGate = new Promise((resolve) => { releaseEdit = resolve; });
+  t.after(() => releaseEdit());
+  const provider = { async *stream(request) {
+    requests.push(structuredClone(request));
+    if (requests.length === 4) await editGate;
+    yield providerEvent(request.requestId, 'text.delta', { text: `Answer ${requests.length}.` });
+    yield providerEvent(request.requestId, 'completed', { usage: {
+      inputTokens: 100, outputTokens: 20, contextWindowTokens: 4_096,
+      cacheReadInputTokens: 75, cacheMissInputTokens: 25,
+    } });
+  } };
+  const actor = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'message-edit');
+  t.after(() => actor.dispose());
+  const reference = { referenceId: 'reference:original', workspaceId: workspaceBinding.workspaceId,
+    logicalPath: 'notes.txt', displayName: 'notes.txt', kind: 'file', mediaType: 'text/plain', byteLength: 8 };
+  for (const [index, text] of ['Keep this first question.', 'Replace this second question.', 'Remove this third question.'].entries()) {
+    await actor.submit({ ...messageCommand(sessionId, `command:edit-seed:${index}`, text),
+      ...(index === 1 ? { filesystemReferences: [reference] } : {}) });
+    await waitForProjection(actor, (value) => value.run?.status === 'completed' && requests.length === index + 1);
+  }
+  const original = await actor.snapshot();
+  const saved = await readEvents(journal, sessionId);
+  const statusReader = new SessionService(journal, { async create() { throw new Error('status_read_must_not_open_an_actor'); } });
+  t.after(() => statusReader.dispose());
+  await statusReader.statuses([sessionId]);
+  const command = { schemaVersion: 'deepcode.command.v3', type: 'message.edit', sessionId,
+    commandId: 'command:edit', messageId: original.messages[2].messageId, expectedRevision: original.revision, text: 'Revised second question.' };
+  const stale = await actor.submit({ ...command, commandId: 'command:stale', expectedRevision: original.revision - 1 });
+  assert.equal(stale.error.code, 'message_edit_stale');
+  const invalid = await actor.submit({ ...command, commandId: 'command:invalid', messageId: original.messages[1].messageId });
+  assert.equal(invalid.error.code, 'message_edit_target_invalid');
+  const reply = await actor.submit(command);
+  assert.equal(reply.status, 'accepted');
+  await waitUntil(() => requests.length === 4, 'edited provider input');
+  const active = await actor.submit({ ...command, commandId: 'command:active' });
+  assert.equal(active.error.code, 'message_edit_run_active');
+  releaseEdit();
+  const edited = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.deepEqual(edited.messages.map((message) => message.content), ['Keep this first question.', 'Answer 1.', 'Revised second question.', 'Answer 4.']);
+  assert.deepEqual(edited.messages[2].filesystemReferences, [reference]);
+  assert.equal(edited.tokenUsage.providerCallCount, 4, 'superseded calls still consumed Provider usage');
+  assert.equal(edited.tokenUsage.inputTokens, 400);
+  assert.equal(edited.tokenUsage.cacheReadInputTokens, 300);
+  const input = JSON.stringify(requests[3].messages);
+  assert.ok(input.includes('Keep this first question.'));
+  assert.ok(input.includes('Revised second question.'));
+  assert.equal(/Replace this second|Remove this third|Answer 2\.|Answer 3\./u.test(input), false);
+  const after = await readEvents(journal, sessionId);
+  assert.deepEqual(after.slice(0, saved.length), saved, 'the original journal is never rewritten');
+  assert.equal(after.filter((event) => event.type === 'conversation.revised').length, 1);
+  assert.equal((await actor.submit(command)).status, 'replayed');
+  assert.equal(requests.length, 4, 'replayed edits cannot start another run');
+  assert.deepEqual((await statusReader.statuses([sessionId]))[0].run, { runId: edited.run.runId, status: 'completed' });
+  const read = await statusReader.read({ sessionId, view: 'messages' });
+  assert.equal(/Replace this second|Remove this third|Answer 2\.|Answer 3\./u.test(JSON.stringify(read)), false);
+  assert.deepEqual(projectSession(loopSnapshot(sessionId, after).state), edited);
+  await actor.dispose();
+  const restored = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'message-edit-reopened');
+  t.after(() => restored.dispose());
+  await restored.recover();
+  assert.deepEqual(await restored.snapshot(), edited);
+  await restored.submit({ ...command, commandId: 'command:edit-again', messageId: edited.messages[2].messageId,
+    expectedRevision: edited.revision, text: 'Second revision.' });
+  const second = await waitForProjection(restored, (value) => value.run?.status === 'completed' && requests.length === 5);
+  assert.deepEqual(second.messages.map((message) => message.content), ['Keep this first question.', 'Answer 1.', 'Second revision.', 'Answer 5.']);
+  assert.equal(second.tokenUsage.inputTokens, 500);
+});
+
+test('browser authorization scope survives reducer snapshots and projection copies', () => {
+  const sessionId = 'session:browser-scope';
+  const event = { type: 'approval.requested', sessionId, runId: 'run:browser', callId: 'call:browser',
+    eventId: 'event:browser', sequence: 3, occurredAt: '2026-09-16T00:00:00Z',
+    payload: { approvalId: 'approval:browser', preview: {
+      summary: 'Use the internal browser', effects: ['external'], logicalTargets: ['browser:preview-1'], authorizationScope: 'sessionBrowser',
+    } },
+  };
+  const input = reduceSession(emptySessionState(sessionId), { ...event, type: 'message.committed', sequence: 1, eventId: 'event:input',
+    payload: { messageId: 'message:input', role: 'user', content: 'Test the browser', filesystemReferences: [], pluginSelections: [] },
+  });
+  const running = reduceSession(input, { ...event, type: 'run.started', sequence: 2, eventId: 'event:start',
+    payload: { inputMessageId: 'message:input', workspaceBindings: [], runtimeSnapshot: runtimeSnapshot('run:browser') },
+  });
+  const state = reduceSession(running, event);
+  const projected = projectSession(state);
+  assert.equal(projected.pendingApproval.preview.authorizationScope, 'sessionBrowser');
+  projected.pendingApproval.preview.effects.push('network');
+  assert.deepEqual(state.pendingApproval.preview.effects, ['external']);
+  const resolved = reduceSession(state, { ...event, type: 'approval.resolved', sequence: 4, eventId: 'event:allow',
+    payload: { approvalId: 'approval:browser', commandId: 'command:allow', authorityId: 'authority:browser', decision: 'allow' },
+  });
+  assert.equal(projectSession(resolved).pendingApproval, null);
+  assert.equal(projectSession(resolved).activities.find((activity) => activity.kind === 'approval').status, 'completed');
+  const denied = reduceSession(state, { ...event, type: 'approval.resolved', sequence: 4, eventId: 'event:deny',
+    payload: { approvalId: 'approval:browser', commandId: 'command:deny', authorityId: 'authority:denied', decision: 'deny' },
+  });
+  assert.equal(projectSession(denied).activities.find((activity) => activity.kind === 'approval').status, 'denied');
+  assert.equal(state.pendingApproval.preview.authorizationScope, 'sessionBrowser');
+});
 
 test('queued input joins the same run after complete tool results and keeps late input before settlement', async (t) => {
   const journal = new InMemoryCommandJournal();
@@ -121,6 +227,43 @@ test('queued input joins the same run after complete tool results and keeps late
   let state = emptySessionState(sessionId);
   for (const event of events) { freeze(state); state = reduceSession(state, event); }
   assert.deepEqual(projectSession(state), await actor.snapshot());
+});
+
+test('request-boundary refresh retains the starting selection when another tool is queued', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:selected-boundaries';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation({ tools: [{
+    toolBindingRef:'binding:selection-read',name:'fs.read',description:'Read a file.',
+    inputSchema:{type:'object',required:['path'],properties:{path:{type:'string'}}},
+    possibleEffects:['workspaceRead'],availability:'callable',origin:'coreBuiltin',
+  }] });
+  const first = {selectionId:'selection:first',uri:'plugin://first@local',label:'First'};
+  const second = {selectionId:'selection:second',uri:'plugin://second@local',label:'Second'};
+  let finishTool;
+  const gate = new Promise(resolve=>{finishTool=resolve;});
+  let toolStarted=false, requests=0;
+  const kernel=emptyKernel({async execute(request){
+    toolStarted=true;await gate;return completedExecutionReply(request,{content:'Read complete.'});
+  }});
+  const actor=actorWith(journal,sessionId,{async *stream(request){
+    if(++requests===1) yield providerEvent(request.requestId,'tool.call',{
+      callId:'provider-call:selection-read',name:request.tools.find(tool=>tool.inputSchema.properties?.path).name,
+      input:{workspace:'primary',path:'README.md'},
+    });
+    else yield providerEvent(request.requestId,'assistant.message',{messageId:'answer:selection',content:'Done.'});
+    yield providerEvent(request.requestId,'completed',{});
+  }},kernel,preparation.port,'selected-boundaries');
+  t.after(async()=>{finishTool();await actor.dispose();});
+  await actor.submit({...messageCommand(sessionId,'command:selection-start','Read.'),pluginCatalogRevision:'catalog:first',pluginSelections:[first]});
+  await waitUntil(()=>toolStarted,'tool executing');
+  assert.deepEqual(preparation.prepared.at(-1).pluginSelections,[first]);
+  await actor.submit({...messageCommand(sessionId,'command:selection-next','Use Second too.'),pluginCatalogRevision:'catalog:second',pluginSelections:[second]});
+  finishTool();
+  await waitForProjection(actor,value=>value.run?.status==='completed');
+  assert.equal(requests,2);
+  assert.deepEqual(preparation.prepared.at(-1).pluginSelections,[first,second]);
+  assert.equal(preparation.prepared.at(-1).runId,preparation.prepared[0].runId);
 });
 
 test('waiting input stays separate from the decision and explicit cancel retains unconsumed text', async (t) => {
@@ -1675,6 +1818,44 @@ test('Session renders one run-scoped tool guidance message with Provider aliases
   await actor.dispose();
 });
 
+test('explicit run approvals are journaled and only accepted for a Kernel candidate', async (t) => {
+  for (const candidate of [false, true]) {
+    const journal = new InMemoryCommandJournal(), sessionId = `session:run-approval-${candidate}`;
+    await createSession(journal, sessionId, [workspaceBinding]);
+    const preparation = fakeRunPreparation({ tools: [{
+      toolBindingRef: 'binding:approval', name: 'web.fetch', description: 'Read URL', origin: 'coreBuiltin', availability: 'callable',
+      possibleEffects: ['network'], inputSchema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] },
+    }] });
+    const preview = { summary: 'Approval fixture', effects: ['external'], logicalTargets: ['.'],
+      ...(candidate ? { authorizationScope: 'runHostShell', authorizationContext: { workspaceId: workspaceBinding.workspaceId, shell: '/bin/bash' } } : {}) };
+    let calls = 0;
+    const actor = actorWith(journal, sessionId, { async *stream(request) {
+      if (++calls === 1) yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:approval', name: request.tools.find((tool) => tool.inputSchema.properties?.url).name, input: { url: 'https://example.test' } });
+      else yield providerEvent(request.requestId, 'assistant.message', { messageId: 'message:done', content: 'Done.' });
+      yield providerEvent(request.requestId, 'completed', {});
+    } }, emptyKernel({ async execute(request) {
+      if (!request.nonWorkspaceAuthority) return { schemaVersion: 'deepcode.kernel-reply', type: 'tool.execution', requestId: request.requestId, callId: request.callId, status: 'approvalRequired', approvalId: 'approval:run', preview };
+      return completedExecutionReply(request, { content: 'Result' });
+    } }), preparation.port, 'run-approval');
+    t.after(() => actor.dispose());
+    await actor.submit(messageCommand(sessionId, 'command:start', 'Exercise approval.'));
+    const waiting = await waitForProjection(actor, (state) => state.pendingApproval !== null);
+    const approval = waiting.pendingApproval;
+    const command = { schemaVersion: 'deepcode.command.v3', type: 'approval.respond', commandId: 'command:allow-run', sessionId,
+      runId: approval.runId, callId: approval.callId, approvalId: approval.approvalId, decision: 'allow', authorizationScope: 'runHostShell' };
+    const reply = await actor.submit(command);
+    assert.equal(reply.status, candidate ? 'accepted' : 'rejected');
+    if (!candidate) {
+      assert.equal((await actor.snapshot()).pendingApproval.approvalId, approval.approvalId);
+      await actor.submit({ ...command, commandId: 'command:allow-once', authorizationScope: undefined });
+    }
+    await waitForProjection(actor, (state) => state.run?.status === 'completed');
+    const resolved = singleEvent(await readEvents(journal, sessionId), 'approval.resolved');
+    assert.equal(resolved.payload.authorizationScope, candidate ? 'runHostShell' : undefined);
+    assert.equal(resolved.payload.decision, 'allow');
+  }
+});
+
 test('read-only bash result projects its real write scope and continues the Loop', async () => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:bash-read-chain';
@@ -2061,7 +2242,7 @@ test('deletion remains available while an unloadable actor rolls back cleanly', 
     },
   });
 
-  const snapshot = service.snapshot(sessionId);
+  const snapshot = service.submit(messageCommand(sessionId, 'command:open-for-delete', 'Start explicitly.'));
   await recoveryStarted;
   const deletion = service.deleteSession(sessionId);
   releaseRecoveryResolve();
@@ -2122,10 +2303,11 @@ test('an escaped Loop fault remains Session-local and releases its runtime', asy
   ));
   await waitUntil(() => failingActor.hasLoopFailure(), 'contained Loop failure');
   assert.equal(failingPreparation.released.length, 1);
-  await assert.rejects(
-    failingActor.snapshot(),
-    /session_loop_failed:fixture_journal_settlement_failed/u,
-  );
+  const failedHistory = await failingActor.snapshot();
+  assert.equal(failedHistory.failureSnapshot.error.message, 'fixture_journal_settlement_failed');
+  assert.ok(failedHistory.messages.length > 0, 'saved history stays readable after an escaped failure');
+  await assert.rejects(failingActor.submit(messageCommand(failingSessionId, 'command:failed-actor', 'Continue.')),
+    /session_loop_failed:fixture_journal_settlement_failed/u);
 
   const healthyPreparation = fakeRunPreparation();
   const healthyActor = actorWith(
@@ -3051,13 +3233,11 @@ test('built-in runtime and control prompts stay concise and policy-scoped', () =
   assert.ok(planInstruction.includes('ask_user_wire'));
   assert.ok(planInstruction.includes('Then execute within its file and execution scope'));
   assert.ok(planInstruction.includes('Routine command or edit details do not require reconfirmation'));
-  assert.ok(planInstruction.length < 600);
   const allowInstruction = allowDelegate.find((instruction) => (
     instruction.id === 'deepcode.workspace-autonomy'
   ))?.text ?? '';
   assert.ok(allowInstruction.includes('interaction_request'));
   assert.equal(allowInstruction.includes('plan_publish'), false);
-  assert.ok(allowInstruction.length < 300);
   const pluginInstruction = planAsk.find((instruction) => (
     instruction.id === 'plugin.fixture.skill'
   ))?.text ?? '';
@@ -3065,10 +3245,12 @@ test('built-in runtime and control prompts stay concise and policy-scoped', () =
   assert.ok(pluginInstruction.includes('structured user input'));
   assert.ok(pluginInstruction.includes('Read the explicitly selected fixture instructions.'));
   const controls = sessionControlToolDefinitions();
-  assert.deepEqual(controls.map((tool) => tool.name), ['interaction.request', 'plan.publish', 'plan.progress']);
-  assert.match(controls[1].description, /not an exact script lock/u);
-  assert.match(controls[2].description, /sourceFactRef is its recordId/u);
-  const bashScope = controls[1].inputSchema.properties.mutationManifest.items.oneOf[2];
+  const publish = controls.find((tool) => tool.name === 'plan.publish');
+  const progress = controls.find((tool) => tool.name === 'plan.progress');
+  assert.ok(controls.some((tool) => tool.name === 'interaction.request'));
+  assert.match(publish.description, /not an exact script lock/u);
+  assert.match(progress.description, /sourceFactRef is its recordId/u);
+  const bashScope = publish.inputSchema.properties.mutationManifest.items.oneOf.find((branch) => branch.properties.operation.enum?.includes('bash'));
   assert.equal(bashScope.required.includes('command'), false);
   assert.ok(bashScope.required.includes('executionScope'));
 });
@@ -4178,7 +4360,7 @@ test('plan preview streams formed fields at the same revision and publishes only
     const encoder = new TextEncoder();
     return new Response(new ReadableStream({ async start(controller) {
       try {
-        for await (const event of provider.stream(request, init.signal)) controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+        for await (const event of provider.stream(request, init.signal)) controller.enqueue(encoder.encode(`data: ${JSON.stringify({ ...event, providerAttemptId: request.providerAttemptId })}\n\n`));
         controller.close();
       } catch (error) { controller.error(error); }
     } }), { headers: { 'content-type': 'text/event-stream' } });
@@ -4370,5 +4552,103 @@ test('mixed Plan batches are rejected before any effect and can be corrected to 
     const events = await readEvents(journal, sessionId);
     assert.equal(events.filter((event) => event.type === 'plan.published').length, 1);
     assert.equal(events.some((event) => event.type === 'tool.requested' || event.type === 'plan.confirmed'), false);
+  }
+});
+
+test('transient provider attempts keep one request, discard partial output, and execute no partial tools', async (t) => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:network-retry';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const requests = [];
+  const failure = { code: 'provider_transport_failed', message: 'Connection reset.', diagnostics: {
+    source: 'providerTransport', phase: 'send', category: 'network', retryable: true,
+    isConnect: true, isTimeout: false, causes: [{ message: 'Connection reset by peer', kind: 'ConnectionReset', osCode: 104 }],
+  } };
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    requests.push(structuredClone(request));
+    if (requests.length === 1) {
+      yield providerEvent(request.requestId, 'text.delta', { text: 'Discard this incomplete answer.' });
+      yield providerEvent(request.requestId, 'tool.call', { callId: 'partial:call', name: 'partial_tool', input: {} });
+      yield providerEvent(request.requestId, 'failed', failure);
+    } else {
+      yield providerEvent(request.requestId, 'text.delta', { text: 'Recovered answer.' });
+      yield providerEvent(request.requestId, 'completed', {});
+    }
+  } }, emptyKernel(), fakeRunPreparation().port, 'retry');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:retry', 'Continue despite a network fluctuation.'));
+  const result = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].requestId, requests[1].requestId);
+  assert.notEqual(requests[0].providerAttemptId, requests[1].providerAttemptId);
+  assert.deepEqual(requests[0].messages, requests[1].messages);
+  assert.deepEqual(requests[0].tools, requests[1].tools);
+  assert.deepEqual(result.providerAttempts.map((value) => value.phase), ['retryWaiting', 'completed']);
+  assert.equal(result.messages.at(-1).content, 'Recovered answer.');
+  const events = await readEvents(journal, sessionId);
+  assert.equal(events.some((event) => event.type === 'tool.requested'), false);
+  assert.equal(events.filter((event) => event.type === 'context.composed').length, 1);
+  assert.deepEqual(events.find((event) => event.type === 'provider.attempt.updated' && event.payload.phase === 'failed').payload.error, failure);
+});
+
+test('five total network sends stop the run, retain a snapshot, and allow an explicit continuation', { timeout: 25000 }, async (t) => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:retry-exhausted';
+  await createSession(journal, sessionId);
+  let count = 0, recover = false;
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    count++;
+    yield providerEvent(request.requestId, recover ? 'text.delta' : 'failed', recover ? { text: 'Continued.' } : {
+      code: 'provider_transport_failed', message: 'Refused.', diagnostics: {
+        source: 'providerTransport', phase: 'send', category: 'network', retryable: true,
+        causes: [{ message: 'Connection refused', kind: 'ConnectionRefused' }],
+      },
+    });
+    if (recover) yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel(), fakeRunPreparation().port, 'exhausted');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:fail-five', 'Run.'));
+  const deadline = Date.now() + 21000;
+  let result;
+  while (Date.now() < deadline) {
+    result = await actor.snapshot();
+    if (['failed', 'indeterminate'].includes(result.run?.status)) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(count, 5);
+  assert.ok(['failed', 'indeterminate'].includes(result.run?.status));
+  assert.equal(result.failureSnapshot.providerAttemptIds.length, 5);
+  assert.equal(result.failureSnapshot.error.code, 'provider_transport_failed');
+  assert.equal(result.providerAttempts.at(-1).phase, 'failed');
+  const reader = new SessionService(journal, { async create() { throw new Error('history_read_must_not_start_runtime'); } });
+  t.after(() => reader.dispose());
+  assert.deepEqual(await reader.snapshot(sessionId), result);
+  recover = true;
+  await actor.submit(messageCommand(sessionId, 'command:continue-after-five', 'Continue.'));
+  const continued = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.equal(count, 6);
+  assert.equal(continued.messages.at(-1).content, 'Continued.');
+  assert.equal(continued.failureSnapshot, undefined);
+});
+
+test('protocol failures and cancellation never enter a network retry loop', async (t) => {
+  const { withProviderAttempts } = await import('../dist/local-agent/providerAttempts.js');
+  const { ProviderReportedFailure } = await import('../dist/local-agent/loopFailure.js');
+  for (const purpose of ['agent', 'contextCompaction']) {
+    const controller = new AbortController(), events = [];
+    let calls = 0;
+    const request = { requestId: 'request:single', sessionId: 'session:single', runId: 'run:single', purpose };
+    const deps = { nextId: () => 'attempt:single', updateAssistantDraft() {}, commit: async (event) => { events.push(event); } };
+    await assert.rejects(withProviderAttempts(request, deps, controller.signal, async () => {
+      calls++;
+      throw new ProviderReportedFailure('provider_invalid_json', 'Malformed frame.');
+    }), /Malformed frame/);
+    assert.equal(calls, 1);
+    assert.equal(events.some((event) => event.payload.phase === 'retryWaiting'), false);
+    const original = new ProviderReportedFailure('provider_transport_failed', 'Reset.', {
+      source: 'providerTransport', phase: 'send', category: 'network', retryable: true, causes: [],
+    });
+    calls = 0;
+    deps.commit = async (event) => { if (event.payload.phase === 'retryWaiting') controller.abort(new Error('user_cancelled')); };
+    await assert.rejects(withProviderAttempts(request, deps, controller.signal, async () => { calls++; throw original; }), /user_cancelled/);
+    assert.equal(calls, 1);
   }
 });

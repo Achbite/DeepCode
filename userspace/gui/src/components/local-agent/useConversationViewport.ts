@@ -38,6 +38,7 @@ export function useConversationViewport({
   const observedScrollTopRef = useRef(0);
   const scrollFrameRef = useRef<number | null>(null);
   const viewportRestoreFrameRef = useRef<number | null>(null);
+  const touchYRef = useRef<number | null>(null);
   const capturePosition = useCallback((): Pick<SessionViewport, 'scrollTop' | 'anchor'> => {
     const body = bodyRef.current;
     if (!body) return { scrollTop: observedScrollTopRef.current };
@@ -49,7 +50,8 @@ export function useConversationViewport({
   const writeScrollTop = useCallback((top: number) => {
     const body = bodyRef.current;
     if (!body) return;
-    if (Math.abs(body.scrollTop - top) > 0.5) body.scrollTop = top;
+    const target = Math.max(0, Math.min(top, body.scrollHeight - body.clientHeight));
+    if (Math.abs(body.scrollTop - target) > 0.5) body.scrollTop = target;
     observedScrollTopRef.current = body.scrollTop;
   }, []);
   const restorePosition = useCallback((saved: SessionViewport) => {
@@ -80,12 +82,14 @@ export function useConversationViewport({
     }
   }, [applyLatestFollowMode, capturePosition]);
 
-  // Native scrolling can arrive before its scroll callback. Consume that movement
-  // before any layout correction; wheel, keyboard and inertia share this path.
+  // Only a reader action can leave follow mode. Layout can clamp scrollTop more
+  // than once before an observer runs (composer replacement, then text growth).
+  // Once detached, consume native movement before restoring the reading anchor,
+  // including keyboard/inertial movement whose scroll callback has not arrived.
   const sampleReaderPosition = useCallback(() => {
     const body = bodyRef.current;
     const activeSessionId = activeViewRef.current;
-    if (!body || !activeSessionId || pendingViewportRestoreRef.current !== null) return false;
+    if (!body || !activeSessionId || followingLatestRef.current || pendingViewportRestoreRef.current !== null) return false;
     const floor = Math.max(0, body.scrollHeight - body.clientHeight);
     const expectedTop = Math.min(observedScrollTopRef.current, floor);
     if (Math.abs(body.scrollTop - expectedTop) <= 0.5) {
@@ -224,10 +228,47 @@ export function useConversationViewport({
     });
   }, [applyLatestFollowMode, capturePosition, writeScrollTop]);
 
+  const beginReading = (target: EventTarget | null) => {
+    const body = bodyRef.current;
+    if (!body || !followingLatestRef.current || body.scrollTop <= 0 || pendingViewportRestoreRef.current !== null) return;
+    // Code blocks and expanded documents may consume this gesture themselves.
+    for (let node = target as HTMLElement | null; node && node !== body; node = node.parentElement) {
+      if (node.scrollHeight <= node.clientHeight) continue;
+      const style = window.getComputedStyle(node);
+      if (!['auto', 'scroll'].includes(style.overflowY)) continue;
+      if (node.scrollTop > 0 || ['contain', 'none'].includes(style.overscrollBehaviorY)) return;
+    }
+    setLatestFollowMode(false);
+  };
+
   const bodyHandlers: React.HTMLAttributes<HTMLDivElement> = {
+    tabIndex: 0,
+    onWheel: (event) => {
+      if (!event.defaultPrevented && !event.ctrlKey && event.deltaY < 0) beginReading(event.target);
+    },
+    onTouchStart: (event) => { touchYRef.current = event.touches.length === 1 ? event.touches[0].clientY : null; },
+    onTouchMove: (event) => {
+      const y = event.touches.length === 1 ? event.touches[0].clientY : null;
+      if (!event.defaultPrevented && y !== null && touchYRef.current !== null && y > touchYRef.current) beginReading(event.target);
+      touchYRef.current = y;
+    },
+    onTouchEnd: () => { touchYRef.current = null; },
+    onTouchCancel: () => { touchYRef.current = null; },
+    onKeyDown: (event) => {
+      if (event.defaultPrevented || (event.target as HTMLElement).closest('input, textarea, select, [contenteditable="true"]')) return;
+      if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)
+        || (event.key === ' ' && event.shiftKey && event.target === event.currentTarget)) beginReading(event.target);
+    },
+    onPointerDown: (event) => {
+      const body = event.currentTarget;
+      if (event.target !== body || event.button !== 0) return;
+      const rect = body.getBoundingClientRect();
+      if (body.offsetWidth > body.clientWidth && event.clientX >= rect.left + body.clientWidth) beginReading(body);
+    },
     onScroll: (event) => {
       if (event.target !== event.currentTarget || (loading && projection === null)) return;
-      sampleReaderPosition();
+      if (followingLatestRef.current) scheduleScrollToLatest();
+      else sampleReaderPosition();
     },
   };
 

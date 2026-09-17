@@ -16,11 +16,34 @@ impl SessionReadPort for SessionServiceProcess {
 
 pub(crate) struct ProductTools {
     reader: Arc<dyn SessionReadPort>,
+    pub(crate) document_python: Option<std::path::PathBuf>,
+    pub(crate) browser_binding: Option<Value>,
 }
 
 impl ProductTools {
     pub(crate) fn new(reader: Arc<dyn SessionReadPort>) -> Self {
-        Self { reader }
+        Self {
+            reader,
+            document_python: None,
+            browser_binding: None,
+        }
+    }
+
+    pub(crate) fn with_browser_binding(mut self, binding: Option<Value>) -> Self {
+        self.browser_binding = binding;
+        self
+    }
+
+    pub(crate) fn with_document_python(mut self, path: Option<&str>) -> Self {
+        self.document_python = path
+            .filter(|path| !path.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("DEEPCODE_DOCUMENT_PYTHON")
+                    .filter(|path| !path.is_empty())
+                    .map(std::path::PathBuf::from)
+            });
+        self
     }
 
     pub(crate) fn call(&self, name: &str, input: Value) -> Result<Value, SessionServiceError> {
@@ -54,9 +77,9 @@ impl ProductTools {
                     "path":{"type":"string","description":"SKILL.md or a reference path linked by that Skill."}
                 }
             })),
-            ("doc.read", "Read bundled DeepCode product documentation in English Markdown. Docs explain product behavior, configuration and known limitations; Skills describe task workflows. Available documents: operations.md, execution-environments.md.".into(), json!({
+            ("doc.read", "Read bundled DeepCode product documentation in English Markdown. Docs explain product behavior, configuration and known limitations; Skills describe task workflows. Available documents: operations.md, execution-environments.md, ui-plugins.md.".into(), json!({
                 "type":"object", "additionalProperties":false, "required":["name"],
-                "properties":{"name":{"type":"string","enum":["operations.md","execution-environments.md"]}}
+                "properties":{"name":{"type":"string","enum":["operations.md","execution-environments.md","ui-plugins.md"]}}
             })),
         ]
     }
@@ -100,9 +123,35 @@ const SKILLS: &[ProductSkill] = &[
             ),
         ],
     },
+    ProductSkill {
+        id: "deepcode-documents",
+        entry: include_str!("../../../skills/deepcode-documents/SKILL.md"),
+        references: &[
+            (
+                "references/design.md",
+                include_str!("../../../skills/deepcode-documents/references/design.md"),
+            ),
+            (
+                "references/formats.md",
+                include_str!("../../../skills/deepcode-documents/references/formats.md"),
+            ),
+            (
+                "assets/document.html",
+                include_str!("../../../skills/deepcode-documents/assets/document.html"),
+            ),
+            (
+                "THIRD_PARTY_NOTICES.md",
+                include_str!("../../../skills/deepcode-documents/THIRD_PARTY_NOTICES.md"),
+            ),
+        ],
+    },
 ];
 
 const DOCS: &[(&str, &str)] = &[
+    (
+        "ui-plugins.md",
+        include_str!("../../../docs/product/ui-plugins.md"),
+    ),
     (
         "operations.md",
         include_str!("../../../docs/product/operations.md"),
@@ -134,8 +183,8 @@ pub(crate) fn bundled_skill_settings() -> Vec<Value> {
         .map(|skill| {
             json!({
                 "id": skill.id,
-                "displayName": skill.id,
-                "description": skill.description(),
+                "displayName": if skill.id == "deepcode-documents" { "文档排版" } else { skill.id },
+                "description": if skill.id == "deepcode-documents" { "排版并导出 HTML、PDF 和 Markdown。" } else { skill.description() },
                 "source": "builtin",
             })
         })
@@ -216,6 +265,27 @@ mod tests {
         assert!(tools
             .call("doc.read", json!({"name":"../../private.md"}))
             .is_err());
-        assert_eq!(bundled_skill_settings().len(), 2);
+        assert_eq!(bundled_skill_settings().len(), 3);
+        assert!(tools
+            .call("doc.read", json!({"name":"ui-plugins.md"}))
+            .unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("apply(context)"));
+        for path in [
+            "SKILL.md",
+            "references/design.md",
+            "references/formats.md",
+            "assets/document.html",
+        ] {
+            let resource = tools
+                .call(
+                    "skill.read",
+                    json!({"name":"deepcode-documents", "path":path}),
+                )
+                .unwrap();
+            assert_eq!(resource["path"], path);
+            assert!(!resource["content"].as_str().unwrap().is_empty());
+        }
     }
 }

@@ -28,10 +28,13 @@ pub(crate) fn run() -> Result<(), String> {
             mut context,
             distribution,
             shell,
+            execution_path,
         } => {
-            if invocation.tool_id != "bash" && !invocation.tool_id.starts_with("fs.") {
+            let tool_id = invocation.input.tool_id().as_str();
+            if tool_id != "bash" && !tool_id.starts_with("fs.") {
                 return Err("WSL worker accepts workspace filesystem and Bash tools only.".into());
             }
+            invocation.input.validate().map_err(|error| error.to_string())?;
             let cancellation = context.cancellation.clone();
             context.progress = KernelProgressSink::new(|progress| {
                 let _ = write_frame(&WorkerFrame::Progress { progress });
@@ -81,14 +84,14 @@ pub(crate) fn run() -> Result<(), String> {
                     &registry,
                     KernelExecutorConfig {
                         shell_program: Some(shell),
+                        execution_path: Some(execution_path),
                         ..KernelExecutorConfig::default()
                     },
                     Arc::new(EmptySecretProvider),
                 ));
-                let tool_id = invocation.tool_id.clone();
                 let linux_archive = context.output_directory.clone();
                 let mut result = executors
-                    .invoke(&tool_id, invocation, context)
+                    .invoke(invocation, context)
                     .map_err(|error| KernelErrorEnvelope::from(&error))?;
                 if let (Some(linux), Some(host)) = (linux_archive, host_archive) {
                     map_archive_references(&mut result.output, &linux, &host.to_string_lossy())?;

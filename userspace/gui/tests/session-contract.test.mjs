@@ -1,6 +1,7 @@
+import { InMemoryCommandJournal } from '../../session-core/tests/support/memoryJournal.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { InMemoryCommandJournal, SessionService, loopSnapshot } from '../../session-core/dist/index.js';
+import { SessionService, loopSnapshot } from '../../session-core/dist/index.js';
 import {
   decodeGuiProjection,
   inputCacheMetric,
@@ -26,6 +27,289 @@ import {
   waitForProjection,
   waitUntil,
 } from '../../session-core/tests/local-agent-fixtures.mjs';
+
+test('GUI message editing submits a revision-bound Session command and reconciles its projection', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:gui-message-edit';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    yield providerEvent(request.requestId, 'text.delta', { text: 'Completed answer.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel(), fakeRunPreparation().port, 'gui-message-edit');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:original', 'Original message.'));
+  const initial = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  const commands = [];
+  installGuiFetch(t, async (url, init) => {
+    if (url.pathname.endsWith('/commands')) {
+      const command = JSON.parse(init.body);
+      commands.push(command);
+      return Response.json({ ok: true, data: await actor.submit(command) });
+    }
+    if (url.pathname.endsWith('/projection')) return Response.json({ ok: true, data: await actor.snapshot() });
+    throw new Error(`Unexpected request: ${url.pathname}`);
+  });
+  const store = await loadGuiModelStore(t);
+  store.setState({ sessionId, projection: initial, loading: false });
+  await store.getState().editMessage(initial.messages[0].messageId, 'Edited text.', initial.revision);
+  assert.equal(commands.length, 1);
+  assert.equal(commands[0].type, 'message.edit');
+  assert.equal(commands[0].messageId, initial.messages[0].messageId);
+  assert.equal(commands[0].expectedRevision, initial.revision);
+  assert.equal(commands[0].text, 'Edited text.');
+  assert.deepEqual(store.getState().projection.messages.filter((message) => message.role === 'user').map((message) => message.content), ['Edited text.']);
+  assert.equal(store.getState().submitting, false);
+  await waitForProjection(actor, (value) => value.run?.status === 'completed');
+});
+
+test('permission requests remain distinct transcript records after the tool completes', async (t) => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:permission-history';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation({ tools: [{
+    toolBindingRef: 'binding:permission', name: 'web.fetch', description: 'Fetch', origin: 'coreBuiltin', availability: 'callable',
+    possibleEffects: ['network'], inputSchema: { type: 'object', properties: { url: { type: 'string' } } },
+  }] });
+  let calls = 0;
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    if (++calls === 1) yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:permission',
+      name: request.tools.find((tool) => tool.inputSchema.properties?.url).name, input: { url: 'https://example.test' } });
+    else yield providerEvent(request.requestId, 'text.delta', { text: 'Finished.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel({ async execute(request) {
+    if (!request.nonWorkspaceAuthority) return { schemaVersion: 'deepcode.kernel-reply', type: 'tool.execution',
+      requestId: request.requestId, callId: request.callId, status: 'approvalRequired', approvalId: 'approval:history',
+      preview: { summary: 'Allow access to https://example.test?', effects: ['external'], logicalTargets: ['https://example.test'] } };
+    const reply = completedExecutionReply(request, { content: 'Result' });
+    reply.record.preparedEffect.logicalTargets = [request.input.url];
+    return reply;
+  } }), preparation.port, 'permission-history');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:start', 'Fetch the page.'));
+  const waiting = await waitForProjection(actor, (state) => state.pendingApproval !== null);
+  const { projectionItems } = await loadGuiModule(t, '/src/components/local-agent/conversationItems.ts');
+  const pendingRows = projectionItems(await decodeGuiProjection(waiting));
+  const record = pendingRows.find((row) => row.type === 'approval');
+  assert.equal(record.value.label, 'Allow access to https://example.test?');
+  assert.equal(record.value.status, 'waiting');
+  assert.equal(pendingRows.at(-1).type, 'toolGroup');
+  const { approvalId, callId, runId } = waiting.pendingApproval;
+  await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'approval.respond', commandId: 'command:allow',
+    sessionId, approvalId, callId, runId, decision: 'allow' });
+  const completed = await waitForProjection(actor, (state) => state.run?.status === 'completed');
+  const rows = projectionItems(await decodeGuiProjection(completed));
+  const accepted = rows.find((row) => row.type === 'approval');
+  assert.equal(accepted.value.activityId, record.value.activityId);
+  assert.equal(accepted.value.status, 'completed');
+  assert.equal(completed.pendingApproval, null);
+  assert.equal(rows.filter((row) => row.type === 'approval').length, 1);
+});
+
+test('UI plugin replacement releases styles and effects and retires failed renderers', async (t) => {
+  const { UiPluginRuntime } = await loadGuiModule(t, '/src/ui-plugins/runtime.ts');
+  const styles = new Set();
+  const signals = [];
+  const disposed = [];
+  const renderer = () => ({ update() {}, dispose() {} });
+  const runtime = new UiPluginRuntime(async (code) => {
+    if (code === 'broken') throw new Error('original module syntax failure');
+    return { apply(ctx) {
+      signals.push(ctx.signal);
+      ctx.addStyle(code);
+      ctx.onDispose(() => disposed.push(code));
+      ctx.register('message.markdown', renderer);
+    } };
+  }, (css) => { styles.add(css); return () => styles.delete(css); });
+  t.after(() => runtime.dispose());
+  const file = (source) => ({ path: '/plugins/reader', enabled: true, manifest: { id: 'reader', name: 'Reader', entry: 'index.js', slots: ['message.markdown'] }, source, error: null });
+  await runtime.replace([file('first')]);
+  assert.equal(runtime.getSnapshot()[0].renderers.get('message.markdown'), renderer);
+  const firstGeneration = runtime.getSnapshot()[0].generation;
+  await runtime.replace([file('second')]);
+  assert.deepEqual([...styles], ['second']);
+  assert.deepEqual(disposed, ['first']);
+  assert.equal(signals[0].aborted, true);
+  assert.ok(runtime.getSnapshot()[0].generation > firstGeneration);
+  await runtime.replace([file('broken')]);
+  assert.equal(styles.size, 0);
+  assert.equal(runtime.getSnapshot()[0].status, 'error');
+  assert.match(runtime.getSnapshot()[0].error, /original module syntax failure/);
+  assert.equal(runtime.getSnapshot()[0].renderers.size, 0);
+  await runtime.replace([file('third')]);
+  await runtime.report(runtime.getSnapshot()[0], new Error('view update failed'));
+  assert.equal(styles.size, 0);
+  assert.match(runtime.getSnapshot()[0].error, /view update failed/);
+  await runtime.replace([{ ...file(null), enabled: false }]);
+  assert.equal(runtime.getSnapshot()[0].status, 'disabled');
+});
+
+test('UI module imports finishing late cannot replace a newer generation', async (t) => {
+  const { UiPluginRuntime } = await loadGuiModule(t, '/src/ui-plugins/runtime.ts');
+  const activated = [];
+  let finishOld;
+  const runtime = new UiPluginRuntime((source) => source === 'old' ? new Promise((resolve) => { finishOld = resolve; })
+    : Promise.resolve({ apply() { activated.push(source); } }), () => () => {});
+  t.after(() => runtime.dispose());
+  const file = (source) => ({ path: '/plugins/theme', enabled: true, manifest: { id: 'theme', name: 'Theme', entry: 'index.js', slots: ['theme'] }, source, error: null });
+  const oldLoad = runtime.replace([file('old')]);
+  await waitUntil(() => Boolean(finishOld));
+  const newLoad = runtime.replace([file('new')]);
+  finishOld({ apply() { activated.push('old'); } });
+  await Promise.all([oldLoad, newLoad]);
+  assert.deepEqual(activated, ['new']);
+  assert.equal(runtime.getSnapshot()[0].status, 'active');
+  await runtime.replace([]);
+  assert.deepEqual(runtime.getSnapshot(), []);
+});
+
+test('UI plugin scopes release all resources even if one disposer fails', async (t) => {
+  const { createPluginScope } = await loadGuiModule(t, '/src/ui-plugins/runtime.ts');
+  const calls = [];
+  const scope = createPluginScope((css) => () => calls.push(css), (error) => { throw error; });
+  scope.addStyle('stylesheet');
+  scope.onDispose(() => { throw new Error('dispose failure'); });
+  scope.onDispose(() => calls.push('event listener'));
+  await assert.rejects(scope.dispose(), /dispose failure/);
+  assert.equal(scope.signal.aborted, true);
+  assert.deepEqual(calls, ['event listener', 'stylesheet']);
+  await assert.rejects(scope.dispose(), /dispose failure/);
+});
+
+test('UI replacement waits for asynchronous views and module disposal', async (t) => {
+  const { UiPluginRuntime } = await loadGuiModule(t, '/src/ui-plugins/runtime.ts');
+  const order = []; let releaseView;
+  const runtime = new UiPluginRuntime(async source => ({ apply(ctx) {
+    order.push(`apply:${source}`); ctx.onDispose(async () => { await Promise.resolve(); order.push(`dispose:${source}`); });
+  } }), () => () => {});
+  t.after(() => runtime.dispose());
+  const file = source => ({path:'/plugins/theme',enabled:true,manifest:{id:'theme',name:'Theme',entry:'index.js',slots:['theme']},source,error:null});
+  await runtime.replace([file('first')]);
+  runtime.attachView(runtime.getSnapshot()[0], () => new Promise(resolve => {releaseView = () => {order.push('view:disposed');resolve();};}));
+  const replacement = runtime.replace([file('second')]);
+  await waitUntil(() => Boolean(releaseView));
+  assert.deepEqual(order, ['apply:first']);
+  releaseView(); await replacement;
+  assert.deepEqual(order, ['apply:first','view:disposed','dispose:first','apply:second']);
+});
+
+test('conflicting display slots are explicit and unload when the selection changes', async (t) => {
+  const { UiPluginRuntime } = await loadGuiModule(t, '/src/ui-plugins/runtime.ts');
+  const runtime = new UiPluginRuntime(async () => ({ apply(ctx) { ctx.register('document.html', () => ({ update() {}, dispose() {} })); } }), () => () => {});
+  t.after(() => runtime.dispose());
+  const file = (id) => ({ path: `/plugins/${id}`, enabled: true, manifest: { id, name: id, entry: 'index.js', slots: ['document.html'] }, source: 'module', error: null });
+  await runtime.replace([file('a')]);
+  await runtime.replace([file('a'), file('b')]);
+  assert.ok(runtime.getSnapshot().every((entry) => entry.status === 'error'));
+  await runtime.replace([file('b')]);
+  assert.equal(runtime.getSnapshot()[0].status, 'active');
+});
+
+test('document preview requests preserve workspace identity, full bytes and read failures', async (t) => {
+  const { readConversationDocument } = await loadGuiModule(t, '/src/services/localAgentApi.ts');
+  let failure = false;
+  const body = '<!doctype html><h1>中文报告</h1>';
+  installGuiFetch(t, (url, init) => {
+    assert.equal(url.pathname, '/api/conversation/sessions/session%3Adoc/resources/read');
+    assert.deepEqual(JSON.parse(init.body), { workspaceId: 'workspace:docs', logicalPath: '报告.html', format: 'document' });
+    return failure ? Response.json({ ok: false, error: 'conversation_document_read_failed', message: 'original read error' })
+      : new Response(body, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  });
+  assert.equal(await (await readConversationDocument('session:doc', 'workspace:docs', '报告.html')).text(), body);
+  failure = true;
+  await assert.rejects(readConversationDocument('session:doc', 'workspace:docs', '报告.html'), /original read error/);
+});
+
+test('document links retain Unicode paths and choose the appropriate reader', async (t) => {
+  const { documentFormat, workspaceResourceLink } = await loadGuiModule(t, '/src/components/local-agent/documentResources.ts');
+  assert.equal(documentFormat('Reports/REPORT.PDF'), 'pdf');
+  assert.equal(documentFormat('报告.html'), 'html');
+  assert.equal(documentFormat('notes.markdown'), 'markdown');
+  assert.equal(documentFormat('src/main.rs'), null);
+  assert.deepEqual(workspaceResourceLink('workspace://workspace%3Adoc/reports%2F%E6%8A%A5%E5%91%8A%20a.pdf'), { workspaceId: 'workspace:doc', logicalPath: 'reports/报告 a.pdf' });
+  assert.equal(workspaceResourceLink('https://example.com/report.pdf'), null);
+  assert.equal(workspaceResourceLink('workspace://workspace:doc/%FF'), null);
+});
+
+test('local links preserve locations, workspace roots and unambiguous readable labels', async (t) => {
+  const { parseLocalTarget, bindLocalTarget, readableResourceLinks } = await loadGuiModule(t, '/src/components/local-agent/resourceLinks.ts');
+  const roots = [{ workspaceId: 'workspace:main', root: '/project/测试 项目' }];
+  const root = parseLocalTarget('deepcode-gui://localhost/project/%E6%B5%8B%E8%AF%95%20%E9%A1%B9%E7%9B%AE');
+  assert.equal(bindLocalTarget(root, roots).logicalPath, '.');
+  assert.deepEqual(parseLocalTarget('file:///project/测试%20项目/src/main.rs#L12C3'), { path: '/project/测试 项目/src/main.rs', absolute: true, line: 12, column: 3 });
+  assert.equal(bindLocalTarget(parseLocalTarget('README.md:12'), roots).logicalPath, 'README.md');
+  assert.equal(bindLocalTarget(parseLocalTarget('./src/../README.md'), roots).logicalPath, 'README.md');
+  assert.equal(bindLocalTarget(parseLocalTarget('/project/测试 项目-other/file'), roots), null);
+  assert.equal(bindLocalTarget(parseLocalTarget('file:///c:/Work'), [{ workspaceId: 'windows', root: 'C:\\Work' }]).logicalPath, '.');
+  assert.equal(bindLocalTarget(parseLocalTarget('/usr/local/bin/c++'), roots), null);
+  assert.throws(() => bindLocalTarget(parseLocalTarget('README.md'), [...roots, { workspaceId: 'second', root: '/other' }]), /unambiguous/);
+  for (const href of ['https://example.com/path', '#section', 'file://remote/path', 'javascript:alert(1)']) assert.equal(parseLocalTarget(href), null);
+  const a = (href, text = href) => ({ type: 'element', tagName: 'a', properties: { href }, children: [{ type: 'text', value: text }] });
+  const tree = readableResourceLinks({ type: 'root', children: [a('/one/src/main.rs:12'), a('/two/lib/main.rs'), a('/project/测试 项目', '项目根目录'),
+    { type: 'element', tagName: 'pre', properties: {}, children: [{ type: 'text', value: '/one/src/main.rs' }] }] });
+  assert.equal(tree.children[0].children[0].value, 'src/main.rs:12');
+  assert.equal(tree.children[1].children[0].value, 'lib/main.rs');
+  assert.equal(tree.children[2].children[0].value, '项目根目录');
+  assert.equal(tree.children[0].properties.title, '/one/src/main.rs:12');
+  assert.equal(tree.children[3].children[0].value, '/one/src/main.rs');
+});
+
+test('document Plan scope and completed artifacts pass through Session to the GUI reader', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:document-artifact';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const tool = {
+    toolBindingRef: 'tool-binding:document:g1', name: 'document.render', description: 'Render a document.',
+    inputSchema: { type: 'object', required: ['path', 'format', 'content'], properties: {
+      path: { type: 'string' }, format: { type: 'string', enum: ['pdf'] }, content: { type: 'string' },
+    } }, possibleEffects: ['workspaceMutation'], availability: 'callable', origin: 'coreBuiltin',
+  };
+  const artifact = { artifactId: 'artifact:document', label: '报告.pdf', workspaceId: workspaceBinding.workspaceId, logicalPath: '报告.pdf', contentType:'application/pdf', contentMode:'fixed' };
+  let calls = 0;
+  let documentRecordId;
+  let documentRecord;
+  const provider = { async *stream(request) {
+    if (++calls === 1) {
+      const plan = request.tools.find((entry) => entry.inputSchema.properties?.mutationManifest);
+      yield providerEvent(request.requestId, 'tool.call', { callId: 'provider-call:document-plan', name: plan.name, input: {
+        title: 'Document', summary: 'Publish the requested report.', steps: [{ stepId: 'report', title: 'Report', details: 'Render the report.' }],
+        mutationManifest: [{ workspace: 'primary', operation: 'document.render', target: '报告.pdf' }],
+      } });
+    } else if (calls === 2) {
+      const renderer = request.tools.find((entry) => entry.inputSchema.properties?.format?.enum?.includes('pdf'));
+      yield providerEvent(request.requestId, 'tool.call', { callId: 'provider-call:document-render', name: renderer.name,
+        input: { workspace: 'primary', path: '报告.pdf', format: 'pdf', content: '<h1>Report</h1>' } });
+    } else if (calls === 3) {
+      const current = await actor.snapshot();
+      const progress = request.tools.find((entry) => entry.inputSchema.properties?.sourceFactRef);
+      yield providerEvent(request.requestId, 'tool.call', { callId: 'provider-call:document-progress', name: progress.name,
+        input: { sourceFactRef: documentRecordId, updates: [{ todoId: current.todoList.items[0].todoId, status: 'completed' }] } });
+    } else {
+      yield providerEvent(request.requestId, 'assistant.message', { messageId: 'provider-message:document-done', content: 'Report is ready.' });
+    }
+    yield providerEvent(request.requestId, 'completed', {});
+  } };
+  const kernel = emptyKernel({ async execute(request) {
+    assert.equal(request.toolName, 'document.render');
+    assert.equal(request.input.workspaceId, workspaceBinding.workspaceId);
+    assert.deepEqual(request.planAuthorities[0].coveredOperations, [{ workspaceId: workspaceBinding.workspaceId, operation: 'document.render', target: '报告.pdf' }]);
+    const reply = completedExecutionReply(request, { artifacts: [artifact] });
+    documentRecordId = reply.record.recordId;
+    documentRecord = reply.record;
+    return reply;
+  } });
+  const actor = actorWith(journal, sessionId, provider, kernel, fakeRunPreparation({ tools: [tool] }).port, 'document-artifact');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:document-start', 'Render a report.'));
+  const waiting = await waitForProjection(actor, (value) => value.pendingPlan !== null);
+  assert.equal(waiting.pendingPlan.mutationManifest[0].operation, 'document.render');
+  await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'plan.respond', commandId: 'command:document-confirm', sessionId,
+    runId: waiting.run.runId, planId: waiting.pendingPlan.planId, revision: waiting.pendingPlan.revision, response: { kind: 'confirm' } });
+  const completed = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.deepEqual((await decodeGuiProjection(completed)).artifacts, [{ ...artifact,
+    sessionId, runId:documentRecord.runId, callId:documentRecord.callId,
+    recordId:documentRecord.recordId, createdAt:documentRecord.completedAt,
+  }]);
+  assert.equal(completed.activities.find((activity) => activity.kind === 'tool').status, 'completed');
+});
 
 test('sidebar reordering preserves project ownership and ignores stale drag targets', async (t) => {
   const { moveSidebarItem } = await loadGuiModule(t, '/src/deepcode-gui/layout/sidebarOrder.ts');
@@ -259,7 +543,7 @@ test('scope-only Plan review foregrounds additions and keeps the complete confir
   const { renderToStaticMarkup } = await import('react-dom/server');
   const { PlanCardContent } = await loadGuiModule(t, '/src/components/local-agent/PlanCard.tsx');
   const { planScopeAddition } = await loadGuiModule(t, '/src/components/local-agent/planReview.ts');
-  const { ComposerDecisionPanels } = await loadGuiModule(t, '/src/components/local-agent/ComposerDecisionPanels.tsx');
+  const { ConversationComposer } = await loadGuiModule(t, '/src/components/local-agent/ConversationComposer.tsx');
   const previous = {
     planId: 'plan:scope-review', revision: 1, runId: 'run:scope', callId: 'call:initial', status: 'confirmed',
     title: 'Implement pool', summary: 'Build and verify the pool.',
@@ -286,11 +570,14 @@ test('scope-only Plan review foregrounds additions and keeps the complete confir
   assert.equal(planScopeAddition(previous, { ...current, steps: [{ ...current.steps[0], verification: [] }] }), null);
   assert.equal(planScopeAddition(previous, { ...current, mutationManifest: current.mutationManifest.slice(1) }), null);
   assert.equal(planScopeAddition(previous, { ...current, summary: 'A different objective.' }), null);
-  const decision = renderToStaticMarkup(createElement(ComposerDecisionPanels, { language: 'zh-CN', composer: {
+  const decision = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', uiActionError: null, composer: {
     pendingPlan: current, pendingScopeAddition: addition, textareaRef: { current: null }, draft: '', submitting: false,
+    profiles: [], selectedProfileId: null, pastedTexts: [], failedDrafts: [], pendingFilesystemPaths: [],
+    pluginSelections: [], filteredPlugins: [], textDecision: true,
   } }));
-  assert.ok(decision.includes('确认新增范围'));
+  assert.match(decision, />确认新增范围<\/b>/);
   assert.ok(decision.includes('保留已有进度'));
+  assert.equal((decision.match(/<textarea\b/g) ?? []).length, 1);
 });
 
 test('last-call, per-run, and Session cache rates use their own input token totals', async (t) => {
@@ -430,69 +717,6 @@ test('compaction owns last-call usage and an unreported next call clears it with
   assert.deepEqual(await decodeGuiProjection(completed), completed);
 });
 
-test('reasoning-only streaming projects activity without raw reasoning or per-chunk journal events', async () => {
-  const journal = new InMemoryCommandJournal();
-  const sessionId = 'session:reasoning-draft';
-  await createSession(journal, sessionId, [workspaceBinding]);
-  const preparation = fakeRunPreparation();
-  let continueStream;
-  const streamHeld = new Promise((resolve) => { continueStream = resolve; });
-  let reasoningConsumed;
-  const reasoningWasConsumed = new Promise((resolve) => { reasoningConsumed = resolve; });
-  const provider = {
-    async *stream(request) {
-      yield providerEvent(request.requestId, 'reasoning.delta', {
-        text: 'Inspecting the current workspace state.',
-      });
-      reasoningConsumed();
-      await streamHeld;
-      yield providerEvent(request.requestId, 'assistant.message', {
-        messageId: 'provider-message:reasoning-draft',
-        content: 'The inspection is complete.',
-        reasoningContent: 'Inspecting the current workspace state.',
-      });
-      yield providerEvent(request.requestId, 'completed', {});
-    },
-  };
-  const actor = actorWith(
-    journal,
-    sessionId,
-    provider,
-    emptyKernel(),
-    preparation.port,
-    'reasoning-draft',
-  );
-
-  await actor.submit(messageCommand(
-    sessionId,
-    'command:reasoning-draft',
-    'Inspect the workspace before answering.',
-  ));
-  await reasoningWasConsumed;
-  const running = await waitForProjection(actor, (value) => (
-    value.run?.status === 'running' && value.assistantDraft?.activity?.phase === 'reasoning'
-  ));
-  assert.equal(running.run.status, 'running');
-  assert.deepEqual(running.assistantDraft.blocks, []);
-  assert.equal(running.assistantDraft.reasoningContent, undefined);
-  assert.equal(running.assistantDraft.content, undefined);
-  assert.equal(running.assistantDraft.activity.purpose, 'agent');
-  assert.ok(Date.parse(running.assistantDraft.activity.lastContentAt) >= Date.parse(running.assistantDraft.activity.startedAt));
-  assert.deepEqual(await decodeGuiProjection(running), running);
-  assert.ok(!JSON.stringify(running).includes('Inspecting the current workspace state.'));
-  assert.equal((await readEvents(journal, sessionId)).some((event) => event.type.includes('reasoning')), false);
-
-  continueStream();
-  const completed = await waitForProjection(actor, (value) => value.run?.status === 'completed');
-  assert.equal(completed.assistantDraft, null);
-  const events = await readEvents(journal, sessionId);
-  assert.equal(
-    singleEvent(events, 'provider.turn.settled').payload.reasoningContent,
-    'Inspecting the current workspace state.',
-  );
-
-  await actor.dispose();
-});
 
 test('GUI consumes complete phase plans and Todo beyond the former item count', async (t) => {
   const journal = new InMemoryCommandJournal();
@@ -757,264 +981,9 @@ test('snapshot-scoped wire tool resolves to exact Kernel bindings, durable ToolR
   }]);
 });
 
-test('input rejection is fed back once, valid batch peers execute once, and a corrected call succeeds', async () => {
-  const journal = new InMemoryCommandJournal();
-  const sessionId = 'session:input-rejection';
-  await createSession(journal, sessionId, [workspaceBinding]);
-  const preparation = fakeRunPreparation({ tools: [{
-    toolBindingRef: 'tool-binding:read:g1', name: 'fs.read', description: 'Read source text.',
-    inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' }, maxLines: { type: 'integer', minimum: 1 } }, additionalProperties: false },
-    possibleEffects: ['workspaceRead'], availability: 'callable', origin: 'coreBuiltin',
-  }] });
-  const executed = [];
-  const kernel = emptyKernel({ async execute(request) {
-    executed.push(structuredClone(request));
-    if (request.input.maxLines === 0) {
-      const { recordId, preparedEffect, authority, startedAt, completedAt, outcome, output, ...identity } = completedExecutionReply(request, {}).record;
-      return {
-        schemaVersion: 'deepcode.kernel-reply', type: 'tool.execution', requestId: request.requestId,
-        callId: request.callId, status: 'inputRejected', rejection: { ...identity,
-          rejectedAt: '2026-09-07T00:00:00Z',
-          error: { code: 'tool_input_invalid', message: 'maxLines must be positive', issues: [{ path: '$.maxLines', rule: 'minimum', message: 'Use at least one line.', expected: 1 }] },
-        },
-      };
-    }
-    return completedExecutionReply(request, { content: `${request.input.path} content` });
-  } });
-  let turns = 0;
-  const provider = { async *stream(request) {
-    turns += 1;
-    const wire = request.tools.find((tool) => tool.inputSchema.properties?.path)?.name;
-    if (turns === 1) {
-      for (const [callId, path, maxLines] of [['bad', 'README.md', 0], ['peer', 'overview.md', 10]]) {
-        yield providerEvent(request.requestId, 'tool.call', { callId: `provider-call:${callId}`, name: wire, input: { workspace: 'primary', path, maxLines } });
-      }
-    } else if (turns === 2) {
-      const results = request.messages.filter((message) => message.role === 'tool');
-      const rejection = results.filter((message) => jsonMessagePayload(message)?.status === 'inputRejected');
-      assert.equal(rejection.length, 1);
-      assert.equal(rejection[0].providerCallId, 'provider-call:bad');
-      assert.equal(jsonMessagePayload(rejection[0]).executed, false);
-      assert.equal(jsonMessagePayload(rejection[0]).error.issues[0].path, '$.maxLines');
-      assert.ok(results.some((message) => message.providerCallId === 'provider-call:peer'));
-      yield providerEvent(request.requestId, 'tool.call', { callId: 'provider-call:corrected', name: wire, input: { workspace: 'primary', path: 'README.md', maxLines: 10 } });
-    } else {
-      assert.equal(turns, 3);
-      yield providerEvent(request.requestId, 'assistant.message', { content: 'Read completed after correcting the input.' });
-    }
-    yield providerEvent(request.requestId, 'completed', {});
-  } };
-  const actor = actorWith(journal, sessionId, provider, kernel, preparation.port, 'input-rejection');
-  await actor.submit(messageCommand(sessionId, 'command:rejection', 'Read the files.'));
-  const projection = await waitForProjection(actor, (value) => value.run?.status === 'completed');
-  assert.deepEqual(executed.map((request) => [request.input.path, request.input.maxLines]), [['README.md', 0], ['overview.md', 10], ['README.md', 10]]);
-  const events = await readEvents(journal, sessionId);
-  const rejected = singleEvent(events, 'tool.input-rejected');
-  assert.equal(events.filter((event) => event.type === 'tool.completed').length, 2);
-  assert.equal(events.some((event) => event.type === 'tool.completed' && event.callId === rejected.callId), false);
-  assert.equal(events.some((event) => event.type === 'todo.progressed'), false);
-  assert.equal(projection.activities.find((activity) => activity.callId === rejected.callId).status, 'rejected');
-  assert.deepEqual(await decodeGuiProjection(projection), projection);
-  assert.deepEqual(loopSnapshot(sessionId, events).state.modelSettings, projection.modelSettings);
-  await actor.dispose();
-});
 
-test('completed malformed arguments are durable unexecuted results; valid peers and correction execute once', async () => {
-  const journal = new InMemoryCommandJournal();
-  const sessionId = 'session:native-input-rejection';
-  await createSession(journal, sessionId, [workspaceBinding]);
-  const preparation = fakeRunPreparation({ apiSurface: 'responses', contextWindowTokens: 100_000, tools: [{
-    toolBindingRef: 'binding:read', name: 'fs.read', description: 'Read text.',
-    inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } },
-    possibleEffects: ['workspaceRead'], availability: 'callable', origin: 'coreBuiltin',
-  }] });
-  const executed = [];
-  const kernel = emptyKernel({ async execute(request) {
-    executed.push(structuredClone(request));
-    return completedExecutionReply(request, { content: request.input.path });
-  } });
-  const badArguments = '{"workspace":"primary","path":"unterminated';
-  let turns = 0;
-  const provider = { async *stream(request) {
-    turns += 1;
-    const name = request.tools.find((tool) => tool.inputSchema.properties?.path).name;
-    if (turns === 1) {
-      for (const [outputIndex, callId, args] of [
-        [0, 'bad-json', badArguments],
-        [1, 'bad-shape', '[]'],
-        [2, 'peer', JSON.stringify({ workspace: 'primary', path: 'overview.md' })],
-      ]) {
-        yield providerEvent(request.requestId, 'output.item.completed', {
-          outputIndex, item: { type: 'function_call', call_id: callId, name, arguments: args, status: 'completed' },
-        });
-      }
-      // Rendering this message must not reparse the preceding rejected arguments.
-      yield providerEvent(request.requestId, 'output.item.completed', {
-        outputIndex: 3, item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Reading files.' }] },
-      });
-    } else if (turns === 2) {
-      const replay = request.messages.find((message) => message.providerOutputBlocks).providerOutputBlocks;
-      assert.deepEqual(replay.map((block) => block.kind), ['toolCallRejected', 'toolCallRejected', 'toolCall', 'narrative']);
-      assert.equal(replay[0].item.arguments, badArguments);
-      assert.equal(replay[1].item.arguments, '[]');
-      const results = request.messages.filter((message) => message.role === 'tool');
-      assert.equal(results.length, 3);
-      for (const rejected of replay.slice(0, 2)) {
-        const result = results.find((message) => message.providerCallId === rejected.providerCallId);
-        assert.equal(result.toolCallId, rejected.callId);
-        assert.equal(jsonMessagePayload(result).executed, false);
-        assert.equal(jsonMessagePayload(result).error.code, 'provider_tool_call_arguments_invalid');
-      }
-      yield providerEvent(request.requestId, 'output.item.completed', {
-        outputIndex: 0, item: { type: 'function_call', call_id: 'corrected', name, arguments: JSON.stringify({ workspace: 'primary', path: 'README.md' }), status: 'completed' },
-      });
-    } else {
-      assert.equal(turns, 3);
-      yield providerEvent(request.requestId, 'output.item.completed', {
-        outputIndex: 0, item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Corrected and read.' }] },
-      });
-    }
-    yield providerEvent(request.requestId, 'completed', { usage: { inputTokens: 100, outputTokens: 20, contextWindowTokens: 100_000, cacheReadInputTokens: 70, cacheMissInputTokens: 30 } });
-  } };
-  const actor = actorWith(journal, sessionId, provider, kernel, preparation.port, 'native-correction');
-  await actor.submit(messageCommand(sessionId, 'command:native-correction', 'Read the files.'));
-  const projection = await waitForProjection(actor, (value) => value.run?.status === 'completed');
-  const events = await readEvents(journal, sessionId);
-  assert.deepEqual(executed.map((request) => request.input.path), ['overview.md', 'README.md']);
-  assert.equal(events.filter((event) => event.type === 'tool.requested').length, 2);
-  assert.equal(events.filter((event) => event.type === 'tool.completed').length, 2);
-  assert.equal(events.some((event) => event.type === 'tool.input-rejected'), false, 'Session rejection must not masquerade as a Kernel fact');
-  assert.equal(projection.activities.filter((activity) => activity.status === 'rejected').length, 2);
-  assert.equal(projection.tokenUsage.reportedCallCount, 3);
-  assert.equal(projection.tokenUsage.cacheHitRatio, 0.7);
-  assert.equal(JSON.stringify(projection).includes(badArguments), false);
-  assert.deepEqual(await decodeGuiProjection(projection), projection);
-  await actor.dispose();
-  const reopened = actorWith(journal, sessionId, provider, kernel, preparation.port, 'native-reopened');
-  assert.deepEqual(await reopened.snapshot(), projection);
-  assert.equal(turns, 3);
-  await reopened.dispose();
-});
 
-test('Plan input rejections survive actor reopen and do not suppress the final explanation', async () => {
-  const journal = new InMemoryCommandJournal();
-  const sessionId = 'session:correction-budget';
-  await createSession(journal, sessionId, [workspaceBinding]);
-  const preparation = fakeRunPreparation({ apiSurface: 'responses', contextWindowTokens: 100_000 });
-  let turns = 0;
-  const provider = { async *stream(request) {
-    turns += 1;
-    assert.ok(turns <= 4, 'the final explanation must end this continuation');
-    if (turns === 4) {
-      assert.ok(request.messages.some((message) => jsonMessagePayload(message)?.error?.code === 'provider_tool_call_arguments_invalid'));
-      yield providerEvent(request.requestId, 'output.item.completed', { outputIndex: 0, item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Verification remains unfinished. The rejected call was not executed.' }] } });
-      yield providerEvent(request.requestId, 'completed', {});
-      return;
-    }
-    const name = request.tools.find((tool) => tool.inputSchema.properties?.mutationManifest).name;
-    if (turns === 2) {
-      const result = request.messages.find((message) => message.role === 'tool' && jsonMessagePayload(message)?.accepted === false);
-      assert.ok(result);
-      assert.equal(jsonMessagePayload(result).executed, false);
-    }
-    yield providerEvent(request.requestId, 'output.item.completed', {
-      outputIndex: 0,
-      item: { type: 'function_call', call_id: `native-plan-${turns}`, name, status: 'completed', arguments: turns === 1 ? '{}'
-        : turns === 2 ? JSON.stringify({ title: 'Verify', summary: 'Verify remaining work.', steps: [{ stepId: 'verify', title: 'Verify', details: 'Run the project check.' }], mutationManifest: [] }) : '{' },
-    });
-    yield providerEvent(request.requestId, 'completed', {});
-  } };
-  const actor = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'budget');
-  await actor.submit(messageCommand(sessionId, 'command:budget', 'Plan the verification.'));
-  const waiting = await waitForProjection(actor, (value) => value.run?.status === 'waiting' && value.pendingPlan !== null);
-  const before = await readEvents(journal, sessionId);
-  assert.equal(before.filter((event) => event.type === 'session.control.rejected').length, 1);
-  assert.equal(before.filter((event) => event.type === 'plan.published').length, 1);
-  assert.equal(before.some((event) => event.type === 'interaction.requested'), false);
-  assert.deepEqual(await decodeGuiProjection(waiting), waiting);
-  await actor.dispose();
-  const reopened = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'budget-reopened');
-  assert.equal(turns, 2);
-  await reopened.submit({ schemaVersion: 'deepcode.command.v3', type: 'plan.respond', commandId: 'command:budget-confirm', sessionId,
-    runId: waiting.run.runId, planId: waiting.pendingPlan.planId, revision: waiting.pendingPlan.revision, response: { kind: 'confirm' } });
-  const failed = await waitForProjection(reopened, (value) => value.run?.status === 'failed');
-  assert.equal(failed.terminalError.code, 'plan_incomplete');
-  assert.equal(failed.todoList.items[0].status, 'pending');
-  assert.ok(failed.messages.some((message) => message.role === 'assistant' && message.content === 'Verification remains unfinished. The rejected call was not executed.'));
-  assert.equal(turns, 4);
-  const events = await readEvents(journal, sessionId);
-  assert.equal(events.filter((event) => event.type === 'plan.confirmed').length, 1);
-  assert.equal(events.some((event) => event.type === 'tool.requested'), false);
-  assert.ok(events.filter((event) => event.type === 'provider.turn.settled').every((event) => event.payload.outcome === 'completed'));
-  assert.deepEqual(await decodeGuiProjection(failed), failed);
-  const historical = structuredClone(failed);
-  const historicalBash = {
-    workspaceId: workspaceBinding.workspaceId, operation: 'bash', command: 'make build',
-    workspaceMode: 'write', executionScope: 'workspace',
-  };
-  historical.plans[0].mutationManifest.push(historicalBash);
-  assert.equal(historical.plans[0].status, 'confirmed');
-  assert.deepEqual(await decodeGuiProjection(historical), historical,
-    'displaying a stored Plan must not require newly introduced execution fields');
-  assert.equal(Object.hasOwn(historicalBash, 'writablePaths'), false,
-    'the GUI must not fabricate a write scope for historical operations');
-  for (const writablePaths of [[], [{ path: 'build', kind: 'invalid' }]]) {
-    const malformed = structuredClone(historical);
-    malformed.plans[0].mutationManifest.at(-1).writablePaths = writablePaths;
-    await assert.rejects(decodeGuiProjection(malformed), /conversation_projection_invalid/u);
-  }
-  await reopened.dispose();
-});
 
-test('Session settings persist independently while the active run keeps its frozen effort', async () => {
-  const journal = new InMemoryCommandJournal();
-  const sessionId = 'session:model-settings';
-  await createSession(journal, sessionId);
-  const preparation = fakeRunPreparation({ reasoningEffort: 'high' });
-  let release;
-  const held = new Promise((resolve) => { release = resolve; });
-  let turns = 0;
-  const provider = { async *stream(request) {
-    turns += 1;
-    if (turns === 1) await held;
-    yield providerEvent(request.requestId, 'assistant.message', { content: 'Done.' });
-    yield providerEvent(request.requestId, 'completed', {});
-  } };
-  const actor = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'settings');
-  const settingsCommand = (id, profileId, reasoningEffortOverride) => ({
-    schemaVersion: 'deepcode.command.v3', type: 'session.model-settings.set', sessionId,
-    commandId: id, settings: { profileId, reasoningEffortOverride },
-  });
-  await actor.submit(settingsCommand('command:settings1', 'profile:one', 'max'));
-  assert.equal(preparation.prepared.length, 0);
-  assert.equal(turns, 0);
-  await actor.submit(messageCommand(sessionId, 'command:start1', 'First task.'));
-  const first = await waitForProjection(actor, (value) => value.assistantDraft?.activity?.phase === 'waitingResponse');
-  await actor.submit(settingsCommand('command:settings2', 'profile:one', 'low'));
-  const edited = await actor.snapshot();
-  assert.equal(edited.run.runId, first.run.runId);
-  assert.equal(edited.run.reasoningEffort, 'max');
-  assert.equal(edited.modelSettings.reasoningEffortOverride, 'low');
-  assert.equal(preparation.prepared.length, 1);
-  assert.equal(turns, 1);
-  assert.deepEqual(await decodeGuiProjection(edited), edited);
-  release();
-  await waitForProjection(actor, (value) => value.run?.status === 'completed');
-  await actor.dispose();
-  const reopened = actorWith(journal, sessionId, provider, emptyKernel(), preparation.port, 'settings-reopened');
-  assert.equal((await reopened.snapshot()).modelSettings.reasoningEffortOverride, 'low');
-  await reopened.submit(messageCommand(sessionId, 'command:start2', 'Second task.'));
-  const second = await waitForProjection(reopened, (value) => value.run?.status === 'completed' && value.run.runId !== first.run.runId);
-  assert.equal(second.run.reasoningEffort, 'low');
-  await reopened.submit(settingsCommand('command:switch', 'profile:two', null));
-  assert.equal((await reopened.snapshot()).modelSettings.reasoningEffortOverride, null);
-  await reopened.submit(messageCommand(sessionId, 'command:start3', 'Third task.'));
-  const third = await waitForProjection(reopened, (value) => value.run?.status === 'completed' && value.run.runId !== second.run.runId);
-  assert.equal(third.run.profileId, 'profile:two');
-  assert.equal(third.run.reasoningEffort, 'high');
-  assert.deepEqual(preparation.prepared.map((request) => request.reasoningEffortOverride), ['max', 'low', undefined]);
-  await reopened.dispose();
-});
 
 test('GUI model settings save after acknowledgement, reset effort on model change, and retain the last saved value on failure', async (t) => {
   const journal = new InMemoryCommandJournal();
@@ -1053,7 +1022,7 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
     throw new Error(`unexpected_gui_request:${init.method ?? 'GET'}:${url.pathname}`);
   });
   const store = await loadGuiModelStore(t);
-  store.setState({ profiles });
+  await store.getState().refreshProfiles();
   await store.getState().selectProfile('profile:one');
   await store.getState().selectReasoningEffort('max');
   assert.equal(commands, 0, 'draft preference is saved without creating a Session');
@@ -1065,7 +1034,7 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
   assert.equal(store.getState().selectedProfileId, 'profile:two');
   assert.equal(store.getState().reasoningEffortOverride, null);
   assert.equal((await actor.snapshot()).modelSettings.profileId, 'profile:two');
-  assert.equal(store.getState().defaultProfileId, 'profile:two');
+  assert.equal(store.getState().defaultProfileId, 'profile:one', 'selecting a model does not change the last actually used model');
   failSave = true;
   await store.getState().selectReasoningEffort('high');
   assert.equal(store.getState().reasoningEffortOverride, null);
@@ -1079,13 +1048,13 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
   assert.equal(store.getState().reasoningEffortOverride, null);
   assert.equal((await actor.snapshot()).run, null);
   store.getState().startNewSession();
-  assert.equal(store.getState().selectedProfileId, 'profile:off');
+  assert.equal(store.getState().selectedProfileId, 'profile:one');
   await store.getState().selectProfile('profile:two');
   store.getState().startNewSession();
-  assert.equal(store.getState().selectedProfileId, 'profile:two');
+  assert.equal(store.getState().selectedProfileId, 'profile:one');
   const reopened = await loadGuiModelStore(t);
   await reopened.getState().refreshProfiles();
-  assert.equal(reopened.getState().selectedProfileId, 'profile:two');
+  assert.equal(reopened.getState().selectedProfileId, 'profile:one');
 });
 
 test('starting a draft during initialization preserves navigation and still loads usable model configuration', async (t) => {
@@ -1132,8 +1101,8 @@ test('starting a draft during initialization preserves navigation and still load
 
 test('independent views own navigation, errors and pending commands separately', async (t) => {
   const { createLocalAgentStore } = await loadGuiModule(t, '/src/state/localAgentStore.ts');
-  const first = createLocalAgentStore('view:one');
-  const second = createLocalAgentStore('view:two');
+  const first = createLocalAgentStore();
+  const second = createLocalAgentStore();
   first.setState({ sessionId: 'session:one', error: 'old failure', submitting: true });
   second.setState({ sessionId: 'session:two', error: null, submitting: false });
   first.getState().startNewSession();
@@ -1224,8 +1193,8 @@ test('continuous conversation keeps every message anchor while mounting nearby c
   t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
   const { ConversationTranscript } = await loadGuiModule(t, '/src/components/local-agent/ConversationTranscript.tsx');
   const props = {
-    language: 'zh-CN', loading: false, completedRuns: new Set(), onDisplayed() {},
-    projection: { sessionId: 'session:long', run: null, plans: [], activities: [], fileChangeRounds: [] },
+    language: 'zh-CN', loading: false, displaySettledRunIds: new Set(), artifacts: [], onDisplayed() {},
+    projection: { sessionId: 'session:long', run: null, plans: [], activities: [], fileChangeRounds: [], artifacts:[] },
     hasConversationContent: true, draftItems: [],
     conversationItems: rows.map((row, index) => ({ ...row.item, sequence: index, streamId: `stream:${index}`, value: { ...row.item.value, messageId: row.key, runId: 'run:long' } })),
     presentation: { content: (id) => id },
@@ -1442,7 +1411,6 @@ test('Plan documents and previews render Markdown entities, code names and verif
   };
   const published = renderToStaticMarkup(createElement(PlanCard, { plan, active: false, language: 'zh-CN' }));
   assert.ok(published.includes('aria-expanded="false"'), 'published plans wait for the reader to expand');
-  assert.equal(published.includes('conversation-plan-document-body'), false, 'collapsed plans do not mount their long document');
   assert.ok(published.includes('ObjectPool&lt;T,N&gt;'));
   const html = renderToStaticMarkup(createElement(PlanCardContent, { plan, language: 'zh-CN' }));
   assert.ok(html.includes('ObjectPool&lt;T,N&gt;'));
@@ -1471,12 +1439,9 @@ test('Plan documents and previews render Markdown entities, code names and verif
   } };
   const previewCard = renderToStaticMarkup(createElement(PlanPreviewCard, previewProps));
   assert.ok(previewCard.includes('aria-expanded="false"'));
-  assert.equal(previewCard.includes('conversation-plan-document-body'), false);
   assert.equal(previewCard.includes('确认执行'), false);
   const preview = renderToStaticMarkup(createElement(PlanPreviewContent, previewProps));
   for (const rendered of [html, preview]) {
-    assert.ok(rendered.includes('conversation-plan-document-body'));
-    assert.ok(rendered.includes('conversation-plan-document-content'));
     assert.match(rendered, /<code>ObjectPool&lt;T,N&gt;<\/code>/);
   }
   assert.equal(preview.includes('确认执行'), false, 'a display-only preview cannot authorize execution');
@@ -1495,8 +1460,7 @@ test('Plan documents and previews render Markdown entities, code names and verif
   assert.match(question, /<strong>容器环境<\/strong>/);
   assert.match(question, /<code>Dockerfile<\/code>/);
   assert.match(question, /<code>Makefile<\/code>/);
-  assert.ok(question.includes('local-agent__interaction-document-scroll'));
-  const optionButton = question.match(/<button[^>]*>[\s\S]*?<\/button>/)?.[0];
+  const optionButton = [...question.matchAll(/<button[^>]*>[\s\S]*?<\/button>/g)].map(([button]) => button).find((button) => button.includes('Makefile'));
   assert.ok(optionButton, 'the option remains a native action button');
   assert.match(optionButton, /disabled=""/);
   assert.match(optionButton, /<code>Makefile<\/code>/, 'the description is part of the option hit target and accessible name');
@@ -1553,7 +1517,6 @@ test('response language uses the shared Settings catalog and a compact labelled 
   assert.match(html, /<select[^>]+aria-label="Response language"/);
   assert.match(html, /<option value="zh-CN" selected="">简体中文<\/option>/);
   assert.equal(html.includes('agent.responseLanguage'), false, 'the user control does not expose the internal setting key');
-  assert.equal(html.includes('settings-field__default'), false);
 });
 
 test('GUI refresh accepts plan preview changes without a new journal revision or activity timestamp', async (t) => {
@@ -1646,7 +1609,6 @@ test('Markdown table reading preserves streaming cells, source links and GFM ali
   assert.match(settled, /<code>Recycler&lt;T,Size,Align&gt;<\/code>/);
   assert.match(settled, /<strong>原始语义<\/strong>/);
   assert.match(settled, /class="katex"/);
-  assert.match(settled, /class="conversation-table-scroll"[^>]*tabindex="0"/);
 });
 
 test('draft and committed provider text occupy the same round and row identity', async (t) => {
@@ -1747,9 +1709,10 @@ test('unchanged status snapshots do not publish redundant GUI state updates', as
   await store.getState().refresh();
   await store.getState().refresh();
   assert.equal(publications, 0);
-  store.setState({ error: 'Status request failed', errorSource: 'statuses' });
+  store.setState({ statusError: 'Status request failed', error: 'Retained command failure', errorSource: 'command' });
   await store.getState().refresh();
-  assert.equal(store.getState().error, null, 'a successful refresh must still clear its previous error');
+  assert.equal(store.getState().statusError, null, 'a successful refresh clears only its previous status error');
+  assert.equal(store.getState().error, 'Retained command failure');
   assert.equal(publications, 2);
 });
 
@@ -1917,7 +1880,7 @@ test('desktop startup diagnostics render the Host failure and log reference verb
   assert.equal(renderToStaticMarkup(createElement(HostStartupDiagnostic, { status: { ...status, phase: 'ready' }, language: 'zh-CN' })), '');
 });
 
-test('conversation reading survives native scroll deliveries and layout growth without device flags', async (t) => {
+test('conversation reading intent survives native scroll deliveries and layout growth', async (t) => {
   const { createElement } = await import('react');
   const { renderToStaticMarkup } = await import('react-dom/server');
   const { useConversationViewport } = await loadGuiModule(t, '/src/components/local-agent/useConversationViewport.ts');
@@ -1962,6 +1925,7 @@ test('conversation reading survives native scroll deliveries and layout growth w
   const deliverScroll = () => viewport.bodyHandlers.onScroll({ target: body, currentTarget: body });
   viewport.setLatestFollowMode(true);
   viewport.preserveReadingPosition();
+  viewport.bodyHandlers.onWheel({ target: body, deltaY: -140 });
   body.scrollTop = 860;
   flushFrames();
   assert.equal(top, 860, 'a pending follow frame yields to native movement even before its scroll callback arrives');
@@ -2007,6 +1971,82 @@ test('conversation reading survives native scroll deliveries and layout growth w
   assert.equal(frames.size, 0);
 });
 
+test('conversation follows decision layout changes and final output until the reader moves away', async (t) => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { useConversationViewport } = await loadGuiModule(t, '/src/components/local-agent/useConversationViewport.ts');
+  const previousWindow = globalThis.window;
+  const frames = new Map();
+  let nextFrame = 0;
+  globalThis.window = {
+    requestAnimationFrame(callback) { frames.set(++nextFrame, callback); return nextFrame; },
+    cancelAnimationFrame(id) { frames.delete(id); },
+    getComputedStyle(node) { return node.style; },
+  };
+  t.after(() => { if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow; });
+  const flushFrames = () => {
+    const pending = [...frames.values()]; frames.clear();
+    for (const callback of pending) callback(0);
+  };
+  let viewport;
+  function Probe() {
+    viewport = useConversationViewport({ sessionId: 'session:decisions', loading: false,
+      projection: { sessionId: 'session:decisions' }, presentationLayoutKey: '', assistantDraftLayoutKey: '', timelineExtentKey: '' });
+    return null;
+  }
+  renderToStaticMarkup(createElement(Probe));
+  let top = 1_000, height = 1_500, writes = 0;
+  const body = { clientHeight: 500,
+    get scrollTop() { return top; },
+    set scrollTop(value) { writes++; top = Math.max(0, Math.min(value, height - this.clientHeight)); },
+    get scrollHeight() { return height; },
+    getBoundingClientRect: () => ({ top: 0 }), querySelectorAll: () => [], closest: () => null,
+  };
+  viewport.bodyRef.current = body;
+  viewport.setLatestFollowMode(true);
+  const deliverScroll = () => viewport.bodyHandlers.onScroll({ target: body, currentTarget: body });
+  for (const decision of ['permission', 'plan', 'question']) {
+    // Removing a decision first grows the viewport and clamps native scrollTop;
+    // restoring the input and appending output then changes the extent again.
+    body.clientHeight = 700; top = height - body.clientHeight;
+    body.clientHeight = 500; height += 100;
+    deliverScroll();
+    viewport.preserveReadingPosition(); viewport.preserveReadingPosition();
+    assert.equal(frames.size, 1, `${decision}: resize and scroll share one frame`);
+    flushFrames();
+    assert.equal(top, height - body.clientHeight, `${decision}: layout clamping cannot detach the reader`);
+  }
+  height += 800;
+  viewport.preserveReadingPosition(); flushFrames();
+  assert.equal(top, height - body.clientHeight, 'final output remains visible after completion');
+  const completedWrites = writes;
+  deliverScroll(); viewport.preserveReadingPosition(); flushFrames();
+  assert.equal(writes, completedWrites, 'programmatic feedback does not rewrite an already clamped tail');
+  assert.equal(frames.size, 0, 'idle layout does not keep scheduling itself');
+
+  const code = { parentElement: body, clientHeight: 100, scrollHeight: 400, scrollTop: 100,
+    style: { overflowY: 'auto' } };
+  viewport.bodyHandlers.onWheel({ target: code, deltaY: -20 });
+  height += 100; viewport.preserveReadingPosition(); flushFrames();
+  assert.equal(top, height - body.clientHeight, 'scrolling a code block does not detach the conversation');
+
+  viewport.preserveReadingPosition();
+  viewport.bodyHandlers.onKeyDown({ target: body, currentTarget: body, key: 'PageUp' });
+  top -= 200; const readingTop = top;
+  flushFrames();
+  assert.equal(top, readingTop, 'keyboard intent wins over an already queued follow frame');
+  height += 100; viewport.preserveReadingPosition(); flushFrames();
+  assert.equal(top, readingTop, 'new final content does not steal the history position');
+  viewport.scrollToLatest(); flushFrames();
+  assert.equal(top, height - body.clientHeight, 'explicit latest resumes the tail');
+
+  viewport.bodyHandlers.onTouchStart({ touches: [{ clientY: 200 }] });
+  viewport.bodyHandlers.onTouchMove({ target: body, touches: [{ clientY: 250 }] });
+  top -= 50; deliverScroll(); height += 100; viewport.preserveReadingPosition(); flushFrames();
+  assert.equal(top, height - body.clientHeight - 150, 'touch reading is retained through further output');
+  assert.equal(frames.size, 0);
+});
+
 test('composer submission receipts preserve newer text and retain the complete failed draft', async (t) => {
   const { submitComposerState, emptyComposerState } = await loadGuiModule(t, '/src/components/local-agent/composerSubmission.ts');
   const original = { ...emptyComposerState(), draft: 'First request',
@@ -2041,7 +2081,32 @@ test('composer submission receipts preserve newer text and retain the complete f
   assert.deepEqual(current, original);
 });
 
-test('pending approvals preserve ordinary input with one primary action', async (t) => {
+test('artifact delivery waits for final text display and keeps historical or interrupted output available', async (t) => {
+  const { conversationDisplay } = await loadGuiModule(t, '/src/components/local-agent/conversationDisplay.ts');
+  const artifacts = [{ artifactId: 'image:old', runId: 'run:old' }, { artifactId: 'image:new', runId: 'run:new' }];
+  const projection = { run: { runId: 'run:new', status: 'running' }, messages: [], timeline: [], artifacts,
+    assistantDraft: { runId: 'run:new', blocks: [{ content: 'Still writing' }] } };
+  const live = new Set(['run:new']);
+  const shown = new Map();
+  assert.deepEqual(conversationDisplay(projection, live, shown).artifacts, [artifacts[0]]);
+  const committed = { ...projection, assistantDraft: null, run: { ...projection.run, status: 'completed' },
+    messages: [{ messageId: 'final', runId: 'run:new', role: 'assistant', content: 'The complete final answer.' }],
+    timeline: [{ kind: 'message', messageId: 'final', streamId: 'stream:final' }],
+  };
+  shown.set('stream:final', 'The complete');
+  assert.deepEqual(conversationDisplay(committed, live, shown).artifacts, [artifacts[0]], 'settlement must not skip the UI display buffer');
+  assert.deepEqual(conversationDisplay({ ...committed, run: { runId: 'run:next', status: 'running' } }, live, shown).artifacts,
+    [artifacts[0]], 'starting the next run does not bypass the previous answer display');
+  shown.set('stream:final', 'The complete final answer.');
+  assert.deepEqual(conversationDisplay(committed, live, shown).artifacts, artifacts);
+  assert.deepEqual(conversationDisplay({ ...committed, run: { ...committed.run, status: 'releasing' } }, live, shown).artifacts, [artifacts[0]], 'showing text does not invent a settled run');
+  assert.deepEqual(conversationDisplay(committed, new Set(), new Map()).artifacts, artifacts, 'settled history does not replay a reveal animation');
+  const interrupted = { ...projection, assistantDraft: null, run: { ...projection.run, status: 'cancelled' } };
+  assert.deepEqual(conversationDisplay(interrupted, live, shown).artifacts, artifacts, 'actual output is retained after cancellation without a final answer');
+  assert.deepEqual(projection.artifacts, artifacts, 'presentation cannot remove canonical artifacts');
+});
+
+test('pending approvals replace ordinary input while preserving its draft for return', async (t) => {
   const previousSelf = globalThis.self;
   globalThis.self = {};
   t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
@@ -2050,19 +2115,40 @@ test('pending approvals preserve ordinary input with one primary action', async 
   const { ConversationComposer } = await loadGuiModule(t, '/src/components/local-agent/ConversationComposer.tsx');
   const composer = {
     pendingApproval: { approvalId: 'approval:one', preview: { summary: 'Write the requested file', effects: [], logicalTargets: [] } },
-    projection: { queuedInputs: [{ commandId: 'queued:one', text: 'Keep the public API unchanged', status: 'queued', filesystemReferences: [] }] },
+    projection: { contextCompositions:[], queuedInputs: [{ commandId: 'queued:one', text: 'Keep the public API unchanged', status: 'queued', filesystemReferences: [] }] },
     profiles: [], selectedProfileId: null, draft: 'Second request', pastedTexts: [], failedDrafts: [],
     pendingFilesystemPaths: [], pluginSelections: [], filteredPlugins: [], showStopAction: false, canSend: false, submitting: true,
     textareaRef: { current: null }, respondApproval() {},
   };
   const html = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', composer, uiActionError: null }));
   assert.match(html, /Write the requested file/);
-  assert.match(html, /<textarea[^>]*>Second request<\/textarea>/);
-  assert.match(html, /local-agent__composer--message/);
-  assert.match(html, /<textarea[^>]*rows="3"/);
-  assert.doesNotMatch(html, /local-agent__send--stop/);
-  assert.match(html, /class="local-agent__send"/);
-  assert.equal((html.match(/<button[^>]*class="local-agent__send(?: |")/g) ?? []).length, 1);
+  assert.doesNotMatch(html, /<textarea|aria-label="发送"/);
+  assert.match(html, /aria-label="拒绝" aria-keyshortcuts="Escape"/);
+  assert.match(html, /aria-label="允许一次" aria-keyshortcuts="Enter"/);
+  const resumed = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', composer: { ...composer, pendingApproval: null }, uiActionError: null }));
+  assert.match(resumed, /<textarea[^>]*>Second request<\/textarea>/);
+  const browser = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', composer: { ...composer,
+    pendingApproval: { ...composer.pendingApproval, preview: { ...composer.pendingApproval.preview, authorizationScope: 'sessionBrowser' } },
+  }, uiActionError: null }));
+  assert.match(browser, /允许当前对话使用内置浏览器/);
+  assert.match(browser, /aria-label="允许此对话"/);
+  const runPreview = { ...composer.pendingApproval.preview, authorizationScope: 'runHostShell', authorizationContext: { workspaceId: 'workspace:one', workspaceRoot: '/project' } };
+  const run = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', composer: { ...composer,
+    pendingApproval: { ...composer.pendingApproval, preview: runPreview },
+  }, uiActionError: null }));
+  assert.match(run, /允许本轮/);
+  assert.match(run, /允许一次/);
+  const { emptySessionState, projectSession } = await import('../../session-core/dist/index.js');
+  const wire = projectSession(emptySessionState('session:browser-wire'));
+  wire.pendingApproval = { ...composer.pendingApproval, runId: 'run:browser', callId: 'call:browser', sequence: 3,
+    createdAt: '2026-09-16T00:00:00Z', preview: { ...composer.pendingApproval.preview, authorizationScope: 'sessionBrowser' },
+  };
+  assert.deepEqual(await decodeGuiProjection(wire), wire, 'explicit scope survives the strict GUI wire decoder');
+  wire.pendingApproval.preview = runPreview;
+  assert.deepEqual(await decodeGuiProjection(wire), wire, 'run grant and Kernel context survive the GUI decoder');
+  const invalidScope = structuredClone(wire);
+  invalidScope.pendingApproval.preview.authorizationScope = 'unknown';
+  await assert.rejects(decodeGuiProjection(invalidScope), /conversation_projection_invalid/);
   assert.match(html, /等待加入当前任务/);
   assert.match(html, /Keep the public API unchanged/);
 });
@@ -2085,43 +2171,53 @@ test('questions and Plan revisions share the main input and render a single prim
       language: 'zh-CN', composer: { ...base, ...decision }, uiActionError: null,
     }));
     assert.equal((html.match(/<textarea\b/g) ?? []).length, 1);
-    assert.match(html, /<textarea[^>]*rows="1"/);
-    assert.ok(html.includes(`local-agent__composer--${decision.pendingPlan ? 'plan' : 'interaction'}`));
-    assert.equal((html.match(/<button[^>]*class="local-agent__send(?: |")/g) ?? []).length, 1);
+    const primaryLabel = decision.pendingPlan ? '提交修改意见' : '回答';
+    assert.equal(html.split(`aria-label="${primaryLabel}"`).length - 1, 1);
+    assert.match(html, /aria-label="关闭(?:方案确认|问题)"/);
     assert.match(html, /保留构建配置<\/textarea>/);
-    assert.doesNotMatch(html, /local-agent__send--stop/);
-    assert.doesNotMatch(html, /local-agent__interaction-composer/);
-    assert.doesNotMatch(html, /local-agent__interaction-close|local-agent__interaction-secondary-actions/);
+    assert.doesNotMatch(html, /aria-label="停止当前运行"/);
     const secondaryLabel = decision.pendingPlan ? '取消并停止' : '跳过';
-    assert.equal(html.split(secondaryLabel).length - 1, 1);
-    const actions = html.slice(html.indexOf('class="local-agent__composer-primary-actions"'));
-    assert.ok(actions.includes(secondaryLabel));
-    assert.ok(actions.indexOf(secondaryLabel) < actions.indexOf('class="local-agent__send"'));
+    assert.equal(html.split(`<span>${secondaryLabel}</span>`).length - 1, 1);
   }
   const running = renderToStaticMarkup(createElement(ConversationComposer, {
     language: 'zh-CN', composer: { ...base, textDecision: false, draft: '', canSend: false, showStopAction: true }, uiActionError: null,
   }));
-  assert.equal((running.match(/<button[^>]*class="local-agent__send(?: |")/g) ?? []).length, 1);
-  assert.match(running, /local-agent__send--stop/);
-  assert.match(running, /local-agent__composer--message/);
-  assert.match(running, /<textarea[^>]*rows="3"/);
+  assert.match(running, /aria-label="停止当前运行"/);
   const editing = renderToStaticMarkup(createElement(ConversationComposer, {
     language: 'zh-CN', composer: { ...base, textDecision: false }, uiActionError: null,
   }));
-  assert.match(editing, /<textarea[^>]*rows="3"/);
   assert.match(editing, /保留构建配置<\/textarea>/);
   assert.match(editing, /aria-label="发送"/);
-  assert.doesNotMatch(editing, /local-agent__send--stop|local-agent__interaction-secondary/);
+  assert.doesNotMatch(editing, /aria-label="停止当前运行"/);
+  const plan = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', uiActionError: null,
+    composer: { ...base, draft: '', canSend: false, pendingPlan: { planId: 'plan:one', revision: 1, title: '清理工作区' } },
+  }));
+  assert.equal((plan.match(/<textarea\b/g) ?? []).length, 1);
+  assert.match(plan, />确认执行<\/b>/);
+  assert.match(plan, /<button[^>]*aria-label="提交修改意见"[^>]*disabled=""/);
+  assert.doesNotMatch(plan, /aria-label="添加"/);
 });
 
-test('resource preview uses the native dialog while committed content projects only displayed text', async (t) => {
+test('resource preview keeps expansion beside the shared sidebar control while committed content projects only displayed text', async (t) => {
   const { createElement } = await import('react');
   const { renderToStaticMarkup } = await import('react-dom/server');
-  const { ResourcePreview } = await loadGuiModule(t, '/src/components/local-agent/ResourcePreview.tsx');
+  const { ResourcePreview, ReaderControls } = await loadGuiModule(t, '/src/components/local-agent/ResourcePreview.tsx');
   const html = renderToStaticMarkup(createElement(ResourcePreview, { language: 'zh-CN', preview: {
-    resourcePreview: { workspaceId: 'workspace:one', logicalPath: 'README.md', status: 'loading' }, closeResourcePreview() {},
+    sessionId:'session:reader', tabs:[{id:'readme',target:{kind:'workspace',workspaceId:'workspace:one',logicalPath:'README.md'}}],
+    activeId:'readme', visible:true, expanded:false, width:55, error:null,
+    selectTab(){},closeTab(){},newPage(){},expand(){},resize(){},openTarget(){},
   } }));
-  assert.match(html, /^<dialog\b/);
+  assert.match(html, /role="separator"/);
+  assert.doesNotMatch(html, /aria-label="铺满工作区"|aria-label="浏览器与预览"/);
+  for (const expanded of [false, true]) {
+    const controls = renderToStaticMarkup(createElement(ReaderControls, { language: 'zh-CN', disabled: false,
+      preview: { visible: true, expanded, expand() {}, toggle() {} } }));
+    const label = expanded ? '返回并排' : '铺满工作区';
+    assert.ok(controls.includes(`aria-label="${label}"`));
+    assert.match(controls, /aria-label="浏览器与预览"/);
+    assert.match(controls, /aria-pressed="true"/);
+  }
+  assert.doesNotMatch(html, /<dialog\b/);
   assert.match(html, /README.md/);
   const { projectCommittedText } = await import('../../presentation-core/dist/index.js');
   const projection = { messages: [
@@ -2141,6 +2237,7 @@ test('unavailable plugins preserve their source error and cannot be selected in 
   globalThis.self = {};
   t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
   const plugin = { uri: 'plugin://broken@1', displayName: 'Broken plugin', shortDescription: 'Optional extension',
+    source:'mounted',category:'functional',contributionKind:'mcp',discovery:'default',
     activationMediaTypes: [], enabled: true, available: false, error: { code: 'plugin_load_failed', message: 'Manifest cannot be read' } };
   installGuiFetch(t, () => Response.json({ ok: true, data: { revision: 'catalog:one', plugins: [plugin] } }));
   const { getPluginCatalog } = await loadGuiModule(t, '/src/services/localAgentApi.ts');
@@ -2383,4 +2480,267 @@ test('saving valid profiles enables an unbound draft and clears its profile erro
   assert.deepEqual(store.getState().profiles, [profile]);
   assert.equal(store.getState().error, null);
   assert.equal(store.getState().errorSource, null);
+});
+
+test('settings drafts survive refreshes and failed saves without converting an empty number to zero', async (t) => {
+  const [{ reconcileSettingDraft, parseSettingDraft }, { useSettingsStore }] = await loadGuiModules(t, ['/src/components/settings-center/settingDraft.ts', '/src/state/settingsStore.ts']);
+  let draft = { saved: 'old prompt', text: 'new prompt\nwith a second line' };
+  const saved = draft.saved;
+  useSettingsStore.setState({ effectiveSettings: { ...useSettingsStore.getState().effectiveSettings, 'agent.systemPrompt': saved } });
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  installGuiFetch(t, async (url, init) => {
+    assert.equal(url.pathname, '/api/user-settings');
+    assert.equal(init.method, 'PATCH');
+    assert.equal(JSON.parse(init.body).patches['agent.systemPrompt'], draft.text);
+    await gate;
+    return Response.json({ ok: false, message: 'settings_write_failed: read-only directory' });
+  });
+  const saving = useSettingsStore.getState().patchUserSetting('agent.systemPrompt', draft.text);
+  assert.equal(useSettingsStore.getState().effectiveSettings['agent.systemPrompt'], saved);
+  release();
+  assert.equal(await saving, null);
+  assert.equal(useSettingsStore.getState().errorMessage, 'settings_write_failed: read-only directory');
+  assert.equal(useSettingsStore.getState().effectiveSettings['agent.systemPrompt'], saved);
+  draft = reconcileSettingDraft(draft, saved);
+  assert.equal(draft.text, 'new prompt\nwith a second line');
+  draft = reconcileSettingDraft(draft, 'updated by another window');
+  assert.equal(draft.text, 'new prompt\nwith a second line');
+  assert.equal(draft.saved, 'updated by another window');
+  assert.deepEqual(reconcileSettingDraft({ saved: 'old', text: 'old' }, 'new'), { saved: 'new', text: 'new' });
+  assert.equal(parseSettingDraft('', true), null);
+  assert.equal(parseSettingDraft('12', true), 12);
+  assert.equal(parseSettingDraft('', false), '');
+});
+
+test('settings search matches words across field and model metadata without order dependence', async (t) => {
+  const { matchesSettingsQuery } = await loadGuiModule(t, '/src/components/settings-center/settingsSearch.tsx');
+  assert.equal(matchesSettingsQuery('PDF Python', 'PDF 生成环境', 'WeasyPrint Python'), true);
+  assert.equal(matchesSettingsQuery('flash deepseek', 'DeepSeek Flash', 'deepseek-v4-flash'), true);
+  assert.equal(matchesSettingsQuery('shell windows', 'Windows Shell'), true);
+  assert.equal(matchesSettingsQuery('github python', 'GitHub', 'Read repositories'), false);
+});
+
+test('environment settings use the Host platform for Windows controls without changing persisted values', async (t) => {
+  const [{ AgentSettingsSection }, { useSettingsStore }] = await loadGuiModules(t, [
+    '/src/components/settings-center/sections/CategorizedSettingsSections.tsx',
+    '/src/state/settingsStore.ts',
+  ]);
+  const React = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const settings = { ...useSettingsStore.getState().effectiveSettings, 'agent.windows.shell': 'gitBash', 'agent.windows.gitBashPath': 'C:\\Git\\bin\\bash.exe' };
+  // React's server renderer reads Zustand's initial snapshot, not getState().
+  const initialSnapshot = useSettingsStore.getInitialState();
+  const original = { effectiveSettings: initialSnapshot.effectiveSettings, environment: initialSnapshot.environment };
+  t.after(() => { Object.assign(initialSnapshot, original); });
+  Object.assign(initialSnapshot, { effectiveSettings: settings, environment: { os: 'macos' } });
+  useSettingsStore.setState({ effectiveSettings: settings, environment: initialSnapshot.environment });
+  const mac = renderToStaticMarkup(React.createElement(AgentSettingsSection, { category: 'environment' }));
+  assert.doesNotMatch(mac, /aria-label="Windows Shell"/);
+  assert.doesNotMatch(mac, /aria-label="Git Bash (路径|path)"/);
+  assert.match(mac, /WeasyPrint/);
+  initialSnapshot.environment = { os: 'windows' };
+  useSettingsStore.setState({ environment: initialSnapshot.environment });
+  const windows = renderToStaticMarkup(React.createElement(AgentSettingsSection, { category: 'environment' }));
+  assert.match(windows, /aria-label="Windows Shell"/);
+  assert.match(windows, /aria-label="Git Bash (路径|path)"/);
+  assert.equal(useSettingsStore.getState().effectiveSettings, settings);
+});
+
+test('picker navigation skips unavailable tools and supports wrapping and tab endpoints', async (t) => {
+  const { nextEnabledIndex } = await loadGuiModule(t, '/src/components/shared/keyboardNavigation.ts');
+  const tools = [false, true, false, true];
+  assert.equal(nextEnabledIndex(tools, -1, 'ArrowDown'), 1);
+  assert.equal(nextEnabledIndex(tools, 1, 'ArrowDown'), 3);
+  assert.equal(nextEnabledIndex(tools, 3, 'ArrowDown'), 1);
+  assert.equal(nextEnabledIndex(tools, 1, 'ArrowUp'), 3);
+  assert.equal(nextEnabledIndex([false], 0, 'Home'), -1);
+  assert.equal(nextEnabledIndex([true, true], 1, 'Home'), 0);
+  assert.equal(nextEnabledIndex([true, true], 0, 'End'), 1);
+});
+
+test('UI update detection compares entry resources and retains the original load failure', async (t) => {
+  const { interfaceResourcesChanged, interfaceUpdateSnapshot, reportInterfaceLoadError, subscribeInterfaceUpdates } = await loadGuiModule(t, '/src/services/interfaceUpdates.ts');
+  assert.equal(interfaceResourcesChanged(['entry-a.js', 'style-a.css'], ['style-a.css', 'entry-a.js']), false);
+  assert.equal(interfaceResourcesChanged(['entry-a.js'], ['entry-b.js']), true);
+  assert.equal(interfaceResourcesChanged(['entry-a.js'], ['entry-a.js', 'style-b.css']), true);
+  let notifications = 0;
+  const unsubscribe = subscribeInterfaceUpdates(() => notifications++);
+  reportInterfaceLoadError(new Error('Importing a module script failed: SettingsCenter-old.js'));
+  assert.equal(interfaceUpdateSnapshot().error, 'Importing a module script failed: SettingsCenter-old.js');
+  assert.equal(interfaceUpdateSnapshot().available, false);
+  assert.equal(notifications, 1);
+  unsubscribe();
+  reportInterfaceLoadError(new Error('second failure'));
+  assert.equal(notifications, 1);
+});
+
+test('custom light and dark palettes persist through the shared settings owner and reset independently', async (t) => {
+  const [{ useSettingsStore }, palette] = await loadGuiModules(t, ['/src/state/settingsStore.ts', '/src/theme/palette.ts']);
+  let persisted = { 'gui.colorTheme': 'system', 'gui.accentColor': 'purple' };
+  let fail = false;
+  installGuiFetch(t, (url, init) => {
+    assert.equal(url.pathname, '/api/user-settings');
+    if (init.method === 'PATCH') {
+      const { patches } = JSON.parse(init.body);
+      if (fail) return Response.json({ ok: false, message: 'palette write failed' });
+      for (const [key, value] of Object.entries(patches)) {
+        if (value === null) delete persisted[key]; else persisted[key] = value;
+      }
+      return Response.json({ ok: true, data: { settings: persisted, changedKeys: Object.keys(patches), activation: 'immediate' } });
+    }
+    return Response.json({ ok: true, data: { settings: persisted, runtimeSettings: persisted, overriddenKeys: Object.keys(persisted), storePath: '/test/user-settings.json' } });
+  });
+  await useSettingsStore.getState().loadUserSettings();
+  const custom = { '--dc-theme-light-background': '#f5f1ea', '--dc-theme-dark-background': '#202124', '--dc-custom-dark-accent': '#aaccee' };
+  assert.equal(await useSettingsStore.getState().patchUserSetting(palette.PALETTE_SETTING, JSON.stringify(custom)), 'immediate');
+  const [{ useSettingsStore: reloaded }] = await loadGuiModules(t, ['/src/state/settingsStore.ts']);
+  await reloaded.getState().loadUserSettings();
+  const read = () => palette.decodePaletteOverrides(reloaded.getState().effectiveSettings[palette.PALETTE_SETTING]);
+  assert.deepEqual(read(), custom);
+  assert.equal(palette.paletteColor(read(), 'dark', 'accent', 'purple'), '#aaccee');
+  assert.equal(palette.paletteColor(read(), 'light', 'accent', 'purple'), palette.UI_PALETTE.tokens['--dc-accent-purple-light']);
+  fail = true;
+  assert.equal(await reloaded.getState().patchUserSetting(palette.PALETTE_SETTING, '{}'), null);
+  assert.match(reloaded.getState().errorMessage, /palette write failed/);
+  assert.deepEqual(read(), custom);
+  fail = false;
+  const lightOnly = palette.resetPaletteTheme(read(), 'dark');
+  assert.equal(await reloaded.getState().patchUserSetting(palette.PALETTE_SETTING, JSON.stringify(lightOnly)), 'immediate');
+  await reloaded.getState().loadUserSettings();
+  assert.deepEqual(read(), { '--dc-theme-light-background': '#f5f1ea' });
+  assert.equal(reloaded.getState().effectiveSettings['gui.colorTheme'], 'system');
+  assert.equal(reloaded.getState().effectiveSettings['gui.accentColor'], 'purple');
+  assert.equal(await reloaded.getState().resetUserSetting(palette.PALETTE_SETTING), 'immediate');
+  await reloaded.getState().loadUserSettings();
+  assert.deepEqual(read(), {});
+});
+
+test('palette rejects incomplete input and reset removes custom colors and derived contrast', async (t) => {
+  const { decodePaletteOverrides, paletteOverrideCss, resetPaletteTheme } = await loadGuiModule(t, '/src/theme/palette.ts');
+  for (const encoded of ['{broken', '[]', 'null', '{"unknown":"#112233"}', '{"--dc-theme-dark-background":"#12"}', '{"--dc-theme-dark-background":null}']) {
+    assert.throws(() => decodePaletteOverrides(encoded));
+    assert.throws(() => paletteOverrideCss(encoded));
+  }
+  const custom = { '--dc-custom-dark-accent': '#aabbcc', '--dc-theme-light-border': '#11223322' };
+  const css = paletteOverrideCss(JSON.stringify(custom));
+  assert.match(css, /--dc-custom-dark-accent-contrast:var\(--dc-shadow-color\)/);
+  const reset = paletteOverrideCss(JSON.stringify(resetPaletteTheme(custom, 'dark')));
+  assert.doesNotMatch(reset, /custom-dark/);
+  assert.match(reset, /--dc-theme-light-border:#11223322/);
+  assert.equal(paletteOverrideCss('{}'), ':root{}');
+});
+
+test('named themes validate before import and select light and dark palettes independently', async (t) => {
+  const library = await loadGuiModule(t, '/src/theme/themeLibrary.ts');
+  const palette = await loadGuiModule(t, '/src/theme/palette.ts');
+  const imported = library.importTheme(JSON.stringify({ name: 'Review Theme', light: { background: '#F4F2ED' }, dark: { accent: '#BBAADD' } }));
+  assert.equal(imported.light.background, '#f4f2ed');
+  const themes = [...library.builtinThemes(), { id: 'review', ...imported }];
+  let applied = library.applyThemePalette({}, imported, 'light');
+  assert.equal(library.selectedThemeId(themes, applied, 'light'), 'review');
+  assert.equal(library.selectedThemeId(themes, applied, 'dark'), 'default');
+  applied = library.applyThemePalette(applied, themes[0], 'dark');
+  assert.equal(applied['--dc-theme-light-background'], '#f4f2ed');
+  assert.equal(library.selectedThemeId(themes, applied, 'dark'), themes[0].id);
+  const edited = { ...applied, '--dc-custom-dark-accent': '#abcdef' };
+  assert.equal(library.selectedThemeId(themes, edited, 'dark'), 'custom');
+  assert.deepEqual(library.applyThemePalette(applied, null, 'dark'), { '--dc-theme-light-background': '#f4f2ed' });
+  for (const theme of themes) palette.decodePaletteOverrides(JSON.stringify(library.themeOverrides(theme)));
+  for (const document of [null, [], { name: 'Empty' }, { name: 'Bad', dark: { unknown: '#112233' } }, { name: 'Bad', dark: { accent: '#12' } }]) {
+    assert.throws(() => library.importTheme(JSON.stringify(document)));
+  }
+  assert.throws(() => library.decodeThemeLibrary(JSON.stringify([{ id: 'same', ...imported }, { id: 'same', ...imported }])));
+});
+
+test('theme library and UI fonts persist without changing active colors or appearance mode', async (t) => {
+  const [{ useSettingsStore }, library, fonts] = await loadGuiModules(t, ['/src/state/settingsStore.ts', '/src/theme/themeLibrary.ts', '/src/theme/typography.ts']);
+  let persisted = { 'gui.colorTheme': 'system', 'workbench.styleTokenOverrides': '{"--dc-custom-dark-accent":"#ccbbaa"}' };
+  installGuiFetch(t, (url, init) => {
+    assert.equal(url.pathname, '/api/user-settings');
+    if (init.method === 'PATCH') {
+      const { patches } = JSON.parse(init.body);
+      for (const [key, value] of Object.entries(patches)) { if (value === null) delete persisted[key]; else persisted[key] = value; }
+      return Response.json({ ok: true, data: { settings: persisted, changedKeys: Object.keys(patches), activation: 'immediate' } });
+    }
+    return Response.json({ ok: true, data: { settings: persisted, runtimeSettings: persisted, overriddenKeys: Object.keys(persisted), storePath: '/test/user-settings.json' } });
+  });
+  const saved = [{ id: 'user-theme', name: 'User theme', dark: { background: '#202022' } }];
+  await useSettingsStore.getState().patchUserSetting(library.THEME_LIBRARY_SETTING, JSON.stringify(saved));
+  await useSettingsStore.getState().patchUserSettingsBatch({ [fonts.UI_FONT_FAMILY_SETTING]: 'PingFang SC', [fonts.UI_FONT_SIZE_SETTING]: 16 });
+  const [{ useSettingsStore: reloaded }] = await loadGuiModules(t, ['/src/state/settingsStore.ts']);
+  await reloaded.getState().loadUserSettings();
+  const settings = reloaded.getState().effectiveSettings;
+  assert.deepEqual(library.decodeThemeLibrary(settings[library.THEME_LIBRARY_SETTING]), saved);
+  assert.equal(settings['gui.colorTheme'], 'system');
+  assert.equal(settings['workbench.styleTokenOverrides'], '{"--dc-custom-dark-accent":"#ccbbaa"}');
+  assert.match(fonts.uiFontFamily(settings[fonts.UI_FONT_FAMILY_SETTING]), /^"PingFang SC",/);
+  assert.equal(fonts.uiFontSize(settings[fonts.UI_FONT_SIZE_SETTING]), 16);
+  assert.throws(() => fonts.uiFontFamily(''));
+  assert.throws(() => fonts.uiFontFamily('bad; family'));
+  assert.throws(() => fonts.uiFontSize(0));
+  assert.throws(() => fonts.uiFontSize(14.5));
+  await reloaded.getState().patchUserSettingsBatch({ [fonts.UI_FONT_FAMILY_SETTING]: null, [fonts.UI_FONT_SIZE_SETTING]: null });
+  assert.equal(reloaded.getState().effectiveSettings[fonts.UI_FONT_FAMILY_SETTING], 'system');
+  assert.equal(reloaded.getState().effectiveSettings[fonts.UI_FONT_SIZE_SETTING], 14);
+  assert.deepEqual(library.decodeThemeLibrary(reloaded.getState().effectiveSettings[library.THEME_LIBRARY_SETTING]), saved);
+});
+
+test('GUI consumes diagnostic attempts and failure snapshots while rejecting malformed facts', async (t) => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:gui-diagnostic';
+  await createSession(journal, sessionId);
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    yield providerEvent(request.requestId, 'failed', { code: 'provider_http_failed', message: 'HTTP 401', diagnostics: {
+      source: 'providerTransport', phase: 'response', category: 'http', retryable: false,
+      causes: [{ message: 'Authentication rejected' }], archivePath: '/test/attempt/timeline.jsonl',
+    } });
+  } }, emptyKernel(), fakeRunPreparation().port, 'gui-diag');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:diag', 'Test failure.'));
+  const projection = await waitForProjection(actor, (value) => value.run?.status === 'failed');
+  assert.equal(projection.providerAttempts.length, 1);
+  assert.equal(projection.failureSnapshot.error.diagnostics.retryable, false);
+  assert.deepEqual(await decodeGuiProjection(projection), projection);
+  for (const mutate of [
+    (p) => { p.providerAttempts[0].attempt = 6; },
+    (p) => { p.terminalError.diagnostics.retryable = 'yes'; },
+    (p) => { p.failureSnapshot.error.diagnostics.causes[0].osCode = 'unknown'; },
+    (p) => { p.failureSnapshot.revision = -1; },
+  ]) {
+    const malformed = structuredClone(projection); mutate(malformed);
+    await assert.rejects(decodeGuiProjection(malformed), /conversation_projection_invalid/);
+  }
+});
+
+test('startup opens a new draft even when history exists, and status failure does not erase the reader', async (t) => {
+  const { emptySessionState, projectSession } = await import('../../session-core/dist/index.js');
+  const history = projectSession(emptySessionState('session:history'));
+  let statusFailed = false;
+  const requests = [];
+  installGuiFetch(t, async (url) => {
+    requests.push(url.pathname);
+    if (url.pathname === '/api/conversation/catalog') return Response.json({ ok: true, data: { projects: [], sessions: [{
+      id: 'session:history', title: 'Existing history', workspaceBindings: [], createdAt: '2026-09-01', updatedAt: '2026-09-01',
+    }] } });
+    if (url.pathname === '/api/conversation/plugins') return Response.json({ ok: true, data: { revision: 'catalog:test', plugins: [] } });
+    if (url.pathname === '/api/llm/profiles') return Response.json({ ok: true, data: { profiles: [] } });
+    if (url.pathname === '/api/conversation/statuses') {
+      statusFailed = true;
+      throw new Error('original_status_failure');
+    }
+    if (url.pathname.endsWith('/projection')) return Response.json({ ok: true, data: history });
+    throw new Error(`Unexpected request: ${url.pathname}`);
+  });
+  const store = await loadGuiModelStore(t);
+  await store.getState().initialize();
+  await waitUntil(() => statusFailed, 'status response');
+  await store.getState().refresh();
+  assert.equal(store.getState().sessionId, null);
+  assert.equal(store.getState().projection, null);
+  assert.equal(requests.some((path) => path.endsWith('/projection')), false);
+  store.setState({ sessionId: history.sessionId, projection: history, error: 'command_failure', errorSource: 'command' });
+  await store.getState().refresh();
+  assert.equal(store.getState().statusError, 'original_status_failure');
+  assert.equal(store.getState().error, 'command_failure');
+  assert.deepEqual(store.getState().projection, history);
 });

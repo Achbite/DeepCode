@@ -56,18 +56,32 @@ impl KernelToolKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum KernelWorkspaceMode {
+    #[default]
     Read,
     Write,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum KernelExecutionScope {
+    #[default]
     Workspace,
     Host,
+}
+
+impl KernelWorkspaceMode {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Read => "read", Self::Write => "write" }
+    }
+}
+
+impl KernelExecutionScope {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Workspace => "workspace", Self::Host => "host" }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,8 +99,7 @@ pub struct KernelTextEdit {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
-    tag = "kind",
-    content = "data",
+    tag = "targetKind",
     rename_all = "camelCase",
     rename_all_fields = "camelCase",
     deny_unknown_fields
@@ -107,10 +120,13 @@ pub enum KernelCanonicalInvocation {
     #[serde(rename = "fs.read")]
     FsRead {
         path: String,
+        #[serde(default = "default_start_line")]
         start_line: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         start_byte: Option<u64>,
+        #[serde(default = "default_max_lines")]
         max_lines: u32,
+        #[serde(default = "default_read_bytes")]
         max_bytes: u32,
     },
     #[serde(rename = "fs.write")]
@@ -129,24 +145,45 @@ pub enum KernelCanonicalInvocation {
     #[serde(rename = "bash")]
     ProcessShell {
         command: String,
+        #[serde(default)]
         workspace_mode: KernelWorkspaceMode,
+        #[serde(default)]
         execution_scope: KernelExecutionScope,
+        #[serde(default = "default_timeout")]
         timeout: u32,
         terminal: Option<KernelTerminalInput>,
     },
     #[serde(rename = "powershell")]
     ProcessPowerShell {
         command: String,
+        #[serde(default)]
         workspace_mode: KernelWorkspaceMode,
+        #[serde(default)]
         execution_scope: KernelExecutionScope,
+        #[serde(default = "default_timeout")]
         timeout: u32,
         terminal: Option<KernelTerminalInput>,
     },
     #[serde(rename = "web.search")]
-    WebSearch { query: String, limit: u32 },
+    WebSearch {
+        query: String,
+        #[serde(default = "default_search_limit")]
+        limit: u32,
+    },
     #[serde(rename = "web.fetch")]
-    WebFetch { url: String, max_bytes: u32 },
+    WebFetch {
+        url: String,
+        #[serde(default = "default_fetch_bytes")]
+        max_bytes: u32,
+    },
 }
+
+fn default_start_line() -> u32 { 1 }
+fn default_max_lines() -> u32 { 2_000 }
+fn default_read_bytes() -> u32 { 262_144 }
+fn default_timeout() -> u32 { 120 }
+fn default_search_limit() -> u32 { 5 }
+fn default_fetch_bytes() -> u32 { 98_304 }
 
 impl KernelCanonicalInvocation {
     pub fn tool_id(&self) -> KernelToolKind {

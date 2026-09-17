@@ -81,14 +81,6 @@ pub(crate) async fn host_shutdown(
 }
 
 pub(crate) async fn shutdown_owned_host_resources(state: &AppState) -> bool {
-    let terminal_cleanup_ok = state
-        .terminal_runtime
-        .lock()
-        .map(|mut terminal| {
-            terminal.shutdown_all();
-            true
-        })
-        .unwrap_or(false);
     let session_service = state.session_service.clone();
     let session_cleanup_ok = tokio::task::spawn_blocking(move || session_service.shutdown())
         .await
@@ -97,7 +89,7 @@ pub(crate) async fn shutdown_owned_host_resources(state: &AppState) -> bool {
     let plugin_cleanup_ok = tokio::task::spawn_blocking(move || local_agent.shutdown_plugins())
         .await
         .is_ok_and(|result| result.is_ok());
-    session_cleanup_ok && plugin_cleanup_ok && terminal_cleanup_ok
+    session_cleanup_ok && plugin_cleanup_ok
 }
 
 pub(crate) fn request_host_shutdown() {

@@ -2,7 +2,7 @@ use super::*;
 
 /// These copies belong to the tool attempt's Session output directory. Later
 /// workspace edits cannot change the evidence for this invocation.
-pub(super) fn capture_side(
+pub fn capture_side(
     target: &Path,
     context: &KernelToolExecutionContext,
     index: usize,
@@ -23,7 +23,7 @@ pub(super) fn capture_side(
     }
 }
 
-pub(super) fn change_fact(
+pub fn change_fact(
     context: &KernelToolExecutionContext,
     path: &str,
     before: Value,

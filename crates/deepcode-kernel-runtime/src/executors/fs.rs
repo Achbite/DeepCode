@@ -12,29 +12,28 @@ impl KernelToolExecutor for FsReadExecutor {
         invocation: KernelToolInvocation,
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        let path = get_string(&invocation.input, "path").unwrap_or_default();
+        let KernelCanonicalInvocation::FsRead { path, start_line, start_byte, max_lines, max_bytes } = invocation.input else {
+            return Err(KernelError::InvalidCommand("fs.read invocation required".into()));
+        };
         let target = prepared_workspace_target(&context)?;
-        if !target.is_file() {
-            return Err(KernelError::InvalidCommand(format!("{path} is not a file")));
+        let metadata = std::fs::metadata(&target).map_err(|error| KernelError::Structured {
+            code: "fs_read_metadata_failed", stage: "metadata", message: format!("Cannot inspect {path}: {error}"),
+            details: serde_json::json!({"path":path,"ioKind":format!("{:?}",error.kind()),"osCode":error.raw_os_error()}),
+        })?;
+        if !metadata.is_file() {
+            return Err(KernelError::Structured {
+                code: "fs_read_not_file",
+                stage: "metadata",
+                message: format!("{path} is not a regular file"),
+                details: serde_json::json!({"path":path}),
+            });
         }
         let mut output = deepcode_kernel_tools::text_range::read_text_range(
             &target,
-            invocation
-                .input
-                .get("startLine")
-                .and_then(Value::as_u64)
-                .unwrap_or(1),
-            invocation.input.get("startByte").and_then(Value::as_u64),
-            invocation
-                .input
-                .get("maxLines")
-                .and_then(Value::as_u64)
-                .unwrap_or(2000) as usize,
-            invocation
-                .input
-                .get("maxBytes")
-                .and_then(Value::as_u64)
-                .unwrap_or(262144) as usize,
+            u64::from(start_line),
+            start_byte,
+            max_lines as usize,
+            max_bytes as usize,
         )
         .map_err(KernelError::InvalidCommand)?;
         output["workspaceId"] = serde_json::json!(workspace_id(&context)?);
@@ -49,7 +48,9 @@ impl KernelToolExecutor for FsWriteExecutor {
         invocation: KernelToolInvocation,
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        let path = get_string(&invocation.input, "path").unwrap_or_default();
+        let KernelCanonicalInvocation::FsWrite { path, content, executable } = invocation.input else {
+            return Err(KernelError::InvalidCommand("fs.write invocation required".into()));
+        };
         let target = prepared_workspace_target(&context)?;
         let existed = target.exists();
         if existed && !target.is_file() {
@@ -62,8 +63,6 @@ impl KernelToolExecutor for FsWriteExecutor {
         })?;
         fs::create_dir_all(parent)
             .map_err(|error| KernelError::Other(format!("create fs.write parent: {error}")))?;
-        let content = get_string_allow_empty(&invocation.input, "content").unwrap_or_default();
-        let executable = invocation.input.get("executable").and_then(Value::as_bool);
         let content_changed = !existed || !file_matches_content(&target, content.as_bytes())?;
         let before = capture_side(&target, &context, 0, "before");
         let attributes = if existed {
@@ -88,8 +87,7 @@ impl KernelToolExecutor for FsWriteExecutor {
                 "fileChanges": changes,
                 "created": !existed,
                 "saved": true,
-                "sizeBytes": content.len(),
-                "contentHash": deepcode_kernel_tools::hash_bytes(content.as_bytes())
+                "sizeBytes": content.len()
             }),
             mode,
         ))
@@ -102,7 +100,9 @@ impl KernelToolExecutor for FsEditExecutor {
         invocation: KernelToolInvocation,
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        let path = get_string(&invocation.input, "path").unwrap_or_default();
+        let KernelCanonicalInvocation::FsEdit { path, edits } = invocation.input else {
+            return Err(KernelError::InvalidCommand("fs.edit invocation required".into()));
+        };
         let target = prepared_workspace_target(&context)?;
         if !target.is_file() {
             return Err(KernelError::InvalidCommand(format!("{path} is not a file")));
@@ -115,11 +115,7 @@ impl KernelToolExecutor for FsEditExecutor {
                 ))
             })?
             .content;
-        let edits = invocation
-            .input
-            .get("edits")
-            .ok_or_else(|| KernelError::InvalidCommand("fs.edit requires edits".to_string()))?;
-        let patch = apply_exact_text_edits(&original, edits)?;
+        let patch = apply_exact_text_edits(&original, &edits)?;
         let before = capture_side(&target, &context, 0, "before");
         atomic_write_text(&target, &patch.updated)?;
         let after = capture_side(&target, &context, 0, "after");
@@ -136,13 +132,11 @@ impl KernelToolExecutor for FsEditExecutor {
                 "path": normalize_relative_path(&path),
                 "fileChanges": changes,
                 "patched": true,
-                "oldContentHash": deepcode_kernel_tools::hash_bytes(original.as_bytes()),
-                "newContentHash": deepcode_kernel_tools::hash_bytes(patch.updated.as_bytes()),
                 "oldContentBytes": original.len(),
                 "newContentBytes": patch.updated.len(),
                 "changedRanges": patch.changed_ranges,
                 "editPreview": patch.preview,
-                "editCount": edits.as_array().map_or(0, Vec::len)
+                "editCount": edits.len()
             }),
             mode,
         ))
@@ -155,20 +149,12 @@ impl KernelToolExecutor for FsDeleteExecutor {
         invocation: KernelToolInvocation,
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        let path = get_string(&invocation.input, "path").unwrap_or_default();
-        let target_kind = get_string(&invocation.input, "targetKind").ok_or_else(|| {
-            KernelError::InvalidCommand(
-                "fs.delete requires targetKind=file or directoryTree".to_string(),
-            )
-        })?;
-        let target_kind = match target_kind.trim() {
-            "file" => "file",
-            "directoryTree" => "directoryTree",
-            _ => {
-                return Err(KernelError::InvalidCommand(
-                    "fs.delete requires targetKind=file or directoryTree".to_string(),
-                ))
-            }
+        let KernelCanonicalInvocation::FsDelete(delete) = invocation.input else {
+            return Err(KernelError::InvalidCommand("fs.delete invocation required".into()));
+        };
+        let (path, target_kind) = match delete {
+            KernelDeleteTarget::File { path } => (path, "file"),
+            KernelDeleteTarget::DirectoryTree { path } => (path, "directoryTree"),
         };
         let target = prepared_workspace_target(&context)?;
         if target.is_dir() {

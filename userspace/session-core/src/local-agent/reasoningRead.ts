@@ -5,6 +5,7 @@ type Part = { kind: 'text' | 'summary'; content: string };
 
 // A display window, independent of the Provider replay data and journal.
 export class LiveReasoning {
+  reset(): void { this.requestId = ''; this.contents = { text: '', summary: '' }; this.total = 0; }
   private requestId = '';
   private runId = '';
   private contents = { text: '', summary: '' };

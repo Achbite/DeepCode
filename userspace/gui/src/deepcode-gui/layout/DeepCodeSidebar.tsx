@@ -17,6 +17,7 @@ interface DeepCodeSidebarProps {
   projects: ConversationProject[];
   sessions: ConversationSessionSummary[];
   sessionStatuses: Readonly<Record<string, ConversationSessionStatus>>;
+  statusError: string | null;
   readRunMarkers: Readonly<Record<string, string>>;
   collapsedProjectIds: ReadonlySet<string>;
   activeSessionId: string | null;
@@ -47,6 +48,7 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
   projects,
   sessions,
   sessionStatuses,
+  statusError,
   readRunMarkers,
   collapsedProjectIds,
   activeSessionId,
@@ -160,6 +162,7 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || document.querySelector('dialog[open]')) return;
       if (event.key === 'Meta' || event.metaKey) setCommandPressed(true);
       if (!event.metaKey || event.altKey || event.ctrlKey || event.shiftKey || busy) return;
       const match = /^Digit([1-9])$/u.exec(event.code);
@@ -184,7 +187,7 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
   }, [busy, onActivateSession, shortcutSessions]);
 
   return (
-    <aside
+    <div
       className="deepcode-gui-left-rail"
       onPointerMove={movePointer}
       onPointerUp={dropPointer}
@@ -216,8 +219,13 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
       </div>
 
       {reorderError && (
-        <div className="deepcode-gui-sidebar-order-error" role="alert">
+        <div className="deepcode-gui-sidebar-error" role="alert">
           {t(language, 'deepcodeGui.sidebar.orderError', { detail: reorderError })}
+        </div>
+      )}
+      {statusError && (
+        <div className="deepcode-gui-sidebar-error" role="alert">
+          {t(language, 'deepcodeGui.sidebar.statusError', { detail: statusError })}
         </div>
       )}
 
@@ -405,13 +413,15 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
       </section>
 
       <div className="deepcode-gui-sidebar-spacer" />
+      <footer className="deepcode-gui-sidebar-footer">
       <button type="button" className="deepcode-gui-sidebar-settings" onClick={onOpenSettings}>
         <span className="deepcode-gui-sidebar-settings__icon">
           <DeepCodeShellIcon name="settings" />
         </span>
-        <span>{t(language, 'settings.title')}</span>
+        <span>{t(language, 'deepcodeGui.settings.entry')}</span>
       </button>
-    </aside>
+      </footer>
+    </div>
   );
 };
 

@@ -1,3 +1,5 @@
+import UiIcon from '../../icons/registry';
+import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { ContextCompositionProjection, ContextUsageProjection, LlmProviderProfile, LlmReasoningEffort } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
@@ -95,7 +97,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
         onClick={() => { setContextOpen(false); setMenu((current) => current ? null : 'models'); }}>
         <span>{title}</span>
         {selectorEffortLabel && <span className="deepcode-session-model__selector-effort">{selectorEffortLabel}</span>}
-        <span aria-hidden="true">⌄</span>
+        <UiIcon name="chevronDown" size={14} />
       </button>
       {menu && (
         <div ref={menuRef} id={menuId} role="menu" className="deepcode-session-model__menu"
@@ -108,7 +110,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
               {enabled.map((profile) => (
                 <button key={profile.id} type="button" role="menuitemradio" aria-checked={selected?.id === profile.id}
                   disabled={busy} onClick={async () => { await onProfileChange(profile.id); closeMenu(); }}>
-                  <span>{profile.name}</span><span className="deepcode-session-model__tick" aria-hidden="true">{selected?.id === profile.id ? '✓' : ''}</span>
+                  <span>{profile.name}</span><span className="deepcode-session-model__tick" aria-hidden="true">{selected?.id === profile.id ? <DeepCodeShellIcon name="check" size={14} /> : null}</span>
                 </button>
               ))}
             </div>
@@ -128,7 +130,7 @@ const SessionModelSelector: React.FC<SessionModelSelectorProps> = ({
                 aria-checked={reasoningEffortOverride === effort}
                 onClick={async () => { await onReasoningEffortChange(effort); setMenu('models'); }}>
                 <span>{effort ? t(language, `settings.llm.effort.${effort}`) : t(language, 'agent.profile.followDefault')}</span>
-                <span className="deepcode-session-model__tick" aria-hidden="true">{reasoningEffortOverride === effort ? '✓' : ''}</span>
+                <span className="deepcode-session-model__tick" aria-hidden="true">{reasoningEffortOverride === effort ? <DeepCodeShellIcon name="check" size={14} /> : null}</span>
               </button>
             ))}
           </>}

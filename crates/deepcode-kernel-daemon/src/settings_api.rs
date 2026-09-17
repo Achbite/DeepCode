@@ -39,7 +39,9 @@ pub(crate) async fn workspace_sandbox_setup(State(state): State<AppState>) -> Js
 fn setting_activates_at_next_run(key: &str) -> bool {
     key.starts_with("skills.")
         || key.starts_with("mcp.")
+        || key.starts_with("plugins.")
         || key.starts_with("agent.web.search.")
+        || key.starts_with("agent.documents.")
         || key == "agent.systemPrompt"
         || key.starts_with("agent.permissions.")
         || key.starts_with("agent.windows.")
@@ -347,7 +349,7 @@ pub(crate) async fn llm_probe(
             }))
         }
     };
-    match probe_llm_profile_stream(&profile).await {
+    match probe_llm_profile_stream(&state.local_agent.provider_transport.client, &profile).await {
         Ok(output) => ApiResponse::ok(json!({
             "ok": output.response_present,
             "provider": profile.kind,
@@ -380,22 +382,9 @@ pub(crate) async fn llm_probe(
 
 pub(crate) fn default_user_settings() -> Value {
     json!({
-        "editor.tabSize": 4,
-        "editor.insertSpaces": true,
-        "editor.wordWrap": "off",
-        "editor.fontSize": 14,
-        "editor.fontFamily": "Consolas, 'Courier New', monospace",
-        "editor.renderWhitespace": "none",
-        "files.autoSave": "afterDelay",
-        "files.autoSaveDelay": 1000,
-        "files.hotExit": true,
-        "files.encoding": "utf8",
-        "files.eol": "\n",
-        "keyboard.enableBasicShortcuts": true,
-        "explorer.confirmDelete": false,
-        "workbench.colorTheme": "vs-dark",
         "workbench.language": "zh-CN",
         "workbench.styleTokenOverrides": "{}",
+        "workbench.uiPlugins": "[]",
         "agent.systemPrompt": "",
         "agent.responseLanguage": "auto",
         "agent.windows.shell": "auto",
@@ -406,16 +395,16 @@ pub(crate) fn default_user_settings() -> Value {
         "agent.permissions.engineeringDecisions": "ask",
         "agent.permissions.networkRead": "allow",
         "agent.permissions.external": "ask",
-        "terminal.integrated.defaultProfile.windows": "wsl",
-        "terminal.integrated.prewarm": "afterStartup",
-        "terminal.integrated.spawnTimeoutMs": 8000,
         "agent.web.search.endpointTemplate": "",
         "agent.web.search.authHeaderName": "Authorization",
         "agent.web.search.authSecretRef": "",
+        "agent.documents.pythonPath": "",
         "skills.autoLoad": true,
         "skills.mounts": "[]",
         "mcp.autoLoad": false,
         "mcp.servers": "[]",
+        "plugins.sources": "[]",
+        "plugins.disabled": "[]",
         "gui.colorTheme": "light",
         "gui.accentColor": "blue",
         "gui.navigationDensity": "comfortable",
@@ -425,6 +414,12 @@ pub(crate) fn default_user_settings() -> Value {
 }
 
 pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), String> {
+    if settings
+        .get("agent.documents.pythonPath")
+        .is_some_and(|value| !value.is_string())
+    {
+        return Err("agent.documents.pythonPath 必须是字符串。".into());
+    }
     crate::session_environment::response_language_setting(settings)?;
     crate::session_environment::validate_settings(settings)?;
     if let Some(object) = settings.as_object() {

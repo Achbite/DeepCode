@@ -2,9 +2,11 @@
   "schemaVersion": "deepcode.first-party-plugin.v1",
   "id": "pdf",
   "uri": "plugin://pdf@first-party",
-  "displayName": "PDF Reader",
-  "shortDescription": "Extract bounded page ranges from PDF files in the current prepared workspace binding.",
-  "activationMediaTypes": ["application/pdf"],
+  "displayName": "PDF 阅读",
+  "shortDescription": "提取文档内容，按页阅读。",
+  "activationMediaTypes": [
+    "application/pdf"
+  ],
   "providerRef": "tool-provider:first-party:pdf",
   "capabilityRefs": [
     "pdf:paged-text-read"
@@ -18,15 +20,31 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "path": { "type": "string", "minLength": 1, "description": "Workspace-relative path from an attached filesystem reference." },
-          "startPage": { "type": "integer", "minimum": 1, "default": 1 },
-          "endPage": { "type": "integer", "minimum": 1 }
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Workspace-relative path from an attached filesystem reference."
+          },
+          "startPage": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 1
+          },
+          "endPage": {
+            "type": "integer",
+            "minimum": 1
+          }
         },
-        "required": ["path"],
+        "required": [
+          "path"
+        ],
         "additionalProperties": false
       },
       "effect": "workspaceRead",
-      "binding": { "kind": "workspacePath", "argument": "path" },
+      "binding": {
+        "kind": "workspacePath",
+        "argument": "path"
+      },
       "toolContributionRef": "tool-contribution:first-party:pdf.read",
       "promptContribution": {
         "contributionRef": "tool-prompt-contribution:first-party:pdf.read",

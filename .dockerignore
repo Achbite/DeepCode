@@ -15,3 +15,6 @@ _agent_tmp_*
 *.log
 .DS_Store
 Thumbs.db
+.logs
+.task-artifacts
+docs/task-receipts

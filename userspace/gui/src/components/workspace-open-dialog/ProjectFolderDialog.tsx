@@ -1,3 +1,5 @@
+import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
+import ModalDialog from '../shared/ModalDialog';
 import React, { useEffect, useMemo, useState } from 'react';
 import type { BrowseEntry, BrowsePathResult, InitialLocation } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
@@ -67,14 +69,6 @@ const BrowserProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onCancel();
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [onCancel]);
-
   const isAttachmentSelection = selectionMode === 'messageAttachment';
   const allowsFiles = selectionMode !== 'directory';
   const entries = useMemo(
@@ -91,11 +85,9 @@ const BrowserProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
   const selectedType = selectedEntry?.type ?? 'directory';
 
   return (
-    <div className="ws-open-dialog__backdrop" onClick={onCancel}>
+    <ModalDialog className="ws-open-dialog__backdrop" onClose={onCancel} aria-label={title ?? t(language, 'deepcodeGui.project.folderDialogTitle')}>
       <div
         className={`ws-open-dialog${isAttachmentSelection ? ' ws-open-dialog--message-attachment' : ''}`}
-        role="dialog"
-        aria-modal="true"
         aria-label={title ?? t(language, isAttachmentSelection
           ? 'agent.attachment.pickerTitle'
           : 'deepcodeGui.project.folderDialogTitle')}
@@ -115,7 +107,7 @@ const BrowserProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
             className="ws-open-dialog__close"
             aria-label={t(language, 'workspaceDialog.cancel')}
             onClick={onCancel}
-          >×</button>
+          ><DeepCodeShellIcon name="close" size={14} /></button>
         </div>
         <div className="ws-open-dialog__addressbar">
           <button
@@ -166,7 +158,7 @@ const BrowserProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
                 title={location.absolutePath}
               >
                 <span className="ws-open-dialog__sidebar-icon">
-                  {t(language, `workspaceDialog.locationKind.${location.kind}`)}
+                  <DeepCodeShellIcon name={location.kind === 'home' ? 'account' : 'folder'} size={16} />
                 </span>
                 <span>{location.label}</span>
               </button>
@@ -195,7 +187,7 @@ const BrowserProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
                     title={entry.absolutePath}
                   >
                     <span className="ws-open-dialog__entry-icon">
-                      {t(language, `workspaceDialog.entryKind.${entry.type}`)}
+                      <DeepCodeShellIcon name={entry.type === 'directory' ? 'folder' : 'file'} size={16} />
                     </span>
                     <span className="ws-open-dialog__entry-name">{entry.name}</span>
                   </li>
@@ -223,7 +215,7 @@ const BrowserProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
           </div>
         </div>
       </div>
-    </div>
+    </ModalDialog>
   );
 };
 

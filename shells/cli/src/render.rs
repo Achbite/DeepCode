@@ -20,6 +20,7 @@ pub(crate) struct CliRenderState {
     plan_preview: Option<(String, String)>,
     summarized_runs: HashSet<String>,
     queued_inputs: HashMap<String, String>,
+    retry_attempt: Option<String>,
 }
 
 impl CliRenderState {
@@ -55,6 +56,21 @@ impl CliRenderState {
         out: &mut impl Write,
         projection: &SessionProjection,
     ) -> io::Result<()> {
+        if let Some(attempt) = projection
+            .provider_attempts
+            .last()
+            .filter(|attempt| attempt.phase == "retryWaiting")
+        {
+            if self.retry_attempt.as_ref() != Some(&attempt.provider_attempt_id) {
+                self.finish_text(out)?;
+                writeln!(
+                    out,
+                    "网络连接中断，等待第 {}/5 次尝试。",
+                    attempt.attempt + 1
+                )?;
+                self.retry_attempt = Some(attempt.provider_attempt_id.clone());
+            }
+        }
         for input in &projection.queued_inputs {
             if self.queued_inputs.get(&input.message_id) != Some(&input.status) {
                 self.finish_text(out)?;
@@ -721,6 +737,9 @@ pub(crate) fn render_approval(
     approval: &ApprovalProjection,
 ) -> io::Result<()> {
     writeln!(out, "需要你批准：{}", approval.preview.summary)?;
+    if approval.preview.authorization_scope.as_deref() == Some("sessionBrowser") {
+        writeln!(out, "允许后，当前对话内的浏览器页面操作无需重复确认。")?;
+    }
     for target in &approval.preview.logical_targets {
         writeln!(out, "  - {target}")?;
     }
@@ -762,6 +781,35 @@ pub(crate) fn render_terminal_error(
 ) -> io::Result<()> {
     if let Some(error) = projection.terminal_error.as_ref() {
         writeln!(out, "{}: {}", error.code, error.message)?;
+        if let Some(details) = &error.diagnostics {
+            writeln!(
+                out,
+                "  {} · {} · {}",
+                details.source, details.phase, details.category
+            )?;
+            for cause in &details.causes {
+                writeln!(
+                    out,
+                    "  {}{}",
+                    cause.message,
+                    cause
+                        .os_code
+                        .map(|code| format!(" [OS {code}]"))
+                        .unwrap_or_default()
+                )?;
+            }
+            for secondary in &details.secondary {
+                writeln!(out, "  附加错误 {}: {}", secondary.code, secondary.message)?;
+            }
+        }
+        if let Some(snapshot) = &projection.failure_snapshot {
+            writeln!(
+                out,
+                "  已记录失败状态：revision {} · {} 次 Provider 尝试",
+                snapshot.revision,
+                snapshot.provider_attempt_ids.len()
+            )?;
+        }
     }
     Ok(())
 }

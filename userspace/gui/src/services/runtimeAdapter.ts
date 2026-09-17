@@ -8,7 +8,8 @@ type TauriCoreApi = {
 
 declare global {
   interface Window {
-    __TAURI__?: { core?: TauriCoreApi };
+    __TAURI__?: { core?: TauriCoreApi; event?: {listen<T>(name:string,listener:(event:{payload:T})=>void):Promise<()=>void>} };
+    __DEEPCODE_SELF_PREVIEW__?: boolean;
   }
 }
 
@@ -38,6 +39,7 @@ export interface HostStartupStatusV1 {
 }
 
 function tauriInvoke(): TauriCoreApi['invoke'] | null {
+  if (window.__DEEPCODE_SELF_PREVIEW__) return null;
   return window.__TAURI__?.core?.invoke ?? null;
 }
 
@@ -195,32 +197,10 @@ export const getHealth = api.getHealth;
 export const getCurrentWorkspace = api.getCurrentWorkspace;
 export const openWorkspace = api.openWorkspace;
 export const saveWorkspaceFile = api.saveWorkspaceFile;
-export const patchWorkspaceSettings = api.patchWorkspaceSettings;
 export const getInitialLocations = api.getInitialLocations;
 export const browsePath = api.browsePath;
-export const getFileTree = api.getFileTree;
-export const readFile = api.readFile;
-export const codeSearch = api.codeSearch;
-export const getGitStatus = api.getGitStatus;
-export const getGitDiff = api.getGitDiff;
 export const getUserSettings = api.getUserSettings;
 export const patchUserSettings = api.patchUserSettings;
 export const getLlmProfiles = api.getLlmProfiles;
 export const patchLlmProfiles = api.patchLlmProfiles;
 export const probeLlmProfile = api.probeLlmProfile;
-export const getShellEnvironment = api.getShellEnvironment;
-export const getTerminalCapabilities = api.getTerminalCapabilities;
-export const getTerminalWarmupStatus = api.getTerminalWarmupStatus;
-export const warmupTerminalRuntime = api.warmupTerminalRuntime;
-export const listTerminalSessions = api.listTerminalSessions;
-export const createTerminalSession = api.createTerminalSession;
-export const sendTerminalInput = api.sendTerminalInput;
-export const resizeTerminalSession = api.resizeTerminalSession;
-export const updateTerminalSession = api.updateTerminalSession;
-export const restartTerminalSession = api.restartTerminalSession;
-export const deleteTerminalSession = api.deleteTerminalSession;
-export const getTerminalEvents = api.getTerminalEvents;
-export const getBrowserRuntimeStatus = api.getBrowserRuntimeStatus;
-export const openBrowserPreview = api.openBrowserPreview;
-export const reloadBrowserPreview = api.reloadBrowserPreview;
-export const setBrowserInspectMode = api.setBrowserInspectMode;

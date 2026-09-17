@@ -1,3 +1,6 @@
+use crate::local_agent_api::{
+    LocalProviderHostedTool, LocalProviderMessage, LocalProviderToolCall,
+};
 use crate::prelude::*;
 use crate::*;
 use axum::body::Body;
@@ -25,11 +28,19 @@ pub(crate) struct ResolvedLlmProfile {
     pub(crate) api_key: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct LlmToolDefinition {
     pub(crate) name: String,
     pub(crate) description: String,
     pub(crate) input_schema: Value,
+}
+
+pub(crate) struct ProviderRequestInput {
+    pub(crate) messages: Vec<LocalProviderMessage>,
+    pub(crate) tools: Vec<LlmToolDefinition>,
+    pub(crate) hosted_tools: Vec<LocalProviderHostedTool>,
+    pub(crate) require_tool_call: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -183,7 +194,7 @@ pub(crate) fn resolve_llm_profile(
 
 pub(crate) fn openai_compatible_request_body(
     profile: &ResolvedLlmProfile,
-    messages: Vec<Value>,
+    messages: &[LocalProviderMessage],
     tools: &[LlmToolDefinition],
     stream: bool,
     require_tool_call: bool,
@@ -192,7 +203,7 @@ pub(crate) fn openai_compatible_request_body(
     let mut body = json!({
         "model": profile.model,
         "messages": messages
-            .into_iter()
+            .iter()
             .map(|message| openai_compatible_message(message, compatibility))
             .collect::<Vec<_>>(),
         "stream": stream,
@@ -255,9 +266,9 @@ pub(crate) fn openai_compatible_request_body(
 
 fn responses_request_body(
     profile: &ResolvedLlmProfile,
-    messages: Vec<Value>,
+    messages: &[LocalProviderMessage],
     tools: &[LlmToolDefinition],
-    hosted_tools: &[Value],
+    hosted_tools: &[LocalProviderHostedTool],
     stream: bool,
     require_tool_call: bool,
 ) -> Result<Value, ProviderTransportError> {
@@ -273,16 +284,7 @@ fn responses_request_body(
         })
         .collect::<Vec<_>>();
     for tool in hosted_tools {
-        let tool = tool.as_object().ok_or_else(|| {
-            ProviderTransportError::message(
-                "provider_hosted_tool_invalid",
-                "Responses hosted tool 不是对象。",
-            )
-        })?;
-        if tool.len() != 2
-            || tool.get("type").and_then(Value::as_str) != Some("webSearch")
-            || tool.get("providerToolType").and_then(Value::as_str) != Some("web_search")
-        {
+        if tool.tool_type != "webSearch" || tool.provider_tool_type != "web_search" {
             return Err(ProviderTransportError::message(
                 "provider_hosted_tool_invalid",
                 "Responses hosted tool 合同无效。",
@@ -319,31 +321,24 @@ fn responses_request_body(
     Ok(body)
 }
 
-fn responses_input(messages: Vec<Value>) -> Result<Vec<Value>, ProviderTransportError> {
+fn responses_input(
+    messages: &[LocalProviderMessage],
+) -> Result<Vec<Value>, ProviderTransportError> {
     let mut input = Vec::new();
     for message in messages {
-        let record = message.as_object().ok_or_else(|| {
-            ProviderTransportError::message("provider_envelope_invalid", "Responses 消息不是对象。")
-        })?;
-        if let Some(blocks) = record
-            .get("providerOutputBlocks")
-            .filter(|blocks| !blocks.is_null())
-        {
-            if record.get("role").and_then(Value::as_str) != Some("assistant") {
+        if let Some(blocks) = &message.provider_output_blocks {
+            if message.role != "assistant" {
                 return Err(ProviderTransportError::message(
                     "provider_envelope_invalid",
                     "Responses providerOutputBlocks 只能属于 assistant 消息。",
                 ));
             }
-            let blocks = blocks
-                .as_array()
-                .filter(|blocks| !blocks.is_empty())
-                .ok_or_else(|| {
-                    ProviderTransportError::message(
-                        "provider_envelope_invalid",
-                        "Responses providerOutputBlocks 不是非空数组。",
-                    )
-                })?;
+            if blocks.is_empty() {
+                return Err(ProviderTransportError::message(
+                    "provider_envelope_invalid",
+                    "Responses providerOutputBlocks 不能为空。",
+                ));
+            }
             for block in blocks {
                 let item = block.get("item").ok_or_else(|| {
                     ProviderTransportError::message(
@@ -361,16 +356,7 @@ fn responses_input(messages: Vec<Value>) -> Result<Vec<Value>, ProviderTransport
             }
             continue;
         }
-        if let Some(provider_items) = record
-            .get("providerItems")
-            .filter(|provider_items| !provider_items.is_null())
-        {
-            let provider_items = provider_items.as_array().ok_or_else(|| {
-                ProviderTransportError::message(
-                    "provider_envelope_invalid",
-                    "Responses providerItems 不是数组。",
-                )
-            })?;
+        if let Some(provider_items) = &message.provider_items {
             for item in provider_items {
                 if !valid_responses_hosted_search_item(item) {
                     return Err(ProviderTransportError::message(
@@ -381,29 +367,12 @@ fn responses_input(messages: Vec<Value>) -> Result<Vec<Value>, ProviderTransport
                 input.push(item.clone());
             }
         }
-        let role = record
-            .get("role")
-            .and_then(Value::as_str)
-            .filter(|role| matches!(*role, "system" | "user" | "assistant" | "tool"))
-            .ok_or_else(|| {
-                ProviderTransportError::message(
-                    "provider_envelope_invalid",
-                    "Responses 消息角色无效。",
-                )
-            })?;
-        let content = record
-            .get("content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ProviderTransportError::message(
-                    "provider_envelope_invalid",
-                    "Responses 消息正文不是字符串。",
-                )
-            })?;
+        let role = message.role.as_str();
+        let content = &message.content;
         if role == "tool" {
-            let call_id = record
-                .get("providerCallId")
-                .and_then(Value::as_str)
+            let call_id = message
+                .provider_call_id
+                .as_deref()
                 .filter(|call_id| !call_id.trim().is_empty())
                 .ok_or_else(|| {
                     ProviderTransportError::message(
@@ -428,52 +397,8 @@ fn responses_input(messages: Vec<Value>) -> Result<Vec<Value>, ProviderTransport
                 }],
             }));
         }
-        let calls = match record.get("toolCalls").filter(|calls| !calls.is_null()) {
-            Some(value) => value.as_array().ok_or_else(|| {
-                ProviderTransportError::message(
-                    "provider_envelope_invalid",
-                    "Responses toolCalls 不是数组。",
-                )
-            })?,
-            None => continue,
-        };
-        for call in calls {
-            let call = call.as_object().ok_or_else(|| {
-                ProviderTransportError::message(
-                    "provider_envelope_invalid",
-                    "Responses toolCalls 成员不是对象。",
-                )
-            })?;
-            let call_id = call
-                .get("providerCallId")
-                .and_then(Value::as_str)
-                .filter(|call_id| !call_id.trim().is_empty())
-                .ok_or_else(|| {
-                    ProviderTransportError::message(
-                        "provider_envelope_invalid",
-                        "Responses function_call 缺少 providerCallId。",
-                    )
-                })?;
-            let name = call
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|name| !name.trim().is_empty())
-                .ok_or_else(|| {
-                    ProviderTransportError::message(
-                        "provider_envelope_invalid",
-                        "Responses function_call 缺少工具名称。",
-                    )
-                })?;
-            let arguments = call
-                .get("input")
-                .filter(|input| input.is_object() || input.is_string())
-                .ok_or_else(|| {
-                    ProviderTransportError::message(
-                        "provider_envelope_invalid",
-                        "Responses function_call 参数不是对象或原始 JSON 字符串。",
-                    )
-                })?;
-            let arguments = match arguments {
+        for call in message.tool_calls.iter().flatten() {
+            let arguments = match &call.input {
                 Value::String(text) => text.clone(),
                 value => serde_json::to_string(value).map_err(|error| {
                     ProviderTransportError::message(
@@ -484,8 +409,8 @@ fn responses_input(messages: Vec<Value>) -> Result<Vec<Value>, ProviderTransport
             };
             input.push(json!({
                 "type": "function_call",
-                "call_id": call_id,
-                "name": name,
+                "call_id": call.provider_call_id,
+                "name": call.name,
                 "arguments": arguments,
             }));
         }
@@ -529,24 +454,17 @@ fn valid_responses_replay_item(item: &Value) -> bool {
 }
 
 fn openai_compatible_message(
-    message: Value,
+    message: &LocalProviderMessage,
     compatibility: ProviderThinkingCompatibility,
 ) -> Value {
-    let Some(record) = message.as_object() else {
-        return message;
-    };
-    let role = record.get("role").and_then(Value::as_str).unwrap_or("user");
+    let role = message.role.as_str();
     match role {
         "assistant" => {
             let mut output = json!({
                 "role": "assistant",
-                "content": message_content_string(record.get("content"))
+                "content": message.content
             });
-            if let Some(reasoning) = record
-                .get("reasoningContent")
-                .or_else(|| record.get("reasoning_content"))
-                .and_then(Value::as_str)
-            {
+            if let Some(reasoning) = &message.reasoning_content {
                 output[if matches!(
                     compatibility,
                     ProviderThinkingCompatibility::DeepSeek
@@ -558,17 +476,12 @@ fn openai_compatible_message(
                     "reasoning"
                 }] = json!(reasoning);
             }
-            let calls = record
-                .get("toolCalls")
-                .or_else(|| record.get("tool_calls"))
-                .and_then(Value::as_array)
-                .map(|calls| {
-                    calls
-                        .iter()
-                        .filter_map(openai_tool_call)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let calls = message
+                .tool_calls
+                .iter()
+                .flatten()
+                .map(openai_tool_call)
+                .collect::<Vec<_>>();
             if !calls.is_empty() {
                 output["tool_calls"] = Value::Array(calls);
                 if compatibility == ProviderThinkingCompatibility::DeepSeek
@@ -586,24 +499,19 @@ fn openai_compatible_message(
         }
         "tool" => json!({
             "role": "tool",
-            "tool_call_id": record
-                .get("providerCallId")
-                .and_then(Value::as_str)
+            "tool_call_id": message.provider_call_id.as_deref()
                 .expect("validated tool message has providerCallId"),
-            "content": provider_tool_content(record.get("content"), compatibility)
+            "content": provider_tool_content(&message.content, compatibility)
         }),
         _ => json!({
             "role": role,
-            "content": message_content_string(record.get("content"))
+            "content": message.content
         }),
     }
 }
 
-fn provider_tool_content(
-    content: Option<&Value>,
-    compatibility: ProviderThinkingCompatibility,
-) -> String {
-    let text = message_content_string(content);
+fn provider_tool_content(content: &str, compatibility: ProviderThinkingCompatibility) -> String {
+    let text = content.to_owned();
     if compatibility == ProviderThinkingCompatibility::Moonshot {
         if let Ok(result) = serde_json::from_str::<Value>(&text) {
             if result["outcome"] == "completed" && result["output"]["provider"] == "kimi-formula" {
@@ -616,41 +524,18 @@ fn provider_tool_content(
     text
 }
 
-fn openai_tool_call(value: &Value) -> Option<Value> {
-    let record = value.as_object()?;
-    let function = record.get("function").and_then(Value::as_object);
-    let name = function
-        .and_then(|value| value.get("name"))
-        .or_else(|| record.get("name"))
-        .and_then(Value::as_str)?;
-    let arguments = function
-        .and_then(|value| value.get("arguments"))
-        .or_else(|| record.get("input"))
-        .or_else(|| record.get("arguments"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    Some(json!({
-        "id": record
-            .get("providerCallId")
-            .and_then(Value::as_str)
-            .expect("validated tool call has providerCallId"),
+fn openai_tool_call(call: &LocalProviderToolCall) -> Value {
+    json!({
+        "id": call.provider_call_id,
         "type": "function",
         "function": {
-            "name": name,
-            "arguments": match arguments {
-                Value::String(text) => text,
-                value => serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+            "name": call.name,
+            "arguments": match &call.input {
+                Value::String(text) => text.clone(),
+                value => value.to_string(),
             }
         }
-    }))
-}
-
-pub(crate) fn message_content_string(value: Option<&Value>) -> String {
-    match value {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Null) | None => String::new(),
-        Some(value) => serde_json::to_string(value).unwrap_or_default(),
-    }
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -724,35 +609,19 @@ struct PreparedProviderRequest {
 
 fn prepare_provider_request(
     profile: &ResolvedLlmProfile,
-    envelope: &Value,
+    envelope: &ProviderRequestInput,
 ) -> Result<PreparedProviderRequest, ProviderTransportError> {
     let kind = ProviderStreamKind::from_profile_kind(&profile.kind)
         .ok_or_else(|| ProviderTransportError::new("provider_kind_unsupported"))?;
-    let messages = envelope
-        .get("messages")
-        .and_then(Value::as_array)
-        .cloned()
-        .ok_or_else(|| ProviderTransportError::new("provider_envelope_invalid"))?;
-    let tools = envelope
-        .get("tools")
-        .and_then(Value::as_array)
-        .cloned()
-        .map(provider_tools_from_values)
-        .ok_or_else(|| ProviderTransportError::new("provider_envelope_invalid"))?;
-    let hosted_tools = envelope
-        .get("hostedTools")
-        .and_then(Value::as_array)
-        .cloned()
-        .ok_or_else(|| ProviderTransportError::new("provider_envelope_invalid"))?;
+    let messages = envelope.messages.as_slice();
+    let tools = envelope.tools.as_slice();
+    let hosted_tools = envelope.hosted_tools.as_slice();
     if !hosted_tools.is_empty() && kind != ProviderStreamKind::Responses {
         return Err(ProviderTransportError::new(
             "provider_hosted_tool_unsupported",
         ));
     }
-    let require_tool_call = envelope
-        .get("requireToolCall")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| ProviderTransportError::new("provider_envelope_invalid"))?;
+    let require_tool_call = envelope.require_tool_call;
     if require_tool_call && tools.is_empty() {
         return Err(ProviderTransportError::new(
             "provider_required_tool_missing",
@@ -803,11 +672,12 @@ fn provider_request_url(profile: &ResolvedLlmProfile, kind: ProviderStreamKind) 
 }
 
 fn build_provider_request(
+    client: &reqwest::Client,
     profile: &ResolvedLlmProfile,
     prepared: &PreparedProviderRequest,
 ) -> Result<reqwest::RequestBuilder, ProviderTransportError> {
     let url = provider_request_url(profile, prepared.kind);
-    let mut request = reqwest::Client::new()
+    let mut request = client
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(prepared.body.clone());
@@ -944,27 +814,39 @@ fn trimmed_payload(raw: &[u8]) -> Option<Vec<u8>> {
 }
 
 pub(crate) async fn probe_llm_profile_stream(
+    client: &reqwest::Client,
     profile: &ResolvedLlmProfile,
 ) -> Result<LlmStreamProbeResult, ProviderTransportError> {
-    tokio::time::timeout(LLM_PROFILE_PROBE_TIMEOUT, probe_profile(profile))
+    tokio::time::timeout(LLM_PROFILE_PROBE_TIMEOUT, probe_profile(client, profile))
         .await
         .unwrap_or_else(|_| Err(ProviderTransportError::new("provider_probe_timeout")))
 }
 
 async fn probe_profile(
+    client: &reqwest::Client,
     profile: &ResolvedLlmProfile,
 ) -> Result<LlmStreamProbeResult, ProviderTransportError> {
     let prepared = prepare_provider_request(
         profile,
-        &json!({
-            "messages": [{ "role": "user", "content": "Reply with OK." }],
-            "tools": [],
-            "hostedTools": [],
-            "requireToolCall": false
-        }),
+        &ProviderRequestInput {
+            messages: vec![LocalProviderMessage {
+                role: "user".into(),
+                content: "Reply with OK.".into(),
+                reasoning_content: None,
+                reasoning_signature: None,
+                tool_call_id: None,
+                provider_call_id: None,
+                tool_calls: None,
+                provider_items: None,
+                provider_output_blocks: None,
+            }],
+            tools: vec![],
+            hosted_tools: vec![],
+            require_tool_call: false,
+        },
     )?;
     let kind = prepared.kind;
-    let mut response = build_provider_request(profile, &prepared)?
+    let mut response = build_provider_request(client, profile, &prepared)?
         .send()
         .await
         .map_err(|_| ProviderTransportError::new("provider_transport_failed"))?;
@@ -1011,13 +893,16 @@ async fn probe_profile(
 }
 
 pub(crate) fn local_agent_provider_stream_response(
+    client: reqwest::Client,
+    provider_attempt_id: Option<String>,
     profile: ResolvedLlmProfile,
-    request_envelope: Value,
+    request_envelope: ProviderRequestInput,
     request_id: String,
     archive_directory: std::path::PathBuf,
     archive_identity: Value,
 ) -> Response {
     let response_request_id = request_id.clone();
+    let response_attempt_id = provider_attempt_id.clone();
     let stream = async_stream::stream! {
         let mut archive = match deepcode_kernel_runtime::execution_archive::ExecutionArchive::open(
             Some(&archive_directory),
@@ -1026,7 +911,7 @@ pub(crate) fn local_agent_provider_stream_response(
             Ok(archive) => archive,
             Err(error) => {
                 yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(
-                    &request_id,
+                    &request_id, provider_attempt_id.as_deref(),
                     "failed",
                     json!({"code": "execution_archive_failed", "message": error.to_string()}),
                 )));
@@ -1038,7 +923,7 @@ pub(crate) fn local_agent_provider_stream_response(
             Err(error) => {
                 let (packet, archive_failed) = archived_provider_event(
                     &mut archive,
-                    &request_id,
+                    &request_id, provider_attempt_id.as_deref(),
                     "failed",
                     json!({ "code": error.code, "message": error.safe_message() }),
                 );
@@ -1062,18 +947,18 @@ pub(crate) fn local_agent_provider_stream_response(
             .and_then(|()| archive.bytes("request.body", &prepared.body))
         {
             yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(
-                &request_id,
+                &request_id, provider_attempt_id.as_deref(),
                 "failed",
                 json!({"code": "execution_archive_failed", "message": error.to_string()}),
             )));
             return;
         }
-        let request = match build_provider_request(&profile, &prepared) {
+        let request = match build_provider_request(&client, &profile, &prepared) {
             Ok(request) => request,
             Err(error) => {
                 let (packet, archive_failed) = archived_provider_event(
                     &mut archive,
-                    &request_id,
+                    &request_id, provider_attempt_id.as_deref(),
                     "failed",
                     json!({ "code": error.code, "message": error.safe_message() }),
                 );
@@ -1089,12 +974,9 @@ pub(crate) fn local_agent_provider_stream_response(
             Err(error) => {
                 let (packet, archive_failed) = archived_provider_event(
                     &mut archive,
-                    &request_id,
+                    &request_id, provider_attempt_id.as_deref(),
                     "failed",
-                    json!({
-                        "code": "provider_transport_failed",
-                        "message": format!("Provider 连接失败：{error}"),
-                    }),
+                    crate::provider_transport::network_failure(error, "send", profile.api_key.as_deref()),
                 );
                 yield Ok::<Bytes, Infallible>(Bytes::from(packet));
                 if archive_failed {
@@ -1105,34 +987,34 @@ pub(crate) fn local_agent_provider_stream_response(
         };
         if let Err(error) = archive.record("response.headers", json!({
                 "statusCode": response.status().as_u16(),
-                "url": response.url().as_str(),
+                "url": crate::provider_transport::safe_detail(response.url().as_str(), profile.api_key.as_deref()),
                 "contentType": response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
             })) {
-                yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(&request_id, "failed",
+                yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(&request_id, provider_attempt_id.as_deref(), "failed",
                     json!({"code": "execution_archive_failed", "message": error.to_string()}))));
                 return;
             }
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let message = match provider_http_error_message(&mut response, status, &mut archive).await {
+            let (message, body_error) = match provider_http_error_message(&mut response, status, &mut archive, profile.api_key.as_deref()).await {
                 Ok(message) => message,
                 Err(error) => {
                     yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(
-                        &request_id,
+                        &request_id, provider_attempt_id.as_deref(),
                         "failed",
-                        json!({"code": "execution_archive_failed", "message": error.to_string()}),
+                        crate::provider_transport::secondary_failure(
+                            json!({"code":"provider_http_failed", "message":format!("Provider 返回 HTTP {status}。")}),
+                            "execution_archive_failed", error.to_string()),
                     )));
                     return;
                 }
             };
             let (packet, archive_failed) = archived_provider_event(
                 &mut archive,
-                &request_id,
+                &request_id, provider_attempt_id.as_deref(),
                 "failed",
-                json!({
-                    "code": "provider_http_failed",
-                    "message": message,
-                }),
+                { let mut failure = json!({"code":"provider_http_failed", "message":crate::provider_transport::safe_detail(&message, profile.api_key.as_deref())});
+                  if let Some(error) = body_error { failure["diagnostics"] = error["diagnostics"].clone(); failure["diagnostics"]["retryable"] = json!(false); } failure },
             );
             yield Ok::<Bytes, Infallible>(Bytes::from(packet));
             if archive_failed {
@@ -1147,7 +1029,7 @@ pub(crate) fn local_agent_provider_stream_response(
                 Ok(Some(chunk)) => {
                     if let Err(error) = archive.bytes("response.chunk", &chunk) {
                         yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(
-                            &request_id,
+                            &request_id, provider_attempt_id.as_deref(),
                             "failed",
                             json!({"code": "execution_archive_failed", "message": error.to_string()}),
                         )));
@@ -1158,7 +1040,7 @@ pub(crate) fn local_agent_provider_stream_response(
                         Err(error) => {
                             let (packet, archive_failed) = archived_provider_event(
                                 &mut archive,
-                                &request_id,
+                                &request_id, provider_attempt_id.as_deref(),
                                 "failed",
                                 json!({ "code": error.code, "message": error.safe_message() }),
                             );
@@ -1175,7 +1057,7 @@ pub(crate) fn local_agent_provider_stream_response(
                     Err(error) => {
                         let (packet, archive_failed) = archived_provider_event(
                             &mut archive,
-                            &request_id,
+                            &request_id, provider_attempt_id.as_deref(),
                             "failed",
                             json!({ "code": error.code, "message": error.safe_message() }),
                         );
@@ -1189,12 +1071,9 @@ pub(crate) fn local_agent_provider_stream_response(
                 Err(error) => {
                     let (packet, archive_failed) = archived_provider_event(
                         &mut archive,
-                        &request_id,
+                        &request_id, provider_attempt_id.as_deref(),
                         "failed",
-                        json!({
-                            "code": "provider_stream_read_failed",
-                            "message": format!("读取 Provider 流失败：{error}"),
-                        }),
+                        crate::provider_transport::network_failure(error, "responseBody", profile.api_key.as_deref()),
                     );
                     yield Ok::<Bytes, Infallible>(Bytes::from(packet));
                     if archive_failed {
@@ -1209,7 +1088,7 @@ pub(crate) fn local_agent_provider_stream_response(
                     Err(error) => {
                         let (packet, archive_failed) = archived_provider_event(
                             &mut archive,
-                            &request_id,
+                            &request_id, provider_attempt_id.as_deref(),
                             "failed",
                             json!({ "code": error.code, "message": error.message }),
                         );
@@ -1230,7 +1109,7 @@ pub(crate) fn local_agent_provider_stream_response(
                                 .remove("type");
                             let (packet, archive_failed) = archived_provider_event(
                                 &mut archive,
-                                &request_id,
+                                &request_id, provider_attempt_id.as_deref(),
                                 "tool.call.delta",
                                 data,
                             );
@@ -1260,7 +1139,7 @@ pub(crate) fn local_agent_provider_stream_response(
                                 data["kind"] = json!("summary");
                             }
                             let (packet, archive_failed) =
-                                archived_provider_event(&mut archive, &request_id, provider_type, data);
+                                archived_provider_event(&mut archive, &request_id, provider_attempt_id.as_deref(), provider_type, data);
                             yield Ok::<Bytes, Infallible>(Bytes::from(packet));
                             if archive_failed {
                                 return;
@@ -1272,7 +1151,7 @@ pub(crate) fn local_agent_provider_stream_response(
                             else {
                                 let (packet, archive_failed) = archived_provider_event(
                                     &mut archive,
-                                    &request_id,
+                                    &request_id, provider_attempt_id.as_deref(),
                                     "failed",
                                     json!({
                                         "code": "provider_stream_emission_invalid",
@@ -1288,7 +1167,7 @@ pub(crate) fn local_agent_provider_stream_response(
                             let Some(item) = emission.event.get("item") else {
                                 let (packet, archive_failed) = archived_provider_event(
                                     &mut archive,
-                                    &request_id,
+                                    &request_id, provider_attempt_id.as_deref(),
                                     "failed",
                                     json!({
                                         "code": "provider_stream_emission_invalid",
@@ -1306,7 +1185,7 @@ pub(crate) fn local_agent_provider_stream_response(
                             {
                                 let (packet, archive_failed) = archived_provider_event(
                                     &mut archive,
-                                    &request_id,
+                                    &request_id, provider_attempt_id.as_deref(),
                                     "failed",
                                     json!({
                                         "code": "provider_hosted_search_unrequested",
@@ -1321,7 +1200,7 @@ pub(crate) fn local_agent_provider_stream_response(
                             }
                             let (packet, archive_failed) = archived_provider_event(
                                 &mut archive,
-                                &request_id,
+                                &request_id, provider_attempt_id.as_deref(),
                                 "output.item.completed",
                                 json!({
                                     "outputIndex": output_index,
@@ -1346,7 +1225,7 @@ pub(crate) fn local_agent_provider_stream_response(
             Err(error) => {
                 let (packet, archive_failed) = archived_provider_event(
                     &mut archive,
-                    &request_id,
+                    &request_id, provider_attempt_id.as_deref(),
                     "failed",
                     json!({ "code": error.code, "message": error.message }),
                 );
@@ -1360,7 +1239,7 @@ pub(crate) fn local_agent_provider_stream_response(
         if !prepared.hosted_web_search_enabled && !result.output.hosted_web_search_calls.is_empty() {
             let (packet, archive_failed) = archived_provider_event(
                 &mut archive,
-                &request_id,
+                &request_id, provider_attempt_id.as_deref(),
                 "failed",
                 json!({
                     "code": "provider_hosted_search_unrequested",
@@ -1403,7 +1282,7 @@ pub(crate) fn local_agent_provider_stream_response(
                 message["reasoningSignature"] = json!(signature);
             }
             let (packet, archive_failed) =
-                archived_provider_event(&mut archive, &request_id, "assistant.message", message);
+                archived_provider_event(&mut archive, &request_id, provider_attempt_id.as_deref(), "assistant.message", message);
             yield Ok::<Bytes, Infallible>(Bytes::from(packet));
             if archive_failed {
                 return;
@@ -1430,7 +1309,7 @@ pub(crate) fn local_agent_provider_stream_response(
             for call in result.output.tool_calls {
                 let (packet, archive_failed) = archived_provider_event(
                     &mut archive,
-                    &request_id,
+                    &request_id, provider_attempt_id.as_deref(),
                     "tool.call",
                     json!({
                         "callId": call.id,
@@ -1446,7 +1325,7 @@ pub(crate) fn local_agent_provider_stream_response(
             for item in result.output.hosted_web_search_calls {
                 let (packet, archive_failed) = archived_provider_event(
                     &mut archive,
-                    &request_id,
+                    &request_id, provider_attempt_id.as_deref(),
                     "hosted.web-search.completed",
                     json!({ "item": item }),
                 );
@@ -1457,7 +1336,7 @@ pub(crate) fn local_agent_provider_stream_response(
             }
         }
         let (packet, archive_failed) =
-            archived_provider_event(&mut archive, &request_id, "completed", completed_data);
+            archived_provider_event(&mut archive, &request_id, provider_attempt_id.as_deref(), "completed", completed_data);
         yield Ok::<Bytes, Infallible>(Bytes::from(packet));
         if archive_failed {
             return;
@@ -1470,6 +1349,7 @@ pub(crate) fn local_agent_provider_stream_response(
         .unwrap_or_else(|_| {
             Response::new(Body::from(provider_event(
                 &response_request_id,
+                response_attempt_id.as_deref(),
                 "failed",
                 json!({
                     "code": "provider_response_build_failed",
@@ -1484,9 +1364,18 @@ pub(crate) fn local_agent_provider_stream_response(
 fn archived_provider_event(
     archive: &mut deepcode_kernel_runtime::execution_archive::ExecutionArchive,
     request_id: &str,
+    provider_attempt_id: Option<&str>,
     event_type: &str,
-    data: Value,
+    mut data: Value,
 ) -> (String, bool) {
+    if event_type == "failed" {
+        if !data["diagnostics"].is_object() {
+            data["diagnostics"] = json!({"source":"providerTransport", "phase":"response", "category":"protocol", "retryable":false, "causes":[]});
+        }
+        if let Some(path) = archive.path() {
+            data["diagnostics"]["archivePath"] = json!(path.to_string_lossy());
+        }
+    }
     let written = archive
         .record("session.event", json!({"type": event_type, "data": &data}))
         .and_then(|()| {
@@ -1497,14 +1386,24 @@ fn archived_provider_event(
             }
         });
     match written {
-        Ok(()) => (provider_event(request_id, event_type, data), false),
+        Ok(()) => (
+            provider_event(request_id, provider_attempt_id, event_type, data),
+            false,
+        ),
         Err(error) => (
             provider_event(
                 request_id,
+                provider_attempt_id,
                 "failed",
-                json!({
-                    "code": "execution_archive_failed", "message": error.to_string(),
-                }),
+                if event_type == "failed" {
+                    crate::provider_transport::secondary_failure(
+                        data,
+                        "execution_archive_failed",
+                        error.to_string(),
+                    )
+                } else {
+                    json!({"code":"execution_archive_failed","message":error.to_string()})
+                },
             ),
             true,
         ),
@@ -1515,8 +1414,10 @@ async fn provider_http_error_message(
     response: &mut reqwest::Response,
     status: u16,
     archive: &mut deepcode_kernel_runtime::execution_archive::ExecutionArchive,
-) -> std::io::Result<String> {
+    secret: Option<&str>,
+) -> std::io::Result<(String, Option<Value>)> {
     let mut body = Vec::new();
+    let mut body_error = None;
     while body.len() < PROVIDER_ERROR_BODY_LIMIT {
         match response.chunk().await {
             Ok(Some(chunk)) => {
@@ -1524,7 +1425,15 @@ async fn provider_http_error_message(
                 let remaining = PROVIDER_ERROR_BODY_LIMIT - body.len();
                 body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
             }
-            Ok(None) | Err(_) => break,
+            Ok(None) => break,
+            Err(error) => {
+                body_error = Some(crate::provider_transport::network_failure(
+                    error,
+                    "errorBody",
+                    secret,
+                ));
+                break;
+            }
         }
     }
     archive.record(
@@ -1534,10 +1443,13 @@ async fn provider_http_error_message(
             "limitReached": body.len() == PROVIDER_ERROR_BODY_LIMIT,
         }),
     )?;
-    Ok(match provider_http_error_detail(&body) {
-        Some(detail) => format!("Provider 返回 HTTP {status}：{detail}"),
-        None => format!("Provider 返回 HTTP {status}。"),
-    })
+    Ok((
+        match provider_http_error_detail(&body) {
+            Some(detail) => format!("Provider 返回 HTTP {status}：{detail}"),
+            None => format!("Provider 返回 HTTP {status}。"),
+        },
+        body_error,
+    ))
 }
 
 fn provider_http_error_detail(body: &[u8]) -> Option<String> {
@@ -1559,16 +1471,22 @@ fn provider_http_error_detail(body: &[u8]) -> Option<String> {
     )
 }
 
-fn provider_event(request_id: &str, event_type: &str, data: Value) -> String {
-    sse_json_event(
-        "provider_event",
-        json!({
-            "schemaVersion": "deepcode.provider-event",
-            "requestId": request_id,
-            "type": event_type,
-            "data": data,
-        }),
-    )
+fn provider_event(
+    request_id: &str,
+    provider_attempt_id: Option<&str>,
+    event_type: &str,
+    data: Value,
+) -> String {
+    let mut event = json!({
+        "schemaVersion": "deepcode.provider-event",
+        "requestId": request_id,
+        "type": event_type,
+        "data": data,
+    });
+    if let Some(attempt) = provider_attempt_id {
+        event["providerAttemptId"] = json!(attempt);
+    }
+    sse_json_event("provider_event", event)
 }
 
 fn token_limit_u32(value: &Value) -> Option<u32> {
@@ -1639,14 +1557,14 @@ fn provider_thinking_compatibility(profile: &ResolvedLlmProfile) -> ProviderThin
     }
 }
 
-pub(crate) fn split_system_messages(messages: Vec<Value>) -> (String, Vec<Value>) {
+pub(crate) fn split_system_messages(
+    messages: &[LocalProviderMessage],
+) -> (String, Vec<&LocalProviderMessage>) {
     let mut system = Vec::new();
     let mut chat = Vec::new();
     for message in messages {
-        if message.get("role").and_then(Value::as_str) == Some("system") {
-            if let Some(content) = message.get("content").and_then(Value::as_str) {
-                system.push(content.to_string());
-            }
+        if message.role == "system" {
+            system.push(message.content.as_str());
         } else {
             chat.push(message);
         }
@@ -1658,9 +1576,18 @@ pub(crate) fn split_system_messages(messages: Vec<Value>) -> (String, Vec<Value>
 mod tests {
     use super::*;
 
+    fn provider_input(value: Value) -> ProviderRequestInput {
+        ProviderRequestInput {
+            messages: serde_json::from_value(value["messages"].clone()).unwrap(),
+            tools: serde_json::from_value(value["tools"].clone()).unwrap(),
+            hosted_tools: serde_json::from_value(value["hostedTools"].clone()).unwrap(),
+            require_tool_call: value["requireToolCall"].as_bool().unwrap(),
+        }
+    }
+
     #[test]
     fn required_tool_constraint_reaches_each_provider_payload() {
-        let envelope = json!({
+        let envelope = provider_input(json!({
             "messages": [{ "role": "user", "content": "Execute the confirmed step." }],
             "tools": [{
                 "name": "fixture_tool",
@@ -1669,7 +1596,7 @@ mod tests {
             }],
             "hostedTools": [],
             "requireToolCall": true
-        });
+        }));
         for (kind, expected) in [
             ("openaiCompatible", json!("required")),
             ("responses", json!("required")),
@@ -1692,7 +1619,7 @@ mod tests {
     fn normal_provider_request_does_not_force_a_tool_call() {
         let prepared = prepare_provider_request(
             &test_profile("openaiCompatible"),
-            &json!({
+            &provider_input(json!({
                 "messages": [{ "role": "user", "content": "Answer normally." }],
                 "tools": [{
                     "name": "fixture_tool",
@@ -1701,7 +1628,7 @@ mod tests {
                 }],
                 "hostedTools": [],
                 "requireToolCall": false
-            }),
+            })),
         )
         .expect("normal request must prepare");
         let body: Value =
@@ -1716,7 +1643,7 @@ mod tests {
         profile.thinking = Some("enabled".to_string());
         let prepared = prepare_provider_request(
             &profile,
-            &json!({
+            &provider_input(json!({
                 "messages": [{ "role": "user", "content": "Execute the confirmed step." }],
                 "tools": [{
                     "name": "fixture_tool",
@@ -1725,7 +1652,7 @@ mod tests {
                 }],
                 "hostedTools": [],
                 "requireToolCall": true
-            }),
+            })),
         )
         .expect("DeepSeek thinking request must prepare");
         let body: Value =
@@ -1756,7 +1683,7 @@ mod tests {
         });
         let prepared = prepare_provider_request(
             &profile,
-            &json!({
+            &provider_input(json!({
                 "messages": [
                     { "role": "user", "content": "Find the current release." },
                     {
@@ -1771,7 +1698,7 @@ mod tests {
                     "providerToolType": "web_search"
                 }],
                 "requireToolCall": false
-            }),
+            })),
         )
         .expect("Responses request must prepare");
         let body: Value =
@@ -1847,7 +1774,7 @@ mod tests {
             .collect::<Vec<_>>();
         let prepared = prepare_provider_request(
             &test_profile("responses"),
-            &json!({
+            &provider_input(json!({
                 "messages": [
                     { "role": "user", "content": "Inspect it." },
                     {
@@ -1865,7 +1792,7 @@ mod tests {
                 "tools": [],
                 "hostedTools": [],
                 "requireToolCall": false,
-            }),
+            })),
         )
         .expect("ordered Responses replay must prepare");
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
@@ -1886,7 +1813,7 @@ mod tests {
     fn responses_replays_rejected_raw_arguments_and_result_without_repair() {
         let item = json!({"type":"function_call","call_id":"native:bad","name":"fs_read","arguments":"{\"path\":","status":"completed"});
         let rejection = json!({"status":"inputRejected","executed":false,"error":{"code":"provider_tool_call_arguments_invalid","message":"Invalid JSON object."}}).to_string();
-        let prepared = prepare_provider_request(&test_profile("responses"), &json!({
+        let prepared = prepare_provider_request(&test_profile("responses"), &provider_input(json!({
             "messages":[
                 {"role":"user","content":"Read source."},
                 {"role":"assistant","content":"","providerOutputBlocks":[{
@@ -1894,7 +1821,7 @@ mod tests {
                 }]},
                 {"role":"tool","toolCallId":"call:bad","providerCallId":"native:bad","content":rejection}
             ],"tools":[],"hostedTools":[],"requireToolCall":false
-        })).unwrap();
+        }))).unwrap();
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
         assert_eq!(body["input"][1], item);
         assert_eq!(
@@ -1907,7 +1834,7 @@ mod tests {
     fn responses_request_rejects_invalid_hosted_tool_instead_of_rewriting_it() {
         let error = prepare_provider_request(
             &test_profile("responses"),
-            &json!({
+            &provider_input(json!({
                 "messages": [{ "role": "user", "content": "Search." }],
                 "tools": [],
                 "hostedTools": [{
@@ -1915,7 +1842,7 @@ mod tests {
                     "providerToolType": "some_other_tool"
                 }],
                 "requireToolCall": false
-            }),
+            })),
         )
         .expect_err("invalid hosted tool must fail");
 
@@ -1933,11 +1860,17 @@ mod tests {
             .to_string()
         );
         assert_eq!(
-            provider_tool_content(Some(&content), ProviderThinkingCompatibility::Moonshot),
+            provider_tool_content(
+                content.as_str().unwrap(),
+                ProviderThinkingCompatibility::Moonshot
+            ),
             encrypted
         );
         assert_eq!(
-            provider_tool_content(Some(&content), ProviderThinkingCompatibility::DeepSeek),
+            provider_tool_content(
+                content.as_str().unwrap(),
+                ProviderThinkingCompatibility::DeepSeek
+            ),
             content.as_str().unwrap()
         );
     }
@@ -1954,12 +1887,12 @@ mod tests {
         kimi.model = "kimi-k3".into();
         kimi.reasoning_effort = Some("max".into());
         kimi.thinking = Some("enabled".into());
-        let body = openai_compatible_request_body(&kimi, vec![], &tools, true, true);
+        let body = openai_compatible_request_body(&kimi, &[], &tools, true, true);
         assert!(body.get("thinking").is_none());
         assert_eq!(body["reasoning_effort"], "max");
         assert_eq!(body["tool_choice"], "required");
         kimi.model = "kimi-k2.7-code".into();
-        let body = openai_compatible_request_body(&kimi, vec![], &tools, true, true);
+        let body = openai_compatible_request_body(&kimi, &[], &tools, true, true);
         assert_eq!(body["thinking"], json!({"type":"enabled", "keep":"all"}));
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("tool_choice").is_none());
@@ -1967,11 +1900,14 @@ mod tests {
         deepseek.provider_flavor = Some("deepseek".into());
         deepseek.thinking = Some("enabled".into());
         deepseek.reasoning_effort = Some("high".into());
-        let body = anthropic_stream_request_body(&deepseek, vec![], &[], false).unwrap();
+        let body = anthropic_stream_request_body(&deepseek, &[], &[], false).unwrap();
         assert_eq!(body["thinking"], json!({"type":"enabled"}));
         assert_eq!(body["output_config"], json!({"effort":"high"}));
         let glm = openai_compatible_message(
-            json!({"role":"assistant", "content":"", "reasoningContent":"reasoning"}),
+            &serde_json::from_value(
+                json!({"role":"assistant", "content":"", "reasoningContent":"reasoning"}),
+            )
+            .unwrap(),
             ProviderThinkingCompatibility::Glm,
         );
         assert_eq!(glm["reasoning_content"], "reasoning");
@@ -1989,7 +1925,7 @@ mod tests {
         for raw in [r#"{"path":"a.txt"}"#, r#"{"path":"a.txt"#, "[]", ""] {
             let body = responses_request_body(
                 &test_profile("responses"),
-                vec![message(json!(raw))],
+                &[serde_json::from_value(message(json!(raw))).unwrap()],
                 &[],
                 &[],
                 true,
@@ -1999,7 +1935,7 @@ mod tests {
             assert_eq!(body["input"][0]["arguments"], raw);
             let result = anthropic_stream_request_body(
                 &test_profile("anthropic"),
-                vec![message(json!(raw))],
+                &[serde_json::from_value(message(json!(raw))).unwrap()],
                 &[],
                 false,
             );
@@ -2081,10 +2017,14 @@ mod tests {
                 request[start..start + length].to_vec()
             });
             let response = local_agent_provider_stream_response(
+                crate::provider_transport::ProviderTransport::new()
+                    .unwrap()
+                    .client,
+                None,
                 profile,
-                json!({
+                provider_input(json!({
                     "messages":[{"role":"user","content":"归档检查"}], "tools":[], "hostedTools":[], "requireToolCall":false,
-                }),
+                })),
                 "request:archive".into(),
                 directory.clone(),
                 json!({"sessionId":"session:archive","runId":"run:archive","requestId":"request:archive"}),
@@ -2125,6 +2065,7 @@ mod tests {
                 .map(|line| {
                     provider_event(
                         "request:archive",
+                        None,
                         line["data"]["type"].as_str().unwrap(),
                         line["data"]["data"].clone(),
                     )

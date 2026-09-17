@@ -1,10 +1,10 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "DeepCode-GUI",
-  "version": "0.5.60",
+  "version": "0.6.1",
   "identifier": "com.achbite.deepcode.gui",
   "build": {
-    "frontendDist": "../dist",
+    "frontendDist": [],
     "devUrl": "http://127.0.0.1:31246",
     "beforeBuildCommand": ""
   },

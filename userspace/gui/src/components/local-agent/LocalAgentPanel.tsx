@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { normalizeUiLanguage, t } from '../../i18n';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import { useSettingsStore } from '../../state/settingsStore';
@@ -10,18 +11,20 @@ import { useConversationViewport } from './useConversationViewport';
 import { useProjectionPolling, useProfilesUpdated } from './useProjectionPolling';
 import { useAgentComposer } from './useAgentComposer';
 import { FileChanges, roundChangeActivities } from './FileChanges';
-import { useConversationDisplay } from './useConversationDisplay';
+import { useDisplayedConversation } from './ConversationDisplayProvider';
 import { ConversationComposer } from './ConversationComposer';
 import { ConversationTranscript } from './ConversationTranscript';
-import { ResourcePreview, useResourcePreview } from './ResourcePreview';
+import { ReaderControls, ResourcePreview, useResourcePreview } from './ResourcePreview';
+import { ArtifactLinks } from './ArtifactLinks';
 import { SessionRunStatus } from './SessionRunStatus';
 import './localAgentPanel.css';
 
 interface LocalAgentPanelProps {
   mode?: 'panel' | 'workbench';
+  headerTarget?: HTMLElement | null;
 }
 
-const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => {
+const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', headerTarget }) => {
   const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
   const showReasoning = effectiveSettings['gui.showReasoning'] === true;
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
@@ -45,8 +48,8 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
     || t(language, 'agent.session.newTitle');
   const conversationItems = useMemo(() => projectionItems(projection), [projection?.sessionId, projection?.revision]);
   const assistantDraft = projection?.assistantDraft ?? null;
-  const display = useConversationDisplay(projection);
-  const showChangeBar = projection?.run && !display.completedRuns.has(projection.run.runId)
+  const display = useDisplayedConversation();
+  const showChangeBar = projection?.run && !display.displaySettledRunIds.has(projection.run.runId)
     && !['failed', 'cancelled', 'indeterminate'].includes(projection.run.status);
   const draftItems = useMemo(
     () => assistantDraftItems(assistantDraft),
@@ -86,18 +89,19 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
   const { bodyRef, bodyHandlers, followingLatest, scrollToLatest } = viewport;
   const composer = useAgentComposer(language, viewport.setLatestFollowMode);
   const resourcePreview = useResourcePreview(sessionId);
+  const [readerHeader, setReaderHeader] = useState<HTMLDivElement | null>(null);
+  const readerLayout = { '--reader-width': `${resourcePreview.width}%` } as React.CSSProperties;
 
-  return (
-    <section className={`local-agent local-agent--${mode}${hasConversationContent ? '' : ' local-agent--empty'}`}>
-      <header className="local-agent__header">
+  const header = (
+      <header className={`local-agent__header${resourcePreview.visible ? ' local-agent__header--reading' : ''}${resourcePreview.expanded ? ' local-agent__header--expanded' : ''}`} style={readerLayout}>
+        <div className="local-agent__header-conversation">
         <div className="local-agent__heading">
           <span className="local-agent__heading-mark"><DeepCodeShellIcon name="session" /></span>
           <div>
             <strong>{title}</strong>
-            <span>{activeProject?.title ?? t(language, 'agent.chat.independent')}</span>
+            {!headerTarget && activeProject && <span>{activeProject.title}</span>}
           </div>
         </div>
-        <div className="local-agent__header-actions">
           <SessionRunStatus
             run={projection?.run ?? null}
             language={language}
@@ -106,12 +110,23 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
               : undefined}
           />
         </div>
+        <div className="local-agent__header-preview">
+          {resourcePreview.visible && <div className="reader-header-tabs" ref={setReaderHeader} />}
+          <div className="local-agent__header-actions">
+          <ReaderControls language={language} preview={resourcePreview} disabled={!sessionId} />
+          </div>
+        </div>
       </header>
+  );
 
+  return (
+    <section className={`local-agent local-agent--${mode}${headerTarget ? ' local-agent--external-header' : ''}${hasConversationContent ? '' : ' local-agent--empty'}${resourcePreview.visible ? ' local-agent--reading' : ''}${resourcePreview.expanded ? ' local-agent--expanded' : ''}`} style={readerLayout}>
+      {headerTarget ? createPortal(header, headerTarget) : header}
       <div className="local-agent__viewport">
       <div ref={bodyRef} className="local-agent__body" aria-live="polite" {...bodyHandlers}>
         <ConversationTranscript
-          completedRuns={display.completedRuns}
+          displaySettledRunIds={display.displaySettledRunIds}
+          artifacts={display.artifacts}
           onDisplayed={display.onDisplayed}
           showReasoning={showReasoning}
           language={language}
@@ -125,8 +140,16 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           viewport={viewport}
           openWorkspaceResource={resourcePreview.openWorkspaceResource}
           setUiActionError={setUiActionError}
+          canEditMessage={composer.canEditMessage}
+          onEditMessage={composer.beginMessageEdit}
         />
-        {!followingLatest && hasConversationContent && (
+        {mode === 'panel' && !!display.artifacts.length && <ArtifactLinks artifacts={display.artifacts} onOpen={resourcePreview.openWorkspaceResource} />}
+        {mode !== 'panel' && !!display.artifacts.length && <details className="conversation-artifact-shortcuts">
+          <summary>{t(language, 'deepcodeGui.outputs.title')}</summary>
+          <ArtifactLinks artifacts={display.artifacts} onOpen={resourcePreview.openWorkspaceResource} />
+        </details>}
+      </div>
+      {!followingLatest && hasConversationContent && (
           <button
             type="button"
             className="local-agent__jump-latest"
@@ -138,7 +161,6 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
           </button>
         )}
       </div>
-      </div>
 
       <ConversationComposer
         changeBar={showChangeBar && <FileChanges key={`${sessionId}:${projection.run!.runId}`} activities={roundChangeActivities(projection, projection.run!.runId)} compact />}
@@ -146,7 +168,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel' }) => 
         composer={composer}
         uiActionError={uiActionError}
       />
-      <ResourcePreview language={language} preview={resourcePreview} />
+      <ResourcePreview language={language} preview={resourcePreview} tabsTarget={readerHeader} />
       {composer.attachmentDialogOpen && (
         <ProjectFolderDialog
           language={language}

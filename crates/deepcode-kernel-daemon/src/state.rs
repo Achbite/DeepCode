@@ -8,7 +8,6 @@ pub(crate) struct AppState {
     pub(crate) host_connection: crate::host_connection::HostConnection,
     pub(crate) gui: Arc<Mutex<GuiState>>,
     pub(crate) host_services: HostServices,
-    pub(crate) terminal_runtime: Arc<Mutex<crate::terminal_api::TerminalRuntime>>,
 }
 
 #[derive(Debug)]

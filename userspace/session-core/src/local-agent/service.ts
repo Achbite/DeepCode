@@ -1,10 +1,11 @@
+import { admitSessionEvents } from './admission.js';
+import { loopSnapshot } from './loop.js';
 import type {
   CommandJournalPort,
   CommandReply,
   ContextCompositionProjection,
   ConversationCommand,
   ConversationPort,
-  ConversationReadQuery,
   ConversationReadResult,
   ConversationSessionStatus,
   SessionProjection,
@@ -13,7 +14,7 @@ import type {
 import { SessionActor } from './actor.js';
 import type { AgentComposition } from './plugins.js';
 import { decodeConversationReadQuery, readConversation, readSessionEvents } from './conversationRead.js';
-import { emptySessionState, recoverSession, reduceSession, type SessionState } from './reducer.js';
+import { emptySessionState, projectSession, recoverSession, reduceSession, type SessionState } from './reducer.js';
 
 export interface SessionCompositionFactory {
   create(input: {
@@ -39,6 +40,11 @@ export class SessionService implements ConversationPort {
     workspaceBindings: WorkspaceBindingDisplay[];
     profileId?: string;
   }): Promise<SessionProjection> {
+    admitSessionEvents(loopSnapshot(input.sessionId, []), [{
+      type: 'session.created', sessionId: input.sessionId,
+      payload: { displayTitle: input.displayTitle, workspaceBindings: input.workspaceBindings,
+        ...(input.profileId ? { profileId: input.profileId } : {}) },
+    }]);
     await this.journal.createSession({
       sessionId: input.sessionId,
       displayTitle: input.displayTitle,
@@ -79,7 +85,11 @@ export class SessionService implements ConversationPort {
   }
 
   async snapshot(sessionId: string): Promise<SessionProjection> {
-    return await (await this.actor(sessionId)).snapshot();
+    const live = this.#actors.get(sessionId);
+    if (live) return (await live).snapshot();
+    const events = await readSessionEvents(this.journal, sessionId);
+    if (!events.length) throw new Error('session_not_found');
+    return projectSession(recoverSession(sessionId, events));
   }
 
   async activity(): Promise<{ active: boolean }> {
@@ -94,6 +104,10 @@ export class SessionService implements ConversationPort {
       // Sidebar reads must not open Actors or resume waiting/running conversations.
       let state = this.#statusStates.get(sessionId) ?? emptySessionState(sessionId);
       for await (const event of this.journal.read(sessionId, state.revision)) {
+        if (event.type === 'conversation.revised') {
+          state = recoverSession(sessionId, await readSessionEvents(this.journal, sessionId));
+          break;
+        }
         state = reduceSession(state, event);
       }
       if (state.revision === 0) throw new Error('session_not_found');
@@ -118,8 +132,8 @@ export class SessionService implements ConversationPort {
     return structuredClone(receipt);
   }
 
-  async read(query: ConversationReadQuery): Promise<ConversationReadResult> {
-    decodeConversationReadQuery(query);
+  async read(input: unknown): Promise<ConversationReadResult> {
+    const query = decodeConversationReadQuery(input);
     if (query.view === 'reasoning' && query.providerRequestId && this.#actors.has(query.sessionId)) {
       const actor = await this.#actors.get(query.sessionId)!;
       const projection = await actor.snapshot();

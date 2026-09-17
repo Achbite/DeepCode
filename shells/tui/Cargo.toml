@@ -10,5 +10,6 @@ authors.workspace = true
 deepcode-kernel-client.workspace = true
 crossterm.workspace = true
 ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
+pulldown-cmark = { version = "0.13", default-features = false }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["signal"] }

@@ -1,7 +1,8 @@
 use crate::local_agent_mcp::McpRuntime;
 use crate::local_agent_store::{LocalAgentJournal, LocalAgentStoreError};
 use crate::local_agent_tool_catalog::{
-    CatalogEffectScope, PreparedCatalogBinding, ToolCatalogError, ToolCatalogSnapshot,
+    CatalogEffectScope, PreparedCatalogBinding, PreparedToolInput, ToolCatalogError,
+    ToolCatalogSnapshot,
 };
 use deepcode_kernel_runtime::executors::{
     resolved_network_target, KernelCancellationToken, KernelExecutorConfig,
@@ -9,6 +10,7 @@ use deepcode_kernel_runtime::executors::{
     SecretProvider,
 };
 use deepcode_kernel_runtime::workspace_boundary::WorkspaceBoundary;
+use deepcode_kernel_tools::kernel_internal::{KernelCanonicalInvocation, KernelDeleteTarget};
 use deepcode_kernel_tools::{ToolAvailability, ToolInputIssue};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
@@ -277,6 +279,7 @@ struct KernelGeneration {
 struct RunCatalogKey {
     session_id: String,
     run_id: String,
+    snapshot_ref: String,
 }
 
 struct KernelGenerationState {
@@ -285,7 +288,6 @@ struct KernelGenerationState {
 }
 
 struct ReleasedRunBinding {
-    snapshot_ref: String,
     dispose_error: Option<LocalAgentKernelError>,
 }
 
@@ -390,7 +392,6 @@ impl LocalAgentKernel {
 
     pub(crate) fn prepare_generation(
         extension_generation_ref: &str,
-        kernel_runtime_generation_key: &str,
         executor_config: KernelExecutorConfig,
         secret_provider: Arc<dyn SecretProvider>,
         mcp: McpRuntime,
@@ -400,7 +401,6 @@ impl LocalAgentKernel {
     ) -> Result<PreparedKernelGeneration, LocalAgentKernelError> {
         let catalog = ToolCatalogSnapshot::prepare(
             extension_generation_ref,
-            kernel_runtime_generation_key,
             executor_config.clone(),
             secret_provider,
             mcp,
@@ -432,11 +432,12 @@ impl LocalAgentKernel {
         ] {
             validate_id(field, value)?;
         }
+        let generation = prepared.generation;
         let key = RunCatalogKey {
             session_id: request.session_id.clone(),
             run_id: request.run_id.clone(),
+            snapshot_ref: generation.catalog.snapshot_ref().to_string(),
         };
-        let generation = prepared.generation;
         {
             let mut state = self.lock_generations()?;
             if state.released_run_bindings.contains_key(&key) {
@@ -485,16 +486,11 @@ impl LocalAgentKernel {
         let key = RunCatalogKey {
             session_id: request.session_id.clone(),
             run_id: request.run_id.clone(),
+            snapshot_ref: request.kernel_catalog_snapshot_ref.clone(),
         };
         let has_live_binding = {
             let state = self.lock_generations()?;
             if let Some(released) = state.released_run_bindings.get(&key) {
-                if released.snapshot_ref != request.kernel_catalog_snapshot_ref {
-                    return Err(LocalAgentKernelError::new(
-                        "tool_catalog_release_identity_conflict",
-                        "当前 run 已释放的是其他 KernelCatalogSnapshotRef。",
-                    ));
-                }
                 if let Some(error) = released.dispose_error.clone() {
                     return Err(error);
                 }
@@ -514,38 +510,15 @@ impl LocalAgentKernel {
             }
         };
         if !has_live_binding {
-            let runtime = self
-                .journal
-                .run_runtime_snapshot(&request.session_id, &request.run_id)?;
-            if runtime
-                .get("kernelCatalogSnapshotRef")
-                .and_then(Value::as_str)
-                != Some(request.kernel_catalog_snapshot_ref.as_str())
-            {
-                return Err(LocalAgentKernelError::new(
-                    "tool_catalog_release_identity_conflict",
-                    "KernelCatalogSnapshotRef 与持久化 run.runtime snapshot 不一致。",
-                ));
-            }
-            self.lock_generations()?.released_run_bindings.insert(
-                key,
-                ReleasedRunBinding {
-                    snapshot_ref: request.kernel_catalog_snapshot_ref.clone(),
-                    dispose_error: None,
-                },
-            );
-            return Ok(catalog_release_reply(&request, true));
+            return Err(LocalAgentKernelError::new(
+                "tool_catalog_run_binding_not_found",
+                "当前 run 的物理 catalog 绑定已丢失，无法确认旧实例已经释放。",
+            ));
         }
         self.cancel_and_drain_attempts(Some((&request.session_id, &request.run_id)))?;
         let already_released = {
             let mut state = self.lock_generations()?;
             if let Some(released) = state.released_run_bindings.get(&key) {
-                if released.snapshot_ref != request.kernel_catalog_snapshot_ref {
-                    return Err(LocalAgentKernelError::new(
-                        "tool_catalog_release_identity_conflict",
-                        "当前 run 已释放的是其他 KernelCatalogSnapshotRef。",
-                    ));
-                }
                 if let Some(error) = released.dispose_error.clone() {
                     return Err(error);
                 }
@@ -585,7 +558,6 @@ impl LocalAgentKernel {
                 state.released_run_bindings.insert(
                     key,
                     ReleasedRunBinding {
-                        snapshot_ref: request.kernel_catalog_snapshot_ref.clone(),
                         dispose_error: dispose_error.clone(),
                     },
                 );
@@ -949,7 +921,10 @@ impl LocalAgentKernel {
                 format!("Kernel 工具 {} 当前被阻止，不能执行。", request.tool_name),
             ));
         }
-        let scope = match binding.effect_scope() {
+        let scope = match binding
+            .effect_scope(&request.input)
+            .map_err(catalog_error)?
+        {
             CatalogEffectScope::LocalRead => PreparedEffectScope::LocalRead,
             CatalogEffectScope::WorkspaceRead => PreparedEffectScope::WorkspaceRead,
             CatalogEffectScope::WorkspaceMutation => PreparedEffectScope::WorkspaceMutation,
@@ -988,14 +963,9 @@ impl LocalAgentKernel {
                 ));
             }
         }
-        let arguments = binding.canonicalize(tool_input).map_err(catalog_error)?;
-        let mut logical_targets = match binding
-            .binding_logical_targets(&arguments)
-            .map_err(catalog_error)?
-        {
-            Some(targets) => targets,
-            None => canonical_logical_targets(&request.tool_name, &arguments)?,
-        };
+        let input = binding.canonicalize(tool_input).map_err(catalog_error)?;
+        let arguments = input.arguments();
+        let mut logical_targets = input.logical_targets();
         if matches!(
             scope,
             PreparedEffectScope::Network | PreparedEffectScope::External
@@ -1004,16 +974,16 @@ impl LocalAgentKernel {
                 logical_targets.push(target.to_string());
             }
         }
-        if let Some(target) = resolved_network_target(
-            request.tool_name.as_str(),
-            &arguments,
-            &generation.executor_config,
-        )
-        .map_err(|error| LocalAgentKernelError::new("tool_target_invalid", error.to_string()))?
-        {
-            logical_targets.push(target);
-            logical_targets.sort();
-            logical_targets.dedup();
+        if let PreparedToolInput::Builtin(canonical) = &input {
+            if let Some(target) = resolved_network_target(canonical, &generation.executor_config)
+                .map_err(|error| {
+                    LocalAgentKernelError::new("tool_target_invalid", error.to_string())
+                })?
+            {
+                logical_targets.push(target);
+                logical_targets.sort();
+                logical_targets.dedup();
+            }
         }
         let (workspace_root, private_resolved_targets) = match workspace_id.as_deref() {
             Some(workspace_id) => {
@@ -1086,47 +1056,32 @@ impl LocalAgentKernel {
             }
             None => (None, Vec::new()),
         };
-        let delete_target_kind = if request.tool_name == "fs.delete" {
-            match arguments.get("targetKind").and_then(Value::as_str) {
-                Some("file") => Some("file".to_string()),
-                Some("directoryTree") => Some("directoryTree".to_string()),
-                _ => {
-                    return Err(LocalAgentKernelError::new(
-                        "tool_input_invalid",
-                        "fs.delete canonical targetKind 无效。",
-                    ))
-                }
-            }
-        } else {
-            None
+        let delete_target_kind = match &input {
+            PreparedToolInput::Builtin(KernelCanonicalInvocation::FsDelete(
+                KernelDeleteTarget::File { .. },
+            )) => Some("file".to_owned()),
+            PreparedToolInput::Builtin(KernelCanonicalInvocation::FsDelete(
+                KernelDeleteTarget::DirectoryTree { .. },
+            )) => Some("directoryTree".to_owned()),
+            _ => None,
         };
-        let process_workspace_mode = if is_shell_tool(&request.tool_name) {
-            match arguments.get("workspaceMode").and_then(Value::as_str) {
-                Some("read") => Some("read".to_string()),
-                Some("write") => Some("write".to_string()),
-                _ => {
-                    return Err(LocalAgentKernelError::new(
-                        "tool_input_invalid",
-                        "bash 必须显式声明 workspaceMode=read 或 write。",
-                    ))
+        let (process_workspace_mode, process_execution_scope) = match &input {
+            PreparedToolInput::Builtin(
+                KernelCanonicalInvocation::ProcessShell {
+                    workspace_mode,
+                    execution_scope,
+                    ..
                 }
-            }
-        } else {
-            None
-        };
-        let process_execution_scope = if is_shell_tool(&request.tool_name) {
-            match arguments.get("executionScope").and_then(Value::as_str) {
-                Some("workspace") => Some("workspace".to_string()),
-                Some("host") => Some("host".to_string()),
-                _ => {
-                    return Err(LocalAgentKernelError::new(
-                        "tool_input_invalid",
-                        "bash 必须显式声明 executionScope=workspace 或 host。",
-                    ))
-                }
-            }
-        } else {
-            None
+                | KernelCanonicalInvocation::ProcessPowerShell {
+                    workspace_mode,
+                    execution_scope,
+                    ..
+                },
+            ) => (
+                Some(workspace_mode.as_str().to_owned()),
+                Some(execution_scope.as_str().to_owned()),
+            ),
+            _ => (None, None),
         };
         Ok(PreparedEffect {
             generation,
@@ -1140,7 +1095,7 @@ impl LocalAgentKernel {
                 "toolName": request.tool_name,
                 "arguments": arguments,
             }),
-            canonical_arguments: arguments,
+            input,
             workspace_root,
             delete_target_kind,
             process_workspace_mode,
@@ -1295,7 +1250,32 @@ impl LocalAgentKernel {
                 "source": "userSetting",
                 "authorityId": permission_setting_id(scope),
             }))),
-            PermissionMode::Ask => Ok(Admission::ApprovalRequired),
+            PermissionMode::Ask => {
+                if let Some(context) = prepared.host_shell_authorization_context() {
+                    if let Some(authority_id) = self.journal.run_host_shell_authority(
+                        &request.session_id,
+                        &request.run_id,
+                        &context,
+                    )? {
+                        return Ok(Admission::Allowed(json!({
+                            "decision": "allow", "source": "user", "authorityId": authority_id,
+                            "authorizationScope": "runHostShell",
+                        })));
+                    }
+                }
+                if prepared.binding.is_browser_page() {
+                    if let Some(authority_id) = self
+                        .journal
+                        .session_browser_authority(&request.session_id)?
+                    {
+                        return Ok(Admission::Allowed(json!({
+                            "decision": "allow", "source": "user", "authorityId": authority_id,
+                            "authorizationScope": "sessionBrowser",
+                        })));
+                    }
+                }
+                Ok(Admission::ApprovalRequired)
+            }
             PermissionMode::Deny => Ok(Admission::Denied {
                 authority: json!({
                     "decision": "deny",
@@ -1394,7 +1374,6 @@ impl LocalAgentKernel {
         cancellation: KernelCancellationToken,
         progress: deepcode_kernel_runtime::executors::KernelProgressSink,
     ) -> Result<KernelToolExecutionResult, String> {
-        let _private_targets = &prepared.private_resolved_targets;
         let workspace_write_targets = if is_shell_tool(&prepared.operation)
             && prepared.process_execution_scope.as_deref() == Some("workspace")
             && authority["source"] == "plan"
@@ -1434,7 +1413,7 @@ impl LocalAgentKernel {
             .binding
             .invoke(
                 &request.attempt_id,
-                prepared.canonical_arguments.clone(),
+                prepared.input.clone(),
                 KernelToolExecutionContext {
                     output_directory: Some(
                         self.session_output_directory(&request.session_id)
@@ -1478,6 +1457,7 @@ impl LocalAgentKernel {
         let key = RunCatalogKey {
             session_id: request.session_id.clone(),
             run_id: request.run_id.clone(),
+            snapshot_ref: request.kernel_catalog_snapshot_ref.clone(),
         };
         let state = self.lock_generations()?;
         let generation = state.run_bindings.get(&key).ok_or_else(|| {
@@ -1600,7 +1580,7 @@ struct PreparedEffect {
     logical_targets: Vec<String>,
     private_resolved_targets: Vec<String>,
     canonical_invocation: Value,
-    canonical_arguments: Value,
+    input: PreparedToolInput,
     workspace_root: Option<String>,
     delete_target_kind: Option<String>,
     process_workspace_mode: Option<String>,
@@ -1641,11 +1621,34 @@ impl PreparedEffect {
     }
 
     fn preview(&self, tool_name: &str) -> Value {
-        json!({
-            "summary": effect_summary(tool_name, &self.logical_targets, &self.canonical_arguments),
+        let mut preview = json!({
+            "summary": effect_summary(tool_name, &self.logical_targets, &self.canonical_invocation["arguments"]),
             "effects": process_effect_names(self),
             "logicalTargets": self.logical_targets,
-        })
+        });
+        if self.binding.is_browser_page() {
+            preview["authorizationScope"] = json!("sessionBrowser");
+        }
+        if let Some(context) = self.host_shell_authorization_context() {
+            preview["authorizationScope"] = json!("runHostShell");
+            preview["authorizationContext"] = context;
+        }
+        preview
+    }
+
+    fn host_shell_authorization_context(&self) -> Option<Value> {
+        if !is_shell_tool(&self.operation)
+            || self.process_execution_scope.as_deref() != Some("host")
+        {
+            return None;
+        }
+        Some(json!({
+            "workspaceId": self.workspace_id,
+            "workspaceRoot": self.workspace_root,
+            "shell": self.generation.executor_config.shell_program,
+            "wsl": self.generation.executor_config.wsl,
+            "executionPath": self.generation.executor_config.execution_path,
+        }))
     }
 }
 
@@ -1877,34 +1880,6 @@ fn take_workspace_id(input: &mut Value) -> Result<String, LocalAgentKernelError>
     Ok(workspace_id.to_string())
 }
 
-fn canonical_logical_targets(
-    tool_name: &str,
-    arguments: &Value,
-) -> Result<Vec<String>, LocalAgentKernelError> {
-    if is_shell_tool(tool_name) {
-        return Ok(vec![".".to_string()]);
-    }
-    let field = match tool_name {
-        "fs.read" | "fs.write" | "fs.edit" | "fs.delete" => Some("path"),
-        "web.fetch" => Some("url"),
-        "web.search" => None,
-        _ => None,
-    };
-    let mut targets = field
-        .and_then(|field| arguments.get(field).and_then(Value::as_str))
-        .map(|target| vec![target.to_string()])
-        .unwrap_or_default();
-    targets.sort();
-    targets.dedup();
-    if matches!(tool_name, "fs.write" | "fs.edit" | "fs.delete") && targets.len() != 1 {
-        return Err(LocalAgentKernelError::new(
-            "prepared_effect_target_invalid",
-            "闭合 workspace mutation 必须解析为一个精确逻辑 target。",
-        ));
-    }
-    Ok(targets)
-}
-
 fn authority_matches_identity(
     authority: &Value,
     request: &LocalToolExecutionRequest,
@@ -1944,10 +1919,6 @@ fn authority_matches_identity(
 
 fn authority_covers(authority: &Value, prepared: &PreparedEffect) -> bool {
     if is_shell_tool(&prepared.operation) {
-        let arguments = prepared
-            .canonical_arguments
-            .as_object()
-            .expect("canonical process arguments");
         return authority
             .get("coveredOperations")
             .and_then(Value::as_array)
@@ -1962,7 +1933,7 @@ fn authority_covers(authority: &Value, prepared: &PreparedEffect) -> bool {
                             == Some(prepared.operation.as_str())
                         && object.get("workspaceMode").and_then(Value::as_str) == Some("write")
                         && object.get("executionScope").and_then(Value::as_str)
-                            == arguments.get("executionScope").and_then(Value::as_str)
+                            == prepared.process_execution_scope.as_deref()
                 })
             });
     }
@@ -1982,11 +1953,13 @@ fn authority_covers(authority: &Value, prepared: &PreparedEffect) -> bool {
                     == prepared.workspace_id.as_deref()
                     && (object.get("operation").and_then(Value::as_str)
                         == Some(prepared.operation.as_str())
-                        || matches!(prepared.operation.as_str(), "fs.write" | "fs.edit")
-                            && matches!(
-                                object.get("operation").and_then(Value::as_str),
-                                Some("fs.write" | "fs.edit")
-                            ));
+                        || matches!(
+                            prepared.operation.as_str(),
+                            "fs.write" | "fs.edit" | "document.render" | "browser.capture"
+                        ) && matches!(
+                            object.get("operation").and_then(Value::as_str),
+                            Some("fs.write" | "fs.edit" | "document.render" | "browser.capture")
+                        ));
                 if !base {
                     return false;
                 }
@@ -2330,6 +2303,20 @@ mod attempt_control_tests {
         tool_name: &str,
         input: Value,
     ) -> (LocalAgentKernel, LocalToolExecutionRequest, Value) {
+        kernel_with_product_tools(
+            resolver,
+            tool_name,
+            input,
+            crate::local_agent_product_tools::test_product_tools(),
+        )
+    }
+
+    fn kernel_with_product_tools(
+        resolver: Arc<dyn WorkspaceResolverPort>,
+        tool_name: &str,
+        input: Value,
+        product: Arc<crate::local_agent_product_tools::ProductTools>,
+    ) -> (LocalAgentKernel, LocalToolExecutionRequest, Value) {
         let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
         let bindings = json!([{"workspaceId":"workspace:test", "displayName":"Fixture"}]);
         journal
@@ -2339,13 +2326,12 @@ mod attempt_control_tests {
             LocalAgentKernel::open(Path::new(":memory:"), journal.clone(), resolver).unwrap();
         let generation = LocalAgentKernel::prepare_generation(
             "extension:test",
-            "kernel-generation:test",
             KernelExecutorConfig::default(),
             Arc::new(deepcode_kernel_runtime::executors::EmptySecretProvider),
             McpRuntime::default(),
             LocalAgentPermissionPolicy::from_settings(&json!({})).unwrap(),
             false,
-            crate::local_agent_product_tools::test_product_tools(),
+            product,
         )
         .unwrap();
         let catalog = kernel
@@ -2381,6 +2367,256 @@ mod attempt_control_tests {
             "workspaceBindings":["workspace:test"], "input":input
         })).unwrap();
         (kernel, request, catalog)
+    }
+
+    #[test]
+    fn host_shell_grant_is_explicit_and_bound_to_run_workspace_and_environment() {
+        struct Workspace;
+        impl WorkspaceResolverPort for Workspace {
+            fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
+                Ok(ResolvedWorkspace {
+                    root: std::env::current_dir().unwrap().to_string_lossy().into(),
+                    read_only: false,
+                })
+            }
+        }
+        let (kernel, mut request, _) = kernel_with_request(
+            Arc::new(Workspace),
+            "bash",
+            json!({"workspaceId":"workspace:test","command":"pwd","workspaceMode":"read","executionScope":"host"}),
+        );
+        let effect = kernel.prepare_tool(&request).unwrap();
+        let preview = effect.preview("bash");
+        assert_eq!(preview["authorizationScope"], "runHostShell");
+        let commit = |call: &str, scope: bool| {
+            kernel.journal.append(&json!({"type":"approval.requested","sessionId":"session:reject","runId":"run:reject","callId":call,
+                "payload":{"approvalId":call,"preview":preview}})).unwrap();
+            let mut payload =
+                json!({"approvalId":call,"commandId":call,"authorityId":call,"decision":"allow"});
+            if scope {
+                payload["authorizationScope"] = json!("runHostShell");
+            }
+            kernel.journal.append(&json!({"type":"approval.resolved","sessionId":"session:reject","runId":"run:reject","callId":call,"payload":payload})).unwrap();
+        };
+        commit("call:once", false);
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        commit("call:run-grant", true);
+        request.call_id = "call:later".into();
+        assert!(
+            matches!(kernel.admit(&request, &effect).unwrap(), Admission::Allowed(ref value)
+            if value["externalAuthority"]["authorityId"] == "call:run-grant" && value["externalAuthority"]["authorizationScope"] == "runHostShell")
+        );
+        request.run_id = "run:other".into();
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        request.run_id = "run:reject".into();
+        let mut other = effect.clone();
+        other.workspace_id = Some("workspace:other".into());
+        assert!(matches!(
+            kernel.admit(&request, &other).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        other = effect.clone();
+        let mut config = other.generation.executor_config.clone();
+        config.shell_program = Some(deepcode_kernel_runtime::shell_environment::ShellProgram {
+            tool: "bash".into(),
+            executable: PathBuf::from("/different/bash"),
+            dialect: "bash".into(),
+        });
+        other.generation = Arc::new(KernelGeneration {
+            catalog: effect.generation.catalog.clone(),
+            executor_config: config,
+            permissions: effect.generation.permissions.clone(),
+        });
+        assert!(matches!(
+            kernel.admit(&request, &other).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        other = effect.clone();
+        other.process_workspace_mode = Some("write".into());
+        assert!(
+            matches!(
+                kernel.admit(&request, &other).unwrap(),
+                Admission::Denied { .. }
+            ),
+            "run grant does not replace Plan admission"
+        );
+        other = effect.clone();
+        other.operation = "browser.service".into();
+        other.scope = PreparedEffectScope::External;
+        assert!(
+            matches!(
+                kernel.admit(&request, &other).unwrap(),
+                Admission::ApprovalRequired
+            ),
+            "other tools cannot use the Shell grant"
+        );
+        kernel.journal.append(&json!({"type":"run.finishing","sessionId":"session:reject","runId":"run:reject","payload":{"outcome":"cancelled"}})).unwrap();
+        kernel.journal.append(&json!({"type":"run.runtime.released","sessionId":"session:reject","runId":"run:reject",
+            "payload":{"runRuntimeSnapshotRef":"runtime:test","extensionGenerationRef":"extension:test","kernelCatalogSnapshotRef":request.kernel_catalog_snapshot_ref,
+                "providerRuntimeRef":"provider:test","pluginInstanceRefs":[],"alreadyReleased":false}})).unwrap();
+        kernel.journal.append(&json!({"type":"run.settled","sessionId":"session:reject","runId":"run:reject","payload":{"outcome":"cancelled"}})).unwrap();
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::Denied { .. }
+        ));
+    }
+
+    #[test]
+    fn browser_grant_is_explicit_session_scoped_and_does_not_authorize_services() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct BrowserHost {
+            registration: Value,
+            stop: Arc<AtomicBool>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for BrowserHost {
+            fn drop(&mut self) {
+                let mut registration = self.registration.clone();
+                registration["remove"] = json!(true);
+                let _ = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(crate::browser_tools::register(axum::Json(
+                        serde_json::from_value(registration).unwrap(),
+                    )));
+                self.stop.store(true, Ordering::SeqCst);
+                let _ = TcpStream::connect(self.registration["endpoint"].as_str().unwrap());
+                self.thread.take().unwrap().join().unwrap();
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                if stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let _: Value = serde_json::from_str(&line).unwrap();
+                stream.write_all(b"{\"ok\":true,\"data\":{}}\n").unwrap();
+            }
+        });
+        let host = BrowserHost {
+            registration: json!({"hostInstanceId":format!("dcinstance_{}", "b".repeat(64)),
+            "endpoint":endpoint,"callbackToken":format!("dchost_{}", "b".repeat(64)),"remove":false}),
+            stop,
+            thread: Some(thread),
+        };
+        let response = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::browser_tools::register(axum::Json(
+                serde_json::from_value(host.registration.clone()).unwrap(),
+            )));
+        assert_eq!(response.0["ok"], true);
+        struct NoWorkspace;
+        impl WorkspaceResolverPort for NoWorkspace {
+            fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
+                panic!("page operations do not resolve a workspace");
+            }
+        }
+        let mut product = crate::local_agent_product_tools::test_product_tools();
+        Arc::get_mut(&mut product).unwrap().browser_binding = Some(
+            json!({"hostInstanceId":host.registration["hostInstanceId"],"windowLabel":"main"}),
+        );
+        let (kernel, mut request, catalog) = kernel_with_product_tools(
+            Arc::new(NoWorkspace),
+            "browser.page",
+            json!({"action":"act","previewId":"preview-1","operation":"click","selector":"#button"}),
+            product,
+        );
+        let effect = kernel.prepare_tool(&request).unwrap();
+        let preview = effect.preview("browser.page");
+        assert_eq!(preview["authorizationScope"], "sessionBrowser");
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        let commit = |call: &str, scope: bool, decision: &str| {
+            let mut preview = preview.clone();
+            if !scope {
+                preview
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("authorizationScope");
+            }
+            kernel.journal.append(&json!({"type":"approval.requested","sessionId":request.session_id,"runId":request.run_id,"callId":call,
+                "payload":{"approvalId":call,"preview":preview}})).unwrap();
+            kernel.journal.append(&json!({"type":"approval.resolved","sessionId":request.session_id,"runId":request.run_id,"callId":call,
+                "payload":{"approvalId":call,"commandId":call,"authorityId":call,"decision":decision}})).unwrap();
+        };
+        commit("call:ordinary", false, "allow");
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        commit("call:denied", true, "deny");
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        commit("call:browser", true, "allow");
+        request.call_id = "call:later".into();
+        request.run_id = "run:later".into();
+        let allowed = kernel.admit(&request, &effect).unwrap();
+        assert!(
+            matches!(allowed, Admission::Allowed(ref value) if value["authorityId"] == "call:browser" && value["authorizationScope"] == "sessionBrowser")
+        );
+        request.session_id = "session:other".into();
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        request.session_id = "session:reject".into();
+        request.run_id = "run:reject".into();
+        request.tool_name = "browser.service".into();
+        request.tool_binding_ref = catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "browser.service")
+            .unwrap()["toolBindingRef"]
+            .as_str()
+            .unwrap()
+            .into();
+        request.input = json!({"action":"start","directory":"/tmp","command":"node","args":[],"url":"http://127.0.0.1:3000"});
+        let service = kernel.prepare_tool(&request).unwrap();
+        assert!(matches!(
+            kernel.admit(&request, &service).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        let mut denied = effect.clone();
+        denied.generation = Arc::new(KernelGeneration {
+            catalog: effect.generation.catalog.clone(),
+            executor_config: effect.generation.executor_config.clone(),
+            permissions: LocalAgentPermissionPolicy::from_settings(
+                &json!({"agent.permissions.external":"deny"}),
+            )
+            .unwrap(),
+        });
+        assert!(matches!(
+            kernel.admit(&request, &denied).unwrap(),
+            Admission::Denied { .. }
+        ));
     }
 
     #[test]
@@ -2530,7 +2766,6 @@ mod attempt_control_tests {
     fn plan_scope_allows_execution_details_but_preserves_targets_and_boundaries() {
         let generation = LocalAgentKernel::prepare_generation(
             "extension:scope",
-            "generation:scope",
             KernelExecutorConfig::default(),
             Arc::new(deepcode_kernel_runtime::executors::EmptySecretProvider),
             McpRuntime::default(),
@@ -2551,16 +2786,17 @@ mod attempt_control_tests {
             .catalog
             .binding(tool["toolBindingRef"].as_str().unwrap(), "bash")
             .unwrap();
+        let input = binding.canonicalize(json!({"command":"make shell", "executionScope":"host", "workspaceMode":"write", "terminal":{"stdin":"./build.sh\nexit\n"}})).unwrap();
         let mut effect = PreparedEffect {
             generation: Arc::clone(&generation),
             binding,
             scope: PreparedEffectScope::Process,
+            input,
             workspace_id: Some("workspace:scope".into()),
             operation: "bash".into(),
             logical_targets: vec![".".into()],
             private_resolved_targets: vec![],
-            canonical_invocation: json!({}),
-            canonical_arguments: json!({"command":"make shell", "executionScope":"host", "workspaceMode":"write", "terminal":{"stdin":"./build.sh\nexit\n"}}),
+            canonical_invocation: json!({"toolId":"bash", "arguments":{"command":"make shell", "executionScope":"host", "workspaceMode":"write", "terminal":{"stdin":"./build.sh\nexit\n"}}}),
             workspace_root: None,
             delete_target_kind: None,
             process_workspace_mode: Some("write".into()),
@@ -2568,9 +2804,9 @@ mod attempt_control_tests {
         };
         let authority = json!({"coveredOperations":[{"workspaceId":"workspace:scope", "operation":"bash", "workspaceMode":"write", "executionScope":"host", "command":"make build"}]});
         assert!(authority_covers(&authority, &effect));
-        effect.canonical_arguments["executionScope"] = json!("workspace");
+        effect.process_execution_scope = Some("workspace".into());
         assert!(!authority_covers(&authority, &effect));
-        effect.canonical_arguments["executionScope"] = json!("host");
+        effect.process_execution_scope = Some("host".into());
         effect.workspace_id = Some("workspace:other".into());
         assert!(!authority_covers(&authority, &effect));
         effect.workspace_id = Some("workspace:scope".into());
@@ -2578,6 +2814,11 @@ mod attempt_control_tests {
         effect.logical_targets = vec!["src/pool.hpp".into()];
         let file = json!({"coveredOperations":[{"workspaceId":"workspace:scope", "operation":"fs.edit", "target":"src/pool.hpp"}]});
         assert!(authority_covers(&file, &effect));
+        effect.operation = "document.render".into();
+        assert!(authority_covers(&file, &effect));
+        effect.logical_targets = vec!["reports/output.pdf".into()];
+        assert!(!authority_covers(&file, &effect));
+        effect.operation = "fs.write".into();
         effect.logical_targets = vec!["src/other.hpp".into()];
         assert!(!authority_covers(&file, &effect));
         let directory = json!({"coveredOperations":[{"workspaceId":"workspace:scope", "operation":"fs.edit", "target":"src", "targetKind":"directoryTree"}]});
@@ -2634,12 +2875,10 @@ pub(crate) fn output_directory_key(identity: &str) -> String {
 #[cfg(test)]
 mod output_directory_tests {
     #[test]
-    fn output_names_are_windows_components_without_changing_logical_hashes() {
+    fn output_names_are_portable_components() {
         let identity = "session:record/with/path";
-        let logical = deepcode_kernel_tools::hash_bytes(identity.as_bytes());
         let component = super::output_directory_key(identity);
-        assert!(logical.starts_with("sha256:"));
-        assert_eq!(component, logical.replacen(':', "-", 1));
+        assert!(!component.is_empty());
         assert!(!component
             .chars()
             .any(|character| r#"<>:\"/\|?*"#.contains(character)));
