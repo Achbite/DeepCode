@@ -3,7 +3,7 @@
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$ROOT_DIR"
-[ "$(uname -s)/$(uname -m)" = Darwin/arm64 ] || { printf 'macOS packaging requires the macOS arm64 host build.sh entry.\n' >&2; exit 1; }
+[ "$(uname -s)/$(uname -m)" = Darwin/arm64 ] || { printf 'macOS native packaging requires a Darwin/arm64 executor. Use build.sh to select the host bridge.\n' >&2; exit 1; }
 CARGO="${DEEPCODE_MACOS_CARGO:-$(command -v cargo || printf '%s/bin/cargo' "${CARGO_HOME:-$HOME/.cargo}")}"
 NODE="${DEEPCODE_MACOS_NODE_BIN:-$(command -v node)}"
 command -v "$CARGO" >/dev/null || { printf 'Set DEEPCODE_MACOS_CARGO to the installed cargo executable.\n' >&2; exit 1; }

@@ -76,7 +76,7 @@ Build the local package from source:
 bash ./build.sh
 ```
 
-The script attempts Linux, Windows and macOS packaging by default, skipping targets whose support environment is unavailable; `make build` uses the same entrypoint. Frontend and Session assets are built from source in Docker, while native Rust/Tauri packaging runs on the Darwin host.
+Run `make shell` once to prepare the development container and, on Mac, its host build bridge. Run `bash ./build.sh` from that container or from the host; `make build` uses the same entrypoint. Frontend and Session assets are built once in Docker, while native Rust/Tauri packaging runs on the Darwin host using those same assets. A detected Mac host whose bridge or toolchain fails makes the build fail; a host without Mac support reports macOS as skipped. The final summary lists the platforms actually updated.
 
 `bin/macos-arm64/` contains one complete `DeepCode-GUI.app` and CLI/TUI launchers pointing inside it. Runtime content is present only once. A complete archive is also written to `bin/DeepCode-<version>-macos-arm64.tar.gz`. Existing user configuration and sessions are preserved, and are excluded from the new archive.
 
@@ -84,7 +84,7 @@ The macOS bundle is ad-hoc signed. See [distribution details](docs/distribution.
 
 ## Linux and Windows packages
 
-Run the same command to build all supported platform packages. Linux and Windows builds use the single `deepcode-dev` container; macOS runs native compilation from the host entrypoint:
+Run the same command to build all supported platform packages. Linux and Windows builds use the configured development container; a container invocation automatically delegates macOS native packaging to its prepared Mac host:
 
 ```bash
 bash ./build.sh
@@ -101,9 +101,9 @@ make shell
 bash ./build.sh
 ```
 
-`make shell` passes the host platform into the container and prepares the native packaging service on Mac. Running `build.sh` inside that container still attempts all three platforms; unavailable targets are reported as skipped. A target that starts and fails is reported as failed and makes the final build exit nonzero.
+`make shell` passes the host platform into the container and prepares the Mac build bridge. The bridge belongs to this worktree and the running container; it exits when that container stops. It passes build output and the actual exit code back to the container, and cancellation stops only that request's native build. It neither rebuilds shared assets nor installs toolchains. `make reset-dev` and `make clean` stop the bridge before removing their container.
 
-Every entrypoint reevaluates `Dockerfile.dev` through Docker's build cache. If the source mount, image, or port changed, the tooling recreates only the fixed `deepcode-dev` container and preserves dependency/build caches. Branch-specific containers and `DEEPCODE_WORKTREE_ID` are no longer part of the development model. To recreate only the container, run:
+`make shell` reevaluates `Dockerfile.dev` through Docker's build cache. If the source mount, image, or port changed, the tooling recreates only the configured development container and preserves dependency/build caches. To recreate only the container, run:
 
 ```bash
 make reset-dev
@@ -307,10 +307,13 @@ Use CLI `status`, the UI's API/Agent status, and package-local `logs/`. Session 
 ```bash
 bash ./test.sh static
 bash ./test.sh required
+bash ./test.sh cli
 bash ./test.sh full
 ```
 
-Run `required` and `full` inside `make shell`. They prepare the current TypeScript dependencies before running checks; host execution is rejected. `static` can run on the host and checks shell syntax, Git whitespace changes and the existing layer-dependency rules. `required` runs Rust workspace tests, TypeScript checks and the registered Session/GUI contract tests. `full` additionally builds CLI/TUI and GUI web resources and runs the existing local Provider fixture, tool execution and session lifecycle checks. It does not certify live Provider behavior, native GUI interaction or release packages.
+Run `required`, `cli`, and `full` inside `make shell`. `static` checks current shell syntax and Git whitespace changes; it does not inspect dependency names or fixed source locations. `required` prepares shared TypeScript packages once, then runs Rust workspace tests, Session/GUI contract tests, GUI type checking, and the current build/publication and UI-update behavior checks. Package-level Node tests consume those prepared outputs and do not rebuild them implicitly. The retired Editor, old macOS service, and one-time journal repair are outside these profiles.
+
+`cli` adds the real CLI/Session/Kernel path with a deterministic local Provider. `full` also builds TUI and GUI web resources and covers external MCP/first-party CLI, runtime release, and document output. These fixtures share `scripts/tests/support.py`. Direct script invocation requires `DEEPCODE_E2E_DAEMON`, `DEEPCODE_E2E_CLI`, `DEEPCODE_E2E_TUI`, and `DEEPCODE_E2E_SESSION_BRIDGE` to select the artifacts being checked; `test.sh` supplies its current Cargo and shared-build outputs unless explicitly overridden. `workspace-shell-cli.py` remains an optional focused PTY/timeout check. These source checks do not certify a live Provider, native GUI interaction, or a release package.
 
 The native GUI tests belong to a separate Cargo workspace. Their explicit entrypoint in a supported native build environment is `cargo test --manifest-path shells/deepcode-gui/src-tauri/Cargo.toml`; they are not part of the default `required` or `full` profiles.
 

@@ -108,9 +108,9 @@ RUN_ARGS := \
 export CONTAINER_NAME WORKDIR_IN_CTNR
 
 help:
-	@echo "make shell / docker-info / reset-dev: 当前 worktree 的 Docker 环境"
+	@echo "make shell / docker-info / reset-dev: 当前 worktree 的 Docker 环境；Mac 自动准备宿主打包通道"
 	@echo "make build: 一次共享构建，尝试全部可用平台"
-	@echo "make package-macos: Docker 共享构建 + 宿主 Darwin 编译/组装"
+	@echo "make package-macos: Docker 共享构建 + 宿主 Darwin 编译/组装，支持容器内 build.sh 发起"
 	@echo "make ui: 单 GUI 资源到 bin/ui/web-deepcode-gui"
 	@echo "make ui-update UI_PACKAGE=bin/macos-arm64: 完整替换本地包 GUI"
 	@echo "make native-gui: Docker 内构建 Linux GUI native shell"
@@ -212,6 +212,7 @@ _ensure_container: _ensure_image
 				;; \
 		esac; \
 	fi
+	@if [ "$(DEEPCODE_BUILD_HOST_OS)" = Darwin ]; then python3 scripts/macos-build-bridge.py ensure; fi
 
 # ---- shell：唯一交互入口 ----
 shell: _ensure_container
@@ -237,11 +238,13 @@ dev-deepcode-gui: _ensure_container
 
 # ---- reset-dev / clean：只操作固定命名的单仓开发资源 ----
 reset-dev:
+	@if [ "$(DEEPCODE_BUILD_HOST_OS)" = Darwin ]; then python3 scripts/macos-build-bridge.py stop; fi
 	@echo "[make] 移除唯一开发容器 $(CONTAINER_NAME)，保留依赖与编译缓存 ..."
 	-@docker rm -f $(CONTAINER_NAME) >/dev/null 2>&1 || true
 	@echo "[make] 重置完成；下次 make shell/build 会按当前源码与镜像重建容器。"
 
 clean:
+	@if [ "$(DEEPCODE_BUILD_HOST_OS)" = Darwin ]; then python3 scripts/macos-build-bridge.py stop; fi
 	@echo "[make] 强制移除容器 $(CONTAINER_NAME) ..."
 	-@docker rm -f $(CONTAINER_NAME) >/dev/null 2>&1 || true
 	@echo "[make] 强制移除镜像 $(IMAGE) ..."

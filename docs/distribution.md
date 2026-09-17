@@ -8,7 +8,9 @@ macOS 的 `DeepCode-GUI.app` 包含所有程序和运行资源，可以整体移
 
 `DEEPCODE_CONFIG_DIR` 可指定现有用户数据位置。macOS 启动器及 GUI 默认沿用包所在目录的数据根，移动 App 时可显式指定原数据根；本次整理不迁移已有数据。Linux/Windows GUI 保持程序目录的数据根，直接 CLI/TUI 保持现有 Host config_root 规则。已有输出目录中的 config、runtime、会话、日志等不会被构建覆盖或放进压缩包。
 
-开发环境先在目标 worktree 使用 `make shell` 准备 Docker。从宿主执行 `bash build.sh` 会尝试所有可用平台；`--stage package-linux`、`--stage package-windows`、`--stage package-macos` 可指定单平台。macOS 必须从宿主入口调用，Docker 编译共享 TypeScript/GUI，宿主既有工具链编译 Darwin。缺少的工具链会明确报错；构建不自动安装 Node/Rust、不启用后台打包服务、不失败换源重试。通过 PATH 或 DEEPCODE_MACOS_CARGO、DEEPCODE_MACOS_NODE_BIN 指定已安装工具。
+开发环境先在目标 worktree 使用 `make shell` 准备 Docker；Mac 上同时自动准备绑定当前 worktree 和容器的宿主打包通道。随后在容器或宿主执行 `bash build.sh` 均会尝试所有可用平台；`--stage package-linux`、`--stage package-windows`、`--stage package-macos` 可指定单平台。容器生成一次共享 TypeScript/GUI 产物，macOS 请求通过共享目录交给宿主，由宿主既有工具链编译 Darwin、组装并签名。
+
+已知存在 Mac 宿主时，通道或工具链失败会使构建返回非零退出码；没有 Mac 构建能力时，默认构建明确跳过，显式指定 macOS 则报错。最终摘要列出实际更新和跳过的平台。通道传回本次日志及退出码，取消只停止本次原生构建；容器停止、`make reset-dev` 或 `make clean` 会结束对应通道。同一 worktree 同时只允许一个构建写入共享产物，宿主未确认退出时保留 staging 和锁，并报告路径。构建不自动安装 Node/Rust、不失败换源重试。通过 PATH 或 DEEPCODE_MACOS_CARGO、DEEPCODE_MACOS_NODE_BIN 指定已安装工具；宿主通道不进入发行包。
 
 一次 package 调用只准备一次依赖、编译一次共享 TypeScript、检查一次 GUI 类型并构建一次 GUI。Cargo target、registry、pnpm store、已有 sccache 保留；不同 worktree 使用独立可变 target/node_modules。每次清理 TS/Vite 输出并新建空 staging，完整组装后替换明确的程序内容，因此删除的文件和旧 chunk 不会残留。构建号/提交只用于追溯，不用于跨组件相等校验。
 

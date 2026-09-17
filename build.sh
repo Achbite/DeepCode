@@ -17,7 +17,7 @@ Usage: bash build.sh [--stage STAGE]...
   package (default)    Build every available platform; fail if none built.
   package-linux       Linux runtime for the container architecture.
   package-windows     Windows x64 runtime (GNU cross toolchain).
-  package-macos       macOS arm64 runtime; invoke on the macOS host.
+  package-macos       macOS arm64 runtime; Docker delegates to its Mac host.
   ui                  Build shared TypeScript + GUI once, publish bin/ui.
   daemon | cli | tui  Build only the selected Linux native executable.
   native-gui          Build only the Linux native GUI shell.
@@ -26,6 +26,7 @@ Environment: CONTAINER_NAME, WORKDIR_IN_CTNR, DEEPCODE_OUTPUT_DIR,
   DEEPCODE_MACOS_CARGO, DEEPCODE_MACOS_NODE_BIN, DEEPCODE_MACOS_CARGO_TARGET_DIR.
 Tools must already be installed. Package stages use a fresh staging directory;
 Cargo/pnpm caches are retained. User data in existing output directories is retained.
+On Mac, make shell prepares the host bridge before entering Docker.
 HELP
 }
 while [ "$#" -gt 0 ]; do
@@ -45,22 +46,54 @@ if [ "$IN_CONTAINER" -eq 0 ]; then
 fi
 case "$OUTPUT_DIR/" in "$ROOT_DIR/"*) ;; *) printf 'Output must be inside the mounted worktree.\n' >&2; exit 2 ;; esac
 mkdir -p "$OUTPUT_DIR" "$ROOT_DIR/.build-cache"
+BUILD_LOCK="$ROOT_DIR/.build-cache/build.lock"
+mkdir "$BUILD_LOCK" 2>/dev/null || { printf 'Another build owns %s; wait for it to finish.\n' "$BUILD_LOCK" >&2; exit 1; }
 TRANSACTION="$(mktemp -d "$ROOT_DIR/.build-cache/package.XXXXXX")"
+printf '%s\n' "$TRANSACTION" > "$BUILD_LOCK/transaction"
+started=$SECONDS
+current_stage=preflight
+built_platforms=()
+skipped_platforms=()
 cleanup() {
   local status="$1"
+  local macos_pending=0
   trap - EXIT INT TERM
   if [ "$IN_CONTAINER" -eq 0 ] && [ -f "$TRANSACTION/container.pid" ]; then
     local process_group
     process_group="$(cat "$TRANSACTION/container.pid")"
     docker exec "$CONTAINER_NAME" kill -TERM -- "-$process_group" || printf 'Could not stop this build process group: %s\n' "$process_group" >&2
   fi
-  rm -rf -- "$TRANSACTION"
+  if [ -f "$TRANSACTION/macos-request" ]; then
+    if ! python3 "$ROOT_DIR/scripts/macos-build-bridge.py" cancel --shared "$TRANSACTION/shared"; then
+      status=1
+      macos_pending=1
+    fi
+  fi
+  if [ "$macos_pending" -eq 1 ]; then
+    printf 'Mac host has not confirmed exit; retaining staging and build lock: %s\n' "$TRANSACTION" >&2
+  else
+    rm -rf -- "$TRANSACTION" "$BUILD_LOCK"
+  fi
+  if [ "$status" -ne 0 ]; then
+    printf '==[build][FAILED]== stage=%s exit=%s updated="%s" skipped="%s"\n' "$current_stage" "$status" "${built_platforms[*]:-none}" "${skipped_platforms[*]:-none}" >&2
+  fi
   exit "$status"
 }
 trap 'cleanup $?' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 container_path() { printf '%s/%s' "$WORKDIR_IN_CTNR" "${1#"$ROOT_DIR/"}"; }
+macos_step() {
+  if [ "$IN_CONTAINER" -eq 1 ]; then
+    python3 "$ROOT_DIR/scripts/macos-build-bridge.py" "$@"
+  elif [ "$(uname -s)" != Darwin ]; then
+    printf 'No macOS build host is registered for this worktree.\n'; return 3
+  elif [ "$1" = check ]; then
+    bash "$ROOT_DIR/scripts/package-macos.sh" --check
+  else
+    bash "$ROOT_DIR/scripts/package-macos.sh" "$TRANSACTION/shared" "$OUTPUT_DIR"
+  fi
+}
 container_step() {
   if [ "$IN_CONTAINER" -eq 1 ]; then
     bash "$ROOT_DIR/scripts/build-platforms.sh" "$@"
@@ -98,21 +131,27 @@ available=()
 for platform in "${platforms[@]:-}"; do
   [ -n "$platform" ] || continue
   if [ "$platform" = macos ]; then
-    check=(bash "$ROOT_DIR/scripts/package-macos.sh" --check)
+    check=(macos_step check)
   else
     check=(container_step --check "$platform")
   fi
+  current_stage="check-$platform"
   if reason="$("${check[@]}" 2>&1)"; then
     available+=("$platform")
-  elif [ "$all" -eq 1 ]; then
-    printf '==[build][SKIPPED]== %s: %s\n' "$platform" "$reason"
+    [ "$platform" != macos ] || printf '==[build][host]== macOS arm64 packaging available\n'
   else
-    printf '==[build][error]== %s: %s\n' "$platform" "$reason" >&2; exit 1
+    check_status=$?
+    if [ "$all" -eq 1 ] && { [ "$platform" != macos ] || [ "$check_status" -eq 3 ]; }; then
+      skipped_platforms+=("$platform")
+      printf '==[build][SKIPPED]== %s: %s\n' "$platform" "$reason"
+    else
+      printf '==[build][error]== %s: %s\n' "$platform" "$reason" >&2; exit "$check_status"
+    fi
   fi
 done
 [ "${#platforms[@]}" -eq 0 ] || [ "${#available[@]}" -gt 0 ] || { printf 'No platform can be built.\n' >&2; exit 1; }
-started=$SECONDS
 if [ "$ui" -eq 1 ] || [ "${#available[@]}" -gt 0 ]; then
+  current_stage=shared
   container_step --shared "$SHARED_DIR"
 fi
 if [ "$ui" -eq 1 ]; then
@@ -120,19 +159,22 @@ if [ "$ui" -eq 1 ]; then
   rm -rf -- "$OUTPUT_DIR/ui/web"
 fi
 for stage in "${native_stages[@]:-}"; do
+  current_stage="$stage"
   [ -z "$stage" ] || container_step --native "$stage"
 done
 built=0
 for platform in "${available[@]:-}"; do
   [ -n "$platform" ] || continue
   phase_start=$SECONDS
+  current_stage="$platform"
   printf '==[build][platform][START]== %s\n' "$platform"
   if [ "$platform" = macos ]; then
-    bash "$ROOT_DIR/scripts/package-macos.sh" "$TRANSACTION/shared" "$OUTPUT_DIR"
+    macos_step package --shared "$TRANSACTION/shared" --output "$OUTPUT_DIR"
   else
     container_step --package "$platform" "$SHARED_DIR" "$CONTAINER_OUTPUT"
   fi
   built=$((built + 1))
+  built_platforms+=("$platform")
   printf '==[build][platform][DONE]== %s seconds=%s\n' "$platform" "$((SECONDS - phase_start))"
 done
-printf '==[build][DONE]== packages=%s seconds=%s output=%s\n' "$built" "$((SECONDS - started))" "$OUTPUT_DIR"
+printf '==[build][DONE]== packages=%s updated="%s" skipped="%s" seconds=%s output=%s\n' "$built" "${built_platforms[*]:-none}" "${skipped_platforms[*]:-none}" "$((SECONDS - started))" "$OUTPUT_DIR"

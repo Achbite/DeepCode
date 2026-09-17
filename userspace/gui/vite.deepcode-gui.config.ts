@@ -57,6 +57,8 @@ export default defineConfig(({ command }) => {
         },
         output: {
           manualChunks(id: string) {
+            if (id.endsWith('/pdfjs-dist/legacy/build/pdf.mjs')) return 'pdf-core';
+            if (id.endsWith('/pdfjs-dist/legacy/web/pdf_viewer.mjs')) return 'pdf-viewer';
             if (
               id.includes('react-markdown') ||
               id.includes('remark-') ||
