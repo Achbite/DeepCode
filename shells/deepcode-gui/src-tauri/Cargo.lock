@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "deepcode-gui-tauri-shell"
-version = "0.5.60"
+version = "0.6.1"
 dependencies = [
  "block2",
  "deepcode-host-connection",
@@ -526,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "deepcode-host-connection"
-version = "0.5.60"
+version = "0.6.1"
 dependencies = [
  "deepcode-kernel-abi",
  "libc",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "deepcode-kernel-abi"
-version = "0.5.60"
+version = "0.6.1"
 dependencies = [
  "serde",
  "serde_json",

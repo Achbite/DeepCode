@@ -1,6 +1,6 @@
 # DeepCode
 
-当前产品版本：**0.5.60**。
+当前产品版本：**0.6.1**。
 
 > English guide: [README.md](README.md)
 

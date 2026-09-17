@@ -1,6 +1,6 @@
 # DeepCode
 
-Current product version: **0.5.60**.
+Current product version: **0.6.1**.
 
 > 中文说明：[README.zh-CN.md](README.zh-CN.md)
 
