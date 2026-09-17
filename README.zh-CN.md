@@ -33,24 +33,15 @@ DeepCode 不包含 Requirement、Plan、Review 等并行工作流引擎。普通
 
 Session binding 始终把工作区工具限制在当前 run 的不可变目录快照内。`agent.permissions.workspaceMutation` 默认是 `plan`；改为 `allow` 会关闭工作区修改的 Plan admission 门禁，包括声明 `workspaceMode=write` 的 `bash` 调用。所选 Shell 工具（`bash` 或 `powershell`）从绑定工作区执行一条有界命令，并强制声明 `workspaceMode` 与 `executionScope`。`executionScope=workspace` 使用工作区沙箱：read 模式只可写 Kernel 持有的临时存储，write 模式需要精确的工作区修改 authority；平台适配分别使用 macOS sandbox-exec、Linux/WSL2 Bubblewrap 和需要初始化的原生 Windows 工作区支持；缺少条件时明确返回错误，详见[执行环境说明](docs/product/execution-environments.md)。`executionScope=host` 使用宿主用户环境，并额外要求 `agent.permissions.external`；若 Host 命令会修改工作区，必须声明 write 模式，因此同时需要工作区修改与 external authority。可选的 `terminal.stdin` 会向一次性临时 PTY 精确写入一次；未声明时 stdin 关闭，不创建可持续复用的 terminal session。命令从绑定工作区根目录启动，PATH 由 Host PATH 与现有标准开发工具目录组成；每次 attempt 只持有并回收自己创建的子进程组、PTY 与临时文件。退出码为零生成 completed ToolRecord；非零退出或超时生成 failed ToolRecord，并保留有界输出和退出事实。网络读取默认 `allow`；Host Bash 与外部 effect 工具使用独立 external 权限。`web.search` 与 `web.fetch` 保持为通用核心联网工具，GitHub、arXiv 与 PDF 专用工作流通过 Skill 或插件按需激活。`agent.permissions.engineeringDecisions` 独立控制实质工程路线不明确时通过 `interaction.request` 询问，还是委托 Agent 依据当前代码事实自行裁决。
 
-## 0.5.60 更新
-
-- Agent 工作时可以继续发送消息。Session 按顺序排队，在当前模型输出和工具结果完整落定后、下次模型请求前引入；等待决策时仍通过专门答复处理，只有显式停止才取消。
-- 内核工具和 Session 扩展接口按实际消费者简化。未选择插件的装载错误只影响该插件；本次选中的插件仍须完整装载成功。
-- 共享 Host 发现保留启动及代理错误，包含本轮 Windows 原生工作区 sandbox、进程执行和 Shell 选择修复。
-- 模型配置无效时，Host 和已有对话仍可打开；设置页保留配置错误并提供明确的重新配置入口。
-- 新配置默认提供 DeepSeek Flash 模板；每个模型在自己的配置卡内保存，上次选择的模型会作为新对话默认模型。
-- 侧边栏项目和对话支持拖动排序；复制、赞、踩采用一致的悬停和键盘聚焦交互。
-
-产品版本由包清单声明，生成的 `BUILDINFO.json` 记录版本、源码提交、构建时间和平台。制品身份与数据库、wire schema 的版本分别表达。
-
 ## 选择界面
 
-| 界面            | 适合场景                                    | 入口                                            |
-| --------------- | ------------------------------------------- | ----------------------------------------------- |
-| DeepCode-GUI    | 专注的本地 Agent 对话                       | `DeepCode-GUI.app` 或 `DeepCode-GUI.exe`    |
-| CLI             | 一次性任务、脚本和终端工作流                | `DeepCode-CLI.command` 或 `deepcode-cli`    |
-| TUI             | 持续的交互式终端对话                        | `DeepCode-TUI.command` 或 `deepcode-tui`    |
+
+| 界面           | 适合场景           | 入口                                      |
+| ------------ | -------------- | --------------------------------------- |
+| DeepCode-GUI | 专注的本地 Agent 对话 | `DeepCode-GUI.app` 或 `DeepCode-GUI.exe` |
+| CLI          | 一次性任务、脚本和终端工作流 | `DeepCode-CLI.command` 或 `deepcode-cli` |
+| TUI          | 持续的交互式终端对话     | `DeepCode-TUI.command` 或 `deepcode-tui` |
+
 
 DeepCode-GUI 提供 Agent 对话、附件、只读文件查看和变更预览；TUI 提供终端交互，CLI 用于任务、自动化与诊断。独立 Editor 已退役，编辑能力后续由 VS Code 插件承接。
 
@@ -151,7 +142,7 @@ macOS 更新在宿主执行并重新签名。完成后关闭再打开窗口；�
 
 此入口适用于既有 Host / Session 接口下的页面、样式和渲染修改。新增后端接口或工具执行能力仍需正常构建相应服务；本次文档工具和资源 API 首次安装也需要包含这些服务的完整版本。
 
-UI 插件支持在窗口内热替换。在 **设置 → 插件 → 界面插件** 添加本地目录，保存入口代码后只更新对应展示区域；首批插槽覆盖正文、文档预览和主题，不开放 Session、Provider 或底层工具端口。见[插件接口与示例](docs/product/ui-plugins.md)。
+UI 插件支持在窗口内热替换。在 <strong>设置 → 插件 → 界面插件</strong> 添加本地目录，保存入口代码后只更新对应展示区域；首批插槽覆盖正文、文档预览和主题，不开放 Session、Provider 或底层工具端口。见[插件接口与示例](docs/product/ui-plugins.md)。
 
 ## 文档排版与预览
 

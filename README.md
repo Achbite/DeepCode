@@ -8,15 +8,6 @@ DeepCode is a local-first coding-agent framework. DeepCode-GUI, CLI, and TUI sha
 
 “Local-first” means workspace access, the Session journal, shared projections, tool execution, and tool records stay on this machine. Prompts and context selected by the Agent are still sent to the configured model provider unless you use a local provider such as Ollama.
 
-## What's new in 0.5.60
-
-- Submit messages while the Agent is working. Session queues them in order and introduces them before the next model request after the current model output and tool results settle. Pending decisions keep their dedicated response flow; stopping is explicit.
-- Kernel tools and Session extension points have been simplified around their actual consumers. An unselected plugin's loading error stays local to that plugin; selected plugins must load successfully.
-- Shared Host discovery preserves startup and proxy errors. Native Windows workspace sandbox, process execution, and shell selection include the current Windows fixes.
-- Invalid model configuration no longer prevents the Host from starting or displaying existing conversations. Settings retains the configuration error and provides an explicit repair action.
-- A new configuration starts with a DeepSeek Flash template. Save each model in its own configuration card; the last selected model becomes the default for new conversations.
-- Drag projects and conversations to reorder the sidebar. Copy, thumbs-up, and thumbs-down actions now share consistent hover and keyboard-focus behavior.
-
 The release version is declared in the package manifests. Generated `BUILDINFO.json` records `version`, source commit, build time, and platform; these identify the artifact independently of database and wire schema versions.
 
 ## How it works
@@ -44,11 +35,13 @@ A Session binding always limits workspace tools to its immutable run snapshot. `
 
 ## Interfaces
 
-| Interface       | Best for                                                   | Entry                                                |
-| --------------- | ---------------------------------------------------------- | ---------------------------------------------------- |
-| DeepCode-GUI    | A focused local Agent conversation                         | `DeepCode-GUI.app` or `DeepCode-GUI.exe`         |
-| CLI             | One-shot tasks, scripts, and terminal workflows            | `DeepCode-CLI.command` or `deepcode-cli`         |
-| TUI             | Continuous interactive terminal conversations              | `DeepCode-TUI.command` or `deepcode-tui`         |
+
+| Interface    | Best for                                        | Entry                                    |
+| ------------ | ----------------------------------------------- | ---------------------------------------- |
+| DeepCode-GUI | A focused local Agent conversation              | `DeepCode-GUI.app` or `DeepCode-GUI.exe` |
+| CLI          | One-shot tasks, scripts, and terminal workflows | `DeepCode-CLI.command` or `deepcode-cli` |
+| TUI          | Continuous interactive terminal conversations   | `DeepCode-TUI.command` or `deepcode-tui` |
+
 
 Use DeepCode-GUI for Agent conversations, attachments, read-only files and change previews. TUI provides terminal interaction; CLI supports tasks, automation and diagnostics. The standalone Editor is retired; future editing support belongs to a VS Code extension.
 
@@ -149,13 +142,13 @@ Run macOS updates on the host to refresh the App signature, then close and reope
 
 This path covers UI changes using existing Host / Session interfaces. New backend interfaces or executors still require the corresponding service build. The document tools and resource API introduced here require an initial full version containing those services.
 
-UI plugins also support live replacement in the open window. Add a local plugin folder in **Settings → Plugins → UI plugins**; saved entry changes update only its presentation. The first slots cover committed message text, document previews and themes. See the [plugin API and example](docs/product/ui-plugins.md). No Session, Provider or tool ports are exposed.
+UI plugins also support live replacement in the open window. Add a local plugin folder in <strong>Settings → Plugins → UI plugins</strong>; saved entry changes update only its presentation. The first slots cover committed message text, document previews and themes. See the [plugin API and example](docs/product/ui-plugins.md). No Session, Provider or tool ports are exposed.
 
 ## Document composition and preview
 
 The built-in [deepcode-documents Skill](skills/deepcode-documents/SKILL.md) is read on demand when a user requests polished layouts or document exports. It includes design guidance inspired by Kami, a reusable HTML template and format instructions. Ordinary replies do not automatically create files. For example: “Format this analysis as a concise report and save HTML, PDF and Markdown versions in the workspace.”
 
-`document.render` uses existing workspace write permissions and Plan scope, publishing a Session artifact only after the file is written. HTML and Markdown need no additional generation runtime. PDF uses WeasyPrint with self-contained HTML. Set the Python interpreter in **Settings → Plugins → Document composition** after installing [WeasyPrint's platform prerequisites](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html) and the [Python requirements](skills/deepcode-documents/scripts/requirements.txt). The development container includes this environment. Native installations need the corresponding runtime; configuration errors remain visible and do not overwrite an existing document.
+`document.render` uses existing workspace write permissions and Plan scope, publishing a Session artifact only after the file is written. HTML and Markdown need no additional generation runtime. PDF uses WeasyPrint with self-contained HTML. Set the Python interpreter in <strong>Settings → Plugins → Document composition</strong> after installing [WeasyPrint's platform prerequisites](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html) and the [Python requirements](skills/deepcode-documents/scripts/requirements.txt). The development container includes this environment. Native installations need the corresponding runtime; configuration errors remain visible and do not overwrite an existing document.
 
 GUI artifacts and workspace links open a shared preview: static HTML with source view, local PDF.js with page navigation, zoom, text selection and download, and the existing Markdown renderer. PDF reading needs no Python or online viewer. Generated HTML embeds its images, SVG and styles; PDF generation does not run JavaScript. Ordinary text retains its paged reader.
 
@@ -165,7 +158,7 @@ Native Windows defaults to automatic shell selection: PowerShell 7 is preferred,
 
 Settings groups configuration into Appearance, Agent behavior, Execution environment, Tool permissions, Models & services, and Plugins. Plugins can load text Skills from a directory or a `SKILL.md` file. Bundled English Markdown product documentation is available through `doc.read`; workflow Skills use `skill.read`. MCP and executable extensions remain part of the shared plugin architecture.
 
-Desktop attachments retain one **Files and folders** entry backed by the operating system's native picker. Skill sources and workspace opening also use one selection window. Windows includes a Select action for the highlighted file or directory. Cancellation leaves existing references unchanged.
+Desktop attachments retain one <strong>Files and folders</strong> entry backed by the operating system's native picker. Skill sources and workspace opening also use one selection window. Windows includes a Select action for the highlighted file or directory. Cancellation leaves existing references unchanged.
 
 Todos describe stable development phases. Adding authorized file/directory scope uses a separate confirmation that preserves steps, verification and progress; a complete Plan revision remains available when the plan itself needs to change. Tool activities display real start and stdout/stderr progress, with final outcomes owned by Kernel records. Reading earlier messages keeps the viewport in place while the conversation runs.
 
@@ -177,10 +170,10 @@ See [Execution environments](docs/product/execution-environments.md) for platfor
 
 Before the first task:
 
-1. Open **Settings → Models & services**.
+1. Open <strong>Settings → Models &amp; services</strong>.
 2. Use the initial DeepSeek Flash template, or add an OpenAI-compatible, Responses, Anthropic, or Ollama profile.
 3. Enter the API key required by the provider and adjust the base URL and model if needed.
-4. Enable the profile and use **Save model** in that model's card. Each saved model has its own save and probe actions.
+4. Enable the profile and use <strong>Save model</strong> in that model's card. Each saved model has its own save and probe actions.
 5. Select a model in the conversation. The shared configuration remembers that selection as the default for new conversations; Settings can also change the default directly.
 
 Packages never include your API key. Secrets are stored in the active configuration root's local secret store; do not share that directory.
@@ -276,7 +269,7 @@ Within `contracts/agent-runtime/`, `catalog.sql`, `session.sql`, and `tool-recor
 
 ### No model is available
 
-Open **Settings → Models & services**, add the required API key and save the model in its own card, then select an enabled model. If the profile file cannot be read, the settings page shows the original error and an explicit repair action. Model requests remain unavailable until valid configuration is saved; existing conversation history remains readable when its Session store is valid.
+Open <strong>Settings → Models &amp; services</strong>, add the required API key and save the model in its own card, then select an enabled model. If the profile file cannot be read, the settings page shows the original error and an explicit repair action. Model requests remain unavailable until valid configuration is saved; existing conversation history remains readable when its Session store is valid.
 
 ### CLI/TUI cannot reach the local Daemon
 
