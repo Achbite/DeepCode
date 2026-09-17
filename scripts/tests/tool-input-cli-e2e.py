@@ -13,10 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-spec = importlib.util.spec_from_file_location(
-    "local_agent_e2e", Path(__file__).with_name("local-agent-e2e.py")
-)
-assert spec is not None and spec.loader is not None
+spec = importlib.util.spec_from_file_location("deepcode_test_support", Path(__file__).with_name("support.py"))
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
 require = fixture.require
@@ -29,74 +26,6 @@ WRITE_PATHS = [{"path": "build", "kind": "directory"}] + [
 ]
 INTRO = {"type": "message", "id": "msg_cli_intro", "role": "assistant", "phase": "commentary",
          "status": "completed", "content": [{"type": "output_text", "text": "I will inspect the current file."}]}
-
-
-def json_payloads(body: dict[str, Any]) -> list[dict[str, Any]]:
-    result = []
-    for message in body["messages"]:
-        try:
-            value = json.loads(message.get("content") or "")
-            if isinstance(value, dict):
-                result.append(value)
-        except ValueError:
-            pass
-    return result
-
-
-class ProviderState:
-    def __init__(self, workspace: Path) -> None:
-        self.workspace = workspace
-        self.requests: list[dict[str, Any]] = []
-        self.responses_requests: list[dict[str, Any]] = []
-        self.failure: BaseException | None = None
-
-    def record_failure(self, error: BaseException) -> None:
-        self.failure = error
-
-    def assert_healthy(self) -> None:
-        if self.failure is not None:
-            raise AssertionError(f"Provider fixture assertion: {self.failure}") from self.failure
-
-    def inspect(self, body: dict[str, Any]) -> tuple[int, dict[str, str], dict[str, Any]]:
-        self.requests.append(body)
-        ordinal = len(self.requests)
-        require(body["tools"] == self.requests[0]["tools"], "工具目录在轮次间变化")
-        prefix = self.requests[0]["messages"]
-        require(body["messages"][:len(prefix)] == prefix, "稳定消息前缀被重写")
-        pending: set[str] = set()
-        results = {}
-        for message in body["messages"]:
-            calls = message.get("tool_calls", [])
-            if calls:
-                require(not pending, "前一批工具调用尚未返回结果")
-                pending.update(call["id"] for call in calls)
-            elif message["role"] == "tool":
-                call_id = message["tool_call_id"]
-                require(call_id in pending, "工具结果没有对应调用")
-                pending.remove(call_id)
-                results[call_id] = json.loads(message["content"])
-            else:
-                require(not pending, "工具结果之前插入了下一条消息")
-        require(not pending, "Provider 收到了缺失工具结果的历史")
-        names = {}
-        for tool in body["tools"]:
-            function = tool["function"]
-            properties = function["parameters"].get("properties", {})
-            if "path" in properties and "startByte" in properties:
-                names["read"] = function["name"]
-                require("workspace" not in function["parameters"]["required"], "workspace 缺省未开放")
-            elif "edits" in properties:
-                names["edit"] = function["name"]
-            elif "path" in properties and "content" in properties and "format" not in properties:
-                names["write"] = function["name"]
-            elif "command" in properties and "timeout" in properties:
-                names["bash"] = function["name"]
-            elif "mutationManifest" in properties:
-                names["plan"] = function["name"]
-            elif "sourceFactRef" in properties:
-                names["progress"] = function["name"]
-        require(len(names) == 6, f"缺少本次工具目录：{names}")
-        return ordinal, names, results
 
 
 class ProviderHandler(fixture.MockProviderHandler):
@@ -164,7 +93,7 @@ class ProviderHandler(fixture.MockProviderHandler):
                 require((self.provider_state.workspace / "probe.txt").read_text() == "ALPHA\nbeta\n", "修改内容不正确")
                 preview = results["edit-corrected"]["output"]["editPreview"]
                 require(preview["hunks"][0]["before"] == "alpha\n" and preview["hunks"][0]["after"] == "ALPHA\n" and not preview["truncated"], "实际编辑摘要未到达模型")
-                todo = next(value for value in reversed(json_payloads(body)) if value.get("type") == "todo.current")
+                todo = next(value for value in reversed(fixture.json_payloads(body)) if value.get("type") == "todo.current")
                 self._send_tool_calls([("progress", names["progress"], {
                     "sourceFactRef": results["edit-corrected"]["recordId"],
                     "updates": [{"todoId": item["todoId"], "status": "completed" if index == 0 else "inProgress"} for index, item in enumerate(todo["items"])],
@@ -175,7 +104,7 @@ class ProviderHandler(fixture.MockProviderHandler):
                     "mutationManifest": [{"workspace": "primary", "operation": "fs.write", "target": "extra", "targetKind": "directoryTree"}],
                 })])
             elif ordinal == 7:
-                todo = next(value for value in reversed(json_payloads(body)) if value.get("type") == "todo.current")
+                todo = next(value for value in reversed(fixture.json_payloads(body)) if value.get("type") == "todo.current")
                 require(todo["sourcePlanRevision"] == 2 and [item["status"] for item in todo["items"]] == ["completed"] + ["inProgress"] * 12, "确认范围补充丢失阶段进度")
                 self._send_tool_calls([
                     ("expanded-create", names["write"], {"path": "extra/new.txt", "content": "expanded scope\n"}),
@@ -187,7 +116,7 @@ class ProviderHandler(fixture.MockProviderHandler):
                 require((self.provider_state.workspace / "extra/new.txt").read_text() == "expanded scope\n", "补范围后内容不符")
                 require(results["pipeline-status"]["outcome"] == "failed" and results["pipeline-status"]["output"]["exitCode"] == 7, "管道原始失败退出码丢失")
                 require(results["expected-nonzero"]["outcome"] == "completed", "预期非零处理失败")
-                todo = next(value for value in reversed(json_payloads(body)) if value.get("type") == "todo.current")
+                todo = next(value for value in reversed(fixture.json_payloads(body)) if value.get("type") == "todo.current")
                 self._send_tool_calls([("progress-final", names["progress"], {
                     "sourceFactRef": results["expanded-create"]["recordId"],
                     "updates": [{"todoId": item["todoId"], "status": "completed"} for item in todo["items"]],
@@ -259,22 +188,13 @@ class ProviderHandler(fixture.MockProviderHandler):
             self.close_connection = True
 
 
-def cli(daemon: Any, session_id: str, text: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run([
-        str(fixture.CLI_BINARY), "--api", daemon.base_url, "--no-auto-start-kernel",
-        "--session", session_id, "--plain", "ask", text,
-    ], cwd=fixture.ROOT, env=fixture.shell_environment(daemon), capture_output=True, text=True, timeout=45)
-    require(result.returncode == expected, f"CLI 退出 {result.returncode}，预期 {expected}\n{result.stdout}\n{result.stderr}")
-    return result
-
-
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="deepcode-tool-input-cli-") as directory:
         root = Path(directory)
         workspace = root / "workspace"
         workspace.mkdir()
         (workspace / "probe.txt").write_text("alpha\nbeta\n")
-        state = ProviderState(workspace)
+        state = fixture.ProviderState(workspace)
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ProviderHandler)
         server.provider_state = state
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -292,13 +212,13 @@ def main() -> None:
             daemon.start()
             session = fixture.create_session(daemon, workspace)
             session_id = session["sessionId"]
-            cli(daemon, session_id, "读取 probe.txt，检查工具反馈并按 Plan 修复。", expected=5)
+            fixture.cli(daemon, session_id, "读取 probe.txt，检查工具反馈并按 Plan 修复。", expected=5)
             state.assert_healthy()
             waiting = fixture.projection(daemon, session_id)
             require(waiting["pendingPlan"]["mutationManifest"][1]["writablePaths"] == WRITE_PATHS, "Plan 写入范围未完整保留")
             require(len(waiting["pendingPlan"]["steps"]) == 13 and len(waiting["pendingPlan"]["mutationManifest"]) == 129, "计划被旧数量限制截断")
             first_plan = waiting["pendingPlan"]
-            cli(daemon, session_id, "/reply 确认", expected=5)
+            fixture.cli(daemon, session_id, "/reply 确认", expected=5)
             state.assert_healthy()
             extension = fixture.projection(daemon, session_id)
             require(extension["pendingPlan"]["planId"] == first_plan["planId"] and extension["pendingPlan"]["revision"] == 2, "范围补充没有沿用当前 Plan")
@@ -308,12 +228,12 @@ def main() -> None:
             expected_statuses = ["completed"] + ["inProgress"] * 12
             require([item["status"] for item in extension["todoList"]["items"]] == expected_statuses, "待确认修订重置进度")
             require(not (workspace / "extra/new.txt").exists(), "范围补充确认前发生写入")
-            require("tool-input-cli-complete" in cli(daemon, session_id, "/reply 确认").stdout, "CLI 未输出完成正文")
+            require("tool-input-cli-complete" in fixture.cli(daemon, session_id, "/reply 确认").stdout, "CLI 未输出完成正文")
             state.assert_healthy()
             after_extension = fixture.projection(daemon, session_id)
             require(after_extension["plans"][-1]["steps"] == first_plan["steps"], "确认后阶段及验收被重写")
             require([item["todoId"] for item in after_extension["todoList"]["items"]] == [item["todoId"] for item in extension["todoList"]["items"]], "确认后 Todo 身份改变")
-            require("pasted-text-cli-complete" in cli(daemon, session_id, LONG_INPUT).stdout, "CLI 未完成粘贴原文读取")
+            require("pasted-text-cli-complete" in fixture.cli(daemon, session_id, LONG_INPUT).stdout, "CLI 未完成粘贴原文读取")
             state.assert_healthy()
             completed = fixture.projection(daemon, session_id)
             require(completed["run"]["status"] == "completed", "最终 Session 未完成")
@@ -327,7 +247,7 @@ def main() -> None:
                 "sessionId": native_session_id, "settings": {"profileId": "e2e-responses", "reasoningEffortOverride": None},
             })
             require(reply["status"] == "accepted", "Responses profile 未接受")
-            native_output = cli(daemon, native_session_id, "检查当前文件并说明结果。")
+            native_output = fixture.cli(daemon, native_session_id, "检查当前文件并说明结果。")
             require("commentary-cli-complete" in native_output.stdout, "CLI 在过程说明后提前结束")
             state.assert_healthy()
             native_projection = fixture.projection(daemon, native_session_id)

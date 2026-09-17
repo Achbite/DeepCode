@@ -400,7 +400,7 @@ mod layout_tests {
         let mut plain = String::new();
         render_tool_plain(&mut plain, &activity);
         let mut lines = Vec::new();
-        push_tool_lines(&mut lines, &activity);
+        push_tool_summary(&mut lines, &activity);
         let styled = lines
             .iter()
             .map(|line| line.to_string())
@@ -410,10 +410,11 @@ mod layout_tests {
             assert!(output.contains("[active]"));
             assert!(output.contains("执行中"));
             assert!(output.contains("诊断"));
-            assert!(output.contains("stdout 10 bytes · stderr 7 bytes"));
-            assert!(output.contains("仅保留最新片段"));
-            assert!(output.contains("已执行"));
         }
+        assert!(styled.contains("/tool tool:live"));
+        assert!(plain.contains("stdout 10 bytes · stderr 7 bytes"));
+        assert!(plain.contains("仅保留最新片段"));
+        assert!(plain.contains("已执行"));
         activity.status = "completed".into();
         activity.live_output = None;
         let mut terminal = String::new();
@@ -453,7 +454,7 @@ mod layout_tests {
             let mut plain = String::new();
             render_tool_plain(&mut plain, &activity);
             let mut lines = Vec::new();
-            push_tool_lines(&mut lines, &activity);
+            push_tool_summary(&mut lines, &activity);
             assert!(plain.contains(expected));
             assert!(lines.iter().any(|line| line.to_string().contains(expected)));
         }
@@ -1709,110 +1710,6 @@ fn tool_error_lines(activity: &ActivityProjection) -> Vec<String> {
     lines
 }
 
-fn push_tool_lines(lines: &mut Vec<Line<'_>>, activity: &ActivityProjection) {
-    let operation = activity
-        .tool
-        .as_ref()
-        .map(|tool| tool.operation.as_str())
-        .unwrap_or(activity.label.as_str());
-    let color = activity_color(&activity.status);
-    lines.push(Line::from(Span::styled(
-        format!("工具 {operation} [{}]", activity.status),
-        Style::default().fg(color),
-    )));
-    for error in tool_error_lines(activity) {
-        lines.push(Line::from(Span::styled(
-            error,
-            Style::default().fg(Color::Red),
-        )));
-    }
-    for detail in tool_progress_details(activity) {
-        lines.push(Line::from(Span::styled(
-            detail,
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    if let Some(output) = activity.live_output.as_ref() {
-        push_tool_stream_lines(lines, "stdout", &output.stdout);
-        push_tool_stream_lines(lines, "stderr", &output.stderr);
-    }
-    if let Some(tool) = activity.tool.as_ref() {
-        if let Some(shell) = tool.shell.as_ref() {
-            lines.push(Line::from(Span::styled(
-                format!("  $ {}", shell.command),
-                Style::default().fg(Color::Gray),
-            )));
-            lines.push(Line::from(Span::styled(
-                format!("  cwd: {}", shell.cwd),
-                Style::default().fg(Color::DarkGray),
-            )));
-            if let Some(result) = shell.result.as_ref() {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  environment: shell={} · interactive={} · pathSource={} · writeScope={} · homeWritable={}",
-                        result.environment.shell,
-                        result.environment.interactive,
-                        result.environment.path_source,
-                        result.environment.write_scope,
-                        result.environment.home_writable,
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                )));
-                let exit = result
-                    .exit_code
-                    .map_or_else(|| "signal/timeout".to_string(), |code| code.to_string());
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  exit: {exit} · {} ms · {} bytes{}{}",
-                        result.duration_ms,
-                        result.captured_bytes,
-                        if result.timed_out {
-                            " · timed out"
-                        } else {
-                            ""
-                        },
-                        if result.truncated {
-                            " · truncated"
-                        } else {
-                            ""
-                        },
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                )));
-                push_tool_stream_lines(lines, "stdout", &result.stdout);
-                push_tool_stream_lines(lines, "stderr", &result.stderr);
-            }
-        }
-        for (index, change) in tool.file_changes.iter().enumerate() {
-            if let Some(record) = &tool.record_id {
-                lines.push(Line::from(format!(
-                    "  {} {} · /diff {} {}",
-                    change.kind, change.path, record, index
-                )));
-            }
-        }
-        for resource in &tool.resources {
-            let detail = match (
-                resource.kind.as_str(),
-                resource.workspace_id.as_deref(),
-                resource.logical_path.as_deref(),
-                resource.uri.as_deref(),
-            ) {
-                ("workspacePath", Some(workspace_id), Some(logical_path), _) => format!(
-                    "  {} · /open {} {}",
-                    resource.label, workspace_id, logical_path
-                ),
-                ("url", _, _, Some(uri)) => format!("  {} · {uri}", resource.label),
-                _ => format!("  {}", resource.label),
-            };
-            lines.push(Line::from(Span::styled(
-                detail,
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-    }
-}
-
 fn push_timeline_plan_lines(lines: &mut Vec<Line<'_>>, plan: &PlanProjection) {
     lines.push(Line::from(Span::styled(
         format!("Plan · revision {} · {}", plan.revision, plan.status),
@@ -1826,19 +1723,6 @@ fn push_timeline_plan_lines(lines: &mut Vec<Line<'_>>, plan: &PlanProjection) {
     for (index, step) in plan.steps.iter().enumerate() {
         lines.push(Line::from(format!("{}. {}", index + 1, step.title)));
         lines.push(Line::from(format!("   {}", step.details)));
-    }
-}
-
-fn push_tool_stream_lines(lines: &mut Vec<Line<'_>>, label: &str, output: &str) {
-    if output.is_empty() {
-        return;
-    }
-    lines.push(Line::from(Span::styled(
-        format!("  {label}:"),
-        Style::default().fg(Color::DarkGray),
-    )));
-    for line in output.lines() {
-        lines.push(Line::from(Span::raw(format!("    {line}"))));
     }
 }
 

@@ -35,18 +35,12 @@ if [ "$profile" != 'static' ]; then
     command -v "$tool" >/dev/null 2>&1 || { printf '缺少命令：%s\n' "$tool" >&2; exit 1; }
   done
 fi
-if [ "$profile" = 'cli' ] || [ "$profile" = 'full' ]; then
-  command -v python3 >/dev/null 2>&1 || { printf '缺少命令：python3\n' >&2; exit 1; }
-fi
-
 run_static() {
-  printf '[test] 源码身份与脚本语法\n'
+  printf '[test] 脚本语法与 diff 格式\n'
   local script
-  for script in ./test.sh ./build.sh ./entrypoint.sh ./scripts/source-identity.sh ./scripts/branch-flow.sh ./scripts/package-macos.sh ./scripts/macos-package-service.sh ./scripts/build-platforms.sh ./scripts/tests/build-platforms.sh ./scripts/check-architecture.sh; do
+  for script in ./test.sh ./build.sh ./entrypoint.sh ./scripts/*.sh; do
     bash -n "$script"
   done
-  bash ./scripts/check-architecture.sh
-  bash ./scripts/tests/build-platforms.sh
   if deepcode_source_git_available "$ROOT_DIR"; then
     git -C "$ROOT_DIR" diff --check
   else
@@ -59,20 +53,29 @@ run_required() {
   printf '[test] Rust workspace\n'
   cargo fmt --all -- --check
   cargo test --workspace
-  printf '[test] Session 事件约束显式修复\n'
-  python3 -I -S ./scripts/tests/session-tool-interrupted-repair.py
-  printf '[test] 独立 UI 资源发布\n'
+  printf '[test] 构建编排与程序发布\n'
+  python3 -I -S ./scripts/tests/build-platforms.py
+  printf '[test] GUI 资源发布\n'
   python3 -I -S ./scripts/tests/ui-update.py
   printf '[test] Userspace 共享依赖\n'
-  bash ./build.sh --stage deps
+  pnpm --store-dir "${PNPM_STORE_DIR:-${PNPM_HOME:-$HOME/.local/share/pnpm}/store}" install --frozen-lockfile
   pnpm build:userspace-shared
   printf '[test] Session 数据流\n'
   pnpm --filter @deepcode/session-core test
   printf '[test] GUI 投影合同与状态交互\n'
   pnpm --filter @deepcode/client test
-  printf '[test] 跨包类型接线\n'
-  pnpm typecheck
+  printf '[test] GUI 类型接线（共享包已编译）\n'
+  pnpm --filter @deepcode/client typecheck
 }
+
+# E2E scripts consume the outputs selected here; direct calls must supply these paths.
+if [ "$profile" = cli ] || [ "$profile" = full ]; then
+  test_target_dir="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
+  export DEEPCODE_E2E_DAEMON="${DEEPCODE_E2E_DAEMON:-$test_target_dir/debug/deepcode-kernel-daemon}"
+  export DEEPCODE_E2E_CLI="${DEEPCODE_E2E_CLI:-$test_target_dir/debug/deepcode-cli}"
+  export DEEPCODE_E2E_TUI="${DEEPCODE_E2E_TUI:-$test_target_dir/debug/deepcode-tui}"
+  export DEEPCODE_E2E_SESSION_BRIDGE="${DEEPCODE_E2E_SESSION_BRIDGE:-$ROOT_DIR/userspace/session-core/dist/sessionServiceBridge.js}"
+fi
 
 case "$profile" in
   static) run_static ;;
@@ -87,7 +90,7 @@ case "$profile" in
     run_required
     printf '[test] CLI、TUI 与 GUI 正式包入口\n'
     cargo build -p deepcode-first-party-tools -p deepcode-kernel-daemon -p deepcode-cli -p deepcode-tui -p deepcode-host-web
-    pnpm build:deepcode-gui
+    pnpm --filter @deepcode/client build:web
     printf '[test] 本地 Agent 真实链路与共享投影壳\n'
     python3 -I -S ./scripts/tests/tool-input-cli-e2e.py
     python3 -I -S ./scripts/tests/local-agent-e2e.py

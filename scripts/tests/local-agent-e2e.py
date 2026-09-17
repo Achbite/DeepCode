@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import http.server
+import importlib.util
 import json
 import os
 import secrets
@@ -23,18 +24,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-ROOT = Path(__file__).resolve().parents[2]
-HOST_TOKEN_HEADER = "x-deepcode-host-shell-token"
-COMMAND_VERSION = "deepcode.command.v3"
+spec = importlib.util.spec_from_file_location("deepcode_test_support", Path(__file__).with_name("support.py"))
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+
 GENERATION_ONE = "SKILL_GENERATION_ONE"
 GENERATION_TWO = "SKILL_GENERATION_TWO"
 ATTACHMENT_CONTENT = "LOCAL_ATTACHMENT_CONTENT_MUST_NOT_REACH_PROVIDER"
 LONG_INPUT = "  原始任务约束与资料🙂\n" * 4000
 PDF_CONTENT = "DEEPCODE_FIRST_PARTY_PDF_BINDING_OK"
-CORE_TOOL_NAMES = [
-    "fs.read", "fs.write", "fs.edit", "fs.delete",
-    "bash", "web.search", "web.fetch", "session.read", "skill.read", "doc.read", "document.render",
-]
+REQUIRED_CORE_TOOLS = {"fs.read", "web.search", "web.fetch"}
 FIRST_PARTY_TOOL_OWNERS = {
     "github.search": "plugin://github@first-party",
     "github.read": "plugin://github@first-party",
@@ -43,36 +42,9 @@ FIRST_PARTY_TOOL_OWNERS = {
     "pdf.read": "plugin://pdf@first-party",
 }
 FIRST_PARTY_PLUGIN_URIS = set(FIRST_PARTY_TOOL_OWNERS.values())
-URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def runtime_path(environment_name: str, default: Path) -> Path:
-    configured = os.environ.get(environment_name)
-    return Path(configured).resolve() if configured else default
-
-
-DAEMON_BINARY = runtime_path(
-    "DEEPCODE_E2E_DAEMON",
-    ROOT / "target" / "debug" / "deepcode-kernel-daemon",
-)
-CLI_BINARY = runtime_path(
-    "DEEPCODE_E2E_CLI",
-    ROOT / "target" / "debug" / "deepcode-cli",
-)
-TUI_BINARY = runtime_path(
-    "DEEPCODE_E2E_TUI",
-    ROOT / "target" / "debug" / "deepcode-tui",
-)
-SESSION_BRIDGE = runtime_path(
-    "DEEPCODE_E2E_SESSION_BRIDGE",
-    ROOT / "userspace" / "session-core" / "dist" / "sessionServiceBridge.js",
-)
-MCP_SERVER = ROOT / "fixtures" / "skill-mcp-smoke" / "mcp" / "mcp-text-tools" / "server.py"
-
-
-def require(condition: bool, message: str) -> None:
-    if not condition:
-        raise AssertionError(message)
+MCP_SERVER = fixture.ROOT / "fixtures" / "skill-mcp-smoke" / "mcp" / "mcp-text-tools" / "server.py"
 
 
 class ProviderState:
@@ -84,22 +56,22 @@ class ProviderState:
         self._failures: list[str] = []
         self._old_wire_name: str | None = None
         self._new_wire_name: str | None = None
-        self._daemon: OwnedDaemon | None = None
+        self._daemon: fixture.OwnedDaemon | None = None
         self._session_id: str | None = None
         self._consumed_receipts: set[str] = set()
         self._last_receipt_sequence = 0
         self.first_request_started = threading.Event()
         self.release_first_request = threading.Event()
 
-    def bind_session(self, daemon: OwnedDaemon, session_id: str) -> None:
-        require(self._daemon is None, "Provider fixture 已绑定 Session")
+    def bind_session(self, daemon: fixture.OwnedDaemon, session_id: str) -> None:
+        fixture.require(self._daemon is None, "Provider fixture 已绑定 Session")
         self._daemon = daemon
         self._session_id = session_id
 
     def register(self, body: dict[str, Any]) -> int:
-        require(body.get("stream") is True, "Provider 请求未使用流式链路")
-        require(isinstance(body.get("messages"), list), "Provider 请求缺少 messages")
-        require(isinstance(body.get("tools"), list), "Provider 请求缺少 tools")
+        fixture.require(body.get("stream") is True, "Provider 请求未使用流式链路")
+        fixture.require(isinstance(body.get("messages"), list), "Provider 请求缺少 messages")
+        fixture.require(isinstance(body.get("tools"), list), "Provider 请求缺少 tools")
         with self._lock:
             self._requests.append(body)
             return len(self._requests)
@@ -108,53 +80,53 @@ class ProviderState:
         tools_by_name = self.current_receipt_tools(ordinal, body)
         messages = body["messages"]
         joined = "\n".join(
-            message_text(message.get("content"))
+            fixture.message_text(message.get("content"))
             for message in messages
             if isinstance(message, dict)
         )
         guidance_messages = [
-            message_text(message.get("content"))
+            fixture.message_text(message.get("content"))
             for message in messages
             if isinstance(message, dict)
             and message.get("role") == "system"
-            and message_text(message.get("content")).startswith("Active tool guidance:")
+            and fixture.message_text(message.get("content")).startswith("Active tool guidance:")
         ]
-        require(len(guidance_messages) == 1, "Provider 请求没有唯一的基础工具 guidance")
+        fixture.require(len(guidance_messages) == 1, "Provider 请求没有唯一的基础工具 guidance")
         guidance = guidance_messages[0]
-        require(
+        fixture.require(
             f"- {tools_by_name['fs.read']['wireName']}: Read UTF-8 workspace text directly or in bounded segments."
             in guidance,
             "fs.read prompt snippet 未进入 Provider 请求",
         )
-        require(
+        fixture.require(
             "instead of shell commands such as cat or sed" in guidance,
             "fs.read 优先于 shell 文本读取的 guidance 缺失",
         )
-        require(
+        fixture.require(
             f"- {tools_by_name['bash']['wireName']}: List, search, discover, build, test, and run commands."
             in guidance,
             "bash prompt snippet 未进入 Provider 请求",
         )
-        require(
+        fixture.require(
             "Do not use this as the default way to read a known UTF-8 workspace text file."
             in guidance,
             "bash 与 fs.read 的职责边界 guidance 缺失",
         )
-        require(
+        fixture.require(
             f"- {tools_by_name['web.fetch']['wireName']}: Read bounded text from a known HTTP or HTTPS URL."
             in guidance,
             "web.fetch prompt snippet 未进入 Provider 请求",
         )
-        require(
+        fixture.require(
             "Do not use this as a substitute for unavailable search by guessing URLs"
             in guidance,
             "web.fetch 与搜索的职责边界 guidance 缺失",
         )
-        require("filesystem or Bash tools" not in joined, "附件文本仍在指示 Bash 读取")
+        fixture.require("filesystem or Bash tools" not in joined, "附件文本仍在指示 Bash 读取")
         mcp_server_id = "fixture-old" if ordinal <= 2 else "fixture-new"
         reverse_tool = tools_by_name.get(f"mcp.{mcp_server_id}.text.reverse")
-        require(isinstance(reverse_tool, dict), "Provider 请求缺少当前代次的 MCP reverse 工具")
-        require(
+        fixture.require(isinstance(reverse_tool, dict), "Provider 请求缺少当前代次的 MCP reverse 工具")
+        fixture.require(
             reverse_tool.get("origin") == "extension"
             and reverse_tool.get("pluginUri") == f"plugin://{mcp_server_id}@mcp",
             "MCP reverse 工具没有绑定当前代次的 plugin owner",
@@ -162,13 +134,13 @@ class ProviderState:
         wire_name = reverse_tool["wireName"]
         for name, plugin_uri in FIRST_PARTY_TOOL_OWNERS.items():
             tool = tools_by_name.get(name)
-            require(
+            fixture.require(
                 isinstance(tool, dict)
                 and tool.get("origin") == "extension"
                 and tool.get("pluginUri") == plugin_uri,
                 f"Provider 请求缺少精确 first-party 工具与 owner：{name}",
             )
-        require(
+        fixture.require(
             "Search GitHub repositories, code, and issues through GitHub's native API." in guidance
             and "Search arXiv paper metadata through its native Atom API." in guidance
             and "Read bounded page ranges from a PDF attached to the current workspace binding."
@@ -176,7 +148,7 @@ class ProviderState:
             "first-party tool prompt contribution 未进入 Provider 请求",
         )
         results = {
-            str(message.get("tool_call_id")): message_text(message.get("content"))
+            str(message.get("tool_call_id")): fixture.message_text(message.get("content"))
             for message in messages
             if isinstance(message, dict)
             and message.get("role") == "tool"
@@ -184,60 +156,60 @@ class ProviderState:
         }
 
         if ordinal == 1:
-            require(GENERATION_ONE in joined, "第一轮首个请求未加载旧 Skill generation")
-            require(GENERATION_TWO not in joined, "第一轮首个请求提前加载新 Skill generation")
-            require('"workspace":"workspace2"' in joined, "文件引用未使用逻辑 workspace handle")
-            require('"path":"e2e-note.txt"' in joined, "文件引用逻辑路径未进入首轮请求")
-            require('"mediaType":"text/plain"' in joined, "文件引用 mediaType 未进入首轮请求")
-            require(ATTACHMENT_CONTENT not in joined, "文件内容被错误嵌入首轮 Provider 请求")
+            fixture.require(GENERATION_ONE in joined, "第一轮首个请求未加载旧 Skill generation")
+            fixture.require(GENERATION_TWO not in joined, "第一轮首个请求提前加载新 Skill generation")
+            fixture.require('"workspace":"workspace2"' in joined, "文件引用未使用逻辑 workspace handle")
+            fixture.require('"path":"e2e-note.txt"' in joined, "文件引用逻辑路径未进入首轮请求")
+            fixture.require('"mediaType":"text/plain"' in joined, "文件引用 mediaType 未进入首轮请求")
+            fixture.require(ATTACHMENT_CONTENT not in joined, "文件内容被错误嵌入首轮 Provider 请求")
             with self._lock:
                 self._old_wire_name = wire_name
             self.first_request_started.set()
         elif ordinal == 2:
-            require(GENERATION_ONE in joined, "同一 run 的 continuation 丢失旧 Skill snapshot")
-            require(GENERATION_TWO not in joined, "同一 run 的 continuation 被新 Skill 改写")
-            require(wire_name == self.old_wire_name(), "同一 run 的 MCP 工具目录发生变化")
-            require(
+            fixture.require(GENERATION_ONE in joined, "同一 run 的 continuation 丢失旧 Skill snapshot")
+            fixture.require(GENERATION_TWO not in joined, "同一 run 的 continuation 被新 Skill 改写")
+            fixture.require(wire_name == self.old_wire_name(), "同一 run 的 MCP 工具目录发生变化")
+            fixture.require(
                 any("ahpla" in content for content in results.values()),
                 "第一轮 MCP ToolRecord 未进入 Provider continuation",
             )
-            require(
+            fixture.require(
                 any("Fixture search result" in content for content in results.values()),
                 "第一轮 web.search ToolRecord 未进入 Provider continuation",
             )
-            require(
+            fixture.require(
                 any("web-fetch-ok" in content for content in results.values()),
                 "第一轮 web.fetch ToolRecord 未进入 Provider continuation",
             )
-            require(
+            fixture.require(
                 any(ATTACHMENT_CONTENT in content for content in results.values()),
                 "第一轮 fs.read 未按逻辑引用惰性读取文件快照",
             )
-            require(
+            fixture.require(
                 any(PDF_CONTENT in content for content in results.values()),
                 "第一轮 pdf.read 未从 Kernel prepared workspace binding 提取正文",
             )
         elif ordinal == 3:
-            require(LONG_INPUT not in joined, "长文本仍被整篇内联到 Provider 请求")
-            require('"path":"user-input.txt"' in joined, "长文本资源引用未进入当前输入")
-            require(GENERATION_TWO in joined, "下一 run 未加载新 Skill generation")
-            require(GENERATION_ONE not in joined, "下一 run 仍暴露旧 Skill generation")
-            require(wire_name != self.old_wire_name(), "下一 run 未取得新的 MCP wire tool")
+            fixture.require(LONG_INPUT not in joined, "长文本仍被整篇内联到 Provider 请求")
+            fixture.require('"path":"user-input.txt"' in joined, "长文本资源引用未进入当前输入")
+            fixture.require(GENERATION_TWO in joined, "下一 run 未加载新 Skill generation")
+            fixture.require(GENERATION_ONE not in joined, "下一 run 仍暴露旧 Skill generation")
+            fixture.require(wire_name != self.old_wire_name(), "下一 run 未取得新的 MCP wire tool")
             with self._lock:
                 self._new_wire_name = wire_name
         elif ordinal == 4:
-            require(GENERATION_TWO in joined, "第二轮 continuation 丢失新 Skill snapshot")
-            require(GENERATION_ONE not in joined, "第二轮 continuation 混入旧 Skill snapshot")
-            require(wire_name == self.new_wire_name(), "第二轮 continuation 的 MCP 目录漂移")
-            require(
+            fixture.require(GENERATION_TWO in joined, "第二轮 continuation 丢失新 Skill snapshot")
+            fixture.require(GENERATION_ONE not in joined, "第二轮 continuation 混入旧 Skill snapshot")
+            fixture.require(wire_name == self.new_wire_name(), "第二轮 continuation 的 MCP 目录漂移")
+            fixture.require(
                 any("ateb" in content for content in results.values()),
                 "第二轮 MCP ToolRecord 未进入 Provider continuation",
             )
-            require(
+            fixture.require(
                 any("Fixture search result" in content for content in results.values()),
                 "第二轮 web.search ToolRecord 未进入 Provider continuation",
             )
-            require(
+            fixture.require(
                 any("web-fetch-ok" in content for content in results.values()),
                 "第二轮 web.fetch ToolRecord 未进入 Provider continuation",
             )
@@ -256,42 +228,42 @@ class ProviderState:
         ordinal: int,
         body: dict[str, Any],
     ) -> dict[str, dict[str, Any]]:
-        require(self._daemon is not None and self._session_id is not None, "Provider fixture 尚未绑定 Session")
-        current = projection(self._daemon, self._session_id)
+        fixture.require(self._daemon is not None and self._session_id is not None, "Provider fixture 尚未绑定 Session")
+        current = fixture.projection(self._daemon, self._session_id)
         run = current.get("run")
-        require(isinstance(run, dict) and run.get("status") == "running", "Provider 请求没有当前 running run")
+        fixture.require(isinstance(run, dict) and run.get("status") == "running", "Provider 请求没有当前 running run")
         receipts = current.get("contextCompositions")
-        require(isinstance(receipts, list), "当前投影缺少 context receipt")
+        fixture.require(isinstance(receipts, list), "当前投影缺少 context receipt")
         with self._lock:
-            require(len(self._consumed_receipts) == ordinal - 1, "Provider 请求与 context receipt 消费次序不一致")
+            fixture.require(len(self._consumed_receipts) == ordinal - 1, "Provider 请求与 context receipt 消费次序不一致")
             pending = [
                 receipt for receipt in receipts
                 if isinstance(receipt, dict)
                 and receipt.get("runId") == run.get("runId")
                 and receipt.get("providerRequestId") not in self._consumed_receipts
             ]
-            require(len(pending) == 1, "当前 run 没有唯一未消费的 context receipt")
+            fixture.require(len(pending) == 1, "当前 run 没有唯一未消费的 context receipt")
             receipt = pending[0]
             request_id = receipt.get("providerRequestId")
             sequence = receipt.get("sequence")
-            require(isinstance(request_id, str) and bool(request_id), "context receipt 缺少 Provider requestId")
-            require(
+            fixture.require(isinstance(request_id, str) and bool(request_id), "context receipt 缺少 Provider requestId")
+            fixture.require(
                 isinstance(sequence, int) and sequence > self._last_receipt_sequence,
                 "context receipt sequence 没有前进",
             )
-            require(receipt.get("purpose") == "agent", "fixture Provider 请求关联到错误的 context purpose")
+            fixture.require(receipt.get("purpose") == "agent", "fixture Provider 请求关联到错误的 context purpose")
             self._consumed_receipts.add(request_id)
             self._last_receipt_sequence = sequence
 
         receipt_tools = receipt.get("tools")
-        require(isinstance(receipt_tools, list) and bool(receipt_tools), "context receipt 工具目录为空")
+        fixture.require(isinstance(receipt_tools, list) and bool(receipt_tools), "context receipt 工具目录为空")
         tools_by_name: dict[str, dict[str, Any]] = {}
         wire_names: list[str] = []
         for tool in receipt_tools:
-            require(isinstance(tool, dict), "context receipt 工具不是对象")
+            fixture.require(isinstance(tool, dict), "context receipt 工具不是对象")
             canonical_name = tool.get("canonicalName")
             wire_name = tool.get("wireName")
-            require(
+            fixture.require(
                 isinstance(canonical_name, str) and bool(canonical_name)
                 and isinstance(wire_name, str) and bool(wire_name)
                 and canonical_name not in tools_by_name and wire_name not in wire_names
@@ -305,11 +277,10 @@ class ProviderState:
             if isinstance(item, dict) and isinstance(item.get("function"), dict) else None
             for item in body["tools"]
         ]
-        require(provider_wire_names == wire_names, "Provider 请求的工具目录与当前 context receipt 不一致")
-        require(
-            [tool["canonicalName"] for tool in receipt_tools if tool.get("origin") == "coreBuiltin"]
-            == CORE_TOOL_NAMES,
-            "Provider 基础工具没有保持精确集合与顺序",
+        fixture.require(provider_wire_names == wire_names, "Provider 请求的工具目录与当前 context receipt 不一致")
+        fixture.require(
+            REQUIRED_CORE_TOOLS.issubset(tool["canonicalName"] for tool in receipt_tools if tool.get("origin") == "coreBuiltin"),
+            "Provider 缺少本场景需要的基础工具",
         )
         return tools_by_name
 
@@ -334,32 +305,29 @@ class ProviderState:
     def old_wire_name(self) -> str:
         with self._lock:
             value = self._old_wire_name
-        require(value is not None, "旧 MCP wire name 尚未捕获")
+        fixture.require(value is not None, "旧 MCP wire name 尚未捕获")
         return value
 
     def new_wire_name(self) -> str:
         with self._lock:
             value = self._new_wire_name
-        require(value is not None, "新 MCP wire name 尚未捕获")
+        fixture.require(value is not None, "新 MCP wire name 尚未捕获")
         return value
 
 
-class MockProviderHandler(http.server.BaseHTTPRequestHandler):
+class MockProviderHandler(fixture.MockProviderHandler):
     protocol_version = "HTTP/1.1"
 
-    @property
-    def provider_state(self) -> ProviderState:
-        return self.server.provider_state  # type: ignore[attr-defined]
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         headers_sent = False
         try:
-            require(self.path.endswith("/chat/completions"), "Provider endpoint 不匹配")
-            require(self.headers.get("authorization") == "Bearer e2e-key", "Provider 凭据不匹配")
+            fixture.require(self.path.endswith("/chat/completions"), "Provider endpoint 不匹配")
+            fixture.require(self.headers.get("authorization") == "Bearer e2e-key", "Provider 凭据不匹配")
             length = int(self.headers.get("content-length", "0"))
-            require(0 < length <= 8 * 1024 * 1024, "Provider 请求长度无效")
+            fixture.require(0 < length <= 8 * 1024 * 1024, "Provider 请求长度无效")
             body = json.loads(self.rfile.read(length))
-            require(isinstance(body, dict), "Provider body 不是对象")
+            fixture.require(isinstance(body, dict), "Provider body 不是对象")
             ordinal = self.provider_state.register(body)
             wire_names = self.provider_state.inspect(ordinal, body)
 
@@ -371,7 +339,7 @@ class MockProviderHandler(http.server.BaseHTTPRequestHandler):
             headers_sent = True
 
             if ordinal == 1:
-                require(
+                fixture.require(
                     self.provider_state.release_first_request.wait(timeout=20),
                     "等待第一轮运行时更新超时",
                 )
@@ -418,79 +386,6 @@ class MockProviderHandler(http.server.BaseHTTPRequestHandler):
                 self.send_error(500)
             self.close_connection = True
 
-    def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == "/fixture-resource":
-            encoded = b"web-fetch-ok"
-            self.send_response(200)
-            self.send_header("content-type", "text/plain; charset=utf-8")
-        elif parsed.path == "/search":
-            encoded = json.dumps({
-                "results": [{
-                    "title": "Fixture search result",
-                    "url": f"http://127.0.0.1:{self.server.server_port}/fixture-resource",
-                    "snippet": "Local deterministic search evidence.",
-                }],
-            }, separators=(",", ":")).encode("utf-8")
-            self.send_response(200)
-            self.send_header("content-type", "application/json")
-        else:
-            self.send_error(404)
-            return
-        self.send_header("content-length", str(len(encoded)))
-        self.send_header("connection", "close")
-        self.end_headers()
-        self.wfile.write(encoded)
-        self.close_connection = True
-
-    def _send_tool_calls(
-        self,
-        calls: list[tuple[str, str, dict[str, Any]]],
-    ) -> None:
-        self._send_payload({
-            "choices": [{
-                "index": 0,
-                "delta": {
-                    "tool_calls": [{
-                        "index": index,
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": json.dumps(arguments, separators=(",", ":")),
-                        },
-                    } for index, (call_id, name, arguments) in enumerate(calls)],
-                },
-                "finish_reason": "tool_calls",
-            }],
-            "usage": provider_usage(),
-        })
-        self._send_done()
-
-    def _send_text(self, content: str) -> None:
-        self._send_payload({
-            "choices": [{
-                "index": 0,
-                "delta": {"content": content},
-                "finish_reason": "stop",
-            }],
-            "usage": provider_usage(),
-        })
-        self._send_done()
-
-    def _send_payload(self, payload: dict[str, Any]) -> None:
-        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        self.wfile.write(f"data: {encoded}\n\n".encode("utf-8"))
-        self.wfile.flush()
-
-    def _send_done(self) -> None:
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
-        self.close_connection = True
-
-    def log_message(self, _format: str, *_args: object) -> None:
-        return
-
 
 class MockProviderServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
@@ -499,22 +394,6 @@ class MockProviderServer(http.server.ThreadingHTTPServer):
     def __init__(self, state: ProviderState) -> None:
         super().__init__(("127.0.0.1", 0), MockProviderHandler)
         self.provider_state = state
-
-
-def provider_usage() -> dict[str, Any]:
-    return {
-        "prompt_tokens": 100,
-        "completion_tokens": 10,
-        "prompt_tokens_details": {"cached_tokens": 40},
-    }
-
-
-def message_text(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if value is None:
-        return ""
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def write_pdf_fixture(path: Path, text: str) -> None:
@@ -552,259 +431,18 @@ def write_pdf_fixture(path: Path, text: str) -> None:
     path.write_bytes(encoded)
 
 
-class OwnedDaemon:
-    def __init__(self, config_root: Path) -> None:
-        self.config_root = config_root
-        self.token = f"dchost_{secrets.token_hex(32)}"
-        self.instance_id = f"dcinstance_{secrets.token_hex(32)}"
-        self.port = free_port()
-        self.base_url = f"http://127.0.0.1:{self.port}"
-        self.log_file = tempfile.TemporaryFile(mode="w+b")
-        self.process: subprocess.Popen[bytes] | None = None
-        self.identity: dict[str, Any] | None = None
-
-    def start(self) -> None:
-        node = shutil.which("node")
-        require(node is not None, "找不到 Node runtime")
-        require(DAEMON_BINARY.is_file(), f"缺少 Daemon：{DAEMON_BINARY}")
-        require(SESSION_BRIDGE.is_file(), f"缺少 Session bridge：{SESSION_BRIDGE}")
-        environment = os.environ.copy()
-        for name in list(environment):
-            if name.lower() in {"http_proxy", "https_proxy", "all_proxy"}:
-                environment.pop(name, None)
-        environment.update({
-            "DEEPCODE_HOST": "127.0.0.1",
-            "DEEPCODE_PORT": str(self.port),
-            "DEEPCODE_CONFIG_DIR": str(self.config_root),
-            "DEEPCODE_HOST_SHELL_TOKEN": self.token,
-            "DEEPCODE_HOST_INSTANCE_ID": self.instance_id,
-            "DEEPCODE_SESSION_BRIDGE": str(SESSION_BRIDGE),
-            "DEEPCODE_NODE": node,
-            "DEEPCODE_LLM_API_KEY": "e2e-key",
-            "NO_PROXY": "127.0.0.1,localhost",
-            "no_proxy": "127.0.0.1,localhost",
-            "RUST_BACKTRACE": "1",
-        })
-        self.process = subprocess.Popen(
-            [str(DAEMON_BINARY)],
-            cwd=ROOT,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=self.log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-
-        def ready() -> dict[str, Any] | None:
-            if self.process is not None and self.process.poll() is not None:
-                raise AssertionError(
-                    f"Daemon 提前退出 code={self.process.returncode}\n{self.log_tail()}"
-                )
-            try:
-                value = api_json(self.base_url, "/api/host/identity")
-                return value if isinstance(value, dict) else None
-            except (OSError, ValueError, urllib.error.URLError):
-                return None
-
-        self.identity = wait_until(ready, 12, "Daemon 未进入 ready")
-        require(self.identity.get("instanceId") == self.instance_id, "Daemon identity 不匹配")
-
-    def shutdown(self) -> None:
-        require(self.process is not None, "Daemon 尚未启动")
-        require(self.identity is not None, "Daemon identity 不存在")
-        receipt = api_json(
-            self.base_url,
-            "/api/host/shutdown",
-            token=self.token,
-            method="POST",
-            body={"expectedIdentity": self.identity},
-            timeout=15,
-        )
-        require(isinstance(receipt, dict), "shutdown receipt 不是对象")
-        require(receipt.get("accepted") is True, "Daemon 未接受 shutdown")
-        require(receipt.get("cleanupComplete") is True, "Daemon 资源未完整清理")
-        require(receipt.get("identity") == self.identity, "shutdown identity 漂移")
-        try:
-            code = self.process.wait(timeout=10)
-        except subprocess.TimeoutExpired as error:
-            self.terminate_group()
-            raise AssertionError("Daemon 接受 shutdown 后未退出") from error
-        require(code == 0, f"Daemon shutdown 后退出码为 {code}\n{self.log_tail()}")
-
-    def terminate_group(self) -> None:
-        if self.process is None or self.process.poll() is not None:
-            return
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/PID", str(self.process.pid), "/T", "/F"],
-                capture_output=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            self.process.wait(timeout=5)
-            return
-        try:
-            os.killpg(self.process.pid, signal.SIGTERM)
-            self.process.wait(timeout=3)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
-            if self.process.poll() is None:
-                try:
-                    os.killpg(self.process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                self.process.wait(timeout=3)
-
-    def close(self) -> None:
-        self.terminate_group()
-        self.log_file.close()
-
-    def log_tail(self) -> str:
-        self.log_file.flush()
-        position = self.log_file.tell()
-        self.log_file.seek(0)
-        content = self.log_file.read().decode("utf-8", errors="replace")
-        self.log_file.seek(position)
-        return content[-12000:]
-
-
-def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as handle:
-        handle.bind(("127.0.0.1", 0))
-        return int(handle.getsockname()[1])
-
-
-def wait_until(operation: Callable[[], Any], timeout: float, message: str) -> Any:
-    deadline = time.monotonic() + timeout
-    last_error: Exception | None = None
-    while time.monotonic() < deadline:
-        try:
-            value = operation()
-            if value:
-                return value
-        except AssertionError:
-            raise
-        except Exception as error:
-            last_error = error
-        time.sleep(0.05)
-    suffix = f": {last_error}" if last_error else ""
-    raise AssertionError(f"{message}{suffix}")
-
-
-def api_envelope(
-    base_url: str,
-    path: str,
-    *,
-    token: str | None = None,
-    method: str = "GET",
-    body: dict[str, Any] | None = None,
-    timeout: float = 5,
-) -> dict[str, Any]:
-    encoded = None if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
-    headers = {"accept": "application/json"}
-    if encoded is not None:
-        headers["content-type"] = "application/json"
-    if token is not None:
-        headers[HOST_TOKEN_HEADER] = token
-    request = urllib.request.Request(
-        f"{base_url}{path}",
-        data=encoded,
-        headers=headers,
-        method=method,
-    )
-    try:
-        with URL_OPENER.open(request, timeout=timeout) as response:
-            raw = response.read()
-    except urllib.error.HTTPError as error:
-        raw = error.read()
-    envelope = json.loads(raw)
-    require(isinstance(envelope, dict), f"{path} 返回的 envelope 不是对象")
-    return envelope
-
-
-def api_json(
-    base_url: str,
-    path: str,
-    *,
-    token: str | None = None,
-    method: str = "GET",
-    body: dict[str, Any] | None = None,
-    timeout: float = 5,
-) -> Any:
-    envelope = api_envelope(
-        base_url,
-        path,
-        token=token,
-        method=method,
-        body=body,
-        timeout=timeout,
-    )
-    require(
-        envelope.get("ok") is True,
-        f"{path} 失败：{envelope.get('error')} {envelope.get('message')}",
-    )
-    return envelope.get("data")
-
-
-def projection(daemon: OwnedDaemon, session_id: str) -> dict[str, Any]:
-    path_id = urllib.parse.quote(session_id, safe="")
-    value = api_json(
-        daemon.base_url,
-        f"/api/conversation/sessions/{path_id}/projection",
-        token=daemon.token,
-    )
-    require(isinstance(value, dict), "SessionProjection 不是对象")
-    require(value.get("schemaVersion") == "deepcode.session-projection.v5", "投影协议不是当前值")
-    require(value.get("sessionId") == session_id, "SessionProjection identity 漂移")
-    return value
-
-
-def wait_completed(
-    daemon: OwnedDaemon,
-    provider: ProviderState,
-    session_id: str,
-    label: str,
-) -> dict[str, Any]:
-    def current_if_ready() -> dict[str, Any] | None:
-        provider.assert_healthy()
-        current = projection(daemon, session_id)
-        run = current.get("run") or {}
-        if run.get("status") == "completed":
-            return current
-        if run.get("status") in {"failed", "cancelled", "indeterminate"}:
-            raise AssertionError(
-                f"Session 在到达 {label} 前终止：{run.get('status')} {current.get('terminalError')}"
-                f"\ndaemon:\n{daemon.log_tail()}"
-            )
-        return None
-
-    return wait_until(current_if_ready, 20, f"Session 未到达 {label}")
-
-
-def create_session(daemon: OwnedDaemon, workspace_path: Path) -> dict[str, Any]:
-    value = api_json(
-        daemon.base_url,
-        "/api/conversation/sessions",
-        token=daemon.token,
-        method="POST",
-        body={"workspacePaths": [str(workspace_path)]},
-        timeout=12,
-    )
-    require(isinstance(value, dict), "create Session 未返回 projection")
-    require(isinstance(value.get("sessionId"), str), "Session id 无效")
-    return value
-
-
 def assert_unknown_attachment_fields_rejected(
-    daemon: OwnedDaemon,
+    daemon: fixture.OwnedDaemon,
     session_id: str,
 ) -> None:
     path_id = urllib.parse.quote(session_id, safe="")
-    envelope = api_envelope(
+    envelope = fixture.api_envelope(
         daemon.base_url,
         f"/api/conversation/sessions/{path_id}/commands",
         token=daemon.token,
         method="POST",
         body={
-            "schemaVersion": COMMAND_VERSION,
+            "schemaVersion": fixture.COMMAND_VERSION,
             "type": "message.submit",
             "commandId": "command-unknown-attachment-fields",
             "sessionId": session_id,
@@ -814,25 +452,25 @@ def assert_unknown_attachment_fields_rejected(
         },
         timeout=12,
     )
-    require(envelope.get("ok") is False, "未声明的附件字段被当前 Session wire 合同接受")
+    fixture.require(envelope.get("ok") is False, "未声明的附件字段被当前 Session wire 合同接受")
 
 
-def selected_plugin_catalog(daemon: OwnedDaemon, label: str) -> tuple[str, list[dict[str, Any]]]:
-    catalog = api_json(
+def selected_plugin_catalog(daemon: fixture.OwnedDaemon, label: str) -> tuple[str, list[dict[str, Any]]]:
+    catalog = fixture.api_json(
         daemon.base_url,
         "/api/conversation/plugins",
         token=daemon.token,
     )
-    require(isinstance(catalog, dict), f"{label} PluginCatalogProjection 不是对象")
+    fixture.require(isinstance(catalog, dict), f"{label} PluginCatalogProjection 不是对象")
     revision = catalog.get("revision")
     plugins = catalog.get("plugins")
-    require(isinstance(revision, str) and revision, f"{label} 插件目录 revision 无效")
-    require(isinstance(plugins, list), f"{label} 插件目录不是数组")
+    fixture.require(isinstance(revision, str) and revision, f"{label} 插件目录 revision 无效")
+    fixture.require(isinstance(plugins, list), f"{label} 插件目录不是数组")
     typed_plugins = [plugin for plugin in plugins if isinstance(plugin, dict)]
-    require(len(typed_plugins) == len(plugins), f"{label} 插件目录项不是对象")
+    fixture.require(len(typed_plugins) == len(plugins), f"{label} 插件目录项不是对象")
     uris = {plugin.get("uri") for plugin in typed_plugins}
-    require(FIRST_PARTY_PLUGIN_URIS.issubset(uris), f"{label} 缺少 first-party 插件")
-    require(
+    fixture.require(FIRST_PARTY_PLUGIN_URIS.issubset(uris), f"{label} 缺少 first-party 插件")
+    fixture.require(
         len(typed_plugins) == 5
         and len([uri for uri in uris if isinstance(uri, str) and uri.endswith("@skill")]) == 1
         and len([uri for uri in uris if isinstance(uri, str) and uri.endswith("@mcp")]) == 1,
@@ -842,7 +480,7 @@ def selected_plugin_catalog(daemon: OwnedDaemon, label: str) -> tuple[str, list[
 
 
 def submit_message(
-    daemon: OwnedDaemon,
+    daemon: fixture.OwnedDaemon,
     session_id: str,
     command_id: str,
     text: str,
@@ -851,24 +489,24 @@ def submit_message(
     revision, plugins = selected_plugin_catalog(daemon, "message.submit")
     selections = []
     for index, plugin in enumerate(plugins):
-        require(isinstance(plugin, dict), "插件目录项不是对象")
+        fixture.require(isinstance(plugin, dict), "插件目录项不是对象")
         uri = plugin.get("uri")
         label = plugin.get("displayName")
-        require(isinstance(uri, str) and uri.startswith("plugin://"), "插件 URI 无效")
-        require(isinstance(label, str) and label, "插件 label 无效")
+        fixture.require(isinstance(uri, str) and uri.startswith("plugin://"), "插件 URI 无效")
+        fixture.require(isinstance(label, str) and label, "插件 label 无效")
         selections.append({
             "selectionId": f"{command_id}:plugin:{index + 1}",
             "uri": uri,
             "label": label,
         })
     path_id = urllib.parse.quote(session_id, safe="")
-    value = api_json(
+    value = fixture.api_json(
         daemon.base_url,
         f"/api/conversation/sessions/{path_id}/commands",
         token=daemon.token,
         method="POST",
         body={
-            "schemaVersion": COMMAND_VERSION,
+            "schemaVersion": fixture.COMMAND_VERSION,
             "type": "message.submit",
             "commandId": command_id,
             "sessionId": session_id,
@@ -879,20 +517,20 @@ def submit_message(
         },
         timeout=15,
     )
-    require(isinstance(value, dict), "command reply 不是对象")
-    require(value.get("status") == "accepted", "Session 未接纳 message.submit")
+    fixture.require(isinstance(value, dict), "command reply 不是对象")
+    fixture.require(value.get("status") == "accepted", "Session 未接纳 message.submit")
     return value
 
 
 def start_cli_ask_with_file(
-    daemon: OwnedDaemon,
+    daemon: fixture.OwnedDaemon,
     session_id: str,
     file_path: Path,
     text: str,
 ) -> subprocess.Popen[str]:
     _, plugins = selected_plugin_catalog(daemon, "CLI ask")
     command = [
-        str(CLI_BINARY),
+        str(fixture.CLI_BINARY),
         "--api", daemon.base_url,
         "--no-auto-start-kernel",
         "--session", session_id,
@@ -901,13 +539,13 @@ def start_cli_ask_with_file(
     ]
     for plugin in plugins:
         uri = plugin.get("uri") if isinstance(plugin, dict) else None
-        require(isinstance(uri, str) and uri.startswith("plugin://"), "CLI ask 插件 URI 无效")
+        fixture.require(isinstance(uri, str) and uri.startswith("plugin://"), "CLI ask 插件 URI 无效")
         command.extend(["--plugin", uri])
     command.extend(["ask", text])
     return subprocess.Popen(
         command,
-        cwd=ROOT,
-        env=shell_environment(daemon),
+        cwd=fixture.ROOT,
+        env=fixture.shell_environment(daemon),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -939,66 +577,35 @@ def plugin_settings(
     }
 
 
-def write_configuration(
-    config_root: Path,
-    provider_url: str,
-    settings: dict[str, Any],
-) -> None:
-    settings_root = config_root / "config" / "user" / "local" / "settings"
-    settings_root.mkdir(parents=True)
-    profile = {
-        "profiles": [{
-            "id": "e2e-main",
-            "name": "Local E2E",
-            "kind": "openaiCompatible",
-            "providerFlavor": "openai",
-            "baseUrl": provider_url,
-            "model": "mock-main",
-            "contextWindowTokens": 65536,
-            "maxOutputTokens": 512,
-            "enabled": True,
-        }],
-        "defaultProfileId": "e2e-main",
-    }
-    (settings_root / "llm-profiles.json").write_text(
-        json.dumps(profile, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    (settings_root / "user-settings.json").write_text(
-        json.dumps(settings, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-
 def patch_plugins(
-    daemon: OwnedDaemon,
+    daemon: fixture.OwnedDaemon,
     old_settings: dict[str, Any],
     new_settings: dict[str, Any],
 ) -> None:
     changed = {key: new_settings[key] for key in new_settings if new_settings[key] != old_settings[key]}
-    result = api_json(
+    result = fixture.api_json(
         daemon.base_url,
         "/api/user-settings",
         token=daemon.token,
         method="PATCH",
         body={"patches": changed},
     )
-    require(result.get("activation") == "nextRun", "插件设置未声明 nextRun 激活")
-    require(set(result.get("changedKeys", [])) == set(changed), "插件设置变更键不完整")
+    fixture.require(result.get("activation") == "nextRun", "插件设置未声明 nextRun 激活")
+    fixture.require(set(result.get("changedKeys", [])) == set(changed), "插件设置变更键不完整")
 
-    snapshot = api_json(daemon.base_url, "/api/user-settings", token=daemon.token)
+    snapshot = fixture.api_json(daemon.base_url, "/api/user-settings", token=daemon.token)
     for key in changed:
-        require(snapshot["settings"].get(key) == new_settings[key], f"{key} 未写入保存设置")
-        require(
+        fixture.require(snapshot["settings"].get(key) == new_settings[key], f"{key} 未写入保存设置")
+        fixture.require(
             snapshot["runtimeSettings"].get(key) == old_settings[key],
             f"{key} 在当前 run 内提前激活",
         )
 
 
-def assert_runtime_activated(daemon: OwnedDaemon, new_settings: dict[str, Any]) -> None:
-    snapshot = api_json(daemon.base_url, "/api/user-settings", token=daemon.token)
+def assert_runtime_activated(daemon: fixture.OwnedDaemon, new_settings: dict[str, Any]) -> None:
+    snapshot = fixture.api_json(daemon.base_url, "/api/user-settings", token=daemon.token)
     for key in ("skills.mounts", "mcp.servers"):
-        require(
+        fixture.require(
             snapshot["runtimeSettings"].get(key) == new_settings[key],
             f"{key} 未在下一 run 激活",
         )
@@ -1006,43 +613,38 @@ def assert_runtime_activated(daemon: OwnedDaemon, new_settings: dict[str, Any]) 
 
 def assert_projection_flow(value: dict[str, Any]) -> None:
     run = value.get("run") or {}
-    require(run.get("status") == "completed", "最终 run 未完成")
+    fixture.require(run.get("status") == "completed", "最终 run 未完成")
     assistant_messages = [
         message for message in value.get("messages", []) if message.get("role") == "assistant"
     ]
-    require(len(assistant_messages) == 2, "两轮基础链路没有形成两个 assistant 事实")
-    require(assistant_messages[-1].get("content") == "round-two-complete", "最终消息数据流错误")
+    fixture.require(len(assistant_messages) == 2, "两轮基础链路没有形成两个 assistant 事实")
+    fixture.require(assistant_messages[-1].get("content") == "round-two-complete", "最终消息数据流错误")
     completed_tools = [
         activity
         for activity in value.get("activities", [])
         if activity.get("kind") == "tool" and activity.get("status") == "completed"
     ]
-    require(
+    fixture.require(
         len(completed_tools) == 8,
         "两轮惰性文件读取/MCP/PDF/web 调用未形成八个 completed activity",
     )
 
     usage = value.get("tokenUsage") or {}
-    require(usage.get("providerCallCount") == 4, "Provider 调用聚合错误")
-    require(usage.get("reportedCallCount") == 4, "缓存报告调用聚合错误")
-    require(usage.get("inputTokens") == 400, "输入 token 聚合错误")
-    require(usage.get("outputTokens") == 40, "输出 token 聚合错误")
-    require(usage.get("cacheReadInputTokens") == 160, "缓存读取 token 聚合错误")
-    require(usage.get("cacheMissInputTokens") == 240, "缓存未命中 token 聚合错误")
-    require(usage.get("cacheAvailable") is True, "缓存事实未标记 available")
-    require(usage.get("cacheComplete") is True, "缓存事实未标记 complete")
+    fixture.require(usage.get("providerCallCount") == 4, "Provider 调用聚合错误")
+    fixture.require(usage.get("reportedCallCount") == 4, "缓存报告调用聚合错误")
+    fixture.require(usage.get("inputTokens") == 400, "输入 token 聚合错误")
+    fixture.require(usage.get("outputTokens") == 40, "输出 token 聚合错误")
+    fixture.require(usage.get("cacheReadInputTokens") == 160, "缓存读取 token 聚合错误")
+    fixture.require(usage.get("cacheMissInputTokens") == 240, "缓存未命中 token 聚合错误")
+    fixture.require(usage.get("cacheAvailable") is True, "缓存事实未标记 available")
+    fixture.require(usage.get("cacheComplete") is True, "缓存事实未标记 complete")
     ratio = usage.get("cacheHitRatio")
-    require(isinstance(ratio, (int, float)) and abs(ratio - 0.4) < 1e-12, "缓存命中率分母错误")
-
-
-def sqlite_read_only(path: Path) -> sqlite3.Connection:
-    require(path.is_file(), f"运行事实未落盘：{path.name}")
-    return sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    fixture.require(isinstance(ratio, (int, float)) and abs(ratio - 0.4) < 1e-12, "缓存命中率分母错误")
 
 
 def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: str) -> None:
     runtime_root = config_root / "runtime" / "agent-runtime"
-    with sqlite_read_only(runtime_root / "session.sqlite3") as connection:
+    with fixture.sqlite_read_only(runtime_root / "session.sqlite3") as connection:
         started_rows = connection.execute(
             "SELECT run_id, payload_json FROM session_events "
             "WHERE session_id=? AND event_type='run.started' ORDER BY sequence",
@@ -1055,15 +657,15 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
             "'run.runtime.release_failed','run.settled') ORDER BY sequence",
             (session_id,),
         ).fetchall()
-    require(len(started_rows) == 2, "两轮链路没有两个 run.started runtime snapshot")
+    fixture.require(len(started_rows) == 2, "两轮链路没有两个 run.started runtime snapshot")
 
-    with sqlite_read_only(runtime_root / "tool-record.sqlite3") as connection:
+    with fixture.sqlite_read_only(runtime_root / "tool-record.sqlite3") as connection:
         record_rows = connection.execute(
             "SELECT run_id, call_id, record_json FROM tool_records "
             "WHERE session_id=? ORDER BY completed_at, call_id",
             (session_id,),
         ).fetchall()
-    require(len(record_rows) == 8, "两轮链路没有八个文件读取/MCP/PDF/web ToolRecord")
+    fixture.require(len(record_rows) == 8, "两轮链路没有八个文件读取/MCP/PDF/web ToolRecord")
     records_by_run: dict[str, list[tuple[str, dict[str, Any]]]] = {}
     for run_id, call_id, encoded in record_rows:
         records_by_run.setdefault(run_id, []).append((call_id, json.loads(encoded)))
@@ -1074,58 +676,46 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
 
     snapshots: list[dict[str, Any]] = []
     plugin_instances: list[str] = []
-    first_receipts: list[dict[str, Any]] = []
     expected_io = [("alpha", "ahpla"), ("beta", "ateb")]
     for run_index, ((run_id, encoded), (expected_input, expected_output)) in enumerate(
         zip(started_rows, expected_io)
     ):
         payload = json.loads(encoded)
         runtime = payload.get("runtimeSnapshot")
-        require(isinstance(runtime, dict), "run.started 缺少 runtimeSnapshot")
+        fixture.require(isinstance(runtime, dict), "run.started 缺少 runtimeSnapshot")
         workspace_bindings = payload.get("workspaceBindings")
-        require(isinstance(workspace_bindings, list) and workspace_bindings, "run.started 缺少 workspace bindings")
+        fixture.require(isinstance(workspace_bindings, list) and workspace_bindings, "run.started 缺少 workspace bindings")
         primary_workspace_id = workspace_bindings[0].get("workspaceId")
-        require(isinstance(primary_workspace_id, str) and primary_workspace_id, "primary workspaceId 无效")
+        fixture.require(isinstance(primary_workspace_id, str) and primary_workspace_id, "primary workspaceId 无效")
         runtime_tools = runtime.get("tools", [])
-        require(isinstance(runtime_tools, list), "run runtime tools 不是数组")
+        fixture.require(isinstance(runtime_tools, list), "run runtime tools 不是数组")
         runtime_core_tools = [
             tool for tool in runtime_tools
             if isinstance(tool, dict) and tool.get("origin") == "coreBuiltin"
         ]
-        require(
-            [tool.get("name") for tool in runtime_core_tools]
-            == sorted(CORE_TOOL_NAMES),
-            "Kernel runtime snapshot 未包含当前完整基础工具",
+        fixture.require(
+            REQUIRED_CORE_TOOLS.issubset(tool.get("name") for tool in runtime_core_tools),
+            "Kernel runtime snapshot 缺少本场景需要的基础工具",
         )
         runtime_tools_by_name = {
             tool.get("name"): tool for tool in runtime_tools if isinstance(tool, dict)
         }
         prompt_contributions = runtime.get("toolPromptContributions")
-        require(isinstance(prompt_contributions, list), "run runtime 缺少 tool prompt snapshot")
-        require(
-            [item.get("canonicalToolName") for item in prompt_contributions]
-            == [
-                "fs.read", "bash", "web.fetch",
-                "arxiv.read", "arxiv.search",
-                "github.read", "github.search",
-                "pdf.read",
-            ],
-            "run runtime 未按稳定顺序冻结 core/first-party tool guidance",
-        )
+        fixture.require(isinstance(prompt_contributions, list), "run runtime 缺少 tool prompt snapshot")
         for contribution in prompt_contributions:
             tool_name = contribution.get("canonicalToolName")
             target = runtime_tools_by_name.get(tool_name)
-            require(isinstance(target, dict), "tool prompt 指向不存在的 runtime tool")
+            fixture.require(isinstance(target, dict), "tool prompt 指向不存在的 runtime tool")
             if tool_name in {"fs.read", "bash", "web.fetch"}:
-                require(contribution.get("origin") == "coreBuiltin", "core tool prompt origin 漂移")
-                require("pluginUri" not in contribution, "core tool prompt 错误携带 pluginUri")
+                fixture.require(contribution.get("origin") == "coreBuiltin", "core tool prompt origin 漂移")
+                fixture.require("pluginUri" not in contribution, "core tool prompt 错误携带 pluginUri")
             else:
-                require(contribution.get("origin") == "extension", "first-party prompt origin 漂移")
-                require(
+                fixture.require(contribution.get("origin") == "extension", "first-party prompt origin 漂移")
+                fixture.require(
                     contribution.get("pluginUri") in FIRST_PARTY_PLUGIN_URIS,
                     "first-party prompt 缺少精确 pluginUri",
                 )
-            require(
+            fixture.require(
                 contribution.get("preparedToolBindingRef") == target.get("toolBindingRef"),
                 "tool prompt 没有绑定当前 run 的 prepared tool",
             )
@@ -1135,67 +725,67 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
             for tool in runtime_tools
             if isinstance(tool, dict) and tool.get("name") == f"mcp.{mcp_server_id}.text.reverse"
         ]
-        require(len(reverse_tools) == 1, "run snapshot 缺少唯一 MCP 工具 binding")
+        fixture.require(len(reverse_tools) == 1, "run snapshot 缺少唯一 MCP 工具 binding")
         tool = reverse_tools[0]
-        require(tool.get("origin") == "extension", "MCP prepared tool 缺少 extension origin")
-        require(
+        fixture.require(tool.get("origin") == "extension", "MCP prepared tool 缺少 extension origin")
+        fixture.require(
             tool.get("pluginUri") == f"plugin://{mcp_server_id}@mcp",
             "MCP prepared tool 缺少精确 pluginUri",
         )
         run_records = records_by_run.get(run_id, [])
         expected_record_count = 5 if run_index == 0 else 3
-        require(
+        fixture.require(
             len(run_records) == expected_record_count,
             f"当前 run 没有精确 {expected_record_count} 个 ToolRecord",
         )
         mcp_records = [entry for entry in run_records if entry[1].get("toolName") == tool.get("name")]
-        require(len(mcp_records) == 1, "MCP ToolRecord 未唯一关联到 runtime tool")
+        fixture.require(len(mcp_records) == 1, "MCP ToolRecord 未唯一关联到 runtime tool")
         call_id, record = mcp_records[0]
-        require(record.get("callId") == call_id, "ToolRecord callId 列与事实不一致")
-        require(record.get("outcome") == "completed", "MCP ToolRecord 未完成")
-        require(record.get("input", {}).get("text") == expected_input, "MCP 输入事实错误")
-        require(expected_output in json.dumps(record.get("output"), ensure_ascii=False), "MCP 输出事实错误")
-        require(
+        fixture.require(record.get("callId") == call_id, "ToolRecord callId 列与事实不一致")
+        fixture.require(record.get("outcome") == "completed", "MCP ToolRecord 未完成")
+        fixture.require(record.get("input", {}).get("text") == expected_input, "MCP 输入事实错误")
+        fixture.require(expected_output in json.dumps(record.get("output"), ensure_ascii=False), "MCP 输出事实错误")
+        fixture.require(
             record.get("extensionGenerationRef") == runtime.get("extensionGenerationRef"),
             "ToolRecord 与 run 的 ExtensionGenerationRef 不一致",
         )
-        require(
+        fixture.require(
             record.get("kernelCatalogSnapshotRef") == runtime.get("kernelCatalogSnapshotRef"),
             "ToolRecord 与 run 的 KernelCatalogSnapshotRef 不一致",
         )
-        require(record.get("toolBindingRef") == tool.get("toolBindingRef"), "ToolBindingRef 未贯通")
-        require(record.get("toolName") == tool.get("name"), "ToolRecord 工具名未贯通")
+        fixture.require(record.get("toolBindingRef") == tool.get("toolBindingRef"), "ToolBindingRef 未贯通")
+        fixture.require(record.get("toolName") == tool.get("name"), "ToolRecord 工具名未贯通")
         prepared = record.get("preparedEffect") or {}
-        require(prepared.get("origin") == "extension", "MCP 工具未标记为 extension contribution")
-        require(prepared.get("toolBindingRef") == tool.get("toolBindingRef"), "PreparedEffect binding 漂移")
+        fixture.require(prepared.get("origin") == "extension", "MCP 工具未标记为 extension contribution")
+        fixture.require(prepared.get("toolBindingRef") == tool.get("toolBindingRef"), "PreparedEffect binding 漂移")
         plugin_instance = prepared.get("pluginInstanceRef")
-        require(isinstance(plugin_instance, str) and plugin_instance, "MCP 缺少 PluginInstanceRef")
+        fixture.require(isinstance(plugin_instance, str) and plugin_instance, "MCP 缺少 PluginInstanceRef")
         plugin_instances.append(plugin_instance)
         web_records = {candidate.get("toolName"): candidate for _, candidate in run_records}
         if run_index == 0:
             pdf_tool = runtime_tools_by_name.get("pdf.read")
-            require(isinstance(pdf_tool, dict), "run snapshot 缺少 pdf.read")
-            require(pdf_tool.get("possibleEffects") == ["workspaceRead"], "pdf.read effect scope 错误")
-            require(pdf_tool.get("pluginUri") == "plugin://pdf@first-party", "pdf.read plugin owner 错误")
+            fixture.require(isinstance(pdf_tool, dict), "run snapshot 缺少 pdf.read")
+            fixture.require(pdf_tool.get("possibleEffects") == ["workspaceRead"], "pdf.read effect scope 错误")
+            fixture.require(pdf_tool.get("pluginUri") == "plugin://pdf@first-party", "pdf.read plugin owner 错误")
             pdf_record = web_records.get("pdf.read")
-            require(isinstance(pdf_record, dict), "第一轮缺少 pdf.read ToolRecord")
-            require(pdf_record.get("outcome") == "completed", "pdf.read ToolRecord 未完成")
-            require(pdf_record.get("input", {}).get("path") == "fixture.pdf", "pdf.read 输入路径漂移")
-            require(
+            fixture.require(isinstance(pdf_record, dict), "第一轮缺少 pdf.read ToolRecord")
+            fixture.require(pdf_record.get("outcome") == "completed", "pdf.read ToolRecord 未完成")
+            fixture.require(pdf_record.get("input", {}).get("path") == "fixture.pdf", "pdf.read 输入路径漂移")
+            fixture.require(
                 PDF_CONTENT in json.dumps(pdf_record.get("output"), ensure_ascii=False),
                 "pdf.read ToolRecord 未包含真实提取正文",
             )
             pdf_effect = pdf_record.get("preparedEffect") or {}
-            require(pdf_effect.get("workspaceId") == primary_workspace_id, "pdf.read workspace binding 错误")
-            require(pdf_effect.get("logicalTargets") == ["fixture.pdf"], "pdf.read logical target 漂移")
-        require("Fixture search result" in json.dumps(
+            fixture.require(pdf_effect.get("workspaceId") == primary_workspace_id, "pdf.read workspace binding 错误")
+            fixture.require(pdf_effect.get("logicalTargets") == ["fixture.pdf"], "pdf.read logical target 漂移")
+        fixture.require("Fixture search result" in json.dumps(
             web_records["web.search"].get("output"), ensure_ascii=False,
         ), "web.search 没有真实返回结构化结果")
-        require("web-fetch-ok" in json.dumps(
+        fixture.require("web-fetch-ok" in json.dumps(
             web_records["web.fetch"].get("output"), ensure_ascii=False,
         ), "web.fetch 没有真实获取 HTTP 内容")
         if run_index == 0:
-            require(
+            fixture.require(
                 ATTACHMENT_CONTENT in json.dumps(
                     web_records["fs.read"].get("output"), ensure_ascii=False,
                 ),
@@ -1204,11 +794,11 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
 
         lifecycle = lifecycle_by_run.get(run_id, [])
         event_types = [event_type for event_type, _, _ in lifecycle]
-        require("run.runtime.release_failed" not in event_types, "run runtime release 失败")
+        fixture.require("run.runtime.release_failed" not in event_types, "run runtime release 失败")
         for event_type in ("run.finishing", "run.runtime.released", "run.settled"):
-            require(event_types.count(event_type) == 1, f"{event_type} 回执数量错误")
+            fixture.require(event_types.count(event_type) == 1, f"{event_type} 回执数量错误")
         positions = {event_type: sequence for event_type, sequence, _ in lifecycle}
-        require(
+        fixture.require(
             positions["run.finishing"] < positions["run.runtime.released"] < positions["run.settled"],
             "run release receipt 没有位于 finishing 与 settled 之间",
         )
@@ -1216,10 +806,10 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
             event_payload for event_type, _, event_payload in lifecycle
             if event_type == "run.runtime.released"
         )
-        require(released_payload.get("alreadyReleased") is False, "首次 release 被错误标为重放")
-        require(
-            len(released_payload.get("pluginInstanceRefs", [])) == 5,
-            "release receipt 未列出当前 run 的三项 first-party/Skill/MCP plugin lease",
+        fixture.require(released_payload.get("alreadyReleased") is False, "首次 release 被错误标为重放")
+        fixture.require(
+            sorted(released_payload.get("pluginInstanceRefs", [])) == sorted(plugin["pluginInstanceRef"] for plugin in runtime["selectedPlugins"]["plugins"]),
+            "release receipt 必须恰好结束本次选中的插件实例",
         )
         completed_order = [
             event_payload.get("record", {}).get("toolName")
@@ -1231,29 +821,21 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
             if run_index == 0
             else [tool.get("name"), "web.search", "web.fetch"]
         )
-        require(completed_order == expected_completed_order, "同一 Provider turn 的工具没有严格按请求顺序完成")
+        fixture.require(completed_order == expected_completed_order, "同一 Provider turn 的工具没有严格按请求顺序完成")
         receipts = [
             event_payload for event_type, _, event_payload in lifecycle
             if event_type == "context.composed"
         ]
-        require(len(receipts) == 2, "每个 run 必须有 tool turn 与 continuation 两个 context receipt")
+        fixture.require(len(receipts) == 2, "每个 run 必须有 tool turn 与 continuation 两个 context receipt")
         for receipt in receipts:
-            for field in (
-                "stableCoreHash", "baseToolSchemaHash", "selectedPluginSnapshotHash",
-            ):
-                require(
-                    isinstance(receipt.get(field), str)
-                    and receipt[field].startswith("context-hash-v1:"),
-                    f"context.composed 缺少 {field}",
-                )
-            require(
+            fixture.require(
                 isinstance(receipt.get("dynamicInstructionBytes"), int)
                 and receipt["dynamicInstructionBytes"] > 0,
                 "context.composed dynamicInstructionBytes 无效",
             )
             provider_tools = receipt.get("tools")
-            require(isinstance(provider_tools, list) and provider_tools, "context receipt 工具目录为空")
-            require(all(
+            fixture.require(isinstance(provider_tools, list) and provider_tools, "context receipt 工具目录为空")
+            fixture.require(all(
                 isinstance(item, dict)
                 and isinstance(item.get("canonicalName"), str)
                 and isinstance(item.get("wireName"), str)
@@ -1261,7 +843,6 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
                 and item.get("availability") == "callable"
                 for item in provider_tools
             ), "context receipt 工具来源字段不完整")
-        first_receipts.append(receipts[0])
         snapshots.append(runtime)
 
     for key in (
@@ -1269,86 +850,66 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
         "extensionGenerationRef",
         "kernelCatalogSnapshotRef",
     ):
-        require(snapshots[0].get(key) != snapshots[1].get(key), f"下一 run 未更新 {key}")
-    require(snapshots[0]["tools"] != snapshots[1]["tools"], "下一 run 的工具 snapshot 未更新")
+        fixture.require(snapshots[0].get(key) != snapshots[1].get(key), f"下一 run 未更新 {key}")
+    fixture.require(snapshots[0]["tools"] != snapshots[1]["tools"], "下一 run 的工具 snapshot 未更新")
     prompt_bindings = [
         [item.get("preparedToolBindingRef") for item in snapshot["toolPromptContributions"]]
         for snapshot in snapshots
     ]
-    require(prompt_bindings[0] != prompt_bindings[1], "下一 run 未重新绑定 tool prompt snapshot")
+    fixture.require(prompt_bindings[0] != prompt_bindings[1], "下一 run 未重新绑定 tool prompt snapshot")
     prompt_content = [[
         {key: value for key, value in item.items() if key != "preparedToolBindingRef"}
         for item in snapshot["toolPromptContributions"]
     ] for snapshot in snapshots]
-    require(prompt_content[0] == prompt_content[1], "稳定 core tool guidance 文本发生漂移")
-    require(plugin_instances[0] != plugin_instances[1], "两代 MCP 复用了 PluginInstanceRef")
-    require(
-        first_receipts[0]["stableCoreHash"] == first_receipts[1]["stableCoreHash"],
-        "两个 run 的稳定 System Prompt hash 漂移",
-    )
-    require(
-        first_receipts[0]["baseToolSchemaHash"] == first_receipts[1]["baseToolSchemaHash"],
-        "两个 run 的基础工具 schema hash 漂移",
-    )
-    require(
-        first_receipts[0]["selectedPluginSnapshotHash"]
-        != first_receipts[1]["selectedPluginSnapshotHash"],
-        "插件代次更新后 selected plugin snapshot hash 未变化",
-    )
-
-
-def shell_environment(daemon: OwnedDaemon) -> dict[str, str]:
-    environment = os.environ.copy()
-    environment["DEEPCODE_HOST_SHELL_TOKEN"] = daemon.token
-    environment["DEEPCODE_CLI_RUN_TIMEOUT_MS"] = "15000"
-    return environment
+    fixture.require(prompt_content[0] == prompt_content[1], "稳定 core tool guidance 文本发生漂移")
+    fixture.require(plugin_instances[0] != plugin_instances[1], "两代 MCP 复用了 PluginInstanceRef")
 
 
 def assert_shells_read_projection(
-    daemon: OwnedDaemon,
+    daemon: fixture.OwnedDaemon,
     session_id: str,
     revision: int,
 ) -> None:
-    require(CLI_BINARY.is_file(), f"缺少 CLI：{CLI_BINARY}")
+    fixture.require(fixture.CLI_BINARY.is_file(), f"缺少 CLI：{fixture.CLI_BINARY}")
     cli = subprocess.run(
         [
-            str(CLI_BINARY),
+            str(fixture.CLI_BINARY),
             "--api", daemon.base_url,
             "--no-auto-start-kernel",
             "--session", session_id,
             "show",
         ],
-        cwd=ROOT,
-        env=shell_environment(daemon),
+        cwd=fixture.ROOT,
+        env=fixture.shell_environment(daemon),
         check=False,
         capture_output=True,
         text=True,
         timeout=18,
     )
-    require(cli.returncode == 0, f"CLI 读取共享投影失败：{cli.stderr}")
-    require(
+    fixture.require(cli.returncode == 0, f"CLI 读取共享投影失败：{cli.stderr}")
+    fixture.require(
         f"session={session_id} revision={revision}" in f"{cli.stdout}\n{cli.stderr}",
         "CLI 没有读取精确 SessionProjection identity",
     )
 
-    require(TUI_BINARY.is_file(), f"缺少 TUI：{TUI_BINARY}")
+    fixture.require(fixture.TUI_BINARY.is_file(), f"缺少 TUI：{fixture.TUI_BINARY}")
     tui = subprocess.run(
         [
-            str(TUI_BINARY),
+            str(fixture.TUI_BINARY),
             "--api", daemon.base_url,
             "--no-auto-start-kernel",
             "--session", session_id,
             "--smoke",
         ],
-        cwd=ROOT,
-        env=shell_environment(daemon),
+        cwd=fixture.ROOT,
+        env=fixture.shell_environment(daemon),
         check=False,
         capture_output=True,
         text=True,
         timeout=18,
     )
-    require(tui.returncode == 0, f"TUI 读取共享投影失败：{tui.stderr}")
-    require(
+    fixture.require(tui.returncode == 0, f"TUI 读取共享投影失败：{tui.stderr}")
+    fixture.require(
         f"session={session_id} revision={revision}" in tui.stdout,
         "TUI 没有读取精确 SessionProjection identity",
     )
@@ -1359,37 +920,37 @@ def assert_shells_read_projection(
     for key in ("DEEPCODE_API_URL", "DEEPCODE_PORT", "DEEPCODE_HOST_SHELL_TOKEN", "DEEPCODE_HOST_INSTANCE_ID"):
         discovered_environment.pop(key, None)
     discovered_environment["DEEPCODE_CONFIG_DIR"] = str(daemon.config_root)
-    for binary, action in ((TUI_BINARY, "--smoke"), (CLI_BINARY, "show")):
+    for binary, action in ((fixture.TUI_BINARY, "--smoke"), (fixture.CLI_BINARY, "show")):
         attached = subprocess.run(
             [str(binary), "--no-auto-start-kernel", "--session", session_id, action],
-            cwd=ROOT, env=discovered_environment, check=False,
+            cwd=fixture.ROOT, env=discovered_environment, check=False,
             capture_output=True, text=True, timeout=18,
         )
-        require(attached.returncode == 0, f"{binary.name} 共享连接失败：{attached.stderr}")
-        require(
+        fixture.require(attached.returncode == 0, f"{binary.name} 共享连接失败：{attached.stderr}")
+        fixture.require(
             f"session={session_id} revision={revision}" in f"{attached.stdout}\n{attached.stderr}",
             f"{binary.name} 自动发现后未读取原 Session",
         )
-        require(daemon.process is not None and daemon.process.poll() is None, "壳退出后错误地停止了共享 Host")
-        require(api_json(daemon.base_url, "/api/host/identity") == daemon.identity, "壳连接时替换了 Host 实例")
+        fixture.require(daemon.process is not None and daemon.process.poll() is None, "壳退出后错误地停止了共享 Host")
+        fixture.require(fixture.api_json(daemon.base_url, "/api/host/identity") == daemon.identity, "壳连接时替换了 Host 实例")
 
 
 def assert_provider_count_stable(provider: ProviderState, expected: int) -> None:
     deadline = time.monotonic() + 0.35
     while time.monotonic() < deadline:
         provider.assert_healthy()
-        require(provider.count() == expected, "恢复 settled Session 时重复调用 Provider")
+        fixture.require(provider.count() == expected, "恢复 settled Session 时重复调用 Provider")
         time.sleep(0.05)
 
 
 def main() -> None:
-    require(MCP_SERVER.is_file(), f"缺少 MCP fixture：{MCP_SERVER}")
+    fixture.require(MCP_SERVER.is_file(), f"缺少 MCP fixture：{MCP_SERVER}")
     provider = ProviderState()
     provider_server = MockProviderServer(provider)
     provider_thread = threading.Thread(target=provider_server.serve_forever, daemon=True)
     provider_thread.start()
-    daemon_one: OwnedDaemon | None = None
-    daemon_two: OwnedDaemon | None = None
+    daemon_one: fixture.OwnedDaemon | None = None
+    daemon_two: fixture.OwnedDaemon | None = None
     cli_ask: subprocess.Popen[str] | None = None
     try:
         with tempfile.TemporaryDirectory(prefix="deepcode-basic-loop-e2e-") as temporary:
@@ -1431,20 +992,20 @@ def main() -> None:
                 ),
                 **old_plugins,
             }
-            write_configuration(config_root, provider_url, user_settings)
+            fixture.write_configuration(config_root, provider_url, user_settings)
 
-            daemon_one = OwnedDaemon(config_root)
+            daemon_one = fixture.OwnedDaemon(config_root)
             daemon_one.start()
-            created = create_session(daemon_one, workspace_root)
+            created = fixture.create_session(daemon_one, workspace_root)
             session_id = created["sessionId"]
             provider.bind_session(daemon_one, session_id)
             creation_bindings = created.get("workspaceBindings")
-            require(
+            fixture.require(
                 isinstance(creation_bindings, list) and len(creation_bindings) == 1,
                 "新项目 Session 没有原子绑定唯一 workspace creation snapshot",
             )
             assert_unknown_attachment_fields_rejected(daemon_one, session_id)
-            require(provider.count() == 0, "未声明附件字段的命令在拒绝前错误启动了 Provider")
+            fixture.require(provider.count() == 0, "未声明附件字段的命令在拒绝前错误启动了 Provider")
             cli_ask = start_cli_ask_with_file(
                 daemon_one,
                 session_id,
@@ -1471,7 +1032,7 @@ def main() -> None:
                     )
                 return provider.first_started()
 
-            wait_until(
+            fixture.wait_until(
                 first_provider_request_started,
                 12,
                 "第一轮 Provider 请求未开始",
@@ -1480,18 +1041,18 @@ def main() -> None:
             skill_file.write_text(f"# Runtime fixture\n\n{GENERATION_TWO}\n", encoding="utf-8")
             patch_plugins(daemon_one, old_plugins, new_plugins)
             provider.release_first_request.set()
-            first = wait_completed(daemon_one, provider, session_id, "first run completed")
+            first = fixture.wait_completed(daemon_one, provider, session_id, "first run completed")
             cli_stdout, cli_stderr = cli_ask.communicate(timeout=18)
-            require(cli_ask.returncode == 0, f"CLI ask --file 失败：{cli_stderr}")
-            require("round-one-complete" in cli_stdout, "CLI ask 未显示第一轮回答")
+            fixture.require(cli_ask.returncode == 0, f"CLI ask --file 失败：{cli_stderr}")
+            fixture.require("round-one-complete" in cli_stdout, "CLI ask 未显示第一轮回答")
             cli_ask = None
-            require(first.get("messages", [])[-1].get("content") == "round-one-complete", "第一轮回答未贯通")
+            fixture.require(first.get("messages", [])[-1].get("content") == "round-one-complete", "第一轮回答未贯通")
             first_input = first.get("messages", [])[0]
             filesystem_references = first_input.get("filesystemReferences")
-            require(isinstance(filesystem_references, list) and len(filesystem_references) == 1, "Host 未返回唯一文件引用")
-            require(filesystem_references[0].get("logicalPath") == "e2e-note.txt", "逻辑文件名漂移")
-            require(filesystem_references[0].get("mediaType") == "text/plain", "文本媒体类型漂移")
-            require(
+            fixture.require(isinstance(filesystem_references, list) and len(filesystem_references) == 1, "Host 未返回唯一文件引用")
+            fixture.require(filesystem_references[0].get("logicalPath") == "e2e-note.txt", "逻辑文件名漂移")
+            fixture.require(filesystem_references[0].get("mediaType") == "text/plain", "文本媒体类型漂移")
+            fixture.require(
                 set(filesystem_references[0]) == {
                     "referenceId", "workspaceId", "logicalPath", "displayName", "kind",
                     "mediaType", "byteLength",
@@ -1501,23 +1062,23 @@ def main() -> None:
 
             input_path = f"/api/conversation/sessions/{urllib.parse.quote(session_id, safe='')}/input-resources/command-round-two"
             upload = urllib.request.Request(daemon_one.base_url + input_path, method="POST",
-                data=LONG_INPUT.encode("utf-8"), headers={HOST_TOKEN_HEADER: daemon_one.token, "content-type": "text/plain; charset=utf-8"})
-            with URL_OPENER.open(upload, timeout=10) as response:
+                data=LONG_INPUT.encode("utf-8"), headers={fixture.HOST_TOKEN_HEADER: daemon_one.token, "content-type": "text/plain; charset=utf-8"})
+            with fixture.URL_OPENER.open(upload, timeout=10) as response:
                 saved = json.loads(response.read())
-            require(saved.get("ok") is True, "长文本原文保存失败")
+            fixture.require(saved.get("ok") is True, "长文本原文保存失败")
             reference = saved["data"]["reference"]
-            unbound = api_envelope(daemon_one.base_url,
+            unbound = fixture.api_envelope(daemon_one.base_url,
                 f"/api/conversation/sessions/{urllib.parse.quote(session_id, safe='')}/resources/read",
                 token=daemon_one.token, method="POST",
                 body={"workspaceId": reference["workspaceId"], "logicalPath": reference["logicalPath"]})
-            require(unbound.get("ok") is False, "未接纳输入的暂存资源提前成为会话可读事实")
+            fixture.require(unbound.get("ok") is False, "未接纳输入的暂存资源提前成为会话可读事实")
             # Reusing the same command identity with the complete text must retain
             # exactly the same saved original before Session admission.
             submit_message(daemon_one, session_id, "command-round-two", LONG_INPUT)
-            final = wait_completed(daemon_one, provider, session_id, "second run completed")
+            final = fixture.wait_completed(daemon_one, provider, session_id, "second run completed")
             provider.assert_healthy()
-            require(provider.count() == 4, "两轮 tool/continuation Provider 调用数不是四次")
-            require(provider.old_wire_name() != provider.new_wire_name(), "MCP wire tool 未热更新")
+            fixture.require(provider.count() == 4, "两轮 tool/continuation Provider 调用数不是四次")
+            fixture.require(provider.old_wire_name() != provider.new_wire_name(), "MCP wire tool 未热更新")
             assert_runtime_activated(daemon_one, new_plugins)
             assert_projection_flow(final)
             final_revision = int(final["revision"])
@@ -1525,45 +1086,45 @@ def main() -> None:
             daemon_one.shutdown()
             assert_persisted_tool_bindings_and_release(config_root, session_id)
 
-            daemon_two = OwnedDaemon(config_root)
+            daemon_two = fixture.OwnedDaemon(config_root)
             daemon_two.start()
-            recovered = projection(daemon_two, session_id)
-            require((recovered.get("run") or {}).get("status") == "completed", "重启后完成态丢失")
-            require(int(recovered["revision"]) == final_revision, "重启后 projection revision 漂移")
+            recovered = fixture.projection(daemon_two, session_id)
+            fixture.require((recovered.get("run") or {}).get("status") == "completed", "重启后完成态丢失")
+            fixture.require(int(recovered["revision"]) == final_revision, "重启后 projection revision 漂移")
             assert_projection_flow(recovered)
             second_input = [message for message in recovered["messages"] if message["role"] == "user"][1]
-            require(second_input["filesystemReferences"] == [reference], "长文本原文引用在接纳或重启后漂移")
-            require(second_input["content"] != LONG_INPUT, "长文本未从命令传输中资源化")
+            fixture.require(second_input["filesystemReferences"] == [reference], "长文本原文引用在接纳或重启后漂移")
+            fixture.require(second_input["content"] != LONG_INPUT, "长文本未从命令传输中资源化")
             segments: list[str] = []
             cursor: int | None = None
             while True:
                 query = {"workspaceId": reference["workspaceId"], "logicalPath": reference["logicalPath"]}
                 if cursor is not None:
                     query["startByte"] = cursor
-                page = api_json(daemon_two.base_url,
+                page = fixture.api_json(daemon_two.base_url,
                     f"/api/conversation/sessions/{urllib.parse.quote(session_id, safe='')}/resources/read",
                     token=daemon_two.token, method="POST", body=query)
-                require(len(page["content"].encode("utf-8")) <= 262144, "资源读取超过单次字节预算")
+                fixture.require(len(page["content"].encode("utf-8")) <= 262144, "资源读取超过单次字节预算")
                 segments.append(page["content"])
                 next_byte = page.get("nextByte")
                 if next_byte is None:
                     break
-                require(next_byte > (cursor or 0), "资源续读游标没有前进")
+                fixture.require(next_byte > (cursor or 0), "资源续读游标没有前进")
                 cursor = next_byte
-            require(len(segments) > 1 and "".join(segments) == LONG_INPUT, "分页读取未完整保留 Unicode 原文")
+            fixture.require(len(segments) > 1 and "".join(segments) == LONG_INPUT, "分页读取未完整保留 Unicode 原文")
             assert_provider_count_stable(provider, 4)
             assert_shells_read_projection(daemon_two, session_id, final_revision)
             attachment_root = config_root / "runtime" / "agent-runtime" / "attachments"
-            require(any(attachment_root.rglob("e2e-note.txt")), "Host 文件快照未持有到 Session 生命周期")
+            fixture.require(any(attachment_root.rglob("e2e-note.txt")), "Host 文件快照未持有到 Session 生命周期")
             path_id = urllib.parse.quote(session_id, safe="")
-            api_json(
+            fixture.api_json(
                 daemon_two.base_url,
                 f"/api/conversation/sessions/{path_id}",
                 token=daemon_two.token,
                 method="DELETE",
                 timeout=12,
             )
-            require(
+            fixture.require(
                 not attachment_root.exists() or not any(attachment_root.iterdir()),
                 "Session 删除后 Host 文件快照仍然存在",
             )

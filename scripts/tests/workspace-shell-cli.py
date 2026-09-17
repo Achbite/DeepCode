@@ -15,11 +15,10 @@ import subprocess
 import tempfile
 import threading
 
-spec = importlib.util.spec_from_file_location("cli_fixture", Path(__file__).with_name("tool-input-cli-e2e.py"))
+spec = importlib.util.spec_from_file_location("deepcode_test_support", Path(__file__).with_name("support.py"))
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
-base = fixture.fixture
-require = base.require
+require = fixture.require
 WINDOWS = os.name == 'nt'
 SHELL = 'powershell' if WINDOWS else 'bash'
 
@@ -27,10 +26,7 @@ SHELL = 'powershell' if WINDOWS else 'bash'
 def command(bash, powershell):
     return powershell if WINDOWS else bash
 
-class State(fixture.ProviderState):
-    pass
-
-class Provider(base.MockProviderHandler):
+class Provider(fixture.MockProviderHandler):
     def do_POST(self):
         try:
             body = json.loads(self.rfile.read(int(self.headers['content-length'])))
@@ -94,24 +90,24 @@ class Provider(base.MockProviderHandler):
             self.close_connection = True
 
 def main():
-    status = json.loads(subprocess.check_output([str(base.DAEMON_BINARY), '--workspace-sandbox-status'], text=True, encoding='utf-8'))
+    status = json.loads(subprocess.check_output([str(fixture.DAEMON_BINARY), '--workspace-sandbox-status'], text=True, encoding='utf-8'))
     require(status['available'], f'Unsupported runtime environment: {status}')
     with tempfile.TemporaryDirectory(prefix='deepcode-workspace-shell-') as directory:
         root = Path(directory); workspace = root / 'workspace'; workspace.mkdir()
         (workspace / 'README.txt').write_text('workspace-read-ok\n', encoding='utf-8')
         subprocess.run(['git', 'init', '-q', '-b', 'workspace-test', str(workspace)], check=True)
-        state = State(workspace)
+        state = fixture.ProviderState(workspace)
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Provider)
         server.provider_state = state
         thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
-        daemon = base.OwnedDaemon(root / 'config')
+        daemon = fixture.OwnedDaemon(root / 'config')
         try:
-            base.write_configuration(daemon.config_root, f'http://127.0.0.1:{server.server_port}/v1', {
+            fixture.write_configuration(daemon.config_root, f'http://127.0.0.1:{server.server_port}/v1', {
                 'agent.permissions.workspaceMutation': 'plan', 'agent.permissions.external': 'deny',
                 **({'agent.windows.shell': 'auto'} if WINDOWS else {}),
             })
             daemon.start()
-            session = base.create_session(daemon, workspace)['sessionId']
+            session = fixture.create_session(daemon, workspace)['sessionId']
             fixture.cli(daemon, session, 'Inspect this workspace and generate the authorized output.', expected=5)
             state.assert_healthy()
             require(not (workspace / 'build/output.txt').exists(), 'Output created before Plan confirmation')
@@ -121,7 +117,7 @@ def main():
             require((workspace / 'build/output.txt').read_text(encoding='utf-8') == 'generated 中文\n', 'Output file mismatch')
             require(not (root / 'outside.txt').exists(), 'Outside file was modified')
             require(not (workspace / 'readonly.txt').exists(), 'Read-only command created a file')
-            projection = base.projection(daemon, session)
+            projection = fixture.projection(daemon, session)
             require(projection['run']['status'] == 'completed', projection['run'])
             with closing(sqlite3.connect(f'{(daemon.config_root / "runtime/agent-runtime/session.sqlite3").as_uri()}?mode=ro', uri=True)) as database:
                 require(database.execute("select count(*) from session_events where event_type='approval.requested'").fetchone()[0] == 0, 'Workspace execution unexpectedly requested approval')

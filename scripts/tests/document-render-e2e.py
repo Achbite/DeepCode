@@ -13,10 +13,10 @@ import threading
 import urllib.parse
 import urllib.request
 
-spec = importlib.util.spec_from_file_location("cli_fixture", Path(__file__).with_name("tool-input-cli-e2e.py"))
-cli_fixture = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(cli_fixture)
-fixture, require = cli_fixture.fixture, cli_fixture.require
+spec = importlib.util.spec_from_file_location("deepcode_test_support", Path(__file__).with_name("support.py"))
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+require = fixture.require
 HTML = (fixture.ROOT / "skills/deepcode-documents/assets/document.html").read_text().replace("文档标题", "文档预览 · Document report").replace(
     "与读者和用途相关的简短说明", "同一份内容 · HTML / PDF / Markdown").replace("章节标题", "清晰的排版").replace(
     "替换为用户要求的正文。根据实际内容增删章节，不保留示例文字。",
@@ -143,7 +143,7 @@ def main():
             fixture.write_configuration(daemon.config_root, f"http://127.0.0.1:{server.server_port}/v1", {"agent.permissions.workspaceMutation": "allow"})
             daemon.start()
             session = fixture.create_session(daemon, workspace)
-            cli_fixture.cli(daemon, session["sessionId"], "请将报告排版为 HTML、PDF 和 Markdown。")
+            fixture.cli(daemon, session["sessionId"], "请将报告排版为 HTML、PDF 和 Markdown。")
             state.assert_healthy()
             verify_resources(daemon, fixture.projection(daemon, session["sessionId"]), workspace)
             print("[documents-e2e] PASS: actual CLI, built-in Skill, HTML/PDF/Markdown tools, artifacts, resource bytes, and continuation after a read failure (fixture Provider)", flush=True)
