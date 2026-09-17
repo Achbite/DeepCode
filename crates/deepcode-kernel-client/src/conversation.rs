@@ -778,7 +778,7 @@ impl SessionProjection {
                                     activity.activity_id != *activity_id
                                         || !matches!(
                                             activity.kind.as_str(),
-                                            "tool" | "providerHosted"
+                                            "tool" | "providerHosted" | "approval"
                                         )
                                 })
                         })
@@ -799,7 +799,7 @@ impl SessionProjection {
                 != self
                     .activities
                     .iter()
-                    .filter(|activity| matches!(activity.kind.as_str(), "tool" | "providerHosted"))
+                    .filter(|activity| matches!(activity.kind.as_str(), "tool" | "providerHosted" | "approval"))
                     .count()
         {
             return Err("shared Session projection canonical timeline is incomplete".to_string());
@@ -890,21 +890,10 @@ impl SessionTimelineItem {
 }
 
 fn invalid_context_composition_shape(receipt: &ContextCompositionProjection) -> bool {
-    !valid_context_hash(&receipt.stable_core_hash)
-        || !valid_context_hash(&receipt.base_tool_schema_hash)
-        || !valid_context_hash(&receipt.selected_plugin_snapshot_hash)
-        || invalid_context_messages(&receipt.messages)
+    invalid_context_messages(&receipt.messages)
         || invalid_context_items(&receipt.workspace_bindings)
         || invalid_context_tools(&receipt.tools)
         || invalid_context_partitions(&receipt.partitions)
-}
-
-fn valid_context_hash(value: &str) -> bool {
-    value
-        .strip_prefix("context-hash-v1:")
-        .is_some_and(|suffix| {
-            suffix.len() == 16 && suffix.chars().all(|value| value.is_ascii_hexdigit())
-        })
 }
 
 fn invalid_context_partitions(partitions: &[ContextCompositionPartitionProjection]) -> bool {
@@ -1578,9 +1567,6 @@ pub struct ContextCompositionProjection {
     pub purpose: String,
     pub run_id: String,
     pub response_constraint: String,
-    pub stable_core_hash: String,
-    pub base_tool_schema_hash: String,
-    pub selected_plugin_snapshot_hash: String,
     pub dynamic_instruction_bytes: u64,
     pub messages: Vec<ContextCompositionMessage>,
     pub workspace_bindings: Vec<ContextCompositionItem>,
@@ -2272,7 +2258,7 @@ fn valid_shell_execution_environment(environment: &ShellExecutionEnvironmentProj
     !environment.shell.trim().is_empty()
         && matches!(environment.execution_scope.as_str(), "workspace" | "host")
         && environment.interactive == environment.terminal
-        && environment.path_source == "hostPlusStandardDeveloperPaths"
+        && !environment.path_source.trim().is_empty()
         && if environment.execution_scope == "host" {
             environment.write_scope == "hostUser"
                 && environment.home_writable

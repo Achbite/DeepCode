@@ -1,6 +1,10 @@
 //! Platform implementations of the existing workspace Shell policy.
+#[cfg(any(target_os = "linux", windows))]
 use deepcode_kernel_abi::{KernelError, KernelResult};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use std::path::Path;
+#[cfg(any(target_os = "linux", windows))]
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
@@ -56,6 +60,7 @@ pub fn probe() -> SandboxStatus {
     }
 }
 
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn unavailable(tool: &str, message: impl Into<String>) -> KernelError {
     KernelError::Structured {
         code: if tool == "powershell" {
@@ -71,6 +76,7 @@ pub(crate) fn unavailable(tool: &str, message: impl Into<String>) -> KernelError
 
 /// Directory grants may create the authorized output directory. File grants do
 /// not implicitly authorize creating or renaming entries in their parent.
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn writable_paths(
     root: &Path,
     mode: &str,

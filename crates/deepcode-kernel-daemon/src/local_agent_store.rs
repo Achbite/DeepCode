@@ -54,7 +54,7 @@ impl LocalAgentJournal {
             })?;
         }
         let existed = path.exists();
-        let mut connection = Connection::open(path).map_err(sql_open_error)?;
+        let connection = Connection::open(path).map_err(sql_open_error)?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(sql_error("session_store_busy_timeout_failed"))?;
@@ -67,7 +67,6 @@ impl LocalAgentJournal {
                 .map_err(sql_error("session_store_schema_create_failed"))?;
         }
         verify_session_store(&connection)?;
-        extend_event_storage(&mut connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
@@ -275,7 +274,6 @@ impl LocalAgentJournal {
         let reply = object.get("reply").expect("required reply");
         validate_command(command)?;
         validate_reply(reply)?;
-        validate_command_event_batch(command, events, reply)?;
         let session_id = required_string(command, "sessionId")?;
         let command_id = required_string(command, "commandId")?;
         if required_string(reply, "sessionId")? != session_id
@@ -376,17 +374,6 @@ impl LocalAgentJournal {
             .into_iter()
             .filter_map(|binding| binding["workspaceId"].as_str().map(str::to_string))
             .collect())
-    }
-
-    pub(crate) fn run_runtime_snapshot(
-        &self,
-        session_id: &str,
-        run_id: &str,
-    ) -> Result<Value, LocalAgentStoreError> {
-        validate_id("sessionId", session_id)?;
-        validate_id("runId", run_id)?;
-        let connection = self.lock()?;
-        run_runtime_snapshot_fact(&connection, session_id, run_id)
     }
 
     pub(crate) fn run_provider_runtime(
@@ -693,7 +680,7 @@ fn insert_event(
     event: ValidatedNewEvent<'_>,
 ) -> Result<Value, LocalAgentStoreError> {
     let ValidatedNewEvent(event) = event;
-    validate_event_facts(transaction, event)?;
+    validate_event_references(transaction, event)?;
     let session_id = required_string(event, "sessionId")?;
     let event_type = required_string(event, "type")?;
     let sequence: i64 = transaction
@@ -1533,9 +1520,6 @@ fn validate_new_event(
                     "providerRequestId",
                     "purpose",
                     "responseConstraint",
-                    "stableCoreHash",
-                    "baseToolSchemaHash",
-                    "selectedPluginSnapshotHash",
                     "dynamicInstructionBytes",
                     "messages",
                     "workspaceBindings",
@@ -1565,24 +1549,6 @@ fn validate_new_event(
                     "session_event_invalid",
                     "context.composed responseConstraint 无效。",
                 ));
-            }
-            for field in [
-                "stableCoreHash",
-                "baseToolSchemaHash",
-                "selectedPluginSnapshotHash",
-            ] {
-                let value = required_string(payload, field)?;
-                if value.len() != "context-hash-v1:".len() + 16
-                    || !value.starts_with("context-hash-v1:")
-                    || !value["context-hash-v1:".len()..]
-                        .chars()
-                        .all(|character| character.is_ascii_hexdigit())
-                {
-                    return Err(LocalAgentStoreError::new(
-                        "session_event_invalid",
-                        format!("context.composed {field} 无效。"),
-                    ));
-                }
             }
             required_u64(payload, "dynamicInstructionBytes")?;
             validate_context_messages(payload.get("messages").expect("validated messages"))?;
@@ -1930,1386 +1896,50 @@ fn validate_new_event(
     Ok(ValidatedNewEvent(event))
 }
 
-fn validate_event_facts(
+fn validate_event_references(
     transaction: &Transaction<'_>,
     event: &Value,
 ) -> Result<(), LocalAgentStoreError> {
-    let event_type = required_string(event, "type")?;
-    if event_type == "session.created" {
-        return Ok(());
-    }
     let session_id = required_string(event, "sessionId")?;
-    if event_type == "conversation.revised" {
-        let payload = &event["payload"];
-        let valid: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND sequence=?2
-               AND event_type='input.accepted' AND run_id IS NULL AND json_extract(payload_json, '$.messageId')=?3)
-             AND (SELECT MAX(sequence) FROM session_events WHERE session_id=?1)=?4",
-            params![session_id, payload["fromSequence"].as_i64(), payload["messageId"].as_str(), payload["throughSequence"].as_i64()],
-            |row| row.get(0),
-        ).map_err(sql_error("conversation_revision_fact_read_failed"))?;
-        if !valid {
-            return Err(LocalAgentStoreError::new(
-                "conversation_revision_range_invalid",
-                "编辑重跑范围与当前 journal 不一致。",
-            ));
+    if let Some(run_id) = event.get("runId").and_then(Value::as_str) {
+        if event["type"] != "run.started" {
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2 AND event_type='run.started')",
+                params![session_id, run_id], |row| row.get(0),
+            ).map_err(sql_error("session_event_reference_read_failed"))?;
+            if !exists {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_run_missing",
+                    "Session event references an unknown run.",
+                ));
+            }
         }
     }
-    let provider_message = event_type == "message.committed"
-        && event
-            .get("payload")
-            .and_then(|payload| payload.get("role"))
-            .and_then(Value::as_str)
-            == Some("assistant");
-    if provider_message
-        || matches!(
-            event_type,
-            "input.queued"
-                | "run.tools.prepared"
-                | "narrative.committed"
-                | "plan.published"
+    if matches!(
+        event["type"].as_str(),
+        Some(
+            "tool.started"
+                | "tool.completed"
+                | "tool.input-rejected"
+                | "tool.interrupted"
+                | "approval.requested"
+                | "approval.resolved"
+                | "interaction.resolved"
                 | "plan.confirmed"
                 | "plan.revision.requested"
-                | "plan.superseded"
                 | "plan.cancelled"
-                | "plan.completed"
-                | "todo.seeded"
-                | "todo.reconciled"
-                | "todo.progressed"
-                | "session.control.rejected"
-                | "context.compaction.requested"
-                | "context.compacted"
-                | "context.composed"
-                | "provider.attempt.updated"
-                | "run.failure.recorded"
-                | "provider.turn.settled"
-                | "context.updated"
-                | "run.finishing"
-                | "run.runtime.released"
-                | "run.runtime.release_failed"
-                | "run.settled"
         )
-    {
-        let run_id = required_string(event, "runId")?;
-        let run_started: bool = transaction
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM session_events
-                     WHERE session_id=?1 AND run_id=?2 AND event_type='run.started'
-                 )",
-                params![session_id, run_id],
-                |row| row.get(0),
-            )
-            .map_err(sql_error("session_event_fact_read_failed"))?;
-        let run_settled: bool = transaction
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM session_events
-                     WHERE session_id=?1 AND run_id=?2 AND event_type='run.settled'
-                 )",
-                params![session_id, run_id],
-                |row| row.get(0),
-            )
-            .map_err(sql_error("session_event_fact_read_failed"))?;
-        if !run_started || run_settled {
+    ) {
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2 AND call_id=?3)",
+            params![session_id, event["runId"].as_str(), event["callId"].as_str()], |row| row.get(0),
+        ).map_err(sql_error("session_event_reference_read_failed"))?;
+        if !exists {
             return Err(LocalAgentStoreError::new(
-                "session_event_run_not_active",
-                format!("{event_type} 必须关联已开始且未 settled 的当前 run。"),
+                "session_event_call_missing",
+                "Session event references an unknown call.",
             ));
         }
-    }
-    match event_type {
-        "input.queued" => {
-            let run_id = required_string(event, "runId")?;
-            let finishing: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM session_events
-                 WHERE session_id=?1 AND run_id=?2 AND event_type='run.finishing')",
-                    params![session_id, run_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            if finishing {
-                return Err(LocalAgentStoreError::new(
-                    "session_event_run_not_active",
-                    "结束中的 run 不再接收排队输入。",
-                ));
-            }
-        }
-        "message.committed" if provider_message => {
-            validate_provider_output_identity(transaction, event, true)?;
-        }
-        "narrative.committed" => {
-            validate_provider_output_identity(transaction, event, true)?;
-        }
-        "interaction.requested" | "plan.published" | "tool.requested" => {
-            let run_id = required_string(event, "runId")?;
-            if !pending_provider_composition_exists(transaction, session_id, run_id)? {
-                return Err(LocalAgentStoreError::new(
-                    "provider_turn_composition_missing",
-                    "Provider-origin call fact 必须属于当前未完成的 composition。",
-                ));
-            }
-            let call_id = required_string(event, "callId")?;
-            let duplicate: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND call_id=?2
-                           AND event_type IN ('plan.published', 'tool.requested',
-                                              'interaction.requested', 'session.control.rejected')
-                     )",
-                    params![session_id, call_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            if duplicate {
-                return Err(LocalAgentStoreError::new(
-                    "session_root_call_duplicate",
-                    "Provider-origin LogicalCallId 已经写入当前 Session。",
-                ));
-            }
-            let payload = event.get("payload").expect("validated payload");
-            if event_type == "plan.published" {
-                let plan_id = required_string(payload, "planId")?;
-                let revision = required_positive_revision(payload, "revision")?;
-                let revision_sql = i64::try_from(revision).map_err(|_| {
-                    LocalAgentStoreError::new(
-                        "session_event_invalid",
-                        "Plan revision 超出 SQLite 整数范围。",
-                    )
-                })?;
-                let plan_duplicate: bool = transaction
-                    .query_row(
-                        "SELECT EXISTS(
-                             SELECT 1 FROM session_events
-                             WHERE session_id=?1 AND event_type='plan.published'
-                               AND json_extract(payload_json, '$.planId')=?2
-                               AND json_extract(payload_json, '$.revision')=?3
-                         )",
-                        params![session_id, plan_id, revision_sql],
-                        |row| row.get(0),
-                    )
-                    .map_err(sql_error("session_event_fact_read_failed"))?;
-                if plan_duplicate {
-                    return Err(LocalAgentStoreError::new(
-                        "plan_revision_duplicate",
-                        "Plan revision 已经发布。",
-                    ));
-                }
-            } else if event_type == "interaction.requested" {
-                let interaction_id = required_string(payload, "interactionId")?;
-                let duplicate_interaction: bool = transaction
-                    .query_row(
-                        "SELECT EXISTS(
-                             SELECT 1 FROM session_events
-                             WHERE session_id=?1 AND event_type='interaction.requested'
-                               AND json_extract(payload_json, '$.interactionId')=?2
-                         )",
-                        params![session_id, interaction_id],
-                        |row| row.get(0),
-                    )
-                    .map_err(sql_error("session_event_fact_read_failed"))?;
-                if duplicate_interaction {
-                    return Err(LocalAgentStoreError::new(
-                        "interaction_identity_duplicate",
-                        "InteractionId 已经存在。",
-                    ));
-                }
-            }
-        }
-        "todo.progressed" => {
-            let run_id = required_string(event, "runId")?;
-            if let Some(call_id) = event.get("callId").and_then(Value::as_str) {
-                if !pending_provider_composition_exists(transaction, session_id, run_id)? {
-                    return Err(LocalAgentStoreError::new(
-                        "provider_turn_composition_missing",
-                        "Plan progress 必须属于当前未完成的 composition。",
-                    ));
-                }
-                let duplicate: bool = transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND call_id=?2)",
-                    params![session_id, call_id], |row| row.get(0),
-                ).map_err(sql_error("session_event_fact_read_failed"))?;
-                if duplicate {
-                    return Err(LocalAgentStoreError::new(
-                        "provider_call_identity_duplicate",
-                        "Plan progress 复用了已有 LogicalCallId。",
-                    ));
-                }
-            }
-            let payload = event.get("payload").expect("validated payload");
-            let plan_id = required_string(payload, "sourcePlanId")?;
-            let revision = required_positive_revision(payload, "sourcePlanRevision")?;
-            if !plan_revision_is_active(transaction, session_id, plan_id, revision)? {
-                return Err(LocalAgentStoreError::new(
-                    "todo_source_plan_inactive",
-                    "todo.progressed 必须引用当前 active confirmed Plan revision。",
-                ));
-            }
-            let todo = todo_state_for_plan(transaction, session_id, plan_id, revision)?
-                .ok_or_else(|| {
-                    LocalAgentStoreError::new(
-                        "todo_source_missing",
-                        "todo.progressed 缺少对应的 seeded/reconciled Todo。",
-                    )
-                })?;
-            for update in payload
-                .get("updates")
-                .and_then(Value::as_array)
-                .expect("validated updates")
-            {
-                if !todo.contains_key(required_string(update, "todoId")?) {
-                    return Err(LocalAgentStoreError::new(
-                        "todo_item_missing",
-                        "todo.progressed 引用了不存在的 todoId。",
-                    ));
-                }
-            }
-            let source_fact_ref = required_string(payload, "sourceFactRef")?;
-            let needs_success = payload["updates"]
-                .as_array()
-                .expect("validated updates")
-                .iter()
-                .any(|update| update["status"] == "completed");
-            let source_record_exists: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND run_id=?2 AND event_type='tool.completed'
-                           AND json_extract(payload_json, '$.record.recordId')=?3
-                           AND (?4=0 OR json_extract(payload_json, '$.record.outcome')='completed')
-                     )",
-                    params![session_id, run_id, source_fact_ref, needs_success],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            if !source_record_exists {
-                return Err(LocalAgentStoreError::new(
-                    "todo_source_fact_missing",
-                    "todo.progressed 必须引用本 run 的 ToolRecord（可早于 Plan 确认）；完成步骤需要成功结果。",
-                ));
-            }
-        }
-        "plan.confirmed" | "plan.revision.requested" | "plan.cancelled" => {
-            let payload = event.get("payload").expect("validated payload");
-            let run_id = required_string(event, "runId")?;
-            let call_id = required_string(event, "callId")?;
-            let plan_id = required_string(payload, "planId")?;
-            let revision = required_positive_revision(payload, "revision")?;
-            let revision_sql = i64::try_from(revision).map_err(|_| {
-                LocalAgentStoreError::new(
-                    "session_event_invalid",
-                    "Plan revision 超出 SQLite 整数范围。",
-                )
-            })?;
-            let publication_exists: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND run_id=?2 AND call_id=?3
-                           AND event_type='plan.published'
-                           AND json_extract(payload_json, '$.planId')=?4
-                           AND json_extract(payload_json, '$.revision')=?5
-                     )",
-                    params![session_id, run_id, call_id, plan_id, revision_sql],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            let decision_exists: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND call_id=?2
-                           AND event_type IN ('plan.confirmed', 'plan.revision.requested', 'plan.cancelled')
-                           AND json_extract(payload_json, '$.planId')=?3
-                           AND json_extract(payload_json, '$.revision')=?4
-                     )",
-                    params![session_id, call_id, plan_id, revision_sql],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            if !publication_exists || decision_exists {
-                return Err(LocalAgentStoreError::new(
-                    "plan_decision_fact_invalid",
-                    "Plan decision 必须精确引用仍未裁决的 publication。",
-                ));
-            }
-        }
-        "todo.seeded" | "todo.reconciled" => {
-            let payload = event.get("payload").expect("validated payload");
-            let plan_id = required_string(payload, "sourcePlanId")?;
-            let revision = required_positive_revision(payload, "sourcePlanRevision")?;
-            if !plan_revision_is_active(transaction, session_id, plan_id, revision)? {
-                return Err(LocalAgentStoreError::new(
-                    "todo_source_plan_inactive",
-                    "Todo seed/reconcile 必须引用刚确认且 active 的 Plan revision。",
-                ));
-            }
-        }
-        "plan.completed" => {
-            let payload = event.get("payload").expect("validated payload");
-            let plan_id = required_string(payload, "planId")?;
-            let revision = required_positive_revision(payload, "revision")?;
-            if !plan_revision_is_active(transaction, session_id, plan_id, revision)? {
-                return Err(LocalAgentStoreError::new(
-                    "plan_completion_inactive",
-                    "只有 active confirmed Plan revision 可以完成。",
-                ));
-            }
-            let todo = todo_state_for_plan(transaction, session_id, plan_id, revision)?
-                .ok_or_else(|| {
-                    LocalAgentStoreError::new(
-                        "plan_completion_todo_missing",
-                        "Plan completion 缺少 Todo。",
-                    )
-                })?;
-            if todo.is_empty() || todo.values().any(|status| status != "completed") {
-                return Err(LocalAgentStoreError::new(
-                    "plan_completion_todo_incomplete",
-                    "Plan completion 要求对应 Todo 全部完成。",
-                ));
-            }
-        }
-        "plan.superseded" => {
-            let payload = event.get("payload").expect("validated payload");
-            let plan_id = required_string(payload, "planId")?;
-            let revision = required_positive_revision(payload, "revision")?;
-            let next_plan_id = required_string(payload, "supersededByPlanId")?;
-            let next_revision = required_positive_revision(payload, "supersededByRevision")?;
-            if plan_id == next_plan_id && revision == next_revision
-                || !plan_revision_can_be_superseded(transaction, session_id, plan_id, revision)?
-            {
-                return Err(LocalAgentStoreError::new(
-                    "plan_supersede_invalid",
-                    "plan.superseded 必须引用不同的新 Plan revision 和当前 active revision。",
-                ));
-            }
-        }
-        "plan.invalidated" => {
-            let payload = event.get("payload").expect("validated payload");
-            if !plan_revision_is_active(
-                transaction,
-                session_id,
-                required_string(payload, "planId")?,
-                required_positive_revision(payload, "revision")?,
-            )? {
-                return Err(LocalAgentStoreError::new(
-                    "plan_invalidation_inactive",
-                    "plan.invalidated 只能作用于 active confirmed revision。",
-                ));
-            }
-        }
-        "session.control.rejected" => {
-            let run_id = required_string(event, "runId")?;
-            if !pending_provider_composition_exists(transaction, session_id, run_id)? {
-                return Err(LocalAgentStoreError::new(
-                    "provider_turn_composition_missing",
-                    "Session control 拒绝事实必须属于当前未完成的 composition。",
-                ));
-            }
-            let call_id = required_string(event, "callId")?;
-            let duplicate: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND call_id=?2
-                           AND event_type IN (
-                             'interaction.requested', 'plan.published',
-                             'tool.requested', 'session.control.rejected', 'todo.progressed'
-                           )
-                     )",
-                    params![session_id, call_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            if duplicate {
-                return Err(LocalAgentStoreError::new(
-                    "session_control_rejection_invalid",
-                    "Session control 拒绝回执复用了已有 LogicalCallId。",
-                ));
-            }
-        }
-        "context.compaction.requested" => {
-            let payload = event.get("payload").expect("validated payload");
-            let compaction_id = required_string(payload, "compactionId")?;
-            let provider_request_id = required_string(payload, "providerRequestId")?;
-            let covered = required_u64(payload, "coveredThroughSequence")?;
-            let current_sequence: i64 = transaction
-                .query_row(
-                    "SELECT COALESCE(MAX(sequence), 0) FROM session_events WHERE session_id=?1",
-                    params![session_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            let current_sequence = u64::try_from(current_sequence).map_err(|_| {
-                LocalAgentStoreError::new(
-                    "session_event_fact_invalid",
-                    "Session event sequence 不能为负数。",
-                )
-            })?;
-            if covered > current_sequence {
-                return Err(LocalAgentStoreError::new(
-                    "context_compaction_cutoff_invalid",
-                    "上下文压缩 cutoff 超出当前 Session revision。",
-                ));
-            }
-            let duplicate: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND event_type='context.compaction.requested'
-                           AND (
-                             json_extract(payload_json, '$.compactionId')=?2
-                             OR json_extract(payload_json, '$.providerRequestId')=?3
-                           )
-                     )",
-                    params![session_id, compaction_id, provider_request_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            if duplicate {
-                return Err(LocalAgentStoreError::new(
-                    "context_compaction_identity_duplicate",
-                    "上下文压缩身份或 Provider request 身份重复。",
-                ));
-            }
-        }
-        "context.compacted" => {
-            let payload = event.get("payload").expect("validated payload");
-            let compaction_id = required_string(payload, "compactionId")?;
-            let run_id = required_string(event, "runId")?;
-            let requested: Option<String> = transaction
-                .query_row(
-                    "SELECT payload_json FROM session_events
-                     WHERE session_id=?1 AND run_id=?2
-                       AND event_type='context.compaction.requested'
-                       AND json_extract(payload_json, '$.compactionId')=?3",
-                    params![session_id, run_id, compaction_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            let Some(requested_json) = requested else {
-                return Err(LocalAgentStoreError::new(
-                    "context_compaction_request_missing",
-                    "context.compacted 缺少对应的 requested 事实。",
-                ));
-            };
-            let requested_payload: Value = serde_json::from_str(&requested_json).map_err(|_| {
-                LocalAgentStoreError::new(
-                    "session_event_fact_invalid",
-                    "已持久化的上下文压缩请求不是有效 JSON。",
-                )
-            })?;
-            if required_string(&requested_payload, "providerRequestId")?
-                != required_string(payload, "providerRequestId")?
-                || required_string(&requested_payload, "trigger")?
-                    != required_string(payload, "trigger")?
-                || required_u64(&requested_payload, "coveredThroughSequence")?
-                    != required_u64(payload, "coveredThroughSequence")?
-            {
-                return Err(LocalAgentStoreError::new(
-                    "context_compaction_completion_mismatch",
-                    "context.compacted 与 requested 身份或 cutoff 不一致。",
-                ));
-            }
-            let provider_request_id = required_string(payload, "providerRequestId")?;
-            let receipt_exists: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND run_id=?2 AND event_type='context.composed'
-                           AND json_extract(payload_json, '$.providerRequestId')=?3
-                           AND json_extract(payload_json, '$.purpose')='contextCompaction'
-                     )",
-                    params![session_id, run_id, provider_request_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            let completion_exists: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND run_id=?2
-                           AND event_type='provider.turn.settled'
-                           AND json_extract(payload_json, '$.providerRequestId')=?3
-                           AND json_extract(payload_json, '$.purpose')='contextCompaction'
-                           AND json_extract(payload_json, '$.outcome')='completed'
-                     )",
-                    params![session_id, run_id, provider_request_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            let duplicate: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND event_type='context.compacted'
-                           AND json_extract(payload_json, '$.compactionId')=?2
-                     )",
-                    params![session_id, compaction_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            if !receipt_exists || !completion_exists || duplicate {
-                return Err(LocalAgentStoreError::new(
-                    "context_compaction_completion_invalid",
-                    "context.compacted 缺少压缩专用 composition/completion receipt 或已经完成。",
-                ));
-            }
-        }
-        "run.tools.prepared" => {
-            let run_id = required_string(event, "runId")?;
-            if pending_provider_composition_exists(transaction, session_id, run_id)? {
-                return Err(LocalAgentStoreError::new(
-                    "provider_turn_still_active",
-                    "工具视图只能在 Provider 请求之间生效。",
-                ));
-            }
-            let mut runtime = run_runtime_snapshot_fact(transaction, session_id, run_id)?;
-            let view = &event["payload"]["toolView"];
-            for (field, value) in view.as_object().expect("validated tool view") {
-                runtime[field] = value.clone();
-            }
-            validate_run_runtime_snapshot(&runtime)?;
-        }
-        "provider.attempt.updated" => {
-            let run_id = required_string(event, "runId")?;
-            let payload = &event["payload"];
-            let request_id = required_string(payload, "providerRequestId")?;
-            let composition: Option<String> = transaction.query_row(
-                "SELECT payload_json FROM session_events WHERE session_id=?1 AND run_id=?2 AND event_type='context.composed' AND json_extract(payload_json,'$.providerRequestId')=?3",
-                params![session_id,run_id,request_id], |row| row.get(0),
-            ).optional().map_err(sql_error("provider_attempt_fact_read_failed"))?;
-            let valid_composition = composition
-                .as_deref()
-                .map(|value| decode_json(value, "session_event_fact_corrupt"))
-                .transpose()?
-                .is_some_and(|value| value["purpose"] == payload["purpose"]);
-            let previous: Option<String> = transaction.query_row(
-                "SELECT payload_json FROM session_events WHERE session_id=?1 AND run_id=?2 AND event_type='provider.attempt.updated' AND json_extract(payload_json,'$.providerRequestId')=?3 ORDER BY sequence DESC LIMIT 1",
-                params![session_id,run_id,request_id], |row| row.get(0),
-            ).optional().map_err(sql_error("provider_attempt_fact_read_failed"))?;
-            let previous = previous
-                .as_deref()
-                .map(|value| decode_json(value, "session_event_fact_corrupt"))
-                .transpose()?;
-            let phase = required_string(payload, "phase")?;
-            let valid_transition = match previous {
-                None => phase == "started" && payload["attempt"] == 1,
-                Some(previous) if phase == "started" => {
-                    previous["phase"] == "retryWaiting"
-                        && previous["providerAttemptId"] != payload["providerAttemptId"]
-                        && previous["attempt"].as_u64().map(|n| n + 1)
-                            == payload["attempt"].as_u64()
-                }
-                Some(previous) => {
-                    previous["providerAttemptId"] == payload["providerAttemptId"]
-                        && previous["attempt"] == payload["attempt"]
-                        && if phase == "retryWaiting" {
-                            previous["phase"] == "failed"
-                        } else {
-                            previous["phase"] == "started"
-                                && matches!(phase, "completed" | "failed")
-                        }
-                }
-            };
-            if !valid_composition || !valid_transition {
-                return Err(LocalAgentStoreError::new(
-                    "provider_attempt_transition_invalid",
-                    "Provider 尝试必须属于同一逻辑请求并按顺序推进。",
-                ));
-            }
-        }
-        "run.failure.recorded" => {
-            let revision: i64 = transaction
-                .query_row(
-                    "SELECT MAX(sequence) FROM session_events WHERE session_id=?1",
-                    params![session_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            if event["payload"]["revision"]
-                .as_u64()
-                .is_none_or(|value| value > revision as u64)
-            {
-                return Err(LocalAgentStoreError::new(
-                    "run_failure_revision_invalid",
-                    "失败快照引用了尚未提交的事件。",
-                ));
-            }
-        }
-        "context.composed" => {
-            let run_id = required_string(event, "runId")?;
-            let payload = event.get("payload").expect("validated payload");
-            let provider_request_id = required_string(payload, "providerRequestId")?;
-            if let Some(catalog) = payload
-                .get("kernelCatalogSnapshotRef")
-                .and_then(Value::as_str)
-            {
-                let valid: bool = transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2 AND
-                    ((event_type='run.started' AND json_extract(payload_json,'$.runtimeSnapshot.kernelCatalogSnapshotRef')=?3)
-                    OR (event_type='run.tools.prepared' AND json_extract(payload_json,'$.toolView.kernelCatalogSnapshotRef')=?3)))",
-                    params![session_id, run_id, catalog], |row| row.get(0),
-                ).map_err(sql_error("session_event_fact_read_failed"))?;
-                if !valid {
-                    return Err(LocalAgentStoreError::new(
-                        "tool_request_binding_missing",
-                        "Provider 请求缺少所属 run 的准备工具视图。",
-                    ));
-                }
-            }
-            let pending_composition: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events AS composed
-                         WHERE composed.session_id=?1 AND composed.run_id=?2
-                           AND composed.event_type='context.composed'
-                           AND NOT EXISTS(
-                             SELECT 1 FROM session_events AS completed
-                             WHERE completed.session_id=composed.session_id
-                               AND completed.run_id=composed.run_id
-                               AND completed.event_type='provider.turn.settled'
-                               AND json_extract(completed.payload_json, '$.providerRequestId')
-                                   = json_extract(composed.payload_json, '$.providerRequestId')
-                           )
-                     )",
-                    params![session_id, run_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            if pending_composition {
-                return Err(LocalAgentStoreError::new(
-                    "provider_turn_still_active",
-                    "同一 run 的前一个 Provider turn 尚未完成。",
-                ));
-            }
-            let duplicate: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND event_type='context.composed'
-                           AND json_extract(payload_json, '$.providerRequestId')=?2
-                     )",
-                    params![session_id, provider_request_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            if duplicate {
-                return Err(LocalAgentStoreError::new(
-                    "provider_request_receipt_duplicate",
-                    "providerRequestId 已经存在 composition receipt。",
-                ));
-            }
-            let purpose = required_string(payload, "purpose")?;
-            let compaction_request_exists: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND run_id=?2
-                           AND event_type='context.compaction.requested'
-                           AND json_extract(payload_json, '$.providerRequestId')=?3
-                     )",
-                    params![session_id, run_id, provider_request_id,],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            if (purpose == "contextCompaction") != compaction_request_exists {
-                return Err(LocalAgentStoreError::new(
-                    "context_composition_purpose_mismatch",
-                    "context.composed purpose 与压缩请求事实不一致。",
-                ));
-            }
-            let runtime = run_provider_runtime_from_connection(transaction, session_id, run_id)?;
-            let hosted_search_tool_count = payload
-                .get("tools")
-                .and_then(Value::as_array)
-                .expect("validated context tools")
-                .iter()
-                .filter(|tool| tool.get("origin").and_then(Value::as_str) == Some("providerHosted"))
-                .count();
-            let expected_hosted_search_tool =
-                purpose == "agent" && runtime.web_search_owner == "providerHosted";
-            if hosted_search_tool_count != usize::from(expected_hosted_search_tool) {
-                return Err(LocalAgentStoreError::new(
-                    "context_composition_search_owner_mismatch",
-                    "context.composed 搜索工具与 run.started 固定的执行 owner 不一致。",
-                ));
-            }
-        }
-        "provider.turn.settled" => {
-            let run_id = required_string(event, "runId")?;
-            let payload = event.get("payload").expect("validated payload");
-            let provider_request_id = required_string(payload, "providerRequestId")?;
-            let composition: Option<(i64, String)> = transaction
-                .query_row(
-                    "SELECT sequence, payload_json FROM session_events
-                     WHERE session_id=?1 AND run_id=?2 AND event_type='context.composed'
-                       AND json_extract(payload_json, '$.providerRequestId')=?3",
-                    params![session_id, run_id, provider_request_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            let (composition_sequence, composition) = composition.ok_or_else(|| {
-                LocalAgentStoreError::new(
-                    "provider_turn_composition_missing",
-                    "provider.turn.settled 缺少同 run 的 context.composed request。",
-                )
-            })?;
-            let composition = decode_json(&composition, "session_event_fact_corrupt")?;
-            if required_string(&composition, "purpose")? != required_string(payload, "purpose")? {
-                return Err(LocalAgentStoreError::new(
-                    "provider_turn_purpose_mismatch",
-                    "provider.turn.settled purpose 与 context.composed request 不一致。",
-                ));
-            }
-            let runtime = run_provider_runtime_from_connection(transaction, session_id, run_id)?;
-            if runtime.provider_runtime_ref != required_string(payload, "providerRuntimeRef")? {
-                return Err(LocalAgentStoreError::new(
-                    "provider_turn_runtime_mismatch",
-                    "provider.turn.settled runtime 与 run.started snapshot 不一致。",
-                ));
-            }
-            let has_ordered_hosted_search = payload
-                .get("orderedOutputBlocks")
-                .and_then(Value::as_array)
-                .is_some_and(|blocks| {
-                    blocks.iter().any(|block| {
-                        block.get("kind").and_then(Value::as_str) == Some("providerHosted")
-                    })
-                });
-            if (payload.get("hostedWebSearchCalls").is_some() || has_ordered_hosted_search)
-                && runtime.web_search_owner != "providerHosted"
-            {
-                return Err(LocalAgentStoreError::new(
-                    "provider_hosted_search_owner_mismatch",
-                    "Provider hosted search 事实与 run.started 固定的执行 owner 不一致。",
-                ));
-            }
-            let duplicate: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND event_type='provider.turn.settled'
-                           AND json_extract(payload_json, '$.providerRequestId')=?2
-                     )",
-                    params![session_id, provider_request_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            if duplicate {
-                return Err(LocalAgentStoreError::new(
-                    "provider_turn_settlement_duplicate",
-                    "providerRequestId 已经写入 Provider settlement。",
-                ));
-            }
-            let mut statement = transaction
-                .prepare(
-                    "SELECT call_id,
-                            json_extract(payload_json, '$.providerCallId'),
-                            CASE event_type
-                              WHEN 'interaction.requested' THEN 'interaction.request'
-                              WHEN 'plan.published' THEN 'plan.publish'
-                              WHEN 'todo.progressed' THEN 'plan.progress'
-                              ELSE json_extract(payload_json, '$.toolName')
-                            END
-                     FROM session_events
-                     WHERE session_id=?1 AND run_id=?2 AND sequence>?3
-                       AND call_id IS NOT NULL AND event_type IN (
-                         'interaction.requested', 'plan.published',
-                         'tool.requested', 'session.control.rejected', 'todo.progressed'
-                       )
-                     ORDER BY sequence ASC",
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            let actual_call_facts = statement
-                .query_map(params![session_id, run_id, composition_sequence], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })
-                .map_err(sql_error("session_event_fact_read_failed"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            let actual_call_ids = actual_call_facts
-                .iter()
-                .map(|(call_id, _, _)| call_id.clone())
-                .collect::<Vec<_>>();
-            if required_string(payload, "outcome")? == "completed" {
-                let ordered_call_ids = payload
-                    .get("orderedCallIds")
-                    .and_then(Value::as_array)
-                    .expect("validated orderedCallIds")
-                    .iter()
-                    .map(|call_id| {
-                        call_id
-                            .as_str()
-                            .expect("validated orderedCallId")
-                            .to_string()
-                    })
-                    .collect::<Vec<_>>();
-                if actual_call_ids != ordered_call_ids {
-                    return Err(LocalAgentStoreError::new(
-                        "provider_turn_call_fact_invalid",
-                        "provider.turn.settled orderedCallIds 必须与本次 composition 后写入的 call facts 完整同序一致。",
-                    ));
-                }
-                if let Some(calls) = payload.get("toolCallInputs").and_then(Value::as_array) {
-                    let accepted = calls.iter().filter(|call| call.get("error").is_none());
-                    if !accepted.zip(actual_call_facts.iter()).all(
-                        |(call, (id, provider_id, name))| {
-                            call["callId"] == *id
-                                && call["providerCallId"] == *provider_id
-                                && call["toolName"] == *name
-                        },
-                    ) {
-                        return Err(LocalAgentStoreError::new(
-                            "provider_turn_call_identity_mismatch",
-                            "聚合输入与已写入的调用身份不一致。",
-                        ));
-                    }
-                }
-                if let Some(blocks) = payload.get("orderedOutputBlocks").and_then(Value::as_array) {
-                    let ordered_tool_calls = blocks
-                        .iter()
-                        .filter(|block| {
-                            block.get("kind").and_then(Value::as_str) == Some("toolCall")
-                        })
-                        .collect::<Vec<_>>();
-                    let identities_match = ordered_tool_calls.len() == actual_call_facts.len()
-                        && ordered_tool_calls.iter().zip(actual_call_facts.iter()).all(
-                            |(block, (call_id, provider_call_id, tool_name))| {
-                                block.get("callId").and_then(Value::as_str)
-                                    == Some(call_id.as_str())
-                                    && block.get("providerCallId").and_then(Value::as_str)
-                                        == Some(provider_call_id.as_str())
-                                    && block.get("toolName").and_then(Value::as_str)
-                                        == Some(tool_name.as_str())
-                            },
-                        );
-                    if !identities_match {
-                        return Err(LocalAgentStoreError::new(
-                            "provider_turn_call_identity_mismatch",
-                            "provider.turn.settled toolCall blocks 必须与已写入的 LogicalCallId、ProviderCallId 和 canonical toolName 完整同序一致。",
-                        ));
-                    }
-                }
-            } else if !actual_call_ids.is_empty() {
-                return Err(LocalAgentStoreError::new(
-                    "provider_turn_terminal_call_fact_invalid",
-                    "失败或结果未知的 Provider turn 不能提交调用事实。",
-                ));
-            }
-        }
-        "context.updated" => {
-            let run_id = required_string(event, "runId")?;
-            let payload = event.get("payload").expect("validated payload");
-            let provider_request_id = required_string(payload, "providerRequestId")?;
-            let receipt_exists: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND run_id=?2 AND event_type='context.composed'
-                           AND json_extract(payload_json, '$.providerRequestId')=?3
-                     )",
-                    params![session_id, run_id, provider_request_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            let completion_exists: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND run_id=?2
-                           AND event_type='provider.turn.settled'
-                           AND json_extract(payload_json, '$.providerRequestId')=?3
-                           AND json_extract(payload_json, '$.outcome')='completed'
-                     )",
-                    params![session_id, run_id, provider_request_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            let duplicate_usage: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND event_type='context.updated'
-                           AND json_extract(payload_json, '$.providerRequestId')=?2
-                     )",
-                    params![session_id, provider_request_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            if !receipt_exists || !completion_exists {
-                return Err(LocalAgentStoreError::new(
-                    "provider_request_receipt_missing",
-                    "context.updated 缺少同 run 的 composition/completion receipt。",
-                ));
-            }
-            if duplicate_usage {
-                return Err(LocalAgentStoreError::new(
-                    "provider_usage_duplicate",
-                    "providerRequestId 已经写入 token usage。",
-                ));
-            }
-            let runtime = run_provider_runtime_from_connection(transaction, session_id, run_id)?;
-            if runtime.provider_runtime_ref != required_string(payload, "providerRuntimeRef")?
-                || runtime.context_window_tokens != required_u64(payload, "contextWindowTokens")?
-            {
-                return Err(LocalAgentStoreError::new(
-                    "provider_usage_runtime_mismatch",
-                    "context.updated runtime 或 context window 与 run.started snapshot 不一致。",
-                ));
-            }
-        }
-        "run.finishing" => {
-            let run_id = required_string(event, "runId")?;
-            let duplicate: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND run_id=?2
-                           AND event_type IN ('run.finishing', 'run.settled')
-                     )",
-                    params![session_id, run_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            if duplicate || pending_provider_composition_exists(transaction, session_id, run_id)? {
-                return Err(LocalAgentStoreError::new(
-                    "run_finishing_state_invalid",
-                    "run.finishing 要求 Provider turn 已完成且此前没有 finishing/settled。",
-                ));
-            }
-            if let Some(final_message_id) = event
-                .get("payload")
-                .and_then(|payload| payload.get("finalMessageId"))
-                .and_then(Value::as_str)
-            {
-                let final_message_exists: bool = transaction
-                    .query_row(
-                        "SELECT EXISTS(
-                             SELECT 1 FROM session_events
-                             WHERE session_id=?1 AND run_id=?2 AND event_type='message.committed'
-                               AND json_extract(payload_json, '$.messageId')=?3
-                               AND json_extract(payload_json, '$.role')='assistant'
-                         )",
-                        params![session_id, run_id, final_message_id],
-                        |row| row.get(0),
-                    )
-                    .map_err(sql_error("session_event_fact_read_failed"))?;
-                if !final_message_exists {
-                    return Err(LocalAgentStoreError::new(
-                        "run_final_message_missing",
-                        "completed run.finishing 必须引用已提交的 Assistant message。",
-                    ));
-                }
-            }
-        }
-        "run.runtime.released" | "run.runtime.release_failed" => {
-            let run_id = required_string(event, "runId")?;
-            let payload = event.get("payload").expect("validated payload");
-            let finishing_exists: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND run_id=?2 AND event_type='run.finishing'
-                     )",
-                    params![session_id, run_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            let released_exists: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND run_id=?2 AND event_type='run.runtime.released'
-                     )",
-                    params![session_id, run_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            if !finishing_exists || released_exists {
-                return Err(LocalAgentStoreError::new(
-                    "run_runtime_release_state_invalid",
-                    "Run runtime 释放回执必须位于 finishing 之后且成功回执只能写入一次。",
-                ));
-            }
-            let runtime = run_runtime_snapshot_fact(transaction, session_id, run_id)?;
-            for (field, pointer) in [
-                ("runRuntimeSnapshotRef", "/runRuntimeSnapshotRef"),
-                ("extensionGenerationRef", "/extensionGenerationRef"),
-                ("kernelCatalogSnapshotRef", "/kernelCatalogSnapshotRef"),
-                ("providerRuntimeRef", "/provider/providerRuntimeRef"),
-            ] {
-                if payload.get(field).and_then(Value::as_str)
-                    != runtime.pointer(pointer).and_then(Value::as_str)
-                {
-                    return Err(LocalAgentStoreError::new(
-                        "run_runtime_release_identity_mismatch",
-                        format!("Run runtime 释放回执的 {field} 与 run.started 不一致。"),
-                    ));
-                }
-            }
-            if event_type == "run.runtime.released" {
-                let latest_tool_view: Option<String> = transaction.query_row(
-                    "SELECT json_extract(payload_json,'$.toolView') FROM session_events WHERE session_id=?1 AND run_id=?2 AND event_type='run.tools.prepared' ORDER BY sequence DESC LIMIT 1",
-                    params![session_id,run_id],|row|row.get(0),
-                ).optional().map_err(sql_error("session_event_fact_read_failed"))?;
-                let latest_tool_view: Option<Value> = latest_tool_view
-                    .map(|value| serde_json::from_str(&value))
-                    .transpose()
-                    .map_err(|error| {
-                        LocalAgentStoreError::new("session_event_invalid", error.to_string())
-                    })?;
-                let expected = latest_tool_view
-                    .as_ref()
-                    .unwrap_or(&runtime)
-                    .pointer("/selectedPlugins/plugins")
-                    .and_then(Value::as_array)
-                    .expect("validated selected plugins")
-                    .iter()
-                    .map(|plugin| required_string(plugin, "pluginInstanceRef"))
-                    .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
-                let actual = payload
-                    .get("pluginInstanceRefs")
-                    .and_then(Value::as_array)
-                    .expect("validated plugin refs")
-                    .iter()
-                    .map(|identity| {
-                        identity.as_str().ok_or_else(|| {
-                            LocalAgentStoreError::new(
-                                "session_event_invalid",
-                                "pluginInstanceRefs 必须只包含标识。",
-                            )
-                        })
-                    })
-                    .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
-                if actual != expected {
-                    return Err(LocalAgentStoreError::new(
-                        "run_runtime_release_plugin_mismatch",
-                        "Run runtime 释放回执必须覆盖全部且仅覆盖本 run 选择的插件实例。",
-                    ));
-                }
-            }
-        }
-        "tool.started" => {
-            let run_id = required_string(event, "runId")?;
-            let call_id = required_string(event, "callId")?;
-            let valid: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2
-                    AND call_id=?3 AND event_type='tool.requested' AND json_extract(payload_json, '$.attemptId')=?4)
-                 AND NOT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2 AND call_id=?3
-                    AND event_type IN ('tool.started','tool.completed','tool.input-rejected','tool.interrupted'))
-                 AND NOT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2
-                    AND event_type IN ('run.runtime.released','run.settled'))",
-                params![session_id, run_id, call_id, required_string(&event["payload"], "attemptId")?],
-                |row| row.get(0),
-            ).map_err(sql_error("session_event_fact_read_failed"))?;
-            if !valid {
-                return Err(LocalAgentStoreError::new(
-                    "tool_started_state_invalid",
-                    "工具开始必须关联当前未完成的同一次调用，并且只记录一次。",
-                ));
-            }
-        }
-        "tool.interrupted" => {
-            let run_id = required_string(event, "runId")?;
-            let call_id = required_string(event, "callId")?;
-            let valid: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2
-                    AND call_id=?3 AND event_type='tool.requested' AND json_extract(payload_json, '$.attemptId')=?4)
-                 AND EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2 AND event_type='run.runtime.released')
-                 AND NOT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2 AND call_id=?3
-                    AND event_type IN ('tool.completed','tool.input-rejected','tool.interrupted'))
-                 AND NOT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2 AND event_type='run.settled')",
-                params![session_id, run_id, call_id, required_string(&event["payload"], "attemptId")?],
-                |row| row.get(0),
-            ).map_err(sql_error("session_event_fact_read_failed"))?;
-            if !valid {
-                return Err(LocalAgentStoreError::new(
-                    "tool_interruption_state_invalid",
-                    "工具中断必须关联释放后的未完成调用。",
-                ));
-            }
-        }
-        "run.settled" => {
-            let run_id = required_string(event, "runId")?;
-            let pending: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM session_events r WHERE r.session_id=?1 AND r.run_id=?2 AND r.event_type='tool.requested'
-                 AND NOT EXISTS(SELECT 1 FROM session_events t WHERE t.session_id=r.session_id AND t.run_id=r.run_id AND t.call_id=r.call_id
-                    AND t.event_type IN ('tool.completed','tool.input-rejected','tool.interrupted')))",
-                params![session_id, run_id], |row| row.get(0),
-            ).map_err(sql_error("session_event_fact_read_failed"))?;
-            if pending {
-                return Err(LocalAgentStoreError::new(
-                    "run_tool_result_missing",
-                    "Run 结算前必须关闭全部工具调用。",
-                ));
-            }
-            let finishing_payload: Option<String> = transaction
-                .query_row(
-                    "SELECT payload_json FROM session_events
-                     WHERE session_id=?1 AND run_id=?2 AND event_type='run.finishing'
-                     ORDER BY sequence DESC LIMIT 1",
-                    params![session_id, run_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            let release_exists: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_events
-                         WHERE session_id=?1 AND run_id=?2 AND event_type='run.runtime.released'
-                     )",
-                    params![session_id, run_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error("session_event_fact_read_failed"))?;
-            let finishing_payload = finishing_payload
-                .map(|encoded| decode_json(&encoded, "session_event_fact_corrupt"))
-                .transpose()?;
-            if !release_exists || finishing_payload.as_ref() != event.get("payload") {
-                return Err(LocalAgentStoreError::new(
-                    "run_settlement_release_receipt_missing",
-                    "run.settled 必须严格复用 finishing 结果并位于成功释放回执之后。",
-                ));
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn plan_revision_is_active(
-    transaction: &Transaction<'_>,
-    session_id: &str,
-    plan_id: &str,
-    revision: u64,
-) -> Result<bool, LocalAgentStoreError> {
-    let mut statement = transaction
-        .prepare(
-            "SELECT event_type, payload_json FROM session_events
-             WHERE session_id=?1 AND event_type IN (
-               'plan.confirmed', 'plan.revision.requested', 'plan.superseded',
-               'plan.cancelled', 'plan.completed', 'plan.invalidated'
-             ) ORDER BY sequence ASC",
-        )
-        .map_err(sql_error("session_event_fact_read_failed"))?;
-    let rows = statement
-        .query_map(params![session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(sql_error("session_event_fact_read_failed"))?;
-    let mut active = false;
-    for row in rows {
-        let (event_type, encoded) = row.map_err(sql_error("session_event_fact_read_failed"))?;
-        let payload = decode_json(&encoded, "session_event_fact_corrupt")?;
-        let same = payload.get("planId").and_then(Value::as_str) == Some(plan_id)
-            && payload.get("revision").and_then(Value::as_u64) == Some(revision);
-        if event_type == "plan.confirmed" {
-            active = same;
-        } else if same {
-            active = false;
-        }
-    }
-    Ok(active)
-}
-
-fn plan_revision_can_be_superseded(
-    transaction: &Transaction<'_>,
-    session_id: &str,
-    plan_id: &str,
-    revision: u64,
-) -> Result<bool, LocalAgentStoreError> {
-    let mut statement = transaction
-        .prepare(
-            "SELECT event_type, payload_json FROM session_events
-             WHERE session_id=?1 AND event_type IN (
-               'plan.confirmed', 'plan.revision.requested', 'plan.superseded',
-               'plan.cancelled', 'plan.completed', 'plan.invalidated'
-             ) ORDER BY sequence ASC",
-        )
-        .map_err(sql_error("session_event_fact_read_failed"))?;
-    let rows = statement
-        .query_map(params![session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(sql_error("session_event_fact_read_failed"))?;
-    let mut state: Option<String> = None;
-    for row in rows {
-        let (event_type, encoded) = row.map_err(sql_error("session_event_fact_read_failed"))?;
-        let payload = decode_json(&encoded, "session_event_fact_corrupt")?;
-        if payload.get("planId").and_then(Value::as_str) == Some(plan_id)
-            && payload.get("revision").and_then(Value::as_u64) == Some(revision)
-        {
-            state = Some(event_type);
-        }
-    }
-    Ok(matches!(
-        state.as_deref(),
-        Some("plan.confirmed" | "plan.revision.requested")
-    ))
-}
-
-fn todo_state_for_plan(
-    transaction: &Transaction<'_>,
-    session_id: &str,
-    plan_id: &str,
-    revision: u64,
-) -> Result<Option<std::collections::HashMap<String, String>>, LocalAgentStoreError> {
-    let mut statement = transaction
-        .prepare(
-            "SELECT event_type, payload_json FROM session_events
-             WHERE session_id=?1 AND event_type IN (
-               'todo.seeded', 'todo.reconciled', 'todo.progressed'
-             ) ORDER BY sequence ASC",
-        )
-        .map_err(sql_error("session_event_fact_read_failed"))?;
-    let rows = statement
-        .query_map(params![session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(sql_error("session_event_fact_read_failed"))?;
-    let mut state: Option<std::collections::HashMap<String, String>> = None;
-    for row in rows {
-        let (event_type, encoded) = row.map_err(sql_error("session_event_fact_read_failed"))?;
-        let payload = decode_json(&encoded, "session_event_fact_corrupt")?;
-        let source_plan_id = payload.get("sourcePlanId").and_then(Value::as_str);
-        let source_revision = payload.get("sourcePlanRevision").and_then(Value::as_u64);
-        if source_plan_id != Some(plan_id) || source_revision != Some(revision) {
-            continue;
-        }
-        if matches!(event_type.as_str(), "todo.seeded" | "todo.reconciled") {
-            state = Some(
-                payload
-                    .get("items")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| {
-                        LocalAgentStoreError::new(
-                            "session_event_fact_corrupt",
-                            "Todo seed/reconcile items 缺失。",
-                        )
-                    })?
-                    .iter()
-                    .map(|item| {
-                        Ok((
-                            required_string(item, "todoId")?.to_string(),
-                            required_string(item, "status")?.to_string(),
-                        ))
-                    })
-                    .collect::<Result<_, LocalAgentStoreError>>()?,
-            );
-        } else if let Some(current) = state.as_mut() {
-            for update in payload
-                .get("updates")
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    LocalAgentStoreError::new(
-                        "session_event_fact_corrupt",
-                        "Todo progress updates 缺失。",
-                    )
-                })?
-            {
-                let todo_id = required_string(update, "todoId")?;
-                if let Some(status) = current.get_mut(todo_id) {
-                    *status = required_string(update, "status")?.to_string();
-                }
-            }
-        }
-    }
-    Ok(state)
-}
-
-fn validate_command_event_batch(
-    command: &Value,
-    events: &[Value],
-    reply: &Value,
-) -> Result<(), LocalAgentStoreError> {
-    if reply.get("status").and_then(Value::as_str) == Some("rejected") {
-        if !events.is_empty() {
-            return Err(LocalAgentStoreError::new(
-                "rejected_command_event_batch_invalid",
-                "rejected 命令不能提交 Session 状态事件。",
-            ));
-        }
-        return Ok(());
-    }
-    if command.get("type").and_then(Value::as_str) != Some("plan.respond") {
-        return Ok(());
-    }
-    let plan_id = required_string(command, "planId")?;
-    let revision = required_positive_revision(command, "revision")?;
-    let command_id = required_string(command, "commandId")?;
-    let response_kind = command
-        .pointer("/response/kind")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            LocalAgentStoreError::new(
-                "session_command_invalid",
-                "plan.respond response kind 缺失。",
-            )
-        })?;
-    let matching = |event: &&Value, event_type: &str| {
-        event.get("type").and_then(Value::as_str) == Some(event_type)
-            && event.pointer("/payload/planId").and_then(Value::as_str) == Some(plan_id)
-            && event.pointer("/payload/revision").and_then(Value::as_u64) == Some(revision)
-            && event.pointer("/payload/commandId").and_then(Value::as_str) == Some(command_id)
-    };
-    let count = |event_type: &str| {
-        events
-            .iter()
-            .filter(|event| matching(event, event_type))
-            .count()
-    };
-    let todo_count = events
-        .iter()
-        .filter(|event| {
-            matches!(
-                event.get("type").and_then(Value::as_str),
-                Some("todo.seeded" | "todo.reconciled")
-            ) && event
-                .pointer("/payload/sourcePlanId")
-                .and_then(Value::as_str)
-                == Some(plan_id)
-                && event
-                    .pointer("/payload/sourcePlanRevision")
-                    .and_then(Value::as_u64)
-                    == Some(revision)
-        })
-        .count();
-    let valid = match response_kind {
-        "confirm" => {
-            count("plan.confirmed") == 1
-                && todo_count == 1
-                && count("plan.revision.requested") == 0
-                && count("plan.cancelled") == 0
-        }
-        "requestRevision" => {
-            count("plan.revision.requested") == 1
-                && count("plan.confirmed") == 0
-                && count("plan.cancelled") == 0
-                && todo_count == 0
-        }
-        "cancel" => {
-            count("plan.cancelled") == 1
-                && count("plan.confirmed") == 0
-                && count("plan.revision.requested") == 0
-                && todo_count == 0
-        }
-        _ => false,
-    };
-    if !valid {
-        return Err(LocalAgentStoreError::new(
-            "plan_command_event_batch_invalid",
-            "plan.respond 必须与对应 Plan lifecycle 和 Todo 事实原子提交。",
-        ));
     }
     Ok(())
 }
@@ -4715,133 +3345,6 @@ fn run_provider_runtime_from_connection(
     validate_run_runtime_snapshot(runtime_snapshot)
 }
 
-fn validate_provider_output_identity(
-    transaction: &Transaction<'_>,
-    event: &Value,
-    completion_required: bool,
-) -> Result<(), LocalAgentStoreError> {
-    let session_id = required_string(event, "sessionId")?;
-    let run_id = required_string(event, "runId")?;
-    let payload = event.get("payload").expect("validated payload");
-    let provider_request_id = required_string(payload, "providerRequestId")?;
-    let composition_exists: bool = transaction
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM session_events
-                 WHERE session_id=?1 AND run_id=?2 AND event_type='context.composed'
-                   AND json_extract(payload_json, '$.providerRequestId')=?3
-             )",
-            params![session_id, run_id, provider_request_id],
-            |row| row.get(0),
-        )
-        .map_err(sql_error("session_event_fact_read_failed"))?;
-    if !composition_exists {
-        return Err(LocalAgentStoreError::new(
-            "provider_output_composition_missing",
-            "Provider 输出缺少同 run 的 context.composed 事实。",
-        ));
-    }
-    if completion_required {
-        let completion_exists: bool = transaction
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM session_events
-                     WHERE session_id=?1 AND run_id=?2 AND event_type='provider.turn.settled'
-                       AND json_extract(payload_json, '$.providerRequestId')=?3
-                       AND json_extract(payload_json, '$.outcome')='completed'
-                 )",
-                params![session_id, run_id, provider_request_id],
-                |row| row.get(0),
-            )
-            .map_err(sql_error("session_event_fact_read_failed"))?;
-        if !completion_exists {
-            return Err(LocalAgentStoreError::new(
-                "provider_output_completion_missing",
-                "Assistant message 必须在同一 Provider turn 完成后提交。",
-            ));
-        }
-        let duplicate: bool = transaction
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM session_events
-                     WHERE session_id=?1 AND run_id=?2 AND event_type='message.committed'
-                       AND json_extract(payload_json, '$.role')='assistant'
-                       AND json_extract(payload_json, '$.providerRequestId')=?3
-                 )",
-                params![session_id, run_id, provider_request_id],
-                |row| row.get(0),
-            )
-            .map_err(sql_error("session_event_fact_read_failed"))?;
-        if duplicate {
-            return Err(LocalAgentStoreError::new(
-                "provider_output_duplicate",
-                "同一 Provider turn 已经提交 assistant message。",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn pending_provider_composition_exists(
-    transaction: &Transaction<'_>,
-    session_id: &str,
-    run_id: &str,
-) -> Result<bool, LocalAgentStoreError> {
-    transaction
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM session_events AS composed
-                 WHERE composed.session_id=?1 AND composed.run_id=?2
-                   AND composed.event_type='context.composed'
-                   AND NOT EXISTS(
-                     SELECT 1 FROM session_events AS completed
-                     WHERE completed.session_id=composed.session_id
-                       AND completed.run_id=composed.run_id
-                       AND completed.event_type='provider.turn.settled'
-                       AND json_extract(completed.payload_json, '$.providerRequestId')
-                           = json_extract(composed.payload_json, '$.providerRequestId')
-                   )
-             )",
-            params![session_id, run_id],
-            |row| row.get(0),
-        )
-        .map_err(sql_error("session_event_fact_read_failed"))
-}
-
-fn run_runtime_snapshot_fact(
-    connection: &Connection,
-    session_id: &str,
-    run_id: &str,
-) -> Result<Value, LocalAgentStoreError> {
-    let encoded: Option<String> = connection
-        .query_row(
-            "SELECT payload_json FROM session_events
-             WHERE session_id=?1 AND run_id=?2 AND event_type='run.started'
-             ORDER BY sequence ASC LIMIT 1",
-            params![session_id, run_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(sql_error("session_event_fact_read_failed"))?;
-    let payload = encoded
-        .map(|encoded| decode_json(&encoded, "session_event_fact_corrupt"))
-        .transpose()?
-        .ok_or_else(|| {
-            LocalAgentStoreError::new(
-                "run_runtime_snapshot_missing",
-                "Run 缺少 run.started runtime snapshot。",
-            )
-        })?;
-    let runtime = payload.get("runtimeSnapshot").cloned().ok_or_else(|| {
-        LocalAgentStoreError::new(
-            "session_event_fact_corrupt",
-            "run.started 缺少 runtimeSnapshot。",
-        )
-    })?;
-    validate_run_runtime_snapshot(&runtime)?;
-    Ok(runtime)
-}
-
 fn validate_run_runtime_snapshot(
     value: &Value,
 ) -> Result<RunProviderRuntime, LocalAgentStoreError> {
@@ -4858,8 +3361,9 @@ fn validate_run_runtime_snapshot(
             "toolPromptContributions",
             "providerToolAliases",
             "selectedPlugins",
+            "environment",
         ],
-        &["environment"],
+        &[],
     )?;
     let run_runtime_snapshot_ref = required_string(value, "runRuntimeSnapshotRef")?;
     let extension_generation_ref = required_string(value, "extensionGenerationRef")?;
@@ -5570,61 +4074,6 @@ fn strip_null_object_fields(mut value: Value) -> Value {
 // Event kinds belong to validate_new_event, not a database-version gate. Older
 // stores embedded an enum CHECK; expand only that constraint in one transaction.
 // Keep the stored DDL, rowids, payload bytes, indexes and triggers unchanged otherwise.
-fn extend_event_storage(connection: &mut Connection) -> Result<(), LocalAgentStoreError> {
-    let stored_sql: String = connection
-        .query_row(
-            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='session_events'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(sql_error("session_store_verify_failed"))?;
-    let event_constraint = regex::Regex::new(
-        r"(?is)CHECK\s*\(\s*event_type\s+IN\s*\(\s*(?:'[^']*'\s*,\s*)*'[^']*'\s*\)\s*\)",
-    )
-    .expect("event type constraint pattern");
-    if !event_constraint.is_match(&stored_sql) {
-        return Ok(());
-    }
-    let expanded_sql = event_constraint.replace(&stored_sql, "CHECK(length(event_type) > 0)");
-    let new_table_sql = expanded_sql.replacen("session_events", "session_events_expanded", 1);
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(sql_error("session_store_event_extension_failed"))?;
-    let definitions = transaction
-        .prepare("SELECT sql FROM sqlite_schema WHERE tbl_name='session_events' AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY type,name")
-        .and_then(|mut statement| statement.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>())
-        .map_err(sql_error("session_store_event_extension_failed"))?;
-    let columns = transaction
-        .prepare("PRAGMA table_info(session_events)")
-        .and_then(|mut statement| {
-            statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .map_err(sql_error("session_store_event_extension_failed"))?;
-    let columns = columns
-        .iter()
-        .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(",");
-    transaction
-        .execute_batch(&new_table_sql)
-        .map_err(sql_error("session_store_event_extension_failed"))?;
-    transaction.execute_batch(&format!(
-        "INSERT INTO session_events_expanded(rowid,{columns}) SELECT rowid,{columns} FROM session_events;
-         DROP TABLE session_events;
-         ALTER TABLE session_events_expanded RENAME TO session_events;"
-    )).map_err(sql_error("session_store_event_extension_failed"))?;
-    for definition in definitions {
-        transaction
-            .execute_batch(&definition)
-            .map_err(sql_error("session_store_event_extension_failed"))?;
-    }
-    transaction
-        .commit()
-        .map_err(sql_error("session_store_event_extension_failed"))
-}
-
 fn verify_session_store(connection: &Connection) -> Result<(), LocalAgentStoreError> {
     // Probe the fields actually consumed by the journal. Neither SQL formatting,
     // additional columns nor a historical user_version imply incompatibility.
@@ -5750,31 +4199,22 @@ fn sql_error(code: &'static str) -> impl FnOnce(rusqlite::Error) -> LocalAgentSt
 mod tests {
     use super::*;
 
-    fn plan_response_command(response: Value) -> Value {
-        json!({
-            "schemaVersion": COMMAND_VERSION,
-            "type": "plan.respond",
-            "commandId": "command:plan-response",
-            "sessionId": "session:plan-response",
-            "runId": "run:plan-response",
-            "planId": "plan:plan-response",
-            "revision": 1,
-            "response": response
-        })
+    struct Store(std::path::PathBuf);
+    impl Store {
+        fn new() -> Self {
+            let root = std::env::temp_dir()
+                .join(random_id("deepcode-store-test").unwrap().replace(':', "-"));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+        fn path(&self) -> std::path::PathBuf {
+            self.0.join("session.sqlite3")
+        }
     }
-
-    fn command_reply(status: &str) -> Value {
-        json!({
-            "schemaVersion": REPLY_VERSION,
-            "commandId": "command:plan-response",
-            "sessionId": "session:plan-response",
-            "status": status,
-            "revision": 0,
-            "error": {
-                "code": "plan_not_pending",
-                "message": "The Plan is no longer pending."
-            }
-        })
+    impl Drop for Store {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn runtime_snapshot() -> Value {
@@ -5791,6 +4231,13 @@ mod tests {
                 "hostedWebSearch": "none"
             },
             "webSearch": {"owner":"unavailable"},
+            "environment": {
+                "os":"fixture", "arch":"fixture", "locale":null, "responseLanguage":null,
+                "userShell":null, "executionTarget":{"kind":"native"},
+                "shell":{"tool":"bash", "executable":"bash", "dialect":"bash"},
+                "executionPath":"fixture-bin", "shellAvailable":true,
+                "workspaceShellSupported":true, "developerCommands":[]
+            },
             "instructions": [],
             "tools": [],
             "toolPromptContributions": [],
@@ -5846,32 +4293,188 @@ mod tests {
         assert_eq!(error.code, "session_event_invalid");
     }
 
+    fn append_model_settings_and_rejected_call(journal: &LocalAgentJournal) {
+        let settings = json!({"profileId":"profile:test","reasoningEffortOverride":"high"});
+        let result = journal
+            .commit_command(&json!({
+                "command": {
+                    "schemaVersion": COMMAND_VERSION,
+                    "type":"session.model-settings.set", "sessionId":"session:loop",
+                    "commandId":"command:settings", "settings":settings
+                },
+                "events":[{
+                    "type":"session.model-settings.updated", "sessionId":"session:loop",
+                    "payload":{"commandId":"command:settings","settings":settings}
+                }],
+                "reply":{
+                    "schemaVersion":REPLY_VERSION,"sessionId":"session:loop",
+                    "commandId":"command:settings","status":"accepted","revision":0
+                }
+            }))
+            .expect("save settings through the real SQLite command transaction");
+        assert_eq!(result["status"], "accepted");
+        journal.append(&json!({
+            "type":"run.started", "sessionId":"session:loop", "runId":"run:loop",
+            "payload":{"inputMessageId":"message:loop","workspaceBindings":[],"runtimeSnapshot":runtime_snapshot()}
+        })).unwrap();
+        journal.append(&json!({
+            "type":"context.composed", "sessionId":"session:loop", "runId":"run:loop",
+            "payload":{
+                "providerRequestId":"provider-request:loop","purpose":"agent","responseConstraint":"normal",
+                "dynamicInstructionBytes":0,"messages":[],"workspaceBindings":[],"tools":[],
+                "partitions":[
+                    {"kind":"instructions","itemCount":0,"requestShapeUnits":1},
+                    {"kind":"sessionControls","itemCount":0,"requestShapeUnits":0},
+                    {"kind":"tools","itemCount":0,"requestShapeUnits":0},
+                    {"kind":"workspaceBindings","itemCount":0,"requestShapeUnits":0},
+                    {"kind":"contextProviders","itemCount":0,"requestShapeUnits":0},
+                    {"kind":"journalMessages","itemCount":0,"requestShapeUnits":0},
+                    {"kind":"filesystemReferences","itemCount":0,"requestShapeUnits":0}
+                ]
+            }
+        })).unwrap();
+        journal.append(&json!({
+            "type":"tool.requested", "sessionId":"session:loop", "runId":"run:loop","callId":"call:loop",
+            "payload":{
+                "providerCallId":"provider-call:loop","attemptId":"attempt:loop","toolName":"bash",
+                "input":{"command":"pwd","executionMode":"read"}
+            }
+        })).unwrap();
+        journal.append(&json!({
+            "type":"provider.turn.settled", "sessionId":"session:loop", "runId":"run:loop",
+            "payload":{
+                "outcome":"completed","providerRequestId":"provider-request:loop","purpose":"agent",
+                "providerRuntimeRef":"provider-runtime:test","orderedCallIds":["call:loop"]
+            }
+        })).unwrap();
+        let event = journal.append(&json!({
+            "type":"tool.input-rejected", "sessionId":"session:loop", "runId":"run:loop","callId":"call:loop",
+            "payload":{"rejection":{
+                "sessionId":"session:loop","runId":"run:loop","callId":"call:loop","attemptId":"attempt:loop",
+                "extensionGenerationRef":"extension-generation:test","kernelCatalogSnapshotRef":"kernel-catalog:test",
+                "toolBindingRef":"tool-binding:bash","toolName":"bash","rejectedAt":"2026-09-07T00:00:00Z",
+                "input":{"command":"pwd","executionMode":"read"},
+                "error":{"code":"tool_input_invalid","message":"Tool was not executed.","issues":[{
+                    "path":"$.executionMode","rule":"additionalProperties","message":"Remove this undeclared field."
+                }]}
+            }}
+        })).expect("persist the rejected input without an execution record");
+        assert_eq!(event["type"], "tool.input-rejected");
+    }
+
+    fn settings_commit(command_id: &str) -> Value {
+        let settings = json!({"profileId":"profile:test","reasoningEffortOverride":"high"});
+        json!({
+            "command":{"schemaVersion":COMMAND_VERSION,"type":"session.model-settings.set",
+                "sessionId":"session:loop","commandId":command_id,"settings":settings},
+            "events":[{"type":"session.model-settings.updated","sessionId":"session:loop",
+                "payload":{"commandId":command_id,"settings":settings}}],
+            "reply":{"schemaVersion":REPLY_VERSION,"sessionId":"session:loop","commandId":command_id,
+                "status":"accepted","revision":0}
+        })
+    }
+
     #[test]
-    fn journal_writes_model_settings_and_input_rejection_to_sqlite() {
-        let path = std::env::temp_dir().join(format!(
-            "deepcode-session-loop-events-{}.sqlite3",
-            random_id("test").unwrap().replace(':', "-")
-        ));
-        let journal = LocalAgentJournal::open(&path).unwrap();
+    fn journal_persists_events_and_command_receipts_without_duplicate_commits() {
+        let store = Store::new();
+        let journal = LocalAgentJournal::open(&store.path()).unwrap();
         journal
             .create_session("session:loop", "Loop", &json!([]), Some("profile:test"))
             .unwrap();
         append_model_settings_and_rejected_call(&journal);
         let events = journal.read_events("session:loop", 0).unwrap();
-        let saved_command = journal
+        let command = journal
             .read_command("session:loop", "command:settings")
             .unwrap();
+        assert_eq!(
+            journal
+                .commit_command(&settings_commit("command:settings"))
+                .unwrap_err()
+                .code,
+            "session_command_already_recorded"
+        );
+        assert_eq!(journal.read_events("session:loop", 0).unwrap(), events);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["sequence"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            (1..=events.len() as u64).collect::<Vec<_>>()
+        );
+        let ids = events
+            .iter()
+            .map(|event| event["eventId"].as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), events.len());
+        let through = events[1]["sequence"].as_u64().unwrap();
+        assert_eq!(
+            journal.read_events("session:loop", through).unwrap(),
+            events[2..]
+        );
         drop(journal);
-        let reopened = LocalAgentJournal::open(&path).unwrap();
+        let reopened = LocalAgentJournal::open(&store.path()).unwrap();
         assert_eq!(reopened.read_events("session:loop", 0).unwrap(), events);
         assert_eq!(
             reopened
                 .read_command("session:loop", "command:settings")
                 .unwrap(),
-            saved_command
+            command
         );
-        drop(reopened);
-        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn failed_event_and_command_batches_do_not_partially_write_or_consume_sequence() {
+        let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
+        journal
+            .create_session("session:loop", "Loop", &json!([]), None)
+            .unwrap();
+        let before = journal.read_events("session:loop", 0).unwrap();
+        let missing_run = json!({"type":"run.finishing","sessionId":"session:loop","runId":"run:missing","payload":{"outcome":"cancelled"}});
+        let commit = settings_commit("command:atomic");
+        let mut invalid = commit.clone();
+        invalid["events"]
+            .as_array_mut()
+            .unwrap()
+            .push(missing_run.clone());
+        assert_eq!(
+            journal.commit_command(&invalid).unwrap_err().code,
+            "session_event_run_missing"
+        );
+        assert_eq!(journal.read_events("session:loop", 0).unwrap(), before);
+        assert!(journal
+            .read_command("session:loop", "command:atomic")
+            .unwrap()
+            .is_none());
+        assert!(journal
+            .append_batch(&[commit["events"][0].clone(), missing_run])
+            .is_err());
+        assert_eq!(journal.read_events("session:loop", 0).unwrap(), before);
+        let saved = journal.commit_command(&commit).unwrap();
+        assert_eq!(
+            saved["revision"],
+            before.last().unwrap()["sequence"].as_u64().unwrap() + 1
+        );
+    }
+
+    #[test]
+    fn store_rejects_unknown_calls_and_duplicate_terminal_records() {
+        let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
+        journal
+            .create_session("session:loop", "Loop", &json!([]), None)
+            .unwrap();
+        journal.append(&json!({"type":"run.started","sessionId":"session:loop","runId":"run:loop",
+            "payload":{"inputMessageId":"message:loop","workspaceBindings":[],"runtimeSnapshot":runtime_snapshot()}})).unwrap();
+        let started = json!({"type":"tool.started","sessionId":"session:loop","runId":"run:loop","callId":"call:missing",
+            "payload":{"attemptId":"attempt:missing"}});
+        assert_eq!(
+            journal.append(&started).unwrap_err().code,
+            "session_event_call_missing"
+        );
+        let finishing = json!({"type":"run.finishing","sessionId":"session:loop","runId":"run:loop","payload":{"outcome":"cancelled"}});
+        journal.append(&finishing).unwrap();
+        let before = journal.read_events("session:loop", 0).unwrap();
+        assert!(journal.append(&finishing).is_err());
+        assert_eq!(journal.read_events("session:loop", 0).unwrap(), before);
     }
 
     #[test]
@@ -5884,6 +4487,8 @@ mod tests {
             "payload":{"commandId":"command:first","messageId":"message:loop","text":"First message"}})).unwrap();
         append_model_settings_and_rejected_call(&journal);
         let grant = |id: &str| {
+            journal.append(&json!({"type":"tool.requested", "sessionId":"session:loop", "runId":"run:loop", "callId":id,
+                "payload":{"providerCallId":format!("provider:{id}"),"attemptId":format!("attempt:{id}"),"toolName":"web.open","input":{}}})).unwrap();
             journal.append(&json!({"type":"approval.requested", "sessionId":"session:loop", "runId":"run:loop", "callId":id,
                 "payload":{"approvalId":id,"preview":{"summary":"Use browser","effects":["external"],"logicalTargets":["browser:test"],"authorizationScope":"sessionBrowser"}}})).unwrap();
             journal.append(&json!({"type":"approval.resolved", "sessionId":"session:loop", "runId":"run:loop", "callId":id,
@@ -5940,348 +4545,9 @@ mod tests {
     }
 
     #[test]
-    fn journal_persists_session_input_rejection_without_a_kernel_call() {
-        let path = std::env::temp_dir().join(format!(
-            "deepcode-provider-input-{}.sqlite3",
-            random_id("test").unwrap().replace(':', "-")
-        ));
-        let journal = LocalAgentJournal::open(&path).unwrap();
-        journal
-            .create_session("session:loop", "Loop", &json!([]), Some("profile:test"))
-            .unwrap();
-        append_model_settings_and_rejected_call(&journal);
-        let events = journal.read_events("session:loop", 0).unwrap();
-        let mut composition = events
-            .iter()
-            .find(|event| event["type"] == "context.composed")
-            .unwrap()
-            .clone();
-        let composition = composition.as_object_mut().unwrap();
-        for field in ["schemaVersion", "eventId", "sequence", "occurredAt"] {
-            composition.remove(field);
-        }
-        composition.get_mut("payload").unwrap()["providerRequestId"] =
-            json!("provider-request:bad-arguments");
-        journal.append(&Value::Object(composition.clone())).unwrap();
-        let block = json!({
-            "outputIndex":0,"kind":"toolCallRejected","callId":"call:raw-rejected",
-            "providerCallId":"native:raw-rejected","toolName":"fs.read",
-            "item":{"type":"function_call","call_id":"native:raw-rejected","name":"fs_read","arguments":"{\"path\":","status":"completed"},
-            "error":{"code":"provider_tool_call_arguments_invalid","message":"Invalid JSON object.","issues":[{"path":"$","rule":"json_object","message":"Invalid JSON object."}]}
-        });
-        let completed = json!({
-            "type":"provider.turn.settled","sessionId":"session:loop","runId":"run:loop",
-            "payload":{"outcome":"completed","providerRequestId":"provider-request:bad-arguments","purpose":"agent",
-                "providerRuntimeRef":"provider-runtime:test","orderedCallIds":[],"orderedOutputBlocks":[block]}
-        });
-        let mut fake_call_fact = completed.clone();
-        fake_call_fact["payload"]["orderedCallIds"] = json!(["call:raw-rejected"]);
-        assert!(
-            journal.append(&fake_call_fact).is_err(),
-            "a rejection must not invent an accepted call fact"
-        );
-        journal.append(&completed).unwrap();
-        let saved = journal.read_events("session:loop", 0).unwrap();
-        assert_eq!(
-            saved
-                .iter()
-                .filter(|event| event["type"] == "tool.requested")
-                .count(),
-            1,
-            "only the earlier Kernel fixture call exists"
-        );
-        assert_eq!(
-            saved.last().unwrap()["payload"]["orderedOutputBlocks"][0],
-            block
-        );
-        drop(journal);
-        let reopened = LocalAgentJournal::open(&path).unwrap();
-        assert_eq!(reopened.read_events("session:loop", 0).unwrap(), saved);
-        drop(reopened);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn queued_input_retains_its_payload_only_while_run_can_accept_it() {
-        let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
-        journal
-            .create_session("session:loop", "Loop", &json!([]), Some("profile:test"))
-            .unwrap();
-        let queued = json!({"type":"input.queued", "sessionId":"session:loop", "runId":"run:loop",
-            "payload":{"commandId":"command:queued", "messageId":"message:queued", "text":"补充🙂",
-                "filesystemReferences":[], "pluginSelections":[]}});
-        assert_eq!(
-            journal.append(&queued).unwrap_err().code,
-            "session_event_run_not_active"
-        );
-        append_model_settings_and_rejected_call(&journal);
-        let committed = journal.append(&queued).unwrap();
-        assert_eq!(committed["payload"], queued["payload"]);
-        journal
-            .append(
-                &json!({"type":"run.finishing", "sessionId":"session:loop", "runId":"run:loop",
-            "payload":{"outcome":"cancelled"}}),
-            )
-            .unwrap();
-        assert_eq!(
-            journal.append(&queued).unwrap_err().code,
-            "session_event_run_not_active"
-        );
-        let saved = journal.read_events("session:loop", 0).unwrap();
-        assert_eq!(
-            saved
-                .iter()
-                .filter(|event| event["type"] == "input.queued")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn journal_closes_unknown_tool_result_after_release_before_settlement() {
-        let path = std::env::temp_dir().join(format!(
-            "deepcode-tool-interrupted-{}.sqlite3",
-            random_id("test").unwrap().replace(':', "-")
-        ));
-        let journal = LocalAgentJournal::open(&path).unwrap();
-        journal
-            .create_session("session:loop", "Loop", &json!([]), Some("profile:test"))
-            .unwrap();
-        append_model_settings_and_rejected_call(&journal);
-        let events = journal.read_events("session:loop", 0).unwrap();
-        for kind in [
-            "context.composed",
-            "tool.requested",
-            "provider.turn.settled",
-        ] {
-            let mut event = events
-                .iter()
-                .find(|event| event["type"] == kind)
-                .unwrap()
-                .clone();
-            let object = event.as_object_mut().unwrap();
-            for key in ["schemaVersion", "eventId", "sequence", "occurredAt"] {
-                object.remove(key);
-            }
-            if kind == "tool.requested" {
-                event["callId"] = json!("call:unknown");
-                event["payload"]["attemptId"] = json!("attempt:unknown");
-                event["payload"]["providerCallId"] = json!("provider-call:unknown");
-            } else {
-                event["payload"]["providerRequestId"] = json!("provider-request:unknown");
-                if kind == "provider.turn.settled" {
-                    event["payload"]["orderedCallIds"] = json!(["call:unknown"]);
-                }
-            }
-            journal.append(&event).unwrap();
-        }
-        let started = json!({"type":"tool.started", "sessionId":"session:loop", "runId":"run:loop", "callId":"call:unknown",
-            "payload":{"attemptId":"attempt:unknown", "startedAt":"1789298353986"}});
-        let mut wrong_started = started.clone();
-        wrong_started["payload"]["attemptId"] = json!("attempt:other");
-        assert_eq!(
-            journal.append(&wrong_started).unwrap_err().code,
-            "tool_started_state_invalid"
-        );
-        journal.append(&started).unwrap();
-        assert_eq!(
-            journal.append(&started).unwrap_err().code,
-            "tool_started_state_invalid"
-        );
-        let interrupted = json!({
-            "type":"tool.interrupted", "sessionId":"session:loop", "runId":"run:loop", "callId":"call:unknown",
-            "payload":{"attemptId":"attempt:unknown", "error":{"code":"tool_result_unknown", "message":"Kernel result unavailable after runtime release; original fetch failed."}}
-        });
-        assert_eq!(
-            journal.append(&interrupted).unwrap_err().code,
-            "tool_interruption_state_invalid"
-        );
-        let outcome = json!({"outcome":"failed", "error":{"code":"local_agent_transport_failed", "message":"fetch failed"}});
-        journal.append(&json!({"type":"run.finishing", "sessionId":"session:loop", "runId":"run:loop", "payload":outcome})).unwrap();
-        journal.append(&json!({
-            "type":"run.runtime.released", "sessionId":"session:loop", "runId":"run:loop",
-            "payload":{"runRuntimeSnapshotRef":"run-runtime:test", "extensionGenerationRef":"extension-generation:test", "kernelCatalogSnapshotRef":"kernel-catalog:test", "providerRuntimeRef":"provider-runtime:test", "pluginInstanceRefs":[], "alreadyReleased":false}
-        })).unwrap();
-        let settled = json!({"type":"run.settled", "sessionId":"session:loop", "runId":"run:loop", "payload":outcome});
-        assert_eq!(
-            journal.append(&settled).unwrap_err().code,
-            "run_tool_result_missing"
-        );
-        let mut wrong_attempt = interrupted.clone();
-        wrong_attempt["payload"]["attemptId"] = json!("attempt:other");
-        assert_eq!(
-            journal.append(&wrong_attempt).unwrap_err().code,
-            "tool_interruption_state_invalid"
-        );
-        journal.append_batch(&[interrupted, settled]).unwrap();
-        let saved = journal.read_events("session:loop", 0).unwrap();
-        let last = &saved[saved.len() - 3..];
-        assert_eq!(
-            last.iter()
-                .map(|event| event["type"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            ["run.runtime.released", "tool.interrupted", "run.settled"]
-        );
-        assert!(last[1]["payload"].get("record").is_none());
-        assert!(last[1]["payload"].get("executed").is_none());
-        assert_eq!(last[2]["payload"]["error"]["message"], "fetch failed");
-        drop(journal);
-        let reopened = LocalAgentJournal::open(&path).unwrap();
-        assert_eq!(reopened.read_events("session:loop", 0).unwrap(), saved);
-        drop(reopened);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn journal_extends_event_storage_without_rewriting_history() {
-        let path = std::env::temp_dir().join(format!(
-            "deepcode-session-constraint-{}.sqlite3",
-            random_id("test").unwrap().replace(':', "-")
-        ));
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(&SESSION_STORE_SCHEMA.replace(
-                "CHECK(length(event_type) > 0)",
-                "CHECK(event_type IN ('session.created','input.accepted'))",
-            ))
-            .unwrap();
-        connection.execute_batch("PRAGMA user_version=7;").unwrap();
-        let journal = LocalAgentJournal {
-            connection: Arc::new(Mutex::new(connection)),
-        };
-        journal
-            .create_session(
-                "session:loop",
-                "Existing conversation",
-                &json!([
-                    {"workspaceId":"workspace:test","displayName":"Test"}
-                ]),
-                Some("profile:test"),
-            )
-            .unwrap();
-        journal.commit_command(&json!({
-            "command":{
-                "schemaVersion":COMMAND_VERSION,"type":"message.submit","sessionId":"session:loop",
-                "commandId":"command:before-repair","text":"Preserve this conversation."
-            },
-            "events":[{
-                "type":"input.accepted","sessionId":"session:loop",
-                "payload":{"commandId":"command:before-repair","messageId":"message:before-repair","text":"Preserve this conversation."}
-            }],
-            "reply":{
-                "schemaVersion":REPLY_VERSION,"sessionId":"session:loop",
-                "commandId":"command:before-repair","status":"accepted","revision":0
-            }
-        })).unwrap();
-        let before_events = journal.read_events("session:loop", 0).unwrap();
-        let before_command = journal
-            .read_command("session:loop", "command:before-repair")
-            .unwrap();
-        let read_indexes = |journal: &LocalAgentJournal| -> Vec<(String, String)> {
-            journal.lock().unwrap()
-                .prepare("SELECT name, sql FROM sqlite_schema WHERE type='index' AND tbl_name='session_events' AND sql IS NOT NULL ORDER BY name")
-                .unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap().collect::<rusqlite::Result<_>>().unwrap()
-        };
-        let read_table =
-            |journal: &LocalAgentJournal| -> String {
-                journal.lock().unwrap().query_row(
-                "SELECT sql FROM sqlite_schema WHERE type='table' AND name='session_events'",
-                [], |row| row.get(0),
-            ).unwrap()
-            };
-        let read_schema_revision = |journal: &LocalAgentJournal| -> u32 {
-            journal
-                .lock()
-                .unwrap()
-                .query_row("PRAGMA schema_version", [], |row| row.get(0))
-                .unwrap()
-        };
-        let before_indexes = read_indexes(&journal);
-        let before_table = read_table(&journal);
-        let before_schema_revision = read_schema_revision(&journal);
-        drop(journal);
-        let unchanged = LocalAgentJournal::open(&path).expect("extend the event constraint");
-        assert_eq!(
-            unchanged.read_events("session:loop", 0).unwrap(),
-            before_events
-        );
-        assert_eq!(
-            unchanged
-                .read_command("session:loop", "command:before-repair")
-                .unwrap(),
-            before_command
-        );
-        assert_eq!(read_indexes(&unchanged), before_indexes);
-        assert_ne!(read_table(&unchanged), before_table);
-        assert!(read_schema_revision(&unchanged) > before_schema_revision);
-        assert_eq!(
-            unchanged
-                .lock()
-                .unwrap()
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
-                .unwrap(),
-            7
-        );
-        assert_eq!(unchanged.lock().unwrap().query_row(
-            "SELECT display_name FROM session_workspace_bindings WHERE session_id='session:loop'", [],
-            |row| row.get::<_, String>(0)
-        ).unwrap(), "Test");
-        assert!(
-            unchanged
-                .append(&json!({
-                    "type":"undeclared.event", "sessionId":"session:loop", "payload":{}
-                }))
-                .is_err(),
-            "unknown events must still fail at the journal write boundary"
-        );
-        append_model_settings_and_rejected_call(&unchanged);
-        let runtime = runtime_snapshot();
-        let view: Map<String, Value> = [
-            "extensionGenerationRef",
-            "kernelCatalogSnapshotRef",
-            "instructions",
-            "tools",
-            "toolPromptContributions",
-            "providerToolAliases",
-            "selectedPlugins",
-        ]
-        .into_iter()
-        .map(|field| (field.to_string(), runtime[field].clone()))
-        .collect();
-        unchanged
-            .append(&json!({
-                "type":"run.tools.prepared", "sessionId":"session:loop", "runId":"run:loop",
-                "payload":{"toolView":view}
-            }))
-            .expect("write the newly introduced event to the existing conversation");
-        assert_eq!(
-            unchanged
-                .lock()
-                .unwrap()
-                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
-                .unwrap(),
-            "ok"
-        );
-        let after_events = unchanged.read_events("session:loop", 0).unwrap();
-        let after_schema_revision = read_schema_revision(&unchanged);
-        drop(unchanged);
-        let reopened = LocalAgentJournal::open(&path).unwrap();
-        assert_eq!(
-            reopened.read_events("session:loop", 0).unwrap(),
-            after_events
-        );
-        assert_eq!(read_schema_revision(&reopened), after_schema_revision);
-        drop(reopened);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn journal_uses_required_fields_instead_of_a_version_gate() {
-        let path = std::env::temp_dir().join(format!(
-            "deepcode-session-shape-{}.sqlite3",
-            random_id("test").unwrap().replace(':', "-")
-        ));
+        let store = Store::new();
+        let path = store.path();
         let journal = LocalAgentJournal::open(&path).unwrap();
         journal
             .create_session("session:shape", "History", &json!([]), None)
@@ -6302,7 +4568,7 @@ mod tests {
             .unwrap();
         drop(journal);
         let reopened = LocalAgentJournal::open(&path)
-            .expect("compatible fields with a historical version marker");
+            .expect("required fields remain readable independently of the informational marker");
         assert_eq!(reopened.read_events("session:shape", 0).unwrap(), before);
         assert_eq!(
             reopened
@@ -6325,413 +4591,6 @@ mod tests {
             .expect("missing required column");
         assert_eq!(error.code, "session_store_schema_incomplete");
         assert!(error.message.contains("payload_json"));
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn journal_event_extension_rolls_back_on_invalid_stored_content() {
-        let mut connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(&SESSION_STORE_SCHEMA.replace(
-                "CHECK(length(event_type) > 0)",
-                "CHECK(event_type IN ('session.created',''))",
-            ))
-            .unwrap();
-        connection.execute_batch("INSERT INTO sessions VALUES ('session:bad','History',NULL,'time');
-            INSERT INTO session_events VALUES ('session:bad',1,'event:bad','',NULL,NULL,'{}','time');").unwrap();
-        let before: String = connection
-            .query_row(
-                "SELECT sql FROM sqlite_schema WHERE name='session_events'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let error = extend_event_storage(&mut connection).unwrap_err();
-        assert_eq!(error.code, "session_store_event_extension_failed");
-        assert!(error.message.contains("CHECK constraint failed"));
-        let after: String = connection
-            .query_row(
-                "SELECT sql FROM sqlite_schema WHERE name='session_events'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(after, before);
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT event_type FROM session_events WHERE event_id='event:bad'",
-                    [],
-                    |row| row.get::<_, String>(0)
-                )
-                .unwrap(),
-            ""
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT count(*) FROM sqlite_schema WHERE name='session_events_expanded'",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            0
-        );
-    }
-
-    fn append_model_settings_and_rejected_call(journal: &LocalAgentJournal) {
-        let settings = json!({"profileId":"profile:test","reasoningEffortOverride":"high"});
-        let result = journal
-            .commit_command(&json!({
-                "command": {
-                    "schemaVersion": COMMAND_VERSION,
-                    "type":"session.model-settings.set", "sessionId":"session:loop",
-                    "commandId":"command:settings", "settings":settings
-                },
-                "events":[{
-                    "type":"session.model-settings.updated", "sessionId":"session:loop",
-                    "payload":{"commandId":"command:settings","settings":settings}
-                }],
-                "reply":{
-                    "schemaVersion":REPLY_VERSION,"sessionId":"session:loop",
-                    "commandId":"command:settings","status":"accepted","revision":0
-                }
-            }))
-            .expect("save settings through the real SQLite command transaction");
-        assert_eq!(result["status"], "accepted");
-        journal.append(&json!({
-            "type":"run.started", "sessionId":"session:loop", "runId":"run:loop",
-            "payload":{"inputMessageId":"message:loop","workspaceBindings":[],"runtimeSnapshot":runtime_snapshot()}
-        })).unwrap();
-        journal.append(&json!({
-            "type":"context.composed", "sessionId":"session:loop", "runId":"run:loop",
-            "payload":{
-                "providerRequestId":"provider-request:loop","purpose":"agent","responseConstraint":"normal",
-                "stableCoreHash":"context-hash-v1:0000000000000001",
-                "baseToolSchemaHash":"context-hash-v1:0000000000000002",
-                "selectedPluginSnapshotHash":"context-hash-v1:0000000000000003",
-                "dynamicInstructionBytes":0,"messages":[],"workspaceBindings":[],"tools":[],
-                "partitions":[
-                    {"kind":"instructions","itemCount":0,"requestShapeUnits":1},
-                    {"kind":"sessionControls","itemCount":0,"requestShapeUnits":0},
-                    {"kind":"tools","itemCount":0,"requestShapeUnits":0},
-                    {"kind":"workspaceBindings","itemCount":0,"requestShapeUnits":0},
-                    {"kind":"contextProviders","itemCount":0,"requestShapeUnits":0},
-                    {"kind":"journalMessages","itemCount":0,"requestShapeUnits":0},
-                    {"kind":"filesystemReferences","itemCount":0,"requestShapeUnits":0}
-                ]
-            }
-        })).unwrap();
-        journal.append(&json!({
-            "type":"tool.requested", "sessionId":"session:loop", "runId":"run:loop","callId":"call:loop",
-            "payload":{
-                "providerCallId":"provider-call:loop","attemptId":"attempt:loop","toolName":"bash",
-                "input":{"command":"pwd","executionMode":"read"}
-            }
-        })).unwrap();
-        journal.append(&json!({
-            "type":"provider.turn.settled", "sessionId":"session:loop", "runId":"run:loop",
-            "payload":{
-                "outcome":"completed","providerRequestId":"provider-request:loop","purpose":"agent",
-                "providerRuntimeRef":"provider-runtime:test","orderedCallIds":["call:loop"]
-            }
-        })).unwrap();
-        let event = journal.append(&json!({
-            "type":"tool.input-rejected", "sessionId":"session:loop", "runId":"run:loop","callId":"call:loop",
-            "payload":{"rejection":{
-                "sessionId":"session:loop","runId":"run:loop","callId":"call:loop","attemptId":"attempt:loop",
-                "extensionGenerationRef":"extension-generation:test","kernelCatalogSnapshotRef":"kernel-catalog:test",
-                "toolBindingRef":"tool-binding:bash","toolName":"bash","rejectedAt":"2026-09-07T00:00:00Z",
-                "input":{"command":"pwd","executionMode":"read"},
-                "error":{"code":"tool_input_invalid","message":"Tool was not executed.","issues":[{
-                    "path":"$.executionMode","rule":"additionalProperties","message":"Remove this undeclared field."
-                }]}
-            }}
-        })).expect("persist the rejected input without an execution record");
-        assert_eq!(event["type"], "tool.input-rejected");
-    }
-
-    #[test]
-    fn journal_persists_basic_provider_turn_and_usage_flow() {
-        let path = std::env::temp_dir().join(format!(
-            "deepcode-session-facts-{}.sqlite3",
-            random_id("test").unwrap().replace(':', "-")
-        ));
-        let journal = LocalAgentJournal::open(&path).expect("open fact journal");
-        journal
-            .create_session("session:facts", "Facts", &json!([]), Some("profile:test"))
-            .expect("create fact session");
-        journal
-            .append(&json!({
-                "type":"run.started",
-                "sessionId":"session:facts",
-                "runId":"run:facts",
-                "payload":{
-                    "inputMessageId":"message:facts",
-                    "workspaceBindings":[],
-                    "runtimeSnapshot": runtime_snapshot()
-                }
-            }))
-            .expect("start fact run");
-        journal
-            .append(&json!({
-                "type":"context.composed",
-                "sessionId":"session:facts",
-                "runId":"run:facts",
-                "payload":{
-                    "providerRequestId":"provider-request:facts",
-                    "purpose":"agent",
-                    "responseConstraint":"normal",
-                    "stableCoreHash":"context-hash-v1:0000000000000001",
-                    "baseToolSchemaHash":"context-hash-v1:0000000000000002",
-                    "selectedPluginSnapshotHash":"context-hash-v1:0000000000000003",
-                    "dynamicInstructionBytes":1,
-                    "messages":[],
-                    "workspaceBindings":[],
-                    "tools":[],
-                    "partitions":[
-                        {"kind":"instructions","itemCount":0,"requestShapeUnits":1},
-                        {"kind":"sessionControls","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"tools","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"workspaceBindings","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"contextProviders","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"journalMessages","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"filesystemReferences","itemCount":0,"requestShapeUnits":0}
-                    ]
-                }
-            }))
-            .expect("record provider request composition");
-        journal
-            .append(&json!({
-                "type":"plan.published",
-                "sessionId":"session:facts",
-                "runId":"run:facts",
-                "callId":"call:plan",
-                "payload":{
-                    "providerCallId":"provider-call:plan",
-                    "planId":"plan:facts",
-                    "revision":1,
-                    "title":"Inspect",
-                    "summary":"Inspect the workspace.",
-                    "steps":[{"stepId":"step:one","title":"Inspect","details":"Inspect files."}],
-                    "mutationManifest":[]
-                }
-            }))
-            .expect("record structured provider call fact");
-        journal
-            .append(&json!({
-                "type":"provider.turn.settled",
-                "sessionId":"session:facts",
-                "runId":"run:facts",
-                "payload":{
-                    "outcome":"completed",
-                    "providerRequestId":"provider-request:facts",
-                    "purpose":"agent",
-                    "providerRuntimeRef":"provider-runtime:test",
-                    "orderedCallIds":["call:plan"]
-                }
-            }))
-            .expect("complete provider turn");
-        journal
-            .append(&json!({
-                "type":"context.updated",
-                "sessionId":"session:facts",
-                "runId":"run:facts",
-                "payload":{
-                    "providerRequestId":"provider-request:facts",
-                    "providerRuntimeRef":"provider-runtime:test",
-                    "inputTokens":20,
-                    "outputTokens":5,
-                    "contextWindowTokens":1000,
-                    "cacheReadInputTokens":8,
-                    "cacheMissInputTokens":12
-                }
-            }))
-            .expect("record receipt-linked usage");
-        journal
-            .append(&json!({
-                "type":"message.committed",
-                "sessionId":"session:facts",
-                "runId":"run:facts",
-                "payload":{
-                    "messageId":"message:final",
-                    "role":"assistant",
-                    "content":"Done.",
-                    "providerRequestId":"provider-request:facts"
-                }
-            }))
-            .expect("record final assistant message");
-        journal
-            .append(&json!({
-                "type":"run.finishing",
-                "sessionId":"session:facts",
-                "runId":"run:facts",
-                "payload":{"outcome":"completed","finalMessageId":"message:final"}
-            }))
-            .expect("finish fact run");
-        journal
-            .append(&json!({
-                "type":"run.runtime.released",
-                "sessionId":"session:facts",
-                "runId":"run:facts",
-                "payload":{
-                    "runRuntimeSnapshotRef":"run-runtime:test",
-                    "extensionGenerationRef":"extension-generation:test",
-                    "kernelCatalogSnapshotRef":"kernel-catalog:test",
-                    "providerRuntimeRef":"provider-runtime:test",
-                    "pluginInstanceRefs":[],
-                    "alreadyReleased":false
-                }
-            }))
-            .expect("record runtime release receipt");
-        journal
-            .append(&json!({
-                "type":"run.settled",
-                "sessionId":"session:facts",
-                "runId":"run:facts",
-                "payload":{"outcome":"completed","finalMessageId":"message:final"}
-            }))
-            .expect("settle fact run after release");
-        let events = journal
-            .read_events("session:facts", 0)
-            .expect("read durable provider flow");
-        let event_types = events
-            .iter()
-            .map(|event| event["type"].as_str().expect("event type"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            event_types,
-            [
-                "session.created",
-                "run.started",
-                "context.composed",
-                "plan.published",
-                "provider.turn.settled",
-                "context.updated",
-                "message.committed",
-                "run.finishing",
-                "run.runtime.released",
-                "run.settled",
-            ]
-        );
-        assert_eq!(
-            events[5]["payload"]["providerRequestId"],
-            "provider-request:facts"
-        );
-
-        drop(journal);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn pending_provider_composition_is_closed_atomically_before_run_finishing() {
-        let path = std::env::temp_dir().join(format!(
-            "deepcode-session-provider-terminal-{}.sqlite3",
-            random_id("test").unwrap().replace(':', "-")
-        ));
-        let journal = LocalAgentJournal::open(&path).expect("open terminal fact journal");
-        journal
-            .create_session(
-                "session:terminal",
-                "Terminal",
-                &json!([]),
-                Some("profile:test"),
-            )
-            .expect("create terminal fact session");
-        journal
-            .append(&json!({
-                "type":"run.started",
-                "sessionId":"session:terminal",
-                "runId":"run:terminal",
-                "payload":{
-                    "inputMessageId":"message:terminal",
-                    "workspaceBindings":[],
-                    "runtimeSnapshot":runtime_snapshot()
-                }
-            }))
-            .expect("start terminal fact run");
-        journal
-            .append(&json!({
-                "type":"context.composed",
-                "sessionId":"session:terminal",
-                "runId":"run:terminal",
-                "payload":{
-                    "providerRequestId":"provider-request:terminal",
-                    "purpose":"agent",
-                    "responseConstraint":"normal",
-                    "stableCoreHash":"context-hash-v1:0000000000000001",
-                    "baseToolSchemaHash":"context-hash-v1:0000000000000002",
-                    "selectedPluginSnapshotHash":"context-hash-v1:0000000000000003",
-                    "dynamicInstructionBytes":1,
-                    "messages":[],
-                    "workspaceBindings":[],
-                    "tools":[],
-                    "partitions":[
-                        {"kind":"instructions","itemCount":0,"requestShapeUnits":1},
-                        {"kind":"sessionControls","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"tools","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"workspaceBindings","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"contextProviders","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"journalMessages","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"filesystemReferences","itemCount":0,"requestShapeUnits":0}
-                    ]
-                }
-            }))
-            .expect("record pending provider composition");
-        let error = json!({
-            "code":"provider_turn_outcome_unknown",
-            "message":"Provider completion was not observed."
-        });
-        let batch = [
-            json!({
-                "type":"provider.turn.settled",
-                "sessionId":"session:terminal",
-                "runId":"run:terminal",
-                "payload":{
-                    "providerRequestId":"provider-request:terminal",
-                    "purpose":"agent",
-                    "providerRuntimeRef":"provider-runtime:test",
-                    "outcome":"indeterminate",
-                    "error":error
-                }
-            }),
-            json!({
-                "type":"run.finishing",
-                "sessionId":"session:terminal",
-                "runId":"run:terminal",
-                "payload":{
-                    "outcome":"indeterminate",
-                    "error":error
-                }
-            }),
-        ];
-        let before = journal.read_events("session:terminal", 0).unwrap();
-        let mut invalid_shape = batch.clone();
-        invalid_shape[1]["payload"] = Value::Null;
-        let shape_error = journal
-            .append_batch(&invalid_shape)
-            .expect_err("invalid event shape must reject the whole batch");
-        assert_eq!(shape_error.code, "session_event_invalid");
-        assert_eq!(journal.read_events("session:terminal", 0).unwrap(), before);
-
-        let fact_error = journal
-            .append_batch(&[batch[0].clone(), batch[1].clone(), batch[1].clone()])
-            .expect_err("invalid lifecycle facts must roll back the whole batch");
-        assert_eq!(fact_error.code, "run_finishing_state_invalid");
-        assert_eq!(journal.read_events("session:terminal", 0).unwrap(), before);
-
-        let committed = journal
-            .append_batch(&batch)
-            .expect("settle provider and start run release in one transaction");
-        assert_eq!(committed[0]["type"], "provider.turn.settled");
-        assert_eq!(committed[1]["type"], "run.finishing");
-        assert_eq!(
-            committed[0]["sequence"].as_u64().unwrap() + 1,
-            committed[1]["sequence"].as_u64().unwrap()
-        );
-
-        drop(journal);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -6762,261 +4621,5 @@ mod tests {
         let error = validate_new_event(&reused, false).expect_err("identity reuse must fail");
         assert_eq!(error.code, "session_event_invalid");
         assert!(error.message.contains("不能复用"));
-    }
-
-    #[test]
-    fn ordered_tool_call_identity_must_match_the_committed_provider_call_fact() {
-        let path = std::env::temp_dir().join(format!(
-            "deepcode-session-ordered-call-{}.sqlite3",
-            random_id("test").unwrap().replace(':', "-")
-        ));
-        let journal = LocalAgentJournal::open(&path).expect("open ordered call journal");
-        journal
-            .create_session(
-                "session:ordered-call",
-                "Ordered call",
-                &json!([]),
-                Some("profile:test"),
-            )
-            .expect("create ordered call session");
-        journal
-            .append(&json!({
-                "type":"run.started",
-                "sessionId":"session:ordered-call",
-                "runId":"run:ordered-call",
-                "payload":{
-                    "inputMessageId":"message:ordered-call",
-                    "workspaceBindings":[],
-                    "runtimeSnapshot":runtime_snapshot()
-                }
-            }))
-            .expect("start ordered call run");
-        journal
-            .append(&json!({
-                "type":"context.composed",
-                "sessionId":"session:ordered-call",
-                "runId":"run:ordered-call",
-                "payload":{
-                    "providerRequestId":"provider-request:ordered-call",
-                    "purpose":"agent",
-                    "responseConstraint":"normal",
-                    "stableCoreHash":"context-hash-v1:0000000000000001",
-                    "baseToolSchemaHash":"context-hash-v1:0000000000000002",
-                    "selectedPluginSnapshotHash":"context-hash-v1:0000000000000003",
-                    "dynamicInstructionBytes":1,
-                    "messages":[],
-                    "workspaceBindings":[],
-                    "tools":[],
-                    "partitions":[
-                        {"kind":"instructions","itemCount":0,"requestShapeUnits":1},
-                        {"kind":"sessionControls","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"tools","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"workspaceBindings","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"contextProviders","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"journalMessages","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"filesystemReferences","itemCount":0,"requestShapeUnits":0}
-                    ]
-                }
-            }))
-            .expect("record ordered call composition");
-        journal
-            .append(&json!({
-                "type":"plan.published",
-                "sessionId":"session:ordered-call",
-                "runId":"run:ordered-call",
-                "callId":"call:ordered-plan",
-                "payload":{
-                    "providerCallId":"provider-call:ordered-plan",
-                    "planId":"plan:ordered-call",
-                    "revision":1,
-                    "title":"Inspect",
-                    "summary":"Inspect the workspace.",
-                    "steps":[{"stepId":"step:ordered","title":"Inspect","details":"Inspect files."}],
-                    "mutationManifest":[]
-                }
-            }))
-            .expect("record ordered plan call fact");
-
-        let settlement = |provider_call_id: &str, tool_name: &str| {
-            json!({
-                "type":"provider.turn.settled",
-                "sessionId":"session:ordered-call",
-                "runId":"run:ordered-call",
-                "payload":{
-                    "outcome":"completed",
-                    "providerRequestId":"provider-request:ordered-call",
-                    "purpose":"agent",
-                    "providerRuntimeRef":"provider-runtime:test",
-                    "orderedCallIds":["call:ordered-plan"],
-                    "orderedOutputBlocks":[{
-                        "outputIndex":0,
-                        "kind":"toolCall",
-                        "callId":"call:ordered-plan",
-                        "providerCallId":provider_call_id,
-                        "toolName":tool_name,
-                        "item":{
-                            "type":"function_call",
-                            "id":"provider-item:ordered-plan",
-                            "call_id":provider_call_id,
-                            "name":"plan_publish",
-                            "arguments":"{}",
-                            "status":"completed"
-                        }
-                    }]
-                }
-            })
-        };
-        let error = journal
-            .append(&settlement("provider-call:wrong", "plan.publish"))
-            .expect_err("mismatched provider call identity must fail");
-        assert_eq!(error.code, "provider_turn_call_identity_mismatch");
-        let error = journal
-            .append(&settlement("provider-call:ordered-plan", "fs.read"))
-            .expect_err("mismatched canonical tool name must fail");
-        assert_eq!(error.code, "provider_turn_call_identity_mismatch");
-        journal
-            .append(&settlement("provider-call:ordered-plan", "plan.publish"))
-            .expect("matching ordered tool call identity must persist");
-
-        drop(journal);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn rejected_commands_are_eventless_while_accepted_plan_responses_remain_atomic() {
-        let command = plan_response_command(json!({"kind": "cancel"}));
-        let rejected = command_reply("rejected");
-        validate_command_event_batch(&command, &[], &rejected)
-            .expect("persist the real stale Plan rejection without lifecycle events");
-
-        let rejected_with_event = [json!({
-            "type": "plan.cancelled",
-            "payload": {
-                "planId": "plan:plan-response",
-                "revision": 1,
-                "commandId": "command:plan-response"
-            }
-        })];
-        let error = validate_command_event_batch(&command, &rejected_with_event, &rejected)
-            .expect_err("a rejected command must never mutate Session facts");
-        assert_eq!(error.code, "rejected_command_event_batch_invalid");
-
-        let accepted = command_reply("accepted");
-        let error = validate_command_event_batch(&command, &[], &accepted)
-            .expect_err("an accepted Plan response must carry its lifecycle fact");
-        assert_eq!(error.code, "plan_command_event_batch_invalid");
-
-        validate_command_event_batch(&command, &rejected_with_event, &accepted)
-            .expect("the matching accepted Plan lifecycle fact remains valid");
-    }
-
-    #[test]
-    fn explicit_plan_progress_persists_with_provider_order_and_tool_evidence() {
-        let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
-        journal
-            .create_session(
-                "session:progress",
-                "Progress",
-                &json!([]),
-                Some("profile:test"),
-            )
-            .unwrap();
-        let event = |kind: &str, payload: Value| json!({"type":kind, "sessionId":"session:progress", "runId":"run:progress", "payload":payload});
-        let composition = |id: &str| {
-            event(
-                "context.composed",
-                json!({
-                    "providerRequestId":id,"purpose":"agent","responseConstraint":"normal",
-                    "stableCoreHash":"context-hash-v1:0000000000000001", "baseToolSchemaHash":"context-hash-v1:0000000000000002",
-                    "selectedPluginSnapshotHash":"context-hash-v1:0000000000000003", "dynamicInstructionBytes":0,
-                    "messages":[], "workspaceBindings":[], "tools":[],
-                    "partitions":[
-                        {"kind":"instructions","itemCount":0,"requestShapeUnits":1},
-                        {"kind":"sessionControls","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"tools","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"workspaceBindings","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"contextProviders","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"journalMessages","itemCount":0,"requestShapeUnits":0},
-                        {"kind":"filesystemReferences","itemCount":0,"requestShapeUnits":0}
-                    ]
-                }),
-            )
-        };
-        let settled = |id: &str, calls: Value| {
-            event(
-                "provider.turn.settled",
-                json!({
-                    "outcome":"completed", "providerRequestId":id, "purpose":"agent",
-                    "providerRuntimeRef":"provider-runtime:test", "orderedCallIds":calls,
-                }),
-            )
-        };
-        journal.append(&event("run.started", json!({"inputMessageId":"message:progress", "workspaceBindings":[], "runtimeSnapshot":runtime_snapshot()}))).unwrap();
-        journal.append(&composition("request:plan")).unwrap();
-        let mut plan = event(
-            "plan.published",
-            json!({"providerCallId":"provider:plan", "planId":"plan:progress", "revision":1, "title":"Inspect", "summary":"Inspect files.", "steps":[{"stepId":"step:inspect", "title":"Inspect", "details":"Read source."}], "mutationManifest":[]}),
-        );
-        plan["callId"] = json!("call:plan");
-        journal.append(&plan).unwrap();
-        journal
-            .append(&settled("request:plan", json!(["call:plan"])))
-            .unwrap();
-        let mut confirm = event(
-            "plan.confirmed",
-            json!({"planId":"plan:progress", "revision":1, "commandId":"command:confirm", "decisionId":"decision:confirm", "authorities":[]}),
-        );
-        confirm["callId"] = json!("call:plan");
-        journal.append(&confirm).unwrap();
-        journal.append(&event("todo.seeded", json!({"sourcePlanId":"plan:progress", "sourcePlanRevision":1, "items":[{"todoId":"todo:inspect", "sourceStepId":"step:inspect", "label":"Inspect", "status":"pending"}]}))).unwrap();
-        // The store consumes the Kernel result as an opaque canonical record;
-        // this fixture supplies the fields used by the Todo evidence boundary.
-        let mut record = event(
-            "tool.completed",
-            json!({"record":{"recordId":"record:read", "outcome":"completed"}}),
-        );
-        record["callId"] = json!("call:read");
-        journal.append(&record).unwrap();
-        journal.append(&composition("request:progress")).unwrap();
-        let mut progress = event(
-            "todo.progressed",
-            json!({
-                "providerCallId":"provider:progress", "sourcePlanId":"plan:progress", "sourcePlanRevision":1,
-                "sourceFactRef":"record:read", "updates":[{"todoId":"todo:inspect", "status":"completed"}],
-            }),
-        );
-        progress["callId"] = json!("call:progress");
-        let mut missing = progress.clone();
-        missing["payload"]["sourceFactRef"] = json!("record:missing");
-        assert_eq!(
-            journal.append(&missing).unwrap_err().code,
-            "todo_source_fact_missing"
-        );
-        let mut completion = settled("request:progress", json!(["call:progress"]));
-        completion["payload"]["orderedOutputBlocks"] = json!([{
-            "kind":"toolCall", "outputIndex":0, "callId":"call:progress", "providerCallId":"provider:progress", "toolName":"plan.progress",
-            "item":{"type":"function_call", "call_id":"provider:progress", "name":"plan_progress", "arguments":"{}", "status":"completed"},
-        }]);
-        journal
-            .append_batch(&[progress.clone(), completion])
-            .unwrap();
-        assert_eq!(
-            journal.append(&progress).unwrap_err().code,
-            "provider_turn_composition_missing"
-        );
-        journal
-            .append(&event(
-                "plan.completed",
-                json!({"planId":"plan:progress", "revision":1}),
-            ))
-            .unwrap();
-        let events = journal.read_events("session:progress", 0).unwrap();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|value| value["type"] == "todo.progressed")
-                .count(),
-            1
-        );
     }
 }

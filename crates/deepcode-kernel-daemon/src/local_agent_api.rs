@@ -122,25 +122,6 @@ impl LocalAgentRuntime {
             RunPreparationError::new("gui_state_lock_failed", "GUI state 锁已损坏。")
         })?;
         let settings = &gui.user_settings;
-        let current_revision = if request.plugin_selections.is_empty() {
-            None
-        } else {
-            Some(
-                crate::local_agent_plugins::current_plugin_catalog_revision(
-                    settings,
-                    &request.plugin_selections,
-                )
-                .map_err(|message| {
-                    RunPreparationError::new("extension_snapshot_prepare_failed", message)
-                })?,
-            )
-        };
-        let requested_plugin_identity = json!({
-            "pluginCatalogRevision": request.plugin_catalog_revision.clone(),
-            "pluginImplementationRevision":current_revision,
-            "refreshPlugins":request.refresh_plugins,
-            "pluginSelections": request.plugin_selections.clone(),
-        });
         let mut prepared_runs = self.prepared_runs.lock().map_err(|_| {
             RunPreparationError::new(
                 "prepared_run_registry_lock_failed",
@@ -151,6 +132,19 @@ impl LocalAgentRuntime {
             .get(&key)
             .and_then(|views| views.last())
             .cloned();
+        if request.restore_environment {
+            return prepared_runs.get(&key).and_then(|views| views.first())
+                .map(|prepared| prepared.response.clone())
+                .ok_or_else(|| RunPreparationError::new("provider_runtime_unavailable", "当前 run 的运行时绑定已丢失；历史记录仍可读取，请开始新的会话。"));
+        }
+        let mut plugin_selection = crate::local_agent_plugins::resolve_plugin_selection(
+            settings, &mut request.plugin_selections, request.refresh_plugins,
+        ).map_err(|message| RunPreparationError::new("extension_snapshot_prepare_failed", message))?;
+        let requested_plugin_identity = json!({
+            "pluginCatalogRevision": request.plugin_catalog_revision.clone(),
+            "refreshPlugins":request.refresh_plugins,
+            "pluginSelections": request.plugin_selections.clone(),
+        });
         if let Some(prepared) = &previous {
             let effective_profile_id = prepared
                 .response
@@ -186,7 +180,7 @@ impl LocalAgentRuntime {
             if let Some(existing) = prepared_runs.get(&key).and_then(|views| {
                 views
                     .iter()
-                    .find(|view| view.requested_plugin_identity == requested_plugin_identity)
+                    .find(|view| view.requested_plugin_identity == requested_plugin_identity && view.plugin_selection.same_inputs(&plugin_selection))
             }) {
                 return Ok(existing.response.clone());
             }
@@ -205,15 +199,17 @@ impl LocalAgentRuntime {
                 environment_settings["_executionTarget"] = target.clone();
             }
         }
-        let mut environment = crate::session_environment::prepare(
+        let mut environment = if let Some(previous) = &previous {
+            previous.response["environment"].clone()
+        } else { crate::session_environment::prepare(
             &environment_settings,
             request.environment.as_ref(),
             request.restore_environment,
         )
-        .map_err(|message| RunPreparationError::new("session_environment_invalid", message))?;
+        .map_err(|message| RunPreparationError::new("session_environment_invalid", message))? };
         // A new task binds its own originating window; it never inherits the
         // preceding task's GUI capability from the saved execution environment.
-        environment
+        if previous.is_none() { environment
             .as_object_mut()
             .expect("prepared environment")
             .remove("hostBinding");
@@ -227,6 +223,7 @@ impl LocalAgentRuntime {
                 ));
             }
             environment["hostBinding"] = binding.clone();
+        }
         }
         // Validate and freeze the requested Provider before starting any new
         // out-of-process plugin generation. A bad Profile must not replace the
@@ -245,30 +242,6 @@ impl LocalAgentRuntime {
         };
         let provider_runtime = provider_binding.snapshot().clone();
         if let Some(previous) = &previous {
-            environment = previous.response["environment"].clone();
-        }
-        if request.refresh_plugins {
-            let catalog = crate::local_agent_plugins::plugin_catalog_projection(settings).map_err(
-                |message| RunPreparationError::new("extension_snapshot_prepare_failed", message),
-            )?;
-            // Disabling/removing a source withdraws it only from the next request. Existing bindings remain leased.
-            request.plugin_selections.retain(|selection| {
-                catalog["plugins"].as_array().is_some_and(|items| {
-                    items
-                        .iter()
-                        .any(|item| item["uri"] == selection.uri && item["enabled"] == true)
-                })
-            });
-        }
-        let mut plugin_selection = crate::local_agent_plugins::resolve_plugin_selection(
-            settings,
-            request.plugin_catalog_revision.as_deref(),
-            &request.plugin_selections,
-        )
-        .map_err(|message| {
-            RunPreparationError::new("extension_snapshot_prepare_failed", message)
-        })?;
-        if let Some(previous) = &previous {
             plugin_selection.retain_prepared(&previous.plugin_selection);
         }
         let mut plugin_config =
@@ -279,28 +252,17 @@ impl LocalAgentRuntime {
         let mcp = if let Some(previous) = &previous {
             previous
                 .mcp
-                .extend_selected_settings(settings, plugin_selection.mcp_plugin_instances())
+                .extend_selected_sources(&plugin_selection.mcp_sources, plugin_selection.mcp_plugin_instances())
         } else {
-            crate::local_agent_mcp::McpRuntime::from_selected_settings(
-                settings,
+            crate::local_agent_mcp::McpRuntime::from_selected_sources(
+                &plugin_selection.mcp_sources,
                 plugin_selection.mcp_plugin_instances(),
             )
         }
         .map_err(|error| RunPreparationError::new(error.code, error.message))?;
-        let extension_generation_ref = crate::local_agent_plugins::extension_generation_ref(
-            &plugin_config,
-            &plugin_selection,
-            &mcp,
-        )
+        let extension_generation_ref = crate::utils::new_runtime_ref("extension-generation")
         .map_err(|message| {
             RunPreparationError::new("extension_identity_prepare_failed", message)
-        })?;
-        let next_kernel_runtime_key = crate::local_agent_plugins::kernel_runtime_generation_key(
-            &extension_generation_ref,
-            settings,
-        )
-        .map_err(|message| {
-            RunPreparationError::new("kernel_runtime_identity_prepare_failed", message)
         })?;
         let (mut executor_config, mut secrets) =
             crate::runtime_tool_configuration(&gui).map_err(|message| {
@@ -310,6 +272,8 @@ impl LocalAgentRuntime {
             .map_err(|error| {
                 RunPreparationError::new("session_environment_invalid", error.to_string())
             })?;
+        executor_config.execution_path = Some(environment["executionPath"].as_str()
+            .ok_or_else(|| RunPreparationError::new("session_environment_invalid", "Prepared execution PATH is missing."))?.into());
         if environment["executionTarget"]["kind"] == "wsl" {
             executor_config.wsl = Some(deepcode_kernel_runtime::wsl_execution::WslExecution {
                 distribution: environment["executionTarget"]["distribution"]
@@ -349,7 +313,6 @@ impl LocalAgentRuntime {
             web_search.get("owner").and_then(Value::as_str) == Some("kernelAdapter");
         let prepared = LocalAgentKernel::prepare_generation(
             &extension_generation_ref,
-            &next_kernel_runtime_key,
             executor_config,
             Arc::new(secrets),
             mcp.clone(),
@@ -641,7 +604,7 @@ struct LocalProviderRequest {
     max_output_tokens: u32,
     workspace_bindings: Vec<LocalProviderWorkspaceBinding>,
     messages: Vec<LocalProviderMessage>,
-    tools: Vec<LocalProviderTool>,
+    tools: Vec<LlmToolDefinition>,
     hosted_tools: Vec<LocalProviderHostedTool>,
 }
 
@@ -654,41 +617,33 @@ struct LocalProviderWorkspaceBinding {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LocalProviderMessage {
-    role: String,
-    content: String,
-    reasoning_content: Option<String>,
-    reasoning_signature: Option<String>,
-    tool_call_id: Option<String>,
-    provider_call_id: Option<String>,
-    tool_calls: Option<Vec<LocalProviderToolCall>>,
-    provider_items: Option<Vec<Value>>,
-    provider_output_blocks: Option<Vec<Value>>,
+pub(crate) struct LocalProviderMessage {
+    pub(crate) role: String,
+    pub(crate) content: String,
+    pub(crate) reasoning_content: Option<String>,
+    pub(crate) reasoning_signature: Option<String>,
+    pub(crate) tool_call_id: Option<String>,
+    pub(crate) provider_call_id: Option<String>,
+    pub(crate) tool_calls: Option<Vec<LocalProviderToolCall>>,
+    pub(crate) provider_items: Option<Vec<Value>>,
+    pub(crate) provider_output_blocks: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LocalProviderToolCall {
-    call_id: String,
-    provider_call_id: String,
-    name: String,
-    input: Value,
+pub(crate) struct LocalProviderToolCall {
+    pub(crate) call_id: String,
+    pub(crate) provider_call_id: String,
+    pub(crate) name: String,
+    pub(crate) input: Value,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LocalProviderTool {
-    name: String,
-    description: String,
-    input_schema: Value,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LocalProviderHostedTool {
+pub(crate) struct LocalProviderHostedTool {
     #[serde(rename = "type")]
-    tool_type: String,
-    provider_tool_type: String,
+    pub(crate) tool_type: String,
+    pub(crate) provider_tool_type: String,
 }
 
 pub(crate) async fn local_agent_session_create(
@@ -1045,26 +1000,13 @@ pub(crate) async fn local_agent_provider_stream(
             "Provider 请求的目录集合与 run.started 冻结快照不一致。",
         );
     }
-    let runtime = {
-        let gui = match state.gui.lock() {
-            Ok(gui) => gui,
-            Err(_) => {
-                return local_provider_error(
-                    &request_id,
-                    "gui_state_lock_failed",
-                    "GUI state 锁已损坏。",
-                )
-            }
-        };
-        state.local_agent.provider_runtimes.resolve(
-            &gui,
+    let runtime = state.local_agent.provider_runtimes.resolve(
             &body.session_id,
             &body.run_id,
             &body.provider_runtime_ref,
             &body.profile_id,
             frozen_provider_runtime.reasoning_effort_override.as_deref(),
-        )
-    };
+        );
     let runtime = match runtime {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -1078,12 +1020,12 @@ pub(crate) async fn local_agent_provider_stream(
             "Provider 请求的输出预算与 run.started 固定的 runtime 不一致。",
         );
     }
-    let request_envelope = json!({
-        "messages": body.messages,
-        "tools": body.tools,
-        "hostedTools": body.hosted_tools,
-        "requireToolCall": body.response_constraint == "toolRequired",
-    });
+    let request_envelope = ProviderRequestInput {
+        messages: body.messages,
+        tools: body.tools,
+        hosted_tools: body.hosted_tools,
+        require_tool_call: body.response_constraint == "toolRequired",
+    };
     let archive_directory = state
         .local_agent
         .kernel

@@ -3,7 +3,6 @@ import {
   DEFAULT_USER_SETTINGS,
   agentSettingsIndex,
   shellPreferenceSettingsIndex,
-  workspaceOverridableSettingsIndex,
   type SettingCatalogEntry,
   type SettingsSurface,
   type GetUserSettingsResult,
@@ -14,7 +13,6 @@ import {
 import {
   getUserSettings,
   patchUserSettings,
-  patchWorkspaceSettings,
 } from '../services/runtimeAdapter';
 import {
   normalizeGuiAccentColor,
@@ -22,7 +20,7 @@ import {
 } from '../theme/deepcodeGuiTheme';
 import { activeT, settingText } from '../i18n';
 
-export type SettingSource = 'default' | 'user' | 'workspace';
+export type SettingSource = 'default' | 'user';
 
 export type SettingControlType = 'boolean' | 'number' | 'text' | 'textarea' | 'select';
 
@@ -59,7 +57,6 @@ interface SettingsStateData {
   environment: Record<string, unknown> | null;
   userSettings: UserSettings;
   runtimeUserSettings: UserSettings;
-  workspaceSettings: Record<string, unknown>;
   effectiveSettings: UserSettings;
   runtimeEffectiveSettings: UserSettings;
   sources: Record<string, SettingSource>;
@@ -72,7 +69,6 @@ interface SettingsStateData {
 
 interface SettingsActions {
   loadUserSettings: () => Promise<void>;
-  syncWorkspaceSettings: (settings: Record<string, unknown>) => void;
   patchUserSetting: (
     key: string,
     value: UserSettingValue,
@@ -80,7 +76,6 @@ interface SettingsActions {
   patchUserSettingsBatch: (
     patches: Record<string, UserSettingValue>,
   ) => Promise<UserSettingsActivation | null>;
-  patchWorkspaceSetting: (key: string, value: UserSettingValue) => Promise<boolean>;
   resetUserSetting: (key: string) => Promise<UserSettingsActivation | null>;
   getSettingSource: (key: string) => SettingSource;
 }
@@ -237,10 +232,6 @@ export function shellPreferenceSettingDefinitions(surface: SettingsSurface): Set
   return definitionsForCatalog(shellPreferenceSettingsIndex(surface));
 }
 
-export function workspaceSettingDefinitions(): SettingDefinition[] {
-  return definitionsForCatalog(workspaceOverridableSettingsIndex());
-}
-
 function definitionsForCatalog(entries: readonly SettingCatalogEntry[]): SettingDefinition[] {
   return entries.flatMap((entry) => {
     const definition = SETTING_DEFINITION_BY_KEY.get(entry.key);
@@ -249,9 +240,6 @@ function definitionsForCatalog(entries: readonly SettingCatalogEntry[]): Setting
 }
 
 const KNOWN_SETTING_KEYS = new Set(Object.keys(DEFAULT_USER_SETTINGS));
-const WORKSPACE_OVERRIDABLE_SETTING_KEYS = new Set(
-  workspaceOverridableSettingsIndex().map((entry) => entry.key)
-);
 
 function isSupportedSettingValue(value: unknown): value is UserSettingValue {
   return (
@@ -285,24 +273,10 @@ function normalizeSettingValue(key: string, value: unknown): UserSettingValue {
   return isSupportedSettingValue(value) ? value : defaultValue;
 }
 
-function normalizeWorkspaceSettings(settings: Record<string, unknown>): UserSettings {
-  const normalized: UserSettings = {};
-  for (const [rawKey, rawValue] of Object.entries(settings)) {
-    const key = rawKey.startsWith('deepcode.')
-      ? rawKey.slice('deepcode.'.length)
-      : rawKey;
-    if (!KNOWN_SETTING_KEYS.has(key) || !WORKSPACE_OVERRIDABLE_SETTING_KEYS.has(key)) continue;
-    normalized[key] = normalizeSettingValue(key, rawValue);
-  }
-  return normalized;
-}
-
 function buildEffectiveSettings(
   userSettings: UserSettings,
-  workspaceSettings: Record<string, unknown>,
   overriddenKeys: string[]
 ): Pick<SettingsStateData, 'effectiveSettings' | 'sources'> {
-  const normalizedWorkspace = normalizeWorkspaceSettings(workspaceSettings);
   const normalizedUserSettings = Object.fromEntries(
     Object.entries(userSettings).map(([key, value]) => [
       key,
@@ -312,13 +286,10 @@ function buildEffectiveSettings(
   const effectiveSettings: UserSettings = {
     ...DEFAULT_USER_SETTINGS,
     ...normalizedUserSettings,
-    ...normalizedWorkspace,
   };
   const sources: Record<string, SettingSource> = {};
   for (const key of Object.keys(effectiveSettings)) {
-    if (key in normalizedWorkspace) {
-      sources[key] = 'workspace';
-    } else if (overriddenKeys.includes(key)) {
+    if (overriddenKeys.includes(key)) {
       sources[key] = 'user';
     } else {
       sources[key] = 'default';
@@ -339,7 +310,7 @@ function hasPendingNextRunActivation(
 }
 
 export const useSettingsStore = create<SettingsStore>((set, get) => {
-  const initialEffective = buildEffectiveSettings(DEFAULT_USER_SETTINGS, {}, []);
+  const initialEffective = buildEffectiveSettings(DEFAULT_USER_SETTINGS, []);
 
   const applyCanonicalSettings = (
     snapshot: GetUserSettingsResult,
@@ -347,12 +318,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
   ) => {
     const next = buildEffectiveSettings(
       snapshot.settings,
-      get().workspaceSettings,
       overriddenKeys,
     );
     const runtime = buildEffectiveSettings(
       snapshot.runtimeSettings,
-      get().workspaceSettings,
       overriddenKeys,
     );
     set({
@@ -404,7 +373,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
     } else {
       const next = buildEffectiveSettings(
         result.data.settings,
-        get().workspaceSettings,
         overriddenKeys,
       );
       set({
@@ -422,7 +390,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
     environment: null,
     userSettings: DEFAULT_USER_SETTINGS,
     runtimeUserSettings: DEFAULT_USER_SETTINGS,
-    workspaceSettings: {},
     effectiveSettings: initialEffective.effectiveSettings,
     runtimeEffectiveSettings: initialEffective.effectiveSettings,
     sources: initialEffective.sources,
@@ -446,25 +413,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
       applyCanonicalSettings(result.data);
     },
 
-    syncWorkspaceSettings: (settings) => {
-      const next = buildEffectiveSettings(
-        get().userSettings,
-        settings,
-        get().overriddenKeys
-      );
-      const runtime = buildEffectiveSettings(
-        get().runtimeUserSettings,
-        settings,
-        get().overriddenKeys
-      );
-      set({
-        workspaceSettings: settings,
-        effectiveSettings: next.effectiveSettings,
-        runtimeEffectiveSettings: runtime.effectiveSettings,
-        sources: next.sources,
-      });
-    },
-
     patchUserSetting: async (key, value) => {
       const normalized = normalizeSettingValue(key, value);
       return applyUserSettingsPatch(
@@ -485,35 +433,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
         normalized,
         activeT('settings.error.saveUser', { key: keys }),
       );
-    },
-
-    patchWorkspaceSetting: async (key, value) => {
-      if (!WORKSPACE_OVERRIDABLE_SETTING_KEYS.has(key)) {
-        set({ errorMessage: activeT('settings.error.protectedWorkspaceKey', { key }) });
-        return false;
-      }
-      const normalized = normalizeSettingValue(key, value);
-      const result = await patchWorkspaceSettings({
-        [`deepcode.${key}`]: normalized,
-      });
-      if (!result.ok || !result.data) {
-        set({
-          errorMessage: result.message ?? activeT('settings.error.saveWorkspace', { key }),
-        });
-        return false;
-      }
-      const next = buildEffectiveSettings(
-        get().userSettings,
-        result.data.settings,
-        get().overriddenKeys
-      );
-      set({
-        workspaceSettings: result.data.settings,
-        effectiveSettings: next.effectiveSettings,
-        sources: next.sources,
-        errorMessage: null,
-      });
-      return true;
     },
 
     resetUserSetting: async (key) => {

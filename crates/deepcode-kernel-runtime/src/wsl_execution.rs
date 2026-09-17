@@ -27,6 +27,7 @@ pub enum WorkerRequest {
         context: KernelToolExecutionContext,
         distribution: String,
         shell: ShellProgram,
+        execution_path: String,
     },
 }
 
@@ -221,6 +222,7 @@ mod progress_tests {
 pub(crate) struct WslExecutor {
     pub target: WslExecution,
     pub shell: Option<ShellProgram>,
+    pub execution_path: Option<String>,
 }
 impl KernelToolExecutor for WslExecutor {
     fn invoke(
@@ -229,9 +231,13 @@ impl KernelToolExecutor for WslExecutor {
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
         let cancellation = context.cancellation.clone();
-        let shell_call = matches!(invocation.tool_id.as_str(), "bash" | "powershell");
+        let shell_call = matches!(invocation.input.tool_id().as_str(), "bash" | "powershell");
         let progress = context.progress.clone();
-        let timeout = Duration::from_secs(invocation.input["timeout"].as_u64().unwrap_or(120) + 30);
+        let timeout = Duration::from_secs(match &invocation.input {
+            deepcode_kernel_tools::kernel_internal::KernelCanonicalInvocation::ProcessShell { timeout, .. }
+            | deepcode_kernel_tools::kernel_internal::KernelCanonicalInvocation::ProcessPowerShell { timeout, .. } => u64::from(*timeout),
+            _ => 120,
+        } + 30);
         let shell = self
             .shell
             .clone()
@@ -242,6 +248,7 @@ impl KernelToolExecutor for WslExecutor {
                 context,
                 distribution: self.target.distribution.clone(),
                 shell,
+                execution_path: self.execution_path.clone().ok_or_else(|| failure("The prepared WSL PATH is missing."))?,
             },
             &cancellation,
             timeout,

@@ -65,6 +65,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const catalog = useLocalAgentStore((state) => state.catalog);
   const sidebarOrder = useSidebarOrder(catalog.projects, catalog.sessions);
   const sessionStatuses = useLocalAgentStore((state) => state.sessionStatuses);
+  const statusError = useLocalAgentStore((state) => state.statusError);
   const sidebarStatuses = useMemo(() => {
     if (!projection || (sessionStatuses[projection.sessionId]?.revision ?? -1) > projection.revision) {
       return sessionStatuses;
@@ -301,6 +302,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
           reorderError={sidebarOrder.error}
           onReorder={(source, target, edge) => void sidebarOrder.move(source, target, edge)}
           sessionStatuses={sidebarStatuses}
+          statusError={statusError}
           readRunMarkers={readRunMarkers}
           collapsedProjectIds={collapsedSet}
           activeSessionId={activeSessionId}

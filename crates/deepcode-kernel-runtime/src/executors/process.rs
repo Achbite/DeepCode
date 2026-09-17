@@ -1,11 +1,5 @@
 use super::*;
-#[cfg(test)]
-use crate::shell_environment::compose_agent_shell_path;
-use crate::shell_environment::resolved_agent_shell_path;
-use crate::shell_environment::{discover, ShellProgram, ShellScript};
-use deepcode_kernel_tools::kernel_internal::{
-    process_shell_hard_deny_reason, MAX_TERMINAL_STDIN_BYTES,
-};
+use crate::shell_environment::{ShellProgram, ShellScript};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::ffi::OsString;
 #[cfg(target_os = "macos")]
@@ -34,7 +28,7 @@ const BASH_OUTPUT_LIMIT_BYTES: usize = 50 * 1024;
 const BASH_OUTPUT_LIMIT_LINES: usize = 2000;
 const BASH_TERMINAL_COLS: u16 = 120;
 const BASH_TERMINAL_ROWS: u16 = 30;
-const AGENT_SHELL_PATH_SOURCE: &str = "hostPlusStandardDeveloperPaths";
+const AGENT_SHELL_PATH_SOURCE: &str = "preparedRunEnvironment";
 const AGENT_SHELL_READ_MODE_WRITE_SCOPE: &str = "kernelTemporaryOnly";
 const AGENT_SHELL_WRITE_MODE_WRITE_SCOPE: &str = "workspaceAndKernelTemporary";
 const AGENT_SHELL_HOST_WRITE_SCOPE: &str = "hostUser";
@@ -82,11 +76,9 @@ const AGENT_SHELL_ENV_ALLOWLIST: &[&str] = &[
     "VOLTA_HOME",
 ];
 
-#[cfg(test)]
-pub(super) struct ProcessShellExecutor;
-
 pub(super) struct ConfiguredShellExecutor {
     pub program: Option<ShellProgram>,
+    pub execution_path: Option<String>,
 }
 
 impl KernelToolExecutor for ConfiguredShellExecutor {
@@ -95,18 +87,12 @@ impl KernelToolExecutor for ConfiguredShellExecutor {
         invocation: KernelToolInvocation,
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        invoke_shell(invocation, context, self.program.as_ref())
-    }
-}
-
-#[cfg(test)]
-impl KernelToolExecutor for ProcessShellExecutor {
-    fn invoke(
-        &self,
-        invocation: KernelToolInvocation,
-        context: KernelToolExecutionContext,
-    ) -> KernelResult<KernelToolExecutionResult> {
-        invoke_shell(invocation, context, None)
+        invoke_shell(
+            invocation,
+            context,
+            self.program.as_ref(),
+            self.execution_path.as_deref(),
+        )
     }
 }
 
@@ -114,40 +100,43 @@ fn invoke_shell(
     invocation: KernelToolInvocation,
     context: KernelToolExecutionContext,
     selected: Option<&ShellProgram>,
+    execution_path: Option<&str>,
 ) -> KernelResult<KernelToolExecutionResult> {
-    let tool_name = invocation.tool_id.clone();
-    let command_text = required_string(&invocation.input, "command")?;
-    if let Some(reason) = process_shell_hard_deny_reason(&command_text) {
-        return Err(KernelError::Structured {
-            code: "bash_hard_denied",
-            stage: "execution",
-            message: format!("bash command {reason}"),
-            details: serde_json::json!({ "toolId": "bash" }),
-        });
-    }
-    let workspace_mode = required_string(&invocation.input, "workspaceMode")?;
-    if !matches!(workspace_mode.as_str(), "read" | "write") {
-        return Err(KernelError::InvalidCommand(
-            "bash workspaceMode must be read or write".to_string(),
-        ));
-    }
-    let execution_scope = required_string(&invocation.input, "executionScope")?;
-    if !matches!(execution_scope.as_str(), "workspace" | "host") {
-        return Err(KernelError::InvalidCommand(
-            "bash executionScope must be workspace or host".to_string(),
-        ));
-    }
-    let terminal_stdin = terminal_stdin(&invocation.input)?;
+    let execution_path = execution_path
+        .ok_or_else(|| KernelError::InvalidCommand("Prepared execution PATH is missing".into()))?;
+    let tool_name = invocation.input.tool_id().as_str();
+    let (command_text, workspace_mode, execution_scope, timeout_seconds, terminal_stdin) =
+        match invocation.input {
+            KernelCanonicalInvocation::ProcessShell {
+                command,
+                workspace_mode,
+                execution_scope,
+                timeout,
+                terminal,
+            }
+            | KernelCanonicalInvocation::ProcessPowerShell {
+                command,
+                workspace_mode,
+                execution_scope,
+                timeout,
+                terminal,
+            } => (
+                command,
+                workspace_mode.as_str().to_owned(),
+                execution_scope.as_str().to_owned(),
+                u64::from(timeout),
+                terminal.map(|value| value.stdin),
+            ),
+            _ => {
+                return Err(KernelError::InvalidCommand(
+                    "Shell invocation required".into(),
+                ))
+            }
+        };
     let write_scope = shell_write_scope(&execution_scope, &workspace_mode);
     let workspace_id = workspace_id(&context)?.to_string();
     let workspace_root = canonical_process_workspace_root(&context)?;
     let cwd = prepared_process_cwd(&context, &workspace_root)?;
-    let timeout_seconds = invocation
-        .input
-        .get("timeout")
-        .and_then(Value::as_u64)
-        .unwrap_or(120)
-        .clamp(1, 600);
     let shell = match selected {
         Some(program) if program.tool == tool_name => program.clone(),
         Some(_) => {
@@ -155,7 +144,11 @@ fn invoke_shell(
                 "Shell does not match the prepared execution environment".into(),
             ))
         }
-        None => discover(&tool_name)?,
+        None => {
+            return Err(KernelError::InvalidCommand(
+                "Prepared shell is missing".into(),
+            ))
+        }
     };
     if !shell.executable.is_file() {
         return Err(KernelError::Structured {
@@ -182,6 +175,7 @@ fn invoke_shell(
             workspace_root,
             cwd,
             shell,
+            execution_path,
             context,
         );
     }
@@ -209,7 +203,13 @@ fn invoke_shell(
     process.args(&prepared_command.arguments);
     #[cfg(unix)]
     process.process_group(0);
-    apply_agent_shell_environment(&mut process, &bash_program, &execution_scope, terminal);
+    apply_agent_shell_environment(
+        &mut process,
+        &bash_program,
+        &execution_scope,
+        terminal,
+        execution_path,
+    );
     process
         .current_dir(&cwd)
         .env("DEEPCODE_AGENT_SHELL", "1")
@@ -271,6 +271,7 @@ fn invoke_shell(
         Arc::clone(&stop_capture),
         context.progress.clone(),
         "stdout",
+        false,
     );
     let stderr_reader = spawn_output_reader(
         stderr,
@@ -279,6 +280,7 @@ fn invoke_shell(
         Arc::clone(&stop_capture),
         context.progress.clone(),
         "stderr",
+        false,
     );
 
     let wait_result = wait_for_bounded_child(
@@ -374,7 +376,7 @@ fn invoke_shell(
             "networkAccess": execution_scope == "host"
         }
     });
-    archive.finish(&mut output, truncated)?;
+    archive.finish(&mut output)?;
     if success {
         Ok(ok(invocation.id, output))
     } else if timed_out {
@@ -405,29 +407,6 @@ fn invoke_shell(
     }
 }
 
-fn terminal_stdin(input: &Value) -> KernelResult<Option<String>> {
-    let Some(terminal) = input.get("terminal") else {
-        return Ok(None);
-    };
-    let object = terminal.as_object().ok_or_else(|| {
-        KernelError::InvalidCommand("bash terminal must be an object".to_string())
-    })?;
-    if object.len() != 1 || !object.contains_key("stdin") {
-        return Err(KernelError::InvalidCommand(
-            "bash terminal must contain only stdin".to_string(),
-        ));
-    }
-    let stdin = object.get("stdin").and_then(Value::as_str).ok_or_else(|| {
-        KernelError::InvalidCommand("bash terminal.stdin must be a string".to_string())
-    })?;
-    if stdin.len() > MAX_TERMINAL_STDIN_BYTES {
-        return Err(KernelError::InvalidCommand(format!(
-            "bash terminal.stdin exceeds {MAX_TERMINAL_STDIN_BYTES} bytes"
-        )));
-    }
-    Ok(Some(stdin.to_string()))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn invoke_terminal_shell(
     invocation_id: String,
@@ -440,6 +419,7 @@ fn invoke_terminal_shell(
     workspace_root: PathBuf,
     cwd: PathBuf,
     shell: ShellProgram,
+    execution_path: &str,
     context: KernelToolExecutionContext,
 ) -> KernelResult<KernelToolExecutionResult> {
     let tool_name = shell.tool.clone();
@@ -474,7 +454,12 @@ fn invoke_terminal_shell(
     )?;
     let mut command = CommandBuilder::new(&prepared_command.program);
     command.args(&prepared_command.arguments);
-    apply_agent_terminal_environment(&mut command, &bash_program, &execution_scope);
+    apply_agent_terminal_environment(
+        &mut command,
+        &bash_program,
+        &execution_scope,
+        execution_path,
+    );
     command.cwd(&cwd);
     command.env("DEEPCODE_AGENT_SHELL", "1");
     command.env("DEEPCODE_WORKSPACE_ROOT", &workspace_root);
@@ -535,13 +520,14 @@ fn invoke_terminal_shell(
         .take_writer()
         .map_err(|error| KernelError::Other(format!("open bash pty writer: {error}")))?;
     let stop_capture = Arc::new(AtomicBool::new(false));
-    let stdout_reader = spawn_pty_output_reader(
+    let stdout_reader = spawn_output_reader(
         reader,
         stdout_file,
         BASH_OUTPUT_LIMIT_BYTES,
         Arc::clone(&stop_capture),
         context.progress.clone(),
         "stdout",
+        true,
     );
     let write_result = writer
         .write_all(terminal_stdin.as_bytes())
@@ -650,7 +636,7 @@ fn invoke_terminal_shell(
             "networkAccess": execution_scope == "host"
         }
     });
-    archive.finish(&mut output, stdout.truncated)?;
+    archive.finish(&mut output)?;
     if success {
         Ok(ok(invocation_id, output))
     } else if timed_out {
@@ -686,6 +672,7 @@ fn apply_agent_shell_environment(
     bash_program: &Path,
     execution_scope: &str,
     terminal: bool,
+    execution_path: &str,
 ) {
     if execution_scope == "workspace" {
         command.env_clear();
@@ -699,7 +686,7 @@ fn apply_agent_shell_environment(
         }
     }
     command
-        .env("PATH", resolved_agent_shell_path())
+        .env("PATH", execution_path)
         .env("TERM", if terminal { "xterm-256color" } else { "dumb" })
         .env("SHELL", bash_program)
         .env("NO_COLOR", "1")
@@ -710,6 +697,7 @@ fn apply_agent_terminal_environment(
     command: &mut CommandBuilder,
     bash_program: &Path,
     execution_scope: &str,
+    execution_path: &str,
 ) {
     if execution_scope == "workspace" {
         command.env_clear();
@@ -722,7 +710,7 @@ fn apply_agent_terminal_environment(
             }
         }
     }
-    command.env("PATH", resolved_agent_shell_path());
+    command.env("PATH", execution_path);
     command.env("TERM", "xterm-256color");
     command.env("SHELL", bash_program);
     command.env("NO_COLOR", "1");
@@ -1145,7 +1133,7 @@ impl ShellOutputArchive {
         fs::File::create(self.directory.join(format!("{stream}.log"))).map_err(output_archive_error)
     }
 
-    fn finish(mut self, output: &mut Value, _truncated: bool) -> KernelResult<()> {
+    fn finish(mut self, output: &mut Value) -> KernelResult<()> {
         {
             let mut paths = serde_json::Map::new();
             for stream in ["stdout", "stderr"] {
@@ -1195,51 +1183,7 @@ fn spawn_output_reader(
     stop: Arc<AtomicBool>,
     progress: KernelProgressSink,
     stream: &'static str,
-) -> thread::JoinHandle<std::io::Result<CapturedOutput>> {
-    thread::spawn(move || {
-        let mut captured = Vec::new();
-        let mut truncated = false;
-        let mut offset = 0_u64;
-        let mut chunk = [0_u8; 8 * 1024];
-        loop {
-            let read = match reader.read(&mut chunk) {
-                Ok(read) => read,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if stop.load(AtomicOrdering::Acquire) {
-                        break;
-                    }
-                    thread::sleep(PROCESS_POLL_INTERVAL);
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            if read == 0 {
-                break;
-            }
-            archive.write_all(&chunk[..read])?;
-            progress.emit(KernelToolProgress::Output {
-                stream: stream.into(),
-                offset,
-                bytes: chunk[..read].to_vec(),
-            });
-            offset += read as u64;
-            truncated |= append_tail(&mut captured, &chunk[..read], max_bytes);
-        }
-        Ok(CapturedOutput {
-            bytes: captured,
-            truncated,
-        })
-    })
-}
-
-fn spawn_pty_output_reader(
-    mut reader: impl Read + Send + 'static,
-    mut archive: fs::File,
-    max_bytes: usize,
-    stop: Arc<AtomicBool>,
-    progress: KernelProgressSink,
-    stream: &'static str,
+    _pty: bool,
 ) -> thread::JoinHandle<std::io::Result<CapturedOutput>> {
     thread::spawn(move || {
         let mut captured = Vec::new();
@@ -1258,7 +1202,7 @@ fn spawn_pty_output_reader(
                     continue;
                 }
                 #[cfg(unix)]
-                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) if _pty && error.raw_os_error() == Some(libc::EIO) => break,
                 Err(error) => return Err(error),
             };
             if read == 0 {

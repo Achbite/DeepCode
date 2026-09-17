@@ -122,16 +122,17 @@ export function createProviderToolCodec(
     .map((tool) => tool.name));
   const callableKernel = runtimeTools.filter((tool) => tool.availability === 'callable');
   const byName = new Map(callableKernel.map((tool) => [tool.name, tool]));
-  const core = CORE_TOOL_ORDER.flatMap((name) => {
-    const tool = byName.get(name);
-    if (!tool) return [];
-    if (tool.origin !== 'coreBuiltin') {
-      throw new LoopFailure('core_tool_origin_invalid', `基础工具来源无效：${name}`);
-    }
-    return [freezeProviderToolDefinition(tool, workspaceToolNames.has(tool.name))];
-  });
+  const core = callableKernel.filter((tool) => tool.origin === 'coreBuiltin')
+    .sort((left, right) => {
+      const position = (name: string) => {
+        const index = CORE_TOOL_ORDER.indexOf(name as typeof CORE_TOOL_ORDER[number]);
+        return index < 0 ? CORE_TOOL_ORDER.length : index;
+      };
+      return position(left.name) - position(right.name) || left.name.localeCompare(right.name, 'en');
+    })
+    .map((tool) => freezeProviderToolDefinition(tool, workspaceToolNames.has(tool.name)));
   const plugin = callableKernel
-    .filter((tool) => !CORE_TOOL_ORDER.includes(tool.name as typeof CORE_TOOL_ORDER[number]))
+    .filter((tool) => tool.origin === 'extension')
     .map((tool) => {
       if (tool.origin !== 'extension' || !tool.pluginUri) {
         throw new LoopFailure('plugin_tool_origin_invalid', `插件工具来源无效：${tool.name}`);

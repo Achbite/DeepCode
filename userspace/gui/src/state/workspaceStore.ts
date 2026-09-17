@@ -1,4 +1,4 @@
-/** Current workspace and settings overlay; Session workspace authority is separate. */
+/** Current workspace metadata; Session owns workspace authority. */
 import { create } from 'zustand';
 import {
   getDefaultWorkspacePath,

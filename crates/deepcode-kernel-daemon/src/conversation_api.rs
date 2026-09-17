@@ -526,11 +526,12 @@ pub(crate) async fn conversation_filesystem_references_resolve(
         if gui.conversation_catalog.session(&session_id).is_none() {
             return ApiResponse::error("conversation_session_not_found", "对话不存在。");
         }
-        let previous = gui.conversation_catalog.clone();
+        let mut workspaces = Vec::new();
         let attachment_store_root = gui.paths.attachment_store_root.clone();
         let mut created_snapshot_roots = Vec::new();
         let references = match resolve_filesystem_references(
-            &mut gui.conversation_catalog,
+            &gui.conversation_catalog,
+            &mut workspaces,
             &attachment_store_root,
             &session_id,
             &body.references,
@@ -539,12 +540,11 @@ pub(crate) async fn conversation_filesystem_references_resolve(
         ) {
             Ok(value) => value,
             Err((code, message)) => {
-                gui.conversation_catalog = previous;
                 cleanup_created_snapshot_roots(&created_snapshot_roots);
                 return ApiResponse::error(code, message);
             }
         };
-        if let Err(error) = persist_catalog_or_rollback(&mut gui, previous) {
+        if let Err(error) = persist_catalog_rows(&mut gui, workspaces, None, None) {
             cleanup_created_snapshot_roots(&created_snapshot_roots);
             return ApiResponse::error("conversation_catalog_write_failed", error);
         }
@@ -573,20 +573,21 @@ pub(crate) async fn conversation_directory_index_attach(
         if gui.conversation_catalog.session(&session_id).is_none() {
             return ApiResponse::error("conversation_session_not_found", "对话不存在。");
         }
-        let previous = gui.conversation_catalog.clone();
-        let workspace_ids = match register_roots(
-            &mut gui.conversation_catalog,
+        let mut workspaces = Vec::new();
+        let workspace_ids = match prepare_roots(
+            &gui.conversation_catalog,
+            &mut workspaces,
             vec![canonical_root],
             &crate::now_text(),
         ) {
             Ok(value) => value,
             Err(error) => return session_service_error(error),
         };
-        let binding = binding_snapshot(&gui.conversation_catalog, &workspace_ids)
+        let binding = binding_snapshot(&gui.conversation_catalog, &workspaces, &workspace_ids)
             .into_iter()
             .next()
             .expect("registered workspace has display binding");
-        if let Err(error) = persist_catalog_or_rollback(&mut gui, previous) {
+        if let Err(error) = persist_catalog_rows(&mut gui, workspaces, None, None) {
             return ApiResponse::error("conversation_catalog_write_failed", error);
         }
         binding
@@ -776,23 +777,22 @@ pub(crate) async fn conversation_project_create(
     if let Some(error) = gui.conversation_catalog_error.as_deref() {
         return ApiResponse::error("conversation_catalog_unavailable", error);
     }
-    let previous = gui.conversation_catalog.clone();
-    let workspace_ids = match register_roots(&mut gui.conversation_catalog, roots, &now) {
+    let mut workspaces = Vec::new();
+    let workspace_ids = match prepare_roots(&gui.conversation_catalog, &mut workspaces, roots, &now)
+    {
         Ok(value) => value,
         Err(error) => {
-            gui.conversation_catalog = previous;
             return session_service_error(error);
         }
     };
-    gui.conversation_catalog
-        .insert_project(ConversationProjectRecord {
-            id,
-            title,
-            workspace_ids,
-            created_at: now.clone(),
-            updated_at: now,
-        });
-    if let Err(error) = persist_catalog_or_rollback(&mut gui, previous) {
+    let project = ConversationProjectRecord {
+        id,
+        title,
+        workspace_ids,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    if let Err(error) = persist_catalog_rows(&mut gui, workspaces, Some(project), None) {
         return ApiResponse::error("conversation_catalog_write_failed", error);
     }
     ApiResponse::ok(gui.conversation_catalog.public_value())
@@ -830,31 +830,24 @@ pub(crate) async fn conversation_project_update(
     if let Some(error) = gui.conversation_catalog_error.as_deref() {
         return ApiResponse::error("conversation_catalog_unavailable", error);
     }
-    if gui.conversation_catalog.project(&project_id).is_none() {
+    let Some(mut project) = gui.conversation_catalog.project(&project_id).cloned() else {
         return ApiResponse::error("conversation_project_not_found", "项目不存在。");
-    }
-    let previous = gui.conversation_catalog.clone();
+    };
+    let mut workspaces = Vec::new();
     if let Some(title) = title {
-        gui.conversation_catalog
-            .rename_project(&project_id, &title, &now);
+        project.title = title;
     }
     if let Some(roots) = roots {
-        let workspace_ids = match register_roots(&mut gui.conversation_catalog, roots, &now) {
-            Ok(value) => value,
-            Err(error) => {
-                gui.conversation_catalog = previous;
-                return session_service_error(error);
-            }
-        };
-        if let Err(code) =
-            gui.conversation_catalog
-                .replace_project_bindings(&project_id, workspace_ids, &now)
-        {
-            gui.conversation_catalog = previous;
-            return ApiResponse::error(code, "项目或工作目录不存在。");
-        }
+        project.workspace_ids =
+            match prepare_roots(&gui.conversation_catalog, &mut workspaces, roots, &now) {
+                Ok(value) => value,
+                Err(error) => {
+                    return session_service_error(error);
+                }
+            };
     }
-    if let Err(error) = persist_catalog_or_rollback(&mut gui, previous) {
+    project.updated_at = now;
+    if let Err(error) = persist_catalog_rows(&mut gui, workspaces, Some(project), None) {
         return ApiResponse::error("conversation_catalog_write_failed", error);
     }
     ApiResponse::ok(gui.conversation_catalog.public_value())
@@ -869,11 +862,14 @@ pub(crate) async fn conversation_project_delete(
     if let Some(error) = gui.conversation_catalog_error.as_deref() {
         return ApiResponse::error("conversation_catalog_unavailable", error);
     }
-    let previous = gui.conversation_catalog.clone();
-    if !gui.conversation_catalog.delete_project(&project_id, &now) {
+    if gui.conversation_catalog.project(&project_id).is_none() {
         return ApiResponse::error("conversation_project_not_found", "项目不存在。");
     }
-    if let Err(error) = persist_catalog_or_rollback(&mut gui, previous) {
+    let path = gui.paths.catalog_store_path.clone();
+    if let Err(error) = gui
+        .conversation_catalog
+        .remove_project(&path, &project_id, &now)
+    {
         return ApiResponse::error("conversation_catalog_write_failed", error);
     }
     ApiResponse::ok(gui.conversation_catalog.public_value())
@@ -916,7 +912,7 @@ pub(crate) async fn conversation_session_create(
             Ok(value) => value,
             Err((code, message)) => return ApiResponse::error(code, message),
         };
-        let previous = gui.conversation_catalog.clone();
+        let mut workspaces = Vec::new();
         let bindings = if let Some(project_id) = body.project_id.as_deref() {
             match gui
                 .conversation_catalog
@@ -930,15 +926,15 @@ pub(crate) async fn conversation_session_create(
                 Ok(value) => value,
                 Err(error) => return ApiResponse::error("conversation_workspace_invalid", error),
             };
-            let workspace_ids = match register_roots(&mut gui.conversation_catalog, roots, &now) {
-                Ok(value) => value,
-                Err(error) => {
-                    gui.conversation_catalog = previous;
-                    return session_service_error(error);
-                }
-            };
-            let bindings = binding_snapshot(&gui.conversation_catalog, &workspace_ids);
-            if let Err(error) = persist_catalog_or_rollback(&mut gui, previous) {
+            let workspace_ids =
+                match prepare_roots(&gui.conversation_catalog, &mut workspaces, roots, &now) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return session_service_error(error);
+                    }
+                };
+            let bindings = binding_snapshot(&gui.conversation_catalog, &workspaces, &workspace_ids);
+            if let Err(error) = persist_catalog_rows(&mut gui, workspaces, None, None) {
                 return ApiResponse::error("conversation_catalog_write_failed", error);
             }
             bindings
@@ -979,18 +975,16 @@ pub(crate) async fn conversation_session_create(
                 "项目在 Session 创建期间已被删除。".to_string(),
             ))
         } else {
-            let previous = gui.conversation_catalog.clone();
-            gui.conversation_catalog
-                .insert_session(ConversationSessionRecord {
-                    id: session_id.clone(),
-                    title: "新对话".to_string(),
-                    workspace_bindings: bindings.clone(),
-                    project_id: body.project_id.clone(),
-                    profile_id: Some(profile_id.clone()),
-                    created_at: now.clone(),
-                    updated_at: now.clone(),
-                });
-            persist_catalog_or_rollback(&mut gui, previous)
+            let session = ConversationSessionRecord {
+                id: session_id.clone(),
+                title: "新对话".to_string(),
+                workspace_bindings: bindings.clone(),
+                project_id: body.project_id.clone(),
+                profile_id: Some(profile_id.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+            persist_catalog_rows(&mut gui, Vec::new(), None, Some(session))
                 .map_err(|error| ("conversation_catalog_write_failed", error))
         }
     };
@@ -1029,31 +1023,23 @@ pub(crate) async fn conversation_session_update(
     if let Some(error) = gui.conversation_catalog_error.as_deref() {
         return ApiResponse::error("conversation_catalog_unavailable", error);
     }
-    if gui.conversation_catalog.session(&session_id).is_none() {
+    let Some(mut session) = gui.conversation_catalog.session(&session_id).cloned() else {
         return ApiResponse::error("conversation_session_not_found", "对话不存在。");
-    }
-    let previous = gui.conversation_catalog.clone();
+    };
     if let Some(title) = title {
-        gui.conversation_catalog
-            .rename_session(&session_id, &title, &now);
+        session.title = title;
     }
     if let Some(project_id) = body.project_id.as_ref() {
-        if let Err(code) =
-            gui.conversation_catalog
-                .move_session(&session_id, project_id.as_deref(), &now)
+        if project_id
+            .as_deref()
+            .is_some_and(|id| gui.conversation_catalog.project(id).is_none())
         {
-            gui.conversation_catalog = previous;
-            return ApiResponse::error(
-                code,
-                if code == "conversation_project_not_found" {
-                    "项目不存在。"
-                } else {
-                    "对话不存在。"
-                },
-            );
+            return ApiResponse::error("conversation_project_not_found", "项目不存在。");
         }
+        session.project_id = project_id.clone();
     }
-    if let Err(error) = persist_catalog_or_rollback(&mut gui, previous) {
+    session.updated_at = now;
+    if let Err(error) = persist_catalog_rows(&mut gui, Vec::new(), None, Some(session)) {
         return ApiResponse::error("conversation_catalog_write_failed", error);
     }
     ApiResponse::ok(gui.conversation_catalog.public_value())
@@ -1087,14 +1073,8 @@ pub(crate) async fn conversation_session_delete(
             .filter(|workspace| workspace.owner_session_id.as_deref() == Some(session_id.as_str()))
             .cloned()
             .collect::<Vec<_>>();
-        if !gui.conversation_catalog.delete_session(&session_id) {
-            return ApiResponse::error("conversation_session_not_found", "对话不存在。");
-        }
-        if let Err(error) = gui
-            .conversation_catalog
-            .persist(&gui.paths.catalog_store_path)
-        {
-            gui.conversation_catalog.insert_session(deleted);
+        let path = gui.paths.catalog_store_path.clone();
+        if let Err(error) = gui.conversation_catalog.remove_session(&path, &session_id) {
             return ApiResponse::error("conversation_catalog_write_failed", error);
         }
         (deleted, deleted_workspaces)
@@ -1117,13 +1097,8 @@ pub(crate) async fn conversation_session_delete(
                 ),
             );
         }
-        gui.conversation_catalog.insert_session(deleted);
-        for workspace in deleted_workspaces {
-            gui.conversation_catalog.register_workspace(workspace);
-        }
-        if let Err(rollback_error) = gui
-            .conversation_catalog
-            .persist(&gui.paths.catalog_store_path)
+        if let Err(rollback_error) =
+            persist_catalog_rows(&mut gui, deleted_workspaces, None, Some(deleted))
         {
             return ApiResponse::error(
                 "conversation_delete_rollback_failed",
@@ -1226,20 +1201,18 @@ fn save_input_resource(
         display_name = "粘贴的文本".to_string();
     }
     if gui.conversation_catalog.workspace(&workspace_id).is_none() {
-        let previous = gui.conversation_catalog.clone();
         let canonical_root = fs::canonicalize(&root)
             .map_err(|error| error.to_string())?
             .to_string_lossy()
             .to_string();
-        gui.conversation_catalog
-            .register_workspace(ConversationWorkspaceRecord {
-                workspace_id: workspace_id.clone(),
-                display_name: display_name.clone(),
-                canonical_root,
-                owner_session_id: Some(session_id.to_string()),
-                created_at: crate::now_text(),
-            });
-        if let Err(error) = persist_catalog_or_rollback(&mut gui, previous) {
+        let workspace = ConversationWorkspaceRecord {
+            workspace_id: workspace_id.clone(),
+            display_name: display_name.clone(),
+            canonical_root,
+            owner_session_id: Some(session_id.to_string()),
+            created_at: crate::now_text(),
+        };
+        if let Err(error) = persist_catalog_rows(&mut gui, vec![workspace], None, None) {
             cleanup_created_snapshot_roots(&[root]);
             return Err(error);
         }
@@ -1429,14 +1402,18 @@ pub(crate) async fn conversation_command_submit(
             .and_then(Value::as_str);
         let mut gui = state.gui.lock().expect("gui state lock");
         if gui.conversation_catalog_error.is_none() {
-            let previous = gui.conversation_catalog.clone();
-            if gui.conversation_catalog.touch_session(
-                &session_id,
-                automatic_title.as_deref(),
-                active_profile_id,
-                &crate::now_text(),
-            ) {
-                if let Err(error) = persist_catalog_or_rollback(&mut gui, previous) {
+            if let Some(mut session) = gui.conversation_catalog.session(&session_id).cloned() {
+                if session.title == "新对话" {
+                    if let Some(title) = automatic_title.filter(|title| !title.is_empty()) {
+                        session.title = title;
+                    }
+                }
+                if let Some(profile_id) = active_profile_id {
+                    session.profile_id = Some(profile_id.into());
+                }
+                session.updated_at = crate::now_text();
+                if let Err(error) = persist_catalog_rows(&mut gui, Vec::new(), None, Some(session))
+                {
                     eprintln!("[conversation-catalog] {error}");
                 }
             }
@@ -1496,18 +1473,14 @@ fn session_service_error(error: SessionServiceError) -> Json<ApiResponse> {
     ApiResponse::error(error.code, error.message)
 }
 
-fn persist_catalog_or_rollback(
+fn persist_catalog_rows(
     gui: &mut crate::GuiState,
-    previous: ConversationCatalog,
+    workspaces: Vec<ConversationWorkspaceRecord>,
+    project: Option<ConversationProjectRecord>,
+    session: Option<ConversationSessionRecord>,
 ) -> Result<(), String> {
-    if let Err(error) = gui
-        .conversation_catalog
-        .persist(&gui.paths.catalog_store_path)
-    {
-        gui.conversation_catalog = previous;
-        return Err(error);
-    }
-    Ok(())
+    gui.conversation_catalog
+        .write_rows(&gui.paths.catalog_store_path, workspaces, project, session)
 }
 
 fn canonical_roots(paths: &[String]) -> Result<Vec<String>, String> {
@@ -1526,7 +1499,8 @@ fn canonical_roots(paths: &[String]) -> Result<Vec<String>, String> {
 }
 
 fn resolve_filesystem_references(
-    catalog: &mut ConversationCatalog,
+    catalog: &ConversationCatalog,
+    workspaces: &mut Vec<ConversationWorkspaceRecord>,
     attachment_store_root: &FsPath,
     session_id: &str,
     inputs: &[FilesystemReferencePathInput],
@@ -1547,14 +1521,14 @@ fn resolve_filesystem_references(
                         "同一目录不能在一条消息中重复附加。".to_string(),
                     ));
                 }
-                let workspace_ids =
-                    register_roots(catalog, vec![canonical_root], now).map_err(|error| {
-                        (
-                            "conversation_filesystem_reference_identity_failed",
-                            format!("{}: {}", error.code, error.message),
-                        )
-                    })?;
-                let binding = binding_snapshot(catalog, &workspace_ids)
+                let workspace_ids = prepare_roots(catalog, workspaces, vec![canonical_root], now)
+                    .map_err(|error| {
+                    (
+                        "conversation_filesystem_reference_identity_failed",
+                        format!("{}: {}", error.code, error.message),
+                    )
+                })?;
+                let binding = binding_snapshot(catalog, workspaces, &workspace_ids)
                     .into_iter()
                     .next()
                     .ok_or((
@@ -1680,7 +1654,7 @@ fn resolve_filesystem_references(
                     .to_string();
                 let display_name = bounded_display_name(&file_name);
                 let media_type = filesystem_reference_media_type(&source);
-                catalog.register_workspace(ConversationWorkspaceRecord {
+                workspaces.push(ConversationWorkspaceRecord {
                     workspace_id: workspace_id.clone(),
                     display_name: display_name.clone(),
                     canonical_root: canonical_snapshot_root,
@@ -1755,19 +1729,24 @@ fn filesystem_reference_media_type(path: &FsPath) -> &'static str {
     }
 }
 
-fn register_roots(
-    catalog: &mut ConversationCatalog,
+fn prepare_roots(
+    catalog: &ConversationCatalog,
+    workspaces: &mut Vec<ConversationWorkspaceRecord>,
     roots: Vec<String>,
     now: &str,
 ) -> Result<Vec<String>, SessionServiceError> {
     let mut workspace_ids = Vec::with_capacity(roots.len());
     for root in roots {
-        if let Some(workspace) = catalog.workspace_by_root(&root) {
+        if let Some(workspace) = catalog.workspace_by_root(&root).or_else(|| {
+            workspaces
+                .iter()
+                .find(|workspace| workspace.canonical_root == root)
+        }) {
             workspace_ids.push(workspace.workspace_id.clone());
             continue;
         }
         let workspace_id = random_id("workspace")?;
-        catalog.register_workspace(ConversationWorkspaceRecord {
+        workspaces.push(ConversationWorkspaceRecord {
             workspace_id: workspace_id.clone(),
             display_name: workspace_display_name(&root),
             canonical_root: root,
@@ -1781,11 +1760,18 @@ fn register_roots(
 
 fn binding_snapshot(
     catalog: &ConversationCatalog,
+    workspaces: &[ConversationWorkspaceRecord],
     workspace_ids: &[String],
 ) -> Vec<WorkspaceBindingDisplayRecord> {
     workspace_ids
         .iter()
-        .filter_map(|workspace_id| catalog.workspace(workspace_id))
+        .filter_map(|workspace_id| {
+            catalog.workspace(workspace_id).or_else(|| {
+                workspaces
+                    .iter()
+                    .find(|workspace| &workspace.workspace_id == workspace_id)
+            })
+        })
         .map(|workspace| WorkspaceBindingDisplayRecord {
             workspace_id: workspace.workspace_id.clone(),
             display_name: workspace.display_name.clone(),
@@ -2357,8 +2343,10 @@ mod tests {
         }];
         let mut created_snapshot_roots = Vec::new();
 
+        let mut workspaces = Vec::new();
         let references = resolve_filesystem_references(
-            &mut catalog,
+            &catalog,
+            &mut workspaces,
             &attachment_tree.0,
             "session:test",
             &inputs,
@@ -2375,7 +2363,10 @@ mod tests {
         let workspace_id = reference["workspaceId"]
             .as_str()
             .expect("workspace identity");
-        let workspace = catalog.workspace(workspace_id).expect("snapshot workspace");
+        let workspace = workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .expect("snapshot workspace");
         assert_eq!(workspace.owner_session_id.as_deref(), Some("session:test"));
         let imported = PathBuf::from(&workspace.canonical_root).join("fixture.pdf");
         assert_eq!(
@@ -2388,6 +2379,7 @@ mod tests {
             std::fs::read(&imported).expect("read stable snapshot"),
             b"%PDF fixture bytes"
         );
+        catalog.workspaces.extend(workspaces);
         assert!(validate_message_filesystem_references(
             &catalog,
             "session:test",

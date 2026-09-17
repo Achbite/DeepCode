@@ -40,7 +40,6 @@ function afterFirstPaint(task: () => void): () => void {
   };
 }
 
-const EMPTY_WORKSPACE_SETTINGS: Record<string, unknown> = {};
 
 const HOST_STARTUP_MESSAGE_KEYS: Readonly<Record<string, string>> = {
   host_startup_idle: 'deepcodeGui.hostStartup.idle',
@@ -115,9 +114,7 @@ const DeepCodeGuiApp: React.FC = () => {
     setErrorMessage,
   } = useAppStatusStore();
   const loadWorkspace = useWorkspaceStore((s) => s.loadCurrent);
-  const workspaceSettings = useWorkspaceStore((s) => s.current?.settings ?? EMPTY_WORKSPACE_SETTINGS);
   const loadUserSettings = useSettingsStore((s) => s.loadUserSettings);
-  const syncWorkspaceSettings = useSettingsStore((s) => s.syncWorkspaceSettings);
   const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
   const loadedIncarnationRef = useRef<string | null>(null);
@@ -201,9 +198,6 @@ const DeepCodeGuiApp: React.FC = () => {
     void useLocalAgentStore.getState().initialize();
   }, [apiStatus, connectedIncarnation, loadUserSettings, loadWorkspace]);
 
-  useEffect(() => {
-    syncWorkspaceSettings(workspaceSettings);
-  }, [workspaceSettings, syncWorkspaceSettings]);
 
   useEffect(() => {
     const preference = normalizeGuiThemePreference(effectiveSettings['gui.colorTheme']);

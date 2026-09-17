@@ -582,8 +582,7 @@ function decodeSelectedPluginSnapshot(
   if (
     requested.length > 0
     && (
-      (request.pluginCatalogRevision !== undefined && value.catalogRevision !== request.pluginCatalogRevision)
-      || (!request.refreshPlugins && (requested.length !== plugins.length || requested.some((selection) => !seen.has(selection.uri))))
+      (!request.refreshPlugins && (requested.length !== plugins.length || requested.some((selection) => !seen.has(selection.uri))))
       || plugins.some((plugin) => !requested.some(selection=>selection.uri===plugin.uri))
     )
   ) throw new Error('selected_plugin_snapshot_identity_mismatch');

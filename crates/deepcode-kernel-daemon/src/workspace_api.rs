@@ -64,17 +64,6 @@ pub(crate) async fn workspace_save_file(
     }
 }
 
-pub(crate) async fn workspace_patch_settings(
-    State(state): State<AppState>,
-    Json(body): Json<Value>,
-) -> Json<ApiResponse> {
-    let settings = body.get("settings").cloned().unwrap_or_else(|| json!({}));
-    match state.host_services.workspace.patch_settings(settings) {
-        Ok(settings) => ApiResponse::ok(json!({ "settings": settings })),
-        Err(error) => ApiResponse::error(error.code, error.message),
-    }
-}
-
 pub(crate) async fn fs_initial_locations(State(state): State<AppState>) -> Json<ApiResponse> {
     let mut locations = Vec::new();
     if let Some(home) = home_dir() {

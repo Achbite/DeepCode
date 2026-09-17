@@ -2119,7 +2119,7 @@ function hasSettlement(events: readonly SessionEvent[], runId: string): boolean 
   return events.some((event) => event.type === 'run.settled' && event.runId === runId);
 }
 
-function uncompletedProviderComposition(
+export function uncompletedProviderComposition(
   snapshot: LoopSnapshot,
   runId: string,
 ): SessionState['contextCompositions'][number] | null {
@@ -2195,7 +2195,7 @@ function providerTurnSettledEvent(
   };
 }
 
-function providerTurnTerminalEvent(
+export function providerTurnTerminalEvent(
   sessionId: string,
   runId: string,
   composition: SessionState['contextCompositions'][number],

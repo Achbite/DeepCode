@@ -232,3 +232,13 @@ mod tests {
 pub(crate) fn now_text() -> String {
     now_millis().to_string()
 }
+pub(crate) fn new_runtime_ref(prefix: &str) -> Result<String, String> {
+    let mut entropy = [0_u8; 16];
+    getrandom::fill(&mut entropy).map_err(|error| format!("Generate {prefix}: {error}"))?;
+    let mut reference = format!("{prefix}:");
+    for byte in entropy {
+        use std::fmt::Write as _;
+        write!(&mut reference, "{byte:02x}").expect("String write");
+    }
+    Ok(reference)
+}

@@ -13,7 +13,6 @@ import { useSettingsSearchEntries, useSettingsSearchTarget } from './settingsSea
 export default function GuiPaletteSettings({ language }: { language: UiLanguage }) {
   const settings = useSettingsStore((state) => state.effectiveSettings);
   const loading = useSettingsStore((state) => state.loading);
-  const source = useSettingsStore((state) => state.sources[PALETTE_SETTING]);
   const encoded = String(settings[PALETTE_SETTING] ?? '{}');
   const [draft, setDraft] = useState({ saved: encoded, text: encoded });
   const [theme, setTheme] = useState<GuiResolvedTheme>(() => resolveGuiTheme(
@@ -29,7 +28,7 @@ export default function GuiPaletteSettings({ language }: { language: UiLanguage 
 
   const accent = normalizeGuiAccentColor(settings['gui.accentColor']);
   const dirty = draft.text !== encoded;
-  const disabled = loading || saving || source === 'workspace';
+  const disabled = loading || saving;
   let values: PaletteOverrides | null = null;
   let configError: string | null = null;
   try {

@@ -555,9 +555,6 @@ export interface ContextCompositionReceipt {
   providerRequestId: string;
   purpose: 'agent' | 'contextCompaction';
   responseConstraint: ProviderResponseConstraint;
-  stableCoreHash: string;
-  baseToolSchemaHash: string;
-  selectedPluginSnapshotHash: string;
   dynamicInstructionBytes: number;
   messages: ContextCompositionMessage[];
   workspaceBindings: ContextCompositionItem[];
@@ -576,9 +573,6 @@ interface ContextCompositionProjectionBase {
 
 export interface ContextCompositionProjection extends ContextCompositionProjectionBase {
   kernelCatalogSnapshotRef?: string;
-  stableCoreHash: string;
-  baseToolSchemaHash: string;
-  selectedPluginSnapshotHash: string;
   dynamicInstructionBytes: number;
   messages: ContextCompositionMessage[];
   workspaceBindings: ContextCompositionItem[];
@@ -1228,7 +1222,8 @@ export interface ShellExecutionEnvironmentProjection {
   interactive: boolean;
   executionScope: 'workspace' | 'host';
   terminal: boolean;
-  pathSource: 'hostPlusStandardDeveloperPaths';
+  /** Diagnostic recorded by the producer, preserved verbatim when reading history. */
+  pathSource: string;
   writeScope: 'kernelTemporaryOnly' | 'workspaceAndKernelTemporary' | 'hostUser';
   homeWritable: boolean;
   networkAccess: boolean;
@@ -1312,7 +1307,9 @@ export interface SessionProjection {
 
 export interface ConversationPort {
   submit(command: ConversationCommand): Promise<CommandReply>;
+  /** Read persisted history or a live snapshot without opening an Actor or writing events. */
   snapshot(sessionId: string): Promise<SessionProjection>;
+  /** Read sidebar status without resuming a conversation. */
   statuses(sessionIds: readonly string[]): Promise<ConversationSessionStatus[]>;
   contextComposition(sessionId: string, providerRequestId: string): Promise<ContextCompositionProjection>;
   read(query: ConversationReadQuery): Promise<ConversationReadResult>;
@@ -1530,7 +1527,7 @@ export interface ProviderToolAlias {
 }
 
 export interface RunRuntimeSnapshot {
-  environment?: JsonObject;
+  environment: JsonObject;
   runRuntimeSnapshotRef: string;
   extensionGenerationRef: string;
   kernelCatalogSnapshotRef: string;

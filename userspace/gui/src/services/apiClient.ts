@@ -10,7 +10,6 @@ import type {
   OpenWorkspaceResult,
   PatchLlmProfilesRequest,
   PatchUserSettingsResult,
-  PatchWorkspaceSettingsResult,
   SaveWorkspaceFileRequest,
   SaveWorkspaceFileResult,
   UserSettingValue,
@@ -145,12 +144,6 @@ export function saveWorkspaceFile(
   request: SaveWorkspaceFileRequest,
 ): Promise<ApiResponse<SaveWorkspaceFileResult>> {
   return sendJson(`${API_BASE}/workspaces/save-file`, 'POST', request);
-}
-
-export function patchWorkspaceSettings(
-  settings: Record<string, unknown>,
-): Promise<ApiResponse<PatchWorkspaceSettingsResult>> {
-  return sendJson(`${API_BASE}/workspaces/current/settings`, 'PATCH', { settings });
 }
 
 export function getInitialLocations(): Promise<ApiResponse<InitialLocations>> {

@@ -48,7 +48,6 @@ interface PendingFilesystemPath {
 type StoreErrorSource =
   | 'initialization'
   | 'projection'
-  | 'statuses'
   | 'catalog'
   | 'pluginCatalog'
   | 'profiles'
@@ -65,6 +64,7 @@ export interface LocalAgentState {
   defaultProfileId: string | null;
   catalog: ConversationCatalog;
   sessionStatuses: Record<string, ConversationSessionStatus>;
+  statusError: string | null;
   pluginCatalog: PluginCatalogProjection;
   projection: SessionProjection | null;
   loading: boolean;
@@ -123,8 +123,7 @@ type StoreSet = (
 ) => void;
 type StoreGet = () => LocalAgentState;
 
-export function createLocalAgentStore(viewId = 'main') {
-const SESSION_STORAGE_KEY = `deepcode.local-agent.active-session:${viewId}`;
+export function createLocalAgentStore() {
 let initialization: Promise<void> | null = null;
 let generation = 0;
 let viewReadController = new AbortController();
@@ -180,6 +179,7 @@ const store = create<LocalAgentState>((set, get) => ({
   defaultProfileId: null,
   catalog: EMPTY_CATALOG,
   sessionStatuses: {},
+  statusError: null,
   pluginCatalog: EMPTY_PLUGIN_CATALOG,
   projection: null,
   loading: false,
@@ -191,7 +191,6 @@ const store = create<LocalAgentState>((set, get) => ({
   initialize: async () => {
     if (initialization) return await initialization;
     const currentGeneration = advanceView();
-    const signal = viewReadController.signal;
     initialization = (async () => {
       set({ loading: true, error: null, errorSource: null });
       try {
@@ -207,8 +206,7 @@ const store = create<LocalAgentState>((set, get) => ({
           profiles,
           profileResult.ok ? profileResult.data?.defaultProfileId : undefined,
         );
-        // Catalog readiness is independent of navigation. Starting a new draft
-        // while boot data loads cancels view restoration, not the shared data.
+        // Catalog readiness is independent of navigation during startup.
         set({ catalog, pluginCatalog, profiles, defaultProfileId });
         void get().refresh();
         if (currentGeneration !== generation) {
@@ -223,32 +221,19 @@ const store = create<LocalAgentState>((set, get) => ({
           }
           return;
         }
-        const remembered = readRememberedSession();
-        const candidate = catalog.sessions.find((session) => session.id === remembered);
-        let projection: SessionProjection | null = null;
-        let projectionError: string | null = null;
-        if (candidate) {
-          try {
-            projection = await readProjection(candidate.id, signal);
-          } catch (error) {
-            projectionError = errorMessage(error);
-          }
-        }
-        if (currentGeneration !== generation) return;
         set({
           catalog,
           pluginCatalog,
           profiles,
           defaultProfileId,
-          selectedProfileId: projection?.modelSettings?.profileId ?? candidate?.profileId ?? defaultProfileId,
-          reasoningEffortOverride: projection?.modelSettings?.reasoningEffortOverride ?? null,
-          sessionId: projection?.sessionId ?? candidate?.id ?? null,
-          projection,
+          selectedProfileId: defaultProfileId,
+          reasoningEffortOverride: null,
+          sessionId: null,
+          projection: null,
           draftProjectId: null,
           loading: false,
-          error: projectionError
-            ?? (profileResult.ok ? null : (profileResult.message ?? 'llm_profiles_unavailable')),
-          errorSource: projectionError ? 'initialization' : (profileResult.ok ? null : 'profiles'),
+          error: profileResult.ok ? null : (profileResult.message ?? 'llm_profiles_unavailable'),
+          errorSource: profileResult.ok ? null : 'profiles',
         });
       } catch (error) {
         if (currentGeneration === generation) {
@@ -323,7 +308,6 @@ const store = create<LocalAgentState>((set, get) => ({
   startNewSession: (projectId = null) => {
     advanceView();
     activeSubmissionCount = 0;
-    forgetSession();
     set({
       sessionId: null,
       projection: null,
@@ -349,7 +333,6 @@ const store = create<LocalAgentState>((set, get) => ({
     activeSubmissionCount = 0;
     const cached = projectionCache.get(sessionId) ?? null;
     if (cached) cacheProjection(cached);
-    rememberSession(sessionId);
     set({
       submitting: false,
       modelSettingsBusy: false,
@@ -371,7 +354,6 @@ const store = create<LocalAgentState>((set, get) => ({
     try {
       const projection = await readProjection(sessionId, signal);
       if (currentGeneration !== generation) return;
-      rememberSession(sessionId);
       set({
         sessionId,
         selectedProfileId: projection.modelSettings?.profileId ?? summary.profileId ?? null,
@@ -423,13 +405,13 @@ const store = create<LocalAgentState>((set, get) => ({
               const current = state.sessionStatuses[item.sessionId];
               return [item.sessionId, current && current.revision > item.revision ? current : item];
             }));
-            if (state.errorSource !== 'statuses'
+            if (state.statusError === null
               && JSON.stringify(sessionStatuses) === JSON.stringify(state.sessionStatuses)) return state;
-            return { sessionStatuses, ...(state.errorSource === 'statuses' ? { error: null, errorSource: null } : {}) };
+            return { sessionStatuses, statusError: null };
           });
           return items;
         } catch (error) {
-          if (generation === refreshGeneration) set({ sessionStatuses: {}, error: errorMessage(error), errorSource: 'statuses' });
+          if (generation === refreshGeneration) set({ sessionStatuses: {}, statusError: errorMessage(error) });
           return null;
         }
       })();
@@ -770,7 +752,6 @@ async function submitNewRun(
       });
       if (generation !== submissionGeneration) throw new Error('conversation_session_changed');
       sessionId = created.sessionId;
-      rememberSession(sessionId);
       onSessionCreated?.(sessionId);
       set({ sessionId, projection: created, draftProjectId: null });
       await get().refreshCatalog();
@@ -1061,30 +1042,6 @@ function nextId(kind: string): string {
   const random = globalThis.crypto?.randomUUID?.()
     ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   return `${kind}:${random}`;
-}
-
-function readRememberedSession(): string | null {
-  try {
-    return window.localStorage.getItem(SESSION_STORAGE_KEY);
-  } catch {
-    return null;
-  }
-}
-
-function rememberSession(sessionId: string): void {
-  try {
-    window.localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
-  } catch {
-    // 最近打开项只是 UI 快捷索引；Catalog 与 Session journal 仍是事实源。
-  }
-}
-
-function forgetSession(): void {
-  try {
-    window.localStorage.removeItem(SESSION_STORAGE_KEY);
-  } catch {
-    // 无可清理的 UI 快捷索引。
-  }
 }
 
 function errorMessage(error: unknown): string {

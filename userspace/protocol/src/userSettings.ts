@@ -16,7 +16,6 @@ export interface SettingCatalogEntry {
   key: string;
   domain: SettingCatalogDomain;
   shellSurface: SettingsSurface[];
-  workspaceOverridable: boolean;
 }
 
 export const DEFAULT_USER_SETTINGS: UserSettings = {
@@ -58,14 +57,12 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
 const SHARED_AGENT_PREFIX = 'agent.';
 const PLUGIN_SETTING_PREFIXES = ['skills.', 'mcp.', 'plugins.'];
 const NON_SHELL_SETTING_PREFIXES = [SHARED_AGENT_PREFIX, ...PLUGIN_SETTING_PREFIXES];
-const WORKSPACE_OVERRIDABLE_KEYS = new Set(['skills.mounts', 'mcp.servers', 'plugins.sources']);
 
 export const SETTING_CATALOG: readonly SettingCatalogEntry[] = Object.freeze(
   Object.keys(DEFAULT_USER_SETTINGS).map((key) => ({
     key,
     domain: domainForKey(key),
     shellSurface: surfacesForKey(key),
-    workspaceOverridable: WORKSPACE_OVERRIDABLE_KEYS.has(key),
   })),
 );
 
@@ -90,10 +87,6 @@ export function shellPreferenceSettingsIndex(
     !NON_SHELL_SETTING_PREFIXES.some((prefix) => entry.key.startsWith(prefix))
       && entry.shellSurface.includes(surface),
   );
-}
-
-export function workspaceOverridableSettingsIndex(): readonly SettingCatalogEntry[] {
-  return SETTING_CATALOG.filter((entry) => entry.workspaceOverridable);
 }
 
 function domainForKey(key: string): SettingCatalogDomain {

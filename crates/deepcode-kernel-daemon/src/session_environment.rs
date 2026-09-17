@@ -50,13 +50,15 @@ pub(crate) fn prepare(
     let locale = system_locale();
     let preference = response_language_setting(settings)?;
     let shell = selected_shell(settings);
+    let execution_path = shell_environment::resolved_agent_shell_path().map_err(|error| error.to_string())?;
+    let path_directories = std::env::split_paths(&execution_path).collect::<Vec<_>>();
     let command_paths: serde_json::Map<String, Value> = [
         "git", "rg", "node", "npm", "pnpm", "python", "python3", "cargo", "rustc", "go", "java",
         "dotnet", "cmake", "make", "ninja", "gcc", "clang", "cl", "docker", "podman", "colima",
     ]
     .into_iter()
     .filter_map(|name| {
-        shell_environment::find_command(name).map(|path| (name.to_string(), json!(path)))
+        shell_environment::find_command_in(name, &path_directories).map(|path| (name.to_string(), json!(path)))
     })
     .collect();
     let commands: Vec<_> = command_paths.keys().cloned().collect();
@@ -73,7 +75,7 @@ pub(crate) fn prepare(
         "shell": shell,
         "developerCommands": commands,
         "commandPaths": command_paths,
-        "executionPath": shell_environment::resolved_agent_shell_path().to_string_lossy(),
+        "executionPath": execution_path.to_string_lossy(),
         "workspaceShellSupported": sandbox.available,
         "workspaceSandbox": sandbox,
     }))
@@ -86,6 +88,7 @@ fn validate_snapshot(snapshot: &Value) -> Result<(), String> {
         || !snapshot["os"].is_string()
         || !snapshot["arch"].is_string()
         || !snapshot["shellAvailable"].is_boolean()
+        || !snapshot["executionPath"].is_string()
         || !snapshot["workspaceShellSupported"].is_boolean()
         || !snapshot["developerCommands"]
             .as_array()

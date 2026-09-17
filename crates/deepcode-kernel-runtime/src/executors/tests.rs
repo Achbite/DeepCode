@@ -1,5 +1,29 @@
 use super::*;
 
+pub(super) fn invocation(id: impl Into<String>, tool: &str, input: Value) -> KernelToolInvocation {
+    KernelToolInvocation {
+        id: id.into(),
+        input: KernelToolRegistry::default()
+            .canonicalize(tool, input)
+            .unwrap(),
+    }
+}
+
+#[cfg(unix)]
+fn shell_executor() -> ConfiguredShellExecutor {
+    ConfiguredShellExecutor {
+        program: Some(
+            crate::shell_environment::discover("bash").expect("fixture Bash environment"),
+        ),
+        execution_path: Some(
+            crate::shell_environment::resolved_agent_shell_path()
+                .unwrap()
+                .into_string()
+                .unwrap(),
+        ),
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn shell_progress_precedes_completion_and_keeps_full_archive() {
@@ -11,10 +35,7 @@ fn shell_progress_precedes_completion_and_keeps_full_archive() {
         let _ = send.send(event);
     });
     let task = std::thread::spawn(move || {
-        ProcessShellExecutor.invoke(KernelToolInvocation {
-        id: "progress".into(), tool_id: "bash".into(),
-        input: serde_json::json!({"command":"printf 'before'; printf 'diagnostic' >&2; while [ ! -f finish ]; do sleep 0.05; done", "workspaceMode":"read", "executionScope":"host", "timeout":15}),
-    }, context)
+        shell_executor().invoke(invocation("progress", "bash", serde_json::json!({"command":"printf 'before'; printf 'diagnostic' >&2; while [ ! -f finish ]; do sleep 0.05; done", "workspaceMode":"read", "executionScope":"host", "timeout":15})), context)
     });
     let started = receive.recv_timeout(std::time::Duration::from_secs(5));
     if !matches!(started, Ok(KernelToolProgress::Started { .. })) {
@@ -67,10 +88,11 @@ fn edit_preview_exposes_line_joins_without_changing_requested_text() {
     let original = "# script\necho ready\nif true; then\n  echo done\nfi\n";
     let patch = apply_exact_text_edits(
         original,
-        &serde_json::json!([
+        &serde_json::from_value::<Vec<KernelTextEdit>>(serde_json::json!([
             {"oldText":"echo ready\n", "newText":"echo ready"},
             {"oldText":"echo done", "newText":"echo 完成"}
-        ]),
+        ]))
+        .unwrap(),
     )
     .unwrap();
     assert_eq!(
@@ -91,9 +113,10 @@ fn edit_preview_exposes_line_joins_without_changing_requested_text() {
     let long = "字".repeat(5000);
     let patch = apply_exact_text_edits(
         &long,
-        &serde_json::json!([
+        &serde_json::from_value::<Vec<KernelTextEdit>>(serde_json::json!([
             {"oldText":long, "newText":"replacement"}
-        ]),
+        ]))
+        .unwrap(),
     )
     .unwrap();
     assert_eq!(patch.updated, "replacement");
@@ -166,12 +189,11 @@ fn builtin_registry_executes_a_prepared_file_read() {
 
     let result = registry
         .invoke(
-            "fs.read",
-            KernelToolInvocation {
-                id: "invocation:read".to_string(),
-                tool_id: "fs.read".to_string(),
-                input: serde_json::json!({ "path": "README.md" }),
-            },
+            invocation(
+                "invocation:read",
+                "fs.read",
+                serde_json::json!({ "path": "README.md" }),
+            ),
             context_with_target(&workspace.0, "README.md"),
         )
         .expect("registered fs.read executes against the prepared target");
@@ -196,12 +218,11 @@ fn builtin_registry_rejects_a_cancelled_attempt_before_execution() {
 
     let error = registry
         .invoke(
-            "fs.read",
-            KernelToolInvocation {
-                id: "invocation:cancelled-read".to_string(),
-                tool_id: "fs.read".to_string(),
-                input: serde_json::json!({ "path": "README.md" }),
-            },
+            invocation(
+                "invocation:cancelled-read",
+                "fs.read",
+                serde_json::json!({ "path": "README.md" }),
+            ),
             context,
         )
         .expect_err("cancelled attempt must not enter the executor");
@@ -236,11 +257,9 @@ fn fs_write_creates_missing_parent_directories_and_replaces_existing_files() {
         .expect("canonical write");
     let created = registry
         .invoke(
-            "fs.write",
             KernelToolInvocation {
                 id: "invocation:create-nested".to_string(),
-                tool_id: "fs.write".to_string(),
-                input: create.arguments,
+                input: create,
             },
             context_with_target(&workspace.0, relative),
         )
@@ -262,11 +281,9 @@ fn fs_write_creates_missing_parent_directories_and_replaces_existing_files() {
         .expect("canonical replacement");
     let replaced = registry
         .invoke(
-            "fs.write",
             KernelToolInvocation {
                 id: "invocation:replace-existing".to_string(),
-                tool_id: "fs.write".to_string(),
-                input: replace.arguments,
+                input: replace,
             },
             context_with_target(&workspace.0, relative),
         )
@@ -304,11 +321,9 @@ fn fs_edit_validates_every_range_before_the_atomic_write() {
         .expect("canonical edit");
     let error = registry
         .invoke(
-            "fs.edit",
             KernelToolInvocation {
                 id: "invocation:overlapping-edit".to_string(),
-                tool_id: "fs.edit".to_string(),
-                input: overlapping.arguments,
+                input: overlapping,
             },
             context_with_target(&workspace.0, "README.md"),
         )
@@ -336,11 +351,9 @@ fn fs_edit_validates_every_range_before_the_atomic_write() {
         .expect("canonical exact edit");
     registry
         .invoke(
-            "fs.edit",
             KernelToolInvocation {
                 id: "invocation:exact-edit".to_string(),
-                tool_id: "fs.edit".to_string(),
-                input: exact.arguments,
+                input: exact,
             },
             context_with_target(&workspace.0, "README.md"),
         )
@@ -375,18 +388,14 @@ fn cancelled_child_is_reaped_before_wait_returns() {
 fn bash_executes_in_the_bound_workspace_and_reports_environment() {
     let workspace = TempWorkspace::new("bash-workspace");
     fs::create_dir_all(workspace.0.join("build")).unwrap();
-    let result = ProcessShellExecutor
+    let result = shell_executor()
         .invoke(
-            KernelToolInvocation {
-                id: "bash-workspace".to_string(),
-                tool_id: "bash".to_string(),
-                input: serde_json::json!({
+            invocation("bash-workspace", "bash", serde_json::json!({
                     "command": "cd build && printf 'stdout-value' && printf 'generated' > generated.txt",
                     "workspaceMode": "write",
                     "executionScope": "workspace",
                     "timeout": 5
-                }),
-            },
+                })),
             context_with_target(&workspace.0, "."),
         )
         .expect("bash command executes in its bound workspace");
@@ -428,18 +437,18 @@ fn bash_executes_in_the_bound_workspace_and_reports_environment() {
 #[test]
 fn bash_cleans_its_owned_temporary_directory() {
     let workspace = TempWorkspace::new("bash-temporary");
-    let result = ProcessShellExecutor
+    let result = shell_executor()
         .invoke(
-            KernelToolInvocation {
-                id: "bash-temporary".to_string(),
-                tool_id: "bash".to_string(),
-                input: serde_json::json!({
+            invocation(
+                "bash-temporary",
+                "bash",
+                serde_json::json!({
                     "command": "printf '%s' \"$TMPDIR\"; printf temporary > \"$TMPDIR/owned.txt\"",
                     "workspaceMode": "read",
                     "executionScope": "workspace",
                     "timeout": 5
                 }),
-            },
+            ),
             context_with_target(&workspace.0, "."),
         )
         .expect("process shell temporary directory is writable");
@@ -463,18 +472,18 @@ fn bash_cleans_its_owned_temporary_directory() {
 #[test]
 fn bash_nonzero_exit_is_a_known_failure_with_structured_output() {
     let workspace = TempWorkspace::new("bash-nonzero");
-    let result = ProcessShellExecutor
+    let result = shell_executor()
         .invoke(
-            KernelToolInvocation {
-                id: "bash-nonzero".to_string(),
-                tool_id: "bash".to_string(),
-                input: serde_json::json!({
+            invocation(
+                "bash-nonzero",
+                "bash",
+                serde_json::json!({
                     "command": "printf 'stdout-value'; printf 'stderr-value' >&2; exit 7",
                     "workspaceMode": "read",
                     "executionScope": "workspace",
                     "timeout": 5
                 }),
-            },
+            ),
             context_with_target(&workspace.0, "."),
         )
         .expect("known Bash failure retains its execution result");
@@ -494,18 +503,18 @@ fn bash_nonzero_exit_is_a_known_failure_with_structured_output() {
 #[test]
 fn bash_timeout_is_a_known_failure_and_releases_its_temporary_directory() {
     let workspace = TempWorkspace::new("bash-timeout");
-    let result = ProcessShellExecutor
+    let result = shell_executor()
         .invoke(
-            KernelToolInvocation {
-                id: "bash-timeout".to_string(),
-                tool_id: "bash".to_string(),
-                input: serde_json::json!({
+            invocation(
+                "bash-timeout",
+                "bash",
+                serde_json::json!({
                     "command": "printf '%s' \"$TMPDIR\"; sleep 2",
                     "workspaceMode": "read",
                     "executionScope": "workspace",
                     "timeout": 1
                 }),
-            },
+            ),
             context_with_target(&workspace.0, "."),
         )
         .expect("timed-out Bash call retains its known execution result");
@@ -528,18 +537,18 @@ fn bash_timeout_is_a_known_failure_and_releases_its_temporary_directory() {
 #[test]
 fn bash_host_scope_reports_the_host_execution_boundary() {
     let workspace = TempWorkspace::new("bash-host");
-    let result = ProcessShellExecutor
+    let result = shell_executor()
         .invoke(
-            KernelToolInvocation {
-                id: "bash-host".to_string(),
-                tool_id: "bash".to_string(),
-                input: serde_json::json!({
+            invocation(
+                "bash-host",
+                "bash",
+                serde_json::json!({
                     "command": "printf 'host-scope'",
                     "workspaceMode": "read",
                     "executionScope": "host",
                     "timeout": 5
                 }),
-            },
+            ),
             context_with_target(&workspace.0, "."),
         )
         .expect("host Bash executes from the bound workspace");
@@ -560,19 +569,15 @@ fn bash_host_scope_reports_the_host_execution_boundary() {
 #[test]
 fn bash_terminal_writes_exact_bounded_input_to_one_call_pty() {
     let workspace = TempWorkspace::new("bash-terminal");
-    let result = ProcessShellExecutor
+    let result = shell_executor()
         .invoke(
-            KernelToolInvocation {
-                id: "bash-terminal".to_string(),
-                tool_id: "bash".to_string(),
-                input: serde_json::json!({
+            invocation("bash-terminal", "bash", serde_json::json!({
                     "command": "IFS= read -r value; if [ -t 0 ]; then tty=yes; else tty=no; fi; printf 'value=%s tty=%s\\n' \"$value\" \"$tty\"",
                     "workspaceMode": "read",
                     "executionScope": "host",
                     "timeout": 5,
                     "terminal": { "stdin": "ready\n" }
-                }),
-            },
+                })),
             context_with_target(&workspace.0, "."),
         )
         .expect("one-call PTY accepts exact input and exits");
@@ -617,11 +622,9 @@ fn bash_limits_preview_and_preserves_complete_output_for_bounded_reads() {
     for line in ["中文🙂", &format!("中文🙂{}", "x".repeat(80))] {
         let workspace = TempWorkspace::new("bash-output-archive");
         let command = format!("i=0; while [ $i -lt 4500 ]; do printf '{line}\\n'; i=$((i+1)); done; printf 'diagnostic\\n' >&2");
-        let result = ProcessShellExecutor.invoke(KernelToolInvocation {
-            id: "archive".into(), tool_id: "bash".into(), input: serde_json::json!({
+        let result = shell_executor().invoke(invocation("archive", "bash", serde_json::json!({
                 "command": command, "workspaceMode": "read", "executionScope": "host", "timeout": 5,
-            }),
-        }, context_with_target(&workspace.0, ".")).unwrap();
+            })), context_with_target(&workspace.0, ".")).unwrap();
         assert_eq!(result.outcome, KernelToolExecutionOutcome::Completed);
         assert_eq!(result.output["truncated"], true);
         let stdout = result.output["stdout"].as_str().unwrap();
@@ -661,12 +664,7 @@ fn file_changes_retain_each_operations_before_and_after_and_deleted_tree_files()
     let invoke = |tool: &str, input: Value| {
         registry
             .invoke(
-                tool,
-                KernelToolInvocation {
-                    id: format!("invocation:{tool}"),
-                    tool_id: tool.into(),
-                    input: input.clone(),
-                },
+                invocation(format!("invocation:{tool}"), tool, input.clone()),
                 context_with_target(&workspace.0, input["path"].as_str().unwrap()),
             )
             .unwrap()
@@ -713,7 +711,11 @@ fn fs_edit_rejections_name_the_failing_edit_index_and_shape() {
         {"oldText": "alpha", "newText": "ALPHA"},
         {"oldText": "gamma", "newText": "GAMMA"},
     ]);
-    let error = apply_exact_text_edits("alpha beta", &not_found).unwrap_err();
+    let error = apply_exact_text_edits(
+        "alpha beta",
+        &serde_json::from_value::<Vec<KernelTextEdit>>(not_found).unwrap(),
+    )
+    .unwrap_err();
     let KernelError::Structured {
         code,
         message,
@@ -729,7 +731,11 @@ fn fs_edit_rejections_name_the_failing_edit_index_and_shape() {
     assert_eq!(details["oldTextBytes"], 5);
 
     let ambiguous = serde_json::json!([{"oldText": "dup", "newText": "x"}]);
-    let error = apply_exact_text_edits("dup dup", &ambiguous).unwrap_err();
+    let error = apply_exact_text_edits(
+        "dup dup",
+        &serde_json::from_value::<Vec<KernelTextEdit>>(ambiguous).unwrap(),
+    )
+    .unwrap_err();
     let KernelError::Structured {
         code,
         message,
@@ -760,12 +766,11 @@ fn fs_read_distinguishes_missing_metadata_from_a_directory() {
     ] {
         let error = registry
             .invoke(
-                "fs.read",
-                KernelToolInvocation {
-                    id: format!("invocation:{path}"),
-                    tool_id: "fs.read".into(),
-                    input: serde_json::json!({"path":path}),
-                },
+                invocation(
+                    format!("invocation:{path}"),
+                    "fs.read",
+                    serde_json::json!({"path":path}),
+                ),
                 context_with_target(&workspace.0, path),
             )
             .unwrap_err();

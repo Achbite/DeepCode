@@ -4,7 +4,7 @@ use crate::{ToolError, ToolResult};
 use deepcode_host_connection::process::{
     spawn_owned_host_process, terminate_owned_process_tree, OwnedHostProcess,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -16,10 +16,10 @@ const MAX_PDF_BYTES: usize = 32 * 1024 * 1024;
 const PDF_TIMEOUT: Duration = Duration::from_secs(90);
 const PDF_SCRIPT: &str = include_str!("../../../skills/deepcode-documents/scripts/render_pdf.py");
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct DocumentInput {
-    path: String,
+pub struct DocumentInput {
+    pub path: String,
     format: String,
     content: String,
 }
@@ -44,8 +44,8 @@ pub fn input_schema() -> Value {
     })
 }
 
-fn decode(input: &Value) -> ToolResult<DocumentInput> {
-    let input: DocumentInput = serde_json::from_value(input.clone())
+pub fn prepare(input: Value) -> ToolResult<DocumentInput> {
+    let input: DocumentInput = serde_json::from_value(input)
         .map_err(|error| ToolError::new("tool_input_invalid", error.to_string()))?;
     if input.path.trim().is_empty() || input.content.trim().is_empty() {
         return Err(ToolError::new(
@@ -79,17 +79,12 @@ fn decode(input: &Value) -> ToolResult<DocumentInput> {
     Ok(input)
 }
 
-pub fn logical_targets(input: &Value) -> ToolResult<Vec<String>> {
-    Ok(vec![decode(input)?.path])
-}
-
-pub fn render(input: &Value, context: DocumentContext<'_>) -> ToolResult<Value> {
-    let input = decode(input)?;
+pub fn render(input: &DocumentInput, context: DocumentContext<'_>) -> ToolResult<Value> {
     check_cancelled(context.cancelled)?;
     let bytes = if input.format == "pdf" {
         render_pdf(&input.content, context.python, context.cancelled)?
     } else {
-        input.content.into_bytes()
+        input.content.as_bytes().to_vec()
     };
     check_cancelled(context.cancelled)?;
     let parent = context
@@ -306,7 +301,7 @@ mod tests {
         ] {
             let target = directory.path().join(name);
             let output = render(
-                &json!({"path":name,"format":format,"content":content}),
+                &prepare(json!({"path":name,"format":format,"content":content})).unwrap(),
                 context(&target, &|| false),
             )
             .unwrap();
@@ -335,9 +330,10 @@ mod tests {
             json!({"path":"report.html", "format":"pdf", "content":"text"}),
             json!({"path":"report.html", "format":"html", "content":" "}),
         ] {
-            assert!(render(&input, context(&target, &|| false)).is_err());
+            assert!(prepare(input).is_err());
         }
-        let input = json!({"path":"report.html", "format":"html", "content":"updated"});
+        let input =
+            prepare(json!({"path":"report.html", "format":"html", "content":"updated"})).unwrap();
         assert_eq!(
             render(&input, context(&target, &|| true)).unwrap_err().code,
             "tool_cancelled"
@@ -356,7 +352,8 @@ mod tests {
         let mut scope = context(&target, &|| false);
         scope.python = Some(&missing);
         let error = render(
-            &json!({"path":"report.pdf", "format":"pdf", "content":"<h1>Report</h1>"}),
+            &prepare(json!({"path":"report.pdf", "format":"pdf", "content":"<h1>Report</h1>"}))
+                .unwrap(),
             scope,
         )
         .unwrap_err();
@@ -372,7 +369,7 @@ mod tests {
             .expect("Run required tests in the project Docker environment, which includes the document renderer.");
         let mut scope = context(&target, &|| false);
         scope.python = Some(&python);
-        let result = render(&json!({"path":"report.pdf", "format":"pdf", "content":"<!doctype html><html><meta charset=utf-8><style>@page { size:A4; margin:20mm } body {font-family: sans-serif}</style><h1>Document export</h1><p>Readable output from the real renderer.</p></html>"}), scope).unwrap();
+        let result = render(&prepare(json!({"path":"report.pdf", "format":"pdf", "content":"<!doctype html><html><meta charset=utf-8><style>@page { size:A4; margin:20mm } body {font-family: sans-serif}</style><h1>Document export</h1><p>Readable output from the real renderer.</p></html>"})).unwrap(), scope).unwrap();
         assert_eq!(result["mediaType"], "application/pdf");
         let extracted = pdf_extract::extract_text(&target).unwrap();
         assert!(extracted.contains("Document export"));

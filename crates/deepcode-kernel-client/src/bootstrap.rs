@@ -20,7 +20,7 @@ const KERNEL_OWNED_SHUTDOWN_IO_WAIT: Duration =
 const KERNEL_OWNED_SHUTDOWN_EXIT_ATTEMPTS: usize = 200;
 
 use deepcode_host_connection::process::{
-    spawn_owned_host_process, terminate_owned_process_tree, OwnedHostProcess,
+    spawn_owned_host_process, terminate_owned_process_tree, wait_for_child_exit, OwnedHostProcess,
 };
 use deepcode_host_connection::{HostClientLease, HOST_LIFETIME_ENV};
 #[cfg(all(test, unix))]
@@ -666,7 +666,7 @@ fn terminate_owned_kernel_process(process: &mut OwnedKernelProcess) {
         return;
     }
     if request_owned_kernel_graceful_shutdown(&process.shutdown_target)
-        && wait_for_kernel_exit(process, KERNEL_OWNED_SHUTDOWN_EXIT_ATTEMPTS)
+        && wait_for_child_exit(process, KERNEL_OWNED_SHUTDOWN_EXIT_ATTEMPTS)
     {
         let _ = process.child.wait();
         return;
@@ -726,17 +726,6 @@ fn request_owned_kernel_api<T: for<'de> Deserialize<'de>>(
         .position(|window| window == b"\r\n\r\n")?
         + 4;
     serde_json::from_slice(&response[body_offset..]).ok()
-}
-
-fn wait_for_kernel_exit(process: &mut OwnedKernelProcess, attempts: usize) -> bool {
-    for _ in 0..attempts {
-        match process.child.try_wait() {
-            Ok(Some(_)) => return true,
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(_) => return false,
-        }
-    }
-    false
 }
 
 struct KernelStartLock {

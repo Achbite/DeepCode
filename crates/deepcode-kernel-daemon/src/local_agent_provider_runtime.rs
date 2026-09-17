@@ -74,7 +74,6 @@ impl ProviderRuntimeRegistry {
 
     pub(crate) fn resolve(
         &self,
-        gui: &GuiState,
         session_id: &str,
         run_id: &str,
         provider_runtime_ref: &str,
@@ -100,16 +99,7 @@ impl ProviderRuntimeRegistry {
             return Ok(binding);
         }
 
-        // A same-version daemon restart loses only the in-memory binding. Rebuild it
-        // from the current profile and accept it solely when the deterministic
-        // runtime identity is unchanged. A changed profile remains unavailable
-        // instead of silently changing an already-started run.
-        let binding = capture_binding(gui, Some(profile_id), reasoning_effort_override)?;
-        if binding.snapshot.provider_runtime_ref != provider_runtime_ref {
-            return Err("Provider runtime 已不再与 run.started 固定的配置一致。".to_string());
-        }
-        self.lock()?.insert(key, binding.clone());
-        Ok(binding)
+        Err("当前 run 的 Provider runtime 绑定已丢失；可读取历史并开始新的 run。".to_string())
     }
 
     pub(crate) fn release(&self, session_id: &str, run_id: &str) -> Result<(), String> {
@@ -170,27 +160,8 @@ fn capture_binding(
         return Err("LLM Profile 的 maxOutputTokens 必须小于 contextWindowTokens。".to_string());
     }
 
-    let runtime_shape = json!({
-        "profileId": profile_id,
-        "kind": profile.kind,
-        "providerFlavor": profile.provider_flavor,
-        "baseUrl": profile.base_url,
-        "model": profile.model,
-        "contextWindowTokens": context_window_tokens,
-        "maxOutputTokens": max_output_tokens,
-        "temperature": profile.temperature,
-        "reasoningEffort": profile.reasoning_effort,
-        "thinking": profile.thinking,
-        "hostedWebSearch": profile.hosted_web_search,
-        "secretRef": selected_profile(gui, &profile_id)?.get("secretRef"),
-    });
-    let encoded = serde_json::to_vec(&runtime_shape)
-        .map_err(|error| format!("编码 Provider runtime identity 失败：{error}"))?;
     let snapshot = ProviderRuntimeSnapshot {
-        provider_runtime_ref: format!(
-            "provider-runtime:{}",
-            deepcode_kernel_tools::hash_bytes(&encoded)
-        ),
+        provider_runtime_ref: crate::utils::new_runtime_ref("provider-runtime")?,
         profile_id,
         reasoning_effort: profile.reasoning_effort.clone(),
         reasoning_effort_override: reasoning_effort_override.map(str::to_string),
@@ -272,7 +243,7 @@ mod tests {
         let effective = with_reasoning_override(configured.clone(), Some("low")).unwrap();
         let body = crate::llm_transport::openai_compatible_request_body(
             &effective,
-            vec![json!({"role":"user","content":"Inspect source."})],
+            &[serde_json::from_value(json!({"role":"user","content":"Inspect source."})).unwrap()],
             &[],
             true,
             false,

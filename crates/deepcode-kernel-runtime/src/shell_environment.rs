@@ -46,11 +46,20 @@ pub fn find_command(name: &str) -> Option<PathBuf> {
     command_candidates(name).find(|path| executable_file(path))
 }
 
+pub fn find_command_in(name: &str, directories: &[PathBuf]) -> Option<PathBuf> {
+    command_candidates_in(name, directories.iter()).find(|path| executable_file(path))
+}
+
 fn command_candidates(name: &str) -> impl Iterator<Item = PathBuf> + '_ {
-    Some(resolved_agent_shell_path())
-        .into_iter()
-        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+    let directories = std::env::split_paths(std::env::var_os("PATH").as_deref().unwrap_or(OsStr::new("")))
+        .collect::<Vec<_>>();
+    command_candidates_in(name, directories.into_iter())
+}
+
+fn command_candidates_in<'a>(name: &'a str, directories: impl Iterator<Item = impl AsRef<Path>> + 'a) -> impl Iterator<Item = PathBuf> + 'a {
+    directories
         .flat_map(move |directory| {
+            let directory = directory.as_ref();
             if cfg!(windows) {
                 ["exe", "cmd", "bat", "com"]
                     .into_iter()
@@ -328,8 +337,7 @@ mod tests {
     }
 }
 
-pub fn resolved_agent_shell_path() -> OsString {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+pub fn resolved_agent_shell_path() -> KernelResult<OsString> {
     let host_path = std::env::var_os("PATH");
     let mut configured_tool_paths = Vec::new();
     for key in ["PNPM_HOME"] {
@@ -348,47 +356,25 @@ pub fn resolved_agent_shell_path() -> OsString {
         configured_tool_paths.push(root.join("bin"));
     }
     compose_agent_shell_path(
-        home.as_deref(),
         host_path.as_deref(),
         &configured_tool_paths,
     )
 }
 
 pub(crate) fn compose_agent_shell_path(
-    home: Option<&Path>,
     host_path: Option<&OsStr>,
     configured_tool_paths: &[PathBuf],
-) -> OsString {
+) -> KernelResult<OsString> {
     let mut paths = Vec::new();
-    if let Some(home) = home {
-        for relative in ["bin", ".local/bin", ".cargo/bin"] {
-            push_existing_unique_path(&mut paths, home.join(relative));
-        }
-    }
     for path in configured_tool_paths {
         push_existing_unique_path(&mut paths, path.clone());
-    }
-    for path in [
-        "/opt/homebrew/bin",
-        "/opt/homebrew/sbin",
-        "/usr/local/bin",
-        "/usr/local/sbin",
-    ] {
-        push_existing_unique_path(&mut paths, PathBuf::from(path));
     }
     if let Some(host_path) = host_path {
         for path in std::env::split_paths(host_path) {
             push_unique_path(&mut paths, path);
         }
     }
-    for path in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
-        push_existing_unique_path(&mut paths, PathBuf::from(path));
-    }
-    std::env::join_paths(paths).unwrap_or_else(|_| {
-        host_path
-            .map(OsStr::to_os_string)
-            .unwrap_or_else(|| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
-    })
+    std::env::join_paths(paths).map_err(|error| KernelError::InvalidCommand(format!("Invalid execution PATH: {error}")))
 }
 
 fn push_existing_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {

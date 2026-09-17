@@ -1,13 +1,14 @@
-use crate::local_agent_mcp::{McpRuntime, McpTool, McpToolBindingRequirement, McpToolEffectScope};
+use crate::local_agent_mcp::{McpRuntime, McpTool, McpToolEffectScope};
 use crate::local_agent_product_tools::ProductTools;
-use deepcode_first_party_tools::documents::{self, DocumentContext};
+use deepcode_first_party_tools::documents::{self, DocumentContext, DocumentInput};
+use deepcode_kernel_tools::kernel_internal::{KernelCanonicalInvocation, KernelDeleteTarget};
 use deepcode_kernel_runtime::executors::{
     builtin_executors, web_search_availability, KernelExecutorConfig, KernelExecutorRegistry,
     KernelToolExecutionContext, KernelToolExecutionFailure, KernelToolExecutionOutcome,
     KernelToolExecutionResult, KernelToolInvocation, SecretProvider,
 };
 use deepcode_kernel_tools::{
-    hash_bytes, KernelToolCatalogError, KernelToolRegistry, ToolAvailability, ToolEffectClass,
+    KernelToolCatalogError, KernelToolRegistry, ToolAvailability, ToolEffectClass,
     ToolEffectScope, ToolInputIssue,
 };
 use serde_json::{json, Value};
@@ -62,7 +63,6 @@ struct PendingToolContribution {
     plugin_uri: Option<String>,
     plugin_instance_ref: Option<String>,
     contribution_ref: String,
-    binding_identity: String,
     name: String,
     description: String,
     input_schema: Value,
@@ -74,6 +74,41 @@ struct PendingToolContribution {
 }
 
 type ExactDisposer = Box<dyn FnOnce() -> Result<(), ToolCatalogError> + Send>;
+
+#[derive(Debug, Clone)]
+pub(crate) enum PreparedToolInput {
+    Builtin(KernelCanonicalInvocation),
+    Document(DocumentInput),
+    Dynamic { arguments: Value, targets: Vec<String> },
+}
+
+impl PreparedToolInput {
+    pub(crate) fn arguments(&self) -> Value {
+        match self {
+            Self::Builtin(input) => input.executor_arguments(),
+            Self::Document(input) => serde_json::to_value(input).expect("DocumentInput serializes"),
+            Self::Dynamic { arguments, .. } => arguments.clone(),
+        }
+    }
+
+    pub(crate) fn logical_targets(&self) -> Vec<String> {
+        match self {
+            Self::Builtin(input) => match input {
+                KernelCanonicalInvocation::FsRead { path, .. }
+                | KernelCanonicalInvocation::FsWrite { path, .. }
+                | KernelCanonicalInvocation::FsEdit { path, .. }
+                | KernelCanonicalInvocation::FsDelete(KernelDeleteTarget::File { path })
+                | KernelCanonicalInvocation::FsDelete(KernelDeleteTarget::DirectoryTree { path }) => vec![path.clone()],
+                KernelCanonicalInvocation::ProcessShell { .. }
+                | KernelCanonicalInvocation::ProcessPowerShell { .. } => vec![".".into()],
+                KernelCanonicalInvocation::WebFetch { url, .. } => vec![url.clone()],
+                KernelCanonicalInvocation::WebSearch { .. } => Vec::new(),
+            },
+            Self::Document(input) => vec![input.path.clone()],
+            Self::Dynamic { targets, .. } => targets.clone(),
+        }
+    }
+}
 
 struct InstalledToolProvider {
     tools: Vec<PendingToolContribution>,
@@ -99,7 +134,6 @@ impl ToolProvider for DocumentToolProvider {
                 plugin_uri: None,
                 plugin_instance_ref: None,
                 contribution_ref: "deepcode:documents/document.render".into(),
-                binding_identity: format!("documents:{}", self.python.as_ref().map(|path| path.to_string_lossy().into_owned()).unwrap_or_default()),
                 name: "document.render".into(),
                 description: "Create a polished document artifact in the workspace. Write complete HTML or Markdown, or render self-contained HTML to PDF with WeasyPrint. Read deepcode-documents via skill.read for templates and typography when needed. Output is a workspace mutation; the existing Plan and permission policy applies. PDF requires a configured Python environment with WeasyPrint. Source limit: 1 MiB; PDF limit: 32 MiB.".into(),
                 input_schema: documents::input_schema(),
@@ -125,7 +159,6 @@ impl ToolProvider for ProductToolProvider {
                     plugin_uri: None,
                     plugin_instance_ref: None,
                     contribution_ref: format!("deepcode:product/{name}"),
-                    binding_identity: format!("product:{name}"),
                     name: name.into(),
                     description,
                     input_schema,
@@ -146,7 +179,6 @@ impl ToolProvider for ProductToolProvider {
                     plugin_uri: None,
                     plugin_instance_ref: None,
                     contribution_ref: format!("deepcode:browser/{name}"),
-                    binding_identity: format!("browser:{binding}:{name}"),
                     name: name.into(),
                     description: match &status {
                         Ok(_) => description.into(),
@@ -179,7 +211,6 @@ impl ToolProvider for ProductToolProvider {
 struct BuiltinToolProvider {
     registry: Arc<KernelToolRegistry>,
     executors: Arc<KernelExecutorRegistry>,
-    binding_identity: String,
     web_search_availability: ToolAvailability,
     shell_tool: String,
 }
@@ -190,7 +221,6 @@ impl BuiltinToolProvider {
         secret_provider: Arc<dyn SecretProvider>,
         enable_web_search: bool,
     ) -> Result<Self, ToolCatalogError> {
-        let binding_identity = builtin_binding_identity(&executor_config)?;
         let web_search_availability = if enable_web_search {
             web_search_availability(&executor_config)
         } else {
@@ -210,7 +240,6 @@ impl BuiltinToolProvider {
         Ok(Self {
             registry,
             executors,
-            binding_identity,
             web_search_availability,
             shell_tool,
         })
@@ -228,7 +257,6 @@ impl ToolProvider for BuiltinToolProvider {
                 plugin_uri: None,
                 plugin_instance_ref: None,
                 contribution_ref: format!("tool-contribution:builtin:{}", descriptor.name),
-                binding_identity: self.binding_identity.clone(),
                 name: descriptor.name.clone(),
                 description: descriptor.description.clone(),
                 input_schema: descriptor.input_schema.clone(),
@@ -278,32 +306,12 @@ impl ToolProvider for McpToolProvider {
             .runtime
             .tools()
             .map(|tool| {
-                let binding_requirement = match &tool.binding_requirement {
-                    McpToolBindingRequirement::None => "none".to_string(),
-                    McpToolBindingRequirement::WorkspacePath { argument } => {
-                        format!("workspacePath:{argument}")
-                    }
-                };
-                let stable_binding_identity = format!(
-                    "mcp-binding:{}",
-                    hash_bytes(
-                        format!(
-                            "{}\n{}\n{}\n{}",
-                            tool.plugin_instance_ref,
-                            tool.public_name,
-                            tool.target,
-                            binding_requirement,
-                        )
-                        .as_bytes(),
-                    )
-                );
                 PendingToolContribution {
                     origin: "extension",
                     provider_ref: tool.provider_ref.clone(),
                     plugin_uri: Some(tool.plugin_uri.clone()),
                     plugin_instance_ref: Some(tool.plugin_instance_ref.clone()),
                     contribution_ref: tool.contribution_ref.clone(),
-                    binding_identity: stable_binding_identity,
                     name: tool.public_name.clone(),
                     description: tool.description.clone(),
                     input_schema: tool.input_schema.clone(),
@@ -411,7 +419,6 @@ pub(crate) struct ToolCatalogSnapshot {
 impl ToolCatalogSnapshot {
     pub(crate) fn prepare(
         extension_generation_ref: &str,
-        kernel_runtime_generation_key: &str,
         executor_config: KernelExecutorConfig,
         secret_provider: Arc<dyn SecretProvider>,
         mcp: McpRuntime,
@@ -419,7 +426,6 @@ impl ToolCatalogSnapshot {
         product: Arc<ProductTools>,
     ) -> Result<Arc<Self>, ToolCatalogError> {
         validate_ref("extensionGenerationRef", extension_generation_ref)?;
-        validate_ref("kernelRuntimeGenerationKey", kernel_runtime_generation_key)?;
         let providers: Vec<Box<dyn ToolProvider>> = vec![
             Box::new(BuiltinToolProvider::prepare(
                 executor_config,
@@ -434,14 +440,12 @@ impl ToolCatalogSnapshot {
         ];
         Self::from_providers(
             extension_generation_ref,
-            kernel_runtime_generation_key,
             providers,
         )
     }
 
     fn from_providers(
         extension_generation_ref: &str,
-        kernel_runtime_generation_key: &str,
         providers: Vec<Box<dyn ToolProvider>>,
     ) -> Result<Arc<Self>, ToolCatalogError> {
         let mut contributions = BTreeMap::new();
@@ -470,56 +474,18 @@ impl ToolCatalogSnapshot {
             disposers.push(installed.dispose);
         }
 
-        let shape = Value::Array(
-            contributions
-                .values()
-                .map(|tool| {
-                    json!({
-                        "origin": tool.origin,
-                        "providerRef": tool.provider_ref,
-                        "pluginUri": tool.plugin_uri,
-                        "pluginInstanceRef": tool.plugin_instance_ref,
-                        "contributionRef": tool.contribution_ref,
-                        "bindingIdentity": tool.binding_identity,
-                        "logicalTarget": tool.logical_target,
-                        "name": tool.name,
-                        "description": tool.description,
-                        "inputSchema": tool.input_schema,
-                        "possibleEffects": possible_effects(tool.effect_class, tool.effect_scope),
-                        "availability": availability_name(tool.availability),
-                    })
-                })
-                .collect(),
-        );
-        let encoded = match serde_json::to_vec(&json!({
-            "extensionGenerationRef": extension_generation_ref,
-            "kernelRuntimeGenerationKey": kernel_runtime_generation_key,
-            "tools": shape,
-        })) {
-            Ok(encoded) => encoded,
-            Err(error) => {
+        let snapshot_ref = match crate::utils::new_runtime_ref("kernel-catalog") {
+            Ok(reference) => reference,
+            Err(message) => {
                 dispose_all(disposers);
-                return Err(ToolCatalogError::new(
-                    "tool_catalog_encode_failed",
-                    error.to_string(),
-                ));
+                return Err(ToolCatalogError::new("tool_catalog_identity_failed", message));
             }
         };
-        let snapshot_ref = format!("kernel-catalog:{}", hash_bytes(&encoded));
 
         let mut tools = BTreeMap::new();
         let mut bindings = BTreeMap::new();
         for (_, contribution) in contributions {
-            let binding_ref = format!(
-                "tool-binding:{}",
-                hash_bytes(
-                    format!(
-                        "{}\n{}\n{}",
-                        snapshot_ref, contribution.contribution_ref, contribution.name
-                    )
-                    .as_bytes()
-                )
-            );
+            let binding_ref = format!("tool-binding:{}:{}", snapshot_ref, tools.len());
             bindings.insert(binding_ref.clone(), contribution.name.clone());
             tools.insert(
                 contribution.name.clone(),
@@ -736,11 +702,11 @@ impl PreparedCatalogBinding {
         self.entry().logical_target.as_deref()
     }
 
-    pub(crate) fn canonicalize(&self, raw_arguments: Value) -> Result<Value, ToolCatalogError> {
+    pub(crate) fn canonicalize(&self, raw_arguments: Value) -> Result<PreparedToolInput, ToolCatalogError> {
         match &self.entry().binding {
             ToolExecutorBinding::Builtin { registry, .. } => registry
                 .canonicalize(self.tool_name(), raw_arguments)
-                .map(|invocation| invocation.arguments)
+                .map(PreparedToolInput::Builtin)
                 .map_err(|error| {
                     let message = error.to_string();
                     match error {
@@ -754,53 +720,35 @@ impl PreparedCatalogBinding {
                         _ => ToolCatalogError::new("tool_catalog_invalid", message),
                     }
                 }),
-            ToolExecutorBinding::Mcp(_) => Ok(raw_arguments),
+            ToolExecutorBinding::Mcp(tool) => {
+                let targets = tool.logical_targets(&raw_arguments)
+                    .map_err(|error| ToolCatalogError::new(error.code, error.message))?;
+                Ok(PreparedToolInput::Dynamic { arguments: raw_arguments, targets })
+            },
             ToolExecutorBinding::Browser(_) => {
-                browser_targets(self.tool_name(), &raw_arguments)?;
-                Ok(raw_arguments)
+                let targets = browser_targets(self.tool_name(), &raw_arguments)?;
+                Ok(PreparedToolInput::Dynamic { arguments: raw_arguments, targets })
             }
             ToolExecutorBinding::Document { .. } => {
-                documents::logical_targets(&raw_arguments)
-                    .map_err(|error| ToolCatalogError::new(error.code, error.message))?;
-                Ok(raw_arguments)
+                documents::prepare(raw_arguments)
+                    .map(PreparedToolInput::Document)
+                    .map_err(|error| ToolCatalogError::new(error.code, error.message))
             }
             ToolExecutorBinding::Product(_) => {
-                product_logical_targets(self.tool_name(), &raw_arguments)?;
-                Ok(raw_arguments)
+                let targets = product_logical_targets(self.tool_name(), &raw_arguments)?;
+                Ok(PreparedToolInput::Dynamic { arguments: raw_arguments, targets })
             }
-        }
-    }
-
-    pub(crate) fn binding_logical_targets(
-        &self,
-        arguments: &Value,
-    ) -> Result<Option<Vec<String>>, ToolCatalogError> {
-        match &self.entry().binding {
-            ToolExecutorBinding::Builtin { .. } => Ok(None),
-            ToolExecutorBinding::Browser(_) => {
-                browser_targets(self.tool_name(), arguments).map(Some)
-            }
-            ToolExecutorBinding::Document { .. } => documents::logical_targets(arguments)
-                .map(Some)
-                .map_err(|error| ToolCatalogError::new(error.code, error.message)),
-            ToolExecutorBinding::Product(_) => {
-                product_logical_targets(self.tool_name(), arguments).map(Some)
-            }
-            ToolExecutorBinding::Mcp(tool) => tool
-                .logical_targets(arguments)
-                .map(Some)
-                .map_err(|error| ToolCatalogError::new(error.code, error.message)),
         }
     }
 
     pub(crate) fn invoke(
         &self,
         invocation_id: &str,
-        input: Value,
+        input: PreparedToolInput,
         context: KernelToolExecutionContext,
     ) -> Result<KernelToolExecutionResult, ToolCatalogError> {
-        match &self.entry().binding {
-            ToolExecutorBinding::Browser(binding) => {
+        match (&self.entry().binding, input) {
+            (ToolExecutorBinding::Browser(binding), PreparedToolInput::Dynamic { arguments: input, .. }) => {
                 let result = crate::browser_tools::execute(
                     binding,
                     self.tool_name(),
@@ -826,7 +774,7 @@ impl PreparedCatalogBinding {
                     },
                 })
             }
-            ToolExecutorBinding::Document { python } => {
+            (ToolExecutorBinding::Document { python }, PreparedToolInput::Document(input)) => {
                 let workspace_id = context.workspace_id.as_deref().ok_or_else(|| {
                     ToolCatalogError::new(
                         "workspace_binding_required",
@@ -884,7 +832,7 @@ impl PreparedCatalogBinding {
                         output["fileChanges"] =
                             json!([deepcode_kernel_runtime::executors::file_change_fact(
                                 &context,
-                                input["path"].as_str().expect("validated document path"),
+                                &input.path,
                                 before,
                                 after
                             )
@@ -910,12 +858,10 @@ impl PreparedCatalogBinding {
                     },
                 })
             }
-            ToolExecutorBinding::Builtin { executors, .. } => executors
+            (ToolExecutorBinding::Builtin { executors, .. }, PreparedToolInput::Builtin(input)) => executors
                 .invoke(
-                    self.tool_name(),
                     KernelToolInvocation {
                         id: invocation_id.to_string(),
-                        tool_id: self.tool_name().to_string(),
                         input,
                     },
                     context,
@@ -943,7 +889,7 @@ impl PreparedCatalogBinding {
                         }),
                     })
                 }),
-            ToolExecutorBinding::Product(product) => {
+            (ToolExecutorBinding::Product(product), PreparedToolInput::Dynamic { arguments: input, .. }) => {
                 let result = product.call(self.tool_name(), input);
                 Ok(match result {
                     Ok(output) => KernelToolExecutionResult {
@@ -963,7 +909,7 @@ impl PreparedCatalogBinding {
                     },
                 })
             }
-            ToolExecutorBinding::Mcp(tool) => tool
+            (ToolExecutorBinding::Mcp(tool), PreparedToolInput::Dynamic { arguments: input, .. }) => tool
                 .call(input, &context)
                 .map(|result| {
                     let crate::local_agent_mcp::McpToolCallResult { output, failure } = result;
@@ -986,6 +932,7 @@ impl PreparedCatalogBinding {
                     }
                 })
                 .map_err(|error| ToolCatalogError::new(error.code, error.message)),
+            _ => Err(ToolCatalogError::new("tool_binding_mismatch", "Prepared input does not match its executor binding.")),
         }
     }
 
@@ -1186,19 +1133,6 @@ fn dispose_all(disposers: Vec<ExactDisposer>) {
     for dispose in disposers.into_iter().rev() {
         let _ = dispose();
     }
-}
-
-fn builtin_binding_identity(config: &KernelExecutorConfig) -> Result<String, ToolCatalogError> {
-    let encoded = serde_json::to_vec(&json!({
-        "webSearchEndpointTemplate": config.web_search_endpoint_template,
-        "webSearchAuthHeaderName": config.web_search_auth_header_name,
-        "webSearchAuthSecretRef": config.web_search_auth_secret_ref,
-        "cloudWebSearch": config.cloud_web_search,
-        "shellProgram": config.shell_program,
-        "wsl": config.wsl,
-    }))
-    .map_err(|error| ToolCatalogError::new("builtin_binding_encode_failed", error.to_string()))?;
-    Ok(format!("builtin-binding:{}", hash_bytes(&encoded)))
 }
 
 fn validate_ref(field: &str, value: &str) -> Result<(), ToolCatalogError> {

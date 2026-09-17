@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -26,7 +27,8 @@ pub(crate) struct McpPluginDescriptor {
     pub(crate) name: String,
     pub(crate) short_description: String,
     pub(crate) activation_media_types: Vec<String>,
-    pub(crate) plugin_artifact_ref: String,
+    pub(crate) implementation: Value,
+    pub(crate) content: Arc<[u8]>,
     pub(crate) provider_ref: String,
     pub(crate) capability_refs: Vec<String>,
     pub(crate) capability_summary: String,
@@ -77,7 +79,7 @@ pub(crate) struct McpTool {
     pub(crate) contribution_ref: String,
     pub(crate) effect_scope: McpToolEffectScope,
     pub(crate) binding_requirement: McpToolBindingRequirement,
-    client: ToolClient,
+    instance: Arc<ToolInstance>,
 }
 
 #[derive(Debug)]
@@ -115,7 +117,7 @@ impl McpTool {
                 }))
             }
         };
-        match &self.client {
+        match &self.instance.client {
             ToolClient::Mcp(client) => {
                 client.call_tool(&self.remote_name, input, metadata, &context.cancellation)
             }
@@ -146,38 +148,81 @@ impl McpTool {
 #[derive(Clone)]
 pub(crate) struct McpRuntime {
     tools: Arc<BTreeMap<String, McpTool>>,
-    clients: Arc<Vec<ToolClient>>,
-    configuration_identity: Arc<Value>,
+    view: Arc<McpView>,
+}
+
+#[derive(Debug)]
+struct ToolInstance {
+    client: ToolClient,
+    views: AtomicUsize,
+}
+
+#[derive(Default)]
+struct McpView {
+    instances: BTreeMap<String, Arc<ToolInstance>>,
+    released: AtomicBool,
+}
+
+impl McpView {
+    fn shutdown(&self) -> Result<(), McpRuntimeError> {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let mut first_error = None;
+        for instance in self.instances.values() {
+            if instance.views.fetch_sub(1, Ordering::AcqRel) == 1 {
+                if let Err(error) = instance.client.shutdown() {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for McpView {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
 }
 
 impl Default for McpRuntime {
     fn default() -> Self {
         Self {
             tools: Arc::new(BTreeMap::new()),
-            clients: Arc::new(Vec::new()),
-            configuration_identity: Arc::new(Value::Array(Vec::new())),
+            view: Arc::new(McpView::default()),
         }
     }
 }
 
 impl McpRuntime {
+    fn from_parts(
+        tools: BTreeMap<String, McpTool>,
+        instances: BTreeMap<String, Arc<ToolInstance>>,
+    ) -> Self {
+        for instance in instances.values() {
+            instance.views.fetch_add(1, Ordering::Relaxed);
+        }
+        Self {
+            tools: Arc::new(tools),
+            view: Arc::new(McpView {
+                instances,
+                released: AtomicBool::new(false),
+            }),
+        }
+    }
     /// Reuse unchanged instances and prepare selected replacements; old views stay pinned.
-    pub(crate) fn extend_selected_settings(
+    pub(crate) fn extend_selected_sources(
         &self,
-        settings: &Value,
+        sources: &[McpServerSource],
         selected: &BTreeMap<String, String>,
     ) -> Result<Self, McpRuntimeError> {
         let additions = selected
             .iter()
-            .filter(|(uri, instance)| {
-                !self
-                    .tools
-                    .values()
-                    .any(|tool| &tool.plugin_uri == *uri && &tool.plugin_instance_ref == *instance)
-            })
+            .filter(|(_, instance)| !self.view.instances.contains_key(*instance))
             .map(|(uri, instance)| (uri.clone(), instance.clone()))
             .collect();
-        let added = Self::from_selected_settings(settings, &additions)?;
+        let added = Self::from_selected_sources(sources, &additions)?;
         let mut tools = self
             .tools
             .iter()
@@ -192,44 +237,25 @@ impl McpRuntime {
                 ));
             }
         }
-        let clients = tools.values().map(|tool| tool.client.clone()).collect();
-        let mut identity = self
-            .configuration_identity
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|item| {
-                item["uri"]
-                    .as_str()
-                    .is_some_and(|uri| selected.contains_key(uri) && !additions.contains_key(uri))
-            })
-            .collect::<Vec<_>>();
-        identity.extend(
-            added
-                .configuration_identity
-                .as_array()
-                .into_iter()
-                .flatten()
-                .cloned(),
-        );
-        identity.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
-        Ok(Self {
-            tools: Arc::new(tools),
-            clients: Arc::new(clients),
-            configuration_identity: Arc::new(Value::Array(identity)),
-        })
+        let instances = self
+            .view
+            .instances
+            .iter()
+            .chain(added.view.instances.iter())
+            .filter(|(id, _)| selected.values().any(|selected| selected == *id))
+            .map(|(id, instance)| (id.clone(), Arc::clone(instance)))
+            .collect();
+        Ok(Self::from_parts(tools, instances))
     }
 
-    pub(crate) fn from_selected_settings(
-        settings: &Value,
+    pub(crate) fn from_selected_sources(
+        sources: &[McpServerSource],
         selected_plugin_instances: &BTreeMap<String, String>,
     ) -> Result<Self, McpRuntimeError> {
         if selected_plugin_instances.is_empty() {
             return Ok(Self::default());
         }
-        let servers = available_server_sources(settings)?;
-        let available = servers
+        let available = sources
             .iter()
             .filter(|server| server.setting.enabled)
             .map(|server| server.descriptor.uri.as_str())
@@ -244,12 +270,13 @@ impl McpRuntime {
             ));
         }
         Self::from_servers(
-            servers
-                .into_iter()
+            sources
+                .iter()
                 .filter(|server| {
                     server.setting.enabled
                         && selected_plugin_instances.contains_key(&server.descriptor.uri)
                 })
+                .cloned()
                 .collect(),
             selected_plugin_instances,
         )
@@ -270,24 +297,8 @@ impl McpRuntime {
                 ));
             }
         }
-        let configuration_identity = Value::Array(
-            servers_by_id
-                .values()
-                .map(|server| {
-                    json!({
-                        "id": server.setting.id,
-                        "uri": server.descriptor.uri,
-                        "pluginArtifactRef": server.descriptor.plugin_artifact_ref,
-                        "name": server.setting.name,
-                        "transport": server.setting.transport,
-                        "command": server.setting.command,
-                        "args": server.setting.args,
-                    })
-                })
-                .collect(),
-        );
         let mut tools = BTreeMap::new();
-        let mut clients = Vec::new();
+        let mut instances = BTreeMap::new();
         for (_, server) in servers_by_id {
             let (client, definitions) = if server.setting.transport == "cli" {
                 let definitions = match &server.contract {
@@ -320,11 +331,14 @@ impl McpRuntime {
                 let definitions = client.list_tools()?;
                 (ToolClient::Mcp(client), definitions)
             };
-            validate_first_party_tool_set(&server, &definitions)?;
             let plugin_instance_ref = selected_plugin_instances
                 .get(&server.descriptor.uri)
                 .expect("selected server has a plugin instance")
                 .clone();
+            let instance = Arc::new(ToolInstance {
+                client,
+                views: AtomicUsize::new(0),
+            });
             for definition in definitions {
                 let contract = tool_contract(&server, &definition)?;
                 let public_name = contract.public_name;
@@ -342,7 +356,7 @@ impl McpRuntime {
                     contribution_ref: contract.contribution_ref,
                     effect_scope: contract.effect_scope,
                     binding_requirement: contract.binding_requirement,
-                    client: client.clone(),
+                    instance: Arc::clone(&instance),
                 };
                 if tools.insert(public_name.clone(), tool).is_some() {
                     return Err(McpRuntimeError::new(
@@ -357,76 +371,29 @@ impl McpRuntime {
                     ));
                 }
             }
-            clients.push(client);
+            instances.insert(plugin_instance_ref, instance);
         }
-        Ok(Self {
-            tools: Arc::new(tools),
-            clients: Arc::new(clients),
-            configuration_identity: Arc::new(configuration_identity),
-        })
+        Ok(Self::from_parts(tools, instances))
     }
 
     pub(crate) fn tools(&self) -> impl Iterator<Item = &McpTool> {
         self.tools.values()
     }
 
-    pub(crate) fn extension_identity(&self) -> Value {
-        json!({
-            "servers": self.configuration_identity.as_ref(),
-            "tools": self.tools.values().map(|tool| json!({
-                "publicName": tool.public_name,
-                "remoteName": tool.remote_name,
-                "description": tool.description,
-                "inputSchema": tool.input_schema,
-                "target": tool.target,
-                "pluginUri": tool.plugin_uri,
-                "providerRef": tool.provider_ref,
-                "contributionRef": tool.contribution_ref,
-                "effectScope": mcp_effect_scope_name(tool.effect_scope),
-                "bindingRequirement": mcp_binding_identity(&tool.binding_requirement),
-            })).collect::<Vec<_>>(),
-        })
-    }
-
     pub(crate) fn shutdown(&self) -> Result<(), McpRuntimeError> {
-        let mut first_error = None;
-        for client in self.clients.iter() {
-            if let Err(error) = client.shutdown() {
-                first_error.get_or_insert(error);
-            }
-        }
-        first_error.map_or(Ok(()), Err)
+        self.view.shutdown()
     }
 }
 
-pub(crate) fn available_plugins(
-    settings: &Value,
-) -> Result<Vec<McpPluginDescriptor>, McpRuntimeError> {
-    Ok(available_server_sources(settings)?
-        .into_iter()
-        .map(|server| {
-            let mut descriptor = server.descriptor;
-            if server.setting.enabled {
-                if descriptor.error.is_none() {
-                    descriptor.error = validate_server(&server.setting)
-                        .and_then(|()| split_args(&server.setting.args).map(|_| ()))
-                        .err();
-                }
-            }
-            descriptor
-        })
-        .collect())
-}
-
-#[derive(Clone)]
-struct McpServerSource {
+#[derive(Debug, Clone)]
+pub(crate) struct McpServerSource {
     setting: McpServerSetting,
-    descriptor: McpPluginDescriptor,
+    pub(crate) descriptor: McpPluginDescriptor,
     contract: McpServerContract,
     cli_entry: Option<(String, Vec<u8>)>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 enum McpServerContract {
     External,
     LocalCli(Vec<RemoteToolDefinition>),
@@ -444,7 +411,9 @@ struct McpToolContract {
     binding_requirement: McpToolBindingRequirement,
 }
 
-fn available_server_sources(settings: &Value) -> Result<Vec<McpServerSource>, McpRuntimeError> {
+pub(crate) fn available_server_sources(
+    settings: &Value,
+) -> Result<Vec<McpServerSource>, McpRuntimeError> {
     let mut sources = configured_servers(settings)?
         .into_iter()
         .map(external_server_source)
@@ -484,7 +453,12 @@ fn available_server_sources(settings: &Value) -> Result<Vec<McpServerSource>, Mc
     }
     let mut ids = BTreeSet::new();
     let mut uris = BTreeSet::new();
-    for source in &sources {
+    for source in &mut sources {
+        if source.setting.enabled && source.descriptor.error.is_none() {
+            source.descriptor.error = validate_server(&source.setting)
+                .and_then(|()| split_args(&source.setting.args).map(|_| ()))
+                .err();
+        }
         if !ids.insert(source.setting.id.clone()) {
             return Err(McpRuntimeError::new(
                 "mcp_server_duplicate",
@@ -509,22 +483,14 @@ fn external_server_source(setting: McpServerSetting) -> Result<McpServerSource, 
         "command": setting.command,
         "args": setting.args,
     });
-    let encoded = serde_json::to_vec(&identity).map_err(|error| {
-        McpRuntimeError::new(
-            "mcp_config_invalid",
-            format!("编码 MCP 插件身份失败：{error}"),
-        )
-    })?;
     let descriptor = McpPluginDescriptor {
         management:json!({"key":"mcp.servers","id":setting.id}),
         uri: mcp_plugin_uri(&setting.id),
         name: setting.name.clone(),
         short_description: "连接的外部工具".to_string(),
         activation_media_types: Vec::new(),
-        plugin_artifact_ref: format!(
-            "plugin-artifact:{}",
-            deepcode_kernel_tools::hash_bytes(&encoded)
-        ),
+        implementation: identity,
+        content: Arc::from([]),
         provider_ref: "tool-provider:mcp".to_string(),
         capability_refs: vec![format!("mcp-server:{}", setting.id)],
         capability_summary: "The selected MCP service is active for this run. Its callable tools are supplied separately by the current tool catalog.".to_string(),
@@ -551,7 +517,7 @@ fn first_party_server_source(
         short_description,
         activation_media_types,
         provider_ref,
-        plugin_artifact_ref,
+        implementation,
         capability_refs,
         capability_summary,
         tools,
@@ -573,7 +539,8 @@ fn first_party_server_source(
         name: display_name.clone(),
         short_description,
         activation_media_types,
-        plugin_artifact_ref,
+        implementation: json!({"manifest": implementation, "command": provider_binary}),
+        content: Arc::from([]),
         provider_ref,
         capability_refs,
         capability_summary,
@@ -599,47 +566,6 @@ fn first_party_server_source(
         contract: McpServerContract::FirstParty(tools),
         cli_entry: None,
     }
-}
-
-fn validate_first_party_tool_set(
-    server: &McpServerSource,
-    definitions: &[RemoteToolDefinition],
-) -> Result<(), McpRuntimeError> {
-    let McpServerContract::FirstParty(expected) = &server.contract else {
-        return Ok(());
-    };
-    if definitions.len() != expected.len() {
-        return Err(McpRuntimeError::new(
-            "first_party_descriptor_mismatch",
-            format!(
-                "First-party provider {} tool 数量与 manifest 不一致。",
-                server.descriptor.uri
-            ),
-        ));
-    }
-    for tool in expected {
-        let definition = definitions
-            .iter()
-            .find(|definition| definition.name == tool.remote_name)
-            .ok_or_else(|| {
-                McpRuntimeError::new(
-                    "first_party_descriptor_mismatch",
-                    format!("First-party provider 缺少工具：{}", tool.remote_name),
-                )
-            })?;
-        if definition.description.as_deref() != Some(tool.description.as_str())
-            || definition.input_schema != tool.input_schema
-        {
-            return Err(McpRuntimeError::new(
-                "first_party_descriptor_mismatch",
-                format!(
-                    "First-party provider 工具 schema/description 与 manifest 不一致：{}",
-                    tool.remote_name
-                ),
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn tool_contract(
@@ -692,23 +618,6 @@ fn tool_contract(
                     }
                 },
             })
-        }
-    }
-}
-
-fn mcp_effect_scope_name(scope: McpToolEffectScope) -> &'static str {
-    match scope {
-        McpToolEffectScope::WorkspaceRead => "workspaceRead",
-        McpToolEffectScope::Network => "network",
-        McpToolEffectScope::External => "external",
-    }
-}
-
-fn mcp_binding_identity(binding: &McpToolBindingRequirement) -> Value {
-    match binding {
-        McpToolBindingRequirement::None => json!({ "kind": "none" }),
-        McpToolBindingRequirement::WorkspacePath { argument } => {
-            json!({ "kind": "workspacePath", "argument": argument })
         }
     }
 }
@@ -816,7 +725,8 @@ fn local_cli_source(source: LocalPluginSource) -> McpServerSource {
             name: source.id.clone(),
             short_description: "本地工具".into(),
             activation_media_types: vec![],
-            plugin_artifact_ref: String::new(),
+            implementation: Value::Null,
+            content: Arc::from([]),
             provider_ref: format!("tool-provider:cli:{}", source.id),
             capability_refs: vec![],
             capability_summary: String::new(),
@@ -870,12 +780,9 @@ fn local_cli_source(source: LocalPluginSource) -> McpServerSource {
                 return Err("工具需要唯一名称、用途和 inputSchema".into());
             }
         }
-        let mut identity = encoded;
-        identity.extend_from_slice(&bytes);
-        result.descriptor.plugin_artifact_ref = format!(
-            "plugin-artifact:{}",
-            deepcode_kernel_tools::hash_bytes(&identity)
-        );
+        result.descriptor.implementation =
+            serde_json::from_slice(&encoded).map_err(|error| error.to_string())?;
+        result.descriptor.content = Arc::from(bytes.as_slice());
         result.descriptor.name = manifest.name.clone();
         result.descriptor.short_description = manifest.description.clone();
         result.descriptor.capability_summary = manifest.description;
@@ -1468,54 +1375,82 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stdio_server_contributes_and_executes_tool() {
-        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/skill-mcp-smoke/mcp/mcp-text-tools/server.py")
-            .canonicalize()
-            .expect("fixture server");
-        let settings = json!({
-            "mcp.autoLoad": true,
-            "mcp.servers": serde_json::to_string(&json!([{
-                "id": "fixture.mcp.text-tools",
-                "name": "Fixture MCP Text Tools",
-                "transport": "stdio",
-                "command": "python3",
-                "args": script.to_string_lossy(),
-                "enabled": true,
-            }])).expect("settings"),
-        });
-        let runtime = McpRuntime::from_selected_settings(
-            &settings,
-            &BTreeMap::from([(
-                mcp_plugin_uri("fixture.mcp.text-tools"),
-                "plugin-instance:test:text-tools".to_string(),
-            )]),
-        )
-        .expect("start selected MCP runtime");
-        let tool = runtime
-            .tools()
-            .find(|tool| tool.public_name == "mcp.fixture.mcp.text-tools.text.reverse")
-            .expect("mapped tool");
-        let result = tool
-            .call(
-                json!({ "text": "DeepCode" }),
-                &KernelToolExecutionContext {
-                    output_directory: None,
-                    workspace_root: None,
-                    workspace_id: None,
-                    private_resolved_targets: Vec::new(),
-                    workspace_write_targets: None,
-                    cancellation: KernelCancellationToken::default(),
-                    progress: Default::default(),
-                },
-            )
-            .expect("call tool");
-        assert!(result.failure.is_none());
-        assert_eq!(
-            result.output.pointer("/content/0/text"),
-            Some(&json!("edoCpeeD"))
+    fn multiple_tools_share_the_instance_until_the_last_runtime_view_releases() {
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = Directory(
+            std::env::temp_dir().join(format!("deepcode-mcp-views-{}-{stamp}", std::process::id())),
         );
-        runtime.shutdown().expect("shutdown MCP runtime");
+        std::fs::create_dir(&root.0).unwrap();
+        let script = root.0.join("server.py");
+        std::fs::write(&script, r#"import json,os,sys
+for line in sys.stdin:
+    request=json.loads(line)
+    if 'id' not in request: continue
+    method=request['method']
+    if method=='initialize':
+        result={'protocolVersion':'2025-06-18','capabilities':{'tools':{}},'serverInfo':{'name':'views','version':'1'}}
+    elif method=='tools/list':
+        result={'tools':[{'name':name,'description':name,'inputSchema':{'type':'object'}} for name in ['first','second']]}
+    else:
+        result={'content':[{'type':'text','text':str(os.getpid())+':'+request['params']['name']}],'isError':False}
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
+"#).unwrap();
+        let settings = json!({"mcp.servers":serde_json::to_string(&json!([{
+            "id":"views", "name":"Views", "transport":"stdio", "command":"python3", "args":script, "enabled":true
+        }])).unwrap()});
+        let sources = available_server_sources(&settings).unwrap();
+        let selected = BTreeMap::from([(mcp_plugin_uri("views"), "instance:views".into())]);
+        let first = McpRuntime::from_selected_sources(&sources, &selected).unwrap();
+        let second = first.extend_selected_sources(&sources, &selected).unwrap();
+        let context = || KernelToolExecutionContext {
+            output_directory: None,
+            workspace_root: None,
+            workspace_id: None,
+            private_resolved_targets: vec![],
+            workspace_write_targets: None,
+            cancellation: KernelCancellationToken::default(),
+            progress: Default::default(),
+        };
+        let call = |runtime: &McpRuntime, name: &str| {
+            runtime
+                .tools()
+                .find(|tool| tool.remote_name == name)
+                .unwrap()
+                .call(json!({}), &context())
+        };
+        let one = call(&first, "first").unwrap();
+        let two = call(&second, "second").unwrap();
+        assert!(one.failure.is_none() && two.failure.is_none());
+        let one = one.output["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let two = two.output["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(one.ends_with(":first") && two.ends_with(":second"));
+        assert_eq!(
+            one.split(':').next(),
+            two.split(':').next(),
+            "both tools execute in the same server process"
+        );
+        first.shutdown().unwrap();
+        assert!(call(&second, "first").unwrap().failure.is_none());
+        second.shutdown().unwrap();
+        for name in ["first", "second"] {
+            assert_eq!(call(&second, name).unwrap_err().code, "mcp_server_stopped");
+        }
+        second.shutdown().unwrap();
     }
 
     #[test]
@@ -1544,11 +1479,17 @@ mod tests {
         let selected = |instance: &str| {
             BTreeMap::from([("plugin://sample@cli".to_string(), instance.to_string())])
         };
-        let first =
-            McpRuntime::from_selected_settings(&settings, &selected("instance:first")).unwrap();
+        let first = McpRuntime::from_selected_sources(
+            &available_server_sources(&settings).unwrap(),
+            &selected("instance:first"),
+        )
+        .unwrap();
         write("second");
         let second = first
-            .extend_selected_settings(&settings, &selected("instance:second"))
+            .extend_selected_sources(
+                &available_server_sources(&settings).unwrap(),
+                &selected("instance:second"),
+            )
             .unwrap();
         let context = |attempt: &str| KernelToolExecutionContext {
             output_directory: Some(root.0.join(attempt)),
@@ -1574,9 +1515,8 @@ mod tests {
         assert!(old.failure.is_none() && new.failure.is_none());
         assert_eq!(old.output["version"], "first");
         assert_eq!(new.output["version"], "second");
-        assert_ne!(first.extension_identity(), second.extension_identity());
         assert!(matches!(
-            second.tools().next().unwrap().client,
+            second.tools().next().unwrap().instance.client,
             ToolClient::Cli(_)
         ));
     }
@@ -1620,8 +1560,8 @@ mod tests {
                 "enabled": true,
             }])).expect("settings"),
         });
-        let runtime = McpRuntime::from_selected_settings(
-            &settings,
+        let runtime = McpRuntime::from_selected_sources(
+            &available_server_sources(&settings).unwrap(),
             &BTreeMap::from([(
                 mcp_plugin_uri("fixture.mcp.cancelled"),
                 "plugin-instance:test:cancelled".to_string(),

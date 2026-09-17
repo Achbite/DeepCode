@@ -26,22 +26,25 @@ export function decodeConversationReadQuery(value: unknown): ConversationReadQue
 
 export async function readSessionEvents(journal: CommandJournalPort, sessionId: string): Promise<SessionEvent[]> {
   const events: SessionEvent[] = [];
-  for await (const event of journal.read(sessionId)) events.push(event);
+  for await (const event of journal.read(sessionId)) {
+    if (event.sessionId !== sessionId) throw new Error('session_event_identity_mismatch');
+    if (event.sequence !== events.length + 1) throw new Error('session_event_sequence_gap');
+    events.push(event);
+  }
   if (!events.length) throw new Error('session_not_found');
   if (events[0].type !== 'session.created') throw new Error('session_creation_event_missing');
   return events;
 }
 
-export async function readConversation(journal: CommandJournalPort, input: ConversationReadQuery): Promise<ConversationReadResult> {
-  const query = decodeConversationReadQuery(input);
+export async function readConversation(journal: CommandJournalPort, query: ConversationReadQuery): Promise<ConversationReadResult> {
   const journalEvents = await readSessionEvents(journal, query.sessionId);
-  const state = recoverSession(query.sessionId, journalEvents);
   const events = activeConversationEvents(journalEvents);
   const view = query.view ?? 'summary';
   const result: ConversationReadResult = {
-    sessionId: query.sessionId, revision: state.revision, view, items: [], nextBefore: null,
+    sessionId: query.sessionId, revision: journalEvents.at(-1)!.sequence, view, items: [], nextBefore: null,
   };
   if (view === 'summary') {
+    const state = recoverSession(query.sessionId, journalEvents);
     const lastUser = state.messages.findLast((message) => message.role === 'user');
     const lastAssistant = state.messages.findLast((message) => message.role === 'assistant');
     result.summary = {

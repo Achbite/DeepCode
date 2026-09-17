@@ -12,7 +12,6 @@ import {
   HttpRunPreparationPort,
 } from './local-agent/httpPorts.js';
 import { SessionService } from './local-agent/service.js';
-import { decodeConversationReadQuery } from './local-agent/conversationRead.js';
 
 declare const process: {
   env: Record<string, string | undefined>;
@@ -122,7 +121,7 @@ async function dispatch(
       return await service.statuses(sessionIds);
     }
     case 'read':
-      return await service.read(decodeConversationReadQuery(request.data));
+      return await service.read(request.data);
     case 'contextComposition':
       return await service.contextComposition(
         requiredString(request.data, 'sessionId'), requiredString(request.data, 'providerRequestId'),

@@ -1,7 +1,8 @@
 use crate::local_agent_mcp::McpRuntime;
 use crate::local_agent_store::{LocalAgentJournal, LocalAgentStoreError};
 use crate::local_agent_tool_catalog::{
-    CatalogEffectScope, PreparedCatalogBinding, ToolCatalogError, ToolCatalogSnapshot,
+    CatalogEffectScope, PreparedCatalogBinding, PreparedToolInput, ToolCatalogError,
+    ToolCatalogSnapshot,
 };
 use deepcode_kernel_runtime::executors::{
     resolved_network_target, KernelCancellationToken, KernelExecutorConfig,
@@ -9,6 +10,7 @@ use deepcode_kernel_runtime::executors::{
     SecretProvider,
 };
 use deepcode_kernel_runtime::workspace_boundary::WorkspaceBoundary;
+use deepcode_kernel_tools::kernel_internal::{KernelCanonicalInvocation, KernelDeleteTarget};
 use deepcode_kernel_tools::{ToolAvailability, ToolInputIssue};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
@@ -286,7 +288,6 @@ struct KernelGenerationState {
 }
 
 struct ReleasedRunBinding {
-    snapshot_ref: String,
     dispose_error: Option<LocalAgentKernelError>,
 }
 
@@ -391,7 +392,6 @@ impl LocalAgentKernel {
 
     pub(crate) fn prepare_generation(
         extension_generation_ref: &str,
-        kernel_runtime_generation_key: &str,
         executor_config: KernelExecutorConfig,
         secret_provider: Arc<dyn SecretProvider>,
         mcp: McpRuntime,
@@ -401,7 +401,6 @@ impl LocalAgentKernel {
     ) -> Result<PreparedKernelGeneration, LocalAgentKernelError> {
         let catalog = ToolCatalogSnapshot::prepare(
             extension_generation_ref,
-            kernel_runtime_generation_key,
             executor_config.clone(),
             secret_provider,
             mcp,
@@ -492,12 +491,6 @@ impl LocalAgentKernel {
         let has_live_binding = {
             let state = self.lock_generations()?;
             if let Some(released) = state.released_run_bindings.get(&key) {
-                if released.snapshot_ref != request.kernel_catalog_snapshot_ref {
-                    return Err(LocalAgentKernelError::new(
-                        "tool_catalog_release_identity_conflict",
-                        "当前 run 已释放的是其他 KernelCatalogSnapshotRef。",
-                    ));
-                }
                 if let Some(error) = released.dispose_error.clone() {
                     return Err(error);
                 }
@@ -517,48 +510,15 @@ impl LocalAgentKernel {
             }
         };
         if !has_live_binding {
-            let runtime = self
-                .journal
-                .run_runtime_snapshot(&request.session_id, &request.run_id)?;
-            let initial_binding = runtime
-                .get("kernelCatalogSnapshotRef")
-                .and_then(Value::as_str)
-                == Some(request.kernel_catalog_snapshot_ref.as_str());
-            let prepared_binding = self
-                .journal
-                .read_events(&request.session_id, 0)?
-                .iter()
-                .any(|event| {
-                    event["runId"].as_str() == Some(request.run_id.as_str())
-                        && event["type"] == "run.tools.prepared"
-                        && event["payload"]["toolView"]["kernelCatalogSnapshotRef"].as_str()
-                            == Some(request.kernel_catalog_snapshot_ref.as_str())
-                });
-            if !initial_binding && !prepared_binding {
-                return Err(LocalAgentKernelError::new(
-                    "tool_catalog_release_identity_conflict",
-                    "KernelCatalogSnapshotRef 与持久化 run.runtime snapshot 不一致。",
-                ));
-            }
-            self.lock_generations()?.released_run_bindings.insert(
-                key,
-                ReleasedRunBinding {
-                    snapshot_ref: request.kernel_catalog_snapshot_ref.clone(),
-                    dispose_error: None,
-                },
-            );
-            return Ok(catalog_release_reply(&request, true));
+            return Err(LocalAgentKernelError::new(
+                "tool_catalog_run_binding_not_found",
+                "当前 run 的物理 catalog 绑定已丢失，无法确认旧实例已经释放。",
+            ));
         }
         self.cancel_and_drain_attempts(Some((&request.session_id, &request.run_id)))?;
         let already_released = {
             let mut state = self.lock_generations()?;
             if let Some(released) = state.released_run_bindings.get(&key) {
-                if released.snapshot_ref != request.kernel_catalog_snapshot_ref {
-                    return Err(LocalAgentKernelError::new(
-                        "tool_catalog_release_identity_conflict",
-                        "当前 run 已释放的是其他 KernelCatalogSnapshotRef。",
-                    ));
-                }
                 if let Some(error) = released.dispose_error.clone() {
                     return Err(error);
                 }
@@ -598,7 +558,6 @@ impl LocalAgentKernel {
                 state.released_run_bindings.insert(
                     key,
                     ReleasedRunBinding {
-                        snapshot_ref: request.kernel_catalog_snapshot_ref.clone(),
                         dispose_error: dispose_error.clone(),
                     },
                 );
@@ -1004,14 +963,9 @@ impl LocalAgentKernel {
                 ));
             }
         }
-        let arguments = binding.canonicalize(tool_input).map_err(catalog_error)?;
-        let mut logical_targets = match binding
-            .binding_logical_targets(&arguments)
-            .map_err(catalog_error)?
-        {
-            Some(targets) => targets,
-            None => canonical_logical_targets(&request.tool_name, &arguments)?,
-        };
+        let input = binding.canonicalize(tool_input).map_err(catalog_error)?;
+        let arguments = input.arguments();
+        let mut logical_targets = input.logical_targets();
         if matches!(
             scope,
             PreparedEffectScope::Network | PreparedEffectScope::External
@@ -1020,16 +974,16 @@ impl LocalAgentKernel {
                 logical_targets.push(target.to_string());
             }
         }
-        if let Some(target) = resolved_network_target(
-            request.tool_name.as_str(),
-            &arguments,
-            &generation.executor_config,
-        )
-        .map_err(|error| LocalAgentKernelError::new("tool_target_invalid", error.to_string()))?
-        {
-            logical_targets.push(target);
-            logical_targets.sort();
-            logical_targets.dedup();
+        if let PreparedToolInput::Builtin(canonical) = &input {
+            if let Some(target) = resolved_network_target(canonical, &generation.executor_config)
+                .map_err(|error| {
+                    LocalAgentKernelError::new("tool_target_invalid", error.to_string())
+                })?
+            {
+                logical_targets.push(target);
+                logical_targets.sort();
+                logical_targets.dedup();
+            }
         }
         let (workspace_root, private_resolved_targets) = match workspace_id.as_deref() {
             Some(workspace_id) => {
@@ -1102,47 +1056,32 @@ impl LocalAgentKernel {
             }
             None => (None, Vec::new()),
         };
-        let delete_target_kind = if request.tool_name == "fs.delete" {
-            match arguments.get("targetKind").and_then(Value::as_str) {
-                Some("file") => Some("file".to_string()),
-                Some("directoryTree") => Some("directoryTree".to_string()),
-                _ => {
-                    return Err(LocalAgentKernelError::new(
-                        "tool_input_invalid",
-                        "fs.delete canonical targetKind 无效。",
-                    ))
-                }
-            }
-        } else {
-            None
+        let delete_target_kind = match &input {
+            PreparedToolInput::Builtin(KernelCanonicalInvocation::FsDelete(
+                KernelDeleteTarget::File { .. },
+            )) => Some("file".to_owned()),
+            PreparedToolInput::Builtin(KernelCanonicalInvocation::FsDelete(
+                KernelDeleteTarget::DirectoryTree { .. },
+            )) => Some("directoryTree".to_owned()),
+            _ => None,
         };
-        let process_workspace_mode = if is_shell_tool(&request.tool_name) {
-            match arguments.get("workspaceMode").and_then(Value::as_str) {
-                Some("read") => Some("read".to_string()),
-                Some("write") => Some("write".to_string()),
-                _ => {
-                    return Err(LocalAgentKernelError::new(
-                        "tool_input_invalid",
-                        "bash 必须显式声明 workspaceMode=read 或 write。",
-                    ))
+        let (process_workspace_mode, process_execution_scope) = match &input {
+            PreparedToolInput::Builtin(
+                KernelCanonicalInvocation::ProcessShell {
+                    workspace_mode,
+                    execution_scope,
+                    ..
                 }
-            }
-        } else {
-            None
-        };
-        let process_execution_scope = if is_shell_tool(&request.tool_name) {
-            match arguments.get("executionScope").and_then(Value::as_str) {
-                Some("workspace") => Some("workspace".to_string()),
-                Some("host") => Some("host".to_string()),
-                _ => {
-                    return Err(LocalAgentKernelError::new(
-                        "tool_input_invalid",
-                        "bash 必须显式声明 executionScope=workspace 或 host。",
-                    ))
-                }
-            }
-        } else {
-            None
+                | KernelCanonicalInvocation::ProcessPowerShell {
+                    workspace_mode,
+                    execution_scope,
+                    ..
+                },
+            ) => (
+                Some(workspace_mode.as_str().to_owned()),
+                Some(execution_scope.as_str().to_owned()),
+            ),
+            _ => (None, None),
         };
         Ok(PreparedEffect {
             generation,
@@ -1156,7 +1095,7 @@ impl LocalAgentKernel {
                 "toolName": request.tool_name,
                 "arguments": arguments,
             }),
-            canonical_arguments: arguments,
+            input,
             workspace_root,
             delete_target_kind,
             process_workspace_mode,
@@ -1435,7 +1374,6 @@ impl LocalAgentKernel {
         cancellation: KernelCancellationToken,
         progress: deepcode_kernel_runtime::executors::KernelProgressSink,
     ) -> Result<KernelToolExecutionResult, String> {
-        let _private_targets = &prepared.private_resolved_targets;
         let workspace_write_targets = if is_shell_tool(&prepared.operation)
             && prepared.process_execution_scope.as_deref() == Some("workspace")
             && authority["source"] == "plan"
@@ -1475,7 +1413,7 @@ impl LocalAgentKernel {
             .binding
             .invoke(
                 &request.attempt_id,
-                prepared.canonical_arguments.clone(),
+                prepared.input.clone(),
                 KernelToolExecutionContext {
                     output_directory: Some(
                         self.session_output_directory(&request.session_id)
@@ -1642,7 +1580,7 @@ struct PreparedEffect {
     logical_targets: Vec<String>,
     private_resolved_targets: Vec<String>,
     canonical_invocation: Value,
-    canonical_arguments: Value,
+    input: PreparedToolInput,
     workspace_root: Option<String>,
     delete_target_kind: Option<String>,
     process_workspace_mode: Option<String>,
@@ -1684,7 +1622,7 @@ impl PreparedEffect {
 
     fn preview(&self, tool_name: &str) -> Value {
         let mut preview = json!({
-            "summary": effect_summary(tool_name, &self.logical_targets, &self.canonical_arguments),
+            "summary": effect_summary(tool_name, &self.logical_targets, &self.canonical_invocation["arguments"]),
             "effects": process_effect_names(self),
             "logicalTargets": self.logical_targets,
         });
@@ -1709,7 +1647,7 @@ impl PreparedEffect {
             "workspaceRoot": self.workspace_root,
             "shell": self.generation.executor_config.shell_program,
             "wsl": self.generation.executor_config.wsl,
-            "executionPath": deepcode_kernel_runtime::shell_environment::resolved_agent_shell_path().to_string_lossy(),
+            "executionPath": self.generation.executor_config.execution_path,
         }))
     }
 }
@@ -1942,34 +1880,6 @@ fn take_workspace_id(input: &mut Value) -> Result<String, LocalAgentKernelError>
     Ok(workspace_id.to_string())
 }
 
-fn canonical_logical_targets(
-    tool_name: &str,
-    arguments: &Value,
-) -> Result<Vec<String>, LocalAgentKernelError> {
-    if is_shell_tool(tool_name) {
-        return Ok(vec![".".to_string()]);
-    }
-    let field = match tool_name {
-        "fs.read" | "fs.write" | "fs.edit" | "fs.delete" => Some("path"),
-        "web.fetch" => Some("url"),
-        "web.search" => None,
-        _ => None,
-    };
-    let mut targets = field
-        .and_then(|field| arguments.get(field).and_then(Value::as_str))
-        .map(|target| vec![target.to_string()])
-        .unwrap_or_default();
-    targets.sort();
-    targets.dedup();
-    if matches!(tool_name, "fs.write" | "fs.edit" | "fs.delete") && targets.len() != 1 {
-        return Err(LocalAgentKernelError::new(
-            "prepared_effect_target_invalid",
-            "闭合 workspace mutation 必须解析为一个精确逻辑 target。",
-        ));
-    }
-    Ok(targets)
-}
-
 fn authority_matches_identity(
     authority: &Value,
     request: &LocalToolExecutionRequest,
@@ -2009,10 +1919,6 @@ fn authority_matches_identity(
 
 fn authority_covers(authority: &Value, prepared: &PreparedEffect) -> bool {
     if is_shell_tool(&prepared.operation) {
-        let arguments = prepared
-            .canonical_arguments
-            .as_object()
-            .expect("canonical process arguments");
         return authority
             .get("coveredOperations")
             .and_then(Value::as_array)
@@ -2027,7 +1933,7 @@ fn authority_covers(authority: &Value, prepared: &PreparedEffect) -> bool {
                             == Some(prepared.operation.as_str())
                         && object.get("workspaceMode").and_then(Value::as_str) == Some("write")
                         && object.get("executionScope").and_then(Value::as_str)
-                            == arguments.get("executionScope").and_then(Value::as_str)
+                            == prepared.process_execution_scope.as_deref()
                 })
             });
     }
@@ -2420,7 +2326,6 @@ mod attempt_control_tests {
             LocalAgentKernel::open(Path::new(":memory:"), journal.clone(), resolver).unwrap();
         let generation = LocalAgentKernel::prepare_generation(
             "extension:test",
-            "kernel-generation:test",
             KernelExecutorConfig::default(),
             Arc::new(deepcode_kernel_runtime::executors::EmptySecretProvider),
             McpRuntime::default(),
@@ -2576,7 +2481,7 @@ mod attempt_control_tests {
             fn drop(&mut self) {
                 let mut registration = self.registration.clone();
                 registration["remove"] = json!(true);
-                tokio::runtime::Builder::new_current_thread()
+                let _ = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .unwrap()
@@ -2861,7 +2766,6 @@ mod attempt_control_tests {
     fn plan_scope_allows_execution_details_but_preserves_targets_and_boundaries() {
         let generation = LocalAgentKernel::prepare_generation(
             "extension:scope",
-            "generation:scope",
             KernelExecutorConfig::default(),
             Arc::new(deepcode_kernel_runtime::executors::EmptySecretProvider),
             McpRuntime::default(),
@@ -2882,16 +2786,17 @@ mod attempt_control_tests {
             .catalog
             .binding(tool["toolBindingRef"].as_str().unwrap(), "bash")
             .unwrap();
+        let input = binding.canonicalize(json!({"command":"make shell", "executionScope":"host", "workspaceMode":"write", "terminal":{"stdin":"./build.sh\nexit\n"}})).unwrap();
         let mut effect = PreparedEffect {
             generation: Arc::clone(&generation),
             binding,
             scope: PreparedEffectScope::Process,
+            input,
             workspace_id: Some("workspace:scope".into()),
             operation: "bash".into(),
             logical_targets: vec![".".into()],
             private_resolved_targets: vec![],
-            canonical_invocation: json!({}),
-            canonical_arguments: json!({"command":"make shell", "executionScope":"host", "workspaceMode":"write", "terminal":{"stdin":"./build.sh\nexit\n"}}),
+            canonical_invocation: json!({"toolId":"bash", "arguments":{"command":"make shell", "executionScope":"host", "workspaceMode":"write", "terminal":{"stdin":"./build.sh\nexit\n"}}}),
             workspace_root: None,
             delete_target_kind: None,
             process_workspace_mode: Some("write".into()),
@@ -2899,9 +2804,9 @@ mod attempt_control_tests {
         };
         let authority = json!({"coveredOperations":[{"workspaceId":"workspace:scope", "operation":"bash", "workspaceMode":"write", "executionScope":"host", "command":"make build"}]});
         assert!(authority_covers(&authority, &effect));
-        effect.canonical_arguments["executionScope"] = json!("workspace");
+        effect.process_execution_scope = Some("workspace".into());
         assert!(!authority_covers(&authority, &effect));
-        effect.canonical_arguments["executionScope"] = json!("host");
+        effect.process_execution_scope = Some("host".into());
         effect.workspace_id = Some("workspace:other".into());
         assert!(!authority_covers(&authority, &effect));
         effect.workspace_id = Some("workspace:scope".into());
@@ -2970,12 +2875,10 @@ pub(crate) fn output_directory_key(identity: &str) -> String {
 #[cfg(test)]
 mod output_directory_tests {
     #[test]
-    fn output_names_are_windows_components_without_changing_logical_hashes() {
+    fn output_names_are_portable_components() {
         let identity = "session:record/with/path";
-        let logical = deepcode_kernel_tools::hash_bytes(identity.as_bytes());
         let component = super::output_directory_key(identity);
-        assert!(logical.starts_with("sha256:"));
-        assert_eq!(component, logical.replacen(':', "-", 1));
+        assert!(!component.is_empty());
         assert!(!component
             .chars()
             .any(|character| r#"<>:\"/\|?*"#.contains(character)));

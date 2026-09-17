@@ -17,6 +17,7 @@ interface DeepCodeSidebarProps {
   projects: ConversationProject[];
   sessions: ConversationSessionSummary[];
   sessionStatuses: Readonly<Record<string, ConversationSessionStatus>>;
+  statusError: string | null;
   readRunMarkers: Readonly<Record<string, string>>;
   collapsedProjectIds: ReadonlySet<string>;
   activeSessionId: string | null;
@@ -47,6 +48,7 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
   projects,
   sessions,
   sessionStatuses,
+  statusError,
   readRunMarkers,
   collapsedProjectIds,
   activeSessionId,
@@ -217,8 +219,13 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
       </div>
 
       {reorderError && (
-        <div className="deepcode-gui-sidebar-order-error" role="alert">
+        <div className="deepcode-gui-sidebar-error" role="alert">
           {t(language, 'deepcodeGui.sidebar.orderError', { detail: reorderError })}
+        </div>
+      )}
+      {statusError && (
+        <div className="deepcode-gui-sidebar-error" role="alert">
+          {t(language, 'deepcodeGui.sidebar.statusError', { detail: statusError })}
         </div>
       )}
 

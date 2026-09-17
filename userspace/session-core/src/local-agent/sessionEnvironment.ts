@@ -7,13 +7,13 @@ export function environmentInstruction(value: unknown): RunRuntimeSnapshot['inst
     throw new Error('session_environment_invalid');
   }
   const data = value as Record<string, unknown>;
-  if (data.executionTarget !== undefined) {
+  {
     const shell = data.shell as Record<string, unknown> | null;
     const target = data.executionTarget as Record<string, unknown> | null;
     if (!target || !['native', 'wsl'].includes(String(target.kind))
       || (target.kind === 'wsl' && ['distribution', 'worker'].some((key) => typeof target[key] !== 'string' || !target[key]))
       || !shell || !['bash', 'powershell'].includes(String(shell.tool))
-      || typeof shell.executable !== 'string' || typeof shell.dialect !== 'string'
+      || typeof shell.executable !== 'string' || typeof shell.dialect !== 'string' || typeof data.executionPath !== 'string'
       || typeof data.shellAvailable !== 'boolean' || typeof data.workspaceShellSupported !== 'boolean'
       || !Array.isArray(data.developerCommands) || !data.developerCommands.every((item) => typeof item === 'string')) {
       throw new Error('session_environment_invalid');
@@ -49,29 +49,7 @@ export function environmentInstruction(value: unknown): RunRuntimeSnapshot['inst
   };
 }
 
-/** The first journaled environment is the Session's stable context, also after restart. */
-export function retainSessionEnvironment(
-  runtime: RunRuntimeSnapshot,
-  events: readonly SessionEvent[],
-): RunRuntimeSnapshot {
-  if (runtime.environment) return runtime;
-  for (const event of events) {
-    if (event.type !== 'run.started') continue;
-    const saved = event.payload.runtimeSnapshot.instructions.find((item) => item.id === ENVIRONMENT_ID);
-    if (saved) {
-      return {
-        ...runtime,
-        instructions: [
-          ...runtime.instructions.filter((item) => item.id !== ENVIRONMENT_ID),
-          { ...saved },
-        ].sort((a, b) => a.id.localeCompare(b.id, 'en')),
-      };
-    }
-  }
-  return runtime;
-}
-
-export function savedSessionEnvironment(events: readonly SessionEvent[]): RunRuntimeSnapshot['environment'] {
+export function savedSessionEnvironment(events: readonly SessionEvent[]): RunRuntimeSnapshot['environment'] | undefined {
   for (let index = events.length - 1; index >= 0; index--) {
     const event = events[index];
     if (event?.type === 'run.started' && event.payload.runtimeSnapshot.environment) {

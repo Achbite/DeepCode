@@ -454,7 +454,7 @@
   bottom: -3px;
 }
 
-.deepcode-gui-sidebar-order-error {
+.deepcode-gui-sidebar-error {
   padding: 6px 8px;
   color: var(--dc-danger);
   font-size: var(--dc-font-caption);

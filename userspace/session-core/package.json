@@ -21,7 +21,7 @@
     "build": "pnpm run clean && tsc -p tsconfig.json",
     "clean": "rm -rf dist tsconfig.tsbuildinfo",
     "typecheck": "tsc --noEmit",
-    "test": "pnpm run build && node --test tests/local-agent.test.mjs"
+    "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@deepcode/protocol": "workspace:*"

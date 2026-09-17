@@ -17,10 +17,6 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/api/workspaces/default-path", get(workspace_default_path))
         .route("/api/workspaces/open", post(workspace_open))
         .route("/api/workspaces/save-file", post(workspace_save_file))
-        .route(
-            "/api/workspaces/current/settings",
-            patch(workspace_patch_settings),
-        )
         .route("/api/fs/initial-locations", get(fs_initial_locations))
         .route("/api/fs/browse", get(fs_browse))
         .route(

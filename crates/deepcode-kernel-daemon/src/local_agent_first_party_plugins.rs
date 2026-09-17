@@ -68,7 +68,7 @@ pub(crate) struct FirstPartyPluginDescriptor {
     pub(crate) short_description: String,
     pub(crate) activation_media_types: Vec<String>,
     pub(crate) provider_ref: String,
-    pub(crate) plugin_artifact_ref: String,
+    pub(crate) implementation: Value,
     pub(crate) capability_refs: Vec<String>,
     pub(crate) capability_summary: String,
     pub(crate) tools: Vec<FirstPartyToolDescriptor>,
@@ -149,10 +149,7 @@ fn decode_manifest(encoded: &str) -> Result<FirstPartyPluginDescriptor, String> 
         short_description: manifest.short_description,
         activation_media_types: manifest.activation_media_types,
         provider_ref: manifest.provider_ref,
-        plugin_artifact_ref: format!(
-            "plugin-artifact:{}",
-            deepcode_kernel_tools::hash_bytes(encoded.as_bytes())
-        ),
+        implementation: serde_json::from_str(encoded).map_err(|error| error.to_string())?,
         capability_refs: manifest.capability_refs,
         capability_summary: manifest.capability_summary,
         tools: manifest.tools,

@@ -1,3 +1,4 @@
+import { advanceTodoList } from './todoState.js';
 import { providerTextStreamId } from './streamIdentity.js';
 import { activeConversationEvents } from './conversationHistory.js';
 import type {
@@ -139,43 +140,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
   if (event.sessionId !== previous.sessionId) throw new Error('session_event_identity_mismatch');
   if (event.sequence !== previous.revision + 1) throw new Error('session_event_sequence_gap');
 
-  const next: SessionState = {
-    ...previous,
-    revision: event.sequence,
-    display: { ...previous.display },
-    modelSettings: previous.modelSettings ? { ...previous.modelSettings } : null,
-    creationWorkspaceBindings: previous.creationWorkspaceBindings.map((binding) => ({ ...binding })),
-    sessionDirectoryIndexes: previous.sessionDirectoryIndexes.map((binding) => ({ ...binding })),
-    workspaceBindings: previous.workspaceBindings.map((binding) => ({ ...binding })),
-    messages: previous.messages.map((message) => ({
-      ...message,
-      ...(message.replyToInteraction ? { replyToInteraction: { ...message.replyToInteraction } } : {}),
-      filesystemReferences: message.filesystemReferences.map((reference) => ({ ...reference })),
-      pluginSelections: message.pluginSelections.map((selection) => ({ ...selection })),
-    })),
-    acceptedInputs: Object.fromEntries(Object.entries(previous.acceptedInputs).map(([id, input]) => [id, {
-      ...input, ...(input.replyToInteraction ? { replyToInteraction: { ...input.replyToInteraction } } : {}),
-    }])),
-    narratives: previous.narratives.map((narrative) => ({ ...narrative })),
-    pendingInteraction: cloneInteraction(previous.pendingInteraction),
-    pendingApproval: cloneApproval(previous.pendingApproval),
-    plans: previous.plans.map((plan) => clonePlanProjection(plan)),
-    activePlanRef: previous.activePlanRef ? { ...previous.activePlanRef } : null,
-    pendingPlan: previous.pendingPlan ? clonePlanProjection(previous.pendingPlan) : null,
-    todoList: cloneTodoList(previous.todoList),
-    contextUsage: previous.contextUsage ? { ...previous.contextUsage } : null,
-    // Historical runtime/Provider facts are immutable after insertion. Events
-    // copy their affected map; public projections still isolate returned values.
-    tokenUsage: { ...previous.tokenUsage },
-    run: previous.run ? cloneRun(previous.run) : null,
-    activities: Object.fromEntries(
-      Object.entries(previous.activities).map(([id, activity]) => [id, cloneActivity(activity)]),
-    ),
-    artifacts: Object.fromEntries(
-      Object.entries(previous.artifacts).map(([id, artifact]) => [id, { ...artifact }]),
-    ),
-    terminalError: previous.terminalError ? { ...previous.terminalError } : null,
-  };
+  const next: SessionState = { ...previous, revision: event.sequence };
 
   switch (event.type) {
     case 'provider.attempt.updated': {
@@ -219,6 +184,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       next.runToolViews = { ...next.runToolViews, [event.runId]: structuredClone(event.payload.toolView) };
       break;
     case 'input.accepted':
+      next.acceptedInputs = { ...next.acceptedInputs };
       next.acceptedInputs[event.payload.commandId] = { messageId: event.payload.messageId };
       break;
     case 'session.model-settings.updated':
@@ -233,6 +199,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       next.workspaceBindings = effectiveWorkspaceBindings(next);
       break;
     case 'session.directory-index.attached':
+      next.sessionDirectoryIndexes = [...next.sessionDirectoryIndexes];
       if (next.workspaceBindings.some((binding) => (
         binding.workspaceId === event.payload.workspaceBinding.workspaceId
       ))) throw new Error('session_directory_index_duplicate');
@@ -251,6 +218,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     }
     case 'run.started':
+      next.activities = { ...next.activities };
       next.tokenUsageHistory = { ...next.tokenUsageHistory };
       next.runRuntimeSnapshots = { ...next.runRuntimeSnapshots };
       {
@@ -299,6 +267,8 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       };
       break;
     case 'message.committed':
+      next.messages = [...next.messages];
+      next.acceptedInputs = { ...next.acceptedInputs };
       {
         next.queuedInputs = next.queuedInputs.filter((input) => input.messageId !== event.payload.messageId);
         const acceptedInput = Object.entries(next.acceptedInputs).find(([, input]) => input.messageId === event.payload.messageId);
@@ -350,6 +320,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       }
       break;
     case 'message.feedback.updated': {
+      next.messages = [...next.messages];
       const index = next.messages.findIndex((message) => message.messageId === event.payload.messageId);
       if (index < 0 || next.messages[index].role !== 'assistant') {
         throw new Error('message_feedback_target_missing');
@@ -358,6 +329,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     }
     case 'narrative.committed':
+      next.narratives = [...next.narratives];
       assertProviderMessageReference(
         requiredProviderTurn(next, event.runId, event.payload.providerRequestId, 'agent'),
         'narrative',
@@ -374,6 +346,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       });
       break;
     case 'interaction.requested':
+      next.activities = { ...next.activities };
       recordProviderCallFact(
         next,
         event.callId,
@@ -411,17 +384,20 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         || next.pendingInteraction.interactionId !== event.payload.interactionId
         || next.pendingInteraction.runId !== event.runId
       ) throw new Error('interaction_request_missing');
+      next.acceptedInputs = { ...next.acceptedInputs };
       const input = next.acceptedInputs[event.payload.commandId];
       if (!input) throw new Error('interaction_response_input_missing');
-      input.replyToInteraction = {
+      next.acceptedInputs[event.payload.commandId] = { ...input, replyToInteraction: {
         interactionId: next.pendingInteraction.interactionId, prompt: next.pendingInteraction.prompt,
-      };
+      } };
       next.pendingInteraction = null;
       settleActivity(next, interactionActivityId(event.payload.interactionId), 'completed');
       resumeRun(next, event.runId);
       break;
     }
     case 'plan.published': {
+      next.plans = [...next.plans];
+      next.activities = { ...next.activities };
       if (findPlanIndex(next, event.payload.planId, event.payload.revision) >= 0) {
         throw new Error('plan_revision_duplicate');
       }
@@ -591,13 +567,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         sourceStepIds.add(item.sourceStepId);
       }
       if (!itemsMatchPlan) throw new Error('todo_seed_plan_steps_mismatch');
-      next.todoList = {
-        sourcePlanId: event.payload.sourcePlanId,
-        sourcePlanRevision: event.payload.sourcePlanRevision,
-        items: event.payload.items.map((item) => ({ ...item })),
-        sequence: event.sequence,
-        updatedAt: event.occurredAt,
-      };
+      next.todoList = advanceTodoList(next.todoList, event);
       break;
     }
     case 'todo.progressed': {
@@ -621,24 +591,14 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       ) throw new Error('todo_source_plan_mismatch');
       if (new Set(event.payload.updates.map((update) => update.todoId)).size
         !== event.payload.updates.length) throw new Error('todo_update_duplicate');
-      const updates = new Map(event.payload.updates.map((update) => [update.todoId, update.status]));
-      for (const todoId of updates.keys()) {
-        if (!next.todoList.items.some((item) => item.todoId === todoId)) {
-          throw new Error('todo_item_missing');
-        }
+      for (const { todoId } of event.payload.updates) {
+        if (!next.todoList.items.some((item) => item.todoId === todoId)) throw new Error('todo_item_missing');
       }
-      next.todoList = {
-        ...next.todoList,
-        items: next.todoList.items.map((item) => ({
-          ...item,
-          status: updates.get(item.todoId) ?? item.status,
-        })),
-        sequence: event.sequence,
-        updatedAt: event.occurredAt,
-      };
+      next.todoList = advanceTodoList(next.todoList, event);
       break;
     }
     case 'tool.requested':
+      next.activities = { ...next.activities };
       recordProviderCallFact(
         next,
         event.callId,
@@ -658,12 +618,14 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       };
       break;
     case 'tool.started': {
+      next.activities = { ...next.activities };
       const activity = next.activities[toolActivityId(event.callId)];
       if (!activity || activity.status !== 'requested') throw new Error('tool_started_without_request');
       next.activities[activity.activityId] = { ...activity, status: 'active', startedAt: event.payload.startedAt };
       break;
     }
     case 'approval.requested':
+      next.activities = { ...next.activities };
       next.pendingApproval = {
         approvalId: event.payload.approvalId,
         runId: event.runId,
@@ -715,6 +677,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         ...next.activities[toolActivityId(event.callId)],
         tool: projectToolActivity(event.payload.record),
       };
+      next.artifacts = { ...next.artifacts };
       for (const artifact of artifactsFromRecord(event.payload.record)) {
         next.artifacts[artifact.artifactId] = artifact;
       }
@@ -731,6 +694,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       };
       break;
     case 'session.control.rejected':
+      next.activities = { ...next.activities };
       assertRunningRun(next, event.runId, 'session_control_rejection_run_not_active');
       recordProviderCallFact(
         next,
@@ -781,9 +745,6 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         ...(event.payload.kernelCatalogSnapshotRef ? { kernelCatalogSnapshotRef: event.payload.kernelCatalogSnapshotRef } : {}),
         purpose: event.payload.purpose,
         responseConstraint: event.payload.responseConstraint,
-        stableCoreHash: event.payload.stableCoreHash,
-        baseToolSchemaHash: event.payload.baseToolSchemaHash,
-        selectedPluginSnapshotHash: event.payload.selectedPluginSnapshotHash,
         dynamicInstructionBytes: event.payload.dynamicInstructionBytes,
         messages: event.payload.messages.map((message) => ({
           ...message,
@@ -800,6 +761,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       });
       break;
     case 'provider.turn.settled': {
+      next.activities = { ...next.activities };
       next.providerTurns = { ...next.providerTurns };
       next.tokenUsageHistory = { ...next.tokenUsageHistory };
       assertRunningRun(next, event.runId, 'provider_turn_run_not_active');
@@ -1105,7 +1067,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
     case 'run.settled':
       next.tokenUsageHistory = { ...next.tokenUsageHistory };
       next.pendingRunSettlements = { ...next.pendingRunSettlements };
-      // Journal admission enforces tool closure for new settlements. Replaying
+      // Session admission enforces tool closure for new settlements. Replaying
       // stored failures must preserve unfinished calls, not hide the entire run.
       if (
         !next.pendingRunSettlements[event.runId]
@@ -1273,7 +1235,7 @@ function cloneRunRuntimeSnapshot(snapshot: RunRuntimeSnapshot): RunRuntimeSnapsh
   }));
   return {
     ...snapshot,
-    ...(snapshot.environment ? { environment: structuredClone(snapshot.environment) } : {}),
+    environment: structuredClone(snapshot.environment),
     provider: { ...snapshot.provider },
     webSearch: { ...snapshot.webSearch },
     instructions: snapshot.instructions.map((instruction) => ({ ...instruction })),
@@ -1733,6 +1695,7 @@ function updatePlan(
 ): void {
   const index = findPlanIndex(state, planId, revision);
   if (index < 0) throw new Error('plan_revision_missing');
+  state.plans = [...state.plans];
   state.plans[index] = update(planFor(state, planId, revision));
 }
 
@@ -1924,7 +1887,7 @@ function settleActivity(
 ): void {
   const activity = state.activities[activityId];
   if (!activity) throw new Error(`activity_source_missing:${activityId}`);
-  state.activities[activityId] = { ...activity, status };
+  state.activities = { ...state.activities, [activityId]: { ...activity, status } };
 }
 
 function projectToolActivity(record: ToolExecutionRecord): NonNullable<ActivityProjection['tool']> {
@@ -2080,7 +2043,8 @@ function projectShellEnvironment(
     || interactive !== terminal
     || outputExecutionScope !== executionScope
     || outputTerminal !== terminal
-    || pathSource !== 'hostPlusStandardDeveloperPaths'
+    || typeof pathSource !== 'string'
+    || !pathSource.trim()
     || writeScope !== expectedWriteScope
     || homeWritable !== (executionScope === 'host')
     || networkAccess !== (executionScope === 'host')

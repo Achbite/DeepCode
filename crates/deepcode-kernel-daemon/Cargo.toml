@@ -22,7 +22,6 @@ reqwest.workspace = true
 async-stream.workspace = true
 bytes.workspace = true
 getrandom = "0.3"
-sha2.workspace = true
 regex.workspace = true
 rusqlite.workspace = true
 

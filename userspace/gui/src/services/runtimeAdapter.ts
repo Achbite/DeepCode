@@ -197,7 +197,6 @@ export const getHealth = api.getHealth;
 export const getCurrentWorkspace = api.getCurrentWorkspace;
 export const openWorkspace = api.openWorkspace;
 export const saveWorkspaceFile = api.saveWorkspaceFile;
-export const patchWorkspaceSettings = api.patchWorkspaceSettings;
 export const getInitialLocations = api.getInitialLocations;
 export const browsePath = api.browsePath;
 export const getUserSettings = api.getUserSettings;

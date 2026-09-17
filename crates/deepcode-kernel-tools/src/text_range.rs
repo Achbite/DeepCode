@@ -2,13 +2,12 @@ use crate::file_content::{
     binary_magic, has_high_control_byte_ratio, lightweight_file_classification,
 };
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 
 /// Read a UTF-8 window without allocating the file or even an unbounded line.
-/// The existing whole-file hash is computed incrementally, outside the output window.
+/// Scan the file for UTF-8 validity and range metadata while retaining only the window.
 pub fn read_text_range(
     path: &Path,
     start_line: u64,
@@ -30,7 +29,6 @@ pub fn read_text_range(
     }
     let mut reader = BufReader::new(file);
     let mut chunk = [0u8; 8192];
-    let mut hasher = Sha256::new();
     let mut output = Vec::with_capacity(max_bytes);
     let mut utf8_tail = Vec::new();
     let mut offset = 0u64;
@@ -55,7 +53,6 @@ pub fn read_text_range(
             }
             script = bytes.starts_with(b"#!");
         }
-        hasher.update(bytes);
         if bytes.contains(&0) {
             return Err("unsupported_file_content: binary_content".into());
         }
@@ -123,7 +120,7 @@ pub fn read_text_range(
         "startLine": selected_line, "endLine": if content.is_empty() { selected_line.saturating_sub(1) } else { end_line },
         "startByte": start, "endByte": end, "maxLines": max_lines, "maxBytes": max_bytes,
         "truncated": truncated, "byteTruncated": byte_truncated, "binary": false,
-        "contentHash": format!("sha256:{:x}", hasher.finalize()), "fileClassification": classification });
+        "fileClassification": classification });
     if truncated {
         result["nextByte"] = json!(end);
         if !byte_truncated {

@@ -1,3 +1,4 @@
+import { advanceTodoList } from './todoState.js';
 import type {
   ContextCompositionMessage,
   ContextCompositionReceipt,
@@ -22,7 +23,6 @@ import type {
   ContextMessageContribution,
 } from './plugins.js';
 import {
-  canonicalJsonValue,
   createProviderToolCodec,
   encodeProviderMessage,
   providerMessageCodecsByCallId,
@@ -205,6 +205,7 @@ export function messagesFromJournal(
 ): ContextMessageContribution[] {
   const messages: ContextMessageContribution[] = [];
   const completionResults = new Map<string, ContextMessageContribution>();
+  const completedTurns = new Map(events.filter(isCompletedProviderTurn).map((event) => [event.payload.providerRequestId, event]));
   const orderedProviderTurns = new Map(events.flatMap((event) => (
     event.type === 'provider.turn.settled'
     && event.payload.outcome === 'completed'
@@ -258,7 +259,7 @@ export function messagesFromJournal(
         && orderedProviderTurns.has(event.payload.providerRequestId)
       ) continue;
       const reasoning = event.payload.role === 'assistant'
-        ? providerReasoning(events, event.payload.providerRequestId)
+        ? providerReasoning(completedTurns.get(event.payload.providerRequestId), event.payload.providerRequestId)
         : {};
       const inputRun = runForInput.get(event.payload.messageId);
       const messageBindings = inputRun?.payload.workspaceBindings ?? workspaceBindings;
@@ -282,7 +283,7 @@ export function messagesFromJournal(
       });
     } else if (event.type === 'narrative.committed') {
       if (orderedProviderTurns.has(event.payload.providerRequestId)) continue;
-      if (!mergeNarrativeIntoProviderCall(messages, events, event)) {
+      if (!mergeNarrativeIntoProviderCall(messages, completedTurns.get(event.payload.providerRequestId), event)) {
         messages.push({
           contributionId: `narrative:${event.payload.narrativeId}`,
           contributionKind: 'journalMessages',
@@ -290,7 +291,7 @@ export function messagesFromJournal(
           message: {
             role: 'assistant',
             content: event.payload.content,
-            ...providerReasoning(events, event.payload.providerRequestId),
+            ...providerReasoning(completedTurns.get(event.payload.providerRequestId), event.payload.providerRequestId),
           },
         });
       }
@@ -522,7 +523,7 @@ export function messagesFromJournal(
           message: {
             role: 'assistant',
             content: '',
-            ...providerReasoning(events, event.payload.providerRequestId),
+            ...providerReasoning(completedTurns.get(event.payload.providerRequestId), event.payload.providerRequestId),
             toolCalls: event.payload.toolCallInputs.map((call) => ({
               callId: call.callId,
               providerCallId: call.providerCallId,
@@ -592,36 +593,6 @@ export function messagesFromJournal(
   }
   applyProviderTurnCompletions(messages, events);
   return messages;
-}
-
-function advanceTodoList(
-  todoList: TodoListProjection | null,
-  event: SessionEvent,
-): TodoListProjection | null {
-  if (event.type === 'todo.seeded' || event.type === 'todo.reconciled') {
-    return {
-      sourcePlanId: event.payload.sourcePlanId,
-      sourcePlanRevision: event.payload.sourcePlanRevision,
-      items: event.payload.items.map((item) => ({ ...item })),
-      sequence: event.sequence,
-      updatedAt: event.occurredAt,
-    };
-  }
-  if (event.type !== 'todo.progressed' || !todoList) return todoList;
-  if (
-    todoList.sourcePlanId !== event.payload.sourcePlanId
-    || todoList.sourcePlanRevision !== event.payload.sourcePlanRevision
-  ) throw new LoopFailure('todo_source_plan_mismatch', 'Session Todo 当前状态来源不一致。');
-  const updates = new Map(event.payload.updates.map((update) => [update.todoId, update.status]));
-  return {
-    ...todoList,
-    items: todoList.items.map((item) => ({
-      ...item,
-      status: updates.get(item.todoId) ?? item.status,
-    })),
-    sequence: event.sequence,
-    updatedAt: event.occurredAt,
-  };
 }
 
 export function buildContextCompositionReceipt(
@@ -699,18 +670,6 @@ export function buildContextCompositionReceipt(
     kernelCatalogSnapshotRef: runtime.kernelCatalogSnapshotRef,
     purpose,
     responseConstraint,
-    stableCoreHash: stableReceiptHash(stableCoreInstructions(runtime)),
-    baseToolSchemaHash: stableReceiptHash(runtime.tools
-      .filter((tool) => tool.origin === 'coreBuiltin')
-      .sort((left, right) => left.name.localeCompare(right.name, 'en'))
-      .map((tool) => ({
-        name: tool.name,
-        description: tool.description,
-        inputSchema: tool.inputSchema,
-        possibleEffects: tool.possibleEffects,
-        availability: tool.availability,
-      }))),
-    selectedPluginSnapshotHash: stableReceiptHash(runtime.selectedPlugins),
     dynamicInstructionBytes: selected.reduce((total, contribution) => (
       contribution.message.role === 'system'
       && contribution.contributionId !== 'instruction:deepcode.coding-agent'
@@ -729,33 +688,6 @@ export function buildContextCompositionReceipt(
       filesystemReferenceFactsByContributionId,
     ),
   };
-}
-
-function stableCoreInstructions(runtime: RunRuntimeSnapshot): readonly { id: string; text: string }[] {
-  const instructions = runtime.instructions.filter((instruction) => (
-    instruction.id === 'deepcode.coding-agent'
-  ));
-  if (instructions.length !== 1) {
-    throw new LoopFailure(
-      'stable_core_instruction_missing',
-      'Run runtime 缺少唯一稳定 Core System Prompt。',
-    );
-  }
-  return instructions;
-}
-
-function stableReceiptHash(value: unknown): string {
-  const encoded = JSON.stringify(canonicalJsonValue(value));
-  let left = 0x811c9dc5;
-  let right = 0x9e3779b9;
-  for (let index = 0; index < encoded.length; index += 1) {
-    const code = encoded.charCodeAt(index);
-    left = Math.imul((left ^ code) >>> 0, 0x01000193) >>> 0;
-    right = Math.imul((right ^ code ^ index) >>> 0, 0x85ebca6b) >>> 0;
-  }
-  return `context-hash-v1:${left.toString(16).padStart(8, '0')}${right
-    .toString(16)
-    .padStart(8, '0')}`;
 }
 
 export function assertContextContributions(
@@ -865,13 +797,9 @@ export function runInputMessageEvent(
 }
 
 function providerReasoning(
-  events: readonly SessionEvent[],
+  completion: CompletedProviderTurnEvent | undefined,
   providerRequestId: string,
 ): Pick<ModelMessage, 'reasoningContent' | 'reasoningSignature' | 'providerItems'> {
-  const completion = events.find((event): event is CompletedProviderTurnEvent => (
-    isCompletedProviderTurn(event)
-    && event.payload.providerRequestId === providerRequestId
-  ));
   if (!completion) {
     throw new LoopFailure(
       'provider_message_completion_missing',
@@ -896,14 +824,9 @@ function providerReasoning(
 
 function mergeNarrativeIntoProviderCall(
   messages: ContextMessageContribution[],
-  events: readonly SessionEvent[],
+  completion: CompletedProviderTurnEvent | undefined,
   narrative: Extract<SessionEvent, { type: 'narrative.committed' }>,
 ): boolean {
-  const completion = events.find((event): event is CompletedProviderTurnEvent => (
-    isCompletedProviderTurn(event)
-    && event.runId === narrative.runId
-    && event.payload.providerRequestId === narrative.payload.providerRequestId
-  ));
   if (!completion) {
     throw new LoopFailure(
       'provider_message_completion_missing',

@@ -1,9 +1,10 @@
 use crate::prelude::*;
 use crate::*;
+use crate::local_agent_api::LocalProviderMessage;
 
 pub(crate) fn anthropic_stream_request_body(
     profile: &ResolvedLlmProfile,
-    messages: Vec<Value>,
+    messages: &[LocalProviderMessage],
     tools: &[LlmToolDefinition],
     require_tool_call: bool,
 ) -> Result<Value, ProviderTransportError> {
@@ -52,87 +53,50 @@ pub(crate) fn anthropic_stream_request_body(
     Ok(body)
 }
 
-fn anthropic_messages(messages: Vec<Value>) -> Result<Vec<Value>, ProviderTransportError> {
+fn anthropic_messages(messages: Vec<&LocalProviderMessage>) -> Result<Vec<Value>, ProviderTransportError> {
     let mut output = Vec::with_capacity(messages.len());
     for message in messages {
-        let Some(record) = message.as_object() else {
-            continue;
-        };
-        match record.get("role").and_then(Value::as_str).unwrap_or("user") {
-            "assistant" => output.push(anthropic_assistant_message(record)?),
-            "tool" => append_anthropic_tool_result(&mut output, record),
+        match message.role.as_str() {
+            "assistant" => output.push(anthropic_assistant_message(message)?),
+            "tool" => append_anthropic_tool_result(&mut output, message),
             "user" => output.push(json!({
                 "role": "user",
-                "content": message_content_string(record.get("content"))
+                "content": message.content
             })),
-            _ => {}
+            _ => return Err(ProviderTransportError::message("provider_envelope_invalid", "Anthropic message role is invalid.")),
         }
     }
     Ok(output)
 }
 
 fn anthropic_assistant_message(
-    record: &serde_json::Map<String, Value>,
+    message: &LocalProviderMessage,
 ) -> Result<Value, ProviderTransportError> {
     let mut content = Vec::new();
-    if let Some(reasoning) = record
-        .get("reasoningContent")
-        .or_else(|| record.get("reasoning_content"))
-        .and_then(Value::as_str)
+    if let Some(reasoning) = message.reasoning_content.as_deref()
         .filter(|value| !value.is_empty())
     {
         let mut block = json!({ "type": "thinking", "thinking": reasoning });
-        if let Some(signature) = record
-            .get("reasoningSignature")
-            .or_else(|| record.get("reasoning_signature"))
-            .and_then(Value::as_str)
+        if let Some(signature) = message.reasoning_signature.as_deref()
             .filter(|value| !value.is_empty())
         {
             block["signature"] = json!(signature);
         }
         content.push(block);
     }
-    let text = message_content_string(record.get("content"));
+    let text = &message.content;
     if !text.is_empty() {
         content.push(json!({ "type": "text", "text": text }));
     }
-    for call in record
-        .get("toolCalls")
-        .or_else(|| record.get("tool_calls"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let Some(call) = call.as_object() else {
-            continue;
-        };
-        let function = call.get("function").and_then(Value::as_object);
-        let Some(name) = function
-            .and_then(|value| value.get("name"))
-            .or_else(|| call.get("name"))
-            .and_then(Value::as_str)
-        else {
-            continue;
-        };
-        let input = function
-            .and_then(|value| value.get("arguments"))
-            .or_else(|| call.get("input"))
-            .or_else(|| call.get("arguments"))
-            .cloned()
-            .ok_or_else(|| {
-                ProviderTransportError::message(
-                    "provider_envelope_invalid",
-                    "Anthropic tool_use 缺少原始参数。",
-                )
-            })?;
-        let input = match input {
+    for call in message.tool_calls.iter().flatten() {
+        let input = match &call.input {
             Value::String(text) => serde_json::from_str(&text).map_err(|error| {
                 ProviderTransportError::message(
                     "provider_tool_arguments_unrepresentable",
                     format!("Anthropic tool_use 要求 input 对象，原始参数无法编码：{error}"),
                 )
             })?,
-            value => value,
+            value => value.clone(),
         };
         if !input.is_object() {
             return Err(ProviderTransportError::message(
@@ -142,11 +106,8 @@ fn anthropic_assistant_message(
         }
         content.push(json!({
             "type": "tool_use",
-            "id": call
-                .get("providerCallId")
-                .and_then(Value::as_str)
-                .expect("validated tool call has providerCallId"),
-            "name": name,
+            "id": call.provider_call_id,
+            "name": call.name,
             "input": input
         }));
     }
@@ -155,15 +116,13 @@ fn anthropic_assistant_message(
 
 fn append_anthropic_tool_result(
     messages: &mut Vec<Value>,
-    record: &serde_json::Map<String, Value>,
+    message: &LocalProviderMessage,
 ) {
     let block = json!({
         "type": "tool_result",
-        "tool_use_id": record
-            .get("providerCallId")
-            .and_then(Value::as_str)
+        "tool_use_id": message.provider_call_id.as_deref()
             .expect("validated tool message has providerCallId"),
-        "content": message_content_string(record.get("content"))
+        "content": message.content
     });
     if let Some(content) = messages
         .last_mut()
@@ -184,7 +143,7 @@ fn append_anthropic_tool_result(
 
 pub(crate) fn ollama_stream_request_body(
     profile: &ResolvedLlmProfile,
-    messages: Vec<Value>,
+    messages: &[LocalProviderMessage],
     tools: &[LlmToolDefinition],
     require_tool_call: bool,
 ) -> Value {

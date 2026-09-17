@@ -93,42 +93,6 @@ impl HostWorkspaceService {
         )))
     }
 
-    pub(crate) fn patch_settings(&self, patches: Value) -> Result<Value, KernelErrorEnvelope> {
-        let patches = patches.as_object().ok_or_else(|| {
-            host_service_error(
-                "host_workspace_settings_invalid",
-                "工作区设置补丁必须是 JSON 对象。",
-            )
-        })?;
-        if let Some(key) = patches.keys().find(|key| !key.starts_with("deepcode.")) {
-            return Err(host_service_error(
-                "host_workspace_settings_key_invalid",
-                format!("工作区设置键不在 deepcode 命名空间内：{key}"),
-            ));
-        }
-        let mut state = self.lock_state()?;
-        let current = state.current.as_mut().ok_or_else(|| {
-            host_service_error(
-                "host_workspace_missing",
-                "修改工作区设置前必须先打开一个工作区。",
-            )
-        })?;
-        let settings = current.settings.as_object_mut().ok_or_else(|| {
-            host_service_error(
-                "host_workspace_settings_invalid",
-                "当前工作区设置不是 JSON 对象。",
-            )
-        })?;
-        for (key, value) in patches {
-            if value.is_null() {
-                settings.remove(key);
-            } else {
-                settings.insert(key.clone(), value.clone());
-            }
-        }
-        Ok(current.settings.clone())
-    }
-
     fn lock_state(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, HostWorkspaceState>, KernelErrorEnvelope> {
@@ -278,7 +242,6 @@ fn workspace_spec(workspace: &HostWorkspaceRecord) -> HostWorkspaceSpec {
             original_path: workspace.original_folder_path.clone(),
             is_absolute: workspace.folder_is_absolute,
         }],
-        settings: workspace.settings.clone(),
         unsupported_fields: workspace.unsupported_fields.clone(),
         opened_at: workspace.opened_at.clone(),
     }

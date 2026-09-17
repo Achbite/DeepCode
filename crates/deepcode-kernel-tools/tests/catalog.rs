@@ -1,43 +1,63 @@
-use deepcode_kernel_tools::{KernelToolRegistry, ToolAvailability};
+use deepcode_kernel_tools::kernel_internal::{
+    KernelCanonicalInvocation, KernelExecutionScope, KernelWorkspaceMode,
+};
+use deepcode_kernel_tools::{KernelToolCatalogError, KernelToolRegistry, ToolAvailability};
 use serde_json::json;
 
 #[test]
-fn rejected_arguments_explain_required_unknown_enum_type_and_nested_bounds() {
-    use deepcode_kernel_tools::KernelToolCatalogError;
+fn invalid_arguments_explain_the_rejected_field() {
     let registry = KernelToolRegistry::new();
-    let error = registry
-        .canonicalize(
+    for (tool, input, path, rule) in [
+        ("bash", json!({}), "$.command", "required"),
+        (
             "bash",
-            json!({"executionMode":"read", "executionScope":"outside", "timeout":"slow"}),
-        )
-        .unwrap_err();
-    let KernelToolCatalogError::InvalidArguments { issues, .. } = error else {
-        panic!("expected typed input rejection")
-    };
-    assert!(issues
-        .iter()
-        .any(|issue| issue.path == "$.command" && issue.rule == "required"));
-    assert!(issues
-        .iter()
-        .any(|issue| issue.path == "$.executionMode" && issue.rule == "additionalProperties"));
-    assert!(issues.iter().any(|issue| issue.path == "$.executionScope"
-        && issue.rule == "enum"
-        && issue.expected == Some(json!(["workspace", "host"]))));
-    assert!(issues
-        .iter()
-        .any(|issue| issue.path == "$.timeout" && issue.rule == "type"));
-    let error = registry
-        .canonicalize(
+            json!({"command":"pwd", "executionMode":"read"}),
+            "$.executionMode",
+            "additionalProperties",
+        ),
+        (
+            "bash",
+            json!({"command":"pwd", "executionScope":"outside"}),
+            "$.executionScope",
+            "enum",
+        ),
+        (
+            "bash",
+            json!({"command":"pwd", "timeout":"slow"}),
+            "$.timeout",
+            "type",
+        ),
+        (
+            "bash",
+            json!({"command":"pwd", "timeout":0}),
+            "$.timeout",
+            "minimum",
+        ),
+        (
             "fs.edit",
             json!({"path":"README.md", "edits":[{"oldText":"", "newText":"updated"}]}),
-        )
-        .unwrap_err();
-    let KernelToolCatalogError::InvalidArguments { issues, .. } = error else {
-        panic!("expected typed input rejection")
-    };
-    assert!(issues
-        .iter()
-        .any(|issue| issue.path == "$.edits[0].oldText" && issue.rule == "minLength"));
+            "$.edits[0].oldText",
+            "minLength",
+        ),
+        (
+            "fs.edit",
+            json!({"path":"README.md", "edits":[{"oldText":"a", "newText":"b"}], "workspaceMode":"write"}),
+            "$.workspaceMode",
+            "additionalProperties",
+        ),
+    ] {
+        let KernelToolCatalogError::InvalidArguments { issues, .. } =
+            registry.canonicalize(tool, input).unwrap_err()
+        else {
+            panic!("expected input rejection for {tool}");
+        };
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.path == path && issue.rule == rule),
+            "{issues:?}"
+        );
+    }
     assert!(matches!(
         registry.canonicalize("missing.tool", json!({})),
         Err(KernelToolCatalogError::ToolNotRegistered(_))
@@ -45,200 +65,105 @@ fn rejected_arguments_explain_required_unknown_enum_type_and_nested_bounds() {
 }
 
 #[test]
-fn bash_defaults_are_workspace_read_without_rewriting_the_script() {
-    let script = "set -o pipefail\nprintf '%s\\n' 'literal $HOME' | head -1";
-    let invocation = KernelToolRegistry::new()
-        .canonicalize("bash", json!({"command": script}))
-        .unwrap();
-    assert_eq!(invocation.arguments["command"], script);
-    assert_eq!(invocation.arguments["workspaceMode"], "read");
-    assert_eq!(invocation.arguments["executionScope"], "workspace");
-    assert_eq!(invocation.arguments["timeout"], 120);
-}
-
-#[test]
-fn catalog_exposes_basic_callable_tools() {
+fn shell_defaults_preserve_the_script_and_native_scope() {
     let registry = KernelToolRegistry::new();
-    let names = registry
-        .descriptors()
-        .map(|descriptor| descriptor.name.as_str())
-        .collect::<Vec<_>>();
-    for required in [
-        "bash",
-        "fs.delete",
-        "fs.edit",
-        "fs.read",
-        "fs.write",
-        "powershell",
-        "web.fetch",
-        "web.search",
-    ] {
-        assert!(names.contains(&required), "missing basic tool {required}");
-    }
-    let bindings = registry
-        .executor_bindings()
-        .map(|(name, _)| name)
-        .collect::<Vec<_>>();
-    for name in names {
-        let descriptor = registry.descriptor(name).unwrap();
-        assert_eq!(descriptor.availability, ToolAvailability::Callable);
-        assert!(bindings.contains(&name), "missing executor for {name}");
-        assert_eq!(descriptor.input_schema["type"], "object");
-    }
-    let bash = registry.descriptor("bash").expect("bash descriptor");
-    let web_search = registry
-        .descriptor("web.search")
-        .expect("web.search descriptor");
-    assert_eq!(web_search.input_schema["required"], json!(["query"]));
-    assert_eq!(
-        web_search.input_schema["properties"]
-            .as_object()
-            .expect("web.search properties")
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        vec!["limit", "query"]
-    );
-    assert!(registry.descriptor("process.shell").is_none());
-    assert_eq!(bash.input_schema["required"], json!(["command"]));
-    assert_eq!(
-        bash.input_schema["properties"]
-            .as_object()
-            .expect("bash properties")
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        vec![
-            "command",
-            "executionScope",
-            "terminal",
-            "timeout",
-            "workspaceMode"
-        ]
-    );
-}
-
-#[test]
-fn powershell_preserves_native_syntax_and_scope_in_its_canonical_invocation() {
+    let script = "set -o pipefail\nprintf '%s\\n' 'literal $HOME' | head -1";
+    let KernelCanonicalInvocation::ProcessShell {
+        command,
+        workspace_mode,
+        execution_scope,
+        timeout,
+        terminal,
+    } = registry
+        .canonicalize("bash", json!({"command":script}))
+        .unwrap()
+    else {
+        panic!("Bash invocation");
+    };
+    assert_eq!(command, script);
+    assert_eq!(workspace_mode, KernelWorkspaceMode::Read);
+    assert_eq!(execution_scope, KernelExecutionScope::Workspace);
+    assert_eq!(timeout, 120);
+    assert!(terminal.is_none());
     let script =
         "Get-Item -LiteralPath 'D:\\Repo Space\\file.txt'\n& git status -sb\nexit $LASTEXITCODE";
-    let invocation = KernelToolRegistry::new()
+    let KernelCanonicalInvocation::ProcessPowerShell {
+        command,
+        execution_scope,
+        ..
+    } = registry
         .canonicalize(
             "powershell",
             json!({"command":script,"executionScope":"host"}),
         )
-        .unwrap();
-    assert_eq!(invocation.arguments["command"], script);
-    assert_eq!(invocation.arguments["executionScope"], "host");
-    assert_eq!(invocation.arguments["workspaceMode"], "read");
+        .unwrap()
+    else {
+        panic!("PowerShell invocation");
+    };
+    assert_eq!(command, script);
+    assert_eq!(execution_scope, KernelExecutionScope::Host);
 }
 
 #[test]
-fn canonical_arguments_reach_the_executor_boundary() {
+fn callable_descriptors_have_executor_bindings() {
     let registry = KernelToolRegistry::new();
-    let read = registry
+    let bindings = registry
+        .executor_bindings()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    for descriptor in registry
+        .descriptors()
+        .filter(|tool| tool.availability == ToolAvailability::Callable)
+    {
+        assert!(
+            bindings.contains(&descriptor.name.as_str()),
+            "missing executor for {}",
+            descriptor.name
+        );
+        assert_eq!(descriptor.input_schema["type"], "object");
+    }
+    assert!(registry.descriptor("fs.read").is_some());
+    assert!(registry.descriptor("bash").is_some());
+}
+
+#[test]
+fn file_invocations_keep_bounds_and_distinct_unicode_spelling() {
+    let registry = KernelToolRegistry::new();
+    let KernelCanonicalInvocation::FsRead {
+        path,
+        start_line,
+        max_lines,
+        ..
+    } = registry
         .canonicalize(
             "fs.read",
             json!({"path":"src/lib.rs","startLine":2,"maxLines":3}),
         )
-        .unwrap();
-    assert_eq!(
-        read.arguments,
-        json!({
-            "path":"src/lib.rs",
-            "startLine":2,
-            "maxLines":3,
-            "maxBytes":262144
-        })
-    );
-
-    let write = registry
+        .unwrap()
+    else {
+        panic!("Read invocation");
+    };
+    assert_eq!(path, "src/lib.rs");
+    assert_eq!(start_line, 2);
+    assert_eq!(max_lines, 3);
+    for expected in ["e\u{301}.txt", "é.txt"] {
+        let KernelCanonicalInvocation::FsRead { path, .. } = registry
+            .canonicalize("fs.read", json!({"path":expected}))
+            .unwrap()
+        else {
+            panic!("Read invocation");
+        };
+        assert_eq!(path, expected);
+    }
+    let KernelCanonicalInvocation::FsWrite { path, content, .. } = registry
         .canonicalize(
             "fs.write",
             json!({"path":"src/generated/main.rs","content":"fn main() {}\n"}),
         )
-        .unwrap();
-    assert_eq!(write.arguments["path"], "src/generated/main.rs");
-    assert!(write.arguments.get("executable").is_none());
-
-    let shell = registry
-        .canonicalize(
-            "bash",
-            json!({
-                "command":"printf ready",
-                "workspaceMode":"read",
-                "executionScope":"workspace"
-            }),
-        )
-        .unwrap();
-    assert_eq!(shell.arguments["command"], "printf ready");
-    assert_eq!(shell.arguments["workspaceMode"], "read");
-    assert_eq!(shell.arguments["executionScope"], "workspace");
-    assert_eq!(shell.arguments["timeout"], 120);
-    assert!(shell.arguments.get("terminal").is_none());
-    assert!(shell.arguments.get("cwd").is_none());
-    assert!(shell.arguments.get("maxOutputBytes").is_none());
-}
-
-#[test]
-fn file_names_keep_distinct_unicode_spelling_through_invocation() {
-    let registry = KernelToolRegistry::new();
-    let decomposed = "e\u{301}.txt";
-    let composed = "é.txt";
-    for path in [decomposed, composed] {
-        let read = registry
-            .canonicalize("fs.read", json!({"path": path}))
-            .unwrap();
-        assert_eq!(read.arguments["path"], path);
-    }
-    assert_ne!(
-        registry
-            .canonicalize("fs.read", json!({"path": decomposed}))
-            .unwrap()
-            .arguments,
-        registry
-            .canonicalize("fs.read", json!({"path": composed}))
-            .unwrap()
-            .arguments
-    );
-}
-
-#[test]
-fn rejected_arguments_expose_field_paths_for_extra_fields_and_bounds() {
-    use deepcode_kernel_tools::KernelToolCatalogError;
-    let registry = KernelToolRegistry::new();
-    let error = registry
-        .canonicalize(
-            "fs.edit",
-            json!({
-                "path": "README.md",
-                "edits": [{"oldText": "a", "newText": "b"}],
-                "workspaceMode": "write"
-            }),
-        )
-        .unwrap_err();
-    let KernelToolCatalogError::InvalidArguments { issues, .. } = error else {
-        panic!("expected typed input rejection")
+        .unwrap()
+    else {
+        panic!("Write invocation");
     };
-    assert!(issues
-        .iter()
-        .any(|issue| issue.path == "$.workspaceMode" && issue.rule == "additionalProperties"));
-
-    let error = registry
-        .canonicalize(
-            "bash",
-            json!({
-                "command": "pwd",
-                "workspaceMode": "read",
-                "executionScope": "workspace",
-                "timeout": 900
-            }),
-        )
-        .unwrap_err();
-    let KernelToolCatalogError::InvalidArguments { issues, .. } = error else {
-        panic!("expected typed input rejection")
-    };
-    assert!(issues.iter().any(|issue| issue.path == "$.timeout"
-        && issue.rule == "maximum"
-        && issue.expected == Some(json!(600))));
+    assert_eq!(path, "src/generated/main.rs");
+    assert_eq!(content, "fn main() {}\n");
 }

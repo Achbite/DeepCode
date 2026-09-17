@@ -368,7 +368,7 @@ export async function readConversationDocument(sessionId: string, workspaceId: s
 
 export class ConversationRequestError extends Error {
   constructor(public readonly code: string, message: string) {
-    super(`${code}:${message}`);
+    super(message === code ? code : `${code}:${message}`);
     this.name = 'ConversationRequestError';
   }
 }
@@ -1103,9 +1103,6 @@ function isContextComposition(value: unknown): boolean {
     'providerRequestId',
     'purpose',
     'responseConstraint',
-    'stableCoreHash',
-    'baseToolSchemaHash',
-    'selectedPluginSnapshotHash',
     'dynamicInstructionBytes',
     'runId',
     'messages',
@@ -1119,9 +1116,6 @@ function isContextComposition(value: unknown): boolean {
     && isIdentifier(value.providerRequestId)
     && ['agent', 'contextCompaction'].includes(String(value.purpose))
     && ['normal', 'toolRequired', 'answerOnly'].includes(String(value.responseConstraint))
-    && isNonEmptyText(value.stableCoreHash)
-    && isNonEmptyText(value.baseToolSchemaHash)
-    && isNonEmptyText(value.selectedPluginSnapshotHash)
     && isNaturalNumber(value.dynamicInstructionBytes)
     && isIdentifier(value.runId)
     && isNaturalNumber(value.sequence)

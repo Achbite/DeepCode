@@ -203,6 +203,7 @@
     "deepcodeGui.sidebar.chats": "Chats",
     "deepcodeGui.sidebar.noChats": "No chats yet",
     "deepcodeGui.sidebar.orderError": "Order not saved: {detail}",
+    "deepcodeGui.sidebar.statusError": "Could not read conversation status: {detail}",
     "deepcodeGui.project.empty": "No projects yet",
     "deepcodeGui.project.new": "New project",
     "deepcodeGui.project.newBlank": "New blank project",

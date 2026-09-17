@@ -1,10 +1,11 @@
+import { admitSessionEvents } from './admission.js';
+import { loopSnapshot } from './loop.js';
 import type {
   CommandJournalPort,
   CommandReply,
   ContextCompositionProjection,
   ConversationCommand,
   ConversationPort,
-  ConversationReadQuery,
   ConversationReadResult,
   ConversationSessionStatus,
   SessionProjection,
@@ -39,6 +40,11 @@ export class SessionService implements ConversationPort {
     workspaceBindings: WorkspaceBindingDisplay[];
     profileId?: string;
   }): Promise<SessionProjection> {
+    admitSessionEvents(loopSnapshot(input.sessionId, []), [{
+      type: 'session.created', sessionId: input.sessionId,
+      payload: { displayTitle: input.displayTitle, workspaceBindings: input.workspaceBindings,
+        ...(input.profileId ? { profileId: input.profileId } : {}) },
+    }]);
     await this.journal.createSession({
       sessionId: input.sessionId,
       displayTitle: input.displayTitle,
@@ -126,8 +132,8 @@ export class SessionService implements ConversationPort {
     return structuredClone(receipt);
   }
 
-  async read(query: ConversationReadQuery): Promise<ConversationReadResult> {
-    decodeConversationReadQuery(query);
+  async read(input: unknown): Promise<ConversationReadResult> {
+    const query = decodeConversationReadQuery(input);
     if (query.view === 'reasoning' && query.providerRequestId && this.#actors.has(query.sessionId)) {
       const actor = await this.#actors.get(query.sessionId)!;
       const projection = await actor.snapshot();

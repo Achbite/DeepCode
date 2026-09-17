@@ -19,8 +19,6 @@ interface SettingsFieldProps {
 
 function sourceLabel(source: SettingSource, language: UiLanguage): string {
   switch (source) {
-    case 'workspace':
-      return t(language, 'settings.source.workspace');
     case 'user':
       return t(language, 'settings.source.user');
     default:

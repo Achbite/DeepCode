@@ -62,7 +62,6 @@ pub struct HostWorkspaceSpec {
     pub source_path: Option<String>,
     pub root_path: String,
     pub folders: Vec<HostWorkspaceFolder>,
-    pub settings: Value,
     pub unsupported_fields: Vec<HostUnsupportedWorkspaceField>,
     pub opened_at: String,
 }

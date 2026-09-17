@@ -29,8 +29,6 @@ interface GuiAppearanceSettingsProps {
 
 function sourceLabel(source: SettingSource, language: UiLanguage): string {
   switch (source) {
-    case 'workspace':
-      return t(language, 'settings.source.workspace');
     case 'user':
       return t(language, 'settings.source.user');
     default:
@@ -101,8 +99,8 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
   const accent = normalizeGuiAccentColor(effectiveSettings['gui.accentColor']);
   const themeSource = themeDefinition ? sources[themeDefinition.key] ?? 'default' : 'default';
   const accentSource = accentDefinition ? sources[accentDefinition.key] ?? 'default' : 'default';
-  const themeDisabled = loading || themeSource === 'workspace';
-  const accentDisabled = loading || accentSource === 'workspace';
+  const themeDisabled = loading;
+  const accentDisabled = loading;
   if (!themeDefinition && !accentDefinition) return null;
 
   const selectTheme = (value: GuiThemePreference, disabled: boolean) => {

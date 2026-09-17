@@ -1,31 +1,13 @@
 mod schema;
 
 use self::schema::provider_schema_for_tool;
-use crate::invocation_adapter::canonicalize_invocation;
-use crate::invocation_types::{KernelCanonicalInvocation, KernelToolKind};
+use crate::invocation_types::KernelToolKind;
 use crate::types::{ToolAvailability, ToolDescriptor, ToolEffectClass, ToolEffectScope};
-use serde_json::Value;
-
-pub(crate) type KernelInvocationCanonicalizer =
-    fn(Value) -> Result<KernelCanonicalInvocation, String>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KernelExecutorBinding {
-    FsRead,
-    FsWrite,
-    FsEdit,
-    FsDelete,
-    WebSearch,
-    WebFetch,
-    ProcessShell,
-    ProcessPowerShell,
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct KernelToolRegistration {
     pub(crate) descriptor: ToolDescriptor,
-    pub(crate) executor_binding: KernelExecutorBinding,
-    pub(crate) canonicalize_invocation: KernelInvocationCanonicalizer,
+    pub(crate) kind: KernelToolKind,
     pub(crate) usage_guidelines: &'static [&'static str],
     tool_id: &'static str,
 }
@@ -39,27 +21,23 @@ impl KernelToolRegistration {
 #[derive(Clone, Copy)]
 struct ToolSpec {
     tool: KernelToolKind,
-    executor_binding: KernelExecutorBinding,
     effect_class: ToolEffectClass,
     effect_scope: ToolEffectScope,
 }
 
 const fn tool(
     tool: KernelToolKind,
-    executor_binding: KernelExecutorBinding,
     effect_class: ToolEffectClass,
     effect_scope: ToolEffectScope,
 ) -> ToolSpec {
     ToolSpec {
         tool,
-        executor_binding,
         effect_class,
         effect_scope,
     }
 }
 
 pub(crate) fn builtin_tool_registrations() -> Vec<KernelToolRegistration> {
-    use KernelExecutorBinding as Executor;
     use KernelToolKind as Tool;
     use ToolEffectClass::{Mutation, Read};
     use ToolEffectScope::{NetworkRead, Process, WorkspaceRead, WorkspaceWrite};
@@ -67,19 +45,17 @@ pub(crate) fn builtin_tool_registrations() -> Vec<KernelToolRegistration> {
     [
         tool(
             Tool::ProcessPowerShell,
-            Executor::ProcessPowerShell,
             Mutation,
             Process,
         ),
-        tool(Tool::FsRead, Executor::FsRead, Read, WorkspaceRead),
-        tool(Tool::FsWrite, Executor::FsWrite, Mutation, WorkspaceWrite),
-        tool(Tool::FsEdit, Executor::FsEdit, Mutation, WorkspaceWrite),
-        tool(Tool::FsDelete, Executor::FsDelete, Mutation, WorkspaceWrite),
-        tool(Tool::WebSearch, Executor::WebSearch, Read, NetworkRead),
-        tool(Tool::WebFetch, Executor::WebFetch, Read, NetworkRead),
+        tool(Tool::FsRead, Read, WorkspaceRead),
+        tool(Tool::FsWrite, Mutation, WorkspaceWrite),
+        tool(Tool::FsEdit, Mutation, WorkspaceWrite),
+        tool(Tool::FsDelete, Mutation, WorkspaceWrite),
+        tool(Tool::WebSearch, Read, NetworkRead),
+        tool(Tool::WebFetch, Read, NetworkRead),
         tool(
             Tool::ProcessShell,
-            Executor::ProcessShell,
             Mutation,
             Process,
         ),
@@ -101,40 +77,9 @@ fn register_tool(spec: ToolSpec) -> KernelToolRegistration {
             effect_scope: spec.effect_scope,
             availability: ToolAvailability::Callable,
         },
-        executor_binding: spec.executor_binding,
-        canonicalize_invocation: canonicalizer_for(spec.tool),
+        kind: spec.tool,
         usage_guidelines,
         tool_id,
-    }
-}
-
-macro_rules! invocation_canonicalizer {
-    ($name:ident, $tool:expr) => {
-        fn $name(arguments: Value) -> Result<KernelCanonicalInvocation, String> {
-            canonicalize_invocation($tool, arguments).map_err(|error| error.to_string())
-        }
-    };
-}
-
-invocation_canonicalizer!(canonicalize_fs_read, KernelToolKind::FsRead);
-invocation_canonicalizer!(canonicalize_fs_write, KernelToolKind::FsWrite);
-invocation_canonicalizer!(canonicalize_fs_edit, KernelToolKind::FsEdit);
-invocation_canonicalizer!(canonicalize_fs_delete, KernelToolKind::FsDelete);
-invocation_canonicalizer!(canonicalize_web_search, KernelToolKind::WebSearch);
-invocation_canonicalizer!(canonicalize_web_fetch, KernelToolKind::WebFetch);
-invocation_canonicalizer!(canonicalize_process_shell, KernelToolKind::ProcessShell);
-invocation_canonicalizer!(canonicalize_powershell, KernelToolKind::ProcessPowerShell);
-
-fn canonicalizer_for(tool: KernelToolKind) -> KernelInvocationCanonicalizer {
-    match tool {
-        KernelToolKind::FsRead => canonicalize_fs_read,
-        KernelToolKind::FsWrite => canonicalize_fs_write,
-        KernelToolKind::FsEdit => canonicalize_fs_edit,
-        KernelToolKind::FsDelete => canonicalize_fs_delete,
-        KernelToolKind::WebSearch => canonicalize_web_search,
-        KernelToolKind::WebFetch => canonicalize_web_fetch,
-        KernelToolKind::ProcessShell => canonicalize_process_shell,
-        KernelToolKind::ProcessPowerShell => canonicalize_powershell,
     }
 }
 

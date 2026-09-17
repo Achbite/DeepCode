@@ -1,9 +1,10 @@
+import { admitSessionEvents } from './admission.js';
 import { failureSnapshotEvent } from './failureSnapshot.js';
 import { errorFact } from './loopFailure.js';
 import { LiveReasoning } from './reasoningRead.js';
 import { LiveToolOutput } from './liveToolOutput.js';
 import { todoItemsForPlan } from './planStage.js';
-import { retainSessionEnvironment, savedSessionEnvironment } from './sessionEnvironment.js';
+import { savedSessionEnvironment } from './sessionEnvironment.js';
 import type {
   AssistantDraftProjection,
   CommandJournalPort,
@@ -26,6 +27,8 @@ import {
   loopSnapshot,
   runAgentLoop,
   terminalToolEvents,
+  uncompletedProviderComposition,
+  providerTurnTerminalEvent,
   type LoopCommand,
   type LoopSnapshot,
 } from './loop.js';
@@ -367,14 +370,14 @@ export class SessionActor {
       const run = current.state.run;
       if (command.type === 'message.submit' && command.runId !== undefined
         && (!run || run.runId !== command.runId || !['running', 'waiting'].includes(run.status))) {
-        return await this.#journal.commitCommand(command, [], {
+        return await this.commitCommandWithinWrite(command, [], {
           ...acceptedReply(command), status: 'rejected',
           error: { code: 'queued_input_run_unavailable', message: '该消息所属的运行已结束或不再接收输入；消息未进入其他运行。' },
         });
       }
       if (!run || !['running', 'waiting'].includes(run.status)) return null;
       if (command.type === 'context.focus') {
-        return await this.#journal.commitCommand(command, [], {
+        return await this.commitCommandWithinWrite(command, [], {
           ...acceptedReply(command), status: 'rejected',
           error: { code: 'context_focus_run_active', message: '当前任务仍在运行；普通补充消息可以排队，/focus 请在本轮结束后使用。' },
         });
@@ -394,12 +397,12 @@ export class SessionActor {
         incompatible = '当前运行的模型设置已固定，排队消息不能替换本轮模型或推理设置。';
       }
       if (incompatible) {
-        return await this.#journal.commitCommand(command, [], {
+        return await this.commitCommandWithinWrite(command, [], {
           ...acceptedReply(command), status: 'rejected',
           error: { code: 'queued_input_runtime_change', message: incompatible },
         });
       }
-      return await this.#journal.commitCommand(command, [{
+      return await this.commitCommandWithinWrite(command, [{
         type: 'input.queued', sessionId: this.sessionId, runId: run.runId,
         payload: {
           commandId: command.commandId, messageId: this.#nextId('message'), text: submittedText,
@@ -451,7 +454,7 @@ export class SessionActor {
         ? { pluginSelections: command.pluginSelections.map((selection) => ({ ...selection })) }
         : {}),
     });
-    const runtimeSnapshot = retainSessionEnvironment(prepared.runtimeSnapshot, before.events);
+    const runtimeSnapshot = prepared.runtimeSnapshot;
     const events: NewSessionEvent[] = [
       ...(edit ? [edit.revised] : []),
       {
@@ -1004,8 +1007,10 @@ export class SessionActor {
       await this.settleRecoveryFailure(runId, error);
       return false;
     }
-    const restored = retainSessionEnvironment(prepared.runtimeSnapshot, snapshot.events);
-    if (canonicalJson(restored) !== canonicalJson(runtime)) {
+    const restored = prepared.runtimeSnapshot;
+    if (restored.provider.providerRuntimeRef !== runtime.provider.providerRuntimeRef
+      || restored.kernelCatalogSnapshotRef !== runtime.kernelCatalogSnapshotRef
+      || restored.extensionGenerationRef !== runtime.extensionGenerationRef) {
       const mismatch = new Error('run_runtime_recovery_identity_mismatch');
       try {
         await this.#composition.runPreparation.release({
@@ -1023,14 +1028,19 @@ export class SessionActor {
 
   private async settleRecoveryFailure(runId: string, error: unknown): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
-    await this.appendLifecycleEvents([{
+    const before = await this.loadSnapshot();
+    const pending = uncompletedProviderComposition(before, runId);
+    const outcome: Extract<RunSettlement, { outcome: 'failed' | 'indeterminate' }> = {
+      outcome: pending ? 'indeterminate' : 'failed',
+      error: { code: errorCode(message), message },
+    };
+    await this.appendLifecycleEvents([
+      ...(pending ? [providerTurnTerminalEvent(this.sessionId, runId, pending,
+        before.state.runRuntimeSnapshots[runId]!.provider.providerRuntimeRef, outcome)] : []), {
       type: 'run.finishing',
       sessionId: this.sessionId,
       runId,
-      payload: {
-        outcome: 'failed',
-        error: { code: errorCode(message), message },
-      },
+      payload: outcome,
     }]);
     const snapshot = await this.loadSnapshot();
     const settlement = snapshot.state.pendingRunSettlements[runId];
@@ -1113,16 +1123,7 @@ export class SessionActor {
   }
 
   private async appendEvents(events: readonly NewSessionEvent[], current: LoopSnapshot): Promise<void> {
-    let previewState = current.state;
-    for (const [index, event] of events.entries()) {
-      previewState = reduceSession(previewState, {
-        ...event,
-        schemaVersion: SESSION_EVENT_VERSION,
-        eventId: `preflight:${current.state.revision + index + 1}`,
-        sequence: current.state.revision + index + 1,
-        occurredAt: '1970-01-01T00:00:00.000Z',
-      } as SessionEvent);
-    }
+    admitSessionEvents(current, events);
     const previousDraft = this.#assistantDraft;
     const closesDraft = current.state.run && closesAssistantDraft(events, current.state.run.runId);
     if (closesDraft) this.#assistantDraft = null;
@@ -1142,7 +1143,20 @@ export class SessionActor {
     events: readonly NewSessionEvent[],
     reply: Omit<CommandReply, 'revision'>,
   ): Promise<CommandReply> {
-    return await this.withWrite(() => this.#journal.commitCommand(command, events, reply));
+    return await this.withWrite(() => this.commitCommandWithinWrite(command, events, reply));
+  }
+
+  private async commitCommandWithinWrite(
+    command: ConversationCommand,
+    events: readonly NewSessionEvent[],
+    reply: Omit<CommandReply, 'revision'>,
+  ): Promise<CommandReply> {
+    const current = await this.loadSnapshot();
+    admitSessionEvents(current, events, { input: command, reply });
+    const committed = await this.#journal.commitCommand(command, events, reply);
+    const next = await this.loadSnapshot();
+    for (const event of next.journalEvents.slice(current.journalEvents.length)) await this.observe(event);
+    return committed;
   }
 
   private async withWrite<T>(operation: () => Promise<T>): Promise<T> {
