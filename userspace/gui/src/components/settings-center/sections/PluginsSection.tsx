@@ -1,167 +1,619 @@
-import React, { useEffect, useState } from 'react';
-import type { SkillSettingsItem } from '@deepcode/protocol';
-import { normalizeUiLanguage, t } from '../../../i18n';
-import { getSkillSettings } from '../../../services/localAgentApi';
+import { localizePlugin } from '../../../pluginLocalization';
+import { useUiLanguage } from '../../../useUiLanguage';
+import { useSettingsSearchEntries } from '../settingsSearch';
+import ModalDialog from '../../shared/ModalDialog';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import type { PluginCatalogItem } from '@deepcode/protocol';
+import { normalizeUiLanguage, t, activeT } from '../../../i18n';
+import { getPluginCatalog } from '../../../services/localAgentApi';
+import { useLocalAgentStore } from '../../../state/localAgentStore';
 import { useSettingsStore } from '../../../state/settingsStore';
-import ProjectFolderDialog from '../../workspace-open-dialog/ProjectFolderDialog';
+import { useUiPlugins } from '../../../ui-plugins/UiPlugins';
+import { inspectLocalPlugin, type LocalPluginInspection } from '../../../ui-plugins/source';
+import { UiPluginShowcase } from '../../../ui-plugins/UiPluginShowcase';
+import { errorText } from '../../../ui-plugins/runtime';
 import DeepCodeShellIcon from '../../shared/DeepCodeShellIcon';
+import ProjectFolderDialog from '../../workspace-open-dialog/ProjectFolderDialog';
 
-interface SkillMount {
-  id: string;
-  path: string;
+type Source = {
+  id?: string;
+  path?: string;
+  name?: string;
+  command?: string;
+  args?: string;
   enabled?: boolean;
-  activationMediaTypes?: string[];
+  transport?: string;
+};
+type Item = {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  key: string;
+  sourceId: string;
+  path?: string;
+  error?: string;
+  status: string;
+  kind: 'ui' | 'tool' | 'guidance';
+  source?: Source;
+};
+function sourceList(value: unknown): Source[] {
+  const decoded: unknown = JSON.parse(String(value ?? '[]'));
+  if (!Array.isArray(decoded) || decoded.some((item) => !item || typeof item !== 'object'))
+    throw new Error(activeT('settings.plugins.invalidSources'));
+  return decoded;
 }
+const filename = (path: string) => path.split(/[\\/]/u).filter(Boolean).at(-1) ?? path;
 
-function decodeMounts(encoded: string): SkillMount[] {
-  const value: unknown = JSON.parse(encoded);
-  if (!Array.isArray(value) || !value.every((item) => item && typeof item === 'object'
-    && typeof item.id === 'string' && typeof item.path === 'string'
-    && (item.enabled === undefined || typeof item.enabled === 'boolean')
-    && (item.activationMediaTypes === undefined || (Array.isArray(item.activationMediaTypes)
-      && item.activationMediaTypes.every((type: unknown) => typeof type === 'string'))))) {
-    throw new Error('skills.mounts must be a list of Skill sources.');
-  }
-  return value;
-}
-
+/** Inventory reads the existing settings owners and live display registry; saving does not invent runtime state. */
 export default function PluginsSection({ query = '' }: { query?: string }) {
   const settings = useSettingsStore((state) => state.effectiveSettings);
-  const patchUserSetting = useSettingsStore((state) => state.patchUserSetting);
-  const storeError = useSettingsStore((state) => state.errorMessage);
-  const pending = useSettingsStore((state) => state.pendingNextRunActivation);
-  const language = normalizeUiLanguage(settings['workbench.language']);
-  const chinese = language === 'zh-CN';
-  const encoded = String(settings['skills.mounts'] ?? '[]');
-  const [mounts, setMounts] = useState<SkillMount[]>([]);
-  const [skills, setSkills] = useState<SkillSettingsItem[]>([]);
-  const [configError, setConfigError] = useState<string | null>(null);
-  const [listError, setListError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [revision, setRevision] = useState(0);
-  const [dirty, setDirty] = useState(false);
-  const [selection, setSelection] = useState<{ sourceId?: string } | null>(null);
-  const [manualPath, setManualPath] = useState('');
-
+  const patch = useSettingsStore((state) => state.patchUserSetting);
+  const language = normalizeUiLanguage(settings['workbench.language']),
+    chinese = language === 'zh-CN';
+  const ui = useUiPlugins();
+  const [catalog, setCatalog] = useState<PluginCatalogItem[]>([]);
+  const [metadata, setMetadata] = useState<Record<string, LocalPluginInspection>>({});
+  const [metadataErrors, setMetadataErrors] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null),
+    [itemErrors, setItemErrors] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState(false),
+    [revision, setRevision] = useState(0),
+    [search, setSearch] = useState('');
+  const [filter, setFilter] = useState<'all' | 'enabled'>('all');
+  const [expanded, setExpanded] = useState<string | null>(null),
+    [choosing, setChoosing] = useState(false);
+  const [candidate, setCandidate] = useState<LocalPluginInspection | null>(null);
+  const addButton = useRef<HTMLButtonElement>(null);
+  const readButton = useRef<HTMLButtonElement>(null);
+  const inspectionTrigger = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
-    try {
-      setMounts(decodeMounts(encoded));
-      setConfigError(null);
-      setDirty(false);
-    } catch (error) {
-      setConfigError(String(error));
+    if (!candidate && !busy && inspectionTrigger.current) {
+      inspectionTrigger.current.focus({ preventScroll: true });
+      inspectionTrigger.current = null;
     }
-  }, [encoded]);
-
+  }, [candidate, busy]);
+  const [manualPath, setManualPath] = useState('');
+  const [connection, setConnection] = useState<Source | null>(null);
+  const config = useMemo(() => {
+    try {
+      return { ui: sourceList(settings['workbench.uiPlugins']), error: null };
+    } catch (reason) {
+      return { ui: [], error: errorText(reason) };
+    }
+  }, [settings['workbench.uiPlugins']]);
   useEffect(() => {
     const controller = new AbortController();
-    setLoading(true);
-    setSkills([]);
-    setListError(null);
-    void getSkillSettings(controller.signal).then((items) => {
-      if (!controller.signal.aborted) setSkills(items);
-    }).catch((error: unknown) => {
-      if (!controller.signal.aborted) setListError(String(error));
-    }).finally(() => {
-      if (!controller.signal.aborted) setLoading(false);
-    });
+    setError(null);
+    void getPluginCatalog(controller.signal)
+      .then((value) => setCatalog(value.plugins))
+      .catch((reason) => {
+        if (!controller.signal.aborted) setError(errorText(reason));
+      });
     return () => controller.abort();
-  }, [encoded, revision]);
-
-  const update = (next: SkillMount[]) => { setMounts(next); setDirty(true); };
-  const addSource = (path: string) => {
-    if (!mounts.some((mount) => mount.path === path)) {
-      update([...mounts, { id: `skill-${crypto.randomUUID()}`, path, enabled: true }]);
+  }, [
+    settings['skills.mounts'],
+    settings['mcp.servers'],
+    settings['plugins.sources'],
+    settings['plugins.disabled'],
+    revision,
+  ]);
+  useEffect(() => {
+    const controller = new AbortController();
+    for (const source of config.ui) {
+      if (!source.path) continue;
+      const path = source.path;
+      void inspectLocalPlugin(path, controller.signal)
+        .then((value) => {
+          if (!controller.signal.aborted) {
+            setMetadata((old) => ({ ...old, [path]: value }));
+            setMetadataErrors((old) => {
+              const next = { ...old };
+              delete next[path];
+              return next;
+            });
+          }
+        })
+        .catch((reason) => {
+          if (!controller.signal.aborted)
+            setMetadataErrors((old) => ({ ...old, [path]: errorText(reason) }));
+        });
+    }
+    return () => controller.abort();
+  }, [config, revision]);
+  const items: Item[] = catalog
+    .filter((plugin) => plugin.management)
+    .map((plugin) => localizePlugin(plugin, language))
+    .map((plugin) => {
+      const owner = plugin.management!;
+      let source: Source | undefined;
+      try {
+        if (owner.key !== 'plugins.disabled')
+          source = sourceList(settings[owner.key]).find((item) => item.id === owner.id);
+      } catch {
+        /* The directory reports malformed settings. */
+      }
+      return {
+        id: plugin.uri,
+        name: plugin.displayName,
+        description: plugin.shortDescription,
+        enabled: plugin.enabled,
+        key: owner.key,
+        sourceId: owner.id,
+        path: owner.path,
+        error: plugin.error ? `${plugin.error.code}: ${plugin.error.message}` : undefined,
+        status: plugin.enabled ? (plugin.available ? t(language, 'settings.plugins.chooseReady') : t(language, 'settings.plugins.unavailable')) : t(language, 'settings.plugins.disabled'),
+        kind: plugin.contributionKind === 'skill' ? 'guidance' : 'tool',
+        source,
+      };
+    });
+  for (const source of config.ui) {
+    const path = source.path ?? '',
+      entry = ui.entries.find((item) => item.path === path),
+      info = metadata[path];
+    items.push({
+      id: 'ui:' + path,
+      name: entry?.manifest?.name ?? info?.name ?? filename(path),
+      description:
+        entry?.manifest?.description ?? info?.description ?? t(language, 'settings.plugins.description'),
+      enabled: source.enabled === true,
+      key: 'workbench.uiPlugins',
+      sourceId: path,
+      path,
+      error: entry?.error ?? metadataErrors[path],
+      status:
+        entry?.status === 'error'
+          ? t(language, 'settings.plugins.failed')
+          : !source.enabled
+            ? t(language, 'settings.plugins.disabled')
+            : entry?.status === 'active'
+              ? t(language, 'settings.plugins.loaded')
+              : entry?.status === 'loading'
+                ? t(language, 'settings.plugins.updating')
+                : t(language, 'settings.plugins.waiting'),
+      kind: 'ui',
+      source,
+    });
+  }
+  useSettingsSearchEntries('plugins', items.map((item) => ({ id: `plugin-${item.id}`, title: item.name, keywords: item.description, category: 'plugins' })));
+  const shown = items.filter(
+    (item) =>
+      (filter === 'all' || item.enabled) &&
+      `${item.name} ${item.description}`
+        .toLowerCase()
+        .includes(`${query} ${search}`.trim().toLowerCase()),
+  );
+  const save = async (item: Item, enabled: boolean, remove = false, replacement?: Source) => {
+    setBusy(true);
+    setItemErrors((old) => {
+      const next = { ...old };
+      delete next[item.id];
+      return next;
+    });
+    try {
+      const current = useSettingsStore.getState().effectiveSettings[item.key];
+      let value: unknown;
+      if (item.key === 'plugins.disabled') {
+        const disabled: unknown = JSON.parse(String(current ?? '[]'));
+        if (!Array.isArray(disabled) || !disabled.every((value) => typeof value === 'string'))
+          throw new Error(t(language, 'settings.plugins.invalidDisabled'));
+        value = enabled
+          ? disabled.filter((id) => id !== item.sourceId)
+          : [...new Set([...disabled, item.sourceId])];
+      } else {
+        const list = sourceList(current),
+          matches = (source: Source) =>
+            item.kind === 'ui' ? source.path === item.path : source.id === item.sourceId;
+        value = remove
+          ? list.filter((source) => !matches(source))
+          : list.map((source) =>
+              matches(source) ? { ...(replacement ?? source), enabled } : source,
+            );
+      }
+      if (!(await patch(item.key, JSON.stringify(value))))
+        throw new Error(useSettingsStore.getState().errorMessage ?? t(language, 'settings.plugins.notSaved'));
+      if (remove) setExpanded(null);
+      setRevision((value) => value + 1);
+      void useLocalAgentStore.getState().refreshPluginCatalog();
+    } catch (reason) {
+      setItemErrors((old) => ({ ...old, [item.id]: errorText(reason) }));
+    } finally {
+      setBusy(false);
     }
   };
-  const selectSource = (path: string) => {
-    if (selection?.sourceId) {
-      update(mounts.map((mount) => mount.id === selection.sourceId ? { ...mount, path } : mount));
-    } else addSource(path);
-    setSelection(null);
-  };
-  const save = async () => {
-    setSaving(true);
+  const inspect = async (path: string) => {
+    inspectionTrigger.current = choosing ? addButton.current : readButton.current;
+    setChoosing(false);
+    setBusy(true);
+    setError(null);
     try {
-      const result = await patchUserSetting('skills.mounts', JSON.stringify(mounts));
-      if (result) { setDirty(false); setRevision((value) => value + 1); }
-    } finally { setSaving(false); }
+      setCandidate(await inspectLocalPlugin(path));
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setBusy(false);
+    }
   };
-  const shown = skills.filter((skill) => `${skill.displayName} ${skill.description} ${skill.source}`
-    .toLowerCase().includes(query.trim().toLowerCase()));
-
-  return <div>
-    <h2 className="settings-title">{t(language, 'settings.nav.plugins')}</h2>
-    <p className="settings-section-description">{chinese
-      ? '管理 Agent 使用的文本 Skill。MCP 服务与其他插件也将在此集中管理。'
-      : 'Manage text Skills for your Agent. MCP services and other plugins will also be managed here.'}</p>
-    {pending && <p className="settings-activation-notice">{t(language, 'settings.agent.nextRunActivationPending')}</p>}
-    <section className="settings-group">
-      <h3 className="settings-card__title">{chinese ? 'Skill 来源' : 'Skill sources'}</h3>
-      <div className="settings-card settings-card__body settings-skill-sources">
-        <p className="settings-plugin-description">{chinese
-          ? '选择包含 SKILL.md 的文件夹，或添加单个 SKILL.md 文件。'
-          : 'Choose a folder containing Skills, or add an individual SKILL.md file.'}</p>
-        {configError && <p role="alert" className="settings-error">{configError}</p>}
-        {!configError && mounts.length === 0 && <p className="settings-plugin-empty">{chinese
-          ? '尚未添加自定义来源。内置 Skill 已列在下方。'
-          : 'No custom sources yet. Built-in Skills are listed below.'}</p>}
-        {!configError && mounts.map((mount, index) => <div className="settings-plugin-source" key={mount.id}>
-          <input type="checkbox" checked={mount.enabled !== false} disabled={saving}
-            aria-label={`${chinese ? '启用' : 'Enable'} ${mount.path || mount.id}`}
-            onChange={(event) => update(mounts.map((item, i) => i === index ? { ...item, enabled: event.target.checked } : item))} />
-          <div className="settings-plugin-source__path">
-            <strong>{mount.path.replace(/[\\/]+$/u, '').split(/[\\/]/u).at(-1) || (chinese ? '未选择来源' : 'No source selected')}</strong>
-            <span title={mount.path} dir="auto">{mount.path || (chinese ? '选择文件夹或 SKILL.md 文件' : 'Choose a folder or SKILL.md file')}</span>
-          </div>
-          <div className="settings-plugin-source__actions">
-            <button type="button" className="settings-button" disabled={saving} onClick={() => setSelection({
-              sourceId: mount.id,
-            })}>{chinese ? '更改…' : 'Change…'}</button>
-            <button type="button" className="settings-button settings-button--quiet" disabled={saving}
-              aria-label={`${chinese ? '移除来源' : 'Remove source'} ${mount.path || index + 1}`}
-              onClick={() => update(mounts.filter((_, i) => i !== index))}>{chinese ? '移除' : 'Remove'}</button>
-          </div>
-        </div>)}
-        <div className="settings-actions settings-plugin-actions">
-          <button type="button" className="settings-button" disabled={saving || !!configError} onClick={() => setSelection({})}>
-            <DeepCodeShellIcon name="plus" />{chinese ? '添加来源…' : 'Add source…'}</button>
-          <button type="button" className="settings-button settings-button--primary settings-plugin-save" disabled={saving || !!configError || !dirty || mounts.some((mount) => !mount.path.trim())} onClick={() => void save()}>{saving ? (chinese ? '正在保存…' : 'Saving…') : (chinese ? '保存更改' : 'Save changes')}</button>
+  const add = async () => {
+    if (!candidate) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const key =
+        candidate.kind === 'ui'
+          ? 'workbench.uiPlugins'
+          : candidate.kind === 'cli'
+            ? 'plugins.sources'
+            : 'skills.mounts';
+      const list = sourceList(useSettingsStore.getState().effectiveSettings[key]);
+      if (
+        list.some(
+          (source) =>
+            source.path === candidate.path ||
+            (candidate.kind === 'cli' && source.id === candidate.id),
+        )
+      )
+        throw new Error(t(language, 'settings.plugins.duplicate'));
+      const source =
+        candidate.kind === 'ui'
+          ? { path: candidate.path, enabled: true }
+          : {
+              id: candidate.kind === 'cli' ? candidate.id : crypto.randomUUID(),
+              path: candidate.path,
+              enabled: true,
+            };
+      if (!(await patch(key, JSON.stringify([...list, source]))))
+        throw new Error(useSettingsStore.getState().errorMessage ?? t(language, 'settings.plugins.notSaved'));
+      setCandidate(null);
+      setManualPath('');
+      setRevision((value) => value + 1);
+      void useLocalAgentStore.getState().refreshPluginCatalog();
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const addConnection = async (source: Source) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const list = sourceList(useSettingsStore.getState().effectiveSettings['mcp.servers']);
+      const entry = { ...source, id: crypto.randomUUID(), transport: 'stdio', enabled: true };
+      if (!(await patch('mcp.servers', JSON.stringify([...list, entry]))))
+        throw new Error(useSettingsStore.getState().errorMessage ?? t(language, 'settings.plugins.notSaved'));
+      setConnection(null);
+      setRevision((value) => value + 1);
+      void useLocalAgentStore.getState().refreshPluginCatalog();
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="plugin-manager">
+      <header className="plugin-manager__heading">
+        <div>
+          <h2 className="settings-title">{chinese ? '插件' : 'Plugins'}</h2>
         </div>
-        <details className="settings-plugin-manual">
-          <summary>{chinese ? '手动输入路径' : 'Enter a path manually'}</summary>
-          <form className="settings-plugin-manual__form" onSubmit={(event) => {
+        <button
+          className="settings-button plugin-manager__add"
+          ref={addButton}
+          disabled={busy}
+          onClick={() => setChoosing(true)}
+        >
+          <DeepCodeShellIcon name="plus" />
+          {chinese ? '添加…' : 'Add…'}
+        </button>
+      </header>
+      <div className="plugin-manager__filters">
+        <div role="group" aria-label={t(language, 'settings.plugins.filter')}>
+          {(['all', 'enabled'] as const).map((key) => (
+            <button
+              key={key}
+
+              aria-pressed={filter === key}
+              onClick={() => setFilter(key)}
+            >
+              {key === 'all' ? (chinese ? '全部' : 'All') : chinese ? '已启用' : 'Enabled'}{' '}
+              <small>
+                {key === 'all' ? items.length : items.filter((item) => item.enabled).length}
+              </small>
+            </button>
+          ))}
+        </div>
+        <label>
+          <DeepCodeShellIcon name="search" />
+          <input
+            placeholder={chinese ? '搜索插件' : 'Search plugins'}
+            aria-label={chinese ? '搜索插件' : 'Search plugins'}
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+          />
+        </label>
+        <button
+          className="reader-icon-button"
+          title={t(language, 'settings.plugins.refresh')}
+          aria-label={t(language, 'settings.plugins.refresh')}
+          onClick={() => {
+            setRevision((value) => value + 1);
+            ui.refresh?.();
+          }}
+        >
+          <DeepCodeShellIcon name="refresh" />
+        </button>
+      </div>
+      {(error || config.error || ui.connectionError) && (
+        <p role="alert" className="settings-error">
+          {error ?? config.error ?? ui.connectionError}
+        </p>
+      )}
+      <div className="plugin-manager__list">
+        {shown.map((item) => (
+          <section id={`setting-plugin-${item.id}`} tabIndex={-1} className="plugin-manager__item" key={item.id}>
+            <div className="plugin-manager__row">
+              <span className="plugin-manager__icon">
+                <DeepCodeShellIcon
+                  name={
+                    item.kind === 'ui'
+                      ? 'extension'
+                      : item.kind === 'guidance'
+                        ? 'artifact'
+                        : 'tool'
+                  }
+                />
+              </span>
+              <button
+                className="plugin-manager__summary"
+                aria-expanded={expanded === item.id}
+                onClick={() => setExpanded(expanded === item.id ? null : item.id)}
+              >
+                <strong>{item.name}</strong>
+                <span>{item.description}</span>
+              </button>
+              <span
+                className={
+                  'plugin-manager__status' +
+                  (item.error
+                    ? ' plugin-manager__status--error'
+                    : item.enabled
+                      ? ' plugin-manager__status--enabled'
+                      : '')
+                }
+                title={item.error ?? item.status}
+                aria-label={item.error ? t(language, 'settings.plugins.failed') : item.status}
+              />
+              <label className="plugin-switch">
+                <input
+                  type="checkbox"
+                  role="switch"
+                  aria-label={`${chinese ? '启用' : 'Enable'} ${item.name}`}
+                  checked={item.enabled}
+                  disabled={busy}
+                  onChange={(event) => void save(item, event.target.checked)}
+                />
+                <span />
+              </label>
+              <button
+                className="reader-icon-button"
+                aria-label={t(language, 'settings.plugins.details', { name: item.name })}
+                aria-expanded={expanded === item.id}
+                onClick={() => setExpanded(expanded === item.id ? null : item.id)}
+              >
+                <DeepCodeShellIcon name={expanded === item.id ? 'chevronDown' : 'chevronRight'} />
+              </button>
+            </div>
+            {(item.error || itemErrors[item.id]) && (
+              <p role="alert" className="settings-error">
+                {itemErrors[item.id] ?? item.error}
+              </p>
+            )}
+            {expanded === item.id && (
+              <div className="plugin-manager__detail">
+                <dl>
+                  <dt>{t(language, 'settings.plugins.status')}</dt>
+                  <dd>{item.status}</dd>
+                  <dt>{t(language, 'settings.plugins.update')}</dt>
+                  <dd>
+                    {item.kind === 'ui'
+                      ? t(language, 'settings.plugins.uiUpdate')
+                      : t(language, 'settings.plugins.toolUpdate')}
+                  </dd>
+                </dl>
+                {item.path && (
+                  <details>
+                    <summary>{t(language, 'settings.plugins.location')}</summary>
+                    <div className="plugin-manager__location">
+                      <code>{item.path}</code>
+                      <button
+                        className="settings-button"
+                        onClick={() =>
+                          void navigator.clipboard
+                            .writeText(item.path!)
+                            .catch((reason) =>
+                              setItemErrors((old) => ({ ...old, [item.id]: errorText(reason) })),
+                            )
+                        }
+                      >
+                        {t(language, 'settings.plugins.copy')}
+                      </button>
+                    </div>
+                  </details>
+                )}
+                {item.key === 'mcp.servers' && item.source && (
+                  <PluginConnectionForm
+                    source={item.source}
+                    busy={busy}
+                    save={(source) => void save(item, item.enabled, false, source)}
+                  />
+                )}
+                <div className="settings-actions">
+                  {item.kind === 'ui' && (
+                    <button
+                      className="settings-button"
+                      disabled={busy || !item.enabled}
+                      onClick={() => ui.refresh?.(item.path)}
+                    >
+                      {t(language, 'settings.plugins.reload')}
+                    </button>
+                  )}
+                  {item.key !== 'plugins.disabled' && (
+                    <button
+                      className="settings-button settings-button--quiet"
+                      disabled={busy}
+                      onClick={() => void save(item, false, true)}
+                    >
+                      {t(language, 'settings.plugins.remove')}
+                    </button>
+                  )}
+                </div>
+                {item.kind === 'ui' && item.enabled && (
+                  <details>
+                    <summary>{t(language, 'settings.plugins.showcase')}</summary>
+                    <UiPluginShowcase language={language} />
+                  </details>
+                )}
+              </div>
+            )}
+          </section>
+        ))}
+      </div>
+      {!shown.length && !error && (
+        <p className="settings-plugin-empty">
+          {chinese ? '暂无匹配的插件。' : 'No matching plugins.'}
+        </p>
+      )}
+      <details className="plugin-manager__manual">
+        <summary>{chinese ? '手动指定位置' : 'Enter a location'}</summary>
+        <form
+          onSubmit={(event) => {
             event.preventDefault();
-            if (!manualPath.trim() || saving || configError) return;
-            addSource(manualPath.trim()); setManualPath('');
-          }}>
-            <input className="settings-field__input" value={manualPath} disabled={saving || !!configError}
-              aria-label={chinese ? 'Skill 文件或目录的完整路径' : 'Full path to a Skill file or folder'}
-              placeholder={chinese ? 'Skill 文件或目录的完整路径' : 'Full path to a Skill file or folder'}
-              onChange={(event) => setManualPath(event.target.value)} />
-            <button type="submit" className="settings-button" disabled={saving || !!configError || !manualPath.trim()}>{chinese ? '添加' : 'Add'}</button>
-          </form>
-        </details>
-        {storeError && <p role="alert" className="settings-error">{storeError}</p>}
-      </div>
-    </section>
-    <section className="settings-group">
-      <h3 className="settings-card__title"><span>{chinese ? '可用 Skill' : 'Available Skills'}{!loading && !listError ? ` · ${shown.length}` : ''}</span>
-        <button className="settings-button" disabled={loading} onClick={() => setRevision((value) => value + 1)}>{chinese ? '刷新列表' : 'Refresh list'}</button></h3>
-      <div className="settings-card settings-card__body" aria-busy={loading}>
-        {loading && <p>{chinese ? '正在读取 Skill…' : 'Loading Skills…'}</p>}
-        {listError && <p role="alert" className="settings-error">{listError}</p>}
-        {!loading && !listError && shown.length === 0 && <p>{query ? t(language, 'settings.noSearchMatch') : (chinese ? '暂无可用 Skill。' : 'No Skills available.')}</p>}
-        {shown.map((skill) => <div className="settings-plugin-item" key={skill.id}>
-          <div className="settings-plugin-item__heading"><strong>{skill.displayName}</strong><span>{skill.source === 'builtin' ? (chinese ? '内置' : 'Built in') : (chinese ? '已加载' : 'Loaded')}</span></div>
-          <p>{skill.description}</p>
-        </div>)}
-      </div>
-    </section>
-    {selection && <ProjectFolderDialog language={language} selectionMode="path"
-      title={chinese ? '选择 Skill 来源' : 'Choose a Skill source'}
-      filters={[{ name: 'Skill (SKILL.md)', extensions: ['md'] }]}
-      onCancel={() => setSelection(null)} onSelect={selectSource} />}
-  </div>;
+            void inspect(manualPath.trim());
+          }}
+        >
+          <input
+            aria-label={t(language, 'settings.plugins.locationLabel')}
+            value={manualPath}
+            onChange={(event) => setManualPath(event.target.value)}
+          />
+          <button ref={readButton} className="settings-button" disabled={busy || !manualPath.trim()}>
+            {t(language, 'settings.plugins.read')}
+          </button>
+        </form>
+      </details>
+      <details className="plugin-manager__manual">
+        <summary>{chinese ? '连接外部工具' : 'Connect external tools'}</summary>
+        {connection ? (
+          <>
+            <PluginConnectionForm
+              source={connection}
+              busy={busy}
+              save={(source) => void addConnection(source)}
+              adding
+            />
+            <button className="settings-button" disabled={busy} onClick={() => setConnection(null)}>
+              {t(language, 'settings.plugins.cancel')}
+            </button>
+          </>
+        ) : (
+          <button
+            className="settings-button"
+            disabled={busy}
+            onClick={() => setConnection({ name: '', command: '', args: '' })}
+          >
+            {t(language, 'settings.plugins.addConnection')}
+          </button>
+        )}
+      </details>
+      {candidate && (
+        <ModalDialog className="plugin-import-overlay" busy={busy} onClose={() => setCandidate(null)} aria-label={chinese ? '添加插件' : 'Add plugin'}>
+          <section className="plugin-import">
+            <h3>{t(language, 'settings.plugins.add')}</h3>
+            <strong>{candidate.name}</strong>
+            <p>{candidate.description}</p>
+            <details>
+              <summary>{t(language, 'settings.plugins.location')}</summary>
+              <code>{candidate.path}</code>
+            </details>
+            {error && (
+              <p role="alert" className="settings-error">
+                {error}
+              </p>
+            )}
+            <div className="settings-actions">
+              <button
+                className="settings-button"
+                disabled={busy}
+                onClick={() => setCandidate(null)}
+              >
+                {t(language, 'settings.plugins.cancel')}
+              </button>
+              <button
+                className="settings-button settings-button--primary"
+                disabled={busy}
+                onClick={() => void add()}
+              >
+                {t(language, 'settings.plugins.addEnable')}
+              </button>
+            </div>
+          </section>
+        </ModalDialog>
+      )}
+      {choosing && (
+        <ProjectFolderDialog
+          language={language}
+          selectionMode="path"
+          title={chinese ? '选择插件文件或文件夹' : 'Choose plugin file or folder'}
+          onCancel={() => setChoosing(false)}
+          onSelect={(path) => void inspect(path)}
+        />
+      )}
+    </div>
+  );
+}
+function PluginConnectionForm({
+  source,
+  busy,
+  save,
+  adding = false,
+}: {
+  source: Source;
+  busy: boolean;
+  save(source: Source): void;
+  adding?: boolean;
+}) {
+  const language = useUiLanguage();
+  const [draft, setDraft] = useState(source);
+  return (
+    <form
+      className="plugin-connection"
+      onSubmit={(event) => {
+        event.preventDefault();
+        save(draft);
+      }}
+    >
+      {(['name', 'command', 'args'] as const).map((key) => (
+        <label key={key}>
+          {key === 'name' ? t(language, 'settings.plugins.name') : key === 'command' ? t(language, 'settings.plugins.command') : t(language, 'settings.plugins.args')}
+          <input
+            required={key !== 'args'}
+            value={draft[key] ?? ''}
+            onChange={(event) => setDraft({ ...draft, [key]: event.target.value })}
+          />
+        </label>
+      ))}
+      <button
+        className="settings-button"
+        disabled={
+          busy ||
+          !draft.name?.trim() ||
+          !draft.command?.trim() ||
+          (!adding && JSON.stringify(source) === JSON.stringify(draft))
+        }
+      >
+        {adding ? t(language, 'settings.plugins.connect') : t(language, 'settings.plugins.save')}
+      </button>
+    </form>
+  );
 }

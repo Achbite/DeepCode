@@ -42,7 +42,6 @@ pub(super) fn invoke(
             output["query"] = search_query_metadata(query, None);
             output["sourceUrl"] = json!(config.endpoint);
             output["retrievedAtMs"] = json!(unix_millis());
-            output["contentHash"] = json!(deepcode_kernel_tools::hash_bytes(&bytes));
             output["untrustedEvidence"] = json!(true);
             Ok(output)
         }).map_err(|error| KernelError::Other(format!("start search worker: {error}")))?

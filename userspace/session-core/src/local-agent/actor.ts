@@ -1,7 +1,10 @@
+import { admitSessionEvents } from './admission.js';
+import { failureSnapshotEvent } from './failureSnapshot.js';
+import { errorFact } from './loopFailure.js';
 import { LiveReasoning } from './reasoningRead.js';
 import { LiveToolOutput } from './liveToolOutput.js';
 import { todoItemsForPlan } from './planStage.js';
-import { retainSessionEnvironment, savedSessionEnvironment } from './sessionEnvironment.js';
+import { savedSessionEnvironment } from './sessionEnvironment.js';
 import type {
   AssistantDraftProjection,
   CommandJournalPort,
@@ -24,6 +27,8 @@ import {
   loopSnapshot,
   runAgentLoop,
   terminalToolEvents,
+  uncompletedProviderComposition,
+  providerTurnTerminalEvent,
   type LoopCommand,
   type LoopSnapshot,
 } from './loop.js';
@@ -100,7 +105,6 @@ export class SessionActor {
   }
 
   async snapshot(): Promise<SessionProjection> {
-    this.assertOperational();
     const projection = projectSession((await this.loadSnapshot()).state, this.#assistantDraft);
     for (const activity of projection.activities) {
       if (activity.status === 'active' && activity.callId) {
@@ -116,6 +120,7 @@ export class SessionActor {
   }
 
   async hasActiveWork(): Promise<boolean> {
+    if (this.#loopFailure) return false;
     const run = (await this.loadSnapshot()).state.run;
     return this.#active !== undefined
       || (run != null && run.status !== 'waiting' && !isTerminal(run.status));
@@ -167,6 +172,8 @@ export class SessionActor {
         return await this.handleDirectoryIndexDetach(command);
       case 'message.submit':
         return await this.handleMessage(command);
+      case 'message.edit':
+        return await this.handleMessageEdit(command);
       case 'context.focus':
         return await this.handleFocus(command);
       case 'message.feedback.set':
@@ -296,11 +303,44 @@ export class SessionActor {
     return await this.handleRunInput(command, command.task, command.task);
   }
 
+  private async handleMessageEdit(command: Extract<ConversationCommand, { type: 'message.edit' }>): Promise<CommandReply> {
+    const snapshot = await this.loadSnapshot();
+    if (snapshot.state.run && !isTerminal(snapshot.state.run.status)) {
+      return await this.recordRejection(command, 'message_edit_run_active', '请等待当前任务结束后再编辑重跑。');
+    }
+    if (command.expectedRevision !== snapshot.state.revision) {
+      return await this.recordRejection(command, 'message_edit_stale', '会话内容已变化，请重新选择要编辑的消息。');
+    }
+    const original = snapshot.state.messages.find((message) => message.messageId === command.messageId);
+    const accepted = snapshot.events.find((event) => event.type === 'input.accepted'
+      && event.payload.messageId === command.messageId);
+    const started = snapshot.events.find((event) => event.type === 'run.started'
+      && event.payload.inputMessageId === command.messageId);
+    if (!original || original.role !== 'user' || original.replyToInteraction || !accepted || !started) {
+      return await this.recordRejection(command, 'message_edit_target_invalid', '只能编辑已结束任务的起始用户消息。');
+    }
+    const revised: Extract<NewSessionEvent, { type: 'conversation.revised' }> = {
+      type: 'conversation.revised', sessionId: this.sessionId,
+      payload: { commandId: command.commandId, messageId: command.messageId,
+        fromSequence: accepted.sequence, throughSequence: snapshot.state.revision },
+    };
+    return await this.handleRunInput({
+      schemaVersion: command.schemaVersion, type: 'message.submit', commandId: command.commandId,
+      sessionId: this.sessionId, text: command.text,
+      filesystemReferences: original.filesystemReferences,
+      pluginSelections: original.pluginSelections,
+      ...(original.guidanceReferences ? { guidanceReferences: original.guidanceReferences } : {}),
+      ...(command.hostBinding ? { hostBinding: command.hostBinding } : {}),
+    }, command.text, null, { command, revised });
+  }
+
   private async handleRunInput(
     command: Extract<ConversationCommand, { type: 'message.submit' | 'context.focus' }>,
     submittedText: string,
     focusTask: string | null,
+    edit?: { command: Extract<ConversationCommand, { type: 'message.edit' }>; revised: Extract<NewSessionEvent, { type: 'conversation.revised' }> },
   ): Promise<CommandReply> {
+    const journalCommand = edit?.command ?? command;
     if (!submittedText.trim() && (command.type === 'context.focus' || !command.filesystemReferences?.length)) {
       if (command.type === 'context.focus') {
         return await this.recordRejection(
@@ -309,7 +349,7 @@ export class SessionActor {
           '/focus 后必须提供新的任务正文。',
         );
       }
-      return await this.recordRejection(command, 'message_empty', '用户消息不能为空。');
+      return await this.recordRejection(journalCommand, 'message_empty', '用户消息不能为空。');
     }
     if (command.profileId !== undefined && !validProfileId(command.profileId)) {
       return await this.recordRejection(command, 'llm_profile_invalid', '模型 Profile 标识无效。');
@@ -330,14 +370,14 @@ export class SessionActor {
       const run = current.state.run;
       if (command.type === 'message.submit' && command.runId !== undefined
         && (!run || run.runId !== command.runId || !['running', 'waiting'].includes(run.status))) {
-        return await this.#journal.commitCommand(command, [], {
+        return await this.commitCommandWithinWrite(command, [], {
           ...acceptedReply(command), status: 'rejected',
           error: { code: 'queued_input_run_unavailable', message: '该消息所属的运行已结束或不再接收输入；消息未进入其他运行。' },
         });
       }
       if (!run || !['running', 'waiting'].includes(run.status)) return null;
       if (command.type === 'context.focus') {
-        return await this.#journal.commitCommand(command, [], {
+        return await this.commitCommandWithinWrite(command, [], {
           ...acceptedReply(command), status: 'rejected',
           error: { code: 'context_focus_run_active', message: '当前任务仍在运行；普通补充消息可以排队，/focus 请在本轮结束后使用。' },
         });
@@ -349,10 +389,6 @@ export class SessionActor {
         !run.workspaceBindings.some((binding) => binding.workspaceId === reference.workspaceId)
       ))) {
         incompatible = '当前运行的目录绑定已固定，无法在排队消息中新增目录。';
-      } else if (command.pluginSelections?.some((selection) => (
-        !runtime.selectedPlugins.plugins.some((plugin) => plugin.uri === selection.uri)
-      ))) {
-        incompatible = '当前运行的插件已固定，无法在排队消息中激活新插件。';
       } else if (
         command.profileId !== undefined && command.profileId !== runtime.provider.profileId
         || command.reasoningEffortOverride !== undefined
@@ -361,15 +397,17 @@ export class SessionActor {
         incompatible = '当前运行的模型设置已固定，排队消息不能替换本轮模型或推理设置。';
       }
       if (incompatible) {
-        return await this.#journal.commitCommand(command, [], {
+        return await this.commitCommandWithinWrite(command, [], {
           ...acceptedReply(command), status: 'rejected',
           error: { code: 'queued_input_runtime_change', message: incompatible },
         });
       }
-      return await this.#journal.commitCommand(command, [{
+      return await this.commitCommandWithinWrite(command, [{
         type: 'input.queued', sessionId: this.sessionId, runId: run.runId,
         payload: {
           commandId: command.commandId, messageId: this.#nextId('message'), text: submittedText,
+          ...(command.guidanceReferences?.length ? {guidanceReferences:structuredClone(command.guidanceReferences)} : {}),
+          ...(command.pluginCatalogRevision ? { pluginCatalogRevision: command.pluginCatalogRevision } : {}),
           ...(command.filesystemReferences?.length ? { filesystemReferences: command.filesystemReferences.map((reference) => ({ ...reference })) } : {}),
           ...(command.pluginSelections?.length ? { pluginSelections: command.pluginSelections.map((selection) => ({ ...selection })) } : {}),
         },
@@ -379,7 +417,11 @@ export class SessionActor {
     // A final turn may already be releasing its runtime; wait for that owned task
     // before admitting the next run, without blocking other Sessions.
     if (this.#active) await this.#active.task;
-    const before = await this.loadSnapshot();
+    const current = await this.loadSnapshot();
+    const before = edit ? loopSnapshot(this.sessionId, [...current.journalEvents, {
+      ...edit.revised, schemaVersion: SESSION_EVENT_VERSION, eventId: `preflight:${command.commandId}`,
+      sequence: current.state.revision + 1, occurredAt: '1970-01-01T00:00:00.000Z',
+    }]) : current;
     if (before.state.run && !isTerminal(before.state.run.status)) {
       return await this.recordRejection(command, 'run_release_pending', '当前运行尚未完成资源释放。');
     }
@@ -402,6 +444,7 @@ export class SessionActor {
       sessionId: this.sessionId,
       runId,
       environment: savedSessionEnvironment(before.events),
+      ...(command.hostBinding ? { hostBinding: { ...command.hostBinding } } : {}),
       ...(profileId ? { profileId } : {}),
       ...(reasoningEffortOverride ? { reasoningEffortOverride } : {}),
       ...(command.pluginCatalogRevision
@@ -411,8 +454,9 @@ export class SessionActor {
         ? { pluginSelections: command.pluginSelections.map((selection) => ({ ...selection })) }
         : {}),
     });
-    const runtimeSnapshot = retainSessionEnvironment(prepared.runtimeSnapshot, before.events);
+    const runtimeSnapshot = prepared.runtimeSnapshot;
     const events: NewSessionEvent[] = [
+      ...(edit ? [edit.revised] : []),
       {
         type: 'session.model-settings.updated',
         sessionId: this.sessionId,
@@ -425,6 +469,7 @@ export class SessionActor {
           commandId: command.commandId,
           messageId,
           text: submittedText,
+          ...(command.guidanceReferences?.length ? {guidanceReferences:structuredClone(command.guidanceReferences)} : {}),
           ...(command.pluginSelections?.length
             ? { pluginSelections: command.pluginSelections.map((selection) => ({ ...selection })) }
             : {}),
@@ -437,6 +482,7 @@ export class SessionActor {
           messageId,
           role: 'user',
           content: submittedText,
+          ...(command.guidanceReferences?.length ? {guidanceReferences:structuredClone(command.guidanceReferences)} : {}),
           ...(command.filesystemReferences?.length
             ? {
                 filesystemReferences: command.filesystemReferences.map((reference) => ({
@@ -478,7 +524,7 @@ export class SessionActor {
     let reply: CommandReply;
     try {
       reply = await this.commitCommand(
-        command,
+        journalCommand,
         events,
         acceptedReply(command),
       );
@@ -612,6 +658,9 @@ export class SessionActor {
         '该 effect 裁决已经关闭或不属于当前运行。',
       );
     }
+    if (command.authorizationScope && (command.decision !== 'allow' || approval.preview.authorizationScope !== command.authorizationScope)) {
+      return await this.recordRejection(command, 'approval_scope_invalid', '当前操作未提供该授权范围。');
+    }
     const reply = await this.commitCommand(
       command,
       [{
@@ -624,6 +673,7 @@ export class SessionActor {
           commandId: command.commandId,
           decision: command.decision,
           authorityId: this.#nextId('authority'),
+          ...(command.authorizationScope ? { authorizationScope: command.authorizationScope } : {}),
         },
       }],
       acceptedReply(command),
@@ -838,16 +888,45 @@ export class SessionActor {
           const current = await this.loadSnapshot();
           if (signal.aborted) return current;
           const queued = current.state.queuedInputs.filter((input) => input.runId === runId);
-          const events = queued.flatMap<NewSessionEvent>((input) => [{
+          const runtime = current.state.runRuntimeSnapshots[runId];
+          if (!runtime) throw new Error('run_runtime_snapshot_missing');
+          const activeView = current.state.runToolViews[runId] ?? runtime;
+          const initialSelections = recoveryPluginSelection(current, runId, runtime).pluginSelections ?? [];
+          const previousSelections = current.events.flatMap((event) => (
+            event.type === 'message.committed' && event.runId === runId && event.payload.role === 'user'
+              ? event.payload.pluginSelections ?? [] : []
+          ));
+          const selections = [...new Map([...initialSelections, ...previousSelections, ...queued.flatMap((input) => input.pluginSelections)]
+            .map((selection) => [selection.uri, selection])).values()];
+          const events: NewSessionEvent[] = [];
+          if (selections.length || activeView.selectedPlugins.plugins.length) {
+            const catalogRevision = queued.filter((input) => input.pluginSelections.length).at(-1)?.pluginCatalogRevision;
+            const prepared = await this.#composition.runPreparation.prepare({
+              sessionId: this.sessionId, runId, profileId: runtime.provider.profileId,
+              environment: runtime.environment,
+              ...(runtime.provider.reasoningEffortOverride ? { reasoningEffortOverride: runtime.provider.reasoningEffortOverride } : {}),
+              pluginSelections: selections,
+              refreshPlugins: !queued.some(input=>input.pluginSelections.length),
+              ...(catalogRevision ? { pluginCatalogRevision: catalogRevision } : {}),
+            });
+            const { extensionGenerationRef, kernelCatalogSnapshotRef, instructions, tools, toolPromptContributions,
+              providerToolAliases, selectedPlugins } = prepared.runtimeSnapshot;
+            if (kernelCatalogSnapshotRef !== activeView.kernelCatalogSnapshotRef) events.push({ type: 'run.tools.prepared', sessionId: this.sessionId, runId,
+              payload: { toolView: { extensionGenerationRef, kernelCatalogSnapshotRef, instructions, tools,
+                toolPromptContributions, providerToolAliases, selectedPlugins } } });
+          }
+          events.push(...queued.flatMap<NewSessionEvent>((input) => [{
             type: 'input.accepted', sessionId: this.sessionId,
             payload: { commandId: input.commandId, messageId: input.messageId, text: input.text,
+              ...(input.guidanceReferences?.length ? {guidanceReferences:structuredClone(input.guidanceReferences)} : {}),
               ...(input.pluginSelections.length ? { pluginSelections: input.pluginSelections } : {}) },
           }, {
             type: 'message.committed', sessionId: this.sessionId, runId,
             payload: { messageId: input.messageId, role: 'user', content: input.text,
+              ...(input.guidanceReferences?.length ? {guidanceReferences:structuredClone(input.guidanceReferences)} : {}),
               ...(input.filesystemReferences.length ? { filesystemReferences: input.filesystemReferences } : {}),
               ...(input.pluginSelections.length ? { pluginSelections: input.pluginSelections } : {}) },
-          }]);
+          }]));
           if (events.length) await this.appendEvents(events, current);
           return await this.loadSnapshot();
         }),
@@ -857,6 +936,7 @@ export class SessionActor {
           }
           this.#assistantDraft = draft ? structuredClone(draft) : null;
         },
+        resetReasoning: () => this.liveReasoning.reset(),
         updateReasoning: (requestId, runId, text, kind) => this.liveReasoning.append(requestId, runId, text, kind),
         updateToolProgress: (callId, progress) => this.#liveToolOutput.update(callId, progress),
         nextId: this.#nextId,
@@ -867,12 +947,17 @@ export class SessionActor {
       const current = await this.loadSnapshot();
       const settlement = current.state.pendingRunSettlements[command.runId];
       if (!settlement) throw new Error('run_finishing_settlement_missing');
-      await this.finalizeRunRuntime(current, command.runId, settlement);
+      if (settlement.outcome === 'failed' || settlement.outcome === 'indeterminate') {
+        await this.withWrite(async () => { const state = await this.loadSnapshot();
+          await this.appendEvents([failureSnapshotEvent(state, command.runId, settlement.error)], state);
+        });
+      }
+      await this.finalizeRunRuntime(await this.loadSnapshot(), command.runId, settlement);
     }
   }
 
   private async containLoopFailure(runId: string, error: unknown): Promise<Error> {
-    const failure = asError(error);
+    let failure = asError(error);
     let snapshot: LoopSnapshot;
     try {
       snapshot = await this.loadSnapshot();
@@ -882,6 +967,11 @@ export class SessionActor {
         failure.message,
       );
     }
+    try {
+      await this.withWrite(async () => { const current = await this.loadSnapshot();
+        await this.appendEvents([failureSnapshotEvent(current, runId, errorFact(failure))], current);
+      });
+    } catch (snapshotError) { failure = new AggregateError([failure, asError(snapshotError)], failure.message); }
     const runtime = snapshot.state.runRuntimeSnapshots[runId];
     if (!runtime || snapshot.state.runRuntimeReleases[runId]) return failure;
     try {
@@ -917,8 +1007,10 @@ export class SessionActor {
       await this.settleRecoveryFailure(runId, error);
       return false;
     }
-    const restored = retainSessionEnvironment(prepared.runtimeSnapshot, snapshot.events);
-    if (canonicalJson(restored) !== canonicalJson(runtime)) {
+    const restored = prepared.runtimeSnapshot;
+    if (restored.provider.providerRuntimeRef !== runtime.provider.providerRuntimeRef
+      || restored.kernelCatalogSnapshotRef !== runtime.kernelCatalogSnapshotRef
+      || restored.extensionGenerationRef !== runtime.extensionGenerationRef) {
       const mismatch = new Error('run_runtime_recovery_identity_mismatch');
       try {
         await this.#composition.runPreparation.release({
@@ -936,14 +1028,19 @@ export class SessionActor {
 
   private async settleRecoveryFailure(runId: string, error: unknown): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
-    await this.appendLifecycleEvents([{
+    const before = await this.loadSnapshot();
+    const pending = uncompletedProviderComposition(before, runId);
+    const outcome: Extract<RunSettlement, { outcome: 'failed' | 'indeterminate' }> = {
+      outcome: pending ? 'indeterminate' : 'failed',
+      error: { code: errorCode(message), message },
+    };
+    await this.appendLifecycleEvents([
+      ...(pending ? [providerTurnTerminalEvent(this.sessionId, runId, pending,
+        before.state.runRuntimeSnapshots[runId]!.provider.providerRuntimeRef, outcome)] : []), {
       type: 'run.finishing',
       sessionId: this.sessionId,
       runId,
-      payload: {
-        outcome: 'failed',
-        error: { code: errorCode(message), message },
-      },
+      payload: outcome,
     }]);
     const snapshot = await this.loadSnapshot();
     const settlement = snapshot.state.pendingRunSettlements[runId];
@@ -1004,7 +1101,7 @@ export class SessionActor {
           extensionGenerationRef: runtime.extensionGenerationRef,
           kernelCatalogSnapshotRef: released.kernelCatalogSnapshotRef,
           providerRuntimeRef: runtime.provider.providerRuntimeRef,
-          pluginInstanceRefs: runtime.selectedPlugins.plugins.map((plugin) => (
+          pluginInstanceRefs: (snapshot.state.runToolViews[runId] ?? runtime).selectedPlugins.plugins.map((plugin) => (
             plugin.pluginInstanceRef
           )),
           alreadyReleased: released.alreadyReleased,
@@ -1026,16 +1123,7 @@ export class SessionActor {
   }
 
   private async appendEvents(events: readonly NewSessionEvent[], current: LoopSnapshot): Promise<void> {
-    let previewState = current.state;
-    for (const [index, event] of events.entries()) {
-      previewState = reduceSession(previewState, {
-        ...event,
-        schemaVersion: SESSION_EVENT_VERSION,
-        eventId: `preflight:${current.state.revision + index + 1}`,
-        sequence: current.state.revision + index + 1,
-        occurredAt: '1970-01-01T00:00:00.000Z',
-      } as SessionEvent);
-    }
+    admitSessionEvents(current, events);
     const previousDraft = this.#assistantDraft;
     const closesDraft = current.state.run && closesAssistantDraft(events, current.state.run.runId);
     if (closesDraft) this.#assistantDraft = null;
@@ -1055,7 +1143,20 @@ export class SessionActor {
     events: readonly NewSessionEvent[],
     reply: Omit<CommandReply, 'revision'>,
   ): Promise<CommandReply> {
-    return await this.withWrite(() => this.#journal.commitCommand(command, events, reply));
+    return await this.withWrite(() => this.commitCommandWithinWrite(command, events, reply));
+  }
+
+  private async commitCommandWithinWrite(
+    command: ConversationCommand,
+    events: readonly NewSessionEvent[],
+    reply: Omit<CommandReply, 'revision'>,
+  ): Promise<CommandReply> {
+    const current = await this.loadSnapshot();
+    admitSessionEvents(current, events, { input: command, reply });
+    const committed = await this.#journal.commitCommand(command, events, reply);
+    const next = await this.loadSnapshot();
+    for (const event of next.journalEvents.slice(current.journalEvents.length)) await this.observe(event);
+    return committed;
   }
 
   private async withWrite<T>(operation: () => Promise<T>): Promise<T> {
@@ -1068,12 +1169,11 @@ export class SessionActor {
     const read = this.#snapshotReads.then(async () => {
       const current = this.#snapshot ?? loopSnapshot(this.sessionId, this.#initialEvents ?? []);
       const added: SessionEvent[] = [];
-      let state = current.state;
-      for await (const event of this.#journal.read(this.sessionId, state.revision)) {
-        state = reduceSession(state, event);
-        added.push(event);
-      }
-      const snapshot = added.length ? { events: [...current.events, ...added], state } : current;
+      for await (const event of this.#journal.read(this.sessionId, current.state.revision)) added.push(event);
+      const snapshot = !added.length ? current : added.some((event) => event.type === 'conversation.revised')
+        ? loopSnapshot(this.sessionId, [...current.journalEvents, ...added])
+        : { journalEvents: [...current.journalEvents, ...added], events: [...current.events, ...added],
+          state: added.reduce(reduceSession, current.state) };
       this.#snapshot = snapshot;
       this.#initialEvents = undefined;
       return snapshot;

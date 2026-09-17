@@ -1,5 +1,5 @@
 use crate::llm_transport::{
-    valid_responses_hosted_search_item, LlmChatOutput, LlmToolCall, LlmToolDefinition,
+    valid_responses_hosted_search_item, LlmChatOutput, LlmToolCall,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1172,26 +1172,6 @@ fn set_token_count(
 
 pub(crate) fn sse_json_event(event: &str, value: Value) -> String {
     format!("event: {event}\ndata: {value}\n\n")
-}
-
-pub(crate) fn provider_tools_from_values(values: Vec<Value>) -> Vec<LlmToolDefinition> {
-    values
-        .into_iter()
-        .filter_map(|value| {
-            Some(LlmToolDefinition {
-                name: value.get("name")?.as_str()?.to_owned(),
-                description: value
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                input_schema: value
-                    .get("inputSchema")
-                    .cloned()
-                    .unwrap_or_else(|| json!({ "type": "object" })),
-            })
-        })
-        .collect()
 }
 
 #[cfg(test)]

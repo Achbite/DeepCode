@@ -32,14 +32,13 @@ function consumeTrustedBootstrap(): KernelHostTarget | null {
   Reflect.deleteProperty(window, '__DEEPCODE_HOST_BOOT__');
   const trustedDesktopOrigin = (
     (
-      ['deepcode-gui:', 'deepcode-editor:'].includes(window.location.protocol)
+      window.location.protocol === 'deepcode-gui:'
       && window.location.hostname === 'localhost'
     )
     || (
       window.location.protocol === 'http:'
       && [
         'deepcode-gui.localhost',
-        'deepcode-editor.localhost',
       ].includes(window.location.hostname)
     )
   );
@@ -92,16 +91,6 @@ export function getKernelHttpOrigin(): string {
 
 export function getKernelApiBase(): string {
   return `${getKernelHttpOrigin()}/api`;
-}
-
-export function getKernelWsBase(): string {
-  if (trustedTarget) return `ws://${trustedTarget.host}:${trustedTarget.port}/ws`;
-  if (browserDevelopmentOrigin) {
-    const origin = new URL(browserDevelopmentOrigin);
-    const protocol = origin.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${protocol}//${origin.host}/ws`;
-  }
-  return 'ws://127.0.0.1:0/ws';
 }
 
 export function getHostConnectionHeaders(): Record<string, string> {

@@ -2,8 +2,7 @@ use deepcode_kernel_runtime::shell_environment::{self, ShellProgram};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-/// Capture once, or reuse the Session-owned snapshot passed by Session. A settings
-/// edit or explicit refresh changes the configuration key at a run boundary.
+/// Recheck basic facts at each new run. A resumed run keeps its journaled snapshot.
 pub(crate) fn prepare(
     settings: &Value,
     previous: Option<&Value>,
@@ -18,11 +17,7 @@ pub(crate) fn prepare(
         "revision": settings.get("agent.environmentRevision").and_then(Value::as_u64).unwrap_or(0),
     });
     if let Some(saved) = previous {
-        let compatible_shell = saved["shell"]["tool"] != "powershell"
-            || saved["shell"]["executable"].as_str().is_some_and(|path| {
-                shell_environment::powershell_path_is_compatible(std::path::Path::new(path))
-            });
-        if restoring || saved.get("configuration") == Some(&configuration) && compatible_shell {
+        if restoring {
             validate_snapshot(saved)?;
             return Ok(saved.clone());
         }
@@ -55,13 +50,18 @@ pub(crate) fn prepare(
     let locale = system_locale();
     let preference = response_language_setting(settings)?;
     let shell = selected_shell(settings);
-    let commands: Vec<_> = [
+    let execution_path = shell_environment::resolved_agent_shell_path().map_err(|error| error.to_string())?;
+    let path_directories = std::env::split_paths(&execution_path).collect::<Vec<_>>();
+    let command_paths: serde_json::Map<String, Value> = [
         "git", "rg", "node", "npm", "pnpm", "python", "python3", "cargo", "rustc", "go", "java",
-        "dotnet", "cmake", "make", "ninja", "gcc", "clang", "cl", "docker", "podman",
+        "dotnet", "cmake", "make", "ninja", "gcc", "clang", "cl", "docker", "podman", "colima",
     ]
     .into_iter()
-    .filter(|name| shell_environment::find_command(name).is_some())
+    .filter_map(|name| {
+        shell_environment::find_command_in(name, &path_directories).map(|path| (name.to_string(), json!(path)))
+    })
     .collect();
+    let commands: Vec<_> = command_paths.keys().cloned().collect();
     let sandbox = deepcode_kernel_runtime::workspace_sandbox::probe();
     Ok(json!({
         "os": std::env::consts::OS,
@@ -74,6 +74,8 @@ pub(crate) fn prepare(
         "shellAvailable": shell.executable.is_file(),
         "shell": shell,
         "developerCommands": commands,
+        "commandPaths": command_paths,
+        "executionPath": execution_path.to_string_lossy(),
         "workspaceShellSupported": sandbox.available,
         "workspaceSandbox": sandbox,
     }))
@@ -86,6 +88,7 @@ fn validate_snapshot(snapshot: &Value) -> Result<(), String> {
         || !snapshot["os"].is_string()
         || !snapshot["arch"].is_string()
         || !snapshot["shellAvailable"].is_boolean()
+        || !snapshot["executionPath"].is_string()
         || !snapshot["workspaceShellSupported"].is_boolean()
         || !snapshot["developerCommands"]
             .as_array()
@@ -337,7 +340,19 @@ mod tests {
     fn saved_environment_changes_only_at_an_explicit_run_boundary() {
         let mut saved = capture(&json!({})).unwrap();
         saved["developerCommands"] = json!(["previously-observed-command"]);
-        assert_eq!(prepare(&json!({}), Some(&saved), false).unwrap(), saved);
+        let rechecked = prepare(&json!({}), Some(&saved), false).unwrap();
+        assert_ne!(rechecked["developerCommands"], saved["developerCommands"]);
+        assert_eq!(rechecked["configuration"], saved["configuration"]);
+        for (name, path) in rechecked["commandPaths"].as_object().unwrap() {
+            assert_eq!(
+                Some(PathBuf::from(path.as_str().unwrap())),
+                shell_environment::find_command(name)
+            );
+        }
+        assert_eq!(
+            prepare(&json!({}), Some(&rechecked), false).unwrap(),
+            rechecked
+        );
         let settings = json!({"agent.environmentRevision":1});
         let refreshed = prepare(&settings, Some(&saved), false).unwrap();
         assert_ne!(refreshed["developerCommands"], saved["developerCommands"]);

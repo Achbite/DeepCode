@@ -3,7 +3,7 @@
   "id": "arxiv",
   "uri": "plugin://arxiv@first-party",
   "displayName": "arXiv",
-  "shortDescription": "Search arXiv metadata and read canonical paper records through the arXiv Atom API.",
+  "shortDescription": "搜索论文，查看摘要与来源。",
   "activationMediaTypes": [],
   "providerRef": "tool-provider:first-party:arxiv",
   "capabilityRefs": [
@@ -19,19 +19,62 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "query": { "type": "string", "minLength": 1 },
-          "field": { "type": "string", "enum": ["all", "title", "author", "abstract", "category", "id"], "default": "all" },
-          "start": { "type": "integer", "minimum": 0, "maximum": 10000, "default": 0 },
-          "limit": { "type": "integer", "minimum": 1, "maximum": 30, "default": 10 },
-          "sortBy": { "type": "string", "enum": ["relevance", "lastUpdatedDate", "submittedDate"], "default": "relevance" },
-          "sortOrder": { "type": "string", "enum": ["ascending", "descending"], "default": "descending" }
+          "query": {
+            "type": "string",
+            "minLength": 1
+          },
+          "field": {
+            "type": "string",
+            "enum": [
+              "all",
+              "title",
+              "author",
+              "abstract",
+              "category",
+              "id"
+            ],
+            "default": "all"
+          },
+          "start": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000,
+            "default": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 30,
+            "default": 10
+          },
+          "sortBy": {
+            "type": "string",
+            "enum": [
+              "relevance",
+              "lastUpdatedDate",
+              "submittedDate"
+            ],
+            "default": "relevance"
+          },
+          "sortOrder": {
+            "type": "string",
+            "enum": [
+              "ascending",
+              "descending"
+            ],
+            "default": "descending"
+          }
         },
-        "required": ["query"],
+        "required": [
+          "query"
+        ],
         "additionalProperties": false
       },
       "effect": "networkRead",
       "logicalTarget": "https://export.arxiv.org/api",
-      "binding": { "kind": "none" },
+      "binding": {
+        "kind": "none"
+      },
       "toolContributionRef": "tool-contribution:first-party:arxiv.search",
       "promptContribution": {
         "contributionRef": "tool-prompt-contribution:first-party:arxiv.search",
@@ -48,14 +91,22 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "id": { "type": "string", "minLength": 1, "description": "Canonical arXiv identifier, optionally including a version." }
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Canonical arXiv identifier, optionally including a version."
+          }
         },
-        "required": ["id"],
+        "required": [
+          "id"
+        ],
         "additionalProperties": false
       },
       "effect": "networkRead",
       "logicalTarget": "https://export.arxiv.org/api",
-      "binding": { "kind": "none" },
+      "binding": {
+        "kind": "none"
+      },
       "toolContributionRef": "tool-contribution:first-party:arxiv.read",
       "promptContribution": {
         "contributionRef": "tool-prompt-contribution:first-party:arxiv.read",

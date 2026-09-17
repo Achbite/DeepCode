@@ -1,10 +1,13 @@
-import React, { useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { parseLocalTarget, bindLocalTarget, type SourcePosition } from './resourceLinks';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { MessageFeedback, SessionProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { useConversationHost } from './ConversationHost';
+import { workspaceResourceLink } from './documentResources';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import type { PresentedCommittedContent } from '../../presentation/PresentationRuntime';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
+import { ArtifactLinks } from './ArtifactLinks';
 import { FileChanges, roundChangeActivities } from './FileChanges';
 import { ReasoningHistory } from './ReasoningDetails';
 import { PlanPreviewCard } from './PlanPreviewCard';
@@ -19,12 +22,16 @@ import { ConversationNavigation } from './ConversationNavigation';
 import { conversationNavigation } from './conversationWindow';
 import { ConversationLayoutCache, ConversationVirtualizer } from './conversationVirtualizer';
 import { ConversationVirtualRow, useConversationRowState } from './ConversationVirtualRow';
+import { MessageActions } from './MessageActions';
+import { RunFailureDetails, ProviderRetryStatus } from './RunFailureDetails';
+import { ApprovalActivity } from './ApprovalActivity';
 
 interface ConversationTranscriptProps {
   language: UiLanguage;
   loading: boolean;
   showReasoning?: boolean;
-  completedRuns: Set<string>;
+  displaySettledRunIds: Set<string>;
+  artifacts: SessionProjection['artifacts'];
   onDisplayed(identity: string, text: string): void;
   projection: SessionProjection | null;
   activeProject: { title: string } | undefined;
@@ -33,14 +40,17 @@ interface ConversationTranscriptProps {
   draftItems: AssistantDraftItem[];
   presentation: PresentedCommittedContent;
   viewport: ConversationViewport;
-  openWorkspaceResource: (workspaceId: string, logicalPath: string) => Promise<void>;
+  openWorkspaceResource: (workspaceId: string, logicalPath: string, position?: SourcePosition) => Promise<void>;
   setUiActionError: React.Dispatch<React.SetStateAction<string | null>>;
+  canEditMessage?: boolean;
+  onEditMessage?: (message: SessionProjection['messages'][number]) => void;
 }
 
 export function ConversationTranscript({
   language,
   showReasoning = false,
-  completedRuns,
+  displaySettledRunIds,
+  artifacts,
   onDisplayed,
   loading,
   projection,
@@ -52,6 +62,8 @@ export function ConversationTranscript({
   viewport,
   openWorkspaceResource,
   setUiActionError,
+  canEditMessage = false,
+  onEditMessage,
 }: ConversationTranscriptProps) {
   const host = useConversationHost();
   const { transcriptRef, messageEndRef, setLatestFollowMode } = viewport;
@@ -68,14 +80,25 @@ export function ConversationTranscript({
   const submitting = useLocalAgentStore((state) => state.submitting);
   const setMessageFeedback = useLocalAgentStore((state) => state.setMessageFeedback);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [pathMenu, setPathMenu] = useState<{ path: string; x: number; y: number } | null>(null);
   const layouts = useRef(new ConversationLayoutCache());
   const currentSessionRef = useRef({ sessionId: projection?.sessionId });
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   if (currentSessionRef.current.sessionId !== projection?.sessionId) currentSessionRef.current = { sessionId: projection?.sessionId };
   useLayoutEffect(() => {
     setCopiedMessageId(null);
+    setPathMenu(null);
     return () => clearTimeout(copyTimerRef.current);
   }, [projection?.sessionId]);
+  useEffect(() => {
+    if (!pathMenu) return;
+    const dismiss = () => setPathMenu(null);
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') dismiss(); };
+    document.addEventListener('click', dismiss);
+    document.addEventListener('keydown', onKey);
+    window.addEventListener('resize', dismiss);
+    return () => { document.removeEventListener('click', dismiss); document.removeEventListener('keydown', onKey); window.removeEventListener('resize', dismiss); };
+  }, [pathMenu]);
   const committedProviderContent = (identity: string | undefined, content: string, committed: React.ReactNode): React.ReactNode => {
     if (!identity) throw new Error('conversation_timeline_stream_missing');
     // Custom presentation renderers retain their output; the builtin Markdown keeps its stream node.
@@ -83,7 +106,7 @@ export function ConversationTranscript({
     return <BufferedMarkdown text={content} streamIdentity={identity} streaming={false} onDisplayed={onDisplayed} />;
   };
 
-  const copyAssistantMessage = async (messageId: string, content: string) => {
+  const copyMessage = async (messageId: string, content: string) => {
     const requestedView = currentSessionRef.current;
     try {
       await host.copyText(content);
@@ -124,6 +147,29 @@ export function ConversationTranscript({
       : null;
     if (!anchor || !event.currentTarget.contains(anchor)) return;
     const href = anchor.getAttribute('href') ?? '';
+    const resource = workspaceResourceLink(href);
+    if (resource) {
+      event.preventDefault();
+      void openWorkspaceResource(resource.workspaceId, resource.logicalPath).catch(reason=>setUiActionError(String(reason)));
+      return;
+    }
+    const localTarget=parseLocalTarget(href);
+    if(localTarget&&projection) {
+      event.preventDefault();
+      const requestedView=currentSessionRef.current;
+      void (async()=>{
+        const candidates=await Promise.all(projection.workspaceBindings.map(async binding=>({workspaceId:binding.workspaceId,root:(await host.resolveResource(projection.sessionId,binding.workspaceId,'.')).path})));
+        const bound=bindLocalTarget(localTarget,candidates);
+        if(currentSessionRef.current!==requestedView)return;
+        if(bound) await openWorkspaceResource(bound.workspaceId,bound.logicalPath,localTarget);
+        else {
+          if(!host.locatePath)throw new Error('Manual file location requires the desktop Host.');
+          await host.locatePath(localTarget.absolute ? localTarget.path : `${candidates[0].root}/${localTarget.path}`);
+        }
+        if(currentSessionRef.current===requestedView)setUiActionError(null);
+      })().catch(reason=>{if(currentSessionRef.current===requestedView)setUiActionError(`${language === 'zh-CN' ? '无法打开此位置。' : 'Unable to open this location.'}\n${localTarget.path}\n${reason instanceof Error ? reason.message : String(reason)}`);});
+      return;
+    }
     if (!/^https?:\/\//i.test(href)) return;
     event.preventDefault();
     const requestedView = currentSessionRef.current;
@@ -158,7 +204,7 @@ export function ConversationTranscript({
               <div className="local-agent__message-attachments">
                 {item.value.filesystemReferences.map((reference) => (
                   <button type="button"
-                    onClick={() => { if (reference.kind === 'file') void openWorkspaceResource(reference.workspaceId, reference.logicalPath); }}
+                    onClick={() => { void openWorkspaceResource(reference.workspaceId, reference.logicalPath).catch(reason => setUiActionError(String(reason))); }}
                     className={reference.kind === 'directory'
                       ? 'local-agent__message-directory'
                       : undefined}
@@ -176,57 +222,11 @@ export function ConversationTranscript({
               </div>
             )}
           </div>
-          {item.value.role === 'assistant' && (
-            <div
-              className="local-agent__message-actions"
-              aria-label={t(language, 'agent.message.actions')}
-            >
-              <button
-                type="button"
-                className="conversation-copy-button"
-                aria-label={copiedMessageId === item.value.messageId
-                  ? t(language, 'agent.message.copied')
-                  : t(language, 'agent.message.copyResponse')}
-                onClick={() => void copyAssistantMessage(item.value.messageId, item.value.content)}
-              >
-                <DeepCodeShellIcon name="copy" />
-                <span className="conversation-copy-hint" role="status">{copiedMessageId === item.value.messageId
-                  ? t(language, 'agent.message.copied')
-                  : t(language, 'agent.message.copy')}</span>
-              </button>
-              <button
-                    type="button"
-                    className={item.value.feedback === 'up' ? 'is-selected' : ''}
-                    aria-pressed={item.value.feedback === 'up'}
-                    aria-label={t(language, 'agent.message.helpful')}
-                    disabled={submitting}
-                    onClick={() => void updateMessageFeedback(
-                      item.value.messageId,
-                      item.value.feedback === 'up' ? null : 'up',
-                    )}
-                  >
-                    <DeepCodeShellIcon name="thumbUp" />
-                    <span className="local-agent__message-action-hint" aria-hidden="true">
-                      {t(language, 'agent.message.helpful')}
-                    </span>
-              </button>
-              <button
-                    type="button"
-                    className={item.value.feedback === 'down' ? 'is-selected' : ''}
-                    aria-pressed={item.value.feedback === 'down'}
-                    aria-label={t(language, 'agent.message.notHelpful')}
-                    disabled={submitting}
-                    onClick={() => void updateMessageFeedback(
-                      item.value.messageId,
-                      item.value.feedback === 'down' ? null : 'down',
-                    )}
-                  >
-                    <DeepCodeShellIcon name="thumbDown" />
-                    <span className="local-agent__message-action-hint" aria-hidden="true">
-                      {t(language, 'agent.message.notHelpful')}
-                    </span>
-              </button>
-            </div>
+          {(item.value.role === 'assistant' || item.value.role === 'user') && (
+            <MessageActions message={item.value} language={language} copied={copiedMessageId === item.value.messageId}
+              busy={submitting} canEdit={canEditMessage} onCopy={() => void copyMessage(item.value.messageId, item.value.content)}
+              onFeedback={(feedback) => void updateMessageFeedback(item.value.messageId, feedback)}
+              onEdit={() => onEditMessage?.(item.value)} />
           )}
         </article>
       ) : item.type === 'narrative' ? (
@@ -249,6 +249,10 @@ export function ConversationTranscript({
           language={language}
           onToggle={onPlanToggle}
         />
+      ) : item.type === 'approval' ? (
+        <ApprovalActivity activity={item.value} language={language}
+          pending={projection?.pendingApproval?.callId === item.value.callId}
+          onExpand={() => setLatestFollowMode(false)} />
       ) : (
         <ToolActivityGroup
           activities={item.values}
@@ -283,7 +287,9 @@ export function ConversationTranscript({
         />
       );
   const providerStatus = <>
-      {projection?.run && projection.run.status !== 'completed' && (
+      {projection?.run?.status === 'running' && projection.providerAttempts?.at(-1)?.phase === 'retryWaiting'
+        ? <ProviderRetryStatus projection={projection} language={language} />
+        : projection?.run && projection.run.status !== 'completed' && (
         <ProviderStageStatus run={projection.run} language={language}
           reasoning={showReasoning && assistantDraft ? { sessionId: projection.sessionId, requestId: assistantDraft.turnId } : undefined}
           key={`${projection.run.runId}:${assistantDraft?.turnId ?? 'idle'}`}
@@ -311,7 +317,20 @@ export function ConversationTranscript({
       className="local-agent__transcript"
       onClick={openTranscriptLink}
       onAuxClick={openTranscriptLink}
+      onContextMenu={(event) => {
+        const anchor = event.target instanceof Element ? event.target.closest<HTMLAnchorElement>('a[href]') : null;
+        const target = anchor && parseLocalTarget(anchor.getAttribute('href') ?? '');
+        if (!target) return;
+        event.preventDefault();
+        setPathMenu({ path: target.path, x: Math.max(8, Math.min(event.clientX, window.innerWidth - 180)), y: Math.max(8, Math.min(event.clientY, window.innerHeight - 50)) });
+      }}
     >
+      {pathMenu && <div className="local-agent__path-menu" role="menu" style={{ left: pathMenu.x, top: pathMenu.y }}>
+        <button type="button" role="menuitem" autoFocus onClick={() => {
+          const requestedView = currentSessionRef.current;
+          void host.copyText(pathMenu.path).catch((reason) => { if (currentSessionRef.current === requestedView) setUiActionError(String(reason)); });
+        }}>{language === 'zh-CN' ? '复制路径' : 'Copy path'}</button>
+      </div>}
       {loading && !projection && (
         <div className="local-agent__empty">{t(language, 'agent.chat.opening')}</div>
       )}
@@ -326,27 +345,23 @@ export function ConversationTranscript({
       )}
       {rounds.map((round) => {
         const current = projection?.run?.runId === round.runId;
-        const completed = completedRuns.has(round.runId);
+        const displaySettled = displaySettledRunIds.has(round.runId);
         const terminal = current && ['failed', 'cancelled', 'indeterminate'].includes(projection!.run!.status);
         const rows = round.rows.map((row) => ({
           key: row.key,
-          process: row.item ? row.item.type !== 'message' : row.draft?.type !== 'text' || row.draft.block.kind === 'narrative',
+          process: row.item ? !['message', 'approval'].includes(row.item.type) : row.draft?.type !== 'text' || row.draft.block.kind === 'narrative',
           required: row.item?.type === 'plan' && samePlanReference(projection?.pendingPlan, row.item.value),
-          live: Boolean(row.draft) || (current && !completed && row.item?.type === 'message' && row.item.value.role === 'assistant'),
+          live: Boolean(row.draft) || (current && !displaySettled && row.item?.type === 'message' && row.item.value.role === 'assistant'),
           content: () => row.item ? renderItem(row.item) : renderDraft(row.draft!),
         }));
-        if (current && !completed) rows.push({ key: `${round.key}:provider-status`, process: true, required: false, live: true, content: () => providerStatus });
-        if (showReasoning && projection && completed) rows.push({ key: `${round.key}:reasoning-history`, process: true, required: false, live: false, content: () => <ReasoningHistory sessionId={projection.sessionId} runId={round.runId} /> });
-        return <ConversationRoundView key={`${projection?.sessionId}:${round.key}`} roundKey={round.key} virtualizer={virtualizer} eagerRows={eagerRows} completed={completed} followingLatest={viewport.followingLatest} rows={rows}>
-          {(completed || terminal) && <FileChanges activities={roundChangeActivities(projection, round.runId)} />}
+        if (current && !displaySettled) rows.push({ key: `${round.key}:provider-status`, process: true, required: false, live: true, content: () => providerStatus });
+        if (showReasoning && projection && displaySettled) rows.push({ key: `${round.key}:reasoning-history`, process: true, required: false, live: false, content: () => <ReasoningHistory sessionId={projection.sessionId} runId={round.runId} /> });
+        return <ConversationRoundView language={language} key={`${projection?.sessionId}:${round.key}`} roundKey={round.key} virtualizer={virtualizer} eagerRows={eagerRows} displaySettled={displaySettled} followingLatest={viewport.followingLatest} rows={rows}>
+          <ArtifactLinks artifacts={artifacts.filter((artifact) => artifact.runId === round.runId)} onOpen={openWorkspaceResource} />
+          {(displaySettled || terminal) && <FileChanges activities={roundChangeActivities(projection, round.runId)} />}
         </ConversationRoundView>;
       })}
-      {projection?.terminalError && (
-        <article className="local-agent__terminal-error">
-          <strong>{projection.terminalError.code}</strong>
-          <span>{projection.terminalError.message}</span>
-        </article>
-      )}
+      {projection && <RunFailureDetails projection={projection} language={language} onError={setUiActionError} />}
       <div ref={messageEndRef} />
     </div>
     </>
@@ -360,22 +375,22 @@ function samePlanReference(
   return reference?.planId === plan.planId && reference.revision === plan.revision;
 }
 
-function ConversationRoundView({ roundKey, virtualizer, eagerRows, completed, followingLatest, rows, children }: {
-  roundKey: string; virtualizer: ConversationVirtualizer; eagerRows: Set<string>;
-  completed: boolean; followingLatest: boolean;
+function ConversationRoundView({ language, roundKey, virtualizer, eagerRows, displaySettled, followingLatest, rows, children }: {
+  language: UiLanguage; roundKey: string; virtualizer: ConversationVirtualizer; eagerRows: Set<string>;
+  displaySettled: boolean; followingLatest: boolean;
   rows: Array<{ key: string; process: boolean; required: boolean; live: boolean; content(): React.ReactNode }>;
   children: React.ReactNode;
 }) {
   const state = virtualizer.layout(`${roundKey}:disclosure`).state;
-  const [disclosure, updateDisclosure] = useState(() => (state.get('process') as { completed: boolean; open: boolean } | undefined) ?? { completed, open: false });
+  const [disclosure, updateDisclosure] = useState(() => (state.get('process') as { displaySettled: boolean; open: boolean } | undefined) ?? { displaySettled, open: false });
   const setDisclosure = (value: typeof disclosure) => { state.set('process', value); updateDisclosure(value); };
-  if (disclosure.completed !== completed) setDisclosure({ completed, open: completed && !followingLatest });
-  const expanded = !completed || disclosure.open;
+  if (disclosure.displaySettled !== displaySettled) setDisclosure({ displaySettled, open: displaySettled && !followingLatest });
+  const expanded = !displaySettled || disclosure.open;
   const firstProcess = rows.find((row) => row.process)?.key;
   return <section className="conversation-round">
     {rows.map((row) => <React.Fragment key={row.key}>
-      {completed && row.key === firstProcess && <button className="conversation-process-toggle" type="button" aria-expanded={expanded} onClick={() => setDisclosure({ completed, open: !expanded })}>
-        <DeepCodeShellIcon name="tool" /><span>{expanded ? '执行过程' : '查看执行过程'}</span><DeepCodeShellIcon name="chevronDown" className="conversation-disclosure-chevron" />
+      {displaySettled && row.key === firstProcess && <button className="conversation-process-toggle" type="button" aria-expanded={expanded} onClick={() => setDisclosure({ displaySettled, open: !expanded })}>
+        <DeepCodeShellIcon name="tool" /><span>{t(language, expanded ? 'agent.process.expanded' : 'agent.process.open')}</span><DeepCodeShellIcon name="chevronDown" className="conversation-disclosure-chevron" />
       </button>}
       <ConversationVirtualRow rowKey={row.key} virtualizer={virtualizer} eager={eagerRows.has(row.key)} live={row.live || row.required}
         hidden={row.process && !expanded && !row.required}>{row.content}</ConversationVirtualRow>

@@ -1,10 +1,8 @@
 import { create } from 'zustand';
-import { useMemo } from 'react';
 import {
   DEFAULT_USER_SETTINGS,
   agentSettingsIndex,
   shellPreferenceSettingsIndex,
-  workspaceOverridableSettingsIndex,
   type SettingCatalogEntry,
   type SettingsSurface,
   type GetUserSettingsResult,
@@ -15,7 +13,6 @@ import {
 import {
   getUserSettings,
   patchUserSettings,
-  patchWorkspaceSettings,
 } from '../services/runtimeAdapter';
 import {
   normalizeGuiAccentColor,
@@ -23,7 +20,7 @@ import {
 } from '../theme/deepcodeGuiTheme';
 import { activeT, settingText } from '../i18n';
 
-export type SettingSource = 'default' | 'user' | 'workspace';
+export type SettingSource = 'default' | 'user';
 
 export type SettingControlType = 'boolean' | 'number' | 'text' | 'textarea' | 'select';
 
@@ -54,21 +51,12 @@ type SettingDefinitionSchema = Omit<
   options?: string[];
 };
 
-export interface EditorEffectiveOptions {
-  tabSize: number;
-  insertSpaces: boolean;
-  wordWrap: string;
-  fontSize: number;
-  fontFamily: string;
-  renderWhitespace: string;
-  theme: string;
-}
+
 
 interface SettingsStateData {
   environment: Record<string, unknown> | null;
   userSettings: UserSettings;
   runtimeUserSettings: UserSettings;
-  workspaceSettings: Record<string, unknown>;
   effectiveSettings: UserSettings;
   runtimeEffectiveSettings: UserSettings;
   sources: Record<string, SettingSource>;
@@ -81,7 +69,6 @@ interface SettingsStateData {
 
 interface SettingsActions {
   loadUserSettings: () => Promise<void>;
-  syncWorkspaceSettings: (settings: Record<string, unknown>) => void;
   patchUserSetting: (
     key: string,
     value: UserSettingValue,
@@ -89,7 +76,6 @@ interface SettingsActions {
   patchUserSettingsBatch: (
     patches: Record<string, UserSettingValue>,
   ) => Promise<UserSettingsActivation | null>;
-  patchWorkspaceSetting: (key: string, value: UserSettingValue) => Promise<void>;
   resetUserSetting: (key: string) => Promise<UserSettingsActivation | null>;
   getSettingSource: (key: string) => SettingSource;
 }
@@ -105,15 +91,6 @@ const SETTING_DEFINITION_SCHEMAS: SettingDefinitionSchema[] = [
     options: [
       'zh-CN',
       'en-US',
-    ],
-  },
-  {
-    key: 'workbench.colorTheme',
-    group: 'workbench',
-    control: 'select',
-    options: [
-      'vs-dark',
-      'vs-light',
     ],
   },
   {
@@ -154,102 +131,6 @@ const SETTING_DEFINITION_SCHEMAS: SettingDefinitionSchema[] = [
     key: 'gui.showContextRail',
     group: 'gui',
     control: 'boolean',
-  },
-  {
-    key: 'editor.tabSize',
-    group: 'editor',
-    control: 'number',
-  },
-  {
-    key: 'editor.insertSpaces',
-    group: 'editor',
-    control: 'boolean',
-  },
-  {
-    key: 'editor.wordWrap',
-    group: 'editor',
-    control: 'select',
-    options: [
-      'off',
-      'on',
-      'wordWrapColumn',
-      'bounded',
-    ],
-  },
-  {
-    key: 'editor.fontSize',
-    group: 'editor',
-    control: 'number',
-  },
-  {
-    key: 'editor.fontFamily',
-    group: 'editor',
-    control: 'text',
-  },
-  {
-    key: 'editor.renderWhitespace',
-    group: 'editor',
-    control: 'select',
-    options: [
-      'none',
-      'boundary',
-      'selection',
-      'trailing',
-      'all',
-    ],
-  },
-  {
-    key: 'files.autoSave',
-    group: 'files',
-    control: 'select',
-    options: [
-      'off',
-      'afterDelay',
-    ],
-  },
-  {
-    key: 'files.autoSaveDelay',
-    group: 'files',
-    control: 'number',
-  },
-  {
-    key: 'files.hotExit',
-    group: 'files',
-    control: 'boolean',
-  },
-  {
-    key: 'keyboard.enableBasicShortcuts',
-    group: 'keyboard',
-    control: 'boolean',
-  },
-  {
-    key: 'explorer.confirmDelete',
-    group: 'explorer',
-    control: 'boolean',
-  },
-  {
-    key: 'terminal.integrated.defaultProfile.windows',
-    group: 'terminal',
-    control: 'select',
-    options: [
-      'wsl',
-      'powershell',
-      'cmd',
-    ],
-  },
-  {
-    key: 'terminal.integrated.prewarm',
-    group: 'terminal',
-    control: 'select',
-    options: [
-      'afterStartup',
-      'off',
-    ],
-  },
-  {
-    key: 'terminal.integrated.spawnTimeoutMs',
-    group: 'terminal',
-    control: 'number',
   },
   { key: 'agent.windows.shell', group: 'agent', control: 'select', options: ['auto', 'powershell7', 'windowsPowerShell', 'gitBash'] },
   { key: 'agent.windows.gitBashPath', group: 'agent', control: 'text' },
@@ -308,6 +189,7 @@ const SETTING_DEFINITION_SCHEMAS: SettingDefinitionSchema[] = [
     group: 'skills',
     control: 'text',
   },
+  { key: 'agent.documents.pythonPath', group: 'agent', control: 'text' },
   {
     key: 'mcp.servers',
     group: 'mcp',
@@ -350,10 +232,6 @@ export function shellPreferenceSettingDefinitions(surface: SettingsSurface): Set
   return definitionsForCatalog(shellPreferenceSettingsIndex(surface));
 }
 
-export function workspaceSettingDefinitions(): SettingDefinition[] {
-  return definitionsForCatalog(workspaceOverridableSettingsIndex());
-}
-
 function definitionsForCatalog(entries: readonly SettingCatalogEntry[]): SettingDefinition[] {
   return entries.flatMap((entry) => {
     const definition = SETTING_DEFINITION_BY_KEY.get(entry.key);
@@ -362,9 +240,6 @@ function definitionsForCatalog(entries: readonly SettingCatalogEntry[]): Setting
 }
 
 const KNOWN_SETTING_KEYS = new Set(Object.keys(DEFAULT_USER_SETTINGS));
-const WORKSPACE_OVERRIDABLE_SETTING_KEYS = new Set(
-  workspaceOverridableSettingsIndex().map((entry) => entry.key)
-);
 
 function isSupportedSettingValue(value: unknown): value is UserSettingValue {
   return (
@@ -398,24 +273,10 @@ function normalizeSettingValue(key: string, value: unknown): UserSettingValue {
   return isSupportedSettingValue(value) ? value : defaultValue;
 }
 
-function normalizeWorkspaceSettings(settings: Record<string, unknown>): UserSettings {
-  const normalized: UserSettings = {};
-  for (const [rawKey, rawValue] of Object.entries(settings)) {
-    const key = rawKey.startsWith('deepcode.')
-      ? rawKey.slice('deepcode.'.length)
-      : rawKey;
-    if (!KNOWN_SETTING_KEYS.has(key) || !WORKSPACE_OVERRIDABLE_SETTING_KEYS.has(key)) continue;
-    normalized[key] = normalizeSettingValue(key, rawValue);
-  }
-  return normalized;
-}
-
 function buildEffectiveSettings(
   userSettings: UserSettings,
-  workspaceSettings: Record<string, unknown>,
   overriddenKeys: string[]
 ): Pick<SettingsStateData, 'effectiveSettings' | 'sources'> {
-  const normalizedWorkspace = normalizeWorkspaceSettings(workspaceSettings);
   const normalizedUserSettings = Object.fromEntries(
     Object.entries(userSettings).map(([key, value]) => [
       key,
@@ -425,13 +286,10 @@ function buildEffectiveSettings(
   const effectiveSettings: UserSettings = {
     ...DEFAULT_USER_SETTINGS,
     ...normalizedUserSettings,
-    ...normalizedWorkspace,
   };
   const sources: Record<string, SettingSource> = {};
   for (const key of Object.keys(effectiveSettings)) {
-    if (key in normalizedWorkspace) {
-      sources[key] = 'workspace';
-    } else if (overriddenKeys.includes(key)) {
+    if (overriddenKeys.includes(key)) {
       sources[key] = 'user';
     } else {
       sources[key] = 'default';
@@ -452,7 +310,7 @@ function hasPendingNextRunActivation(
 }
 
 export const useSettingsStore = create<SettingsStore>((set, get) => {
-  const initialEffective = buildEffectiveSettings(DEFAULT_USER_SETTINGS, {}, []);
+  const initialEffective = buildEffectiveSettings(DEFAULT_USER_SETTINGS, []);
 
   const applyCanonicalSettings = (
     snapshot: GetUserSettingsResult,
@@ -460,12 +318,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
   ) => {
     const next = buildEffectiveSettings(
       snapshot.settings,
-      get().workspaceSettings,
       overriddenKeys,
     );
     const runtime = buildEffectiveSettings(
       snapshot.runtimeSettings,
-      get().workspaceSettings,
       overriddenKeys,
     );
     set({
@@ -517,7 +373,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
     } else {
       const next = buildEffectiveSettings(
         result.data.settings,
-        get().workspaceSettings,
         overriddenKeys,
       );
       set({
@@ -535,7 +390,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
     environment: null,
     userSettings: DEFAULT_USER_SETTINGS,
     runtimeUserSettings: DEFAULT_USER_SETTINGS,
-    workspaceSettings: {},
     effectiveSettings: initialEffective.effectiveSettings,
     runtimeEffectiveSettings: initialEffective.effectiveSettings,
     sources: initialEffective.sources,
@@ -557,25 +411,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
         return;
       }
       applyCanonicalSettings(result.data);
-    },
-
-    syncWorkspaceSettings: (settings) => {
-      const next = buildEffectiveSettings(
-        get().userSettings,
-        settings,
-        get().overriddenKeys
-      );
-      const runtime = buildEffectiveSettings(
-        get().runtimeUserSettings,
-        settings,
-        get().overriddenKeys
-      );
-      set({
-        workspaceSettings: settings,
-        effectiveSettings: next.effectiveSettings,
-        runtimeEffectiveSettings: runtime.effectiveSettings,
-        sources: next.sources,
-      });
     },
 
     patchUserSetting: async (key, value) => {
@@ -600,34 +435,6 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
       );
     },
 
-    patchWorkspaceSetting: async (key, value) => {
-      if (!WORKSPACE_OVERRIDABLE_SETTING_KEYS.has(key)) {
-        set({ errorMessage: activeT('settings.error.protectedWorkspaceKey', { key }) });
-        return;
-      }
-      const normalized = normalizeSettingValue(key, value);
-      const result = await patchWorkspaceSettings({
-        [`deepcode.${key}`]: normalized,
-      });
-      if (!result.ok || !result.data) {
-        set({
-          errorMessage: result.message ?? activeT('settings.error.saveWorkspace', { key }),
-        });
-        return;
-      }
-      const next = buildEffectiveSettings(
-        get().userSettings,
-        result.data.settings,
-        get().overriddenKeys
-      );
-      set({
-        workspaceSettings: result.data.settings,
-        effectiveSettings: next.effectiveSettings,
-        sources: next.sources,
-        errorMessage: null,
-      });
-    },
-
     resetUserSetting: async (key) => {
       return applyUserSettingsPatch(
         { [key]: null },
@@ -638,43 +445,3 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
     getSettingSource: (key) => get().sources[key] ?? 'default',
   };
 });
-
-export function useEditorOptions(): EditorEffectiveOptions {
-  const tabSize = useSettingsStore((s) =>
-    Number(s.effectiveSettings['editor.tabSize'] ?? 4)
-  );
-  const insertSpaces = useSettingsStore((s) =>
-    Boolean(s.effectiveSettings['editor.insertSpaces'] ?? true)
-  );
-  const wordWrap = useSettingsStore((s) =>
-    String(s.effectiveSettings['editor.wordWrap'] ?? 'off')
-  );
-  const fontSize = useSettingsStore((s) =>
-    Number(s.effectiveSettings['editor.fontSize'] ?? 14)
-  );
-  const fontFamily = useSettingsStore((s) =>
-    String(
-      s.effectiveSettings['editor.fontFamily'] ??
-        "Consolas, 'Courier New', monospace"
-    )
-  );
-  const renderWhitespace = useSettingsStore((s) =>
-    String(s.effectiveSettings['editor.renderWhitespace'] ?? 'none')
-  );
-  const theme = useSettingsStore((s) =>
-    String(s.effectiveSettings['workbench.colorTheme'] ?? 'vs-dark')
-  );
-
-  return useMemo(
-    () => ({
-      tabSize,
-      insertSpaces,
-      wordWrap,
-      fontSize,
-      fontFamily,
-      renderWhitespace,
-      theme,
-    }),
-    [tabSize, insertSpaces, wordWrap, fontSize, fontFamily, renderWhitespace, theme]
-  );
-}

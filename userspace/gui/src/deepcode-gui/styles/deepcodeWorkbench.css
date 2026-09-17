@@ -1,0 +1,107 @@
+/* This grid alone owns the navigation width, titlebar height and full-height divider. */
+.deepcode-gui-workbench {
+  --dc-sidebar-width: 244px;
+  --dc-context-width: 296px;
+  --dc-navigation-row: 36px;
+  display: grid;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  grid-template-columns: var(--dc-sidebar-width) minmax(0, 1fr);
+  grid-template-rows: var(--dc-titlebar-height) minmax(0, 1fr);
+  background: var(--dc-background);
+  color: var(--dc-foreground);
+}
+
+.deepcode-gui-workbench:has([data-navigation-density='compact']) { --dc-navigation-row: 31px; }
+.deepcode-gui-workbench:has(.deepcode-gui-shell--no-context) { --dc-header-context-width: auto; }
+
+.deepcode-gui-navigation-box {
+  grid-column: 1;
+  grid-row: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border-right: 1px solid var(--dc-border);
+  background: var(--dc-sidebar);
+}
+
+.deepcode-gui-navigation-box__titlebar {
+  display: flex;
+  align-items: center;
+  flex: 0 0 var(--dc-titlebar-height);
+  padding-inline: 12px;
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+
+.deepcode-gui-navigation-box__content { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.deepcode-gui-navigation-box__content[hidden] { display: none; }
+.deepcode-gui-navigation-box :is(.deepcode-gui-left-rail, .settings-nav) {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: transparent;
+}
+
+.deepcode-gui-titlebar {
+  grid-column: 2;
+  grid-row: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-width: 0;
+  min-height: 0;
+  align-items: stretch;
+  background: var(--dc-surface);
+}
+
+.deepcode-gui-shell {
+  grid-column: 2;
+  grid-row: 2;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-columns: minmax(0, 1fr) var(--dc-context-width);
+  grid-template-rows: minmax(0, 1fr);
+  background: var(--dc-surface);
+}
+
+.deepcode-gui-shell--no-context,
+.deepcode-gui-shell:has(.local-agent--reading) { grid-template-columns: minmax(0, 1fr); }
+.deepcode-gui-main-surfaces { display: contents; }
+.deepcode-gui-session-main { grid-column: 1; grid-row: 1; }
+.deepcode-gui-context-panel { grid-column: 2; grid-row: 1; }
+.deepcode-gui-shell:has(.local-agent--reading) .deepcode-gui-context-panel { display: none; }
+
+.deepcode-local-agent-overlay {
+  grid-column: 2;
+  grid-row: 1 / -1;
+  z-index: 20;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  background: var(--dc-surface);
+}
+
+.deepcode-gui-workbench--settings > .deepcode-gui-titlebar,
+.deepcode-gui-workbench--settings .deepcode-gui-main-surfaces > * { visibility: hidden; }
+
+@media (max-width: 1120px) {
+  .deepcode-gui-workbench { --dc-sidebar-width: 224px; --dc-header-context-width: auto; }
+  .deepcode-gui-shell { grid-template-columns: minmax(0, 1fr); }
+  .deepcode-gui-context-panel, .deepcode-gui-context-rail { display: none; }
+}
+
+@media (max-width: 800px) {
+  .deepcode-gui-workbench:not(.deepcode-gui-workbench--settings):has(.local-agent--reading) { --dc-sidebar-width: 0px; }
+  .deepcode-gui-workbench:not(.deepcode-gui-workbench--settings):has(.local-agent--reading) .deepcode-gui-navigation-box { display: none; }
+}
+
+@media (max-width: 760px) {
+  .deepcode-gui-workbench:not(.deepcode-gui-workbench--settings) { --dc-sidebar-width: 0px; }
+  .deepcode-gui-workbench:not(.deepcode-gui-workbench--settings) .deepcode-gui-navigation-box { display: none; }
+  .deepcode-gui-workbench.deepcode-gui-workbench--settings { --dc-sidebar-width: min(210px, 38vw); }
+}

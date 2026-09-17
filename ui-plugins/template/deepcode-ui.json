@@ -1,0 +1,6 @@
+{
+  "id": "example.message-style",
+  "name": "Message style template",
+  "entry": "dist/index.js",
+  "slots": ["message.plain"]
+}

@@ -1,4 +1,6 @@
 use crate::registrations::{builtin_tool_registrations, KernelToolRegistration};
+use crate::invocation_adapter::canonicalize_invocation;
+use crate::invocation_types::{KernelCanonicalInvocation, KernelToolKind};
 use crate::types::{ToolAvailability, ToolDescriptor};
 use serde::Serialize;
 use serde_json::Value;
@@ -43,12 +45,6 @@ impl ToolInputIssue {
             expected,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalToolInvocation {
-    pub tool_name: String,
-    pub arguments: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -100,18 +96,18 @@ impl KernelToolRegistry {
     #[doc(hidden)]
     pub fn executor_bindings(
         &self,
-    ) -> impl Iterator<Item = (&'static str, crate::kernel_internal::KernelExecutorBinding)> + '_
+    ) -> impl Iterator<Item = (&'static str, KernelToolKind)> + '_
     {
         self.registrations
             .values()
-            .map(|registration| (registration.tool_id(), registration.executor_binding))
+            .map(|registration| (registration.tool_id(), registration.kind))
     }
 
     pub fn canonicalize(
         &self,
         tool_name: &str,
         raw_arguments: Value,
-    ) -> Result<CanonicalToolInvocation, KernelToolCatalogError> {
+    ) -> Result<KernelCanonicalInvocation, KernelToolCatalogError> {
         let registration = self
             .registrations
             .get(tool_name)
@@ -119,8 +115,8 @@ impl KernelToolRegistry {
         if registration.descriptor.availability == ToolAvailability::Blocked {
             return Err(KernelToolCatalogError::ToolBlocked(tool_name.to_owned()));
         }
-        let canonicalize = registration.canonicalize_invocation;
-        let invocation = canonicalize(raw_arguments.clone()).map_err(|reason| {
+        canonicalize_invocation(registration.kind, raw_arguments.clone()).map_err(|error| {
+            let reason = error.to_string();
             // Explain a canonicalizer rejection using its published descriptor. This
             // is diagnostic only: admission remains owned by the canonicalizer.
             let mut issues = Vec::new();
@@ -138,11 +134,6 @@ impl KernelToolRegistry {
                 reason,
                 issues,
             }
-        })?;
-        let arguments = invocation.executor_arguments();
-        Ok(CanonicalToolInvocation {
-            tool_name: tool_name.to_owned(),
-            arguments,
         })
     }
 }

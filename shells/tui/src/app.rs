@@ -52,6 +52,7 @@ pub struct TuiApp {
     projection: Option<SessionProjection>,
     input: String,
     status: String,
+    connection_error: Option<String>,
     next_message_profile_id: Option<String>,
     plugin_catalog: Option<PluginCatalogProjection>,
     selected_plugins: Vec<PluginSelectionInput>,
@@ -71,6 +72,7 @@ impl TuiApp {
     pub fn new(client: HttpKernelClient, renderer: Renderer, host: TuiHostOptions) -> Self {
         Self {
             status: format!("API {} · 初始化", client.base_url()),
+            connection_error: None,
             client,
             renderer,
             host,
@@ -147,14 +149,10 @@ impl TuiApp {
         };
         match self.client.conversation_projection(&session_id).await {
             Ok(projection) => {
-                self.status = projection
-                    .run
-                    .as_ref()
-                    .map(|run| format!("运行状态 · {}", run.status))
-                    .unwrap_or_else(|| "就绪 · /help 查看命令".to_string());
+                self.connection_error = None;
                 self.projection = Some(projection);
             }
-            Err(error) => self.status = format!("刷新共享投影失败：{error}"),
+            Err(error) => self.connection_error = Some(format!("刷新共享投影失败：{error}")),
         }
     }
 
@@ -171,9 +169,20 @@ impl TuiApp {
                 self.tasks_open = false;
                 self.resource_preview = None;
                 self.detail_scroll = 0;
-                self.detail_preview = Some("DeepCode 命令\n\n@ 选择下一次请求的插件\n/tasks 查看任务\n/context 查看上下文\n/focus <task> 开始任务\n/model <profile> 选择后续请求的模型\n/attach <path> 附加目录\n/detach <workspace-id> 移除目录索引\n/open <workspace-id> <logical-path> 读取文件\n/next 继续读取\n/diff <record-id> <index> 查看修改\n/reasoning 开关推理详情\n/reasoning <request-id> 按需读取推理\n/cancel 取消运行\n/cancel-plan 取消计划\n/close 返回会话\n/clear 清空输入\n/show 查看会话信息\n/quit 退出\n\nPgUp / PgDn 滚动当前视图；普通消息随时排队；/reply <答复> 回应交互或修订计划，/reply 1 确认计划。".into());
+                self.detail_preview = Some("DeepCode 命令\n\n@ 选择下一次请求的插件\n/tasks 查看任务\n/context 查看上下文\n/focus <task> 开始任务\n/model <profile> 选择后续请求的模型\n/attach <path> 附加目录\n/detach <workspace-id> 移除目录索引\n/open <workspace-id> <logical-path> 读取文件\n/next 继续读取\n/diff <record-id> <index> 查看修改\n/reasoning 开关推理详情\n/reasoning <request-id> 按需读取推理\n/cancel 取消运行\n/cancel-plan 取消计划\n/close 返回会话\n/clear 清空输入\n/show 查看会话信息\n/error 失败诊断与快照\n/decision 当前决策详情\n/tool <activity-id> 工具详情\n/quit 退出\n\nPgUp / PgDn 滚动当前视图；普通消息随时排队；/reply <答复> 回应交互或修订计划，/reply 1 确认计划。".into());
             }
             "/show" => self.status = self.projection_label(),
+            "/error" | "/decision" => {
+                self.context_open = false;
+                self.tasks_open = false;
+                self.resource_preview = None;
+                self.detail_scroll = 0;
+                self.detail_preview = Some(if input == "/error" {
+                    crate::renderer::failure_details(self.projection.as_ref())
+                } else {
+                    crate::renderer::decision_details(self.projection.as_ref())
+                });
+            }
             "/clear" => {
                 self.clear_input();
                 self.status =
@@ -202,6 +211,16 @@ impl TuiApp {
                 self.resource_preview = None;
                 self.detail_preview = None;
                 self.status = "已关闭辅助视图。".to_string();
+            }
+            value if value.starts_with("/tool ") => {
+                self.context_open = false;
+                self.tasks_open = false;
+                self.resource_preview = None;
+                self.detail_scroll = 0;
+                self.detail_preview = Some(crate::renderer::tool_details(
+                    self.projection.as_ref(),
+                    value.trim_start_matches("/tool ").trim(),
+                ));
             }
             "/cancel-plan" => self.cancel_plan().await,
             "/cancel" => self.cancel_run().await,
@@ -269,6 +288,11 @@ impl TuiApp {
             }
             if let Some(approval) = projection.pending_approval.as_ref() {
                 let decision = approval_decision_for_input(response)?;
+                if decision == "allow-run"
+                    && approval.preview.authorization_scope.as_deref() != Some("runHostShell")
+                {
+                    return Err("当前操作未提供本轮宿主 Shell 授权。".into());
+                }
                 approval_response_command(&session_id, &new_id("command"), approval, decision)
             } else if let Some(plan) = projection.pending_plan.as_ref() {
                 if is_plan_confirmation_input(response) {
@@ -630,24 +654,32 @@ impl TuiApp {
         self.projection.as_ref()
     }
 
+    pub fn connection_error(&self) -> Option<&str> {
+        self.connection_error.as_deref()
+    }
+
     pub fn scroll_content(&mut self, down: bool) {
+        self.scroll_lines(down, 12);
+    }
+
+    pub fn scroll_lines(&mut self, down: bool, lines: u16) {
         if self.detail_preview.is_some()
             || self.resource_preview.is_some()
             || self.context_open
             || self.tasks_open
         {
             self.detail_scroll = if down {
-                self.detail_scroll.saturating_add(12)
+                self.detail_scroll.saturating_add(lines)
             } else {
-                self.detail_scroll.saturating_sub(12)
+                self.detail_scroll.saturating_sub(lines)
             };
         } else {
             let maximum = self.transcript_scroll_max.get();
             let current = self.transcript_scroll.get().unwrap_or(maximum);
             let next = if down {
-                current.saturating_add(12).min(maximum)
+                current.saturating_add(usize::from(lines)).min(maximum)
             } else {
-                current.saturating_sub(12)
+                current.saturating_sub(usize::from(lines))
             };
             self.transcript_scroll.set((next < maximum).then_some(next));
         }
@@ -692,7 +724,11 @@ impl TuiApp {
     }
 
     pub fn status(&self) -> &str {
-        &self.status
+        self.connection_error.as_deref().unwrap_or(&self.status)
+    }
+
+    pub fn next_message_profile(&self) -> Option<&str> {
+        self.next_message_profile_id.as_deref()
     }
 
     pub fn push_input(&mut self, value: char) {
@@ -1015,6 +1051,7 @@ fn approval_decision_for_input(input: &str) -> Result<&'static str, String> {
     match input.trim().to_lowercase().as_str() {
         "1" | "allow" | "允许" | "同意" => Ok("allow"),
         "2" | "deny" | "拒绝" | "不同意" => Ok("deny"),
+        "3" | "allow-run" | "允许本轮" => Ok("allow-run"),
         _ => Err("当前等待 effect 裁决：输入 /reply 1（允许）或 /reply 2（拒绝）。".to_string()),
     }
 }
@@ -1122,7 +1159,7 @@ mod input_tests {
         .unwrap();
         TuiApp::new(
             client,
-            Renderer,
+            Renderer::default(),
             TuiHostOptions {
                 workspace_path: None,
                 session_id: None,
@@ -1210,12 +1247,240 @@ mod input_tests {
     }
 
     #[test]
+    fn decision_dock_keeps_reply_visible_in_narrow_terminal_without_changing_facts() {
+        use ratatui::{backend::TestBackend, Terminal};
+        for (field, decision, _, _, _) in pending_decisions() {
+            let mut app = test_app();
+            app.projection = Some(waiting_projection(field, decision));
+            app.next_message_profile_id = Some("profile:next".into());
+            app.push_input_text("中文输入最后一行");
+            let before = app.projection.clone();
+            let mut terminal = Terminal::new(TestBackend::new(60, 22)).unwrap();
+            terminal
+                .draw(|frame| app.renderer().draw(frame, &app))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = buffer
+                .content
+                .chunks(60)
+                .map(|row| {
+                    let mut line = String::new();
+                    let mut column = 0;
+                    while column < row.len() {
+                        let symbol = row[column].symbol();
+                        line.push_str(symbol);
+                        column += ratatui::text::Span::raw(symbol).width().max(1);
+                    }
+                    line
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("/reply"), "{text}");
+            assert!(text.contains("/decision"), "{text}");
+            assert!(text.contains("中文输入最后一行"), "{text}");
+            assert!(text.contains("profile:current"), "{text}");
+            assert!(text.contains("下次 profile:next"), "{text}");
+            let cursor = terminal.get_cursor_position().unwrap();
+            assert!(
+                cursor.x < 59 && cursor.y < 19 && cursor.y > 10,
+                "{cursor:?}"
+            );
+            assert_eq!(
+                app.projection, before,
+                "rendering must not mutate Session facts"
+            );
+        }
+    }
+
+    #[test]
+    fn wheel_reading_stays_detached_until_reaching_latest() {
+        let mut app = test_app();
+        assert_eq!(app.transcript_offset(100), 100);
+        app.scroll_lines(false, 4);
+        assert_eq!(app.transcript_offset(120), 96);
+        app.scroll_lines(true, 4);
+        assert_eq!(app.transcript_offset(120), 100);
+        app.scroll_lines(true, 24);
+        assert_eq!(app.transcript_offset(140), 140);
+    }
+
+    fn screen_rows(app: &TuiApp, width: u16, height: u16) -> Vec<String> {
+        use ratatui::{backend::TestBackend, text::Span, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| app.renderer().draw(frame, app))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(width as usize)
+            .map(|row| {
+                let mut line = String::new();
+                let mut column = 0;
+                while column < row.len() {
+                    let symbol = row[column].symbol();
+                    line.push_str(symbol);
+                    column += Span::raw(symbol).width().max(1);
+                }
+                line.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn transcript_renders_user_lines_and_markdown_without_repeating_run_activities() {
+        let mut app = test_app();
+        let mut projection = waiting_projection("pendingPlan", serde_json::Value::Null);
+        projection.run.as_mut().unwrap().status = "completed".into();
+        for (index, (role, content)) in [
+            ("user", "第一行\n\n**原样保留**"),
+            ("assistant", "## 能力\n\n- **读文件**\n- 跑测试\n\n完成"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("message:{index}");
+            projection.messages.push(serde_json::from_value(json!({"messageId":id,"role":role,"content":content,"filesystemReferences":[],"pluginSelections":[],"sequence":index + 1,"createdAt":"now"})).unwrap());
+            projection.timeline.push(serde_json::from_value(json!({"kind":"message","timelineId":format!("timeline:{index}"),"sequence":index + 1,"messageId":id})).unwrap());
+        }
+        projection.activities.push(serde_json::from_value(json!({"activityId":"run:test","kind":"run","status":"completed","label":"Agent run","runId":"run:test","sequence":1})).unwrap());
+        app.projection = Some(projection);
+        let before = app.projection.clone();
+        for width in [60, 120] {
+            let rows = screen_rows(&app, width, 30);
+            let text = rows.join("\n");
+            assert!(text.contains("已完成"), "{text}");
+            assert!(text.contains("第一行\n\n **原样保留**"), "{text}");
+            assert!(text.contains("能力\n\n • 读文件\n • 跑测试"), "{text}");
+            assert!(!text.contains("**读文件**"));
+            assert!(!text.contains("run [completed]"));
+            assert!(!text.contains("⠋"));
+        }
+        assert_eq!(app.projection, before);
+    }
+
+    #[test]
+    fn spinner_follows_shared_status_and_stops_on_waiting_or_disconnect() {
+        use crate::renderer::working_indicator;
+        let mut app = test_app();
+        let mut projection = waiting_projection("pendingPlan", serde_json::Value::Null);
+        projection.run.as_mut().unwrap().status = "running".into();
+        app.projection = Some(projection);
+        let before = app.projection.clone();
+        assert!(working_indicator(&app, 0).unwrap().contains("⠋ 运行中"));
+        assert!(working_indicator(&app, 1).unwrap().contains("⠙ 运行中"));
+        assert!(screen_rows(&app, 60, 22)
+            .join("\n")
+            .contains("/cancel 停止"));
+        assert_eq!(app.projection, before);
+        for status in [
+            "waiting",
+            "completed",
+            "failed",
+            "cancelled",
+            "indeterminate",
+            "releaseFailed",
+        ] {
+            app.projection
+                .as_mut()
+                .unwrap()
+                .run
+                .as_mut()
+                .unwrap()
+                .status = status.into();
+            assert!(working_indicator(&app, 0).is_none(), "{status}");
+        }
+        app.projection
+            .as_mut()
+            .unwrap()
+            .run
+            .as_mut()
+            .unwrap()
+            .status = "releasing".into();
+        assert!(working_indicator(&app, 0).unwrap().contains("正在结束"));
+        app.connection_error = Some("刷新共享投影失败".into());
+        assert!(working_indicator(&app, 1).is_none());
+    }
+
+    #[test]
+    fn streaming_markdown_updates_without_a_journal_revision_change() {
+        let mut app = test_app();
+        let mut projection = waiting_projection("pendingPlan", serde_json::Value::Null);
+        projection.run.as_mut().unwrap().status = "running".into();
+        projection.assistant_draft = Some(serde_json::from_value(json!({"runId":"run:test","turnId":"request:test","blocks":[{"kind":"finalMessage","streamId":"stream:test","content":"## 草稿\n\n第一段"}]})).unwrap());
+        app.projection = Some(projection);
+        assert!(screen_rows(&app, 80, 24)
+            .join("\n")
+            .contains("草稿\n\n 第一段"));
+        if let deepcode_kernel_client::AssistantDraftBlockProjection::FinalMessage {
+            content, ..
+        } = &mut app
+            .projection
+            .as_mut()
+            .unwrap()
+            .assistant_draft
+            .as_mut()
+            .unwrap()
+            .blocks[0]
+        {
+            content.push_str("\n\n- 第二段");
+        }
+        assert!(screen_rows(&app, 80, 24).join("\n").contains("• 第二段"));
+    }
+
+    #[test]
+    fn retry_and_failure_details_use_shared_projection_facts() {
+        let mut app = test_app();
+        let mut projection = waiting_projection("pendingPlan", serde_json::Value::Null);
+        projection.run.as_mut().unwrap().status = "running".into();
+        projection.provider_attempts.push(
+            serde_json::from_value(json!({
+                "providerRequestId":"request:test","providerAttemptId":"attempt:2","attempt":2,
+                "purpose":"agent","phase":"retryWaiting","runId":"run:test","updatedAt":"now"
+            }))
+            .unwrap(),
+        );
+        app.projection = Some(projection);
+        assert!(app
+            .renderer()
+            .render_plain(&app)
+            .contains("等待第 3/5 次尝试"));
+        let error = json!({"code":"provider_transport_failed","message":"原始连接失败", "diagnostics":{
+            "source":"providerTransport","phase":"send","category":"network","retryable":true,
+            "causes":[{"message":"Connection refused","osCode":61}]
+        }});
+        let projection = app.projection.as_mut().unwrap();
+        projection.run.as_mut().unwrap().status = "failed".into();
+        projection.terminal_error = Some(serde_json::from_value(error.clone()).unwrap());
+        projection.failure_snapshot = Some(
+            serde_json::from_value(json!({
+                "revision":9,"phase":"send","error":error,"providerAttemptIds":["attempt:2"],
+                "toolRecordIds":["record:done"],"pendingCallIds":[],"queuedMessageIds":[]
+            }))
+            .unwrap(),
+        );
+        let text = app.renderer().render_plain(&app);
+        assert!(!text.contains("等待第 3/5 次尝试"));
+        for fact in [
+            "原始连接失败",
+            "Connection refused",
+            "OS 61",
+            "revision 9",
+            "工具记录 1",
+        ] {
+            assert!(text.contains(fact), "{text}");
+        }
+    }
+
+    #[test]
     fn unavailable_plugin_selection_preserves_the_catalog_error() {
         let catalog: PluginCatalogProjection = serde_json::from_value(json!({"revision":"catalog:test", "plugins":[{
-            "uri":"plugin://broken", "displayName":"Broken", "shortDescription":"Broken entry", "activationMediaTypes":[],
+            "uri":"plugin://broken@mcp", "displayName":"Broken", "shortDescription":"Broken entry", "activationMediaTypes":[],
+            "source":"mounted","category":"functional","contributionKind":"mcp","discovery":"default",
             "enabled":false,"available":false,"error":{"code":"plugin_manifest_invalid","message":"manifest parse failed"}
         }]})).unwrap();
-        let error = plugin_selections_from_uris(&catalog, &["plugin://broken".into()])
+        let error = plugin_selections_from_uris(&catalog, &["plugin://broken@mcp".into()])
             .err()
             .unwrap();
         assert!(error.contains("plugin_manifest_invalid"));

@@ -1,3 +1,4 @@
+import { withProviderAttempts } from './providerAttempts.js';
 import type {
   AssistantDraftBlockProjection,
   AssistantDraftProjection,
@@ -40,13 +41,14 @@ import {
   type ContextCompactionRequestEvent,
 } from './compaction.js';
 import { buildAgentProviderRequest } from './contextComposer.js';
-import { LoopFailure, ProviderCompletedFailure, ProviderReportedFailure } from './loopFailure.js';
+import { errorFact, LoopFailure, ProviderCompletedFailure, ProviderReportedFailure } from './loopFailure.js';
 import {
   canonicalJsonValue,
   decodeProviderToolInput,
   type ProviderToolCodec,
 } from './providerToolCodec.js';
 import { recoverSession, type SessionState } from './reducer.js';
+import { activeConversationEvents } from './conversationHistory.js';
 import { providerTextStreamId } from './streamIdentity.js';
 import { PlanPreviewBuffer } from './planPreview.js';
 import { completedPlanAwaitingLifecycle, planFinalSettlement, planProgressFact, publishPlan } from './planStage.js';
@@ -59,6 +61,7 @@ import {
 } from './sessionControls.js';
 
 export interface LoopSnapshot {
+  journalEvents: readonly SessionEvent[];
   events: readonly SessionEvent[];
   state: SessionState;
 }
@@ -95,6 +98,7 @@ export interface AgentLoopDeps {
   commit(event: NewSessionEvent | readonly NewSessionEvent[] | ((current: LoopSnapshot) => readonly NewSessionEvent[])): Promise<LoopSnapshot>;
   takeQueuedInputs(runId: string): Promise<LoopSnapshot>;
   updateAssistantDraft(draft: AssistantDraftProjection | null): void;
+  resetReasoning?(): void;
   updateReasoning?(requestId: string, runId: string, text: string, kind: 'text' | 'summary'): void;
   updateToolProgress?(callId: string, progress: ToolExecutionProgress): void;
   nextId(kind: string): string;
@@ -211,6 +215,8 @@ export async function runAgentLoop(
   signal: AbortSignal,
 ): Promise<LoopResult> {
   let snapshot = initial;
+  const persist = deps.commit;
+  deps = { ...deps, commit: async (event) => { snapshot = await persist(event); return snapshot; } };
   const runId = command.runId;
   const commit = async (
     event: NewSessionEvent | readonly NewSessionEvent[] | ((current: LoopSnapshot) => readonly NewSessionEvent[]),
@@ -245,7 +251,7 @@ export async function runAgentLoop(
     ]);
     return finishingResult(runId, settlement);
   }
-  const runtime = runRuntimeSnapshot(snapshot, runId);
+  let runtime = runRuntimeSnapshot(snapshot, runId);
   try {
     for (const requestEvent of pendingToolRequests(snapshot.events, runId)) {
       const existing = await deps.composition.kernel.readRecord(requestEvent.callId);
@@ -298,6 +304,7 @@ export async function runAgentLoop(
       }
       const pending = pendingToolRequests(snapshot.events, runId);
       for (const requestEvent of pending) {
+        const runtime = runtimeForToolRequest(snapshot, requestEvent);
         const approval = latestApproval(snapshot.events, runId, requestEvent.callId);
         if (approval.requested && !approval.resolved) {
           return { status: 'waiting', runId, reason: 'approval', callId: requestEvent.callId };
@@ -384,6 +391,7 @@ export async function runAgentLoop(
 
       throwIfAborted(signal);
       snapshot = await deps.takeQueuedInputs(runId);
+      runtime = runRuntimeSnapshot(snapshot, runId);
       throwIfAborted(signal);
       const completedPlan = completedPlanAwaitingLifecycle(snapshot.state, runId);
       if (completedPlan) {
@@ -641,7 +649,10 @@ export async function runAgentLoop(
         outcome: 'indeterminate',
         error: {
           code: 'provider_turn_outcome_unknown',
-          message: `Provider request ${unknownTurn.providerRequestId} 的完成结果不可判定；原始错误 ${cause.code}：${cause.message}`,
+          message: signal.reason === 'user_cancelled' ? '已收到取消请求，本次生成未完成；Provider 最终完成结果未知。'
+            : `Provider request ${unknownTurn.providerRequestId} 的完成结果不可判定；原始错误 ${cause.code}：${cause.message}`,
+          diagnostics: { source: 'session', phase: 'provider', category: signal.aborted ? 'cancelled' : 'unknown', retryable: false,
+            causes: [{ message: `${cause.code}: ${cause.message}` }], ...(signal.aborted ? { stopReason: String(signal.reason) } : {}) },
         },
       };
       await commit([
@@ -738,7 +749,11 @@ async function performContextCompaction(
   await commit(facts);
 }
 
-async function consumeCompactionProvider(
+async function consumeCompactionProvider(request: ProviderRequest, deps: AgentLoopDeps, signal: AbortSignal) {
+  return withProviderAttempts(request, deps, signal, (attempt) => consumeCompactionAttempt(attempt, deps, signal));
+}
+
+async function consumeCompactionAttempt(
   request: ProviderRequest,
   deps: AgentLoopDeps,
   signal: AbortSignal,
@@ -822,7 +837,7 @@ async function consumeCompactionProvider(
         completed = true;
         break;
       case 'failed':
-        throw new ProviderReportedFailure(event.data.code, event.data.message);
+        throw new ProviderReportedFailure(event.data.code, event.data.message, event.data.diagnostics);
     }
   }
   if (!completed) {
@@ -894,9 +909,9 @@ async function consumeProvider(
 ): Promise<ProviderTurn> {
   let completed = false;
   try {
-    return await consumeProviderOutput(request, toolCodec, runId, deps, signal, () => {
+    return await withProviderAttempts(request, deps, signal, (attempt) => consumeProviderOutput(attempt, toolCodec, runId, deps, signal, () => {
       completed = true;
-    });
+    }));
   } catch (error) {
     if (completed && !signal.aborted && !(error instanceof ProviderReportedFailure)) {
       const failure = localAgentError(error);
@@ -1035,7 +1050,7 @@ async function consumeProviderOutput(
         contextUsage = decodeContextUsage(event.data);
         break;
       case 'failed':
-        throw new ProviderReportedFailure(event.data.code, event.data.message);
+        throw new ProviderReportedFailure(event.data.code, event.data.message, event.data.diagnostics);
     }
   }
   if (!completed) throw new LoopFailure('provider_stream_incomplete', 'Provider 流未产生完成事件。');
@@ -1918,6 +1933,7 @@ function expectedToolRecordIdentity(
   runtime: RunRuntimeSnapshot,
   requestEvent: Extract<SessionEvent, { type: 'tool.requested' }>,
 ): ExpectedToolRecordIdentity {
+  runtime = runtimeForToolRequest(snapshot, requestEvent);
   return {
     sessionId: snapshot.state.sessionId,
     runId: requestEvent.runId,
@@ -2103,7 +2119,7 @@ function hasSettlement(events: readonly SessionEvent[], runId: string): boolean 
   return events.some((event) => event.type === 'run.settled' && event.runId === runId);
 }
 
-function uncompletedProviderComposition(
+export function uncompletedProviderComposition(
   snapshot: LoopSnapshot,
   runId: string,
 ): SessionState['contextCompositions'][number] | null {
@@ -2116,7 +2132,19 @@ function uncompletedProviderComposition(
 function runRuntimeSnapshot(snapshot: LoopSnapshot, runId: string): RunRuntimeSnapshot {
   const runtime = snapshot.state.runRuntimeSnapshots[runId];
   if (!runtime) throw new LoopFailure('run_runtime_snapshot_missing', '当前 run 缺少运行时快照。');
-  return runtime;
+  return { ...runtime, ...snapshot.state.runToolViews[runId] };
+}
+
+function runtimeForToolRequest(snapshot: LoopSnapshot, request: Extract<SessionEvent, { type: 'tool.requested' }>): RunRuntimeSnapshot {
+  const turn = Object.values(snapshot.state.providerTurns).find((turn) => turn.orderedCallIds?.includes(request.callId));
+  const receipt = snapshot.state.contextCompositions.find((item) => item.providerRequestId === turn?.providerRequestId);
+  const base = snapshot.state.runRuntimeSnapshots[request.runId];
+  if (!base || !receipt) throw new LoopFailure('tool_request_binding_missing', '工具调用缺少所属 Provider 请求视图。');
+  if (!receipt.kernelCatalogSnapshotRef || receipt.kernelCatalogSnapshotRef === base.kernelCatalogSnapshotRef) return base;
+  const prepared = snapshot.events.find((event) => event.type === 'run.tools.prepared'
+    && event.runId === request.runId && event.payload.toolView.kernelCatalogSnapshotRef === receipt.kernelCatalogSnapshotRef);
+  if (prepared?.type !== 'run.tools.prepared') throw new LoopFailure('tool_request_binding_missing', '工具请求引用的准备视图不存在。');
+  return { ...base, ...prepared.payload.toolView };
 }
 
 function runtimeTool(runtime: RunRuntimeSnapshot, name: string): PreparedToolDescriptor {
@@ -2167,7 +2195,7 @@ function providerTurnSettledEvent(
   };
 }
 
-function providerTurnTerminalEvent(
+export function providerTurnTerminalEvent(
   sessionId: string,
   runId: string,
   composition: SessionState['contextCompositions'][number],
@@ -2237,7 +2265,7 @@ function finishingResult(runId: string, settlement: RunSettlement): LoopResult {
 }
 
 export function loopSnapshot(sessionId: string, events: readonly SessionEvent[]): LoopSnapshot {
-  return { events: [...events], state: recoverSession(sessionId, events) };
+  return { journalEvents: [...events], events: activeConversationEvents(events), state: recoverSession(sessionId, events) };
 }
 
 function runWorkspaceBindings(
@@ -2268,12 +2296,9 @@ function throwIfAborted(signal: AbortSignal): void {
 }
 
 function localAgentError(error: unknown): LocalAgentError {
-  if (error instanceof LoopFailure) return { code: error.code, message: error.message };
+  if (error instanceof LoopFailure) return errorFact(error);
   if (error instanceof SessionControlError) return { code: error.code, message: error.message };
-  return {
-    code: 'agent_loop_failed',
-    message: error instanceof Error ? error.message : String(error),
-  };
+  return errorFact(error);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -41,7 +41,8 @@ export function isShellExecutionEnvironment(value: unknown): boolean {
     && typeof value.terminal === 'boolean'
     && value.interactive === value.terminal
     && (value.executionScope === 'workspace' || value.executionScope === 'host')
-    && value.pathSource === 'hostPlusStandardDeveloperPaths'
+    && typeof value.pathSource === 'string'
+    && value.pathSource.trim().length > 0
     && (value.executionScope === 'host'
       ? value.writeScope === 'hostUser'
         && value.homeWritable === true

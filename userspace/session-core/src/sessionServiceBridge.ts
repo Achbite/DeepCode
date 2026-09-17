@@ -1,3 +1,4 @@
+import { stableCoreInstructions } from './local-agent/coreInstructions.js';
 import type { ConversationCommand } from '@deepcode/protocol';
 import { responseFrames } from './responseFrames.js';
 import {
@@ -11,7 +12,6 @@ import {
   HttpRunPreparationPort,
 } from './local-agent/httpPorts.js';
 import { SessionService } from './local-agent/service.js';
-import { decodeConversationReadQuery } from './local-agent/conversationRead.js';
 
 declare const process: {
   env: Record<string, string | undefined>;
@@ -38,18 +38,6 @@ async function main(): Promise<void> {
   const journal = new HttpCommandJournal({ apiBase, serviceToken });
   const kernel = new HttpKernelPort({ apiBase, serviceToken });
   const provider = new HttpProviderPort({ apiBase, serviceToken });
-  const stableCoreInstructions = Object.freeze([{
-    id: 'deepcode.coding-agent',
-    text: `You are DeepCode, a coding agent. Follow the user's current request and applicable project instructions; stay within the authorized scope and available capabilities.
-
-For substantial work, prefer a brief statement of the immediate next step before extended analysis. Inspect relevant evidence and act incrementally within the authorized scope. Share meaningful findings or changes of direction; related tool calls may continue without repeated narration. Re-read to resolve a concrete uncertainty or failure. Prefer targeted edits to repeated full-file reconstruction.
-
-Preserve failures and input rejections. Rejected input was not executed: correct the reported fields without repeating successful peer calls. Only successful tool results support completed Todo. Express expected nonzero shell outcomes explicitly; a failed overall command remains failed. When blocked, report completed work and blockers in the final answer, leaving unfinished Todo open. Never claim unperformed work as complete.
-
-Use the project's declared build and test entrypoints, including its required container workflow. Determine service availability with a permitted service check, not executable presence. If the required environment or authority is unavailable, request it or report the blocker; do not substitute another toolchain. Keep verbose logs in files and inspect the relevant result without repeating successful work.
-
-Be concise and use standard Markdown with clear file paths. Preserve technical terms, code and quotations in their original form. Use $...$ for inline LaTeX and $$...$$ for display math; show literal formula source only when requested. Avoid emojis unless requested or needed for meaning.`,
-  }]);
   const runPreparation = new HttpRunPreparationPort({
     apiBase,
     serviceToken,
@@ -133,7 +121,7 @@ async function dispatch(
       return await service.statuses(sessionIds);
     }
     case 'read':
-      return await service.read(decodeConversationReadQuery(request.data));
+      return await service.read(request.data);
     case 'contextComposition':
       return await service.contextComposition(
         requiredString(request.data, 'sessionId'), requiredString(request.data, 'providerRequestId'),
@@ -184,7 +172,7 @@ function decodeCommand(value: unknown): ConversationCommand {
           value,
           ['schemaVersion', 'type', 'commandId', 'sessionId', 'text'],
           [
-            'runId', 'filesystemReferences', 'profileId', 'reasoningEffortOverride', 'pluginCatalogRevision', 'pluginSelections',
+            'runId', 'filesystemReferences', 'profileId', 'reasoningEffortOverride', 'pluginCatalogRevision', 'pluginSelections', 'guidanceReferences', 'hostBinding',
           ],
         )
         || (value.runId !== undefined && !validId(value.runId))
@@ -194,6 +182,8 @@ function decodeCommand(value: unknown): ConversationCommand {
         || (value.profileId !== undefined && !validId(value.profileId))
         || (value.reasoningEffortOverride !== undefined && !validReasoningOverride(value.reasoningEffortOverride))
         || !validPluginSelections(value.pluginCatalogRevision, value.pluginSelections)
+        || !validGuidanceReferences(value.guidanceReferences)
+        || !validHostBinding(value.hostBinding)
       ) throw new Error('conversation_command_invalid');
       return value as unknown as ConversationCommand;
     case 'context.focus':
@@ -202,7 +192,7 @@ function decodeCommand(value: unknown): ConversationCommand {
           value,
           ['schemaVersion', 'type', 'commandId', 'sessionId', 'task'],
           [
-            'filesystemReferences', 'profileId', 'reasoningEffortOverride', 'pluginCatalogRevision', 'pluginSelections',
+            'filesystemReferences', 'profileId', 'reasoningEffortOverride', 'pluginCatalogRevision', 'pluginSelections', 'guidanceReferences', 'hostBinding',
           ],
         )
         || typeof value.task !== 'string'
@@ -212,7 +202,14 @@ function decodeCommand(value: unknown): ConversationCommand {
         || (value.profileId !== undefined && !validId(value.profileId))
         || (value.reasoningEffortOverride !== undefined && !validReasoningOverride(value.reasoningEffortOverride))
         || !validPluginSelections(value.pluginCatalogRevision, value.pluginSelections)
+        || !validGuidanceReferences(value.guidanceReferences)
+        || !validHostBinding(value.hostBinding)
       ) throw new Error('conversation_command_invalid');
+      return value as unknown as ConversationCommand;
+    case 'message.edit':
+      if (!hasExactKeys(value, ['schemaVersion', 'type', 'commandId', 'sessionId', 'messageId', 'expectedRevision', 'text'], ['hostBinding'])
+        || !validId(value.messageId) || !positiveInteger(value.expectedRevision)
+        || typeof value.text !== 'string' || !validHostBinding(value.hostBinding)) throw new Error('conversation_command_invalid');
       return value as unknown as ConversationCommand;
     case 'message.feedback.set':
       if (
@@ -247,11 +244,13 @@ function decodeCommand(value: unknown): ConversationCommand {
         !hasExactKeys(value, [
           'schemaVersion', 'type', 'commandId', 'sessionId', 'runId', 'callId', 'approvalId',
           'decision',
-        ])
+        ], ['authorizationScope'])
         || !validId(value.runId)
         || !validId(value.callId)
         || !validId(value.approvalId)
         || value.decision !== 'allow' && value.decision !== 'deny'
+        || value.authorizationScope !== undefined
+          && (value.authorizationScope !== 'runHostShell' || value.decision !== 'allow')
       ) throw new Error('conversation_command_invalid');
       return value as unknown as ConversationCommand;
     case 'plan.respond':
@@ -346,6 +345,18 @@ function validLogicalPath(value: string): boolean {
   if (value === '.') return true;
   if (value.startsWith('/') || value.endsWith('/')) return false;
   return value.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
+}
+
+function validHostBinding(value:unknown):boolean {
+  return value===undefined || isRecord(value) && hasExactKeys(value,['hostInstanceId','windowLabel'])
+    && validId(value.hostInstanceId) && validId(value.windowLabel);
+}
+
+function validGuidanceReferences(value:unknown):boolean {
+  return value===undefined || Array.isArray(value) && value.length<=16 && value.every((reference)=>
+    isRecord(reference) && hasExactKeys(reference,['referenceId','uri','label','toolName','name'])
+    && ['referenceId','uri','label','name'].every((key)=>typeof reference[key]==='string' && Boolean(reference[key]))
+    && ['skill.read','doc.read'].includes(String(reference.toolName)));
 }
 
 function validPluginSelections(revision: unknown, value: unknown): boolean {

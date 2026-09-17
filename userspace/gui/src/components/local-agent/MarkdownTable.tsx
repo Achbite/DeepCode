@@ -78,7 +78,7 @@ export const MarkdownTable = memo(function MarkdownTable({ children }: { childre
         {chinese ? '横向滚动查看' : 'Scroll horizontally'}
       </span>
       <button type="button" className="conversation-table-expand" onClick={() => setExpanded(true)}>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true"><path d="M14 4h6v6M20 4l-7 7M10 20H4v-6M4 20l7-7" /></svg>
+        <DeepCodeShellIcon name="expand" />
         {chinese ? '放大表格' : 'Expand table'}
       </button>
     </div>

@@ -1,10 +1,10 @@
 # DeepCode
 
-当前产品版本：**0.5.60**。
+当前产品版本：**0.6.1**。
 
 > English guide: [README.md](README.md)
 
-DeepCode 是一个本地优先的编码 Agent 框架。Editor、DeepCode-GUI、CLI 和 TUI 共用同一个本地 Session Runtime、Kernel 与 `SessionProjection`，界面差异只体现在渲染粒度和交互方式。
+DeepCode 是一个本地优先的编码 Agent 框架。DeepCode-GUI、CLI 和 TUI 共用同一个本地 Session Runtime、Kernel 与 `SessionProjection`，界面差异只体现在渲染粒度和交互方式。
 
 “本地优先”表示工作区访问、Session journal、共享投影、工具执行和工具记录都保存在本机。除非使用 Ollama 等本地 Provider，否则提示词和 Agent 选取的上下文仍会发送到你配置的模型服务。
 
@@ -33,36 +33,25 @@ DeepCode 不包含 Requirement、Plan、Review 等并行工作流引擎。普通
 
 Session binding 始终把工作区工具限制在当前 run 的不可变目录快照内。`agent.permissions.workspaceMutation` 默认是 `plan`；改为 `allow` 会关闭工作区修改的 Plan admission 门禁，包括声明 `workspaceMode=write` 的 `bash` 调用。所选 Shell 工具（`bash` 或 `powershell`）从绑定工作区执行一条有界命令，并强制声明 `workspaceMode` 与 `executionScope`。`executionScope=workspace` 使用工作区沙箱：read 模式只可写 Kernel 持有的临时存储，write 模式需要精确的工作区修改 authority；平台适配分别使用 macOS sandbox-exec、Linux/WSL2 Bubblewrap 和需要初始化的原生 Windows 工作区支持；缺少条件时明确返回错误，详见[执行环境说明](docs/product/execution-environments.md)。`executionScope=host` 使用宿主用户环境，并额外要求 `agent.permissions.external`；若 Host 命令会修改工作区，必须声明 write 模式，因此同时需要工作区修改与 external authority。可选的 `terminal.stdin` 会向一次性临时 PTY 精确写入一次；未声明时 stdin 关闭，不创建可持续复用的 terminal session。命令从绑定工作区根目录启动，PATH 由 Host PATH 与现有标准开发工具目录组成；每次 attempt 只持有并回收自己创建的子进程组、PTY 与临时文件。退出码为零生成 completed ToolRecord；非零退出或超时生成 failed ToolRecord，并保留有界输出和退出事实。网络读取默认 `allow`；Host Bash 与外部 effect 工具使用独立 external 权限。`web.search` 与 `web.fetch` 保持为通用核心联网工具，GitHub、arXiv 与 PDF 专用工作流通过 Skill 或插件按需激活。`agent.permissions.engineeringDecisions` 独立控制实质工程路线不明确时通过 `interaction.request` 询问，还是委托 Agent 依据当前代码事实自行裁决。
 
-## 0.5.60 更新
-
-- Agent 工作时可以继续发送消息。Session 按顺序排队，在当前模型输出和工具结果完整落定后、下次模型请求前引入；等待决策时仍通过专门答复处理，只有显式停止才取消。
-- 内核工具和 Session 扩展接口按实际消费者简化。未选择插件的装载错误只影响该插件；本次选中的插件仍须完整装载成功。
-- 共享 Host 发现保留启动及代理错误，包含本轮 Windows 原生工作区 sandbox、进程执行和 Shell 选择修复。
-- 模型配置无效时，Host 和已有对话仍可打开；设置页保留配置错误并提供明确的重新配置入口。
-- 新配置默认提供 DeepSeek Flash 模板；每个模型在自己的配置卡内保存，上次选择的模型会作为新对话默认模型。
-- 侧边栏项目和对话支持拖动排序；复制、赞、踩采用一致的悬停和键盘聚焦交互。
-
-产品版本由包清单声明，生成的 `build-info.json` 记录 `productVersion`、源码提交、构建时间和源码状态。制品身份与数据库、wire schema 的版本分别表达。
-
 ## 选择界面
 
-| 界面            | 适合场景                                    | 入口                                            |
-| --------------- | ------------------------------------------- | ----------------------------------------------- |
-| DeepCode Editor | 文件树、编辑器、终端、Git 面板和 Agent 对话 | `DeepCode.app`、`DeepCode.exe` 或 Linux GUI |
-| DeepCode-GUI    | 专注的本地 Agent 对话                       | `DeepCode-GUI.app` 或 `DeepCode-GUI.exe`    |
-| CLI             | 一次性任务、脚本和终端工作流                | `DeepCode-CLI.command` 或 `deepcode-cli`    |
-| TUI             | 持续的交互式终端对话                        | `DeepCode-TUI.command` 或 `deepcode-tui`    |
 
-日常开发推荐使用完整的 DeepCode GUI，将文件树、编辑器、终端、Git 与 Agent 工作流集中在同一界面；偏好终端工作流时推荐使用 TUI。CLI 继续用于一次性操作、自动化与诊断。
+| 界面           | 适合场景           | 入口                                      |
+| ------------ | -------------- | --------------------------------------- |
+| DeepCode-GUI | 专注的本地 Agent 对话 | `DeepCode-GUI.app` 或 `DeepCode-GUI.exe` |
+| CLI          | 一次性任务、脚本和终端工作流 | `DeepCode-CLI.command` 或 `deepcode-cli` |
+| TUI          | 持续的交互式终端对话     | `DeepCode-TUI.command` 或 `deepcode-tui` |
 
-只要使用同一配置根，四个界面就会读取同一批模型配置、Session journal、Kernel 工具记录和共享投影。
+
+DeepCode-GUI 提供 Agent 对话、附件、只读文件查看和变更预览；TUI 提供终端交互，CLI 用于任务、自动化与诊断。独立 Editor 已退役，编辑能力后续由 VS Code 插件承接。
+
+只要使用同一配置根，三个界面就会读取同一批模型配置、Session journal、Kernel 工具记录和共享投影。
 
 ## macOS 快速开始
 
 已有本地包时：
 
 ```bash
-open bin/macos-arm64/DeepCode.app
 open bin/macos-arm64/DeepCode-GUI.app
 ```
 
@@ -82,15 +71,9 @@ bash ./build.sh
 
 脚本默认尝试 Linux、Windows、macOS 全平台打包，缺少支持环境的平台会标记为跳过；`make build` 使用同一入口。前端和 Session 资源在 Docker 内从源码构建，Darwin 原生 Rust／Tauri 打包在宿主执行。
 
-输出位于 `bin/macos-arm64/`，包含两个 App、CLI/TUI launcher、Kernel、Session runtime、Web assets 和包内可写数据根。若包仍显示旧资源，请先退出全部 DeepCode App，再执行：
+输出位于 `bin/macos-arm64/`：一个完整的 `DeepCode-GUI.app`、两个 CLI/TUI 启动器和必要说明。所有运行内容只保存一份，启动器引用 App 内程序。另生成 `bin/DeepCode-<版本>-macos-arm64.tar.gz`。已有配置与会话目录保留，但不进入新压缩包。
 
-```bash
-make package-macos-clean
-```
-
-当前 macOS 包用于本机运行，采用 ad-hoc 签名；它不是 Developer ID 签名或公证的 DMG。
-
-macOS package service 固定使用当前仓库内的请求目录，并只发布到当前仓库的 `bin/macos-arm64/`。请求回执会直接打印 worker 根目录、输出目录和日志位置；打包脚本仍会在发布前确认源码没有在同一事务中发生变化。
+macOS 包使用 ad-hoc 签名。详细布局、缓存和资源更新规则见[分发说明](docs/distribution.md)。
 
 ## Linux 与 Windows 包
 
@@ -100,7 +83,7 @@ macOS package service 固定使用当前仓库内的请求目录，并只发布�
 bash ./build.sh
 ```
 
-无需指定阶段。`make build`、`--full`、`--stage all` 和 `--stage package` 使用相同的平台选择。
+无需指定阶段。`make build` 和 `--stage package` 使用相同的平台选择。
 
 每次构建都会调用所选产品及其依赖的源码构建步骤。Cargo、sccache、Docker 层和依赖存储只用于加速；已有 `dist` 或阶段标记不能替代编译。打包入口也会先构建输入，再组装分发目录。
 
@@ -135,12 +118,41 @@ Linux 启动方式：
 
 ```bash
 cd bin/linux-x64
-./deepcode-gui
+./DeepCode-GUI
 ```
 
 ARM64 Linux 产物改用 `bin/linux-arm64`。
 
-然后打开 [http://127.0.0.1:31245/](http://127.0.0.1:31245/)。Windows 可打开 `DeepCode.exe` 或 `DeepCode-GUI.exe`；目标系统需要 Microsoft Edge WebView2 Evergreen Runtime。
+Linux GUI 直接打开原生窗口。Windows 可打开 `DeepCode-GUI.exe`；目标系统需要 Microsoft Edge WebView2 Evergreen Runtime。
+
+## 独立更新前端
+
+纯界面修改可以单独构建 GUI，复用现有 Kernel、Session runtime 和原生程序：
+
+```bash
+make ui
+python3 scripts/update-ui.py --package bin/macos-arm64
+# 合并为一个命令：
+make ui-update UI_PACKAGE=bin/macos-arm64
+```
+
+`make ui` 在 Docker 内准备依赖、编译共享 TypeScript、检查 GUI 类型并运行一次 Vite，输出 `bin/ui/web-deepcode-gui`，不编译 Rust。更新脚本完整替换指定包内唯一 GUI 目录，Windows/Linux 可指定 `bin/win64` 或对应 Linux 目录，macOS 可指定 App 本身。
+
+macOS 更新在宿主执行并重新签名。完成后关闭再打开窗口；用户配置、历史会话和原生程序保留。开发模式使用 Vite HMR；Session TypeScript 需编译为 JS，更新后受控重启 Host，不热换活动 Agent Loop。
+
+此入口适用于既有 Host / Session 接口下的页面、样式和渲染修改。新增后端接口或工具执行能力仍需正常构建相应服务；本次文档工具和资源 API 首次安装也需要包含这些服务的完整版本。
+
+UI 插件支持在窗口内热替换。在 <strong>设置 → 插件 → 界面插件</strong> 添加本地目录，保存入口代码后只更新对应展示区域；首批插槽覆盖正文、文档预览和主题，不开放 Session、Provider 或底层工具端口。见[插件接口与示例](docs/product/ui-plugins.md)。
+
+## 文档排版与预览
+
+内置 [deepcode-documents Skill](skills/deepcode-documents/SKILL.md) 在用户要求美化、排版或导出文档时按需读取，包含来自 Kami 排版思路的设计参考、HTML 模板和格式说明。普通对话不自动导出文件。可以直接要求 Agent：
+
+> 把这份分析排成简洁的中文报告，输出 HTML、PDF 和 Markdown，保存在当前工作区。
+
+`document.render` 使用现有工作区写入权限和 Plan 范围，成功写入后才把真实产物交给 Session 投影。HTML / Markdown 无额外生成依赖；PDF 将自包含 HTML 交给 WeasyPrint。到“设置 → 插件 → 文档排版”指定安装了 [WeasyPrint](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html) 的 Python 路径；Python 依赖范围见 [requirements.txt](skills/deepcode-documents/scripts/requirements.txt)。开发容器已提供该环境。原生使用环境需自行具备对应平台的 WeasyPrint 运行依赖，配置错误会保留原错误，不覆盖已有文件。
+
+点击 GUI 的产物或消息中的工作区链接可预览文档：HTML 在独立静态页面内显示，可切换源码；PDF 使用本地 PDF.js 阅读，支持翻页、缩放、文字选择和下载；Markdown 复用现有渲染器。读取 PDF 不依赖 Python，也不使用在线预览服务。输出 HTML 应内嵌图片、SVG 和样式，PDF 不执行 JavaScript；普通文本的分页读取保持原行为。
 
 ## 配置模型
 

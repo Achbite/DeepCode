@@ -1,3 +1,4 @@
+import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import React from 'react';
 import { t, type UiLanguage } from '../../i18n';
 import { useSettingsStore } from '../../state/settingsStore';
@@ -7,45 +8,32 @@ export function ComposerPermissionControl({ language, composer }: { language: Ui
   const { permissionControlRef, permissionMenuOpen, setPermissionMenuOpen, setAttachmentMenuOpen } = composer;
   const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
   const runtimeEffectiveSettings = useSettingsStore((state) => state.runtimeEffectiveSettings);
-  const settingsPendingNextRunActivation = useSettingsStore(
-    (state) => state.pendingNextRunActivation,
-  );
   const patchUserSetting = useSettingsStore((state) => state.patchUserSetting);
+  const summary = t(language,
+    runtimeEffectiveSettings['agent.permissions.workspaceMutation'] === 'allow'
+      ? 'agent.permission.summary.allow' : 'agent.permission.summary.plan',
+    { external: t(language,
+      runtimeEffectiveSettings['agent.permissions.external'] === 'allow' ? 'agent.permission.allow'
+        : runtimeEffectiveSettings['agent.permissions.external'] === 'deny' ? 'agent.permission.deny' : 'agent.permission.ask') },
+  );
   return (
     <div ref={permissionControlRef} className="local-agent__permission-control">
       <button
         type="button"
         className="local-agent__permission-summary"
+        aria-label={t(language, 'settings.nav.permissions')}
+        title={summary}
         aria-expanded={permissionMenuOpen}
         onClick={() => {
           setPermissionMenuOpen((open) => !open);
           setAttachmentMenuOpen(false);
         }}
       >
-        {t(
-          language,
-          runtimeEffectiveSettings['agent.permissions.workspaceMutation'] === 'allow'
-            ? 'agent.permission.summary.allow'
-            : 'agent.permission.summary.plan',
-          {
-            external: t(
-              language,
-              runtimeEffectiveSettings['agent.permissions.external'] === 'allow'
-                ? 'agent.permission.allow'
-                : runtimeEffectiveSettings['agent.permissions.external'] === 'deny'
-                  ? 'agent.permission.deny'
-                  : 'agent.permission.ask',
-            ),
-          },
-        )}
+        <DeepCodeShellIcon name="shield" />
+        <span>{summary}</span>
       </button>
       {permissionMenuOpen && (
         <div className="local-agent__permission-menu">
-          {settingsPendingNextRunActivation && (
-            <div className="local-agent__permission-activation-notice">
-              {t(language, 'agent.permission.nextRunActivationPending')}
-            </div>
-          )}
           <div className="local-agent__permission-invariant">
             <span>{t(language, 'agent.permission.workspaceRead')}</span>
             <strong>{t(language, 'agent.permission.workspaceReadAllowed')}</strong>

@@ -1,13 +1,12 @@
 use axum::http::{HeaderMap, Method};
 use deepcode_kernel_abi::is_valid_host_shell_token;
 pub(crate) use deepcode_kernel_abi::{HOST_SHELL_TOKEN_ENV, HOST_SHELL_TOKEN_HEADER};
-use sha2::{Digest, Sha256};
 use std::fmt;
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct HostConnection {
-    token_digest: Arc<[u8; 32]>,
+    token: Arc<str>,
 }
 
 impl fmt::Debug for HostConnection {
@@ -24,7 +23,7 @@ impl HostConnection {
             return Err("Host shell connection token must contain 256 bits of entropy");
         }
         Ok(Self {
-            token_digest: Arc::new(Sha256::digest(token.as_bytes()).into()),
+            token: Arc::from(token),
         })
     }
 
@@ -35,8 +34,7 @@ impl HostConnection {
         else {
             return false;
         };
-        let submitted_digest: [u8; 32] = Sha256::digest(submitted.as_bytes()).into();
-        constant_time_eq(self.token_digest.as_ref(), &submitted_digest)
+        constant_time_eq(self.token.as_bytes(), submitted.as_bytes())
     }
 }
 

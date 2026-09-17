@@ -1,13 +1,16 @@
-import React, { Suspense, lazy, useEffect, useMemo, useState } from 'react';
+import DeepCodeNavigationBox from './DeepCodeNavigationBox';
+import WindowControls from '../../components/window-controls/WindowControls';
+import { InterfaceLoadBoundary } from '../../components/shared/InterfaceUpdateNotice';
+import { loadInterfaceModule } from '../../services/interfaceUpdates';
+import ModalDialog from '../../components/shared/ModalDialog';
+import React, { Suspense, lazy, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type {
   ConversationProject,
   ConversationSessionSummary,
-  SessionProjection,
 } from '@deepcode/protocol';
-import { normalizeUiLanguage, t, type UiLanguage } from '../../i18n';
+import { normalizeUiLanguage, t } from '../../i18n';
 import { useSettingsStore } from '../../state/settingsStore';
 import { useLocalAgentStore } from '../../state/localAgentStore';
-import { inputCacheMetric } from '../../utils/providerUsage';
 import DeepCodeConversationShell from './DeepCodeConversationShell';
 import DeepCodeSidebar from './DeepCodeSidebar';
 import { useReadRunMarkers } from './useReadRunMarkers';
@@ -17,19 +20,18 @@ import DeepCodeTitlebar from './DeepCodeTitlebar';
 import DeepCodeShellIcon from '../../components/shared/DeepCodeShellIcon';
 import ProjectFolderDialog from '../../components/workspace-open-dialog/ProjectFolderDialog';
 import '../styles/deepcodeShell.css';
+import '../styles/deepcodeWorkbench.css';
 
 interface DeepCodeWorkbenchLayoutProps {
   apiStatus: string;
-  wsStatus: string;
   serverVersion?: string;
-  lastHeartbeatAt?: string;
   kernelStartBusy?: boolean;
   kernelStartMessage?: string | null;
   onRetryKernelStart?: () => void | Promise<void>;
 }
 
 const SettingsCenter = lazy(
-  () => import('../../components/settings-center/SettingsCenter'),
+  () => loadInterfaceModule(() => import('../../components/settings-center/SettingsCenter')),
 );
 
 type PositionedMenu<T> = { value: T; x: number; y: number };
@@ -49,11 +51,7 @@ type ManagedWorkspace = { workspaceId: string; displayName: string; canonicalRoo
 
 const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   apiStatus,
-  wsStatus,
   serverVersion,
-  kernelStartBusy = false,
-  kernelStartMessage,
-  onRetryKernelStart,
 }) => {
   const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
@@ -62,12 +60,12 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     : 'comfortable';
   const showContextRail = effectiveSettings['gui.showContextRail'] !== false;
   const projection = useLocalAgentStore((state) => state.projection);
-  const profiles = useLocalAgentStore((state) => state.profiles);
   const activeSessionId = useLocalAgentStore((state) => state.sessionId);
   const draftProjectId = useLocalAgentStore((state) => state.draftProjectId);
   const catalog = useLocalAgentStore((state) => state.catalog);
   const sidebarOrder = useSidebarOrder(catalog.projects, catalog.sessions);
   const sessionStatuses = useLocalAgentStore((state) => state.sessionStatuses);
+  const statusError = useLocalAgentStore((state) => state.statusError);
   const sidebarStatuses = useMemo(() => {
     if (!projection || (sessionStatuses[projection.sessionId]?.revision ?? -1) > projection.revision) {
       return sessionStatuses;
@@ -94,6 +92,37 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const deleteSession = useLocalAgentStore((state) => state.deleteSession);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsNavigation, setSettingsNavigation] = useState<HTMLDivElement | null>(null);
+  const settingsClose = useRef<HTMLButtonElement>(null);
+  const settingsOpener = useRef<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (settingsOpen) {
+      settingsOpener.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      settingsClose.current?.focus({ preventScroll: true });
+    } else if (settingsOpener.current?.isConnected) {
+      settingsOpener.current.focus({ preventScroll: true });
+      settingsOpener.current = null;
+    }
+  }, [settingsOpen]);
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      // Blank-area clicks can focus body, outside the React workbench subtree.
+      // An inner dialog or control that consumes Escape retains priority.
+      if (event.defaultPrevented || event.isComposing
+        || document.querySelector('dialog[open]')) return;
+      if (event.key !== 'Escape') {
+        event.stopPropagation();
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      setSettingsOpen(false);
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [settingsOpen]);
+  const [sessionHeader, setSessionHeader] = useState<HTMLDivElement | null>(null);
   const readRunMarkers = useReadRunMarkers(projection, !loading && !settingsOpen);
   const [collapsedProjectIds, setCollapsedProjectIds] = useState<string[]>([]);
   const [projectCreateMenu, setProjectCreateMenu] = useState<{ x: number; y: number } | null>(null);
@@ -258,21 +287,13 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   };
 
   return (
-    <div className="deepcode-gui-workbench">
-      <DeepCodeTitlebar
-        language={language}
-        apiStatus={apiStatus}
-        agentReady={apiStatus === 'connected' && profiles.length > 0}
-        cacheHitSummary={cacheHitSummary(projection, language)}
-        kernelStartBusy={kernelStartBusy}
-        kernelStartMessage={kernelStartMessage}
-        onRetryKernelStart={onRetryKernelStart}
-      />
+    <div className={`deepcode-gui-workbench${settingsOpen ? ' deepcode-gui-workbench--settings' : ''}`}
+      onKeyDown={(event) => {
+        if (settingsOpen && event.key !== 'Escape') event.stopPropagation();
+      }}>
+      <DeepCodeTitlebar sessionHeaderRef={setSessionHeader} language={language} hidden={settingsOpen} />
 
-      <div
-        className={`deepcode-gui-shell${showContextRail ? '' : ' deepcode-gui-shell--no-context'}`}
-        data-navigation-density={navigationDensity}
-      >
+      <DeepCodeNavigationBox settingsOpen={settingsOpen} settingsTargetRef={setSettingsNavigation}>
         <DeepCodeSidebar
           language={language}
           projects={sidebarOrder.projects}
@@ -281,6 +302,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
           reorderError={sidebarOrder.error}
           onReorder={(source, target, edge) => void sidebarOrder.move(source, target, edge)}
           sessionStatuses={sidebarStatuses}
+          statusError={statusError}
           readRunMarkers={readRunMarkers}
           collapsedProjectIds={collapsedSet}
           activeSessionId={activeSessionId}
@@ -298,10 +320,19 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
           onActivateSession={(session) => void activateSession(session.id)}
           onOpenProjectContextMenu={openProjectMenu}
           onOpenSessionContextMenu={openSessionMenu}
-          onOpenSettings={() => setSettingsOpen(true)}
+          onOpenSettings={() => {
+            setProjectMenu(null); setProjectCreateMenu(null); setSessionMenu(null); setSettingsOpen(true);
+          }}
         />
-        <DeepCodeConversationShell />
-        {showContextRail && <DeepCodeTaskPanel language={language} projection={projection} />}
+      </DeepCodeNavigationBox>
+      <div
+        className={`deepcode-gui-shell${showContextRail ? '' : ' deepcode-gui-shell--no-context'}`}
+        data-navigation-density={navigationDensity}
+      >
+        <div className="deepcode-gui-main-surfaces" inert={settingsOpen} aria-hidden={settingsOpen || undefined}>
+          <DeepCodeConversationShell headerTarget={sessionHeader} />
+          {showContextRail && <DeepCodeTaskPanel language={language} projection={projection} />}
+        </div>
       </div>
 
       {projectCreateMenu && (
@@ -324,7 +355,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
               });
             }}
           >
-            <span className="deepcode-gui-menu-icon">＋</span>
+            <DeepCodeShellIcon name="plus" className="deepcode-gui-menu-icon" />
             <span>{t(language, 'deepcodeGui.project.newBlank')}</span>
           </button>
           <button
@@ -470,7 +501,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       )}
 
       {textDialog && (
-        <div className="deepcode-gui-text-dialog-backdrop" onMouseDown={() => setTextDialog(null)}>
+        <ModalDialog className="deepcode-gui-text-dialog-backdrop" aria-label={textDialog.title} busy={catalogBusy} onClose={() => setTextDialog(null)}>
           <form
             className="deepcode-gui-text-dialog"
             onSubmit={(event) => void submitTextDialog(event)}
@@ -482,7 +513,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                 type="button"
                 aria-label={t(language, 'window.close')}
                 onClick={() => setTextDialog(null)}
-              >×</button>
+              ><DeepCodeShellIcon name="close" size={14} /></button>
             </header>
             <label>
               <span>{t(language, 'deepcodeGui.nameLabel')}</span>
@@ -502,23 +533,12 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
               </button>
             </footer>
           </form>
-        </div>
+        </ModalDialog>
       )}
 
       {deleteSessionCandidate && (
-        <div
-          className="deepcode-gui-text-dialog-backdrop"
-          onMouseDown={() => {
-            if (!catalogBusy) setDeleteSessionCandidate(null);
-          }}
-        >
-          <div
-            className="deepcode-gui-text-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="deepcode-delete-session-title"
-            onMouseDown={(event) => event.stopPropagation()}
-          >
+        <ModalDialog className="deepcode-gui-text-dialog-backdrop" aria-labelledby="deepcode-delete-session-title" busy={catalogBusy} onClose={() => setDeleteSessionCandidate(null)}>
+          <div className="deepcode-gui-text-dialog" onMouseDown={(event) => event.stopPropagation()}>
             <header>
               <h2 id="deepcode-delete-session-title">{t(language, 'agent.session.delete')}</h2>
               <button
@@ -526,9 +546,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                 aria-label={t(language, 'agent.session.cancel')}
                 disabled={catalogBusy}
                 onClick={() => setDeleteSessionCandidate(null)}
-              >
-                ×
-              </button>
+              ><DeepCodeShellIcon name="close" size={14} /></button>
             </header>
             <p className="deepcode-gui-text-dialog__message">
               {t(language, 'deepcodeGui.session.deleteConfirm', {
@@ -558,7 +576,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
               </button>
             </footer>
           </div>
-        </div>
+        </ModalDialog>
       )}
 
       {folderAction && (
@@ -570,16 +588,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       )}
 
       {workspaceManager && (
-        <div
-          className="deepcode-gui-text-dialog-backdrop"
-          onMouseDown={() => !workspaceManager.loading && setWorkspaceManager(null)}
-        >
-          <div
-            className="deepcode-gui-text-dialog deepcode-gui-workspace-manager"
-            role="dialog"
-            aria-modal="true"
-            onMouseDown={(event) => event.stopPropagation()}
-          >
+        <ModalDialog className="deepcode-gui-text-dialog-backdrop" aria-label={t(language, 'deepcodeGui.project.workspacesTitle')} busy={workspaceManager.loading} onClose={() => setWorkspaceManager(null)}>
+          <div className="deepcode-gui-text-dialog deepcode-gui-workspace-manager" onMouseDown={(event) => event.stopPropagation()}>
             <header>
               <h2>{t(language, 'deepcodeGui.project.workspacesTitle')}</h2>
               <button
@@ -587,12 +597,12 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                 aria-label={t(language, 'window.close')}
                 disabled={workspaceManager.loading}
                 onClick={() => setWorkspaceManager(null)}
-              >×</button>
+              ><DeepCodeShellIcon name="close" size={14} /></button>
             </header>
             <p className="deepcode-gui-text-dialog__message">
               {t(language, 'deepcodeGui.project.workspaceTemplateHint')}
             </p>
-            <div className="deepcode-gui-workspace-manager__list">
+            <div className="deepcode-gui-workspace-manager__list" onMouseDown={(event) => event.stopPropagation()}>
               {!workspaceManager.loading && workspaceManager.records.length === 0 && (
                 <div className="deepcode-gui-workspace-manager__empty">
                   {t(language, 'deepcodeGui.project.noWorkspaces')}
@@ -639,88 +649,35 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
               </button>
             </footer>
           </div>
-        </div>
+        </ModalDialog>
       )}
 
       {settingsOpen && (
-        <div
-          className="deepcode-local-agent-overlay"
-          role="dialog"
-          aria-modal="true"
-          aria-label={t(language, 'settings.title')}
-          onMouseDown={() => setSettingsOpen(false)}
-        >
-          <div
-            className="deepcode-local-agent-settings"
-            onMouseDown={(event) => event.stopPropagation()}
-          >
+        <section className="deepcode-local-agent-overlay" aria-label={t(language, 'settings.title')}>
+          <div className="deepcode-local-agent-settings" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="deepcode-local-agent-settings__drag-region" data-tauri-drag-region aria-hidden="true" />
             <button
               type="button"
+              ref={settingsClose}
               className="deepcode-local-agent-settings__close"
               onClick={() => setSettingsOpen(false)}
             >
               {t(language, 'deepcodeGui.settings.close')}
             </button>
-            <Suspense fallback={null}>
+            <div className="deepcode-local-agent-settings__window-controls"><WindowControls language={language} /></div>
+            <InterfaceLoadBoundary><Suspense fallback={null}>
               <SettingsCenter
                 apiStatus={apiStatus}
-                wsStatus={wsStatus}
                 serverVersion={serverVersion}
-                surface="gui"
+                navigationTarget={settingsNavigation}
               />
-            </Suspense>
+            </Suspense></InterfaceLoadBoundary>
           </div>
-        </div>
+        </section>
       )}
     </div>
   );
 };
-
-function cacheHitSummary(
-  projection: SessionProjection | null,
-  language: UiLanguage,
-): { label: string; title: string } {
-  const usage = projection?.tokenUsage;
-  const cache = inputCacheMetric(usage);
-  const running = projection?.run?.status === 'running';
-  if (cache) {
-    const percent = `${formatCachePercent(cache.hitPercent)}%`;
-    return {
-      label: t(language, 'deepcodeGui.cache.summary', { value: percent }),
-      title: t(language, 'deepcodeGui.cache.calculatedTitle', {
-        input: cache.inputTokens.toLocaleString(language),
-        hit: cache.hitTokens.toLocaleString(language),
-        miss: cache.missTokens.toLocaleString(language),
-      }) + (!cache.complete ? ` ${t(language, 'deepcodeGui.cache.partialTitle', {
-        reported: cache.reportedCallCount,
-        calls: cache.providerCallCount,
-      })}` : '') + (running ? ` ${t(language, 'deepcodeGui.cache.updatingTitle')}` : ''),
-    };
-  }
-  if (running) {
-    return {
-      label: t(language, 'deepcodeGui.cache.pendingSummary'),
-      title: t(language, 'deepcodeGui.cache.pendingTitle'),
-    };
-  }
-  if (!usage?.providerCallCount) {
-    return {
-      label: t(language, 'deepcodeGui.cache.emptySummary'),
-      title: t(language, 'deepcodeGui.cache.emptyTitle'),
-    };
-  }
-  return {
-    label: t(language, 'deepcodeGui.cache.unavailableSummary'),
-    title: t(language, 'deepcodeGui.cache.unavailableTitle', {
-      calls: usage.providerCallCount.toLocaleString(language),
-    }),
-  };
-}
-
-function formatCachePercent(value: number): string {
-  const rounded = Math.round(value * 10) / 10;
-  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
-}
 
 function positioned<T>(
   event: React.MouseEvent<HTMLElement>,

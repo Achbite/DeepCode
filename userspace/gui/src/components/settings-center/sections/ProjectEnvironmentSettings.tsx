@@ -63,9 +63,7 @@ export default function ProjectEnvironmentSettings({ chinese }: { chinese: boole
             <input className="settings-field__input" value={target.distribution} disabled={saving} placeholder="Ubuntu" onChange={(event) => setTarget({ ...target, distribution: event.target.value })} /></label>
           <label className="settings-field settings-field--compact"><span>{chinese ? 'Linux Kernel 可执行文件' : 'Linux Kernel executable'}</span>
             <input className="settings-field__input" value={target.worker} disabled={saving} placeholder="/opt/deepcode/deepcode-kernel-daemon" onChange={(event) => setTarget({ ...target, worker: event.target.value })} /></label>
-          <p>{chinese ? '使用发行版内安装的当前版本 Linux Kernel。文件操作与 Bash 一起在该环境执行；不会启动另一个会话服务。项目目录需要能从该发行版访问。' : 'Use the current Linux Kernel installed inside the distribution. File operations and Bash execute together there; no second Session service is started. The project directory must be accessible from that distribution.'}</p>
         </>}
-        <p className="settings-card__inline-placeholder">{chinese ? '环境变更从下一次运行生效。WSL 仅在 Windows 主机可选，不会在工具失败后自动切换。' : 'Changes apply to the next run. WSL is available on Windows hosts and is never selected automatically after a tool failure.'}</p>
         <div className="settings-actions"><button className="settings-button" disabled={saving || !!configurationError || (target.kind === 'wsl' && (!target.distribution.trim() || !target.worker.trim()))} onClick={() => void save()}>{chinese ? '保存项目环境' : 'Save project environment'}</button></div>
       </>}
       {(configurationError || error) && <p className="settings-error" role="alert">{configurationError || error}</p>}

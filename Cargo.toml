@@ -11,13 +11,10 @@ members = [
   "shells/cli",
   "shells/tui",
 ]
-exclude = [
-  "shells/tauri/src-tauri",
-]
 resolver = "2"
 
 [workspace.package]
-version = "0.5.60"
+version = "0.6.1"
 edition = "2021"
 rust-version = "1.86"
 license = "MIT"
@@ -36,6 +33,7 @@ deepcode-kernel-runtime = { path = "crates/deepcode-kernel-runtime" }
 deepcode-kernel-daemon = { path = "crates/deepcode-kernel-daemon" }
 deepcode-kernel-client = { path = "crates/deepcode-kernel-client" }
 deepcode-host-connection = { path = "crates/deepcode-host-connection" }
+deepcode-first-party-tools = { path = "crates/deepcode-first-party-tools" }
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

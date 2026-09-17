@@ -1,11 +1,9 @@
 export * from './api.js';
 export * from './events.js';
-export * from './files.js';
 export * from './workspace.js';
 export * from './userSettings.js';
 export * from './htmlRenderer.js';
-export * from './tools.js';
 export * from './llm.js';
-export * from './runtime.js';
-export * from './browser.js';
 export * from './localAgent.js';
+
+export { isErrorDiagnostics, isLocalAgentErrorValue } from './errorDiagnostics.js';

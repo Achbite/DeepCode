@@ -1,6 +1,6 @@
 use deepcode_kernel_abi::{KernelError, KernelResult};
 use deepcode_kernel_tools::file_content::read_text_file_for_llm;
-use deepcode_kernel_tools::kernel_internal::KernelExecutorBinding;
+use deepcode_kernel_tools::kernel_internal::{KernelCanonicalInvocation, KernelDeleteTarget, KernelTextEdit, KernelToolKind};
 use deepcode_kernel_tools::KernelToolRegistry;
 use deepcode_kernel_tools::ToolAvailability;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ pub struct KernelExecutorConfig {
     pub web_search_auth_secret_ref: String,
     pub cloud_web_search: Option<CloudWebSearchConfig>,
     pub shell_program: Option<crate::shell_environment::ShellProgram>,
+    pub execution_path: Option<String>,
     pub wsl: Option<crate::wsl_execution::WslExecution>,
 }
 
@@ -59,8 +60,7 @@ impl SecretProvider for EmptySecretProvider {
 #[serde(rename_all = "camelCase")]
 pub struct KernelToolInvocation {
     pub id: String,
-    pub tool_id: String,
-    pub input: Value,
+    pub input: KernelCanonicalInvocation,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -199,16 +199,10 @@ impl KernelExecutorRegistry {
 
     pub fn invoke(
         &self,
-        tool_id: &str,
         invocation: KernelToolInvocation,
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        if invocation.tool_id != tool_id {
-            return Err(KernelError::InvalidCommand(format!(
-                "executor lookup for {tool_id} does not match invocation tool {}",
-                invocation.tool_id
-            )));
-        }
+        let tool_id = invocation.input.tool_id().as_str();
         let executor = self.executors.get(tool_id).ok_or_else(|| {
             KernelError::PermissionDenied(format!(
                 "Kernel tool {tool_id} has no executable binding"
@@ -248,6 +242,7 @@ pub fn builtin_executors(
                     Box::new(crate::wsl_execution::WslExecutor {
                         target: wsl.clone(),
                         shell: config.shell_program.clone(),
+                        execution_path: config.execution_path.clone(),
                     }) as Box<dyn KernelToolExecutor>,
                 );
             }
@@ -257,7 +252,6 @@ pub fn builtin_executors(
             )
         })
         .collect::<Vec<_>>();
-    assert_executor_bindings_match_tool_registry(registry, &executors);
     executors
 }
 
@@ -266,90 +260,50 @@ pub fn web_search_availability(config: &KernelExecutorConfig) -> ToolAvailabilit
 }
 
 pub fn resolved_network_target(
-    tool_id: &str,
-    input: &Value,
+    input: &KernelCanonicalInvocation,
     config: &KernelExecutorConfig,
 ) -> KernelResult<Option<String>> {
-    match tool_id {
-        "web.search" => {
-            let query = get_string(input, "query").unwrap_or_default();
-            let limit = input
-                .get("limit")
-                .and_then(Value::as_u64)
-                .unwrap_or(5)
-                .clamp(1, 10);
-            let target = web::web_search_target_url(config, &query, limit)?;
+    match input {
+        KernelCanonicalInvocation::WebSearch { query, limit } => {
+            let target = web::web_search_target_url(config, query, u64::from(*limit))?;
             web::validate_http_url(&target)?;
             Ok(Some(target))
         }
-        "web.fetch" => {
-            let target = get_string(input, "url").unwrap_or_default();
-            web::validate_http_url(&target)?;
-            Ok(Some(target))
+        KernelCanonicalInvocation::WebFetch { url, .. } => {
+            web::validate_http_url(url)?;
+            Ok(Some(url.clone()))
         }
         _ => Ok(None),
     }
 }
 
 fn executor_for_binding(
-    binding: KernelExecutorBinding,
+    binding: KernelToolKind,
     config: KernelExecutorConfig,
     secret_provider: Arc<dyn SecretProvider>,
 ) -> Box<dyn KernelToolExecutor> {
     match binding {
-        KernelExecutorBinding::FsRead => Box::new(FsReadExecutor),
-        KernelExecutorBinding::FsWrite => Box::new(FsWriteExecutor),
-        KernelExecutorBinding::FsEdit => Box::new(FsEditExecutor),
-        KernelExecutorBinding::FsDelete => Box::new(FsDeleteExecutor),
-        KernelExecutorBinding::WebSearch => Box::new(WebSearchExecutor {
+        KernelToolKind::FsRead => Box::new(FsReadExecutor),
+        KernelToolKind::FsWrite => Box::new(FsWriteExecutor),
+        KernelToolKind::FsEdit => Box::new(FsEditExecutor),
+        KernelToolKind::FsDelete => Box::new(FsDeleteExecutor),
+        KernelToolKind::WebSearch => Box::new(WebSearchExecutor {
             config,
             secret_provider,
         }),
-        KernelExecutorBinding::WebFetch => Box::new(WebFetchExecutor),
-        KernelExecutorBinding::ProcessShell | KernelExecutorBinding::ProcessPowerShell => {
+        KernelToolKind::WebFetch => Box::new(WebFetchExecutor),
+        KernelToolKind::ProcessShell | KernelToolKind::ProcessPowerShell => {
             Box::new(process::ConfiguredShellExecutor {
                 program: config.shell_program,
+                execution_path: config.execution_path,
             })
         }
     }
 }
 
-fn assert_executor_bindings_match_tool_registry(
-    registry: &KernelToolRegistry,
-    executors: &[(&'static str, Box<dyn KernelToolExecutor>)],
-) {
-    let binding_ids = executors
-        .iter()
-        .map(|(tool_id, _)| *tool_id)
-        .collect::<Vec<_>>();
-    for descriptor in registry.descriptors() {
-        let binding_count = binding_ids
-            .iter()
-            .filter(|tool_id| **tool_id == descriptor.name)
-            .count();
-        match descriptor.availability {
-            ToolAvailability::Callable => assert_eq!(
-                binding_count, 1,
-                "callable Kernel tool {} must have exactly one executor binding",
-                descriptor.name
-            ),
-            ToolAvailability::Blocked => assert_eq!(
-                binding_count, 0,
-                "blocked Kernel tool {} must not have an executor binding",
-                descriptor.name
-            ),
-        }
-    }
-    for tool_id in binding_ids {
-        assert!(
-            registry.descriptor(tool_id).is_some(),
-            "runtime executor {tool_id} has no canonical ToolRegistration"
-        );
-    }
-}
-
 #[path = "executors/file_changes.rs"]
 mod file_changes;
+pub use file_changes::{capture_side as capture_file_change_side, change_fact as file_change_fact};
 #[path = "executors/fs.rs"]
 mod filesystem;
 mod process;
@@ -361,18 +315,6 @@ use process::*;
 use web::*;
 
 fn ok(invocation_id: String, output: Value) -> KernelToolExecutionResult {
-    let mut affected_resources = ["path", "absolutePath", "from", "to", "destinationPath"]
-        .into_iter()
-        .filter_map(|field| {
-            output
-                .get(field)
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect::<Vec<_>>();
-    affected_resources.sort();
-    affected_resources.dedup();
-    let _ = affected_resources;
     KernelToolExecutionResult {
         invocation_id,
         outcome: KernelToolExecutionOutcome::Completed,
@@ -412,27 +354,14 @@ struct AppliedTextEdits {
     preview: Value,
 }
 
-fn apply_exact_text_edits(original: &str, edits: &Value) -> KernelResult<AppliedTextEdits> {
-    let edits = edits.as_array().ok_or_else(|| {
-        KernelError::InvalidCommand("fs.edit requires a non-empty edits array".to_string())
-    })?;
-    if edits.is_empty() || edits.len() > 128 {
-        return Err(KernelError::InvalidCommand(
-            "fs.edit requires between 1 and 128 edits".to_string(),
-        ));
-    }
-
+fn apply_exact_text_edits(original: &str, edits: &[KernelTextEdit]) -> KernelResult<AppliedTextEdits> {
     let mut ranges = Vec::with_capacity(edits.len());
     for (edit_index, edit) in edits.iter().enumerate() {
-        let old_text = required_string(edit, "oldText")?;
-        let new_text = get_string_allow_empty(edit, "newText").ok_or_else(|| {
-            KernelError::InvalidCommand("fs.edit edit.newText is required".to_string())
-        })?;
-        let (start, end) = unique_match_range(original, &old_text, edit_index)?;
+        let (start, end) = unique_match_range(original, &edit.old_text, edit_index)?;
         ranges.push(TextEditRange {
             start,
             end,
-            new_text,
+            new_text: edit.new_text.clone(),
         });
     }
     ranges.sort_by_key(|range| range.start);
@@ -700,10 +629,6 @@ fn prepared_workspace_target(context: &KernelToolExecutionContext) -> KernelResu
 }
 
 fn get_string(value: &Value, key: &str) -> Option<String> {
-    value.get(key).and_then(Value::as_str).map(str::to_string)
-}
-
-fn get_string_allow_empty(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_string)
 }
 

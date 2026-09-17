@@ -1,3 +1,4 @@
+import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import React from 'react';
 import type { ConversationSessionStatus } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
@@ -26,16 +27,12 @@ export function SessionRunStatus({ run, language, emptyLabel, compact = false }:
       title={label}
     >
       {spinning ? (
-        <span className="local-agent__run-status-spinner" aria-hidden="true" />
+        <DeepCodeShellIcon name="spinner" className="local-agent__run-status-spinner" />
       ) : (
-        <svg className="local-agent__run-status-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-          {status === 'completed' ? <path d="m3.5 8 3 3 6-6" />
-            : status === 'waiting' ? <><circle cx="8" cy="8" r="5.75" /><path d="M6.25 5.75v4.5m3.5-4.5v4.5" /></>
-              : status === 'failed' || status === 'releaseFailed' || status === 'indeterminate'
-                ? <><circle cx="8" cy="8" r="5.75" /><path d="M8 4.75v3.5M8 11h0" /></>
-                : status === 'cancelled' ? <rect x="4.5" y="4.5" width="7" height="7" rx="1" />
-                  : <circle cx="8" cy="8" r="2.5" fill="currentColor" stroke="none" />}
-        </svg>
+        <DeepCodeShellIcon className="local-agent__run-status-icon" name={status === 'completed' ? 'check'
+          : status === 'waiting' ? 'pause'
+            : status === 'failed' || status === 'releaseFailed' || status === 'indeterminate' ? 'warning'
+              : status === 'cancelled' ? 'stop' : 'dot'} />
       )}
       {!compact && <span>{label}</span>}
     </span>

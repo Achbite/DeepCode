@@ -127,16 +127,8 @@ export function planProgressFact(
       `Unknown Todo IDs: ${JSON.stringify(unknown.map((item) => item.todoId))}. No updates were applied. Nearest valid Todo IDs: ${JSON.stringify(nearest)}. Current Plan and Todo: ${JSON.stringify(todo)}.`,
     );
   }
-  const evidence = events.find((event) => event.type === 'tool.completed' && event.runId === runId
-    && event.payload.record.recordId === turn.sourceFactRef);
-  if (!evidence || evidence.type !== 'tool.completed') return reject(
-    'plan_progress_evidence_missing',
-    `No tool result recordId ${turn.sourceFactRef} exists in this run. Use a recordId already received before this turn; earlier investigation results are valid.`,
-  );
-  if (turn.updates.some((update) => update.status === 'completed') && evidence.payload.record.outcome !== 'completed') return reject(
-    'plan_progress_evidence_failed',
-    `Tool result ${turn.sourceFactRef} has outcome ${evidence.payload.record.outcome}; it cannot support completed Todo. Preserve unfinished steps and explain the failure if execution cannot continue.`,
-  );
+  const evidenceError = planProgressEvidence(events, runId, turn.sourceFactRef, turn.updates);
+  if (evidenceError) return reject(evidenceError.code, evidenceError.message);
   return {
     type: 'todo.progressed', sessionId: state.sessionId, runId, callId: turn.callId,
     payload: {
@@ -144,6 +136,23 @@ export function planProgressFact(
       sourceFactRef: turn.sourceFactRef, updates: turn.updates,
     },
   };
+}
+
+export function planProgressEvidence(
+  events: readonly SessionEvent[], runId: string, sourceFactRef: string,
+  updates: readonly { status: string }[],
+): { code: string; message: string } | null {
+  const evidence = events.find((event) => event.type === 'tool.completed' && event.runId === runId
+    && event.payload.record.recordId === sourceFactRef);
+  if (!evidence || evidence.type !== 'tool.completed') return {
+    code: 'plan_progress_evidence_missing',
+    message: `No tool result recordId ${sourceFactRef} exists in this run. Use a recordId already received before this turn; earlier investigation results are valid.`,
+  };
+  if (updates.some((update) => update.status === 'completed') && evidence.payload.record.outcome !== 'completed') return {
+    code: 'plan_progress_evidence_failed',
+    message: `Tool result ${sourceFactRef} has outcome ${evidence.payload.record.outcome}; it cannot support completed Todo. Preserve unfinished steps and explain the failure if execution cannot continue.`,
+  };
+  return null;
 }
 
 export function completedPlanAwaitingLifecycle(state: SessionState, runId: string): { planId: string; revision: number } | null {

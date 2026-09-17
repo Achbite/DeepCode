@@ -40,6 +40,7 @@ export function fakeRunPreparation(options = {}) {
       async prepare(request) {
         prepared.push(structuredClone(request));
         const snapshot = runtimeSnapshot(request.runId, {
+          environment: options.environment,
           profileId: request.profileId ?? options.profileId ?? 'profile:default',
           contextWindowTokens: options.contextWindowTokens,
           maxOutputTokens: options.maxOutputTokens,
@@ -96,6 +97,11 @@ export function runtimeSnapshot(runId, options = {}) {
     extensionGenerationRef: 'extension-generation:g1',
     kernelCatalogSnapshotRef: `kernel-catalog:${runId}`,
     provider,
+    environment: structuredClone(options.environment ?? {
+      os: 'fixture', arch: 'fixture', locale: null, responseLanguage: null, userShell: null,
+      executionTarget: { kind: 'native' }, shell: { tool: 'bash', executable: 'bash', dialect: 'bash' },
+      executionPath: 'fixture-bin', shellAvailable: true, workspaceShellSupported: true, developerCommands: [],
+    }),
     webSearch,
     instructions: [{ id: 'deepcode.coding-agent', text: 'Stable core instruction.' }],
     tools,

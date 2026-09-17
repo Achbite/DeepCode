@@ -8,7 +8,7 @@ mod registrations;
 mod types;
 
 pub use catalog::{
-    CanonicalToolInvocation, KernelToolCatalogError, KernelToolRegistry, ToolInputIssue,
+    KernelToolCatalogError, KernelToolRegistry, ToolInputIssue,
 };
 pub use types::{ToolAvailability, ToolDescriptor, ToolEffectClass, ToolEffectScope};
 
@@ -23,10 +23,9 @@ pub mod kernel_internal {
     };
     pub use crate::invocation_types::{
         process_shell_hard_deny_reason, KernelCanonicalInvocation, KernelDeleteTarget,
-        KernelTextEdit, KernelToolKind, KernelWorkspaceMode, MAX_CANONICAL_INVOCATION_BYTES,
+        KernelTextEdit, KernelToolKind, KernelWorkspaceMode, KernelExecutionScope, MAX_CANONICAL_INVOCATION_BYTES,
         MAX_TERMINAL_STDIN_BYTES,
     };
-    pub use crate::registrations::KernelExecutorBinding;
 }
 
 pub fn hash_bytes(bytes: &[u8]) -> String {

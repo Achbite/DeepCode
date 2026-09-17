@@ -1,9 +1,13 @@
 mod app;
+mod markdown;
 mod renderer;
 
 use app::{TuiApp, TuiHostOptions};
 use crossterm::{
-    event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode,
+        KeyEventKind, KeyModifiers, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -45,7 +49,7 @@ async fn main() {
     };
     let mut app = TuiApp::new(
         bootstrap.client().clone(),
-        Renderer,
+        Renderer::default(),
         TuiHostOptions {
             workspace_path: args.workspace,
             session_id: args.session_id,
@@ -227,6 +231,14 @@ async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
                     app.push_input_text(&text);
                     true
                 }
+                CrosstermEvent::Mouse(mouse) => {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => app.scroll_lines(false, 4),
+                        MouseEventKind::ScrollDown => app.scroll_lines(true, 4),
+                        _ => {}
+                    }
+                    true
+                }
                 _ => true,
             };
             if !keep_running {
@@ -323,7 +335,8 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
+        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture) {
+            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -333,7 +346,7 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
 }

@@ -1,0 +1,45 @@
+/* Shared components use the same semantic names in the editor and desktop shells. */
+:root {
+  --dc-background: var(--bg-app);
+  --dc-sidebar: var(--bg-panel);
+  --dc-surface: var(--bg-panel);
+  --dc-surface-subtle: var(--bg-surface);
+  --dc-surface-raised: var(--bg-elevated);
+  --dc-surface-hover: color-mix(in srgb, var(--text-main) 7%, transparent);
+  --dc-surface-active: color-mix(in srgb, var(--text-main) 12%, transparent);
+  --dc-border: var(--line);
+  --dc-border-strong: var(--line-strong);
+  --dc-foreground: var(--text-main);
+  --dc-foreground-strong: var(--text-strong);
+  --dc-muted: var(--text-muted);
+  --dc-faint: var(--text-placeholder);
+  --dc-success: var(--ok);
+  --dc-success-soft: color-mix(in srgb, var(--ok) 12%, transparent);
+  --dc-warning: var(--warn);
+  --dc-warning-soft: color-mix(in srgb, var(--warn) 12%, transparent);
+  --dc-danger: var(--danger);
+  --dc-danger-soft: color-mix(in srgb, var(--danger) 12%, transparent);
+  --dc-accent: var(--accent);
+  --dc-accent-soft: var(--accent-soft);
+  --dc-accent-contrast: var(--dc-fixed-white);
+  --dc-accent-border: color-mix(in srgb, var(--accent) 30%, transparent);
+  --dc-code-background: var(--bg-app);
+  --dc-shadow-small: var(--shadow-sm);
+  --dc-shadow-panel: var(--shadow-md);
+}
+
+.ui-palette-error {
+  position: fixed;
+  inset: auto 16px 16px;
+  z-index: 10000;
+  display: flex;
+  gap: 16px;
+  padding: 12px;
+  background: var(--dc-surface-raised);
+  color: var(--dc-danger);
+  border: 1px solid var(--dc-danger);
+  border-radius: 8px;
+  font: 13px/1.5 var(--dc-font-ui, sans-serif);
+}
+
+svg[data-ui-icon] { display: inline-block; vertical-align: middle; flex-shrink: 0; }

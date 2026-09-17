@@ -1,7 +1,8 @@
-import React, { useLayoutEffect } from 'react';
+import React, { useId, useLayoutEffect } from 'react';
 import { t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import SessionModelSelector from './SessionModelSelector';
+import TotalCacheUsage from './TotalCacheUsage';
 import { ComposerDecisionPanels } from './ComposerDecisionPanels';
 import { ComposerPermissionControl } from './ComposerPermissionControl';
 import type { AgentComposer } from './useAgentComposer';
@@ -58,6 +59,8 @@ export function ConversationComposer({
     endComposition,
     submitOnComposerEnter,
     filteredPlugins,
+    pluginQuery,
+    setPluginQuery,
     selectPlugin,
     focusCommandSuggestionVisible,
     selectFocusCommand,
@@ -68,12 +71,15 @@ export function ConversationComposer({
     canSend,
     showStopAction,
   } = composer;
-  const inputMode = pendingPlan ? 'plan' : pendingInteraction ? 'interaction' : 'message';
+  const pickerId = useId();
+  const inputMode = pendingApproval ? 'approval' : pendingPlan ? 'plan' : pendingInteraction ? 'interaction' : 'message';
   const compactInput = inputMode !== 'message';
+  const currentRequest = projection?.contextCompositions.filter((item)=>item.runId===projection.run?.runId).at(-1);
+  const readyPlugins = new Set(currentRequest?.tools.filter((tool)=>tool.availability==='callable').map((tool)=>tool.pluginUri));
 
   useLayoutEffect(() => {
     if (textareaRef.current) resizeComposerTextarea(textareaRef.current);
-  }, [draft, compactInput, textareaRef]);
+  }, [draft, inputMode, textareaRef]);
 
   useLayoutEffect(() => {
     const textarea = textareaRef.current;
@@ -87,7 +93,7 @@ export function ConversationComposer({
     });
     observer.observe(textarea);
     return () => observer.disconnect();
-  }, [textareaRef]);
+  }, [inputMode, textareaRef]);
 
   return (
     <footer className={`local-agent__composer-shell${pendingPlan || pendingInteraction || pendingApproval
@@ -95,7 +101,9 @@ export function ConversationComposer({
       : ''}`}>
       {error && <div className="local-agent__error">{error}</div>}
       {attachmentError && <div className="local-agent__error">{attachmentError}</div>}
-      {uiActionError && <div className="local-agent__error">{uiActionError}</div>}
+      {uiActionError && <div className="local-agent__error">{uiActionError.includes('\n')
+        ? <details><summary>{uiActionError.split('\n')[0]}</summary><pre>{uiActionError.slice(uiActionError.indexOf('\n') + 1)}</pre></details>
+        : uiActionError}</div>}
       {composer.failedDrafts.map((failed, index) => <details className="local-agent__failed-draft" key={index}>
         <summary>{language === 'zh-CN' ? '未发送草稿已保留' : 'Unsent draft saved'}</summary>
         <pre>{[failed.draft, ...failed.pastedTexts.map((item) => item.text)].filter(Boolean).join('\n\n')}</pre>
@@ -116,6 +124,11 @@ export function ConversationComposer({
       <div
         className={`local-agent__composer local-agent__composer--${inputMode}`}
         onKeyDown={(event) => {
+          if (composer.editingMessage && event.key === 'Escape' && !event.repeat
+            && !event.nativeEvent.isComposing && !event.defaultPrevented) {
+            event.preventDefault();
+            composer.cancelMessageEdit();
+          }
           if (pendingPlan && event.target !== textareaRef.current && event.key === 'Escape'
             && !event.repeat && !event.nativeEvent.isComposing && !event.defaultPrevented) {
             event.preventDefault();
@@ -130,25 +143,42 @@ export function ConversationComposer({
         }}
       >
         <ComposerDecisionPanels language={language} composer={composer} />
+        {!pendingApproval && <>
+        {composer.editingMessage && !composer.textDecision && <>
+          <div className="local-agent__message-edit-notice">
+            <div><strong>{t(language, 'agent.message.edit')}</strong><p>{t(language, 'agent.message.editDescription')}</p></div>
+            <button type="button" disabled={submitting} onClick={composer.cancelMessageEdit} aria-keyshortcuts="Escape">
+              {t(language, 'agent.message.cancelEdit')}
+            </button>
+          </div>
+          <div className="local-agent__message-edit-references">
+            {composer.editingMessage.message.filesystemReferences.map((reference) => <span key={reference.referenceId}>{reference.displayName}</span>)}
+          </div>
+        </>}
         {pluginPickerOpen && (
           <div
             ref={pluginPickerRef}
             className="local-agent__plugin-picker"
-            role="listbox"
+            role="group"
             aria-label={t(language, 'agent.plugin.picker')}
+            data-native-overlay
           >
             <div className="local-agent__plugin-picker-heading">
               {t(language, 'agent.plugin.picker')}
             </div>
+            <input className="local-agent__plugin-search" aria-label={language === 'zh-CN' ? '搜索工具' : 'Search tools'} placeholder={language === 'zh-CN' ? '搜索工具' : 'Search tools'} value={pluginQuery} onChange={(event) => setPluginQuery(event.target.value)} role="combobox" aria-expanded="true" aria-autocomplete="list" aria-controls={pickerId} aria-activedescendant={pluginActiveIndex >= 0 ? `${pickerId}-${pluginActiveIndex}` : undefined} onKeyDown={(event) => composer.handlePluginPickerKey(event)} />
+            <div id={pickerId} role="listbox" aria-label={t(language, 'agent.plugin.picker')}>
             {filteredPlugins.length ? filteredPlugins.map((plugin, index) => (
               <button
                 type="button"
                 role="option"
-                aria-selected={index === pluginActiveIndex}
+                id={`${pickerId}-${index}`} tabIndex={-1}
+                data-active={index === pluginActiveIndex}
+                aria-selected={pluginSelections.some((selection) => selection.uri === plugin.uri)}
                 key={plugin.uri}
                 disabled={!plugin.enabled || !plugin.available}
                 onClick={() => selectPlugin(plugin)}
-                onMouseEnter={() => setPluginActiveIndex(index)}
+                onMouseEnter={() => { if (plugin.enabled && plugin.available) setPluginActiveIndex(index); }}
               >
                 <DeepCodeShellIcon name="extension" />
                 <span>
@@ -158,13 +188,14 @@ export function ConversationComposer({
                     ? `${plugin.error.code}: ${plugin.error.message}`
                     : language === 'zh-CN' ? '插件未启用' : 'Plugin disabled'}</small>}
                 </span>
-                <code>{plugin.uri}</code>
+                <span className="plugin-selection-mark" title={readyPlugins.has(plugin.uri) ? (language==='zh-CN'?'当前任务已就绪':'Ready in this task') : pluginSelections.some(selection=>selection.uri===plugin.uri) ? (language==='zh-CN'?'已选择，发送后加入任务':'Selected; prepared on send') : undefined}>{pluginSelections.some(selection=>selection.uri===plugin.uri)||readyPlugins.has(plugin.uri)? <DeepCodeShellIcon name="check" size={14} /> : null}</span>
               </button>
             )) : (
               <div className="local-agent__plugin-picker-empty">
                 {t(language, 'agent.plugin.empty')}
               </div>
             )}
+            </div>
           </div>
         )}
         {focusCommandSuggestionVisible && (
@@ -196,21 +227,22 @@ export function ConversationComposer({
             <div className="local-agent__pasted-text-header">
               <DeepCodeShellIcon name="artifact" />
               <span><strong>{pastedTextTitle(paste.text)}</strong><small>TXT · {(new TextEncoder().encode(paste.text).byteLength / 1024).toFixed(1)} KiB</small></span>
-              <button type="button" aria-label="移除粘贴文本" onClick={() => composer.setPastedTexts((current) => current.filter((item) => item.inputId !== paste.inputId))}>×</button>
+              <button type="button" aria-label={t(language, 'agent.paste.remove')} onClick={() => composer.setPastedTexts((current) => current.filter((item) => item.inputId !== paste.inputId))}><DeepCodeShellIcon name="close" size={14} /></button>
             </div>
             <button type="button" className="local-agent__paste-toggle" aria-expanded={paste.expanded} onClick={() => composer.setPastedTexts((current) => current.map((item) => item.inputId === paste.inputId ? { ...item, expanded: !item.expanded } : item))}>
-              {paste.expanded ? '收起原文' : '在文本框中显示'}
+              {t(language, paste.expanded ? 'agent.paste.collapse' : 'agent.paste.expand')}
             </button>
-            {paste.expanded && <textarea aria-label="粘贴文本原文" value={paste.text} onChange={(event) => composer.editPastedText(paste.inputId, event.target.value)} rows={8} />}
+            {paste.expanded && <textarea aria-label={t(language, 'agent.paste.original')} value={paste.text} onChange={(event) => composer.editPastedText(paste.inputId, event.target.value)} rows={8} />}
           </div>
         ))}
+        {composer.textDecision && <span className="local-agent__decision-input-mark" aria-hidden="true"><DeepCodeShellIcon name="compose" size={16} /></span>}
         <textarea
           ref={textareaRef}
           value={draft}
           rows={compactInput ? 1 : 3}
           placeholder={t(language, pendingPlan ? 'agent.composer.placeholder.plan'
             : pendingInteraction ? 'agent.composer.placeholder.interaction' : 'agent.composer.placeholder.task')}
-          disabled={Boolean(pendingInteraction && !pendingInteraction.allowFreeform)}
+          disabled={Boolean(pendingInteraction && !pendingInteraction.allowFreeform || composer.editingMessage && submitting)}
           onChange={(event) => updateDraft(
             event.target.value,
             event.target.selectionStart ?? event.target.value.length,
@@ -241,7 +273,7 @@ export function ConversationComposer({
                     )));
                     setDraft((current) => current.replace(`@${selection.label}`, '').trimStart());
                   }}
-                >×</button>
+                ><DeepCodeShellIcon name="close" size={14} /></button>
               </span>
             ))}
             {pendingFilesystemPaths.map((reference) => (
@@ -266,14 +298,14 @@ export function ConversationComposer({
                   onClick={() => setPendingFilesystemPaths((current) => current.filter((item) => (
                     item.path !== reference.path || item.kind !== reference.kind
                   )))}
-                >×</button>
+                ><DeepCodeShellIcon name="close" size={14} /></button>
               </span>
             ))}
           </div>
         )}
         <div className="local-agent__composer-footer">
-          <div className="local-agent__composer-tools">
-            {!composer.textDecision && <div ref={attachmentControlRef} className="local-agent__attachment-control">
+          {!composer.textDecision && !composer.editingMessage && <div className="local-agent__composer-tools">
+            <div ref={attachmentControlRef} className="local-agent__attachment-control">
               <button
                 type="button"
                 className="local-agent__attach"
@@ -329,11 +361,11 @@ export function ConversationComposer({
                   </button>
                 </div>
               )}
-            </div>}
+            </div>
             <ComposerPermissionControl language={language} composer={composer} />
-          </div>
+          </div>}
           <div className="local-agent__composer-actions">
-            <SessionModelSelector
+            {!composer.textDecision && !composer.editingMessage && <SessionModelSelector
               language={language}
               profiles={profiles}
               selectedProfileId={selectedProfileId}
@@ -343,7 +375,7 @@ export function ConversationComposer({
               busy={loading || submitting || modelSettingsBusy}
               onProfileChange={selectProfile}
               onReasoningEffortChange={selectReasoningEffort}
-            />
+            />}
             <div className="local-agent__composer-primary-actions">
               {(pendingPlan || pendingInteraction?.allowFreeform) && <button
                 type="button"
@@ -363,7 +395,6 @@ export function ConversationComposer({
                 }}
               >
                 <span>{t(language, pendingPlan ? 'agent.plan.ignoreAndStop' : 'agent.interaction.skip')}</span>
-                {pendingPlan && <kbd aria-hidden="true">Esc</kbd>}
               </button>}
               {showStopAction && <button
                 type="button"
@@ -374,25 +405,26 @@ export function ConversationComposer({
               ><DeepCodeShellIcon name="stop" /></button>}
               {!showStopAction && <button
                 type="button"
-                className="local-agent__send"
+                className={`local-agent__send${composer.textDecision || composer.editingMessage ? ' local-agent__send--decision' : ''}`}
                 aria-label={submitting
                     ? t(language, 'agent.composer.sending')
                     : pendingInteraction ? (language === 'zh-CN' ? '回答' : 'Answer')
                       : pendingPlan ? (language === 'zh-CN' ? '提交修改意见' : 'Request changes')
-                        : t(language, 'agent.composer.send')}
+                        : t(language, composer.editingMessage ? 'agent.message.regenerate' : 'agent.composer.send')}
                 title={t(language, 'agent.composer.sendEnter')}
                 disabled={!canSend}
                 onClick={() => void submitDraft()}
               >
-                <DeepCodeShellIcon name="arrowUp" />
+                {composer.editingMessage ? t(language, 'agent.message.regenerate') : composer.textDecision ? t(language, 'agent.composer.send') : <DeepCodeShellIcon name="arrowUp" />}
               </button>}
             </div>
           </div>
         </div>
+        </>}
       </div>
       {!pendingPlan && !pendingInteraction && !pendingApproval && (
         <div className="local-agent__composer-hint">
-          {t(language, 'agent.composer.hint')}
+          <TotalCacheUsage projection={projection} language={language} />
         </div>
       )}
     </footer>

@@ -2,6 +2,7 @@
 //! No command is translated or retried in a different shell.
 use deepcode_kernel_abi::{KernelError, KernelResult};
 use serde::{Deserialize, Serialize};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,11 +46,20 @@ pub fn find_command(name: &str) -> Option<PathBuf> {
     command_candidates(name).find(|path| executable_file(path))
 }
 
+pub fn find_command_in(name: &str, directories: &[PathBuf]) -> Option<PathBuf> {
+    command_candidates_in(name, directories.iter()).find(|path| executable_file(path))
+}
+
 fn command_candidates(name: &str) -> impl Iterator<Item = PathBuf> + '_ {
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+    let directories = std::env::split_paths(std::env::var_os("PATH").as_deref().unwrap_or(OsStr::new("")))
+        .collect::<Vec<_>>();
+    command_candidates_in(name, directories.into_iter())
+}
+
+fn command_candidates_in<'a>(name: &'a str, directories: impl Iterator<Item = impl AsRef<Path>> + 'a) -> impl Iterator<Item = PathBuf> + 'a {
+    directories
         .flat_map(move |directory| {
+            let directory = directory.as_ref();
             if cfg!(windows) {
                 ["exe", "cmd", "bat", "com"]
                     .into_iter()
@@ -324,5 +334,57 @@ mod tests {
         .unwrap();
         assert!(text.ends_with(script));
         assert!(text.starts_with("[Console]::OutputEncoding"));
+    }
+}
+
+pub fn resolved_agent_shell_path() -> KernelResult<OsString> {
+    let host_path = std::env::var_os("PATH");
+    let mut configured_tool_paths = Vec::new();
+    for key in ["PNPM_HOME"] {
+        if let Some(path) = std::env::var_os(key) {
+            configured_tool_paths.push(PathBuf::from(path));
+        }
+    }
+    for key in ["CARGO_HOME", "GOPATH", "JAVA_HOME", "VOLTA_HOME"] {
+        if let Some(path) = std::env::var_os(key) {
+            configured_tool_paths.push(PathBuf::from(path).join("bin"));
+        }
+    }
+    if let Some(path) = std::env::var_os("PYENV_ROOT") {
+        let root = PathBuf::from(path);
+        configured_tool_paths.push(root.join("shims"));
+        configured_tool_paths.push(root.join("bin"));
+    }
+    compose_agent_shell_path(
+        host_path.as_deref(),
+        &configured_tool_paths,
+    )
+}
+
+pub(crate) fn compose_agent_shell_path(
+    host_path: Option<&OsStr>,
+    configured_tool_paths: &[PathBuf],
+) -> KernelResult<OsString> {
+    let mut paths = Vec::new();
+    for path in configured_tool_paths {
+        push_existing_unique_path(&mut paths, path.clone());
+    }
+    if let Some(host_path) = host_path {
+        for path in std::env::split_paths(host_path) {
+            push_unique_path(&mut paths, path);
+        }
+    }
+    std::env::join_paths(paths).map_err(|error| KernelError::InvalidCommand(format!("Invalid execution PATH: {error}")))
+}
+
+fn push_existing_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if path.is_dir() {
+        push_unique_path(paths, path);
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.contains(&path) {
+        paths.push(path);
     }
 }

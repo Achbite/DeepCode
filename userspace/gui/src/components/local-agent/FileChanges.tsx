@@ -1,8 +1,10 @@
+import { t } from '../../i18n';
+import { useUiLanguage } from '../../useUiLanguage';
+import ModalDialog from '../shared/ModalDialog';
 import React, { useEffect, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
 import type { ActivityProjection } from '@deepcode/protocol';
 import { useConversationHost, useConversationTheme } from './ConversationHost';
-import { loadConversationMonaco } from './monacoRuntime';
+import { loadCodeLanguage } from './codeLanguage';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import { isBinaryFileChange } from '../../services/localAgentApi';
@@ -11,6 +13,7 @@ import { changedFiles, readRoundChange, readChangeStatistics, type FileChangeSta
 export { roundChangeActivities } from './fileChangeSummary';
 
 export function FileChanges({ activities, compact = false }: { activities: ActivityProjection[]; compact?: boolean }) {
+  const language = useUiLanguage();
   const { openDiff, readChange } = useConversationHost();
   const sessionId = useLocalAgentStore((state) => state.sessionId);
   const [error, setError] = useState('');
@@ -56,20 +59,20 @@ export function FileChanges({ activities, compact = false }: { activities: Activ
     const statistic = counts.get(file.key);
     return <div className="conversation-change-row" key={file.key}>
       <button type="button" className="conversation-change-file" title={file.path} onClick={() => open(file)}>
-        <span>{file.path}</span>{statistic?.kind === 'text' ? <DiffCounts counts={statistic.counts} /> : <small>{statistic?.kind === 'binary' ? '二进制 · ' : ''}{file.changes.length > 1 ? `${file.changes.length} 次修改` : ({ create: '新增', modify: '修改', delete: '删除' }[file.changes[0]!.change.kind])}</small>}
+        <span>{file.path}</span>{statistic?.kind === 'text' ? <DiffCounts counts={statistic.counts} /> : <small>{statistic?.kind === 'binary' ? t(language, 'changes.binaryPrefix') : ''}{file.changes.length > 1 ? t(language, 'changes.count', { count: file.changes.length }) : ({ create: t(language, 'changes.create'), modify: t(language, 'changes.modify'), delete: t(language, 'changes.delete') }[file.changes[0]!.change.kind])}</small>}
       </button>
     </div>;
   });
   return <section className={`conversation-changes${compact ? ' conversation-changes--compact' : ''}${expanded ? ' is-expanded' : ''}`}>
     <button type="button" className="conversation-changes-heading" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
-      <DeepCodeShellIcon name="compose" /><span><strong>{compact ? `${all.length} 个文件已更改` : `已修改 ${all.length} 个文件`}</strong>{!compact && <small>本轮修改</small>}</span>
+      <DeepCodeShellIcon name="compose" /><span><strong>{t(language, 'changes.files', { count: all.length })}</strong>{!compact && <small>{t(language, 'changes.round')}</small>}</span>
       {total && <DiffCounts counts={total} />}
-      {binaryCount > 0 && <small className="conversation-change-binary-count">另含 {binaryCount} 个二进制文件</small>}
+      {binaryCount > 0 && <small className="conversation-change-binary-count">{t(language, 'changes.binaryCount', { count: binaryCount })}</small>}
       <DeepCodeShellIcon name="chevronDown" className="conversation-disclosure-chevron" />
     </button>
     {(compact || expanded) && <div className="conversation-change-list">{entries}
-      {!compact && all.length > 3 && <button className="conversation-change-more" type="button" aria-expanded={showAll} onClick={() => setShowAll((value) => !value)}><span>{showAll ? '收起更多文件' : `再显示 ${all.length - 3} 个文件`}</span><DeepCodeShellIcon name="chevronDown" className="conversation-disclosure-chevron" /></button>}
-      {statistics.signature === signature && statistics.errors.size > 0 && <details className="conversation-change-error"><summary>{statistics.errors.size} 个文件的行数暂不可用</summary>{[...statistics.errors].map(([path, message]) => <p key={path}><strong>{path}</strong><br />{message}</p>)}</details>}
+      {!compact && all.length > 3 && <button className="conversation-change-more" type="button" aria-expanded={showAll} onClick={() => setShowAll((value) => !value)}><span>{showAll ? t(language, 'changes.collapse') : t(language, 'changes.more', { count: all.length - 3 })}</span><DeepCodeShellIcon name="chevronDown" className="conversation-disclosure-chevron" /></button>}
+      {statistics.signature === signature && statistics.errors.size > 0 && <details className="conversation-change-error"><summary>{t(language, 'changes.unavailable', { count: statistics.errors.size })}</summary>{[...statistics.errors].map(([path, message]) => <p key={path}><strong>{path}</strong><br />{message}</p>)}</details>}
     </div>}
     {error && <p role="alert">{error}</p>}
     {selected && <FileChangePreview key={`${sessionId}:${selected.key}`} sessionId={sessionId} file={selected} statistic={counts.get(selected.key)} close={() => setSelected(null)} />}
@@ -77,84 +80,50 @@ export function FileChanges({ activities, compact = false }: { activities: Activ
 }
 
 function FileChangePreview({ sessionId, file, statistic, close }: { sessionId: string; file: ChangedFile; statistic?: FileChangeStatistics; close(): void }) {
+  const language = useUiLanguage();
   const { readChange } = useConversationHost();
   const theme = useConversationTheme();
   const container = useRef<HTMLDivElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
-  const [status, setStatus] = useState('读取修改内容…');
+  const [status, setStatus] = useState('changes.loading');
   const [error, setError] = useState('');
   const [binary, setBinary] = useState(false);
   const before = file.changes[0]!.change.before;
   const after = file.changes.at(-1)!.change.after;
   const pathEnd = file.path.lastIndexOf('/') + 1;
   useEffect(() => {
-    const previous = document.activeElement;
-    closeButton.current?.focus();
-    return () => { if (previous instanceof HTMLElement && previous.isConnected) previous.focus(); };
-  }, []);
-  useEffect(() => {
     const controller = new AbortController();
     let dispose: (() => void) | undefined;
-    setStatus('读取修改内容…'); setError(''); setBinary(false);
-    void Promise.all([readRoundChange(readChange, sessionId, file, controller.signal), loadConversationMonaco()])
-      .then(([change, monaco]) => {
+    setStatus('changes.loading'); setError(''); setBinary(false);
+    void Promise.all([readRoundChange(readChange, sessionId, file, controller.signal), import('./codeDiffView')])
+      .then(async ([change, { createCodeDiffView }]) => {
+        const language = await loadCodeLanguage('', change.path);
         if (controller.signal.aborted || !container.current) return;
-        const filename = change.path.split('/').at(-1) ?? change.path;
-        const extension = filename.includes('.') ? `.${filename.split('.').at(-1)}` : '';
-        const language = monaco.languages.getLanguages().find((language) => language.filenames?.includes(filename) || extension && language.extensions?.includes(extension))?.id ?? 'plaintext';
-        const diffTheme = `deepcode-diff-${theme}`;
-        const dark = theme === 'vs-dark';
-        monaco.editor.defineTheme(diffTheme, {
-          base: theme, inherit: true, rules: [], colors: {
-            'diffEditor.insertedLineBackground': dark ? '#1d382a' : '#e7f3e9',
-            'diffEditor.removedLineBackground': dark ? '#402627' : '#fbe9e7',
-            'diffEditor.insertedTextBackground': '#00000000',
-            'diffEditor.removedTextBackground': '#00000000',
-            'diffEditorGutter.insertedLineBackground': dark ? '#1d382a' : '#e7f3e9',
-            'diffEditorGutter.removedLineBackground': dark ? '#402627' : '#fbe9e7',
-            'diffEditor.unchangedRegionBackground': dark ? '#252830' : '#f4f4f5',
-            'diffEditor.unchangedRegionForeground': dark ? '#a8acb5' : '#65676c',
-            'diffEditor.unchangedCodeBackground': '#00000000',
-          },
-        });
-        const editor = monaco.editor.createDiffEditor(container.current, {
-          readOnly: true, originalEditable: false, automaticLayout: true, renderSideBySide: false, theme: diffTheme,
-          scrollBeyondLastLine: false, minimap: { enabled: false }, fontSize: 13, lineHeight: 25,
-          fontFamily: 'var(--dc-font-mono)', wordWrap: 'on', diffWordWrap: 'on',
-          ignoreTrimWhitespace: false, renderOverviewRuler: false, renderLineHighlight: 'none',
-          padding: { top: 8, bottom: 12 },
-          hideUnchangedRegions: { enabled: true, contextLineCount: 2, minimumLineCount: 3, revealLineCount: 20 },
-        });
-        const original = monaco.editor.createModel(change.before ?? '', language);
-        const modified = monaco.editor.createModel(change.after ?? '', language);
-        editor.setModel({ original, modified });
-        const listener = editor.onDidUpdateDiff(() => {
-          const changes = editor.getLineChanges();
-          if (changes?.length) editor.revealLineInCenter(Math.max(1, changes[0]!.modifiedStartLineNumber));
-        });
-        dispose = () => { listener.dispose(); editor.dispose(); original.dispose(); modified.dispose(); };
+        const view = createCodeDiffView(container.current, change.before ?? '', change.after ?? '', language, theme === 'vs-dark');
+        dispose = () => view.destroy();
         setStatus('');
       }).catch((error: unknown) => { if (!controller.signal.aborted) {
-        if (isBinaryFileChange(error)) { setBinary(true); setStatus('二进制文件'); }
-        else { setError(String(error)); setStatus('读取失败'); }
+        if (isBinaryFileChange(error)) { setBinary(true); setStatus('changes.binary'); }
+        else { setError(String(error)); setStatus('changes.failed'); }
       } });
     return () => { controller.abort(); dispose?.(); };
   }, [readChange, sessionId, file, theme]);
-  return createPortal(<div className="conversation-diff-overlay" onClick={(event) => { if (event.target === event.currentTarget) close(); }} onKeyDown={(event) => { if (event.key === 'Escape') { event.stopPropagation(); close(); } }}>
-    <section role="dialog" aria-modal="true" aria-label={`${file.path} 修改 Diff`} className="conversation-diff-dialog">
+  return <ModalDialog className="conversation-diff-overlay" onClose={close} aria-label={file.path}>
+    <section aria-label={t(language, 'changes.diffTitle', { path: file.path })} className="conversation-diff-dialog">
       <header className="conversation-diff-header">
         <DeepCodeShellIcon name="artifact" />
-        <div className="conversation-diff-title"><div className="conversation-diff-path" title={file.path}><span>{file.path.slice(0, pathEnd)}</span><strong>{file.path.slice(pathEnd)}</strong></div>{status && <small role="status">{status}</small>}</div>
+        <div className="conversation-diff-title"><div className="conversation-diff-path" title={file.path}><span>{file.path.slice(0, pathEnd)}</span><strong>{file.path.slice(pathEnd)}</strong></div>{status && <small role="status">{t(language, status)}</small>}</div>
         {statistic?.kind === 'text' && <DiffCounts counts={statistic.counts} />}
-        <button ref={closeButton} type="button" className="conversation-diff-close" onClick={close} aria-label="关闭修改详情" title="关闭"><DeepCodeShellIcon name="close" /></button>
+        <button ref={closeButton} type="button" className="conversation-diff-close" onClick={close} aria-label={t(language, 'changes.close')} title={t(language, 'changes.closeTitle')}><DeepCodeShellIcon name="close" /></button>
       </header>
       {error && <p role="alert">{error}</p>}
-      {binary && <div className="conversation-diff-binary">二进制文件不提供文本行数和逐行对比。<small>{before.exists ? `修改前 ${before.sizeBytes ?? '未知'} 字节` : '修改前不存在'} · {after.exists ? `修改后 ${after.sizeBytes ?? '未知'} 字节` : '修改后不存在'}</small></div>}
+      {binary && <div className="conversation-diff-binary">{t(language, 'changes.binaryDescription')}<small>{before.exists ? t(language, 'changes.beforeSize', { size: before.sizeBytes ?? t(language, 'changes.unknown') }) : t(language, 'changes.beforeAbsent')} · {after.exists ? t(language, 'changes.afterSize', { size: after.sizeBytes ?? t(language, 'changes.unknown') }) : t(language, 'changes.afterAbsent')}</small></div>}
       <div ref={container} className="conversation-diff-editor" />
     </section>
-  </div>, document.body);
+  </ModalDialog>;
 }
 
 function DiffCounts({ counts }: { counts: ChangeCounts }) {
-  return <span className="conversation-diff-counts" aria-label={`新增 ${counts.added} 行，删除 ${counts.removed} 行`}><span className="is-added">+{counts.added}</span><span className="is-removed">-{counts.removed}</span></span>;
+  const language = useUiLanguage();
+  return <span className="conversation-diff-counts" aria-label={t(language, 'changes.lineCounts', { added: counts.added, removed: counts.removed })}><span className="is-added">+{counts.added}</span><span className="is-removed">-{counts.removed}</span></span>;
 }

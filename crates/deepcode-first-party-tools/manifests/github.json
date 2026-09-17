@@ -3,7 +3,7 @@
   "id": "github",
   "uri": "plugin://github@first-party",
   "displayName": "GitHub",
-  "shortDescription": "Search GitHub repositories, code, and issues, then read repository contents through the GitHub API.",
+  "shortDescription": "查找仓库、阅读代码和议题。",
   "activationMediaTypes": [],
   "providerRef": "tool-provider:first-party:github",
   "capabilityRefs": [
@@ -19,17 +19,42 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "query": { "type": "string", "minLength": 1 },
-          "kind": { "type": "string", "enum": ["repositories", "code", "issues"], "default": "repositories" },
-          "page": { "type": "integer", "minimum": 1, "maximum": 100, "default": 1 },
-          "limit": { "type": "integer", "minimum": 1, "maximum": 30, "default": 10 }
+          "query": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "repositories",
+              "code",
+              "issues"
+            ],
+            "default": "repositories"
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 1
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 30,
+            "default": 10
+          }
         },
-        "required": ["query"],
+        "required": [
+          "query"
+        ],
         "additionalProperties": false
       },
       "effect": "networkRead",
       "logicalTarget": "https://api.github.com",
-      "binding": { "kind": "none" },
+      "binding": {
+        "kind": "none"
+      },
       "toolContributionRef": "tool-contribution:first-party:github.search",
       "promptContribution": {
         "contributionRef": "tool-prompt-contribution:first-party:github.search",
@@ -47,17 +72,37 @@
       "inputSchema": {
         "type": "object",
         "properties": {
-          "repository": { "type": "string", "minLength": 3, "description": "Repository in owner/name form." },
-          "path": { "type": "string", "minLength": 1, "default": "." },
-          "ref": { "type": "string", "minLength": 1 },
-          "maxBytes": { "type": "integer", "minimum": 1024, "maximum": 262144, "default": 262144 }
+          "repository": {
+            "type": "string",
+            "minLength": 3,
+            "description": "Repository in owner/name form."
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "default": "."
+          },
+          "ref": {
+            "type": "string",
+            "minLength": 1
+          },
+          "maxBytes": {
+            "type": "integer",
+            "minimum": 1024,
+            "maximum": 262144,
+            "default": 262144
+          }
         },
-        "required": ["repository"],
+        "required": [
+          "repository"
+        ],
         "additionalProperties": false
       },
       "effect": "networkRead",
       "logicalTarget": "https://api.github.com",
-      "binding": { "kind": "none" },
+      "binding": {
+        "kind": "none"
+      },
       "toolContributionRef": "tool-contribution:first-party:github.read",
       "promptContribution": {
         "contributionRef": "tool-prompt-contribution:first-party:github.read",

@@ -1,8 +1,8 @@
 import '../components/shared/focus.css';
+import { ConversationDisplayProvider } from '../components/local-agent/ConversationDisplayProvider';
 import { HostStartupDiagnostic } from '../components/shared/HostStartupDiagnostic';
 import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
 import useAppStatusStore from '../state/appStatusStore';
-import { useEditorStore, getTabId } from '../state/editorStore';
 import { useSettingsStore } from '../state/settingsStore';
 import { useWorkspaceStore } from '../state/workspaceStore';
 import { useLocalAgentStore } from '../state/localAgentStore';
@@ -21,7 +21,6 @@ import {
   isRuntimeReady,
   startKernelAfterPermission,
   type HostStartupStatusV1,
-  warmupTerminalRuntime,
 } from '../services/runtimeAdapter';
 import './deepcodeGui.css';
 import './styles/deepcodeDesignTokens.css';
@@ -41,18 +40,6 @@ function afterFirstPaint(task: () => void): () => void {
   };
 }
 
-function isEditableTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false;
-  return (
-    target.isContentEditable ||
-    target.tagName === 'TEXTAREA' ||
-    target.tagName === 'INPUT' ||
-    target.getAttribute('role') === 'textbox' ||
-    Boolean(target.closest('.monaco-editor'))
-  );
-}
-
-const EMPTY_WORKSPACE_SETTINGS: Record<string, unknown> = {};
 
 const HOST_STARTUP_MESSAGE_KEYS: Readonly<Record<string, string>> = {
   host_startup_idle: 'deepcodeGui.hostStartup.idle',
@@ -121,17 +108,13 @@ const BootFallback: React.FC<{ language: ReturnType<typeof normalizeUiLanguage> 
 const DeepCodeGuiApp: React.FC = () => {
   const {
     apiStatus,
-    wsStatus,
     serverVersion,
-    lastHeartbeatAt,
     setApiStatus,
     setServerVersion,
     setErrorMessage,
   } = useAppStatusStore();
   const loadWorkspace = useWorkspaceStore((s) => s.loadCurrent);
-  const workspaceSettings = useWorkspaceStore((s) => s.current?.settings ?? EMPTY_WORKSPACE_SETTINGS);
   const loadUserSettings = useSettingsStore((s) => s.loadUserSettings);
-  const syncWorkspaceSettings = useSettingsStore((s) => s.syncWorkspaceSettings);
   const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
   const loadedIncarnationRef = useRef<string | null>(null);
@@ -141,17 +124,6 @@ const DeepCodeGuiApp: React.FC = () => {
   const [kernelStartBusy, setKernelStartBusy] = useState(false);
   const [hostStartup, setHostStartup] = useState<HostStartupStatusV1 | null>(null);
   const [kernelStartMessage, setKernelStartMessage] = useState<string | null>(null);
-  const dirtySignature = useEditorStore((s) =>
-    s.tabs
-      .flatMap((tab) =>
-        tab.kind === 'file' && tab.isDirty ? [`${getTabId(tab)}:${tab.version}`] : []
-      )
-      .join('|')
-  );
-  const terminalPrewarm = String(
-    effectiveSettings['terminal.integrated.prewarm'] ?? 'afterStartup',
-  );
-
   const recordRuntimeReady = useCallback((attemptId: string | null) => {
     if (attemptId) {
       setConnectedIncarnation(`host:${attemptId}`);
@@ -160,13 +132,6 @@ const DeepCodeGuiApp: React.FC = () => {
       setConnectedIncarnation(`health:${healthConnectionSequenceRef.current}`);
     }
     healthWasReadyRef.current = true;
-  }, []);
-
-  const saveCurrentActiveFile = useCallback(async () => {
-    const { activeTabId, tabs, saveFile } = useEditorStore.getState();
-    const activeTab = tabs.find((tab) => getTabId(tab) === activeTabId);
-    if (activeTab?.kind !== 'file') return false;
-    return saveFile(getTabId(activeTab));
   }, []);
 
   const retryKernelStart = useCallback(async () => {
@@ -233,9 +198,6 @@ const DeepCodeGuiApp: React.FC = () => {
     void useLocalAgentStore.getState().initialize();
   }, [apiStatus, connectedIncarnation, loadUserSettings, loadWorkspace]);
 
-  useEffect(() => {
-    syncWorkspaceSettings(workspaceSettings);
-  }, [workspaceSettings, syncWorkspaceSettings]);
 
   useEffect(() => {
     const preference = normalizeGuiThemePreference(effectiveSettings['gui.colorTheme']);
@@ -317,65 +279,6 @@ const DeepCodeGuiApp: React.FC = () => {
   ]);
 
   useEffect(() => {
-    if (apiStatus !== 'connected') return;
-    let disconnect: (() => void) | null = null;
-    let cancelled = false;
-    const cancel = afterFirstPaint(() => {
-      void import('../services/heartbeatSocket').then((heartbeat) => {
-        if (cancelled) return;
-        heartbeat.connectHeartbeat();
-        disconnect = heartbeat.disconnectHeartbeat;
-      });
-    });
-    return () => {
-      cancelled = true;
-      cancel();
-      disconnect?.();
-    };
-  }, [apiStatus, connectedIncarnation]);
-
-  useEffect(() => {
-    if (apiStatus !== 'connected' || terminalPrewarm !== 'afterStartup') return;
-    const id = window.setTimeout(() => {
-      void warmupTerminalRuntime();
-    }, 1800);
-    return () => window.clearTimeout(id);
-  }, [apiStatus, connectedIncarnation, terminalPrewarm]);
-
-  useEffect(() => {
-    const autoSave = String(effectiveSettings['files.autoSave'] ?? 'off');
-    if (autoSave !== 'afterDelay' || !dirtySignature) return;
-    const delay = Number(effectiveSettings['files.autoSaveDelay'] ?? 1000);
-    const id = window.setTimeout(() => {
-      void useEditorStore.getState().saveAllDirtyFiles();
-    }, Number.isFinite(delay) ? Math.max(250, delay) : 1000);
-    return () => window.clearTimeout(id);
-  }, [dirtySignature, effectiveSettings]);
-
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      const ctrl = event.ctrlKey || event.metaKey;
-      if (!ctrl) return;
-      const key = event.key.toLowerCase();
-      if (key === 's') {
-        event.preventDefault();
-        if (event.shiftKey) {
-          void useEditorStore.getState().saveAllDirtyFiles();
-        } else {
-          void saveCurrentActiveFile();
-        }
-      }
-      if (key === 'w' && !isEditableTarget(event.target)) {
-        event.preventDefault();
-        const { activeTabId, closeTab } = useEditorStore.getState();
-        if (activeTabId) closeTab(activeTabId);
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [saveCurrentActiveFile]);
-
-  useEffect(() => {
     const close = () => {
       void closeAppWindow();
     };
@@ -384,18 +287,16 @@ const DeepCodeGuiApp: React.FC = () => {
   }, []);
 
   return (<>
-    <HostStartupDiagnostic status={apiStatus === 'connected' ? null : hostStartup} language={language} />
-    <Suspense fallback={<BootFallback language={language} />}>
+    <HostStartupDiagnostic status={apiStatus === 'connected' ? null : hostStartup} language={language} busy={kernelStartBusy} onRetry={() => void retryKernelStart()} />
+    <ConversationDisplayProvider><Suspense fallback={<BootFallback language={language} />}>
       <DeepCodeWorkbenchLayout
         apiStatus={apiStatus}
-        wsStatus={wsStatus}
         serverVersion={serverVersion}
-        lastHeartbeatAt={lastHeartbeatAt}
         kernelStartBusy={kernelStartBusy}
         kernelStartMessage={kernelStartMessage}
         onRetryKernelStart={retryKernelStart}
       />
-    </Suspense>
+    </Suspense></ConversationDisplayProvider>
   </>);
 };
 

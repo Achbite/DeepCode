@@ -64,17 +64,6 @@ pub(crate) async fn workspace_save_file(
     }
 }
 
-pub(crate) async fn workspace_patch_settings(
-    State(state): State<AppState>,
-    Json(body): Json<Value>,
-) -> Json<ApiResponse> {
-    let settings = body.get("settings").cloned().unwrap_or_else(|| json!({}));
-    match state.host_services.workspace.patch_settings(settings) {
-        Ok(settings) => ApiResponse::ok(json!({ "settings": settings })),
-        Err(error) => ApiResponse::error(error.code, error.message),
-    }
-}
-
 pub(crate) async fn fs_initial_locations(State(state): State<AppState>) -> Json<ApiResponse> {
     let mut locations = Vec::new();
     if let Some(home) = home_dir() {
@@ -111,28 +100,9 @@ pub(crate) async fn fs_initial_locations(State(state): State<AppState>) -> Json<
     }))
 }
 
-pub(crate) async fn fs_browse(
-    State(state): State<AppState>,
-    Query(query): Query<FileQuery>,
-) -> Json<ApiResponse> {
-    let service = &state.host_services.inspection;
-    match service.query(HostInspectionQuery::Browse { path: query.path }) {
-        Ok(HostInspectionResult {
-            output: HostInspectionOutput::Browse(output),
-            ..
-        }) => ApiResponse::ok(json!(output)),
-        Ok(_) => ApiResponse::error("unexpected_event", "expected browse host inspection result"),
-        Err(error) => ApiResponse::error(error.code, error.message),
-    }
-}
-
-pub(crate) async fn host_inspect(
-    State(state): State<AppState>,
-    Json(query): Json<HostInspectionQuery>,
-) -> Json<ApiResponse> {
-    let service = &state.host_services.inspection;
-    match service.query(query) {
-        Ok(result) => ApiResponse::ok(json!(result)),
+pub(crate) async fn fs_browse(Query(query): Query<FileQuery>) -> Json<ApiResponse> {
+    match crate::host_inspection::host_browse(query.path.as_deref()) {
+        Ok(output) => ApiResponse::ok(json!(output)),
         Err(error) => ApiResponse::error(error.code, error.message),
     }
 }

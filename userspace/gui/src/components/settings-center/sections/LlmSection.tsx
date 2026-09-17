@@ -1,3 +1,4 @@
+import { useSettingsSearchEntries } from '../settingsSearch';
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   DEEPSEEK_ANTHROPIC_BASE_URL,
@@ -395,6 +396,7 @@ const LlmSection: React.FC = () => {
   );
 
   const defaultValid = defaultOptions.some((profile) => profile.id === defaultProfileId);
+  useSettingsSearchEntries('llm-profiles', profiles.map((profile) => ({ id: `profile-${profile.id}`, title: profile.name || profile.model, keywords: [profile.model, profile.baseUrl, profile.kind].join(' '), category: 'llm' })));
   const showDefaultControl = savedProfiles.length > 0 || !!defaultProfileId
     || (storeRepairRequired && hasProfiles);
   const selectedDefault = (storeRepairRequired ? profiles : savedProfiles)
@@ -405,10 +407,6 @@ const LlmSection: React.FC = () => {
       <h2 className="settings-title">{t(language, 'settings.llm.title')}</h2>
 
       <div className="llm-settings__content">
-        <p className="settings-section-description">
-          {t(language, 'settings.llm.body')}
-        </p>
-
         {storeRepairRequired && (
           <div className="settings-recovery-notice" role="alert">
             {t(language, 'settings.llm.repairInvalidStore')}
@@ -449,7 +447,13 @@ const LlmSection: React.FC = () => {
           </button>
         </div>
 
-        {showDefaultControl && (
+        {showDefaultControl && !storeRepairRequired && (
+          <div className="llm-default-row">
+            <span>{language === 'zh-CN' ? '最近使用的模型' : 'Last used model'}</span>
+            <span>{selectedDefault?.name ?? (language === 'zh-CN' ? '尚未提交任务' : 'No task submitted yet')}</span>
+          </div>
+        )}
+        {showDefaultControl && storeRepairRequired && (
           <label className="llm-default-row">
             <span>{t(language, 'settings.llm.defaultProfile')}</span>
             <select
@@ -471,9 +475,9 @@ const LlmSection: React.FC = () => {
           </label>
         )}
 
-        {defaultOptions.length > 0 && (
+        {storeRepairRequired && defaultOptions.length > 0 && (
           <p className="llm-settings__default-hint">
-            {t(language, storeRepairRequired ? 'settings.llm.defaultRepairHint' : 'settings.llm.defaultHint')}
+            {t(language, 'settings.llm.defaultRepairHint')}
           </p>
         )}
         {defaultFeedback && (
@@ -500,6 +504,7 @@ const LlmSection: React.FC = () => {
             const feedback = profileFeedback[profile.id];
             return (
             <fieldset
+              id={`setting-profile-${profile.id}`} tabIndex={-1}
               className="llm-profile"
               key={profile.id}
               aria-label={profile.name || t(language, 'settings.llm.profileName')}
@@ -691,11 +696,6 @@ const LlmSection: React.FC = () => {
                   </select>
                 </label>
               </div>
-              {profile.thinking === 'enabled' && (
-                <div className="settings-card__hint">
-                  {t(language, 'settings.llm.thinkingHint')}
-                </div>
-              )}
               <div className="llm-profile__actions">
                 <button
                   className="settings-action-button"

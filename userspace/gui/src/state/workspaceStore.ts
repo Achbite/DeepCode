@@ -1,12 +1,4 @@
-/**
- * 工作区状态管理（Zustand store）
- *
- * 维护当前活动工作区与 fallback / lastError 状态。
- * 文件读写需要 folderId 时，组件应从此处选择 activeFolderId 后再调 apiClient。
- *
- * 注意：本 store 与 editorStore 解耦——editorStore 只负责"打开了哪些文件"，
- * 不知道 folderId 来自何处；调用 readFile/writeFile 前由组件层注入 folderId。
- */
+/** Current workspace metadata; Session owns workspace authority. */
 import { create } from 'zustand';
 import {
   getDefaultWorkspacePath,

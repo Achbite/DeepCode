@@ -20,7 +20,7 @@ const KERNEL_OWNED_SHUTDOWN_IO_WAIT: Duration =
 const KERNEL_OWNED_SHUTDOWN_EXIT_ATTEMPTS: usize = 200;
 
 use deepcode_host_connection::process::{
-    spawn_owned_host_process, terminate_owned_process_tree, OwnedHostProcess,
+    spawn_owned_host_process, terminate_owned_process_tree, wait_for_child_exit, OwnedHostProcess,
 };
 use deepcode_host_connection::{HostClientLease, HOST_LIFETIME_ENV};
 #[cfg(all(test, unix))]
@@ -567,167 +567,13 @@ fn find_kernel_binary() -> KernelClientResult<Option<PathBuf>> {
         )));
     }
 
-    let mut search_dirs = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            push_unique_path(&mut search_dirs, parent.to_path_buf());
-            if cfg!(target_os = "macos") {
-                if let Some(contents) = parent.parent() {
-                    push_unique_path(&mut search_dirs, contents.to_path_buf());
-                    push_unique_path(&mut search_dirs, contents.join("MacOS"));
-                    push_unique_path(&mut search_dirs, contents.join("Resources"));
-                }
-            }
-            add_target_profile_dirs(&mut search_dirs, parent);
-            add_packaged_kernel_dirs(&mut search_dirs, parent);
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        push_unique_path(&mut search_dirs, cwd.clone());
-        add_packaged_kernel_dirs(&mut search_dirs, &cwd);
-        add_target_profile_dirs(&mut search_dirs, &cwd);
-    }
-
-    for root in &search_dirs {
-        for candidate in kernel_binary_candidates(root) {
-            if candidate.is_file() {
-                return Ok(Some(candidate));
-            }
-        }
-    }
-
-    for root in search_dirs {
-        for ancestor in root.ancestors() {
-            for platform_dir in kernel_platform_dir_names() {
-                for profile in ["release", "debug"] {
-                    for name in kernel_binary_names() {
-                        let direct = ancestor
-                            .join("target")
-                            .join(platform_dir)
-                            .join(profile)
-                            .join(name);
-                        if direct.is_file() {
-                            return Ok(Some(direct));
-                        }
-                        let nested = ancestor
-                            .join("DeepCode")
-                            .join("target")
-                            .join(platform_dir)
-                            .join(profile)
-                            .join(name);
-                        if nested.is_file() {
-                            return Ok(Some(nested));
-                        }
-                    }
-                }
-            }
-            for platform_dir in kernel_platform_dir_names() {
-                for name in kernel_binary_names() {
-                    let direct = ancestor.join("bin").join(platform_dir).join(name);
-                    if direct.is_file() {
-                        return Ok(Some(direct));
-                    }
-                    let nested = ancestor
-                        .join("DeepCode")
-                        .join("bin")
-                        .join(platform_dir)
-                        .join(name);
-                    if nested.is_file() {
-                        return Ok(Some(nested));
-                    }
-                }
-            }
-            for profile in ["release", "debug"] {
-                for name in kernel_binary_names() {
-                    let direct = ancestor.join("target").join(profile).join(name);
-                    if direct.is_file() {
-                        return Ok(Some(direct));
-                    }
-                    let nested = ancestor
-                        .join("DeepCode")
-                        .join("target")
-                        .join(profile)
-                        .join(name);
-                    if nested.is_file() {
-                        return Ok(Some(nested));
-                    }
-                }
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if !paths.iter().any(|existing| existing == &path) {
-        paths.push(path);
-    }
-}
-
-fn add_packaged_kernel_dirs(paths: &mut Vec<PathBuf>, root: &Path) {
-    for ancestor in root.ancestors() {
-        for platform_dir in kernel_platform_dir_names() {
-            push_unique_path(paths, ancestor.join("bin").join(platform_dir));
-            push_unique_path(
-                paths,
-                ancestor.join("DeepCode").join("bin").join(platform_dir),
-            );
-        }
-    }
-}
-
-fn add_target_profile_dirs(paths: &mut Vec<PathBuf>, root: &Path) {
-    for ancestor in root.ancestors() {
-        for platform_dir in kernel_platform_dir_names() {
-            for profile in ["release", "debug"] {
-                push_unique_path(
-                    paths,
-                    ancestor.join("target").join(platform_dir).join(profile),
-                );
-                push_unique_path(
-                    paths,
-                    ancestor
-                        .join("DeepCode")
-                        .join("target")
-                        .join(platform_dir)
-                        .join(profile),
-                );
-            }
-        }
-    }
-}
-
-fn kernel_binary_candidates(root: &Path) -> Vec<PathBuf> {
-    kernel_binary_names()
-        .into_iter()
-        .map(|name| root.join(name))
-        .collect()
-}
-
-fn kernel_binary_names() -> Vec<&'static str> {
-    if cfg!(windows) {
-        vec!["deepcode-kernel-daemon.exe", "deepcode-kernel.exe"]
-    } else {
-        vec!["deepcode-kernel-daemon", "deepcode-kernel"]
-    }
-}
-
-fn kernel_platform_dir_names() -> Vec<&'static str> {
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        vec!["macos-arm64"]
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        vec!["macos-x64", "macos-arm64"]
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        vec!["linux-x64"]
-    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        vec!["linux-arm64", "linux-x64"]
-    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        vec!["windows-x64"]
-    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
-        vec!["windows-arm64", "windows-x64"]
-    } else {
-        Vec::new()
-    }
+    let executable = std::env::current_exe()
+        .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?;
+    let directory = executable.parent().ok_or_else(|| {
+        KernelClientError::Bootstrap("executable directory is unavailable".into())
+    })?;
+    let candidate = directory.join(format!("deepcode-kernel{}", std::env::consts::EXE_SUFFIX));
+    Ok(candidate.is_file().then_some(candidate))
 }
 
 fn spawn_kernel_binary(
@@ -754,6 +600,7 @@ fn spawn_kernel_binary(
     command
         .current_dir(&kernel_dir)
         .env("DEEPCODE_CONFIG_DIR", config_root)
+        .env("DEEPCODE_RUNTIME_DIR", std::env::var_os("DEEPCODE_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| kernel_dir.clone()))
         .env("DEEPCODE_HOST", host)
         .env("DEEPCODE_PORT", port)
         .env(HOST_SHELL_TOKEN_ENV, host_shell_token)
@@ -819,7 +666,7 @@ fn terminate_owned_kernel_process(process: &mut OwnedKernelProcess) {
         return;
     }
     if request_owned_kernel_graceful_shutdown(&process.shutdown_target)
-        && wait_for_kernel_exit(process, KERNEL_OWNED_SHUTDOWN_EXIT_ATTEMPTS)
+        && wait_for_child_exit(process, KERNEL_OWNED_SHUTDOWN_EXIT_ATTEMPTS)
     {
         let _ = process.child.wait();
         return;
@@ -879,17 +726,6 @@ fn request_owned_kernel_api<T: for<'de> Deserialize<'de>>(
         .position(|window| window == b"\r\n\r\n")?
         + 4;
     serde_json::from_slice(&response[body_offset..]).ok()
-}
-
-fn wait_for_kernel_exit(process: &mut OwnedKernelProcess, attempts: usize) -> bool {
-    for _ in 0..attempts {
-        match process.child.try_wait() {
-            Ok(Some(_)) => return true,
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(_) => return false,
-        }
-    }
-    false
 }
 
 struct KernelStartLock {

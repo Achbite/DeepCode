@@ -1,6 +1,6 @@
 use crate::invocation_types::{KernelCanonicalInvocation, KernelDeleteTarget, KernelToolKind};
 use crate::types::ToolValidationError;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -19,29 +19,6 @@ pub fn canonicalize_invocation(
     tool_id: KernelToolKind,
     arguments: Value,
 ) -> Result<KernelCanonicalInvocation, InvocationNormalizationError> {
-    use KernelToolKind as Tool;
-    let mut arguments = adapt_public_arguments(tool_id, arguments)?;
-    let fields = arguments
-        .as_object_mut()
-        .ok_or_else(|| invalid_arguments(tool_id.as_str()))?;
-    let mut materialize = |name: &str, value: Value| {
-        fields.entry(name.to_owned()).or_insert(value);
-    };
-    match tool_id {
-        Tool::FsRead => {
-            materialize("startLine", json!(1));
-            materialize("maxLines", json!(2_000));
-            materialize("maxBytes", json!(262_144));
-        }
-        Tool::ProcessShell | Tool::ProcessPowerShell => {
-            materialize("timeout", json!(120));
-            materialize("workspaceMode", json!("read"));
-            materialize("executionScope", json!("workspace"));
-        }
-        Tool::WebSearch => materialize("limit", json!(5)),
-        Tool::WebFetch => materialize("maxBytes", json!(98_304)),
-        _ => {}
-    }
     let mut invocation = serde_json::from_value::<KernelCanonicalInvocation>(json!({
         "toolId":tool_id,
         "arguments":arguments,
@@ -72,91 +49,6 @@ fn normalize_invocation(
     }
     invocation.validate()?;
     Ok(())
-}
-
-fn adapt_public_arguments(
-    tool_id: KernelToolKind,
-    mut arguments: Value,
-) -> Result<Value, InvocationNormalizationError> {
-    use KernelToolKind as Tool;
-    if tool_id == Tool::FsDelete {
-        return canonicalize_delete_arguments(&arguments);
-    }
-    let fields = arguments
-        .as_object_mut()
-        .ok_or_else(|| invalid_arguments(tool_id.as_str()))?;
-    match tool_id {
-        Tool::FsRead => {
-            ensure_allowed_fields(
-                fields,
-                &["path", "startLine", "startByte", "maxLines", "maxBytes"],
-                tool_id,
-            )?;
-        }
-        Tool::FsWrite => {
-            ensure_allowed_fields(fields, &["path", "content", "executable"], tool_id)?;
-        }
-        Tool::FsEdit => {
-            ensure_allowed_fields(fields, &["path", "edits"], tool_id)?;
-        }
-        Tool::ProcessShell | Tool::ProcessPowerShell => {
-            ensure_allowed_fields(
-                fields,
-                &[
-                    "command",
-                    "workspaceMode",
-                    "executionScope",
-                    "timeout",
-                    "terminal",
-                ],
-                tool_id,
-            )?;
-        }
-        Tool::WebSearch => {
-            ensure_allowed_fields(fields, &["query", "limit"], tool_id)?;
-        }
-        Tool::WebFetch => {
-            ensure_allowed_fields(fields, &["url", "maxBytes"], tool_id)?;
-        }
-        Tool::FsDelete => unreachable!("fs.delete is canonicalized before field adaptation"),
-    }
-    Ok(arguments)
-}
-
-fn ensure_allowed_fields(
-    fields: &Map<String, Value>,
-    allowed: &[&str],
-    tool_id: KernelToolKind,
-) -> Result<(), InvocationNormalizationError> {
-    if fields
-        .keys()
-        .any(|field| !allowed.contains(&field.as_str()))
-    {
-        return Err(invalid_arguments(tool_id.as_str()));
-    }
-    Ok(())
-}
-
-fn canonicalize_delete_arguments(arguments: &Value) -> Result<Value, InvocationNormalizationError> {
-    let tool_id = KernelToolKind::FsDelete.as_str();
-    let fields = arguments
-        .as_object()
-        .ok_or_else(|| invalid_arguments(tool_id))?;
-    let path = fields
-        .get("path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_arguments(tool_id))?;
-    let target_kind = fields
-        .get("targetKind")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_arguments(tool_id))?;
-    match target_kind {
-        "file" if fields.len() == 2 => Ok(json!({"kind":"file","data":{"path":path}})),
-        "directoryTree" if fields.len() == 2 => {
-            Ok(json!({"kind":"directoryTree","data":{"path":path}}))
-        }
-        _ => Err(invalid_arguments(tool_id)),
-    }
 }
 
 pub fn normalize_workspace_path(

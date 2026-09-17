@@ -1,8 +1,16 @@
+import GuiTypography from '../theme/GuiTypography';
+import PaletteOverrides from '../theme/PaletteOverrides';
+import { installPaletteDefaults } from '../theme/palette';
+import { installInterfaceUpdateMonitor } from '../services/interfaceUpdates';
+import { InterfaceUpdateNotice } from '../components/shared/InterfaceUpdateNotice';
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import DeepCodeGuiApp from './DeepCodeGuiApp';
 import { installNativeContextMenuGuard } from '../utils/nativeContextMenuGuard';
 import { activeT } from '../i18n';
+import { UiPluginsProvider } from '../ui-plugins/UiPlugins';
+
+const removePaletteDefaults = installPaletteDefaults();
 
 function formatBootstrapError(reason: unknown): string {
   if (reason instanceof Error) {
@@ -75,6 +83,9 @@ class ErrorBoundary extends React.Component<
             <h1>{activeT('deepcodeGui.bootstrap.renderFailedTitle')}</h1>
             <p>{activeT('deepcodeGui.bootstrap.renderFailedBody')}</p>
             <pre>{this.state.error.stack ?? this.state.error.message}</pre>
+            <button className="settings-button" type="button" onClick={() => window.location.reload()}>
+              {activeT('settings.common.reload')}
+            </button>
           </div>
         </div>
       );
@@ -98,13 +109,16 @@ document.documentElement.dataset.shell = isTauriShell ? 'tauri' : 'browser';
 
 installNativeContextMenuGuard();
 
+const stopUpdateMonitor = installInterfaceUpdateMonitor();
 const root = ReactDOM.createRoot(rootEl);
 let compositionDisposed = false;
 const disposeComposition = () => {
   if (compositionDisposed) return;
   compositionDisposed = true;
   window.removeEventListener('pagehide', handlePageHide);
+  stopUpdateMonitor();
   root.unmount();
+  removePaletteDefaults();
 };
 const handlePageHide = (event: PageTransitionEvent) => {
   if (!event.persisted) disposeComposition();
@@ -116,8 +130,11 @@ try {
   reactRootCreated = true;
   root.render(
     <React.StrictMode>
+      <InterfaceUpdateNotice />
       <ErrorBoundary>
-        <DeepCodeGuiApp />
+        <PaletteOverrides />
+        <GuiTypography />
+        <UiPluginsProvider><DeepCodeGuiApp /></UiPluginsProvider>
       </ErrorBoundary>
     </React.StrictMode>
   );

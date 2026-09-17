@@ -19,6 +19,8 @@ use std::time::Duration;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
+mod ui_plugins;
+
 #[derive(Clone)]
 struct AppState {
     daemon_base_url: String,
@@ -116,6 +118,14 @@ async fn main() {
         .route("/", get(gui_index))
         .route("/index.html", get(gui_index))
         .route("/api/host/identity", get(proxy_identity))
+        .route(
+            "/api/host/plugins/inspect",
+            axum::routing::post(ui_plugins::inspect),
+        )
+        .route(
+            "/api/host/ui-plugins/watch",
+            axum::routing::post(ui_plugins::watch),
+        )
         .route("/api/health", get(proxy_health))
         .route("/api/*path", any(proxy_api))
         .route("/assets/*asset_path", get(gui_asset));
@@ -218,7 +228,7 @@ fn trusted_cors_origin(origin: &HeaderValue) -> bool {
 fn trusted_desktop_origin(origin: &str) -> bool {
     if matches!(
         origin,
-        "deepcode-gui://localhost" | "deepcode-editor://localhost"
+        "deepcode-gui://localhost"
     ) {
         return true;
     }
@@ -228,7 +238,7 @@ fn trusted_desktop_origin(origin: &str) -> bool {
     let (host, port) = authority
         .split_once(':')
         .map_or((authority, None), |(host, port)| (host, Some(port)));
-    if !matches!(host, "deepcode-gui.localhost" | "deepcode-editor.localhost") {
+    if !matches!(host, "deepcode-gui.localhost") {
         return false;
     }
     port.is_none_or(|port| port.parse::<u16>().is_ok_and(|port| port > 0))
@@ -484,6 +494,7 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("DELETE", ["api", "conversation", "sessions", _, "directory-indexes", _])
         | ("GET", ["api", "conversation", "sessions", _, "projection"])
         | ("GET", ["api", "conversation", "sessions", _, "context-compositions", _])
+        | ("GET", ["api", "conversation", "sessions", _, "artifacts", _, "content"])
         | ("POST", ["api", "conversation", "sessions", _, "read"])
         | ("POST", ["api", "conversation", "sessions", _, "resources", "read"]) => true,
         _ => false,

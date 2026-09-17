@@ -86,18 +86,12 @@ impl KernelToolExecutor for WebSearchExecutor {
         invocation: KernelToolInvocation,
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        let query = get_string(&invocation.input, "query").unwrap_or_default();
-        if query.trim().is_empty() {
+        let KernelCanonicalInvocation::WebSearch { query, limit } = &invocation.input else {
             return Err(KernelError::InvalidCommand(
-                "web.search query is required".to_string(),
+                "web.search invocation required".into(),
             ));
-        }
-        let limit = invocation
-            .input
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(5)
-            .clamp(1, 10) as usize;
+        };
+        let limit = *limit as usize;
         run_archived_web_tool(&invocation, &context, |archive| {
             if let Some(config) = &self.config.cloud_web_search {
                 let key = self
@@ -154,7 +148,6 @@ impl KernelToolExecutor for WebSearchExecutor {
                 "query": query, "provider": provider, "results": results,
                 "untrustedEvidence": true, "sourceUrl": url, "finalUrl": response.final_url,
                 "retrievedAtMs": unix_millis(), "truncated": response.truncated,
-                "contentHash": deepcode_kernel_tools::hash_bytes(&response.bytes),
             }))
         })
     }
@@ -218,7 +211,7 @@ fn run_archived_web_tool(
     let mut archive = ExecutionArchive::open(
         context.output_directory.as_deref(),
         json!({
-            "attemptId": invocation.id, "toolId": invocation.tool_id, "input": invocation.input,
+            "attemptId": invocation.id, "toolId": invocation.input.tool_id(), "input": invocation.input.executor_arguments(),
         }),
     )
     .map_err(archive_error)?;
@@ -267,14 +260,13 @@ fn invoke_web_fetch(
     invocation: KernelToolInvocation,
     context: KernelToolExecutionContext,
 ) -> KernelResult<KernelToolExecutionResult> {
-    let url = get_string(&invocation.input, "url").unwrap_or_default();
+    let KernelCanonicalInvocation::WebFetch { url, max_bytes } = &invocation.input else {
+        return Err(KernelError::InvalidCommand(
+            "web.fetch invocation required".into(),
+        ));
+    };
     validate_http_url(&url)?;
-    let max_bytes = invocation
-        .input
-        .get("maxBytes")
-        .and_then(Value::as_u64)
-        .unwrap_or(96 * 1024)
-        .clamp(1024, 256 * 1024) as usize;
+    let max_bytes = *max_bytes as usize;
     run_archived_web_tool(&invocation, &context, |archive| {
         // HTML headers/scripts often exceed the requested excerpt size. Bound
         // the source separately, then spend maxBytes on extracted readable text.
@@ -293,7 +285,6 @@ fn invoke_web_fetch(
         )?;
         Ok(json!({
             "url": url, "content": page.content, "sizeBytes": page.content.len(),
-            "contentHash": deepcode_kernel_tools::hash_bytes(page.content.as_bytes()),
             "contentType": response.content_type, "contentFormat": page.format,
             "encoding": page.encoding, "finalUrl": response.final_url,
             "statusCode": response.status_code, "retrievedAtMs": unix_millis(),
@@ -593,6 +584,7 @@ pub(super) fn percent_encode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executors::tests::invocation;
 
     fn serve_http_response(headers: &str, body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
@@ -655,11 +647,11 @@ mod tests {
         let context = archived_test_context("gzip");
         let directory = context.output_directory.clone().unwrap();
         let result = invoke_web_fetch(
-            KernelToolInvocation {
-                id: "attempt:gzip".into(),
-                tool_id: "web.fetch".into(),
-                input: json!({"url":url, "maxBytes":1024}),
-            },
+            invocation(
+                "attempt:gzip",
+                "web.fetch",
+                json!({"url":url, "maxBytes":1024}),
+            ),
             context,
         )
         .unwrap();
@@ -689,11 +681,7 @@ mod tests {
         let (url, server) = serve_http_response("Content-Type: application/json", raw.clone());
         let context = archived_test_context("search-failure");
         let directory = context.output_directory.clone().unwrap();
-        let invocation = KernelToolInvocation {
-            id: "attempt:bad-search".into(),
-            tool_id: "web.search".into(),
-            input: json!({"query":"docs"}),
-        };
+        let invocation = invocation("attempt:bad-search", "web.search", json!({"query":"docs"}));
         let result = run_archived_web_tool(&invocation, &context, |archive| {
             cloud::invoke(
                 "docs",
@@ -752,11 +740,11 @@ mod tests {
     #[test]
     fn web_fetch_rejects_non_http_urls_at_the_shared_http_boundary() {
         let error = invoke_web_fetch(
-            KernelToolInvocation {
-                id: "invocation:fetch".to_string(),
-                tool_id: "web.fetch".to_string(),
-                input: json!({"url": "ftp://example.invalid/document"}),
-            },
+            invocation(
+                "invocation:fetch",
+                "web.fetch",
+                json!({"url": "ftp://example.invalid/document"}),
+            ),
             KernelToolExecutionContext {
                 output_directory: None,
                 workspace_root: None,

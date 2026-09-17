@@ -5,9 +5,7 @@ export type ConnectionStatus = 'checking' | 'connected' | 'disconnected' | 'erro
 
 export interface AppStatusState {
   apiStatus: ConnectionStatus;
-  wsStatus: ConnectionStatus;
   serverVersion?: string;
-  lastHeartbeatAt?: string;
   errorMessage?: string;
 }
 

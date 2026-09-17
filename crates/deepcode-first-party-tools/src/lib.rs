@@ -1,4 +1,5 @@
 mod arxiv;
+pub mod documents;
 mod github;
 mod pdf;
 
@@ -6,15 +7,10 @@ use reqwest::blocking::Client;
 use reqwest::header::{HeaderName, HeaderValue, USER_AGENT};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
-use std::io::{BufRead, Read, Write};
+use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_HTTP_ERROR_BYTES: usize = 8 * 1024;
-
-const GITHUB_MANIFEST: &str = include_str!("../manifests/github.json");
-const ARXIV_MANIFEST: &str = include_str!("../manifests/arxiv.json");
-const PDF_MANIFEST: &str = include_str!("../manifests/pdf.json");
 
 #[derive(Clone, Copy)]
 enum PluginKind {
@@ -33,14 +29,6 @@ impl PluginKind {
         }
     }
 
-    fn manifest(self) -> &'static str {
-        match self {
-            Self::Github => GITHUB_MANIFEST,
-            Self::Arxiv => ARXIV_MANIFEST,
-            Self::Pdf => PDF_MANIFEST,
-        }
-    }
-
     fn call(self, name: &str, arguments: &Value, metadata: Option<&Value>) -> ToolResult<Value> {
         match self {
             Self::Github => github::call(name, arguments),
@@ -51,9 +39,9 @@ impl PluginKind {
 }
 
 #[derive(Debug)]
-pub(crate) struct ToolError {
-    code: &'static str,
-    message: String,
+pub struct ToolError {
+    pub code: &'static str,
+    pub message: String,
 }
 
 impl ToolError {
@@ -69,119 +57,20 @@ pub(crate) type ToolResult<T> = Result<T, ToolError>;
 
 pub fn run_from_args(arguments: impl Iterator<Item = String>) -> Result<(), String> {
     let arguments = arguments.collect::<Vec<_>>();
-    if arguments.len() != 2 || arguments[0] != "--plugin" {
-        return Err("usage: deepcode-first-party-provider --plugin <github|arxiv|pdf>".to_string());
+    if arguments.len() != 3 || arguments[0] != "--plugin" || arguments[2] != "--call" {
+        return Err(
+            "usage: deepcode-first-party-provider --plugin <github|arxiv|pdf> --call".to_string(),
+        );
     }
     let plugin = PluginKind::parse(&arguments[1])?;
-    let manifest: Value = serde_json::from_str(plugin.manifest())
-        .map_err(|error| format!("invalid embedded plugin manifest: {error}"))?;
-    serve(plugin, &manifest)
-}
-
-fn serve(plugin: PluginKind, manifest: &Value) -> Result<(), String> {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut output = stdout.lock();
-    for line in stdin.lock().lines() {
-        let line = line.map_err(|error| format!("read MCP request: {error}"))?;
-        let request: Value =
-            serde_json::from_str(&line).map_err(|error| format!("decode MCP request: {error}"))?;
-        let Some(method) = request.get("method").and_then(Value::as_str) else {
-            continue;
-        };
-        if request.get("id").is_none() {
-            if method == "exit" {
-                break;
-            }
-            continue;
-        }
-        let id = request["id"].clone();
-        let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
-        let response = match method {
-            "initialize" => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": { "tools": {} },
-                    "serverInfo": {
-                        "name": manifest["displayName"],
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
-                }
-            }),
-            "tools/list" => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "tools": manifest_tools(manifest)? }
-            }),
-            "tools/call" => {
-                let name = params
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| "tools/call requires name".to_string())?;
-                let arguments = params
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                let result = match plugin.call(name, &arguments, params.get("_meta")) {
-                    Ok(value) => tool_success(value),
-                    Err(error) => tool_failure(error),
-                };
-                json!({ "jsonrpc": "2.0", "id": id, "result": result })
-            }
-            _ => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": -32601, "message": format!("method not found: {method}") }
-            }),
-        };
-        serde_json::to_writer(&mut output, &response)
-            .map_err(|error| format!("encode MCP response: {error}"))?;
-        output
-            .write_all(b"\n")
-            .and_then(|_| output.flush())
-            .map_err(|error| format!("write MCP response: {error}"))?;
-    }
-    Ok(())
-}
-
-fn manifest_tools(manifest: &Value) -> Result<Vec<Value>, String> {
-    manifest
-        .get("tools")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "plugin manifest requires tools".to_string())?
-        .iter()
-        .map(|tool| {
-            Ok(json!({
-                "name": tool.get("remoteName").and_then(Value::as_str)
-                    .ok_or_else(|| "plugin tool requires remoteName".to_string())?,
-                "description": tool.get("description").and_then(Value::as_str)
-                    .ok_or_else(|| "plugin tool requires description".to_string())?,
-                "inputSchema": tool.get("inputSchema").filter(|value| value.is_object())
-                    .ok_or_else(|| "plugin tool requires inputSchema".to_string())?,
-            }))
-        })
-        .collect()
-}
-
-fn tool_success(value: Value) -> Value {
-    let text = serde_json::to_string(&value).expect("JSON value serialization cannot fail");
-    json!({
-        "content": [{ "type": "text", "text": text }],
-        "structuredContent": value,
-        "isError": false
-    })
-}
-
-fn tool_failure(error: ToolError) -> Value {
-    let failure = json!({ "error": { "code": error.code, "message": error.message } });
-    let text = serde_json::to_string(&failure).expect("JSON value serialization cannot fail");
-    json!({
-        "content": [{ "type": "text", "text": text }],
-        "structuredContent": failure,
-        "isError": true
-    })
+    let request: Value = serde_json::from_reader(std::io::stdin().take(4 * 1024 * 1024))
+        .map_err(|error| format!("decode CLI input: {error}"))?;
+    let name = request["name"].as_str().ok_or("CLI input requires name")?;
+    let output = match plugin.call(name, &request["arguments"], request.get("context")) {
+        Ok(value) => value,
+        Err(error) => json!({"error":{"code":error.code,"message":error.message}}),
+    };
+    serde_json::to_writer(std::io::stdout(), &output).map_err(|error| error.to_string())
 }
 
 pub(crate) fn input_object<'a>(

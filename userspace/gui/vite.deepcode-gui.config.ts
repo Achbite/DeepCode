@@ -1,6 +1,6 @@
 import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
-import { monacoHostWorkers } from './vite.monaco';
+import { pdfDocumentAssets } from './vite.pdf';
 
 function deepcodeGuiDevelopmentEntry(): Plugin {
   return {
@@ -45,7 +45,7 @@ export default defineConfig(({ command }) => {
     },
   };
   return {
-    plugins: [deepcodeGuiDevelopmentEntry(), react(), monacoHostWorkers()],
+    plugins: [deepcodeGuiDevelopmentEntry(), react(), pdfDocumentAssets()],
     base: './',
     build: {
       outDir: 'dist-deepcode-gui',
@@ -57,9 +57,8 @@ export default defineConfig(({ command }) => {
         },
         output: {
           manualChunks(id: string) {
-            if (id.includes('monaco-editor') || id.includes('@monaco-editor')) {
-              return 'monaco';
-            }
+            if (id.endsWith('/pdfjs-dist/legacy/build/pdf.mjs')) return 'pdf-core';
+            if (id.endsWith('/pdfjs-dist/legacy/web/pdf_viewer.mjs')) return 'pdf-viewer';
             if (
               id.includes('react-markdown') ||
               id.includes('remark-') ||
@@ -77,7 +76,7 @@ export default defineConfig(({ command }) => {
       },
     },
     server: {
-      host: '127.0.0.1',
+      host: process.env.DEEPCODE_GUI_BIND_HOST ?? '127.0.0.1',
       port: devPort,
       strictPort: true,
       proxy: {
