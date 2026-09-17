@@ -1,18 +1,13 @@
 export type UserSettingValue = string | number | boolean | null;
 export type UserSettings = Record<string, UserSettingValue>;
-export type SettingsSurface = 'editor' | 'gui' | 'cli' | 'tui';
+export type SettingsSurface = 'gui' | 'cli' | 'tui';
 
 export type SettingCatalogDomain =
   | 'agent'
   | 'skills'
   | 'mcp'
   | 'plugins'
-  | 'editor'
   | 'workbench'
-  | 'files'
-  | 'keyboard'
-  | 'explorer'
-  | 'terminal'
   | 'gui'
   | 'cli'
   | 'tui';
@@ -25,20 +20,6 @@ export interface SettingCatalogEntry {
 }
 
 export const DEFAULT_USER_SETTINGS: UserSettings = {
-  'editor.tabSize': 4,
-  'editor.insertSpaces': true,
-  'editor.wordWrap': 'off',
-  'editor.fontSize': 14,
-  'editor.fontFamily': "Consolas, 'Courier New', monospace",
-  'editor.renderWhitespace': 'none',
-  'files.autoSave': 'afterDelay',
-  'files.autoSaveDelay': 1000,
-  'files.hotExit': true,
-  'files.encoding': 'utf8',
-  'files.eol': '\n',
-  'keyboard.enableBasicShortcuts': true,
-  'explorer.confirmDelete': false,
-  'workbench.colorTheme': 'vs-dark',
   'workbench.language': 'zh-CN',
   'workbench.styleTokenOverrides': '{}',
   'workbench.uiPlugins': '[]',
@@ -52,9 +33,6 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'gui.showReasoning': false,
   'gui.defaultFileOpen': 'reader',
   'gui.sidebarOrder': '{"projects":[],"sessions":[]}',
-  'terminal.integrated.defaultProfile.windows': 'wsl',
-  'terminal.integrated.prewarm': 'afterStartup',
-  'terminal.integrated.spawnTimeoutMs': 8000,
   'agent.systemPrompt': '',
   'agent.responseLanguage': 'auto',
   'agent.windows.shell': 'auto',
@@ -125,21 +103,21 @@ function domainForKey(key: string): SettingCatalogDomain {
 
 function isDomain(value: string): value is SettingCatalogDomain {
   return [
-    'agent', 'skills', 'mcp', 'plugins', 'editor', 'workbench', 'files', 'keyboard',
-    'explorer', 'terminal', 'gui', 'cli', 'tui',
+    'agent', 'skills', 'mcp', 'plugins', 'workbench',
+    'gui', 'cli', 'tui',
   ].includes(value);
 }
 
 function surfacesForKey(key: string): SettingsSurface[] {
-  if (key === 'workbench.uiPlugins') return ['editor', 'gui'];
+  if (key === 'workbench.uiPlugins') return ['gui'];
   const domain = domainForKey(key);
   if (NON_SHELL_SETTING_PREFIXES.some((prefix) => key.startsWith(prefix))) {
-    return ['editor', 'gui', 'cli', 'tui'];
+    return ['gui', 'cli', 'tui'];
   }
   if (domain === 'gui') return ['gui'];
   if (domain === 'cli') return ['cli'];
   if (domain === 'tui') return ['tui'];
-  return ['editor'];
+  return ['gui'];
 }
 
 export interface GetUserSettingsResult {

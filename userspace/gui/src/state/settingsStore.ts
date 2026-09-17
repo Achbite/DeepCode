@@ -1,5 +1,4 @@
 import { create } from 'zustand';
-import { useMemo } from 'react';
 import {
   DEFAULT_USER_SETTINGS,
   agentSettingsIndex,
@@ -54,15 +53,7 @@ type SettingDefinitionSchema = Omit<
   options?: string[];
 };
 
-export interface EditorEffectiveOptions {
-  tabSize: number;
-  insertSpaces: boolean;
-  wordWrap: string;
-  fontSize: number;
-  fontFamily: string;
-  renderWhitespace: string;
-  theme: string;
-}
+
 
 interface SettingsStateData {
   environment: Record<string, unknown> | null;
@@ -108,15 +99,6 @@ const SETTING_DEFINITION_SCHEMAS: SettingDefinitionSchema[] = [
     ],
   },
   {
-    key: 'workbench.colorTheme',
-    group: 'workbench',
-    control: 'select',
-    options: [
-      'vs-dark',
-      'vs-light',
-    ],
-  },
-  {
     key: 'workbench.styleTokenOverrides',
     group: 'workbench',
     control: 'text',
@@ -154,102 +136,6 @@ const SETTING_DEFINITION_SCHEMAS: SettingDefinitionSchema[] = [
     key: 'gui.showContextRail',
     group: 'gui',
     control: 'boolean',
-  },
-  {
-    key: 'editor.tabSize',
-    group: 'editor',
-    control: 'number',
-  },
-  {
-    key: 'editor.insertSpaces',
-    group: 'editor',
-    control: 'boolean',
-  },
-  {
-    key: 'editor.wordWrap',
-    group: 'editor',
-    control: 'select',
-    options: [
-      'off',
-      'on',
-      'wordWrapColumn',
-      'bounded',
-    ],
-  },
-  {
-    key: 'editor.fontSize',
-    group: 'editor',
-    control: 'number',
-  },
-  {
-    key: 'editor.fontFamily',
-    group: 'editor',
-    control: 'text',
-  },
-  {
-    key: 'editor.renderWhitespace',
-    group: 'editor',
-    control: 'select',
-    options: [
-      'none',
-      'boundary',
-      'selection',
-      'trailing',
-      'all',
-    ],
-  },
-  {
-    key: 'files.autoSave',
-    group: 'files',
-    control: 'select',
-    options: [
-      'off',
-      'afterDelay',
-    ],
-  },
-  {
-    key: 'files.autoSaveDelay',
-    group: 'files',
-    control: 'number',
-  },
-  {
-    key: 'files.hotExit',
-    group: 'files',
-    control: 'boolean',
-  },
-  {
-    key: 'keyboard.enableBasicShortcuts',
-    group: 'keyboard',
-    control: 'boolean',
-  },
-  {
-    key: 'explorer.confirmDelete',
-    group: 'explorer',
-    control: 'boolean',
-  },
-  {
-    key: 'terminal.integrated.defaultProfile.windows',
-    group: 'terminal',
-    control: 'select',
-    options: [
-      'wsl',
-      'powershell',
-      'cmd',
-    ],
-  },
-  {
-    key: 'terminal.integrated.prewarm',
-    group: 'terminal',
-    control: 'select',
-    options: [
-      'afterStartup',
-      'off',
-    ],
-  },
-  {
-    key: 'terminal.integrated.spawnTimeoutMs',
-    group: 'terminal',
-    control: 'number',
   },
   { key: 'agent.windows.shell', group: 'agent', control: 'select', options: ['auto', 'powershell7', 'windowsPowerShell', 'gitBash'] },
   { key: 'agent.windows.gitBashPath', group: 'agent', control: 'text' },
@@ -640,43 +526,3 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
     getSettingSource: (key) => get().sources[key] ?? 'default',
   };
 });
-
-export function useEditorOptions(): EditorEffectiveOptions {
-  const tabSize = useSettingsStore((s) =>
-    Number(s.effectiveSettings['editor.tabSize'] ?? 4)
-  );
-  const insertSpaces = useSettingsStore((s) =>
-    Boolean(s.effectiveSettings['editor.insertSpaces'] ?? true)
-  );
-  const wordWrap = useSettingsStore((s) =>
-    String(s.effectiveSettings['editor.wordWrap'] ?? 'off')
-  );
-  const fontSize = useSettingsStore((s) =>
-    Number(s.effectiveSettings['editor.fontSize'] ?? 14)
-  );
-  const fontFamily = useSettingsStore((s) =>
-    String(
-      s.effectiveSettings['editor.fontFamily'] ??
-        "Consolas, 'Courier New', monospace"
-    )
-  );
-  const renderWhitespace = useSettingsStore((s) =>
-    String(s.effectiveSettings['editor.renderWhitespace'] ?? 'none')
-  );
-  const theme = useSettingsStore((s) =>
-    String(s.effectiveSettings['workbench.colorTheme'] ?? 'vs-dark')
-  );
-
-  return useMemo(
-    () => ({
-      tabSize,
-      insertSpaces,
-      wordWrap,
-      fontSize,
-      fontFamily,
-      renderWhitespace,
-      theme,
-    }),
-    [tabSize, insertSpaces, wordWrap, fontSize, fontFamily, renderWhitespace, theme]
-  );
-}

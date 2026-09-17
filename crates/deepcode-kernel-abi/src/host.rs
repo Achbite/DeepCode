@@ -199,184 +199,11 @@ pub struct HostSkillCatalogResult {
     pub skills: Vec<HostSkillDescriptor>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-pub enum HostInspectionQuery {
-    Browse {
-        path: Option<String>,
-    },
-    List {
-        folder_id: Option<String>,
-        path: String,
-        depth: u32,
-    },
-    Read {
-        folder_id: Option<String>,
-        path: String,
-    },
-    Grep {
-        folder_id: Option<String>,
-        query: String,
-        path: String,
-        include: Vec<String>,
-        exclude: Vec<String>,
-        strategy: String,
-        context_lines: u32,
-        max_results: u32,
-    },
-    GitStatus,
-    GitDiff {
-        path: Option<String>,
-        staged: bool,
-    },
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum HostInspectionQueryKind {
-    Browse,
-    List,
-    Read,
-    Grep,
-    GitStatus,
-    GitDiff,
-}
-
-impl HostInspectionQuery {
-    pub const fn kind(&self) -> HostInspectionQueryKind {
-        match self {
-            Self::Browse { .. } => HostInspectionQueryKind::Browse,
-            Self::List { .. } => HostInspectionQueryKind::List,
-            Self::Read { .. } => HostInspectionQueryKind::Read,
-            Self::Grep { .. } => HostInspectionQueryKind::Grep,
-            Self::GitStatus => HostInspectionQueryKind::GitStatus,
-            Self::GitDiff { .. } => HostInspectionQueryKind::GitDiff,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum HostFileTreeNodeKind {
+pub enum HostBrowseEntryKind {
     File,
     Directory,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostFileClassification {
-    pub kind: String,
-    pub readable_text: bool,
-    pub binary: bool,
-    pub executable: bool,
-    pub size_bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extension: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub magic: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostSearchContextLine {
-    pub line: usize,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostSearchMatch {
-    pub path: String,
-    pub line: usize,
-    pub preview: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub before: Vec<HostSearchContextLine>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub after: Vec<HostSearchContextLine>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostFileTreeNode {
-    pub name: String,
-    pub path: String,
-    #[serde(rename = "type")]
-    pub kind: HostFileTreeNodeKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub children: Option<Vec<HostFileTreeNode>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_classification: Option<HostFileClassification>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostFileReadResult {
-    pub folder_id: String,
-    pub path: String,
-    pub content: String,
-    pub size_bytes: usize,
-    pub file_size_bytes: usize,
-    pub start_line: usize,
-    pub end_line: usize,
-    pub content_hash: String,
-    pub binary: bool,
-    pub file_classification: HostFileClassification,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostGrepResult {
-    pub folder_id: String,
-    pub query: String,
-    pub path: String,
-    pub strategy: String,
-    pub include: Vec<String>,
-    pub exclude: Vec<String>,
-    pub context_lines: usize,
-    pub max_results: usize,
-    pub returned_matches: usize,
-    pub truncated: bool,
-    pub visited_files: usize,
-    pub skipped_files: usize,
-    pub skipped_binary_files: usize,
-    pub skipped_executable_files: usize,
-    pub matches: Vec<HostSearchMatch>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostGitChange {
-    pub path: String,
-    pub index: String,
-    pub worktree: String,
-    pub group: String,
-    pub raw: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostGitStatusResult {
-    pub root: String,
-    pub changes: Vec<HostGitChange>,
-    pub raw: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostGitDiffResult {
-    pub root: String,
-    pub staged: bool,
-    pub path: Option<String>,
-    pub diff: String,
-    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -385,7 +212,7 @@ pub struct HostBrowseEntry {
     pub name: String,
     pub absolute_path: String,
     #[serde(rename = "type")]
-    pub kind: HostFileTreeNodeKind,
+    pub kind: HostBrowseEntryKind,
     pub is_code_workspace: bool,
     pub hidden: bool,
 }
@@ -396,22 +223,4 @@ pub struct HostBrowseResult {
     pub absolute_path: String,
     pub parent_path: Option<String>,
     pub entries: Vec<HostBrowseEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "data", rename_all = "camelCase")]
-pub enum HostInspectionOutput {
-    Browse(HostBrowseResult),
-    List(Vec<HostFileTreeNode>),
-    Read(HostFileReadResult),
-    Grep(HostGrepResult),
-    GitStatus(HostGitStatusResult),
-    GitDiff(HostGitDiffResult),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostInspectionResult {
-    pub source: HostResultSource,
-    pub output: HostInspectionOutput,
 }

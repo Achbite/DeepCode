@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Assemble runtime resources and publish owned program files, preserving user data."""
+import argparse
+import json
+import os
+from pathlib import Path
+import plistlib
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import zipfile
+
+
+def copy_js_package(source, target):
+    target.mkdir(parents=True)
+    package = json.loads((source / 'package.json').read_text())
+    runtime = {key: package[key] for key in ('name', 'version', 'license', 'type', 'main')}
+    runtime['exports'] = {'.': './dist/index.js'}
+    (target / 'package.json').write_text(json.dumps(runtime, indent=2) + '\n')
+    for file in (source / 'dist').rglob('*.js'):
+        destination = target / file.relative_to(source)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(file, destination)
+
+
+def shared(root, destination, dependency_list):
+    copy_js_package(root / 'userspace/session-core', destination / 'session-core')
+    copy_js_package(root / 'userspace/protocol', destination / 'node_modules/@deepcode/protocol')
+    shutil.copytree(root / 'userspace/gui/dist-deepcode-gui', destination / 'web-deepcode-gui')
+    shutil.copy2(root / 'LICENSE', destination / 'LICENSE')
+    dependencies = {}
+
+    def collect(items):
+        for item in items.values():
+            if 'path' in item and 'version' in item:
+                path = Path(item['path']).resolve()
+                if (path / 'package.json').is_file():
+                    dependencies[path] = json.loads((path / 'package.json').read_text())
+            collect(item.get('dependencies', {}))
+
+    for project in json.loads(dependency_list.read_text()):
+        collect(project.get('dependencies', {}))
+    notices = []
+    for path, package in sorted(dependencies.items()):
+        label = package['name'].replace('/', '_') + '@' + package['version']
+        licenses = [file for file in path.iterdir() if file.is_file() and file.name.lower().startswith(('license', 'licence', 'copying', 'notice'))]
+        for file in licenses:
+            target = destination / 'licenses' / label / file.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file, target)
+        notices.append({key: package[key] for key in ('name', 'version', 'license', 'homepage') if key in package})
+    (destination / 'THIRD-PARTY.json').write_text(json.dumps(notices, ensure_ascii=False, indent=2) + '\n')
+
+
+def assemble(args):
+    root, stage = args.root, args.stage
+    version = json.loads((root / 'package.json').read_text())['version']
+    macos = args.platform == 'macos-arm64'
+    windows = args.platform == 'win64'
+    app = stage / 'DeepCode-GUI.app'
+    binaries = app / 'Contents/MacOS' if macos else stage
+    resources = app / 'Contents/Resources' if macos else stage
+    binaries.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(args.shared, resources, dirs_exist_ok=True)
+    suffix = '.exe' if windows else ''
+    names = {'deepcode-kernel-daemon': 'deepcode-kernel', 'deepcode-first-party-provider': 'deepcode-first-party-provider', 'deepcode-host-web': 'deepcode-host-web', 'deepcode-cli': 'deepcode-cli', 'deepcode-tui': 'deepcode-tui', 'DeepCode-GUI': 'DeepCode-GUI'}
+    for source, target in names.items():
+        destination = binaries / (target + suffix)
+        shutil.copy2(args.native / (source + suffix), destination)
+        if macos:
+            subprocess.run(['strip', '-x', str(destination)], check=True)
+        else:
+            subprocess.run(['x86_64-w64-mingw32-strip' if windows else 'strip', '--strip-unneeded', str(destination)], check=True)
+    node = resources / 'node/bin' / ('node.exe' if windows else 'node')
+    node.parent.mkdir(parents=True)
+    shutil.copy2(args.node, node)
+    shutil.copy2(args.node_license, node.parent.parent / 'LICENSE')
+    if args.platform.startswith('linux-'):
+        shutil.copy2(shutil.which('bwrap'), binaries / 'bwrap')
+    if windows:
+        shutil.copy2(args.webview_loader, binaries / 'WebView2Loader.dll')
+        for shell in ('cli', 'tui'):
+            launcher = stage / f'deepcode-{shell}.bat'
+            launcher.write_text('@echo off\nsetlocal\nset "DEEPCODE_RUNTIME_DIR=%~dp0"\nset "DEEPCODE_KERNEL_BIN=%~dp0deepcode-kernel.exe"\n"%~dp0deepcode-' + shell + '.exe" %*\nexit /b %errorlevel%\n')
+    if macos:
+        info = {'CFBundleDevelopmentRegion': 'en', 'CFBundleDisplayName': 'DeepCode-GUI', 'CFBundleExecutable': 'DeepCode-GUI', 'CFBundleIdentifier': 'com.achbite.deepcode.gui', 'CFBundleInfoDictionaryVersion': '6.0', 'CFBundleName': 'DeepCode-GUI', 'CFBundlePackageType': 'APPL', 'CFBundleShortVersionString': version, 'CFBundleVersion': version, 'LSMinimumSystemVersion': '12.0', 'NSHighResolutionCapable': True, 'NSPrincipalClass': 'NSApplication'}
+        (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
+        for shell in ('CLI', 'TUI'):
+            launcher = stage / f'DeepCode-{shell}.command'
+            launcher.write_text('''#!/usr/bin/env bash
+set -euo pipefail
+PACKAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+APP_DIR="$PACKAGE_DIR/DeepCode-GUI.app/Contents"
+export DEEPCODE_CONFIG_DIR="${DEEPCODE_CONFIG_DIR:-$PACKAGE_DIR}"
+export DEEPCODE_RUNTIME_DIR="$APP_DIR/Resources"
+export DEEPCODE_KERNEL_BIN="$APP_DIR/MacOS/deepcode-kernel"
+exec "$APP_DIR/MacOS/deepcode-''' + shell.lower() + '''" "$@"
+''')
+            launcher.chmod(0o755)
+        subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(app)], check=True)
+        subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
+    metadata = {'version': version, 'platform': args.platform, 'sourceCommit': os.environ.get('DEEPCODE_BUILD_COMMIT', 'unknown'), 'builtAt': os.environ['DEEPCODE_BUILD_TIME']}
+    (stage / 'BUILDINFO.json').write_text(json.dumps(metadata, indent=2) + '\n')
+    shutil.copy2(root / 'docs/distribution.md', stage / 'README.md')
+
+
+# Only program entries belong to the publisher. config/runtime/logs/sessions and
+# other user-created entries are never copied, removed or put into the archive.
+PROGRAM_ENTRIES = {
+    'DeepCode.app', 'DeepCode-GUI.app', 'DeepCode', 'DeepCode.exe', 'DeepCode-GUI', 'DeepCode-GUI.exe',
+    'DeepCode-CLI.command', 'DeepCode-TUI.command', 'deepcode', 'libexec',
+    'deepcode-cli.bat', 'deepcode-tui.bat', 'deepcode.cmd',
+    'deepcode-kernel', 'deepcode-kernel.exe', 'deepcode-first-party-provider', 'deepcode-first-party-provider.exe',
+    'deepcode-host-web', 'deepcode-host-web.exe', 'deepcode-cli', 'deepcode-cli.exe', 'deepcode-tui', 'deepcode-tui.exe',
+    'node', 'node_modules', 'session-core', 'web', 'web-deepcode-gui', 'bwrap', 'WebView2Loader.dll',
+    'BUILDINFO.json', 'build-info.json', 'build-info.txt', 'README.md', 'README.txt', 'LICENSE', 'licenses', 'THIRD-PARTY.json',
+}
+
+
+def publish(stage, destination, archive):
+    destination.mkdir(parents=True, exist_ok=True)
+    # Windows locks mapped images. Detect this before replacing any entries.
+    if destination.name == 'win64':
+        for file in [*destination.glob('*.exe'), *destination.glob('*.dll'), destination / 'node/bin/node.exe']:
+            if file.is_file():
+                with file.open('r+b'):
+                    pass
+    temporary = Path(tempfile.mkdtemp(prefix='.publish-', dir=destination.parent))
+    previous = temporary / 'previous'
+    previous.mkdir()
+    published = False
+    try:
+        packaged = temporary / archive.name
+        if archive.suffix == '.zip':
+            with zipfile.ZipFile(packaged, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as output:
+                for file in sorted(stage.rglob('*')):
+                    if file.is_file():
+                        output.write(file, str(Path(destination.name) / file.relative_to(stage)))
+        else:
+            with tarfile.open(packaged, 'w:gz', compresslevel=6) as output:
+                output.add(stage, arcname=destination.name)
+        moved, installed = [], []
+        try:
+            for name in sorted(PROGRAM_ENTRIES | {entry.name for entry in stage.iterdir()}):
+                target = destination / name
+                if target.exists() or target.is_symlink():
+                    target.rename(previous / name)
+                    moved.append(name)
+            for entry in stage.iterdir():
+                entry.rename(destination / entry.name)
+                installed.append(entry.name)
+            packaged.replace(archive)
+            published = True
+        except BaseException:
+            for name in reversed(installed):
+                (destination / name).rename(stage / name)
+            for name in reversed(moved):
+                (previous / name).rename(destination / name)
+            raise
+    finally:
+        if published or not any(previous.iterdir()):
+            shutil.rmtree(temporary)
+        else:
+            print(f'Original program files retained at {previous}', file=sys.stderr)
+    print(f'Published {destination}\nArchive {archive} ({archive.stat().st_size:,} bytes)')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='action', required=True)
+    common = sub.add_parser('shared')
+    common.add_argument('root', type=Path)
+    common.add_argument('destination', type=Path)
+    common.add_argument('dependency_list', type=Path)
+    assembly = sub.add_parser('assemble')
+    for name in ('root', 'stage', 'shared', 'native', 'node', 'node-license'):
+        assembly.add_argument('--' + name, type=Path, required=True)
+    assembly.add_argument('--platform', required=True)
+    assembly.add_argument('--webview-loader', type=Path)
+    publication = sub.add_parser('publish')
+    for name in ('stage', 'destination', 'archive'):
+        publication.add_argument(name, type=Path)
+    args = parser.parse_args()
+    if args.action == 'shared':
+        shared(args.root, args.destination, args.dependency_list)
+    elif args.action == 'assemble':
+        assemble(args)
+    else:
+        publish(args.stage, args.destination, args.archive)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -600,76 +600,25 @@ fn decode_response(
 }
 
 fn resolve_bridge() -> Result<PathBuf, SessionServiceError> {
-    if let Some(path) = environment_file("DEEPCODE_SESSION_BRIDGE")? {
-        return Ok(path);
-    }
-    let executable = std::env::current_exe().map_err(|error| {
-        SessionServiceError::new(
-            "session_service_asset_root_unavailable",
-            format!("无法定位 Daemon 可执行文件：{error}"),
-        )
-    })?;
-    executable
-        .parent()
-        .into_iter()
-        .flat_map(Path::ancestors)
-        .flat_map(|ancestor| {
-            [
-                ancestor.join("session-core/dist/sessionServiceBridge.js"),
-                ancestor.join("userspace/session-core/dist/sessionServiceBridge.js"),
-            ]
-        })
-        .find(|candidate| candidate.is_file())
-        .ok_or_else(|| {
-            SessionServiceError::new(
-                "session_service_bridge_unavailable",
-                "未找到构建后的 sessionServiceBridge.js。",
-            )
-        })
+    runtime_file("DEEPCODE_SESSION_BRIDGE", "session-core/dist/sessionServiceBridge.js")
 }
 
 fn resolve_node() -> Result<PathBuf, SessionServiceError> {
-    if let Some(path) = environment_file("DEEPCODE_NODE")? {
+    runtime_file("DEEPCODE_NODE", if cfg!(windows) { "node/bin/node.exe" } else { "node/bin/node" })
+}
+
+fn runtime_file(environment: &str, relative: &str) -> Result<PathBuf, SessionServiceError> {
+    if let Some(path) = environment_file(environment)? {
         return Ok(path);
     }
-    let executable = std::env::current_exe().map_err(|error| {
-        SessionServiceError::new(
-            "session_service_asset_root_unavailable",
-            format!("无法定位 Daemon 可执行文件：{error}"),
-        )
+    let root = std::env::var_os("DEEPCODE_RUNTIME_DIR").ok_or_else(|| {
+        SessionServiceError::new("session_service_asset_root_unavailable", "Host 未设置 DEEPCODE_RUNTIME_DIR。")
     })?;
-    let executable_name = if cfg!(windows) { "node.exe" } else { "node" };
-    let mut candidates = executable
-        .parent()
-        .into_iter()
-        .flat_map(Path::ancestors)
-        .flat_map(|ancestor| {
-            [
-                ancestor.join("node/bin").join(executable_name),
-                ancestor.join("bin").join(executable_name),
-            ]
-        })
-        .collect::<Vec<_>>();
-    if !cfg!(windows) {
-        candidates.extend(
-            [
-                "/opt/homebrew/bin/node",
-                "/usr/local/bin/node",
-                "/usr/bin/node",
-            ]
-            .into_iter()
-            .map(PathBuf::from),
-        );
+    let path = PathBuf::from(root).join(relative);
+    if !path.is_file() {
+        return Err(SessionServiceError::new("session_service_asset_missing", format!("运行资源不存在：{}", path.display())));
     }
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .ok_or_else(|| {
-            SessionServiceError::new(
-                "session_service_node_unavailable",
-                "未找到 Node 20+ runtime。",
-            )
-        })
+    Ok(path)
 }
 
 fn environment_file(name: &str) -> Result<Option<PathBuf>, SessionServiceError> {

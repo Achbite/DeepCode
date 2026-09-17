@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+[ -f /.dockerenv ] || { printf "Use make dev-deepcode-gui from the host.\n" >&2; exit 1; }
 HOST="${DEEPCODE_HOST:-127.0.0.1}"
 GUI_PORT="${DEEPCODE_GUI_DEV_PORT:-5174}"
 HOST_PORT="${DEEPCODE_HOST_PORT:-31245}"
@@ -30,7 +31,7 @@ valid_port() {
 }
 
 port_is_free() {
-  ! /usr/bin/nc -z "$HOST" "$1" >/dev/null 2>&1
+  ! nc -z "$HOST" "$1" >/dev/null 2>&1
 }
 
 stop_owned_process() {
@@ -76,7 +77,7 @@ wait_for_health() {
       tail -n 40 "$log_path" >&2 || true
       return 1
     }
-    if /usr/bin/curl --silent --show-error --fail \
+    if curl --silent --show-error --fail \
       --header "$header_name: $header_value" \
       "$url" >/dev/null 2>&1; then
       return 0
@@ -134,8 +135,9 @@ if [ "${DEEPCODE_DEV_SKIP_BUILD:-0}" != "1" ]; then
   cargo build -p deepcode-first-party-tools -p deepcode-kernel-daemon -p deepcode-host-web
 fi
 
-DAEMON_BIN="$ROOT_DIR/target/debug/deepcode-kernel-daemon"
-HOST_BIN="$ROOT_DIR/target/debug/deepcode-host-web"
+NATIVE="${CARGO_TARGET_DIR:-$ROOT_DIR/target}/debug"
+DAEMON_BIN="$NATIVE/deepcode-kernel-daemon"
+HOST_BIN="$NATIVE/deepcode-host-web"
 SESSION_BRIDGE="$ROOT_DIR/userspace/session-core/dist/sessionServiceBridge.js"
 VITE_BIN="$ROOT_DIR/userspace/gui/node_modules/vite/bin/vite.js"
 NODE_BIN="$(command -v node)"
@@ -206,7 +208,7 @@ while [ "$attempt" -lt 120 ]; do
     tail -n 40 "$RUNTIME_ROOT/logs/vite.log" >&2 || true
     fail "Vite 启动失败"
   }
-  if /usr/bin/curl --silent --show-error --fail "http://$HOST:$GUI_PORT/" >/dev/null 2>&1; then
+  if curl --silent --show-error --fail "http://$HOST:$GUI_PORT/" >/dev/null 2>&1; then
     break
   fi
   sleep 0.25

@@ -45,12 +45,7 @@ const AGENT_WEB_KEYS = [
 ] as const;
 
 function guiDefinitions(): SettingDefinition[] {
-  return [
-    ...shellPreferenceSettingDefinitions('editor').filter(
-      (definition) => definition.key === 'workbench.language',
-    ),
-    ...shellPreferenceSettingDefinitions('gui'),
-  ];
+  return shellPreferenceSettingDefinitions('gui');
 }
 
 function definitionsFor(

@@ -3,66 +3,54 @@ import { UI_ICON_ROLES } from '../../icons/registry';
 import { SettingsSearchContext, SettingsSearchTargets, matchesSettingsQuery, type SettingsSearchEntry } from './settingsSearch';
 import { settingsSearchDefinitions } from './sections/CategorizedSettingsSections';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import type { SettingsSurface } from '@deepcode/protocol';
 import { normalizeUiLanguage, t } from '../../i18n';
 import { useSettingsStore } from '../../state/settingsStore';
-import CommonSettingsSection from './sections/CommonSettingsSection';
 import {
   AgentSettingsSection,
   GuiSettingsSection,
 } from './sections/CategorizedSettingsSections';
 import LlmSection from './sections/LlmSection';
 import ModelUsageSettings from './ModelUsageSettings';
-import WorkspaceSection from './sections/WorkspaceSection';
 import PluginsSection from './sections/PluginsSection';
 import DeepCodeShellIcon, { type DeepCodeShellIconName } from '../shared/DeepCodeShellIcon';
 import './settingsCenter.css';
 
-type SettingsKey = 'general' | 'about' | 'workspace' | 'common' | 'gui' | 'agent' | 'environment' | 'permissions' | 'llm' | 'plugins';
+type SettingsKey = 'general' | 'about' | 'gui' | 'agent' | 'environment' | 'permissions' | 'llm' | 'plugins';
 
 interface SettingsCenterProps {
   apiStatus: string;
   serverVersion?: string;
-  surface?: Extract<SettingsSurface, 'editor' | 'gui'>;
   navigationTarget?: HTMLElement | null;
 }
 
 const SettingsCenter: React.FC<SettingsCenterProps> = ({
   apiStatus,
   serverVersion,
-  surface = 'editor',
   navigationTarget,
 }) => {
   const [activeKey, setActiveKey] = useState<SettingsKey>(
-    surface === 'gui' ? 'gui' : 'workspace',
+    'gui',
   );
   const [searchEntries, setSearchEntries] = useState<Record<string, SettingsSearchEntry[]>>({});
   const register = useCallback((owner: string, entries: SettingsSearchEntry[]) => setSearchEntries((current) => ({ ...current, [owner]: entries })), []);
   const targets = useRef(new Map<string, HTMLElement>());
   const pendingTarget = useRef<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
-  const [visited, setVisited] = useState<SettingsKey[]>([surface === 'gui' ? 'gui' : 'workspace']);
+  const [visited, setVisited] = useState<SettingsKey[]>(['gui']);
   const language = normalizeUiLanguage(
     useSettingsStore((state) => state.effectiveSettings['workbench.language']),
   );
   const statusText = (value: string) => ['connected', 'disconnected', 'checking'].includes(value)
     ? t(language, `deepcodeGui.status.${value}`) : value;
   const items: Array<{ key: SettingsKey; icon: DeepCodeShellIconName; label: string }> = [
-    ...(surface === 'editor'
-      ? [{ key: 'workspace' as const, icon: UI_ICON_ROLES.settings.workspace, label: t(language, 'settings.nav.workspace') }]
-      : []),
-    ...(surface === 'gui' ? [{ key: 'general' as const, icon: UI_ICON_ROLES.settings.general, label: language === 'zh-CN' ? '通用' : 'General' }] : []),
-    {
-      key: surface === 'gui' ? 'gui' : 'common',
-      icon: UI_ICON_ROLES.settings.appearance,
-      label: t(language, surface === 'gui' ? 'settings.nav.gui' : 'settings.nav.common'),
-    },
+    { key: 'general', icon: UI_ICON_ROLES.settings.general, label: language === 'zh-CN' ? '通用' : 'General' },
+    { key: 'gui', icon: UI_ICON_ROLES.settings.appearance, label: t(language, 'settings.nav.gui') },
     { key: 'agent', icon: UI_ICON_ROLES.settings.agent, label: t(language, 'settings.nav.agent') },
     { key: 'environment', icon: UI_ICON_ROLES.settings.environment, label: t(language, 'settings.nav.environment') },
     { key: 'permissions', icon: UI_ICON_ROLES.settings.permissions, label: t(language, 'settings.nav.permissions') },
     { key: 'llm', icon: UI_ICON_ROLES.settings.models, label: t(language, 'settings.nav.llm') },
     { key: 'plugins', icon: UI_ICON_ROLES.settings.plugins, label: t(language, 'settings.nav.plugins') },
-    ...(surface === 'gui' ? [{ key: 'about' as const, icon: UI_ICON_ROLES.settings.about, label: language === 'zh-CN' ? '关于' : 'About' }] : []),
+    { key: 'about', icon: UI_ICON_ROLES.settings.about, label: language === 'zh-CN' ? '关于' : 'About' },
   ];
 
   const searching = !!searchQuery.trim();
@@ -81,7 +69,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
   };
   useEffect(() => {
     if (searching) setVisited((current) => [...new Set([...current, ...items.map((item) => item.key)])]);
-  }, [searching, surface]);
+  }, [searching]);
   useEffect(() => {
     if (searching || !pendingTarget.current) return;
     const element = targets.current.get(pendingTarget.current) ?? document.getElementById(`setting-${pendingTarget.current}`);
@@ -90,17 +78,6 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
 
   const body = (key: SettingsKey) => {
     switch (key) {
-      case 'workspace':
-        return <WorkspaceSection />;
-      case 'common':
-        return (
-          <CommonSettingsSection
-            apiStatus={statusText(apiStatus)}
-            serverVersion={serverVersion}
-            query=""
-            surface={surface}
-          />
-        );
       case 'general':
       case 'about':
       case 'gui':

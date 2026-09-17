@@ -243,18 +243,15 @@ clean_repo_local() {
     "$ROOT_DIR/userspace/gui/node_modules"
     "$ROOT_DIR/userspace/session-core/node_modules"
     "$ROOT_DIR/userspace/protocol/node_modules"
-    "$ROOT_DIR/shells/tauri/node_modules"
     "$ROOT_DIR/shells/deepcode-gui/node_modules"
     "$ROOT_DIR/userspace/gui/dist"
     "$ROOT_DIR/userspace/gui/dist-deepcode-gui"
     "$ROOT_DIR/userspace/session-core/dist"
     "$ROOT_DIR/userspace/protocol/dist"
-    "$ROOT_DIR/shells/tauri/dist"
     "$ROOT_DIR/shells/deepcode-gui/dist"
     "$ROOT_DIR/userspace/gui/tsconfig.tsbuildinfo"
     "$ROOT_DIR/userspace/session-core/tsconfig.tsbuildinfo"
     "$ROOT_DIR/userspace/protocol/tsconfig.tsbuildinfo"
-    "$ROOT_DIR/shells/tauri/tsconfig.tsbuildinfo"
     "$ROOT_DIR/shells/deepcode-gui/tsconfig.tsbuildinfo"
   )
 

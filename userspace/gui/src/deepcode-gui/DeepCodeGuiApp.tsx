@@ -3,7 +3,6 @@ import { ConversationDisplayProvider } from '../components/local-agent/Conversat
 import { HostStartupDiagnostic } from '../components/shared/HostStartupDiagnostic';
 import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
 import useAppStatusStore from '../state/appStatusStore';
-import { useEditorStore, getTabId } from '../state/editorStore';
 import { useSettingsStore } from '../state/settingsStore';
 import { useWorkspaceStore } from '../state/workspaceStore';
 import { useLocalAgentStore } from '../state/localAgentStore';
@@ -22,7 +21,6 @@ import {
   isRuntimeReady,
   startKernelAfterPermission,
   type HostStartupStatusV1,
-  warmupTerminalRuntime,
 } from '../services/runtimeAdapter';
 import './deepcodeGui.css';
 import './styles/deepcodeDesignTokens.css';
@@ -40,17 +38,6 @@ function afterFirstPaint(task: () => void): () => void {
     cancelled = true;
     window.cancelAnimationFrame(frame);
   };
-}
-
-function isEditableTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false;
-  return (
-    target.isContentEditable ||
-    target.tagName === 'TEXTAREA' ||
-    target.tagName === 'INPUT' ||
-    target.getAttribute('role') === 'textbox' ||
-    Boolean(target.closest('.monaco-editor'))
-  );
 }
 
 const EMPTY_WORKSPACE_SETTINGS: Record<string, unknown> = {};
@@ -140,17 +127,6 @@ const DeepCodeGuiApp: React.FC = () => {
   const [kernelStartBusy, setKernelStartBusy] = useState(false);
   const [hostStartup, setHostStartup] = useState<HostStartupStatusV1 | null>(null);
   const [kernelStartMessage, setKernelStartMessage] = useState<string | null>(null);
-  const dirtySignature = useEditorStore((s) =>
-    s.tabs
-      .flatMap((tab) =>
-        tab.kind === 'file' && tab.isDirty ? [`${getTabId(tab)}:${tab.version}`] : []
-      )
-      .join('|')
-  );
-  const terminalPrewarm = String(
-    effectiveSettings['terminal.integrated.prewarm'] ?? 'afterStartup',
-  );
-
   const recordRuntimeReady = useCallback((attemptId: string | null) => {
     if (attemptId) {
       setConnectedIncarnation(`host:${attemptId}`);
@@ -159,13 +135,6 @@ const DeepCodeGuiApp: React.FC = () => {
       setConnectedIncarnation(`health:${healthConnectionSequenceRef.current}`);
     }
     healthWasReadyRef.current = true;
-  }, []);
-
-  const saveCurrentActiveFile = useCallback(async () => {
-    const { activeTabId, tabs, saveFile } = useEditorStore.getState();
-    const activeTab = tabs.find((tab) => getTabId(tab) === activeTabId);
-    if (activeTab?.kind !== 'file') return false;
-    return saveFile(getTabId(activeTab));
   }, []);
 
   const retryKernelStart = useCallback(async () => {
@@ -314,48 +283,6 @@ const DeepCodeGuiApp: React.FC = () => {
     setKernelStartMessage,
     setServerVersion,
   ]);
-
-  useEffect(() => {
-    if (apiStatus !== 'connected' || terminalPrewarm !== 'afterStartup') return;
-    const id = window.setTimeout(() => {
-      void warmupTerminalRuntime();
-    }, 1800);
-    return () => window.clearTimeout(id);
-  }, [apiStatus, connectedIncarnation, terminalPrewarm]);
-
-  useEffect(() => {
-    const autoSave = String(effectiveSettings['files.autoSave'] ?? 'off');
-    if (autoSave !== 'afterDelay' || !dirtySignature) return;
-    const delay = Number(effectiveSettings['files.autoSaveDelay'] ?? 1000);
-    const id = window.setTimeout(() => {
-      void useEditorStore.getState().saveAllDirtyFiles();
-    }, Number.isFinite(delay) ? Math.max(250, delay) : 1000);
-    return () => window.clearTimeout(id);
-  }, [dirtySignature, effectiveSettings]);
-
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || document.querySelector('dialog[open]')) return;
-      const ctrl = event.ctrlKey || event.metaKey;
-      if (!ctrl) return;
-      const key = event.key.toLowerCase();
-      if (key === 's') {
-        event.preventDefault();
-        if (event.shiftKey) {
-          void useEditorStore.getState().saveAllDirtyFiles();
-        } else {
-          void saveCurrentActiveFile();
-        }
-      }
-      if (key === 'w' && !isEditableTarget(event.target)) {
-        event.preventDefault();
-        const { activeTabId, closeTab } = useEditorStore.getState();
-        if (activeTabId) closeTab(activeTabId);
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [saveCurrentActiveFile]);
 
   useEffect(() => {
     const close = () => {

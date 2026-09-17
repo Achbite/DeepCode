@@ -50,53 +50,6 @@
     "window.minimize": "Minimize",
     "window.maximize": "Maximize or restore",
     "window.close": "Close",
-    "explorer.title": "Explorer",
-    "explorer.workspaceRoot": "Workspace Root",
-    "explorer.newFile": "New File",
-    "explorer.newFolder": "New Folder",
-    "explorer.rename": "Rename",
-    "explorer.delete": "Delete",
-    "explorer.confirm.deleteFile": "Delete file \"{name}\"?",
-    "explorer.confirm.deleteFolder": "Delete folder \"{name}\" and all of its contents?",
-    "explorer.refresh": "Refresh file tree",
-    "explorer.openWorkspace": "Open workspace folder or .code-workspace",
-    "explorer.loading": "Loading...",
-    "explorer.emptyTitle": "No Folder Opened",
-    "explorer.emptyBody": "Open a folder or workspace file to populate Explorer.",
-    "explorer.openFolder": "Open Folder...",
-    "explorer.placeholder.fileName": "File name",
-    "explorer.placeholder.folderName": "Folder name",
-    "explorer.placeholder.rename": "New name",
-    "explorer.error.loadTree": "Failed to load file tree",
-    "explorer.error.exists": "Already exists: {name}",
-    "explorer.error.create": "Create failed",
-    "explorer.error.rename": "Rename failed",
-    "explorer.error.delete": "Delete failed",
-    "explorer.error.deleteRoot": "Cannot delete the workspace root",
-    "explorer.error.renameSeparator": "Rename only changes the current name; path separators are not supported.",
-    "explorer.delete.inProgress": "Deleting {name}...",
-    "explorer.delete.done": "Deleted {name}",
-    "explorer.copyRelativePath": "Copy Relative Path",
-    "explorer.copyAbsolutePath": "Copy Absolute Path",
-    "explorer.copy.relativeDone": "Relative path copied",
-    "explorer.copy.absoluteDone": "Absolute path copied",
-    "explorer.copy.failed": "Copy failed",
-    "terminal.title": "TERMINAL",
-    "terminal.sessions": "Terminal sessions",
-    "terminal.controls": "Terminal panel controls",
-    "terminal.new": "New terminal",
-    "terminal.minimize": "Minimize terminal",
-    "terminal.expand": "Expand terminal",
-    "terminal.input": "Terminal input",
-    "terminal.rename": "Rename Terminal",
-    "terminal.restart": "Restart Terminal",
-    "terminal.close": "Close Terminal",
-    "terminal.defaultName": "Terminal {index}",
-    "terminal.error.requestFailed": "Terminal request failed",
-    "terminal.output.empty": "DeepCode terminal surface\nCreate or select a terminal session.",
-    "terminal.output.starting": "Starting {shell}...",
-    "terminal.output.failed": "{name} failed to start.",
-    "terminal.output.exited": "{name} exited.",
     "workspaceDialog.title": "Open Workspace",
     "workspaceDialog.parent": "Go to parent folder",
     "workspaceDialog.up": "Up",
@@ -128,52 +81,6 @@
     "workspaceDialog.error.openFolder": "Failed to open folder: {message}",
     "workspaceDialog.error.openWorkspaceFile": "Failed to open workspace file: {message}",
     "workspaceDialog.error.systemPicker": "System directory picker failed",
-    "browser.previewUrl": "Preview URL",
-    "browser.open": "Open",
-    "browser.reload": "Reload",
-    "browser.inspect": "Inspect",
-    "browser.stopInspect": "Stop Inspect",
-    "browser.skeletonTitle": "Internal Browser Skeleton",
-    "browser.processing": "Processing placeholder action...",
-    "browser.skeletonHint": "No dev server, iframe, DOM capture, or Agent injection is started in this stage.",
-    "browser.status": "Status",
-    "browser.testStatus": "Test Status",
-    "browser.capability.status": "Runtime Status",
-    "browser.capability.openTargetRecording": "Target URL Recording",
-    "browser.capability.reloadRecording": "Reload Recording",
-    "browser.capability.inspectModeRecording": "Inspect Mode Recording",
-    "browser.capabilityState.available": "Available",
-    "browser.capabilityState.reserved": "Reserved",
-    "browser.currentUrl": "Current URL",
-    "browser.lastAction": "Last Action",
-    "browser.lastActionAt": "Action Time",
-    "browser.lastActionResult": "Action Result",
-    "browser.none": "None",
-    "browser.runtimeStatus.idle": "Idle",
-    "browser.runtimeStatus.starting": "Starting",
-    "browser.runtimeStatus.running": "Running",
-    "browser.runtimeStatus.error": "Error",
-    "browser.inspectState.off": "Off",
-    "browser.inspectState.selecting": "Selecting",
-    "browser.inspectState.selected": "Selected",
-    "browser.action.open": "Open Preview",
-    "browser.action.reload": "Reload Preview",
-    "browser.action.inspect": "Toggle Inspect Mode",
-    "browser.action.snapshot": "Capture Snapshot",
-    "browser.action.attach": "Attach Snapshot",
-    "browser.action.click": "Click Element",
-    "browser.action.type": "Type Text",
-    "browser.action.scroll": "Scroll Page",
-    "browser.actionResult.ok": "Recorded",
-    "browser.actionResult.reserved": "Reserved",
-    "browser.actionResult.unavailable": "Unavailable",
-    "browser.status.idle": "Browser runtime skeleton is idle.",
-    "browser.status.runtime": "Browser runtime is {status}.",
-    "browser.message.reserved": "The browser control backend is unavailable.",
-    "browser.message.statusUnavailable": "Browser runtime status is not available.",
-    "browser.message.openUnavailable": "Open preview is not implemented yet.",
-    "browser.message.reloadUnavailable": "Reload preview is not implemented yet.",
-    "browser.message.inspectUnavailable": "Inspect mode is not implemented yet.",
     "settings.title": "DeepCode Settings",
     "settings.search.label": "Search",
     "settings.search.placeholder": "Search settings",
@@ -388,23 +295,6 @@
     "codeWorkspaceChoice.openAsJsonTitle": "Edit as a JSON file in the editor",
     "codeWorkspaceChoice.openAsWorkspace": "Open as Workspace",
     "codeWorkspaceChoice.openAsWorkspaceTitle": "Open this file as the workspace and replace the current workspace",
-    "editor.empty.title": "Open a file to start editing",
-    "editor.empty.hint": "Select a file from the file tree on the left",
-    "editor.notice.binaryTitle": "Binary File",
-    "editor.notice.binaryBody": "{filePath} is a binary file and is not shown in the editor at this stage.",
-    "editor.notice.sizeBytes": "Size: {size} bytes",
-    "editor.notice.largeTitle": "Large File",
-    "editor.notice.largeBody": "{filePath} is {size} bytes, which exceeds the {threshold} MiB limit. It is shown as a read-only notice and is not opened in the editor.",
-    "editor.notice.largeHint": "Tip: opening large files in Monaco can cause performance issues",
-    "editor.notice.largeWarning": "File exceeds {threshold} MiB; editing and saving may be delayed.",
-    "editor.status.cursor": "Ln {line}, Col {column}",
-    "editor.status.unsaved": "Unsaved",
-    "editor.save.noWorkspace": "No workspace folder is available",
-    "editor.save.openFailed": "Open failed: {message}",
-    "editor.save.unknownError": "Unknown error",
-    "editor.save.blocked": "Save failed: file changes must be confirmed through an Agent plan and executed by Kernel",
-    "editor.save.renamed": "Renamed: {oldName} → {newName}",
-    "explorer.error.hostMutationDisabled": "File changes must be confirmed through an Agent plan and executed by Kernel.",
     "workspace.error.defaultOpen": "Failed to open the default workspace",
     "workspace.error.load": "Failed to load workspace",
     "workspace.error.open": "Failed to open workspace",
@@ -466,19 +356,11 @@
     "settings.error.protectedWorkspaceKey": "Workspace settings cannot override protected key: {key}",
     "settings.error.saveWorkspace": "Failed to save workspace setting: {key}",
     "settings.error.resetUser": "Failed to reset setting: {key}",
-    "browser.frameTitle": "DeepCode internal browser",
     "workbench.status.noFile": "No file",
     "workbench.status.encoding": "UTF-8",
     "workbench.status.api": "API",
     "workbench.status.websocket": "WebSocket",
     "workbench.language.plainText": "Plain Text",
-    "editor.empty.iconLabel": "FILE",
-    "editor.status.encoding": "UTF-8",
-    "editor.status.sizeBytes": "{size} B",
-    "editor.status.indentation.spaces": "Spaces",
-    "editor.status.indentation.tab": "Tab",
-    "terminal.event.exited": "[process exited {code}]",
-    "terminal.event.error": "[error] {message}",
     "workspace.id": "ID",
     "settings.common.add": "Add",
     "settings.common.previous": "Previous",
@@ -972,14 +854,6 @@
         "en-US": "English"
       }
     },
-    "workbench.colorTheme": {
-      "label": "Color Theme",
-      "description": "Workbench color theme.",
-      "options": {
-        "vs-dark": "Dark",
-        "vs-light": "Light"
-      }
-    },
     "gui.colorTheme": {
       "label": "Theme mode",
       "description": "Choose system, light, or dark appearance. System mode follows macOS appearance changes.",
@@ -1017,88 +891,6 @@
     "workbench.styleTokenOverrides": {
       "label": "Custom palette",
       "description": "Custom light and dark colors. Edit them in Appearance → Colors."
-    },
-    "editor.tabSize": {
-      "label": "Tab Size",
-      "description": "Editor indentation width."
-    },
-    "editor.insertSpaces": {
-      "label": "Insert Spaces",
-      "description": "Insert spaces when pressing Tab."
-    },
-    "editor.wordWrap": {
-      "label": "Word Wrap",
-      "description": "Editor line wrapping strategy.",
-      "options": {
-        "off": "Off",
-        "on": "On",
-        "wordWrapColumn": "Word Wrap Column",
-        "bounded": "Bounded"
-      }
-    },
-    "editor.fontSize": {
-      "label": "Font Size",
-      "description": "Editor font size."
-    },
-    "editor.fontFamily": {
-      "label": "Font Family",
-      "description": "Editor font family."
-    },
-    "editor.renderWhitespace": {
-      "label": "Render Whitespace",
-      "description": "Whitespace rendering strategy.",
-      "options": {
-        "none": "None",
-        "boundary": "Boundary",
-        "selection": "Selection",
-        "trailing": "Trailing",
-        "all": "All"
-      }
-    },
-    "files.autoSave": {
-      "label": "Auto Save",
-      "description": "File auto-save strategy.",
-      "options": {
-        "off": "Off",
-        "afterDelay": "After Delay"
-      }
-    },
-    "files.autoSaveDelay": {
-      "label": "Auto Save Delay",
-      "description": "Auto-save delay in milliseconds."
-    },
-    "files.hotExit": {
-      "label": "Hot Exit",
-      "description": "Keep unsaved editor state across reload or restart."
-    },
-    "keyboard.enableBasicShortcuts": {
-      "label": "Basic Shortcuts",
-      "description": "Enable basic shortcuts such as Ctrl+S, Ctrl+Shift+S, Ctrl+A and Ctrl+,."
-    },
-    "explorer.confirmDelete": {
-      "label": "Confirm Delete",
-      "description": "Ask for confirmation before deleting resources."
-    },
-    "terminal.integrated.defaultProfile.windows": {
-      "label": "Windows Terminal Profile",
-      "description": "Default packaged Windows shell. WSL keeps Agent commands Unix-compatible.",
-      "options": {
-        "wsl": "WSL",
-        "powershell": "PowerShell",
-        "cmd": "Command Prompt"
-      }
-    },
-    "terminal.integrated.prewarm": {
-      "label": "Terminal Prewarm",
-      "description": "Warm terminal runtime after startup to reduce first terminal latency.",
-      "options": {
-        "afterStartup": "After Startup",
-        "off": "Off"
-      }
-    },
-    "terminal.integrated.spawnTimeoutMs": {
-      "label": "Terminal Spawn Timeout",
-      "description": "Terminal background spawn timeout in milliseconds."
     },
     "agent.windows.shell": {
       "label": "Windows shell",

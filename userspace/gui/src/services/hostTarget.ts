@@ -32,14 +32,13 @@ function consumeTrustedBootstrap(): KernelHostTarget | null {
   Reflect.deleteProperty(window, '__DEEPCODE_HOST_BOOT__');
   const trustedDesktopOrigin = (
     (
-      ['deepcode-gui:', 'deepcode-editor:'].includes(window.location.protocol)
+      window.location.protocol === 'deepcode-gui:'
       && window.location.hostname === 'localhost'
     )
     || (
       window.location.protocol === 'http:'
       && [
         'deepcode-gui.localhost',
-        'deepcode-editor.localhost',
       ].includes(window.location.hostname)
     )
   );

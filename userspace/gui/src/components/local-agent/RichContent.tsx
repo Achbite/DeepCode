@@ -1,7 +1,7 @@
 import { t } from '../../i18n';
 import { useUiLanguage } from '../../useUiLanguage';
-import { useConversationHost, useConversationTheme } from './ConversationHost';
-import { loadConversationMonaco } from './monacoRuntime';
+import { useConversationHost } from './ConversationHost';
+import { highlightCode, type CodeSpan } from './codeLanguage';
 import React, { memo, useEffect, useId, useState } from 'react';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
@@ -9,9 +9,8 @@ import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 export const CodeContent = memo(function CodeContent({ code, language, streaming = false }: { code: string; language: string; streaming?: boolean }) {
   const uiLanguage = useUiLanguage();
   const host = useConversationHost();
-  const theme = useConversationTheme();
   const [highlightError, setHighlightError] = useState('');
-  const [rendered, setRendered] = useState<{ code: string; html: string } | null>(null);
+  const [rendered, setRendered] = useState<{ code: string; spans: CodeSpan[] } | null>(null);
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState('');
   useEffect(() => {
@@ -22,13 +21,11 @@ export const CodeContent = memo(function CodeContent({ code, language, streaming
   useEffect(() => {
     if (streaming) return;
     let current = true;
-    void loadConversationMonaco().then(async (monaco) => {
-      monaco.editor.setTheme(theme);
-      const html = await monaco.editor.colorize(code, language || 'plaintext', {});
-      if (current) { setRendered({ code, html }); setHighlightError(''); }
+    void highlightCode(code, language).then((spans) => {
+      if (current) { setRendered({ code, spans }); setHighlightError(''); }
     }).catch((error: unknown) => { if (current) { setRendered(null); setHighlightError(String(error)); } });
     return () => { current = false; };
-  }, [code, language, theme, streaming]);
+  }, [code, language, streaming]);
   return <div className="conversation-code">
     <header><span>{language || 'text'}</span><button type="button" className="conversation-copy-button" aria-label={t(uiLanguage, copied ? 'content.code.copied' : 'content.code.copy')} onClick={() => {
       setCopied(false); setCopyError('');
@@ -37,7 +34,7 @@ export const CodeContent = memo(function CodeContent({ code, language, streaming
     {copyError && <small className="conversation-copy-error" role="alert">{copyError}</small>}
     {highlightError && <small role="status">{t(uiLanguage, 'content.code.highlightError', { error: highlightError })}</small>}
     {!streaming && rendered?.code === code
-      ? <pre className="monaco-colorized"><code dangerouslySetInnerHTML={{ __html: rendered.html }} /></pre>
+      ? <pre><code>{rendered.spans.map((span, index) => span.className ? <span key={index} className={span.className}>{span.text}</span> : span.text)}</code></pre>
       : <pre><code>{code}</code></pre>}
   </div>;
 });

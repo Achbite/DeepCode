@@ -1,7 +1,6 @@
-use crate::host_inspection::HostInspectionExecutor;
 use crate::prelude::*;
 use deepcode_kernel_abi::{
-    HostInspectionResult, HostResultSource, HostUnsupportedWorkspaceField, HostWorkspaceFolder,
+    HostResultSource, HostUnsupportedWorkspaceField, HostWorkspaceFolder,
     HostWorkspaceOpened, HostWorkspaceSaved, HostWorkspaceSourceKind, HostWorkspaceSpec,
 };
 use std::ffi::OsStr;
@@ -94,14 +93,6 @@ impl HostWorkspaceService {
         )))
     }
 
-    pub(crate) fn current_root(&self) -> Result<Option<PathBuf>, KernelErrorEnvelope> {
-        Ok(self
-            .lock_state()?
-            .current
-            .as_ref()
-            .map(|workspace| workspace.root.clone()))
-    }
-
     pub(crate) fn patch_settings(&self, patches: Value) -> Result<Value, KernelErrorEnvelope> {
         let patches = patches.as_object().ok_or_else(|| {
             host_service_error(
@@ -147,46 +138,14 @@ impl HostWorkspaceService {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct HostInspectionService {
-    workspace: HostWorkspaceService,
-    executor: HostInspectionExecutor,
-}
-
-impl HostInspectionService {
-    fn new(workspace: HostWorkspaceService) -> Self {
-        Self {
-            workspace,
-            executor: HostInspectionExecutor,
-        }
-    }
-
-    pub(crate) fn query(
-        &self,
-        query: HostInspectionQuery,
-    ) -> Result<HostInspectionResult, KernelErrorEnvelope> {
-        let workspace_root = self.workspace.current_root()?;
-        let output = self.executor.execute(query, workspace_root.as_deref())?;
-        Ok(HostInspectionResult {
-            source: HostResultSource::HostProjection,
-            output,
-        })
-    }
-}
-
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct HostServices {
     pub(crate) workspace: HostWorkspaceService,
-    pub(crate) inspection: HostInspectionService,
 }
 
 impl HostServices {
     pub(crate) fn new() -> Self {
-        let workspace = HostWorkspaceService::default();
-        Self {
-            inspection: HostInspectionService::new(workspace.clone()),
-            workspace,
-        }
+        Self::default()
     }
 }
 

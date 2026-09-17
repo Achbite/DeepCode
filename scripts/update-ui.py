@@ -1,127 +1,83 @@
 #!/usr/bin/env python3
-"""Publish a built UI bundle into an existing local DeepCode package."""
+"""Replace the single GUI resource directory with a complete current build."""
 import argparse
-import json
-import pathlib
+from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 
 
-SURFACES = {"editor": ("web", "DeepCode.app"), "gui": ("web-deepcode-gui", "DeepCode-GUI.app")}
+def sign(app):
+    if app:
+        subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(app)], check=True)
+        subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
 
 
-def targets_for(package, surface):
-    """Use the same locations as the packaged native asset resolvers."""
-    targets, apps = [], set()
-    for name, (directory, app_name) in SURFACES.items():
-        if surface != "all" and name != surface:
-            continue
-        app = package if package.name == app_name else package / app_name
-        if app.is_dir():
-            resources = app / "Contents/Resources" / directory
-            if not resources.is_dir():
-                raise ValueError(f"Packaged UI directory missing in {app}")
-            targets.append((name, resources))
-            apps.add(app)
-        flat = package / directory
-        if flat.is_dir():
-            targets.append((name, flat))
-    if not targets:
-        raise ValueError(f"No {surface} UI assets found in package: {package}")
-    return targets, sorted(apps)
-
-
-def read_identity(assets, surface):
-    directory = assets / SURFACES[surface][0]
-    if not (directory / "index.html").is_file():
-        raise ValueError(f"UI index.html missing: {directory}; run make ui first")
-    identity = json.loads((directory / "frontend-build-info.json").read_text(encoding="utf-8"))
-    if not isinstance(identity, dict) or identity.get("surface") != surface:
-        raise ValueError(f"Frontend identity does not describe {surface}: {directory}")
-    return directory, identity
-
-
-def sign_apps(apps):
-    for app in apps:
-        # Refresh the outer bundle's resource seal. Nested binaries keep their
-        # existing signatures; no native executable is rebuilt.
-        subprocess.run(["codesign", "--force", "--sign", "-", str(app)], check=True)
-        subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
-
-
-def update(assets, package, surface="all"):
-    assets, package = assets.resolve(strict=True), package.resolve(strict=True)
-    targets, apps = targets_for(package, surface)
-    if apps and (sys.platform != "darwin" or shutil.which("codesign") is None):
-        raise ValueError("Updating macOS .app resources requires codesign on the macOS host")
-    sources = {name: read_identity(assets, name) for name, _ in targets}
-    replacements = []
-    signing_started = False
+def replace_ui(source, target, app=None):
+    source, target = source.resolve(), target.resolve()
+    if not (source / 'index.html').is_file():
+        raise ValueError(f'GUI index.html is missing: {source}')
+    if source == target or source in target.parents or target in source.parents:
+        raise ValueError('UI source and destination must be separate directories.')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Keep staging outside the App resource seal.
+    scratch = Path(tempfile.mkdtemp(prefix='.ui-update-', dir=app.parent if app else target.parent))
+    next_ui, previous = scratch / 'next', scratch / 'previous'
+    installed = False
     try:
-        # Copy every selected surface before replacing any published directory.
-        for name, target in targets:
-            source, _ = sources[name]
-            if source == target or source in target.parents or target in source.parents:
-                raise ValueError(f"UI source and target must be separate: {source}, {target}")
-            # Staging must stay outside .app: its final resource seal must not
-            # include temporary copies that disappear after codesign.
-            scratch_parent = next((app.parent for app in apps if app in target.parents), target.parent)
-            scratch = pathlib.Path(tempfile.mkdtemp(prefix=".ui-update-", dir=scratch_parent))
-            replacement = (target, scratch / "next", scratch / "previous")
-            replacements.append(replacement)
-            shutil.copytree(source, replacement[1])
-        for target, staging, previous in replacements:
+        shutil.copytree(source, next_ui)
+        if target.exists():
             target.rename(previous)
-            staging.rename(target)
-        signing_started = bool(apps)
-        sign_apps(apps)
-    except Exception as error:
-        restore_errors = []
-        for target, _, previous in reversed(replacements):
-            if not previous.exists():
-                continue
-            try:
-                if target.exists():
-                    shutil.rmtree(target)
-                previous.rename(target)
-            except OSError as restore_error:
-                restore_errors.append(f"{restore_error}; original assets retained at {previous}")
-        if signing_started:
-            try:
-                sign_apps(apps)
-            except (OSError, subprocess.CalledProcessError) as restore_error:
-                restore_errors.append(f"Original UI restored but bundle signing failed: {restore_error}")
-        if restore_errors:
-            raise RuntimeError(f"{error}\n" + "\n".join(restore_errors)) from error
+        next_ui.rename(target)
+        installed = True
+        sign(app)
+    except BaseException:
+        if installed:
+            shutil.rmtree(target)
+        if previous.exists():
+            previous.rename(target)
+            sign(app)
         raise
     else:
-        for _, _, previous in replacements:
+        if previous.exists():
             shutil.rmtree(previous)
     finally:
-        for _, staging, previous in replacements:
-            # A failed restoration keeps the user's original directory intact.
-            if not previous.exists():
-                shutil.rmtree(staging.parent)
-    return [{"path": str(target), "frontend": sources[name][1]} for name, target in targets]
+        # Preserve the original assets if restoration itself failed.
+        if not previous.exists():
+            shutil.rmtree(scratch)
+    print(f'GUI resources published: {target}')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--assets", type=pathlib.Path, default=pathlib.Path(__file__).resolve().parents[1] / "bin/ui")
-    parser.add_argument("--package", type=pathlib.Path, required=True, help="existing bin/<platform> directory or macOS .app")
-    parser.add_argument("--surface", choices=["all", *SURFACES], default="all")
+    parser.add_argument('--assets', type=Path, default=Path(__file__).resolve().parents[1] / 'bin/ui/web-deepcode-gui')
+    destination = parser.add_mutually_exclusive_group(required=True)
+    destination.add_argument('--package', type=Path, help='Existing platform directory or DeepCode-GUI.app')
+    destination.add_argument('--output', type=Path, help='Publish a standalone built UI directory')
     args = parser.parse_args()
+    app = None
+    if args.package:
+        package = args.package.resolve()
+        app = package if package.suffix == '.app' else package / 'DeepCode-GUI.app'
+        if app.is_dir():
+            target = app / 'Contents/Resources/web-deepcode-gui'
+        else:
+            app = None
+            target = package / 'web-deepcode-gui'
+        if not target.is_dir():
+            parser.error(f'Packaged GUI resources are missing: {target}')
+    else:
+        target = args.output
     try:
-        receipt = update(args.assets, args.package, args.surface)
-    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
-        print(f"UI update failed: {error}", file=sys.stderr)
+        replace_ui(args.assets, target, app)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f'UI update failed: {error}', file=sys.stderr)
         return 1
-    print(json.dumps({"updated": receipt}, indent=2, ensure_ascii=False))
-    print("UI assets updated. Reload or reopen the window to use them. Kernel and Session runtime were retained.")
+    if args.package:
+        print('Close and reopen the GUI window to load this complete UI bundle.')
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())

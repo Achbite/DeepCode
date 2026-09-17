@@ -50,53 +50,6 @@
     "window.minimize": "最小化",
     "window.maximize": "最大化或还原",
     "window.close": "关闭",
-    "explorer.title": "资源管理器",
-    "explorer.workspaceRoot": "工作区根目录",
-    "explorer.newFile": "新建文件",
-    "explorer.newFolder": "新建文件夹",
-    "explorer.rename": "重命名",
-    "explorer.delete": "删除",
-    "explorer.confirm.deleteFile": "确定删除文件“{name}”吗？",
-    "explorer.confirm.deleteFolder": "确定删除文件夹“{name}”及其全部内容吗？",
-    "explorer.refresh": "刷新文件树",
-    "explorer.openWorkspace": "打开工作区（目录或 .code-workspace）",
-    "explorer.loading": "加载中...",
-    "explorer.emptyTitle": "未打开文件夹",
-    "explorer.emptyBody": "打开文件夹或工作区文件后，资源管理器会显示文件树。",
-    "explorer.openFolder": "打开文件夹...",
-    "explorer.placeholder.fileName": "文件名",
-    "explorer.placeholder.folderName": "文件夹名",
-    "explorer.placeholder.rename": "新名称",
-    "explorer.error.loadTree": "加载文件树失败",
-    "explorer.error.exists": "已存在：{name}",
-    "explorer.error.create": "创建失败",
-    "explorer.error.rename": "重命名失败",
-    "explorer.error.delete": "删除失败",
-    "explorer.error.deleteRoot": "不能删除工作区根目录",
-    "explorer.error.renameSeparator": "重命名只修改当前名称，不支持路径分隔符",
-    "explorer.delete.inProgress": "正在删除 {name}...",
-    "explorer.delete.done": "已删除 {name}",
-    "explorer.copyRelativePath": "复制相对路径",
-    "explorer.copyAbsolutePath": "复制绝对路径",
-    "explorer.copy.relativeDone": "已复制相对路径",
-    "explorer.copy.absoluteDone": "已复制绝对路径",
-    "explorer.copy.failed": "复制失败",
-    "terminal.title": "终端",
-    "terminal.sessions": "终端会话",
-    "terminal.controls": "终端面板控制",
-    "terminal.new": "新建终端",
-    "terminal.minimize": "最小化终端",
-    "terminal.expand": "展开终端",
-    "terminal.input": "终端输入",
-    "terminal.rename": "重命名终端",
-    "terminal.restart": "重启终端",
-    "terminal.close": "关闭终端",
-    "terminal.defaultName": "终端 {index}",
-    "terminal.error.requestFailed": "终端请求失败",
-    "terminal.output.empty": "DeepCode 终端界面\n创建或选择一个终端会话。",
-    "terminal.output.starting": "正在启动 {shell}...",
-    "terminal.output.failed": "{name} 启动失败。",
-    "terminal.output.exited": "{name} 已退出。",
     "workspaceDialog.title": "打开工作区",
     "workspaceDialog.parent": "返回上级文件夹",
     "workspaceDialog.up": "上级",
@@ -128,52 +81,6 @@
     "workspaceDialog.error.openFolder": "打开文件夹失败：{message}",
     "workspaceDialog.error.openWorkspaceFile": "打开工作区文件失败：{message}",
     "workspaceDialog.error.systemPicker": "系统目录选择失败",
-    "browser.previewUrl": "预览 URL",
-    "browser.open": "打开",
-    "browser.reload": "刷新",
-    "browser.inspect": "检查",
-    "browser.stopInspect": "停止检查",
-    "browser.skeletonTitle": "内部浏览器骨架",
-    "browser.processing": "正在处理占位操作...",
-    "browser.skeletonHint": "本阶段不会启动 dev server、iframe、DOM 捕获或 Agent 注入。",
-    "browser.status": "状态",
-    "browser.testStatus": "测试状态",
-    "browser.capability.status": "状态查询",
-    "browser.capability.openTargetRecording": "目标 URL 记录",
-    "browser.capability.reloadRecording": "刷新请求记录",
-    "browser.capability.inspectModeRecording": "检查模式记录",
-    "browser.capabilityState.available": "可用",
-    "browser.capabilityState.reserved": "预留",
-    "browser.currentUrl": "当前 URL",
-    "browser.lastAction": "最近动作",
-    "browser.lastActionAt": "动作时间",
-    "browser.lastActionResult": "动作结果",
-    "browser.none": "无",
-    "browser.runtimeStatus.idle": "空闲",
-    "browser.runtimeStatus.starting": "启动中",
-    "browser.runtimeStatus.running": "运行中",
-    "browser.runtimeStatus.error": "错误",
-    "browser.inspectState.off": "关闭",
-    "browser.inspectState.selecting": "选择中",
-    "browser.inspectState.selected": "已选择",
-    "browser.action.open": "打开预览",
-    "browser.action.reload": "刷新预览",
-    "browser.action.inspect": "切换检查模式",
-    "browser.action.snapshot": "捕获快照",
-    "browser.action.attach": "附加快照",
-    "browser.action.click": "点击元素",
-    "browser.action.type": "输入文本",
-    "browser.action.scroll": "滚动页面",
-    "browser.actionResult.ok": "已记录",
-    "browser.actionResult.reserved": "预留",
-    "browser.actionResult.unavailable": "不可用",
-    "browser.status.idle": "浏览器 runtime 骨架空闲。",
-    "browser.status.runtime": "浏览器 runtime 状态：{status}。",
-    "browser.message.reserved": "浏览器控制后端不可用。",
-    "browser.message.statusUnavailable": "浏览器 runtime 状态不可用。",
-    "browser.message.openUnavailable": "打开预览尚未实现。",
-    "browser.message.reloadUnavailable": "刷新预览尚未实现。",
-    "browser.message.inspectUnavailable": "检查模式尚未实现。",
     "settings.title": "DeepCode 设置",
     "settings.search.label": "搜索",
     "settings.search.placeholder": "搜索设置",
@@ -388,23 +295,6 @@
     "codeWorkspaceChoice.openAsJsonTitle": "作为 JSON 文件在编辑器中编辑",
     "codeWorkspaceChoice.openAsWorkspace": "作为工作区打开",
     "codeWorkspaceChoice.openAsWorkspaceTitle": "把该文件作为工作区打开（替换当前工作区）",
-    "editor.empty.title": "打开一个文件开始编辑",
-    "editor.empty.hint": "使用左侧文件树选择文件",
-    "editor.notice.binaryTitle": "二进制文件",
-    "editor.notice.binaryBody": "{filePath} 为二进制文件，当前阶段不在编辑器中展示。",
-    "editor.notice.sizeBytes": "大小：{size} 字节",
-    "editor.notice.largeTitle": "超大文件",
-    "editor.notice.largeBody": "{filePath} 大小为 {size} 字节，超过 {threshold} MiB 阈值，当前以只读提示方式展示，不在编辑器中打开。",
-    "editor.notice.largeHint": "提示：Monaco 打开大文件可能导致性能问题",
-    "editor.notice.largeWarning": "文件超过 {threshold} MiB，编辑与保存可能略有延迟。",
-    "editor.status.cursor": "行 {line}, 列 {column}",
-    "editor.status.unsaved": "未保存",
-    "editor.save.noWorkspace": "当前没有可用的 workspace folder",
-    "editor.save.openFailed": "打开失败: {message}",
-    "editor.save.unknownError": "未知错误",
-    "editor.save.blocked": "保存失败: 文件修改需通过 Agent 计划确认后由 Kernel 执行",
-    "editor.save.renamed": "已重命名: {oldName} → {newName}",
-    "explorer.error.hostMutationDisabled": "文件修改需通过 Agent 计划确认后由 Kernel 执行。",
     "workspace.error.defaultOpen": "默认工作区打开失败",
     "workspace.error.load": "工作区加载失败",
     "workspace.error.open": "打开工作区失败",
@@ -466,19 +356,11 @@
     "settings.error.protectedWorkspaceKey": "工作区设置不能覆盖受保护的键：{key}",
     "settings.error.saveWorkspace": "保存工作区设置失败：{key}",
     "settings.error.resetUser": "重置设置失败：{key}",
-    "browser.frameTitle": "DeepCode 内部浏览器",
     "workbench.status.noFile": "未打开文件",
     "workbench.status.encoding": "UTF-8",
     "workbench.status.api": "API",
     "workbench.status.websocket": "WebSocket",
     "workbench.language.plainText": "纯文本",
-    "editor.empty.iconLabel": "文件",
-    "editor.status.encoding": "UTF-8",
-    "editor.status.sizeBytes": "{size} B",
-    "editor.status.indentation.spaces": "空格",
-    "editor.status.indentation.tab": "Tab",
-    "terminal.event.exited": "[进程已退出，代码 {code}]",
-    "terminal.event.error": "[错误] {message}",
     "workspace.id": "ID",
     "settings.common.add": "添加",
     "settings.common.previous": "上一页",
@@ -972,14 +854,6 @@
         "en-US": "English"
       }
     },
-    "workbench.colorTheme": {
-      "label": "颜色主题",
-      "description": "工作台颜色主题。",
-      "options": {
-        "vs-dark": "深色",
-        "vs-light": "浅色"
-      }
-    },
     "gui.colorTheme": {
       "label": "主题模式",
       "description": "选择系统、浅色或深色外观；系统模式会随 macOS 外观实时切换。",
@@ -1017,88 +891,6 @@
     "workbench.styleTokenOverrides": {
       "label": "自定义配色",
       "description": "保存浅色与深色主题的自定义颜色。在外观的配色区域编辑。"
-    },
-    "editor.tabSize": {
-      "label": "Tab 宽度",
-      "description": "编辑器缩进宽度。"
-    },
-    "editor.insertSpaces": {
-      "label": "插入空格",
-      "description": "按 Tab 时插入空格。"
-    },
-    "editor.wordWrap": {
-      "label": "自动换行",
-      "description": "编辑器换行策略。",
-      "options": {
-        "off": "关闭",
-        "on": "开启",
-        "wordWrapColumn": "按换行列",
-        "bounded": "边界换行"
-      }
-    },
-    "editor.fontSize": {
-      "label": "字体大小",
-      "description": "编辑器字体大小。"
-    },
-    "editor.fontFamily": {
-      "label": "字体族",
-      "description": "编辑器字体族。"
-    },
-    "editor.renderWhitespace": {
-      "label": "显示空白字符",
-      "description": "空白字符显示策略。",
-      "options": {
-        "none": "不显示",
-        "boundary": "边界",
-        "selection": "选区",
-        "trailing": "行尾",
-        "all": "全部"
-      }
-    },
-    "files.autoSave": {
-      "label": "自动保存",
-      "description": "文件自动保存策略。",
-      "options": {
-        "off": "关闭",
-        "afterDelay": "延迟后保存"
-      }
-    },
-    "files.autoSaveDelay": {
-      "label": "自动保存延迟",
-      "description": "自动保存延迟，单位为毫秒。"
-    },
-    "files.hotExit": {
-      "label": "热退出",
-      "description": "刷新或重启后保留未保存的编辑器状态。"
-    },
-    "keyboard.enableBasicShortcuts": {
-      "label": "基础快捷键",
-      "description": "启用 Ctrl+S、Ctrl+Shift+S、Ctrl+A 和 Ctrl+, 等基础快捷键。"
-    },
-    "explorer.confirmDelete": {
-      "label": "删除确认",
-      "description": "删除资源前要求确认。"
-    },
-    "terminal.integrated.defaultProfile.windows": {
-      "label": "Windows 终端配置",
-      "description": "打包态 Windows 默认 shell。WSL 会保持 Agent 命令的 Unix 兼容性。",
-      "options": {
-        "wsl": "WSL",
-        "powershell": "PowerShell",
-        "cmd": "命令提示符"
-      }
-    },
-    "terminal.integrated.prewarm": {
-      "label": "终端预热",
-      "description": "启动后预热终端运行时，降低首次打开终端的延迟。",
-      "options": {
-        "afterStartup": "启动后",
-        "off": "关闭"
-      }
-    },
-    "terminal.integrated.spawnTimeoutMs": {
-      "label": "终端启动超时",
-      "description": "终端后台启动超时，单位为毫秒。"
     },
     "agent.windows.shell": {
       "label": "Windows Shell",

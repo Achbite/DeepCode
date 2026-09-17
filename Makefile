@@ -1,21 +1,4 @@
-# ====================================================================
-# DeepCode 开发容器入口 (Makefile)
-# 主要目标：
-#   make shell          -> 进入唯一开发容器（镜像与容器状态自动收敛）
-#   make build          -> 等同 bash ./build.sh，尝试全平台打包，缺少支持环境时跳过
-#   make build-deepcode-gui -> 在 Docker 内构建 DeepCode-GUI dist
-#   make build-deepcode-gui-tauri -> 在 Docker 内构建 Windows DeepCode-GUI.exe
-#   make dev-deepcode-gui   -> 在 Docker 内启动当前配置端口的 DeepCode-GUI 调试服务
-#   make reset-dev      -> 仅重建开发容器，保留依赖与编译缓存
-#   make clean          -> 清理开发容器、镜像与开发缓存 volumes
-#   make macos-package-service -> 在 macOS 宿主机启动 Docker 可请求的打包服务
-#   make package-macos  -> 生成完整 macOS 发布包：DeepCode.app + DeepCode-GUI.app + CLI/TUI
-#   make package-macos-clean -> 清理打包缓存后重新生成 Darwin GUI/TUI 本机包
-#   make package-macos-deepcode-gui -> 刷新 DeepCode-GUI.app，并同步刷新共享同一运行时的现有 App
-#
-# 适用环境：Linux / macOS / WSL（必须能直连 Docker daemon）
-# 不支持：Windows 原生 PowerShell 直接调用（请先 wsl 进入 Linux 子系统）
-# ====================================================================
+# DeepCode Docker environment and thin build entrypoints.
 
 # ---- 基础常量（与项目结构强绑定）----
 IMAGE_NAME       ?= deepcode-dev
@@ -25,8 +8,6 @@ DOCKERFILE       ?= Dockerfile.dev
 WORKDIR_IN_CTNR  ?= /workspace
 DEEPCODE_PROJECT_ROOT := $(realpath $(CURDIR))
 DEEPCODE_BUILD_HOST_OS := $(shell uname -s)
-DEEPCODE_BUILD_STAGES ?= all
-UI_SURFACE ?= all
 UI_PLUGIN ?= ui-plugins/template
 UI_PACKAGE ?=
 CONTAINER_NAME ?= deepcode-dev
@@ -61,8 +42,9 @@ BUILD_ARGS := \
 # ---- 持久化卷（只有 make clean 才会清空，避免每次 shell 重装依赖）----
 VOL_PNPM_STORE        ?= deepcode-pnpm-store
 VOL_CARGO_REGISTRY    ?= deepcode-cargo-registry
-VOL_CARGO_TARGET      ?= deepcode-cargo-target
-VOL_NODE_MODULES      ?= deepcode-node-modules
+DEEPCODE_CACHE_SCOPE  ?= $(notdir $(DEEPCODE_PROJECT_ROOT))
+VOL_CARGO_TARGET      ?= deepcode-$(DEEPCODE_CACHE_SCOPE)-cargo-target
+VOL_NODE_MODULES      ?= deepcode-$(DEEPCODE_CACHE_SCOPE)-node-modules
 VOLUMES_ALL := $(VOL_PNPM_STORE) $(VOL_CARGO_REGISTRY) $(VOL_CARGO_TARGET) $(VOL_NODE_MODULES)
 
 # ---- WSL / Docker 网络变量透传 ----
@@ -80,10 +62,7 @@ NETWORK_ENV_ARGS_BASE := \
 	-e CARGO_HTTP_PROXY \
 	-e CARGO_HTTP_TIMEOUT \
 	-e CARGO_HTTP_CAINFO \
-	-e CARGO_HTTP_PROXY_CAINFO \
-	-e DEEPCODE_CARGO_SOURCE \
-	-e DEEPCODE_CARGO_FALLBACK_REGISTRY_URL \
-	-e DEEPCODE_CARGO_OFFICIAL_CWD
+	-e CARGO_HTTP_PROXY_CAINFO
 
 ifeq ($(DEEPCODE_DOCKER_NET_ENV_PASSTHROUGH),1)
 NETWORK_ENV_ARGS := $(NETWORK_ENV_ARGS_BASE)
@@ -96,23 +75,26 @@ NETWORK_ENV_ARGS :=
 endif
 
 # ---- 容器运行参数 ----
-# - $(CURDIR) 在 WSL 内自动为 /mnt/e/Dev-Agent/deepagent，挂载到容器 /workspace
+# - 当前 worktree 挂载到 WORKDIR_IN_CTNR
 # - named volumes 覆盖 node_modules / target，避免 Windows ↔ WSL ↔ 容器 IO 雪崩
 RUN_ARGS := \
 	--name $(CONTAINER_NAME) \
 	--hostname $(CONTAINER_HOSTNAME) \
 	--init \
-	--label com.deepcode.project.root=$(DEEPCODE_PROJECT_ROOT) \
-	-w $(WORKDIR_IN_CTNR) \
+	--label "com.deepcode.project.root=$(DEEPCODE_PROJECT_ROOT)" \
+	-w "$(WORKDIR_IN_CTNR)" \
 	-p 127.0.0.1:$(DEEPCODE_HOST_PORT):$(DEEPCODE_CONTAINER_PORT) \
-	-v $(DEEPCODE_PROJECT_ROOT):$(WORKDIR_IN_CTNR) \
+	-v "$(DEEPCODE_PROJECT_ROOT):$(WORKDIR_IN_CTNR)" \
 	-v $(VOL_PNPM_STORE):/root/.local/share/pnpm/store \
 	-v $(VOL_CARGO_REGISTRY):/usr/local/cargo/registry \
-	-v $(VOL_CARGO_TARGET):/workspace/target \
-	-v $(VOL_NODE_MODULES):/workspace/node_modules \
+	-v $(VOL_CARGO_TARGET):$(WORKDIR_IN_CTNR)/target \
+	-v $(VOL_NODE_MODULES):$(WORKDIR_IN_CTNR)/node_modules \
 	-e CARGO_HOME=/usr/local/cargo \
 	-e RUSTUP_HOME=/usr/local/rustup \
 	-e PNPM_HOME=/root/.local/share/pnpm \
+	-e PNPM_STORE_DIR=/root/.local/share/pnpm/store \
+	-e DEEPCODE_WINDOWS_NODE_BIN=/opt/deepcode-node-win64/node.exe \
+	-e DEEPCODE_NODE_LICENSE=/usr/local/LICENSE \
 	-e CARGO_TARGET_DIR=$(DEEPCODE_CONTAINER_CARGO_TARGET_DIR) \
 	-e DEEPCODE_TMPDIR=$(DEEPCODE_CONTAINER_TMPDIR) \
 	-e SCCACHE_DIR=$(DEEPCODE_CONTAINER_SCCACHE_DIR) \
@@ -120,34 +102,20 @@ RUN_ARGS := \
 	-e PATH=/root/.local/share/pnpm:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
 	$(NETWORK_ENV_ARGS)
 
-.PHONY: help docker-info branch-audit branch-hooks shell build ui ui-update build-deepcode-gui build-deepcode-gui-tauri dev-deepcode-gui reset-dev clean macos-package-service macos-package-service-status macos-package-service-stop package-macos package-macos-clean package-macos-deepcode-gui _validate_config _print_image _ensure_image _ensure_container _build_in_container
+.PHONY: help docker-info branch-audit branch-hooks shell build ui ui-update native-gui dev-deepcode-gui reset-dev clean package-macos _validate_config _print_image _ensure_image _ensure_container
 
-# ---- help：默认目标，列出可用入口 ----
+# Environment settings are forwarded to the sole build orchestrator.
+export CONTAINER_NAME WORKDIR_IN_CTNR
+
 help:
-	@echo "DeepCode 开发容器入口"
-	@echo ""
-	@echo "  make shell          进入唯一开发容器（自动更新镜像并收敛容器）"
-	@echo "  make build          尝试 Linux、Windows、macOS 全平台打包；缺少支持环境时跳过"
-	@echo "  make ui             仅在 Docker 内构建两个前端，输出 bin/ui"
-	@echo "  make ui-update UI_PACKAGE=bin/macos-arm64  构建并更新指定本地包的 UI，随后重新加载窗口"
-	@echo "  make build-deepcode-gui  在 Docker 内构建 DeepCode-GUI dist"
-	@echo "  make build-deepcode-gui-tauri  在 Docker 内构建 Windows DeepCode-GUI.exe"
-	@echo "  make docker-info    显示当前项目的容器、挂载、端口、工具链和 volume 配置"
-	@echo "  make branch-audit   只读检查 worktree 与短期分支生命周期"
-	@echo "  make branch-hooks   安装 main/dev-main 的共享 Git 防护 hook"
-	@echo "  make dev-deepcode-gui    在 Docker 内启动 DeepCode-GUI 调试服务：127.0.0.1:$(DEEPCODE_HOST_PORT)"
-	@echo "  make reset-dev      仅移除唯一开发容器；下次命令自动重建并保留缓存"
-	@echo "  make clean          清理唯一开发容器、镜像和全部开发缓存 volumes"
-	@echo "  make macos-package-service  在 macOS 宿主机启动 Docker 打包请求服务"
-	@echo "  make package-macos  生成完整 macOS 发布包：DeepCode.app + DeepCode-GUI.app + CLI/TUI"
-	@echo "  make package-macos-clean  清理打包缓存后重新生成 macOS 本机包（保留 config/sessions/archives/kernel）"
-	@echo "  make package-macos-deepcode-gui  刷新 DeepCode-GUI.app，并同步刷新共享同一运行时的现有 App"
-	@echo ""
-	@echo "进入容器后可手动执行："
-	@echo "  bash ./build.sh   尝试全平台打包到 bin/；缺少支持环境时明确跳过"
-	@echo "  bash ./test.sh --help  查看测试 profile"
-	@echo "  bash ./test.sh    运行默认 required 验证（宿主机不会降级为静态成功）"
-	@echo "  bash ./test.sh --profile static  显式运行宿主机安全静态检查"
+	@echo "make shell / docker-info / reset-dev: 当前 worktree 的 Docker 环境"
+	@echo "make build: 一次共享构建，尝试全部可用平台"
+	@echo "make package-macos: Docker 共享构建 + 宿主 Darwin 编译/组装"
+	@echo "make ui: 单 GUI 资源到 bin/ui/web-deepcode-gui"
+	@echo "make ui-update UI_PACKAGE=bin/macos-arm64: 完整替换本地包 GUI"
+	@echo "make native-gui: Docker 内构建 Linux GUI native shell"
+	@echo "make dev-deepcode-gui: Docker 内 Vite HMR，浏览器访问已映射的 Host 端口"
+	@echo "make clean: 删除当前配置的容器、镜像和缓存 volumes"
 
 docker-info:
 	@echo "projectRoot=$(DEEPCODE_PROJECT_ROOT)"
@@ -183,23 +151,8 @@ _validate_config:
 		exit 1; \
 	fi
 
-macos-package-service:
-	@bash ./build.sh --stage macos-package-service
-
-macos-package-service-status:
-	@bash ./scripts/macos-package-service.sh status
-
-macos-package-service-stop:
-	@bash ./scripts/macos-package-service.sh stop
-
 package-macos:
 	@bash ./build.sh --stage package-macos
-
-package-macos-clean:
-	@bash ./build.sh --stage package-macos --clean-cache
-
-package-macos-deepcode-gui:
-	@bash ./build.sh --stage package-macos-deepcode-gui
 
 # ---- _ensure_image：每次求值 Dockerfile，未变化时直接命中 Docker 缓存 ----
 _print_image:
@@ -217,7 +170,7 @@ _ensure_image: _validate_config
 #   exited      -> docker start
 _ensure_container: _ensure_image
 	@if docker container inspect $(CONTAINER_NAME) >/dev/null 2>&1; then \
-		mounted_root=$$(docker container inspect -f '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' $(CONTAINER_NAME)); \
+		mounted_root=$$(docker container inspect -f '{{range .Mounts}}{{if eq .Destination "$(WORKDIR_IN_CTNR)"}}{{.Source}}{{end}}{{end}}' $(CONTAINER_NAME)); \
 		container_image=$$(docker container inspect -f '{{.Image}}' $(CONTAINER_NAME)); \
 		current_image=$$(docker image inspect -f '{{.Id}}' $(IMAGE)); \
 		actual_host_port=$$(docker container port $(CONTAINER_NAME) $(DEEPCODE_CONTAINER_PORT)/tcp 2>/dev/null | awk -F: 'NR == 1 { print $$NF }'); \
@@ -262,37 +215,25 @@ _ensure_container: _ensure_image
 
 # ---- shell：唯一交互入口 ----
 shell: _ensure_container
-	@if [ "$(DEEPCODE_BUILD_HOST_OS)" = "Darwin" ]; then bash ./scripts/macos-package-service.sh start; fi
 	@echo "[make] exec 进入容器 $(CONTAINER_NAME) ..."
 	@docker exec -it $(NETWORK_ENV_ARGS) -e DEEPCODE_BUILD_HOST_OS=$(DEEPCODE_BUILD_HOST_OS) $(CONTAINER_NAME) bash
 
 build:
 	@bash ./build.sh
 
-_build_in_container: _ensure_container
-	@docker exec $(NETWORK_ENV_ARGS) -e DEEPCODE_BUILD_HOST_OS=$(DEEPCODE_BUILD_HOST_OS) $(CONTAINER_NAME) bash ./build.sh --stage "$(DEEPCODE_BUILD_STAGES)"
-
 ui:
-	@case "$(UI_SURFACE)" in all|gui|editor) ;; *) echo "UI_SURFACE must be all, gui or editor" >&2; exit 2 ;; esac
-	@bash ./build.sh --stage "$(if $(filter all,$(UI_SURFACE)),ui,ui-$(UI_SURFACE))"
+	@bash ./build.sh --stage ui
 
 ui-update:
 	@test -n "$(UI_PACKAGE)" || { echo '请指定 UI_PACKAGE，例如 bin/macos-arm64 或 bin/win64' >&2; exit 2; }
-	@case "$(UI_SURFACE)" in all|gui|editor) ;; *) echo "UI_SURFACE must be all, gui or editor" >&2; exit 2 ;; esac
-	@bash ./build.sh --stage "$(if $(filter all,$(UI_SURFACE)),ui,ui-$(UI_SURFACE))"
-	@python3 ./scripts/update-ui.py --package "$(UI_PACKAGE)" --surface "$(UI_SURFACE)"
+	@bash ./build.sh --stage ui
+	@python3 ./scripts/update-ui.py --package "$(UI_PACKAGE)"
 
-build-deepcode-gui: _ensure_container
-	@echo "[make] Docker 内构建 DeepCode-GUI dist ..."
-	@docker exec $(NETWORK_ENV_ARGS) $(CONTAINER_NAME) bash -c 'bash ./build.sh --stage deepcode-gui'
-
-build-deepcode-gui-tauri: _ensure_container
-	@echo "[make] Docker 内构建 Windows DeepCode-GUI.exe ..."
-	@docker exec $(NETWORK_ENV_ARGS) $(CONTAINER_NAME) bash -c 'bash ./build.sh --stage deepcode-gui-tauri'
+native-gui:
+	@bash ./build.sh --stage native-gui
 
 dev-deepcode-gui: _ensure_container
-	@echo "[make] Docker 内启动 DeepCode-GUI 调试服务：http://127.0.0.1:$(DEEPCODE_HOST_PORT)/"
-	@docker exec -it $(NETWORK_ENV_ARGS) $(CONTAINER_NAME) bash -c 'bash ./build.sh --stage deepcode-gui && DEEPCODE_HOST=0.0.0.0 DEEPCODE_PORT=$(DEEPCODE_CONTAINER_PORT) DEEPCODE_CLIENT_DIST=userspace/gui/dist-deepcode-gui cargo run -p deepcode-host-web'
+	@docker exec -it -w "$(WORKDIR_IN_CTNR)" $(NETWORK_ENV_ARGS) -e DEEPCODE_GUI_BIND_HOST=0.0.0.0 -e DEEPCODE_GUI_DEV_PORT=$(DEEPCODE_CONTAINER_PORT) -e DEEPCODE_HOST_PORT=31247 -e DEEPCODE_DAEMON_PORT=31248 $(CONTAINER_NAME) bash scripts/dev-deepcode-gui-web.sh
 
 # ---- reset-dev / clean：只操作固定命名的单仓开发资源 ----
 reset-dev:
@@ -314,6 +255,6 @@ clean:
 
 .PHONY: ui-plugin ui-plugin-watch
 ui-plugin: _ensure_container
-	@docker exec -e DEEPCODE_UI_PLUGIN_ROOT="/workspace/$(UI_PLUGIN)" $(CONTAINER_NAME) pnpm --filter @deepcode/client exec vite build --config vite.ui-plugin.config.ts
+	@docker exec -e DEEPCODE_UI_PLUGIN_ROOT="$(WORKDIR_IN_CTNR)/$(UI_PLUGIN)" $(CONTAINER_NAME) pnpm --filter @deepcode/client exec vite build --config vite.ui-plugin.config.ts
 ui-plugin-watch: _ensure_container
-	@docker exec -e DEEPCODE_UI_PLUGIN_ROOT="/workspace/$(UI_PLUGIN)" $(CONTAINER_NAME) pnpm --filter @deepcode/client exec vite build --config vite.ui-plugin.config.ts --watch
+	@docker exec -e DEEPCODE_UI_PLUGIN_ROOT="$(WORKDIR_IN_CTNR)/$(UI_PLUGIN)" $(CONTAINER_NAME) pnpm --filter @deepcode/client exec vite build --config vite.ui-plugin.config.ts --watch

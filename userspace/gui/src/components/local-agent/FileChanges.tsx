@@ -1,11 +1,10 @@
-import { UI_PALETTE } from '../../theme/palette';
 import { t } from '../../i18n';
 import { useUiLanguage } from '../../useUiLanguage';
 import ModalDialog from '../shared/ModalDialog';
 import React, { useEffect, useRef, useState } from 'react';
 import type { ActivityProjection } from '@deepcode/protocol';
 import { useConversationHost, useConversationTheme } from './ConversationHost';
-import { loadConversationMonaco } from './monacoRuntime';
+import { loadCodeLanguage } from './codeLanguage';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import { isBinaryFileChange } from '../../services/localAgentApi';
@@ -96,33 +95,12 @@ function FileChangePreview({ sessionId, file, statistic, close }: { sessionId: s
     const controller = new AbortController();
     let dispose: (() => void) | undefined;
     setStatus('changes.loading'); setError(''); setBinary(false);
-    void Promise.all([readRoundChange(readChange, sessionId, file, controller.signal), loadConversationMonaco()])
-      .then(([change, monaco]) => {
+    void Promise.all([readRoundChange(readChange, sessionId, file, controller.signal), import('./codeDiffView')])
+      .then(async ([change, { createCodeDiffView }]) => {
+        const language = await loadCodeLanguage('', change.path);
         if (controller.signal.aborted || !container.current) return;
-        const filename = change.path.split('/').at(-1) ?? change.path;
-        const extension = filename.includes('.') ? `.${filename.split('.').at(-1)}` : '';
-        const codeLanguage = monaco.languages.getLanguages().find((language) => language.filenames?.includes(filename) || extension && language.extensions?.includes(extension))?.id ?? 'plaintext';
-        const diffTheme = `deepcode-diff-${theme}`;
-        const dark = theme === 'vs-dark';
-        monaco.editor.defineTheme(diffTheme, {
-          base: theme, inherit: true, rules: [], colors: UI_PALETTE.diff[dark ? 'dark' : 'light'],
-        });
-        const editor = monaco.editor.createDiffEditor(container.current, {
-          readOnly: true, originalEditable: false, automaticLayout: true, renderSideBySide: false, theme: diffTheme,
-          scrollBeyondLastLine: false, minimap: { enabled: false }, fontSize: 13, lineHeight: 25,
-          fontFamily: 'var(--dc-font-mono)', wordWrap: 'on', diffWordWrap: 'on',
-          ignoreTrimWhitespace: false, renderOverviewRuler: false, renderLineHighlight: 'none',
-          padding: { top: 8, bottom: 12 },
-          hideUnchangedRegions: { enabled: true, contextLineCount: 2, minimumLineCount: 3, revealLineCount: 20 },
-        });
-        const original = monaco.editor.createModel(change.before ?? '', codeLanguage);
-        const modified = monaco.editor.createModel(change.after ?? '', codeLanguage);
-        editor.setModel({ original, modified });
-        const listener = editor.onDidUpdateDiff(() => {
-          const changes = editor.getLineChanges();
-          if (changes?.length) editor.revealLineInCenter(Math.max(1, changes[0]!.modifiedStartLineNumber));
-        });
-        dispose = () => { listener.dispose(); editor.dispose(); original.dispose(); modified.dispose(); };
+        const view = createCodeDiffView(container.current, change.before ?? '', change.after ?? '', language, theme === 'vs-dark');
+        dispose = () => view.destroy();
         setStatus('');
       }).catch((error: unknown) => { if (!controller.signal.aborted) {
         if (isBinaryFileChange(error)) { setBinary(true); setStatus('changes.binary'); }

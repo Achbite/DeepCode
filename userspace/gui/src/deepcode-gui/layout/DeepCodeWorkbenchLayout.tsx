@@ -667,7 +667,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
               <SettingsCenter
                 apiStatus={apiStatus}
                 serverVersion={serverVersion}
-                surface="gui"
                 navigationTarget={settingsNavigation}
               />
             </Suspense></InterfaceLoadBoundary>

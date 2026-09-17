@@ -1,7 +1,6 @@
 #![recursion_limit = "256"]
 
 mod api_response;
-mod browser_api;
 mod config_root_lease;
 mod conversation_api;
 mod conversation_catalog;
@@ -35,15 +34,12 @@ mod session_environment;
 mod session_service;
 mod settings_api;
 mod state;
-mod terminal_api;
-mod terminal_runtime;
 mod utils;
 mod workspace_api;
 
 use crate::prelude::*;
 
 pub(crate) use api_response::*;
-pub(crate) use browser_api::*;
 pub(crate) use config_root_lease::*;
 pub(crate) use conversation_api::*;
 mod browser_tools;
@@ -60,7 +56,6 @@ pub(crate) use local_agent_api::*;
 pub(crate) use session_service::*;
 pub(crate) use settings_api::*;
 pub(crate) use state::*;
-pub(crate) use terminal_api::*;
 pub(crate) use utils::*;
 pub(crate) use workspace_api::*;
 
@@ -140,7 +135,6 @@ async fn main() {
         host_connection,
         gui,
         host_services: HostServices::new(),
-        terminal_runtime: Arc::new(Mutex::new(TerminalRuntime::new())),
     };
     configure_host_lifetime().expect("初始化 Host 生命周期");
     let app = routes::build_app(state.clone());

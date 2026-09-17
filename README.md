@@ -4,7 +4,7 @@ Current product version: **0.5.60**.
 
 > 中文说明：[README.zh-CN.md](README.zh-CN.md)
 
-DeepCode is a local-first coding-agent framework. The Editor, DeepCode-GUI, CLI, and TUI share one local Session Runtime, Kernel, and `SessionProjection`; their differences are limited to rendering and interaction.
+DeepCode is a local-first coding-agent framework. DeepCode-GUI, CLI, and TUI share one local Session Runtime, Kernel, and `SessionProjection`; their differences are limited to rendering and interaction.
 
 “Local-first” means workspace access, the Session journal, shared projections, tool execution, and tool records stay on this machine. Prompts and context selected by the Agent are still sent to the configured model provider unless you use a local provider such as Ollama.
 
@@ -17,7 +17,7 @@ DeepCode is a local-first coding-agent framework. The Editor, DeepCode-GUI, CLI,
 - A new configuration starts with a DeepSeek Flash template. Save each model in its own configuration card; the last selected model becomes the default for new conversations.
 - Drag projects and conversations to reorder the sidebar. Copy, thumbs-up, and thumbs-down actions now share consistent hover and keyboard-focus behavior.
 
-The release version is declared in the package manifests. Generated `build-info.json` records `productVersion`, source commit, build time, and source state; these identify the artifact independently of database and wire schema versions.
+The release version is declared in the package manifests. Generated `BUILDINFO.json` records `version`, source commit, build time, and platform; these identify the artifact independently of database and wire schema versions.
 
 ## How it works
 
@@ -46,12 +46,11 @@ A Session binding always limits workspace tools to its immutable run snapshot. `
 
 | Interface       | Best for                                                   | Entry                                                |
 | --------------- | ---------------------------------------------------------- | ---------------------------------------------------- |
-| DeepCode Editor | Files, editor, terminal, Git panel, and Agent conversation | `DeepCode.app`, `DeepCode.exe`, or the Linux GUI |
 | DeepCode-GUI    | A focused local Agent conversation                         | `DeepCode-GUI.app` or `DeepCode-GUI.exe`         |
 | CLI             | One-shot tasks, scripts, and terminal workflows            | `DeepCode-CLI.command` or `deepcode-cli`         |
 | TUI             | Continuous interactive terminal conversations              | `DeepCode-TUI.command` or `deepcode-tui`         |
 
-For day-to-day development, use the full DeepCode GUI when you want the file tree, editor, terminal, Git, and Agent workflow in one place. Use the TUI for terminal-first development. The CLI remains available for one-shot operations, automation, and diagnostics.
+Use DeepCode-GUI for Agent conversations, attachments, read-only files and change previews. TUI provides terminal interaction; CLI supports tasks, automation and diagnostics. The standalone Editor is retired; future editing support belongs to a VS Code extension.
 
 All interfaces read the same model profiles, Session journal, Kernel records, and projection when they use the same configuration root.
 
@@ -60,7 +59,6 @@ All interfaces read the same model profiles, Session journal, Kernel records, an
 Open an existing local package:
 
 ```bash
-open bin/macos-arm64/DeepCode.app
 open bin/macos-arm64/DeepCode-GUI.app
 ```
 
@@ -80,25 +78,19 @@ bash ./build.sh
 
 The script attempts Linux, Windows and macOS packaging by default, skipping targets whose support environment is unavailable; `make build` uses the same entrypoint. Frontend and Session assets are built from source in Docker, while native Rust/Tauri packaging runs on the Darwin host.
 
-Output is written to `bin/macos-arm64/` and includes both apps, the CLI/TUI launchers, Kernel, Session runtime, web assets, and a package-local writable data root. If a package still shows stale resources, quit every DeepCode app and run:
+`bin/macos-arm64/` contains one complete `DeepCode-GUI.app` and CLI/TUI launchers pointing inside it. Runtime content is present only once. A complete archive is also written to `bin/DeepCode-<version>-macos-arm64.tar.gz`. Existing user configuration and sessions are preserved, and are excluded from the new archive.
 
-```bash
-make package-macos-clean
-```
-
-The macOS package is intended for local use and is ad-hoc signed. It is not a Developer ID signed or notarized DMG.
-
-The macOS package service uses the request directory inside this repository and publishes only to this repository's `bin/macos-arm64/`. Its receipt reports the worker root, output directory, and log. The packaging transaction still verifies that source content did not change before publication.
+The macOS bundle is ad-hoc signed. See [distribution details](docs/distribution.md) for layout, cache ownership and resource updates.
 
 ## Linux and Windows packages
 
-Run the same command to build all supported platform packages. Linux and Windows builds use the single `deepcode-dev` container; macOS requires its native package worker:
+Run the same command to build all supported platform packages. Linux and Windows builds use the single `deepcode-dev` container; macOS runs native compilation from the host entrypoint:
 
 ```bash
 bash ./build.sh
 ```
 
-No stage argument is needed. `make build`, `--full`, `--stage all`, and `--stage package` use the same platform selection.
+No stage argument is needed. `make build` and `--stage package` use the same platform selection.
 
 Each build invokes the source build for every selected product and its dependencies. Cargo, sccache, Docker layers and dependency stores accelerate these steps; existing `dist` files or stage stamps never replace them. Packaging also builds its inputs before assembling the distribution.
 
@@ -133,16 +125,16 @@ On Linux:
 
 ```bash
 cd bin/linux-x64
-./deepcode-gui
+./DeepCode-GUI
 ```
 
 Use `bin/linux-arm64` instead for an ARM64 Linux build.
 
-Then open [http://127.0.0.1:31245/](http://127.0.0.1:31245/). On Windows, use `DeepCode.exe` or `DeepCode-GUI.exe`; Microsoft Edge WebView2 Evergreen Runtime is required.
+The Linux GUI opens a native window. On Windows, use `DeepCode-GUI.exe`; Microsoft Edge WebView2 Evergreen Runtime is required.
 
 ## Update the UI independently
 
-Build both frontends while retaining the installed Kernel, Session runtime and native applications:
+Build the GUI while retaining the installed Kernel, Session runtime and native applications:
 
 ```bash
 make ui
@@ -151,9 +143,9 @@ python3 scripts/update-ui.py --package bin/macos-arm64
 make ui-update UI_PACKAGE=bin/macos-arm64
 ```
 
-`make ui` runs dependency setup, frontend type checking and Vite builds in Docker. It emits `bin/ui/web` and `bin/ui/web-deepcode-gui` without compiling Rust or the Session runtime. The updater replaces only Web resource directories in an existing package. Use `bin/win64` or the appropriate Linux directory for those platforms, a single `.app`, or `--surface gui` / `--surface editor`. Windows development builds continue through WSL / Docker; the updater uses only Python's standard library.
+`make ui` prepares dependencies, compiles shared TypeScript, checks GUI types and runs Vite once in Docker. It emits `bin/ui/web-deepcode-gui` without compiling Rust. The updater replaces the single complete Web directory in an existing package. Use `bin/win64`, a Linux platform directory or a macOS App as the destination.
 
-Run macOS updates on the host so the updater can refresh and verify each App's resource signature. Then choose **Reload interface** in Settings → Appearance / Common settings → Runtime information, or reopen the window. Save edits and unsent input first. User configuration, session history and the original package `build-info.json` remain intact. Each frontend has its own `frontend-build-info.json` with source and build time; these identities do not impose a version-equality gate with the Kernel.
+Run macOS updates on the host to refresh the App signature, then close and reopen the window. Configuration, sessions and native executables are preserved. Development uses Vite HMR; Session TypeScript must be compiled to JS and loaded by a controlled Host restart, never replaced inside an active Agent Loop.
 
 This path covers UI changes using existing Host / Session interfaces. New backend interfaces or executors still require the corresponding service build. The document tools and resource API introduced here require an initial full version containing those services.
 
@@ -165,7 +157,7 @@ The built-in [deepcode-documents Skill](skills/deepcode-documents/SKILL.md) is r
 
 `document.render` uses existing workspace write permissions and Plan scope, publishing a Session artifact only after the file is written. HTML and Markdown need no additional generation runtime. PDF uses WeasyPrint with self-contained HTML. Set the Python interpreter in **Settings → Plugins → Document composition** after installing [WeasyPrint's platform prerequisites](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html) and the [Python requirements](skills/deepcode-documents/scripts/requirements.txt). The development container includes this environment. Native installations need the corresponding runtime; configuration errors remain visible and do not overwrite an existing document.
 
-GUI and Editor artifacts and workspace links open a shared preview: static HTML with source view, local PDF.js with page navigation, zoom, text selection and download, and the existing Markdown renderer. PDF reading needs no Python or online viewer. Generated HTML embeds its images, SVG and styles; PDF generation does not run JavaScript. Ordinary text retains its paged reader.
+GUI artifacts and workspace links open a shared preview: static HTML with source view, local PDF.js with page navigation, zoom, text selection and download, and the existing Markdown renderer. PDF reading needs no Python or online viewer. Generated HTML embeds its images, SVG and styles; PDF generation does not run JavaScript. Ordinary text retains its paged reader.
 
 ## Execution, settings and extensions
 

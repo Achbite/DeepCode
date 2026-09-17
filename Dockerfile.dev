@@ -94,13 +94,6 @@ RUN --mount=type=cache,target=/usr/local/rustup/downloads,sharing=locked \
  && env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
         rustup component add rustfmt clippy
 
-# ---- 4b. BuildKit cache anchors ----
-# 运行期仍通过挂载的工作区复用 target；这里声明 target/sccache cache 形态，
-# 让 Docker BuildKit 与 test/build 脚本的缓存目录保持一致。
-RUN --mount=type=cache,target=/workspace/target,sharing=locked \
-    --mount=type=cache,target=/workspace/.build-cache/sccache,sharing=locked \
-    mkdir -p /workspace/target /workspace/.build-cache/sccache
-
 # ---- 5. 入口脚本 ----
 COPY skills/deepcode-documents/scripts/requirements.txt /opt/deepcode-documents-requirements.txt
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -108,7 +101,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends python3-venv fonts-noto-cjk \
  && python3 -m venv /opt/deepcode-documents \
  && /opt/deepcode-documents/bin/pip install --no-cache-dir -r /opt/deepcode-documents-requirements.txt
-ENV DEEPCODE_DOCUMENT_PYTHON=/opt/deepcode-documents/bin/python
+ENV DEEPCODE_DOCUMENT_PYTHON=/opt/deepcode-documents/bin/python \
+    PNPM_STORE_DIR=/root/.local/share/pnpm/store \
+    DEEPCODE_WINDOWS_NODE_BIN=/opt/deepcode-node-win64/node.exe \
+    DEEPCODE_NODE_LICENSE=/usr/local/LICENSE
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

@@ -8,7 +8,7 @@ In **Settings → Plugins → Add**, choose a local folder or manifest file cont
 
 The Host checks the selected files while the window is connected and publishes changed contents. Saving the entry bundle or manifest replaces that plugin in the open window; no UI reload, Rust build, daemon restart or new conversation is required. **Refresh list** reconnects the source watch; **Reload** in one plugin’s details reloads only that module. Disabling or removing a plugin releases its resources and restores the built-in renderer for its slots.
 
-The source list is stored in the existing user setting `workbench.uiPlugins` and shared by GUI and Editor. It is independent of Skill/MCP activation. A broken source or renderer shows its own error in the settings page and affected slot. A disconnected watch is visible and can be reconnected with Refresh; it does not silently reload the application.
+The source list is stored in the existing user setting `workbench.uiPlugins` and used by the GUI. It is independent of Skill/MCP activation. A broken source or renderer shows its own error in the settings page and affected slot. A disconnected watch is visible and can be reconnected with Refresh; it does not silently reload the application.
 
 ## Manifest and module
 
@@ -63,11 +63,11 @@ make ui
 make ui-update UI_PACKAGE=/absolute/path/to/package
 ```
 
-`make ui` builds current GUI and Editor assets in Docker into `bin/ui`. It checks the shared UI types without compiling Rust or the Session runtime. `ui-update` stages both selected Web directories, then publishes them into the chosen existing package. It retains native executables, Session resources, configuration and original package identity, and writes the new frontend identity with the assets. Reload the window after a whole UI update. This operation differs from plugin hot replacement, which keeps the window and draft intact.
+`make ui` compiles shared TypeScript and one GUI in Docker, writing `bin/ui/web-deepcode-gui`. `ui-update` stages the complete GUI directory and replaces the package's single Web directory. Native executables, Session resources and user configuration are retained. Close and reopen the window after updating the whole UI. Plugin hot replacement keeps the window and draft intact.
 
 The native shells read Web resources through their filesystem protocols. Their Tauri configuration therefore has an empty embedded asset list; UI files are not copied into a second `shells/*/dist` tree or duplicated inside the executable. A normal platform package still invokes Cargo on current source and uses Cargo's dependency cache. No timestamp marker is used to skip source changes.
 
-macOS packages place Web files in `Contents/Resources`. The local updater refreshes the outer app signature after replacing these resources, without re-signing nested executables. Run it on macOS; Windows and Linux use the flat package Web directories.
+macOS packages place Web files in `Contents/Resources`. The local updater refreshes the outer app signature after replacing these resources, using the platform signing tools. Run it on macOS; Windows and Linux use the flat package Web directories.
 
 New Host endpoints require a package containing this implementation once. Later display plugin edits and compatible whole-UI edits use these fast paths. Kernel, Session or native feature changes still use normal platform packaging.
 
@@ -80,11 +80,11 @@ Copy `ui-plugins/template` to a new plugin directory, edit its manifest and `src
 ```sh
 make ui-plugin UI_PLUGIN=ui-plugins/template
 make ui-plugin-watch UI_PLUGIN=ui-plugins/template
-make ui UI_SURFACE=gui
-make ui-update UI_SURFACE=gui UI_PACKAGE=/absolute/path/to/package
+make ui
+make ui-update UI_PACKAGE=/absolute/path/to/package
 ```
 
-`UI_SURFACE=gui` builds and publishes only the standalone GUI; `editor` selects the Editor, and `all` selects both. Plugin builds produce `dist/index.js`; source watching rebuilds that module, while the existing Host watcher loads the finished module. Reader selection, scroll position, PDF page and zoom are owned by the shell and retained in the window session storage. Closing the window ends this view state. Native bridge changes still require packaging and restarting the Host.
+Plugin builds produce `dist/index.js`; source watching rebuilds that module, while the existing Host watcher loads the finished module. Reader selection, scroll position, PDF page and zoom are owned by the shell and retained in the window session storage. Closing the window ends this view state. Native bridge changes still require packaging and restarting the Host.
 
 ## Tool contributions and CLI preference
 

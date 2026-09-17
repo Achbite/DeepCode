@@ -214,9 +214,5 @@ export function UiPluginSlotView({
 }
 
 export function useDisplayTheme(): string {
-  const key =
-    typeof document !== 'undefined' && document.documentElement.dataset.product === 'deepcode-gui'
-      ? 'gui.colorTheme'
-      : 'workbench.colorTheme';
-  return String(useSettingsStore((state) => state.effectiveSettings[key]) ?? 'light');
+  return String(useSettingsStore((state) => state.effectiveSettings['gui.colorTheme']) ?? 'light');
 }

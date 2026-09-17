@@ -228,7 +228,7 @@ fn trusted_cors_origin(origin: &HeaderValue) -> bool {
 fn trusted_desktop_origin(origin: &str) -> bool {
     if matches!(
         origin,
-        "deepcode-gui://localhost" | "deepcode-editor://localhost"
+        "deepcode-gui://localhost"
     ) {
         return true;
     }
@@ -238,7 +238,7 @@ fn trusted_desktop_origin(origin: &str) -> bool {
     let (host, port) = authority
         .split_once(':')
         .map_or((authority, None), |(host, port)| (host, Some(port)));
-    if !matches!(host, "deepcode-gui.localhost" | "deepcode-editor.localhost") {
+    if !matches!(host, "deepcode-gui.localhost") {
         return false;
     }
     port.is_none_or(|port| port.parse::<u16>().is_ok_and(|port| port > 0))

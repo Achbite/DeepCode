@@ -23,7 +23,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::http::{header, Request, Response, StatusCode};
 use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent};
@@ -37,6 +37,38 @@ const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: &str = "31246";
 const APP_ASSET_SCHEME: &str = "deepcode-gui";
 const APP_ASSET_DIR: &str = "web-deepcode-gui";
+
+struct RuntimeLocations {
+    resources: PathBuf,
+    config: PathBuf,
+}
+
+static RUNTIME_LOCATIONS: OnceLock<RuntimeLocations> = OnceLock::new();
+
+fn initialize_runtime_locations(app: &tauri::App) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let (resources, distribution) = {
+        let resources = app.path().resource_dir().map_err(std::io::Error::other)?;
+        let bundle = objc2_foundation::NSBundle::mainBundle();
+        let bundle_path = PathBuf::from(bundle.bundlePath().to_string());
+        let distribution = bundle_path.parent().ok_or_else(|| std::io::Error::other("bundle directory is unavailable"))?.to_path_buf();
+        (resources, distribution)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (resources, distribution) = {
+        let _ = app;
+        let exe_dir = current_exe_dir()
+            .ok_or_else(|| std::io::Error::other("executable directory is unavailable"))?;
+        (exe_dir.clone(), exe_dir)
+    };
+    let config = std::env::var_os("DEEPCODE_CONFIG_DIR").map(PathBuf::from).unwrap_or(distribution);
+    RUNTIME_LOCATIONS.set(RuntimeLocations { resources, config })
+        .map_err(|_| std::io::Error::other("runtime locations already initialized"))
+}
+
+fn runtime_locations() -> &'static RuntimeLocations {
+    RUNTIME_LOCATIONS.get().expect("Host runtime locations initialized before opening windows")
+}
 
 struct HostProcessGroup {
     state: Mutex<HostProcessState>,
@@ -284,6 +316,7 @@ fn main() {
             handler(invoke)
         })
         .setup(|app| {
+            initialize_runtime_locations(app)?;
             let target = resolve_launch_target();
             let mut host_tokens = HostConnectionTokens::resolve()?;
             let registration = Arc::clone(&host_tokens.browser_registration);
@@ -645,10 +678,8 @@ fn serve_bundled_asset(web_dir_name: &str, request: Request<Vec<u8>>) -> Respons
 }
 
 fn resolve_asset_path(web_dir_name: &str, uri_path: &str) -> Result<PathBuf, String> {
-    let exe_dir =
-        current_exe_dir().ok_or_else(|| "failed to resolve executable directory".to_string())?;
-    let web_root =
-        find_bundled_dir(&exe_dir, web_dir_name).unwrap_or_else(|| exe_dir.join(web_dir_name));
+    let web_root = std::env::var_os("DEEPCODE_CLIENT_DIST").map(PathBuf::from)
+        .unwrap_or_else(|| runtime_locations().resources.join(web_dir_name));
     let requested = uri_path.trim_start_matches('/');
     let relative = if requested.is_empty() {
         "index.html"
@@ -925,9 +956,7 @@ fn spawn_host_processes_if_available(
             })?;
     let daemon_dir = parent_dir(&daemon_path).unwrap_or_else(|| exe_dir.clone());
     let proxy_dir = parent_dir(&proxy_path).unwrap_or_else(|| exe_dir.clone());
-    let config_root = std::env::var_os("DEEPCODE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| package_root(&exe_dir).unwrap_or_else(|| daemon_dir.clone()));
+    let config_root = runtime_locations().config.clone();
 
     let shared_start_guard = deepcode_host_connection::HostStartGuard::acquire(&config_root)
         .map_err(|error| {
@@ -972,12 +1001,8 @@ fn spawn_host_processes_if_available(
         host_tokens.instance_id = connection.identity.instance_id.clone();
     }
 
-    let web_dir = std::env::var("DEEPCODE_CLIENT_DIST")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            find_bundled_dir(&exe_dir, "web-deepcode-gui")
-                .unwrap_or_else(|| proxy_dir.join("web-deepcode-gui"))
-        });
+    let web_dir = std::env::var_os("DEEPCODE_CLIENT_DIST").map(PathBuf::from)
+        .unwrap_or_else(|| runtime_locations().resources.join(APP_ASSET_DIR));
 
     let (mut daemon, daemon_identity) = if let Some(connection) = shared {
         if !matches!(
@@ -1019,6 +1044,7 @@ fn spawn_host_processes_if_available(
             .env("DEEPCODE_HOST", &target.host)
             .env("DEEPCODE_PORT", &target.daemon_port)
             .env("DEEPCODE_CONFIG_DIR", config_root)
+            .env("DEEPCODE_RUNTIME_DIR", &runtime_locations().resources)
             .env_remove(HOST_UI_TOKEN_ENV)
             .env(HOST_SHELL_TOKEN_ENV, host_tokens.daemon_token())
             .env(deepcode_host_connection::HOST_LIFETIME_ENV, "automatic")
@@ -1291,7 +1317,8 @@ fn configured_or_bundled_file(
             .then_some(path)
             .filter(|path| path.is_file());
     }
-    find_bundled_file(exe_dir, bundled_name)
+    let path = exe_dir.join(bundled_name);
+    path.is_file().then_some(path)
 }
 
 fn startup_mode() -> &'static str {
@@ -1349,13 +1376,7 @@ fn startup_stopped_failure() -> HostStartupFailure {
 }
 
 fn prepare_host_startup_diagnostics(attempt_id: &str) -> std::io::Result<HostDiagnosticAttempt> {
-    let base = if let Some(config_root) = std::env::var_os("DEEPCODE_CONFIG_DIR") {
-        PathBuf::from(config_root)
-    } else {
-        let exe_dir = current_exe_dir()
-            .ok_or_else(|| std::io::Error::other("desktop executable directory is unavailable"))?;
-        package_root(&exe_dir).unwrap_or_else(|| std::env::temp_dir().join("deepcode-gui"))
-    };
+    let base = &runtime_locations().config;
     let root = base.join("diagnostics").join("host-startup");
     let directory = root.join(attempt_id);
     std::fs::create_dir_all(&directory)?;
@@ -1811,39 +1832,6 @@ fn current_exe_dir() -> Option<PathBuf> {
 
 fn parent_dir(path: &Path) -> Option<PathBuf> {
     path.parent().map(Path::to_path_buf)
-}
-
-fn find_bundled_file(exe_dir: &Path, name: &str) -> Option<PathBuf> {
-    bundled_candidates(exe_dir, name)
-        .into_iter()
-        .find(|path| path.is_file())
-}
-
-fn find_bundled_dir(exe_dir: &Path, name: &str) -> Option<PathBuf> {
-    bundled_candidates(exe_dir, name)
-        .into_iter()
-        .find(|path| path.is_dir())
-}
-
-fn bundled_candidates(exe_dir: &Path, name: &str) -> Vec<PathBuf> {
-    let mut candidates = vec![exe_dir.join(name)];
-    if cfg!(target_os = "macos") {
-        if let Some(contents_dir) = exe_dir.parent() {
-            candidates.push(contents_dir.join("Resources").join(name));
-        }
-    }
-    candidates
-}
-
-fn package_root(exe_dir: &Path) -> Option<PathBuf> {
-    if cfg!(target_os = "macos") {
-        return exe_dir
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .map(Path::to_path_buf);
-    }
-    Some(exe_dir.to_path_buf())
 }
 
 fn kernel_binary_name() -> &'static str {
