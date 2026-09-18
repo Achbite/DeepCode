@@ -1,314 +1,96 @@
 # DeepCode
 
-当前产品版本：**0.6.1**。
+**0.6.2** · [English](README.md)
 
-> English guide: [README.md](README.md)
+## 快速使用
 
-DeepCode 是一个本地优先的编码 Agent 框架。DeepCode-GUI、CLI 和 TUI 共用同一个本地 Session Runtime、Kernel 与 `SessionProjection`，界面差异只体现在渲染粒度和交互方式。
+从 [Releases](https://github.com/Achbite/DeepCode/releases) 下载对应平台的程序包，解压后打开 GUI：
 
-“本地优先”表示工作区访问、Session journal、共享投影、工具执行和工具记录都保存在本机。除非使用 Ollama 等本地 Provider，否则提示词和 Agent 选取的上下文仍会发送到你配置的模型服务。
+| 平台 | 启动方式 |
+| --- | --- |
+| macOS Apple Silicon | `open DeepCode-GUI.app` |
+| Windows x64 | `DeepCode-GUI.exe` |
+| Linux x64 / ARM64 | `./DeepCode-GUI` |
 
-## 核心工作方式
+在 **设置 → 模型与服务** 中添加 API 连接，或登录支持的 Coding Plan。新建对话、选择模型，即可描述任务。项目菜单中的 **管理工作区** 用于配置文件夹和执行环境；Windows 项目可以选择本地 Shell 或 WSL。
 
-一次任务沿着一条简单链路运行：
-
-```text
-用户输入
-  -> Session 中唯一的 Agent Loop
-  -> Provider 返回 typed turn 文本增量或原生工具调用
-  -> Session 按 turn 生命周期记录叙述、答案、交互或 Plan 事实
-  -> 按当前工作区权限策略选择是否等待完整 Plan 确认
-  -> Kernel 以同一 PreparedEffect 授权、执行并记录
-  -> Session 继续循环并生成共享投影
-  -> UI / CLI / TUI 渲染同一份事实
-```
-
-- Session 负责 Agent Loop、上下文、Provider 生命周期、journal 和共享投影。
-- Kernel 负责受控工具目录、`PreparedEffect`、真实副作用边界，以及 Session 保留期间不可变的工具结果记录。
-- Host 只负责本地装配、进程、传输和配置，不推进 Agent 业务语义。
-- UI 只提交命令并消费 `SessionProjection`，不维护另一套任务状态或执行事实。
-- Skill 与 MCP 以插件贡献接入组合，不产生第二个 Agent Loop。
-
-DeepCode 不包含 Requirement、Plan、Review 等并行工作流引擎。普通叙述和最终回答是 LLM 的原生 Markdown 正文；Session 只依据 typed Provider turn 是否包含工具调用来区分两者，并把当前 run 的文本增量作为可丢弃 `assistantDraft` 投影给所有界面。Plan 与 interaction 只能由 LLM 调用 Session 保留的结构化 control 工具产生，不使用 JSONL 正文封装、自然语言推断或失败回退。`plan.publish` 发布一份完整 revision；`plan.respond(confirm)` 只为精确的 workspace、operation 和 normalized targets 提交 session-scoped authority，并从 Plan 步骤原子生成 Todo。修订请求保留同一 Plan identity 并递增 revision，取消则不生成 authority 或 Todo。已确认的 Plan/Todo 会跨普通补充输入和后续 run 保留，直到显式 Plan lifecycle 事实将其 supersede、complete、cancel 或 invalidate。
-
-Session binding 始终把工作区工具限制在当前 run 的不可变目录快照内。`agent.permissions.workspaceMutation` 默认是 `plan`；改为 `allow` 会关闭工作区修改的 Plan admission 门禁，包括声明 `workspaceMode=write` 的 `bash` 调用。所选 Shell 工具（`bash` 或 `powershell`）从绑定工作区执行一条有界命令，并强制声明 `workspaceMode` 与 `executionScope`。`executionScope=workspace` 使用工作区沙箱：read 模式只可写 Kernel 持有的临时存储，write 模式需要精确的工作区修改 authority；平台适配分别使用 macOS sandbox-exec、Linux/WSL2 Bubblewrap 和需要初始化的原生 Windows 工作区支持；缺少条件时明确返回错误，详见[执行环境说明](docs/product/execution-environments.md)。`executionScope=host` 使用宿主用户环境，并额外要求 `agent.permissions.external`；若 Host 命令会修改工作区，必须声明 write 模式，因此同时需要工作区修改与 external authority。可选的 `terminal.stdin` 会向一次性临时 PTY 精确写入一次；未声明时 stdin 关闭，不创建可持续复用的 terminal session。命令从绑定工作区根目录启动，PATH 由 Host PATH 与现有标准开发工具目录组成；每次 attempt 只持有并回收自己创建的子进程组、PTY 与临时文件。退出码为零生成 completed ToolRecord；非零退出或超时生成 failed ToolRecord，并保留有界输出和退出事实。网络读取默认 `allow`；Host Bash 与外部 effect 工具使用独立 external 权限。`web.search` 与 `web.fetch` 保持为通用核心联网工具，GitHub、arXiv 与 PDF 专用工作流通过 Skill 或插件按需激活。`agent.permissions.engineeringDecisions` 独立控制实质工程路线不明确时通过 `interaction.request` 询问，还是委托 Agent 依据当前代码事实自行裁决。
-
-## 选择界面
-
-
-| 界面           | 适合场景           | 入口                                      |
-| ------------ | -------------- | --------------------------------------- |
-| DeepCode-GUI | 专注的本地 Agent 对话 | `DeepCode-GUI.app` 或 `DeepCode-GUI.exe` |
-| CLI          | 一次性任务、脚本和终端工作流 | `DeepCode-CLI.command` 或 `deepcode-cli` |
-| TUI          | 持续的交互式终端对话     | `DeepCode-TUI.command` 或 `deepcode-tui` |
-
-
-DeepCode-GUI 提供 Agent 对话、附件、只读文件查看和变更预览；TUI 提供终端交互，CLI 用于任务、自动化与诊断。独立 Editor 已退役，编辑能力后续由 VS Code 插件承接。
-
-只要使用同一配置根，三个界面就会读取同一批模型配置、Session journal、Kernel 工具记录和共享投影。
-
-## macOS 快速开始
-
-已有本地包时：
+同一程序包也提供终端入口：
 
 ```bash
-open bin/macos-arm64/DeepCode-GUI.app
+# Linux 示例；macOS 使用 DeepCode-CLI.command / DeepCode-TUI.command，
+# Windows 使用 deepcode-cli.bat / deepcode-tui.bat。
+./deepcode-cli connections
+./deepcode-cli auth login openai-codex browser
+./deepcode-cli ask -C /path/to/project "分析一下这个项目"
+./deepcode-tui -C /path/to/project
 ```
 
-终端入口：
+`-C` 显式选择工作目录；省略时创建独立对话，使用 `--session <id>` 可以继续已有对话。更多命令见 `--help`，连接与订阅配置见 [模型与服务](docs/product/model-services.md)。
+
+GUI 支持向消息附加文件或文件夹、查看产物和 diff，以及让 Agent 打开 HTML 预览。浏览器批注仅通过工具栏按钮或 Esc 退出。新对话继承上次选择的模型及该模型记住的推理强度。重载界面使用 macOS 的 **Cmd+Shift+R**，其他平台使用 **Ctrl+Shift+R**。
+
+Windows GUI 需要 WebView2 Evergreen Runtime，Linux GUI 需要 GTK/WebKitGTK。macOS 程序包使用 ad-hoc 签名，详见 [程序包说明](docs/distribution.md)。
+
+## 从源码编译
+
+先安装 Docker 和 GNU Make。Windows 请在已启用 Docker 集成的 WSL2 中运行构建命令。打包 macOS 还需要宿主机的 Xcode Command Line Tools、`rust-toolchain.toml` 指定的 Rust 工具链和 Node.js。
 
 ```bash
-cd bin/macos-arm64
-./DeepCode-TUI.command -C /path/to/project
-./DeepCode-CLI.command --help
-```
-
-从源码生成本地包：
-
-```bash
-bash ./build.sh
-```
-
-脚本默认尝试 Linux、Windows、macOS 全平台打包，缺少支持环境的平台会标记为跳过；`make build` 使用同一入口。前端和 Session 资源在 Docker 内从源码构建，Darwin 原生 Rust／Tauri 打包在宿主执行。
-
-输出位于 `bin/macos-arm64/`：一个完整的 `DeepCode-GUI.app`、两个 CLI/TUI 启动器和必要说明。所有运行内容只保存一份，启动器引用 App 内程序。另生成 `bin/DeepCode-<版本>-macos-arm64.tar.gz`。已有配置与会话目录保留，但不进入新压缩包。
-
-macOS 包使用 ad-hoc 签名。详细布局、缓存和资源更新规则见[分发说明](docs/distribution.md)。
-
-## Linux 与 Windows 包
-
-在 WSL/Linux 上直接执行相同命令，脚本会自动通过唯一的 `deepcode-dev` 容器构建 Linux 和 Windows 产物：
-
-```bash
-bash ./build.sh
-```
-
-无需指定阶段。`make build` 和 `--stage package` 使用相同的平台选择。
-
-每次构建都会调用所选产品及其依赖的源码构建步骤。Cargo、sccache、Docker 层和依赖存储只用于加速；已有 `dist` 或阶段标记不能替代编译。打包入口也会先构建输入，再组装分发目录。
-
-需要交互调试时（Windows 请先进入 WSL）：
-
-```bash
+git clone https://github.com/Achbite/DeepCode.git
+cd DeepCode
 make shell
-bash ./build.sh
 ```
 
-`make shell` 会向容器传入宿主平台，并在 Mac 上准备原生打包服务。容器内执行 `build.sh` 仍会尝试全部三个平台；缺少支持环境时跳过，已开始构建后失败则报告失败并返回非零退出码。
+`make shell` 准备开发容器；macOS 上还会启动当前 worktree 的原生构建通道。在容器中执行下列命令，或保持容器运行后从宿主机执行：
 
-每次入口都会通过 Docker 缓存重新求值 `Dockerfile.dev`。若源码挂载、开发镜像或端口发生变化，工具只重建固定名称的 `deepcode-dev` 容器并保留依赖/编译缓存；不再存在分支专用容器或 `DEEPCODE_WORKTREE_ID`。只想重建容器时执行：
+| 目标平台 | 编译命令 | 输出目录 |
+| --- | --- | --- |
+| macOS Apple Silicon | `bash ./build.sh --stage package-macos` | `bin/macos-arm64/` |
+| Windows x64 | `bash ./build.sh --stage package-windows` | `bin/win64/` |
+| Linux，与容器架构一致 | `bash ./build.sh --stage package-linux` | `bin/linux-x64/` 或 `bin/linux-arm64/` |
+| 所有可用平台 | `bash ./build.sh` | 上述受支持平台的目录 |
+
+共享 TypeScript、GUI、Linux 程序和 Windows 交叉编译都在 Docker 中执行。macOS 原生编译与签名通过通道交给 Mac 宿主。不可用的平台会明确列出，构建错误仍会返回失败。每个平台也会在 `bin/` 生成带版本号的压缩包；已有用户配置和会话会保留，且不会进入压缩包。
+
+只更新已有程序包的前端：
 
 ```bash
-make reset-dev
-```
-
-Rust 开发版本由 `rust-toolchain.toml` 统一指定为 1.88.0；workspace 的最低版本合同是 1.86，满足当前锁文件中依赖的实际要求。
-
-产物写入：
-
-```text
-bin/linux-x64/
-bin/linux-arm64/
-bin/win64/
-```
-
-WSL/Linux 构建的 Linux 目录与开发容器的真实架构一致：amd64 使用 `linux-x64`，arm64 使用 `linux-arm64`。具备支持环境时生成其中一种 Linux 架构、`win64` 和 `macos-arm64`。可以用 `--stage package-linux`、`--stage package-windows`、`--stage package-macos` 单独选择平台。
-
-Linux 启动方式：
-
-```bash
-cd bin/linux-x64
-./DeepCode-GUI
-```
-
-ARM64 Linux 产物改用 `bin/linux-arm64`。
-
-Linux GUI 直接打开原生窗口。Windows 可打开 `DeepCode-GUI.exe`；目标系统需要 Microsoft Edge WebView2 Evergreen Runtime。
-
-## 独立更新前端
-
-纯界面修改可以单独构建 GUI，复用现有 Kernel、Session runtime 和原生程序：
-
-```bash
-make ui
-python3 scripts/update-ui.py --package bin/macos-arm64
-# 合并为一个命令：
 make ui-update UI_PACKAGE=bin/macos-arm64
 ```
 
-`make ui` 在 Docker 内准备依赖、编译共享 TypeScript、检查 GUI 类型并运行一次 Vite，输出 `bin/ui/web-deepcode-gui`，不编译 Rust。更新脚本完整替换指定包内唯一 GUI 目录，Windows/Linux 可指定 `bin/win64` 或对应 Linux 目录，macOS 可指定 App 本身。
+其他平台替换为 `bin/win64` 或对应 Linux 目录。macOS 资源更新在宿主机运行以完成签名，随后重载界面。后端发生变化时仍需构建对应服务或程序包。详见 [分发与构建说明](docs/distribution.md)。
 
-macOS 更新在宿主执行并重新签名。完成后关闭再打开窗口；用户配置、历史会话和原生程序保留。开发模式使用 Vite HMR；Session TypeScript 需编译为 JS，更新后受控重启 Host，不热换活动 Agent Loop。
+## 产品介绍
 
-此入口适用于既有 Host / Session 接口下的页面、样式和渲染修改。新增后端接口或工具执行能力仍需正常构建相应服务；本次文档工具和资源 API 首次安装也需要包含这些服务的完整版本。
+DeepCode 是优先在本机工作的编程 Agent，提供桌面 GUI、用于脚本的 CLI 和交互式 TUI。三种入口共享对话、工具记录、模型连接和权限设置。
 
-UI 插件支持在窗口内热替换。在 <strong>设置 → 插件 → 界面插件</strong> 添加本地目录，保存入口代码后只更新对应展示区域；首批插槽覆盖正文、文档预览和主题，不开放 Session、Provider 或底层工具端口。见[插件接口与示例](docs/product/ui-plugins.md)。
+- **处理项目任务：** 读取和修改文件、搜索代码、执行 Bash 或 PowerShell、检查 diff。工作区访问和外部操作遵循配置的权限策略。
+- **预览并持续修改：** 通过截图和页面交互检查内置浏览器，选取元素或区域批注，在同一对话中继续修改。原始附件保持只读，可编辑副本可以放在 DeepCode 管理的会话目录中。
+- **使用模型服务：** API 连接与订阅服务分别配置和查看用量。Provider 返回的 Token、缓存计数与上下文估算分开呈现。
+- **扩展工具与界面：** 通过 Skill、CLI 工具、MCP 和 UI 插件扩展能力。Agent 可以发现并激活可用插件，用户也可以显式引用。外部电脑控制目前支持 macOS，每次调用需要额外授权。
+- **生成与阅读文档：** 生成 HTML、Markdown、PDF 产物并在界面中预览。PDF 生成需要安装 [文档运行环境](skills/deepcode-documents/SKILL.md)。
 
-## 文档排版与预览
+工作区数据、会话日志和工具执行保留在本机。选中的提示词、上下文和图片会发送给配置的模型服务；如果模型服务也在本机运行，则无需发送到远程 Provider。
 
-内置 [deepcode-documents Skill](skills/deepcode-documents/SKILL.md) 在用户要求美化、排版或导出文档时按需读取，包含来自 Kami 排版思路的设计参考、HTML 模板和格式说明。普通对话不自动导出文件。可以直接要求 Agent：
+Session 负责 Agent Loop 和会话状态，Kernel 负责工具与执行权限，GUI、CLI、TUI 展示共享结果。具体说明见：
 
-> 把这份分析排成简洁的中文报告，输出 HTML、PDF 和 Markdown，保存在当前工作区。
+- [模型、订阅与用量](docs/product/model-services.md)
+- [Shell、工作区环境与权限](docs/product/execution-environments.md)
+- [运行管理与本地数据](docs/product/operations.md)
+- [Computer Use](plugins/computer-use/README.md) · [UI 插件](docs/product/ui-plugins.md)
 
-`document.render` 使用现有工作区写入权限和 Plan 范围，成功写入后才把真实产物交给 Session 投影。HTML / Markdown 无额外生成依赖；PDF 将自包含 HTML 交给 WeasyPrint。到“设置 → 插件 → 文档排版”指定安装了 [WeasyPrint](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html) 的 Python 路径；Python 依赖范围见 [requirements.txt](skills/deepcode-documents/scripts/requirements.txt)。开发容器已提供该环境。原生使用环境需自行具备对应平台的 WeasyPrint 运行依赖，配置错误会保留原错误，不覆盖已有文件。
+## 开发检查
 
-点击 GUI 的产物或消息中的工作区链接可预览文档：HTML 在独立静态页面内显示，可切换源码；PDF 使用本地 PDF.js 阅读，支持翻页、缩放、文字选择和下载；Markdown 复用现有渲染器。读取 PDF 不依赖 Python，也不使用在线预览服务。输出 HTML 应内嵌图片、SVG 和样式，PDF 不执行 JavaScript；普通文本的分页读取保持原行为。
-
-## 配置模型
-
-首次运行任务前：
-
-1. 打开“设置 → 模型与服务”。
-2. 使用初始 DeepSeek Flash 模板，或添加 OpenAI-compatible、Responses、Anthropic、Ollama profile。
-3. 填写 Provider 所需的 API key，按需要调整 Base URL 和模型名。
-4. 启用 profile，在该模型自己的配置卡内点击“保存模型”；保存和探测操作分别归属各模型。
-5. 在对话中选择模型，共享配置会记住该选择并作为新对话默认值；也可以直接在设置中调整默认模型。
-
-打包产物不会包含你的 API key。密钥保存在当前配置根的本地 secret store；不要分享该目录。
-
-对于要求在工具续轮中回传思考字段的 Provider，Session 只在当前 run 的内存中暂存并随同一 Provider 调用链回传该字段；它不会进入 Session journal、共享投影或界面叙述。用户可见的中间过程仍只来自模型的普通 Markdown 正文和结构化工具活动。
-
-## GUI 使用流程
-
-1. 可以直接开始独立对话，也可以新建项目并附加一个或多个本地文件夹。
-2. 项目的有序文件夹列表只作为新 Session 的模板；Session 创建后保留不可变的 creation snapshot，项目变化只影响之后创建的 Session。
-3. 输入框在同一个附件区附加文件或文件夹。文件作为该条消息的不可变内容快照保存；文件夹不复制内容，而是作为该条消息的逻辑目录引用保存，只进入由该消息启动的 run 目录快照，模型通过 `fs.list`、`fs.glob`、`code.grep` 和 `fs.read` 自主探索。
-4. 消息中的文件夹引用会永久随原消息展示，但不会改写 Session 或 Project 的持久目录索引。CLI/TUI 的显式 `attach-directory`/`/attach` 仍管理 Session 目录索引，只影响随后启动的 run，且不会静默写回项目模板。
-5. 输入希望 Agent 完成的编码任务。独立 Session 可以保持无 binding，直到确实需要访问文件夹。
-6. Agent 在 Provider 与工具循环运行时，将当前 typed turn 的 LLM 文本增量作为共享 `assistantDraft` 投影；turn 闭合后再提交为叙述或终答。
-7. Agent 发布 Plan 后，在可折叠 Plan 卡中审阅完整步骤和 mutation manifest；可以确认、用自由文本请求修订或取消。确认后卡片自动折叠但不会被删除，同时原子生成 Todo。若工作区修改策略设为 `allow`，Agent 可以在绑定工作区内直接工作，不必为了权限门禁发布 Plan。
-8. 对话中仍可切换模型，新的 profile 从后续 Provider turn 起生效；新对话默认使用上次选择的模型。
-9. 消息、Plan、activities、产物、上下文用量和 run 状态都来自同一份共享投影。
-10. 已提交的 Assistant 回答可以复制、赞、踩或清除反馈。操作栏在消息悬停或键盘聚焦时显示，鼠标移出后隐藏。赞踩是本地 Session 持久事实，重启后可恢复，不会由 GUI 私存，也不会发送给 Provider。
-11. 点击输入框中的上下文球可以查看当前 Provider 请求的上下文分区。分区条目数和估算取 Session，缓存命中/未命中取 Provider；缺失显示 `N/A`，GUI/TUI 不自行归因或重算。设置页显示由 Session 汇总、按新到旧排列的逐轮 Token 消耗（每页 10 条）。
-12. 复杂任务由 LLM 通过 `plan.publish` 发布完整 Plan；用户确认时 Session 从 Plan 步骤原子生成 Todo，后续 `plan.progress` 只能更新已生成条目的状态。右侧任务面板只消费该共享投影，不把工具调用或 GUI 推断伪装成任务。工具调用仍与叙述按 Session 时间线交错显示在主对话区。
-
-拖动项目可以调整项目顺序，拖动同一分组内的对话可以调整对话顺序。排序保存在用户设置中，重新打开后继续生效；排序不会改变对话所属项目或 Session 事实。
-
-删除 Session 会同时删除对话 Catalog 条目及其完整归档：Session events、command replay、binding 关系和 Kernel ToolRecord。活动 run 必须先停止。
-
-## CLI
-
-以下示例使用 macOS launcher；Linux 将入口替换为 `./deepcode-cli`。
+在 `make shell` 中执行：
 
 ```bash
-./DeepCode-CLI.command status
-./DeepCode-CLI.command ask "解释一个不需要工作区的编码问题"
-./DeepCode-CLI.command ask -C /path/to/project "分析并修复当前构建错误"
-./DeepCode-CLI.command chat -C /path/to/project
-./DeepCode-CLI.command show --session <session-id>
+bash ./test.sh required   # Rust 格式/测试、共享 TS、GUI 合同/类型、构建行为
+bash ./test.sh cli        # 另加 CLI → Session → Kernel 链路
+bash ./test.sh full       # 另加终端/Web 壳及文档产出检查
 ```
 
-继续已有 Session 或回应等待中的 Plan：
+`bash ./test.sh static` 检查 Shell 语法和 Git 空白差异，可在宿主机运行。端到端脚本使用本地 fixture Provider，不替代真实模型或原生 GUI 验收。原生 GUI 测试使用独立 Cargo workspace：`shells/deepcode-gui/src-tauri/Cargo.toml`。
 
-```bash
-./DeepCode-CLI.command ask --session <session-id> 1
-./DeepCode-CLI.command ask --session <session-id> "调整目标后重新给出 Plan"
-./DeepCode-CLI.command cancel-plan --session <session-id>
-./DeepCode-CLI.command model --session <session-id> <profile-id>
-./DeepCode-CLI.command cancel --session <session-id> <run-id>
-./DeepCode-CLI.command attach-directory --session <session-id> /path/to/folder
-./DeepCode-CLI.command detach-directory --session <session-id> <workspace-id>
-```
+## 许可证
 
-只有显式 `-C` / `--workspace` 才会为新的 CLI Session 创建 binding，当前目录不会被隐式采用。Plan 等待时输入 `1`/`确认`确认完整 Plan，其他非空文本请求修订；`cancel-plan` 明确取消。`ask` 会等待 run 到达终态或需要用户决定；failed、cancelled 或 indeterminate 必须非零退出。CLI 只通过 `ConversationPort` 提交命令，不直接调用工具。
-
-## TUI
-
-```bash
-./DeepCode-TUI.command -C /path/to/project
-./DeepCode-TUI.command --session <session-id>
-```
-
-普通文本会提交到当前 Session。交互命令包括：
-
-- `/help`：显示命令提示。
-- `/show`：重新显示当前共享投影。
-- `/cancel-plan`：明确取消当前等待中的 Plan。
-- `/model <profile>`：切换后续 Provider turn 使用的 profile。
-- `/cancel`：取消活动 run。
-- `/attach <path>`：把文件夹作为 Session 目录索引附加。
-- `/detach <workspace-id>`：从后续 run 的有效目录集合中移除该对话目录索引。
-- `/clear`：刷新可见状态，不修改 durable Session。
-- `/quit`、`/exit`：退出 TUI。
-
-Plan 等待时输入 `1`/`确认`确认完整 Plan，其他非空文本作为修订反馈。`Esc` 明确取消等待中的 Plan；空输入、EOF 和 Ctrl-C 都不会取消。与 CLI 相同，只有显式 `-C` / `--workspace` 才为新 Session 创建 binding。
-
-## 本地数据
-
-默认配置根包含：
-
-```text
-config/user/local/settings/llm-profiles.json  模型 profiles
-config/user/local/settings/user-settings.json 用户设置
-config/user/local/secrets/                    本地密钥
-runtime/agent-runtime/catalog.sqlite3        Host 私有 project/workspace catalog
-runtime/agent-runtime/session.sqlite3        Session journal 与命令回放
-runtime/agent-runtime/tool-record.sqlite3    Kernel 工具结果记录
-logs/                                         launcher 或 Kernel 日志（产生时）
-```
-
-设置 `DEEPCODE_CONFIG_DIR` 可指定其他配置根。需要多个入口共享 Session 时，应让它们使用同一配置根。
-打包目录中的 `session-core/` 保存 Session Runtime 代码，不是对话归档。对话历史位于 `runtime/agent-runtime/session.sqlite3`。
-
-`contracts/agent-runtime/` 中的 `catalog.sql`、`session.sql` 与 `tool-record.sql` 是三个事实 owner 的当前建库合同。Runtime 只打开这一精确 schema，其他数据库版本直接拒绝；不存在迁移链或历史入口。详见 [contracts/agent-runtime/README.md](contracts/agent-runtime/README.md)。
-
-## 常见问题
-
-### 没有可用模型
-
-打开“设置 → 模型与服务”，填写所需 API key，在模型自己的配置卡内保存，然后选择已启用的模型。如果 Profile 文件无法读取，设置页会显示原始错误并提供明确的重新配置入口；有效配置保存前模型请求保持不可用，Session store 有效时已有对话仍可读取。
-
-### CLI/TUI 无法连接本地 Daemon
-
-先运行：
-
-```bash
-./DeepCode-CLI.command status
-```
-
-桌面壳和 launcher 通常会启动各自拥有的本地 Daemon。直接运行时可用 `--api` 连接已有实例，或用 `DEEPCODE_PORT` 修改默认端口。受保护的 Host API 需要壳持有的本地 token，不应使用无 token 的裸 `curl /api/health` 作为诊断方式。
-
-### 缺少 Session runtime
-
-使用完整打包产物，或在源码 checkout 中构建：
-
-```bash
-pnpm --filter @deepcode/session-core build
-```
-
-便携包必须保留 launcher 同目录下的 `session-core/`、Node runtime 和 protocol package。
-
-### 查看运行问题
-
-使用 CLI `status`、界面中的 API/Agent 状态和包内 `logs/`。Session 与工具事实保存在上述两个 SQLite 文件中，不存在另一套 UI 私有事实源。
-
-## 源码验证
-
-```bash
-bash ./test.sh static
-bash ./test.sh required
-bash ./test.sh full
-```
-
-`required` 和 `full` 在 `make shell` 容器中运行，并先准备当前 TypeScript 依赖产物；宿主执行会被拒绝。`static` 可在宿主运行，检查脚本语法、Git 空白错误和既有分层依赖规则。`required` 执行 Rust workspace 测试、TypeScript 检查及已登记的 Session／GUI 合同测试。`full` 额外构建 CLI／TUI、GUI Web 资源，并运行已有的本地 Provider fixture、工具执行和会话生命周期检查；它不认证真实 Provider、原生 GUI 交互或发布包。
-
-现有四项原生 GUI 生命周期测试属于独立 Cargo workspace。在受支持的原生构建环境中，显式入口为 `cargo test --manifest-path shells/deepcode-gui/src-tauri/Cargo.toml`；不属于默认 `required` 或 `full` profile。
-
-## 第三方说明与许可证
-
-详见 [NOTICE.md](NOTICE.md)、[ATTRIBUTION.md](ATTRIBUTION.md)、[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 [CITATION.cff](CITATION.cff)。
-
-DeepCode 使用 [MIT License](LICENSE)。
-
-## 执行环境、设置与扩展
-
-原生 Windows 自动选择优先使用 PowerShell 7，未安装时使用 Windows PowerShell 5.1；Git Bash 可选，WSL 按项目显式配置。系统、Shell 和已发现的开发命令作为稳定 Session 上下文保存，在环境边界刷新。Shell 选择与工作区沙箱可用性分别处理。
-
-设置按外观、Agent 行为、执行环境、工具权限、模型与服务、插件分类。插件页可以通过系统原生窗口选择 Skill 文件夹或 SKILL.md。附件保持统一的“文件和文件夹”入口，Skill 来源及打开工作区也使用统一选择窗口。取消选择不会改变已有引用。
-
-Todo 表示稳定开发阶段；新增文件或目录授权范围单独确认，保留阶段、验证条件与进度，需要改变方案本身时才修订完整 Plan。工具执行会显示真实开始状态及可用的 stdout/stderr 增量。阅读历史时保持当前位置，不因新消息强制跳回底部。
-
-应用自动启动的 Host 在最后一个客户端退出且任务结束后停止；通过 deepcode-cli start-host 显式启动的服务持续运行，使用 stop-host 停止。本机 Provider 流不设置 body 空闲超时和总时长上限，保留取消及原始错误，不自动重放中断请求。
-
-系统产品文档采用英文 Markdown，通过 doc.read 读取；工作流 Skill 通过 skill.read 读取。详情见[执行环境](docs/product/execution-environments.md)和[产品操作说明](docs/product/operations.md)。
+[MIT](LICENSE)。另见 [来源说明](ATTRIBUTION.md)、[第三方声明](THIRD_PARTY_NOTICES.md) 和 [引用信息](CITATION.cff)。
