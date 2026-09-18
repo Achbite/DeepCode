@@ -22,6 +22,7 @@ import type {
 import {
   SESSION_CONTROL_INTERACTION_REQUEST,
   SESSION_CONTROL_PLAN_PUBLISH,
+  SESSION_CONTROL_PLUGIN_ACTIVATE,
   SESSION_PROJECTION_VERSION,
 } from '@deepcode/protocol';
 
@@ -692,6 +693,11 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         ...next.activities[toolActivityId(event.callId)],
         interruption: { ...event.payload.error },
       };
+      break;
+    case 'session.plugins.activated':
+      assertRunningRun(next, event.runId, 'plugin_activation_run_not_active');
+      recordProviderCallFact(next, event.callId, event.runId, event.payload.providerCallId,
+        SESSION_CONTROL_PLUGIN_ACTIVATE, event.sequence);
       break;
     case 'session.control.rejected':
       next.activities = { ...next.activities };

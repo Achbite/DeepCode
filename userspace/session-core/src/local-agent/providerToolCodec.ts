@@ -31,6 +31,8 @@ export const CORE_TOOL_ORDER = [
   'browser.page',
   'browser.service',
   'browser.capture',
+  'browser.observe',
+  'computer.control',
 ] as const;
 
 export interface ProviderToolCodec {

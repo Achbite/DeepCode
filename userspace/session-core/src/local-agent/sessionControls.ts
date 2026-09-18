@@ -11,12 +11,14 @@ import {
   SESSION_CONTROL_INTERACTION_REQUEST,
   SESSION_CONTROL_PLAN_PUBLISH,
   SESSION_CONTROL_PLAN_PROGRESS,
+  SESSION_CONTROL_PLUGIN_ACTIVATE,
 } from '@deepcode/protocol';
 
 export interface SessionControlWireNames {
   interactionRequest: string;
   planPublish: string;
   planProgress: string;
+  pluginActivate: string;
 }
 
 export function confirmedPlanExecutionInstruction(): string {
@@ -26,11 +28,14 @@ export function confirmedPlanExecutionInstruction(): string {
 export function sessionControlInstructions(
   names: SessionControlWireNames,
   hasWorkspaceBindings = true,
+  hasPluginDiscovery = false,
 ): string {
+  const decisions = ` Ask for missing information or decisions with ${names.interactionRequest}; confirmation opens a panel and resumes this run after the answer. Correct rejected inputs; Kernel handles permission approval.`;
+  const plugins = hasPluginDiscovery ? ` Discover plugins when the task needs unlisted capabilities. ${names.pluginActivate} loads enabled plugins for this run; user mentions are optional guidance. Loading does not grant tool permissions. Call it alone, then use the new tools.` : '';
   if (!hasWorkspaceBindings) {
-    return `Explicit commentary is progress and may continue without calls; unphased text without calls is the final answer. ${names.interactionRequest} must be the only call in its turn. No workspace is bound to this run; do not invent a workspace handle or request workspace operations.`;
+    return `Explicit commentary is progress and may continue without calls; unphased text without calls is the final answer. ${names.interactionRequest} must be the only call in its turn. No workspace is bound to this run; do not invent a workspace handle or request workspace operations.${decisions}${plugins}`;
   }
-  return `Explicit commentary is progress and may continue without calls; unphased text without calls is the final answer. ${names.interactionRequest} and ${names.planPublish} must each be the only call in their turn. One ${names.planProgress} may accompany ordinary tool calls, reporting confirmed Todo progress from a tool result recordId already received before this turn; never anticipate results of calls in the same turn. Command counts do not determine step completion. Session Todo messages are chronological state updates; the latest update is current. Use a logical workspace handle from the Session binding list and workspace-relative paths; never invent or expose a workspaceId.`;
+  return `Explicit commentary is progress and may continue without calls; unphased text without calls is the final answer. ${names.interactionRequest} and ${names.planPublish} must each be the only call in their turn. One ${names.planProgress} may accompany ordinary tool calls, reporting confirmed Todo progress from a tool result recordId already received before this turn; never anticipate results of calls in the same turn. Command counts do not determine step completion. Session Todo messages are chronological state updates; the latest update is current. Use a logical workspace handle from the Session binding list and workspace-relative paths; never invent or expose a workspaceId.${decisions}${plugins}`;
 }
 
 const INTERACTION_SCHEMA: JsonObject = {
@@ -156,6 +161,7 @@ const PLAN_SCHEMA: JsonObject = {
 };
 
 export type SessionControlCall =
+  | { kind: 'pluginActivate'; callId: string; pluginUris: string[] }
   | {
       kind: 'planProgress';
       callId: string;
@@ -188,6 +194,14 @@ export interface PlanScopeExtension {
 
 export function sessionControlToolDefinitions(): readonly ProviderToolDefinition[] {
   return [
+    {
+      name: SESSION_CONTROL_PLUGIN_ACTIVATE,
+      description: 'Load installed, enabled plugins needed for the current task. Discover exact URIs with plugin search first. User mentions are optional and remain separate user guidance. This adds plugin tools/instructions to the next request in this run; it does not install, enable disabled plugins, change settings or authorize their effects. Must be the only call in its turn.',
+      inputSchema: { type: 'object', additionalProperties: false, required: ['pluginUris'], properties: {
+        pluginUris: { type: 'array', minItems: 1, maxItems: 16, uniqueItems: true,
+          items: { type: 'string', pattern: '^plugin://[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$' } },
+      } },
+    },
     {
       name: SESSION_CONTROL_INTERACTION_REQUEST,
       description: 'Ask the user for missing information or a required decision, then pause the run.',
@@ -227,8 +241,18 @@ export function decodeSessionControlCall(
     name !== SESSION_CONTROL_INTERACTION_REQUEST
     && name !== SESSION_CONTROL_PLAN_PUBLISH
     && name !== SESSION_CONTROL_PLAN_PROGRESS
+    && name !== SESSION_CONTROL_PLUGIN_ACTIVATE
   ) return null;
   const canonicalCallId = requiredIdentifier(callId, 'callId');
+  if (name === SESSION_CONTROL_PLUGIN_ACTIVATE) {
+    assertExactKeys(input, ['pluginUris']);
+    if (!Array.isArray(input.pluginUris) || input.pluginUris.length < 1 || input.pluginUris.length > 16
+      || input.pluginUris.some(uri => typeof uri !== 'string' || !/^plugin:\/\/[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(uri))
+      || new Set(input.pluginUris).size !== input.pluginUris.length) {
+      throw new SessionControlError('plugin_selection_invalid', 'pluginUris 必须包含 1 至 16 个不重复的已发现插件 URI。');
+    }
+    return { kind: 'pluginActivate', callId: canonicalCallId, pluginUris: input.pluginUris as string[] };
+  }
   if (name === SESSION_CONTROL_PLAN_PROGRESS) {
     assertExactKeys(input, ['sourceFactRef', 'updates']);
     if (!Array.isArray(input.updates) || input.updates.length < 1) {

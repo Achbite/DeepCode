@@ -45,6 +45,12 @@ pub struct PluginPickerEntry {
     pub already_selected: bool,
 }
 
+#[derive(Clone)]
+struct ModelPicker {
+    connection_id: Option<String>,
+    selected: usize,
+}
+
 pub struct TuiApp {
     client: HttpKernelClient,
     renderer: Renderer,
@@ -54,6 +60,9 @@ pub struct TuiApp {
     status: String,
     connection_error: Option<String>,
     next_message_profile_id: Option<String>,
+    model_connections: Option<deepcode_kernel_client::ModelConnections>,
+    model_profiles: Vec<deepcode_kernel_client::ModelProfile>,
+    model_picker: Option<ModelPicker>,
     plugin_catalog: Option<PluginCatalogProjection>,
     selected_plugins: Vec<PluginSelectionInput>,
     selected_mentions: Vec<SelectedMention>,
@@ -79,6 +88,9 @@ impl TuiApp {
             projection: None,
             input: String::new(),
             next_message_profile_id: None,
+            model_connections: None,
+            model_profiles: Vec::new(),
+            model_picker: None,
             plugin_catalog: None,
             selected_plugins: Vec::new(),
             selected_mentions: Vec::new(),
@@ -169,7 +181,7 @@ impl TuiApp {
                 self.tasks_open = false;
                 self.resource_preview = None;
                 self.detail_scroll = 0;
-                self.detail_preview = Some("DeepCode 命令\n\n@ 选择下一次请求的插件\n/tasks 查看任务\n/context 查看上下文\n/focus <task> 开始任务\n/model <profile> 选择后续请求的模型\n/attach <path> 附加目录\n/detach <workspace-id> 移除目录索引\n/open <workspace-id> <logical-path> 读取文件\n/next 继续读取\n/diff <record-id> <index> 查看修改\n/reasoning 开关推理详情\n/reasoning <request-id> 按需读取推理\n/cancel 取消运行\n/cancel-plan 取消计划\n/close 返回会话\n/clear 清空输入\n/show 查看会话信息\n/error 失败诊断与快照\n/decision 当前决策详情\n/tool <activity-id> 工具详情\n/quit 退出\n\nPgUp / PgDn 滚动当前视图；普通消息随时排队；/reply <答复> 回应交互或修订计划，/reply 1 确认计划。".into());
+                self.detail_preview = Some("DeepCode 命令\n\n@ 选择下一次请求的插件\n/tasks 查看任务\n/context 查看上下文\n/focus <task> 开始任务\n/model 选择连接和模型；/model <profile> 直接选择已配置模型\n/attach <path> 附加目录\n/detach <workspace-id> 移除目录索引\n/open <workspace-id> <logical-path> 读取文件\n/next 继续读取\n/diff <record-id> <index> 查看修改\n/reasoning 开关推理详情\n/reasoning <request-id> 按需读取推理\n/cancel 取消运行\n/cancel-plan 取消计划\n/close 返回会话\n/clear 清空输入\n/show 查看会话信息\n/error 失败诊断与快照\n/decision 当前决策详情\n/tool <activity-id> 工具详情\n/quit 退出\n\nPgUp / PgDn 滚动当前视图；普通消息随时排队；/reply <答复> 回应交互或修订计划，/reply 1 确认计划。".into());
             }
             "/show" => self.status = self.projection_label(),
             "/error" | "/decision" => {
@@ -233,8 +245,14 @@ impl TuiApp {
                 self.detach_directory(value.trim_start_matches("/detach ").trim())
                     .await
             }
+            "/model" | "/connection" => {
+                self.open_model_picker().await;
+            }
             value if value.starts_with("/model ") => {
-                self.select_model(value.trim_start_matches("/model ").trim())
+                self.open_model_picker().await;
+                if self.model_picker.is_some() {
+                    self.select_model(value.trim_start_matches("/model ").trim());
+                }
             }
             value
                 if value == "/focus"
@@ -375,13 +393,158 @@ impl TuiApp {
             .await;
     }
 
-    fn select_model(&mut self, profile_id: &str) {
-        if profile_id.is_empty() {
-            self.status = "用法：/model <profile>".to_string();
-            return;
+    async fn open_model_picker(&mut self) {
+        match tokio::try_join!(
+            self.client.model_connections(),
+            self.client.model_profiles()
+        ) {
+            Ok((connections, profiles)) => {
+                self.model_connections = Some(connections);
+                self.model_profiles = profiles.profiles;
+                self.plugin_picker = None;
+                self.model_picker = Some(ModelPicker {
+                    connection_id: None,
+                    selected: 0,
+                });
+                self.status = "选择连接 · ↑/↓ 移动 · Enter 选择 · Esc 返回".into();
+            }
+            Err(error) => {
+                self.model_picker = None;
+                self.status = format!("模型目录读取失败：{error}");
+            }
         }
-        self.next_message_profile_id = Some(profile_id.to_string());
-        self.status = format!("后续普通消息将提交模型 Profile {profile_id}；当前 run 不变。");
+    }
+
+    fn select_model(&mut self, profile_id: &str) {
+        let Some(profile) = self
+            .model_profiles
+            .iter()
+            .find(|p| p.id == profile_id && p.parameters.enabled)
+        else {
+            self.status = "所选模型不存在或未启用。".into();
+            return;
+        };
+        let connection_name = self
+            .model_connections
+            .as_ref()
+            .and_then(|c| {
+                c.connections
+                    .iter()
+                    .find(|c| c.connection.id == profile.connection_id)
+            })
+            .map(|c| c.connection.name.as_str())
+            .unwrap_or(&profile.connection_id);
+        self.next_message_profile_id = Some(profile_id.into());
+        self.status = format!(
+            "下次请求：{connection_name} / {}；当前 run 不变。",
+            profile.parameters.name
+        );
+        self.model_picker = None;
+    }
+
+    pub fn model_picker_open(&self) -> bool {
+        self.model_picker.is_some()
+    }
+    pub fn model_picker_title(&self) -> &str {
+        if self
+            .model_picker
+            .as_ref()
+            .is_some_and(|p| p.connection_id.is_some())
+        {
+            "选择模型"
+        } else {
+            "选择连接"
+        }
+    }
+    pub fn model_picker_entries(&self) -> Vec<(String, String, bool)> {
+        let Some(picker) = &self.model_picker else {
+            return vec![];
+        };
+        let entries: Vec<(String, String)> = if let Some(id) = &picker.connection_id {
+            self.model_profiles
+                .iter()
+                .filter(|p| &p.connection_id == id && p.parameters.enabled)
+                .map(|p| {
+                    (
+                        p.id.clone(),
+                        format!("{} · {}", p.parameters.name, p.parameters.model),
+                    )
+                })
+                .collect()
+        } else {
+            self.model_connections
+                .as_ref()
+                .map(|catalog| {
+                    catalog
+                        .connections
+                        .iter()
+                        .map(|c| {
+                            (
+                                c.connection.id.clone(),
+                                format!(
+                                    "{} · {} · {}",
+                                    c.connection.name,
+                                    if c.connection.billing_mode == "subscription" {
+                                        "Coding Plan"
+                                    } else {
+                                        "API"
+                                    },
+                                    match c.auth_status.as_str() {
+                                        "ready" => "可用",
+                                        "needsLogin" => "待登录",
+                                        _ => "未配置",
+                                    }
+                                ),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, (id, label))| (id, label, i == picker.selected))
+            .collect()
+    }
+    pub fn model_picker_move(&mut self, delta: isize) {
+        let count = self.model_picker_entries().len();
+        if let Some(picker) = &mut self.model_picker {
+            if count > 0 {
+                picker.selected =
+                    (picker.selected as isize + delta).rem_euclid(count as isize) as usize;
+            }
+        }
+    }
+    pub fn model_picker_select(&mut self) {
+        let Some(picker) = self.model_picker.clone() else {
+            return;
+        };
+        let Some((id, _, _)) = self.model_picker_entries().get(picker.selected).cloned() else {
+            return;
+        };
+        if picker.connection_id.is_none() {
+            self.model_picker = Some(ModelPicker {
+                connection_id: Some(id),
+                selected: 0,
+            });
+        } else {
+            self.select_model(&id);
+        }
+    }
+    pub fn model_picker_back(&mut self) {
+        if self
+            .model_picker
+            .as_ref()
+            .is_some_and(|p| p.connection_id.is_some())
+        {
+            self.model_picker = Some(ModelPicker {
+                connection_id: None,
+                selected: 0,
+            });
+        } else {
+            self.model_picker = None;
+        }
     }
 
     async fn cancel_run(&mut self) {

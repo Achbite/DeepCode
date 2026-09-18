@@ -178,7 +178,9 @@ async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
                         false
                     }
                     KeyCode::Esc => {
-                        if app.plugin_picker_open() {
+                        if app.model_picker_open() {
+                            app.model_picker_back();
+                        } else if app.plugin_picker_open() {
                             app.dismiss_plugin_picker();
                         } else {
                             app.clear_input();
@@ -190,7 +192,10 @@ async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
                         true
                     }
                     KeyCode::Enter => {
-                        if app.plugin_picker_open() && app.plugin_picker_select() {
+                        if app.model_picker_open() {
+                            app.model_picker_select();
+                            true
+                        } else if app.plugin_picker_open() && app.plugin_picker_select() {
                             true
                         } else {
                             let input = app.take_input();
@@ -198,11 +203,21 @@ async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
                         }
                     }
                     KeyCode::Tab => {
-                        if app.plugin_picker_open() {
+                        if app.model_picker_open() {
+                            app.model_picker_select();
+                        } else if app.plugin_picker_open() {
                             app.plugin_picker_select();
                         } else {
                             app.push_input('\t');
                         }
+                        true
+                    }
+                    KeyCode::Up if app.model_picker_open() => {
+                        app.model_picker_move(-1);
+                        true
+                    }
+                    KeyCode::Down if app.model_picker_open() => {
+                        app.model_picker_move(1);
                         true
                     }
                     KeyCode::Up if app.plugin_picker_open() => {

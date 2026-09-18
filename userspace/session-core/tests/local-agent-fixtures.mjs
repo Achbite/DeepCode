@@ -52,6 +52,11 @@ export function fakeRunPreparation(options = {}) {
           reasoningEffort: request.reasoningEffortOverride ?? options.reasoningEffort,
           reasoningEffortOverride: request.reasoningEffortOverride,
         });
+        snapshot.selectedPlugins.plugins = (request.pluginSelections ?? []).map(selection => ({
+          uri: selection.uri, pluginArtifactRef: `artifact:${selection.uri}`,
+          pluginInstanceRef: `instance:${selection.uri}`, extensionGenerationRef: snapshot.extensionGenerationRef,
+          capabilityRefs: [],
+        }));
         snapshots.push(structuredClone(snapshot));
         return { runtimeSnapshot: snapshot };
       },

@@ -34,6 +34,7 @@ import {
   SESSION_CONTROL_INTERACTION_REQUEST,
   SESSION_CONTROL_PLAN_PUBLISH,
   SESSION_CONTROL_PLAN_PROGRESS,
+  SESSION_CONTROL_PLUGIN_ACTIVATE,
 } from '@deepcode/protocol';
 import { createProviderToolAliases } from './providerToolCodec.js';
 import { LoopFailure, errorFact } from './loopFailure.js';
@@ -444,6 +445,7 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
             interactionRequest: wireName(SESSION_CONTROL_INTERACTION_REQUEST),
             planPublish: wireName(SESSION_CONTROL_PLAN_PUBLISH),
             planProgress: wireName(SESSION_CONTROL_PLAN_PROGRESS),
+            pluginActivate: wireName(SESSION_CONTROL_PLUGIN_ACTIVATE),
           })],
           tools,
           toolPromptContributions: toolPromptContributions as PreparedToolPromptContribution[],

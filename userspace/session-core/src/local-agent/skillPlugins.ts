@@ -70,6 +70,7 @@ export function runtimeInstructions(
     interactionRequest: 'interaction_request',
     planPublish: 'plan_publish',
     planProgress: 'plan_progress',
+    pluginActivate: 'plugin_activate',
   },
 ): readonly InstructionContribution[] {
   const workspaceAutonomyInstruction = config.workspaceMutation === 'allow'
@@ -86,7 +87,7 @@ export function runtimeInstructions(
     },
     ...config.selectedPlugins.map((plugin) => ({
       id: `plugin.${instructionId(plugin.uri)}`,
-      text: `The \`${plugin.displayName}\` plugin is activated for this request by structured user input.
+      text: `The \`${plugin.displayName}\` plugin is loaded for this request. User mentions and Agent-requested activation are independent ways to select capabilities.
 
 Available capabilities:
 ${plugin.capabilitySummary}

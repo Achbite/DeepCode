@@ -37,7 +37,7 @@ export function environmentInstruction(value: unknown): RunRuntimeSnapshot['inst
   }
   return {
     id: ENVIRONMENT_ID,
-    text: `Session environment:\n${JSON.stringify({
+    text: `Tool execution context:\n${JSON.stringify({
       os: data.os,
       arch: data.arch,
       locale: data.locale,
@@ -45,7 +45,7 @@ export function environmentInstruction(value: unknown): RunRuntimeSnapshot['inst
       ...(data.executionPath !== undefined ? { executionPath: data.executionPath } : {}),
       ...(data.hostBinding ? { hostBinding: data.hostBinding } : {}),
       ...(data.executionTarget ? { executionTarget: data.executionTarget, shell: data.shell, shellAvailable: data.shellAvailable, ...(data.commandPaths ? { commandPaths: data.commandPaths } : { developerCommands: data.developerCommands }), workspaceShellSupported: data.workspaceShellSupported, ...(data.workspaceSandbox ? { workspaceSandbox: data.workspaceSandbox } : {}) } : {}),
-    })}\nThese basic facts describe the selected execution environment and remain fixed for this run. Service status has not been probed. Workspace-scoped shell runs under the reported sandbox; host-scoped shell requires Kernel authorization and executes outside that sandbox. A sandbox denial or unreachable socket does not establish that a host service is stopped. Check service status in the intended scope before proposing to start it. Use each tool result's environment and exit status as execution evidence.\nUse ${data.responseLanguage ?? "the user's language"} for all user-facing text, including progress updates, unless the user explicitly requests another language.`,
+    })}\nThese tool-execution facts are fixed for this run. Project build requirements come from project files. commandPaths lists commands found on executionPath, not all installed software. Workspace scope is sandboxed; authorized host calls use the same target, shell and prepared PATH outside that sandbox. Command-not-found describes this PATH; denied access or an unreachable socket does not prove a service is stopped. Check the needed scope and report the actual result. Service readiness is unprobed.\nUse ${data.responseLanguage ?? "the user's language"} for all user-facing text, including progress updates, unless the user explicitly requests another language.`,
   };
 }
 

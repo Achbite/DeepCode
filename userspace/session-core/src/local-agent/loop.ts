@@ -18,6 +18,8 @@ import type {
   RunRuntimeSnapshot,
   SessionEvent,
   PreparedToolDescriptor,
+  PreparedRunRuntime,
+  PluginUri,
   ToolExecutionReply,
   ToolExecutionRecord,
   ToolInputRejection,
@@ -31,6 +33,7 @@ import {
   SESSION_CONTROL_INTERACTION_REQUEST,
   SESSION_CONTROL_PLAN_PUBLISH,
   SESSION_CONTROL_PLAN_PROGRESS,
+  SESSION_CONTROL_PLUGIN_ACTIVATE,
 } from '@deepcode/protocol';
 import type { AgentComposition } from './plugins.js';
 import {
@@ -171,6 +174,7 @@ interface ProviderControlRejection {
 }
 
 type ProviderTurn =
+  | ({ kind: 'pluginActivate'; callId: string; providerCallId: string; pluginUris: string[] } & ProviderTurnCommon)
   | ({ kind: 'answer'; content: string; messageId?: string } & ProviderTurnCommon)
   | ({ kind: 'continuation' } & ProviderTurnCommon)
   | {
@@ -478,6 +482,39 @@ export async function runAgentLoop(
         });
       }
       switch (turn.kind) {
+        case 'pluginActivate': {
+          let prepared: PreparedRunRuntime;
+          try {
+            const uris = [...new Set([...runtime.selectedPlugins.plugins.map(plugin => plugin.uri), ...turn.pluginUris])];
+            prepared = await deps.composition.runPreparation.prepare({
+              sessionId: snapshot.state.sessionId, runId, profileId: runtime.provider.profileId,
+              environment: runtime.environment,
+              ...(runtime.provider.reasoningEffortOverride ? { reasoningEffortOverride: runtime.provider.reasoningEffortOverride } : {}),
+              pluginSelections: uris.map(uri => ({ selectionId: deps.nextId('plugin-selection'), uri: uri as PluginUri, label: uri.slice(0, 160) })),
+            });
+          } catch (error) {
+            await commit([
+              controlRejectionFact(snapshot.state.sessionId, runId, { callId: turn.callId,
+                providerCallId: turn.providerCallId, toolName: SESSION_CONTROL_PLUGIN_ACTIVATE,
+                input: { pluginUris: turn.pluginUris }, error: localAgentError(error) }),
+              providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
+              ...completionDerivedFacts,
+            ]);
+            break;
+          }
+          const { extensionGenerationRef, kernelCatalogSnapshotRef, instructions, tools,
+            toolPromptContributions, providerToolAliases, selectedPlugins } = prepared.runtimeSnapshot;
+          await commit([
+            { type: 'session.plugins.activated', sessionId: snapshot.state.sessionId, runId, callId: turn.callId,
+              payload: { providerCallId: turn.providerCallId, pluginUris: turn.pluginUris } },
+            providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
+            ...completionDerivedFacts,
+            { type: 'run.tools.prepared', sessionId: snapshot.state.sessionId, runId,
+              payload: { toolView: { extensionGenerationRef, kernelCatalogSnapshotRef, instructions, tools,
+                toolPromptContributions, providerToolAliases, selectedPlugins } } },
+          ]);
+          break;
+        }
         case 'continuation': {
           await commit([
             providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
@@ -1135,8 +1172,9 @@ async function consumeProviderOutput(
   ));
   const conflict = inputBlocks.some((block) => (
     block.name === SESSION_CONTROL_INTERACTION_REQUEST || block.name === SESSION_CONTROL_PLAN_PUBLISH
+      || block.name === SESSION_CONTROL_PLUGIN_ACTIVATE
   )) && inputBlocks.length > 1
-    ? 'interaction.request 与 plan.publish 必须独占 Provider turn；本批次未执行，请单独提交。'
+    ? 'interaction.request、plan.publish 与 plugin.activate 必须独占 Provider turn；本批次未执行，请单独提交。'
     : inputBlocks.filter((block) => block.name === SESSION_CONTROL_PLAN_PROGRESS).length > 1
       ? '每个 Provider turn 最多包含一个 plan.progress；本批次未执行，请合并步骤更新。'
       : undefined;
@@ -1437,6 +1475,9 @@ async function consumeProviderOutput(
     ...(orderedNarratives.length > 0 ? { narratives: orderedNarratives } : {}),
   };
   const control = controlCalls[0];
+  if (control?.kind === 'pluginActivate') {
+    return { ...control, providerCallId: control.providerCallId, ...common };
+  }
   if (control?.kind === 'interaction') {
     const interactionId = deps.nextId('interaction');
     if (interactionId === control.callId || interactionId === control.providerCallId) {

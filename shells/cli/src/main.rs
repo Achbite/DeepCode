@@ -1,3 +1,4 @@
+mod model_services;
 mod render;
 
 use deepcode_kernel_client::{
@@ -77,6 +78,21 @@ async fn main() {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     Help,
+    Connections,
+    AuthLogin {
+        selector: String,
+        device_code: bool,
+    },
+    AuthLogout {
+        connection_id: String,
+    },
+    Quota {
+        connection_id: String,
+    },
+    Usage {
+        connection_id: Option<String>,
+        days: u64,
+    },
     Status,
     StopHost,
     StartHost,
@@ -114,6 +130,7 @@ struct Args {
     workspace: Option<PathBuf>,
     session_id: Option<String>,
     plain: bool,
+    profile_id: Option<String>,
     plugins: Vec<String>,
     files: Vec<String>,
     directories: Vec<String>,
@@ -127,6 +144,7 @@ impl Args {
         let mut workspace = None;
         let mut session_id = None;
         let mut plain = false;
+        let mut profile_id = None;
         let mut plugins = Vec::new();
         let mut files = Vec::new();
         let mut directories = Vec::new();
@@ -138,6 +156,10 @@ impl Args {
                 "--api" => {
                     index += 1;
                     api = Some(required_arg(&values, index, "--api")?.to_string());
+                }
+                "--model" => {
+                    index += 1;
+                    profile_id = Some(required_arg(&values, index, "--model")?.to_owned());
                 }
                 "--no-auto-start-kernel" => no_auto_start_kernel = true,
                 "--workspace" | "-C" => {
@@ -204,6 +226,23 @@ impl Args {
             None => Command::Chat,
             Some("help") => Command::Help,
             Some("status") => Command::Status,
+            Some("connections" | "models") if positional.len()==1 => Command::Connections,
+            Some("auth") => match positional.get(1).map(String::as_str) {
+                Some("status") if positional.len()==2 => Command::Connections,
+                Some("login") if (3..=4).contains(&positional.len()) => {
+                    let method=positional.get(3).map(String::as_str).unwrap_or("browser");
+                    if !matches!(method,"browser"|"device") { return Err("登录方式为 browser 或 device。".into()); }
+                    Command::AuthLogin { selector:positional[2].clone(),device_code:method=="device" }
+                }
+                Some("logout") if positional.len()==3 => Command::AuthLogout { connection_id:positional[2].clone() },
+                _ => return Err("用法：auth login <connection-id|openai-codex> [browser|device] / auth status / auth logout <connection-id>".into()),
+            },
+            Some("quota") if positional.len()==2 => Command::Quota { connection_id:positional[1].clone() },
+            Some("usage") if positional.len()<=3 => {
+                let days:u64=positional.get(2).map(|v|v.parse()).transpose().map_err(|_|"统计天数无效。")?.unwrap_or(30);
+                if !(1..=366).contains(&days) { return Err("统计天数必须在 1 至 366 之间。".into()); }
+                Command::Usage { connection_id:positional.get(1).filter(|v|v.as_str()!="all").cloned(),days }
+            },
             Some("stop-host") if positional.len() == 1 => Command::StopHost,
             Some("start-host") if positional.len() == 1 => Command::StartHost,
             Some("diff") if positional.len() == 3 => Command::Diff {
@@ -286,6 +325,7 @@ impl Args {
             workspace,
             session_id,
             plain,
+            profile_id,
             plugins,
             files,
             directories,
@@ -423,6 +463,42 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
     }
     match args.command {
         Command::Help => Ok(Outcome::Done),
+        Command::Connections => model_services::connections(client).await,
+        Command::AuthLogin {
+            selector,
+            device_code,
+        } => model_services::login(client, &selector, device_code).await,
+        Command::AuthLogout { connection_id } => {
+            client
+                .logout_model_connection(&connection_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            println!("已退出登录。{}　", connection_id);
+            Ok(Outcome::Done)
+        }
+        Command::Quota { connection_id } => {
+            let value = client
+                .model_quota(&connection_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+            );
+            Ok(Outcome::Done)
+        }
+        Command::Usage {
+            connection_id,
+            days,
+        } => {
+            model_services::usage(
+                client,
+                connection_id.as_deref(),
+                days,
+                args.session_id.as_deref(),
+            )
+            .await
+        }
         Command::StartHost => {
             println!("共享 Host 已启动为常驻服务。");
             Ok(Outcome::Done)
@@ -457,8 +533,13 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
             Ok(Outcome::Done)
         }
         Command::Ask(text) => {
-            let projection =
-                open_session(client, args.session_id.as_deref(), args.workspace.as_ref()).await?;
+            let projection = open_session(
+                client,
+                args.session_id.as_deref(),
+                args.workspace.as_ref(),
+                args.profile_id.as_deref(),
+            )
+            .await?;
             let filesystem_references = resolve_cli_filesystem_references(
                 client,
                 &projection.session_id,
@@ -475,7 +556,7 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
                 client,
                 &projection,
                 &text,
-                None,
+                args.profile_id.as_deref(),
                 &filesystem_references,
                 plugin_binding.as_ref(),
                 args.plain,
@@ -488,6 +569,7 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
                 args.session_id.as_deref(),
                 args.workspace.as_ref(),
                 &args.plugins,
+                args.profile_id.as_deref(),
             )
             .await
         }
@@ -609,6 +691,7 @@ async fn open_session(
     client: &HttpKernelClient,
     session_id: Option<&str>,
     workspace: Option<&PathBuf>,
+    profile_id: Option<&str>,
 ) -> Result<SessionProjection, String> {
     if let Some(session_id) = session_id {
         return client
@@ -629,7 +712,7 @@ async fn open_session(
             session_id: None,
             workspace_paths,
             project_id: None,
-            profile_id: None,
+            profile_id: profile_id.map(str::to_owned),
         })
         .await
         .map_err(|error| error.to_string())
@@ -894,11 +977,12 @@ async fn run_chat(
     session_id: Option<&str>,
     workspace: Option<&PathBuf>,
     initial_plugin_uris: &[String],
+    initial_profile_id: Option<&str>,
 ) -> Result<Outcome, String> {
     if !io::stdin().is_terminal() {
         return Err("chat 需要交互式终端；非交互调用请使用 ask。".to_string());
     }
-    let mut projection = open_session(client, session_id, workspace).await?;
+    let mut projection = open_session(client, session_id, workspace, initial_profile_id).await?;
     let mut plugin_catalog = client
         .conversation_plugin_catalog()
         .await
@@ -917,7 +1001,7 @@ async fn run_chat(
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut output = CliRenderState::after(&projection);
     let mut rendered_revision = projection.revision;
-    let mut next_message_profile_id: Option<String> = None;
+    let mut next_message_profile_id: Option<String> = initial_profile_id.map(str::to_owned);
     let mut prompt_needed = true;
     loop {
         if prompt_needed {
@@ -996,6 +1080,9 @@ async fn run_chat(
                     render_run_state(&mut io::stdout().lock(), &projection)
                         .map_err(|error| error.to_string())?;
                 }
+            }
+            "/model" | "/connections" => {
+                model_services::connections(client).await?;
             }
             value if value.starts_with("/model ") => {
                 let profile_id = value.trim_start_matches("/model ").trim();
@@ -1234,6 +1321,7 @@ fn new_id(kind: &str) -> String {
 }
 
 fn print_help() {
+    println!("模型服务：connections | auth login <connection-id|openai-codex> [browser|device] | auth status | auth logout <id> | quota <id> | usage [connection-id|all] [days=30]\nask/chat 支持 --model <profile-id>；usage 使用 UTC 日界线。");
     println!(
         r#"DeepCode 本地编码 Agent
 
@@ -1254,8 +1342,8 @@ fn print_help() {
 
 只有显式 -C/--workspace 会为新 Session 创建 creation binding；已有 Session 通过 attach-directory/detach-directory 管理对话目录索引。
 chat 普通文本随时发送，运行中按序排队；/reply 1 确认 Plan，/reply <说明> 修订 Plan 或回答交互，/reply 1/2 允许/拒绝 effect；cancel-plan 明确取消 Plan。
-文件与目录引用只在 ask 中显式选择；--file 与 --directory 均可重复，文件内容不会嵌入首轮 Provider 请求。
-插件只在 ask/chat 中显式选择；--plugin 可重复。PDF 文件按 mediaType 要求一个已配置的 Skill 插件。交互 chat 使用 @ 查看并选择下一次请求的插件，/focus <task> 作为类型化命令提交。
+文件与目录引用只在 ask 中显式选择；--file 与 --directory 均可重复。图片以视觉内容发送给支持图片的模型，其他文件保留只读引用。
+ask/chat 支持 --plugin 显式引用，参数可重复；Agent 也可按任务发现并加载已启用插件。PDF 文件按 mediaType 要求一个已配置的 Skill 插件。交互 chat 使用 @ 查看并选择下一次请求的插件，/focus <task> 作为类型化命令提交。
 所有终端命令都通过 ConversationPort，并只读取共享 SessionProjection。"#,
     );
 }

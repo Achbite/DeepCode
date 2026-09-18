@@ -892,11 +892,7 @@ export class SessionActor {
           if (!runtime) throw new Error('run_runtime_snapshot_missing');
           const activeView = current.state.runToolViews[runId] ?? runtime;
           const initialSelections = recoveryPluginSelection(current, runId, runtime).pluginSelections ?? [];
-          const previousSelections = current.events.flatMap((event) => (
-            event.type === 'message.committed' && event.runId === runId && event.payload.role === 'user'
-              ? event.payload.pluginSelections ?? [] : []
-          ));
-          const selections = [...new Map([...initialSelections, ...previousSelections, ...queued.flatMap((input) => input.pluginSelections)]
+          const selections = [...new Map([...initialSelections, ...queued.flatMap((input) => input.pluginSelections)]
             .map((selection) => [selection.uri, selection])).values()];
           const events: NewSessionEvent[] = [];
           if (selections.length || activeView.selectedPlugins.plugins.length) {
@@ -1359,10 +1355,14 @@ function recoveryPluginSelection(
     event.type === 'input.accepted'
     && event.payload.messageId === started.payload.inputMessageId
   ));
-  const selections = input?.payload.pluginSelections ?? [];
+  const active = snapshot.state.runToolViews[runId]?.selectedPlugins ?? runtime.selectedPlugins;
+  const selections = active.plugins.map((plugin, index) => (
+    input?.payload.pluginSelections?.find(selection => selection.uri === plugin.uri)
+    ?? { selectionId: `plugin-selection:${runId}:${index}`, uri: plugin.uri, label: plugin.uri.slice(0, 160) }
+  ));
   if (selections.length === 0) return {};
   return {
-    pluginCatalogRevision: runtime.selectedPlugins.catalogRevision,
+    pluginCatalogRevision: active.catalogRevision,
     pluginSelections: selections.map((selection) => ({ ...selection })),
   };
 }

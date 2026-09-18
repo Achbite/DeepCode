@@ -689,18 +689,20 @@ test('message uses one prepared runtime through composition, completion, cache p
   await actor.dispose();
 });
 
-test('Session environment survives new runs, restart and compaction without changing the Provider prefix', async (t) => {
+test('new runs refresh execution facts while restart and compaction retain each prepared run environment', async (t) => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:environment';
   await createSession(journal, sessionId);
-  let observed = { os: 'linux', arch: 'aarch64', locale: 'zh-CN', responseLanguage: 'zh-CN', userShell: '/bin/bash' };
+  let observed = { ...runtimeSnapshot('environment:fixture').environment,
+    os: 'linux', arch: 'aarch64', locale: 'zh-CN', responseLanguage: 'zh-CN', userShell: '/bin/bash' };
   const saved = environmentInstruction(observed);
   const preparation = fakeRunPreparation();
   const port = {
     ...preparation.port,
     async prepare(request) {
       const prepared = await preparation.port.prepare(request);
-      prepared.runtimeSnapshot.instructions.push(environmentInstruction(observed));
+      prepared.runtimeSnapshot.environment = structuredClone(request.restoreEnvironment ? request.environment : observed);
+      prepared.runtimeSnapshot.instructions.push(environmentInstruction(prepared.runtimeSnapshot.environment));
       return prepared;
     },
   };
@@ -745,18 +747,22 @@ test('Session environment survives new runs, restart and compaction without chan
     { role: 'system', content: 'Stable core instruction.' },
     { role: 'system', content: saved.text },
   ]);
-  for (const request of agentRequests) {
-    assert.deepEqual(request.messages.slice(0, prefix.length), prefix);
+  for (const [index, request] of agentRequests.entries()) {
+    const expected = index === 0 ? saved : environmentInstruction(observed);
+    assert.deepEqual(request.messages.slice(0, prefix.length), [prefix[0], { role: 'system', content: expected.text }]);
     assert.deepEqual(request.tools, agentRequests[0].tools);
-    assert.equal(request.messages.filter((message) => message.content === saved.text).length, 1);
+    assert.equal(request.messages.filter((message) => message.content === expected.text).length, 1);
   }
   assert.ok(agentRequests[3].messages.some((message) => message.content?.includes('Saved task facts only.')));
   assert.equal(requests.filter((request) => request.purpose === 'contextCompaction').length, 1);
   const runs = (await readEvents(journal, sessionId)).filter((event) => event.type === 'run.started');
   assert.equal(runs.length, 4);
-  for (const run of runs) {
-    assert.deepEqual(run.payload.runtimeSnapshot.instructions.find((item) => item.id === saved.id), saved);
+  for (const [index, run] of runs.entries()) {
+    assert.deepEqual(run.payload.runtimeSnapshot.instructions.find((item) => item.id === saved.id),
+      index === 0 ? saved : environmentInstruction(observed));
   }
+  const compacting = requests.find(request => request.purpose === 'contextCompaction');
+  assert.equal(compacting.providerRuntimeRef, agentRequests[3].providerRuntimeRef);
 
   const newSession = 'session:environment-new';
   await createSession(journal, newSession);
@@ -2356,7 +2362,7 @@ test('one Plan confirmation resumes the same run into Todo-backed execution', as
     availability: 'callable',
     origin: 'coreBuiltin',
   };
-  const preparation = fakeRunPreparation({ tools: [preparedTool] });
+  const preparation = fakeRunPreparation({ tools: [preparedTool], contextWindowTokens: 8_192 });
   const kernelRequests = [];
   const kernel = emptyKernel({
     async execute(request) {
@@ -3242,7 +3248,7 @@ test('built-in runtime and control prompts stay concise and policy-scoped', () =
     instruction.id === 'plugin.fixture.skill'
   ))?.text ?? '';
   assert.ok(pluginInstruction.includes('Fixture'));
-  assert.ok(pluginInstruction.includes('structured user input'));
+  assert.ok(pluginInstruction.includes('User mentions and Agent-requested activation are independent'));
   assert.ok(pluginInstruction.includes('Read the explicitly selected fixture instructions.'));
   const controls = sessionControlToolDefinitions();
   const publish = controls.find((tool) => tool.name === 'plan.publish');
@@ -3355,14 +3361,14 @@ test('Provider cache fields are absent together or exactly partition one call in
     const journal = new InMemoryCommandJournal();
     const sessionId = `session:invalid-cache-${label}`;
     await createSession(journal, sessionId);
-    const preparation = fakeRunPreparation({ contextWindowTokens: 1_000 });
+    const preparation = fakeRunPreparation({ contextWindowTokens: 4_096 });
     const provider = {
       async *stream(request) {
         yield providerEvent(request.requestId, 'completed', {
           usage: {
             inputTokens: 100,
             outputTokens: 0,
-            contextWindowTokens: 1_000,
+            contextWindowTokens: 4_096,
             ...cacheFields,
           },
         });
@@ -4651,4 +4657,54 @@ test('protocol failures and cancellation never enter a network retry loop', asyn
     await assert.rejects(withProviderAttempts(request, deps, controller.signal, async () => { calls++; throw original; }), /user_cancelled/);
     assert.equal(calls, 1);
   }
+});
+
+
+test('a Kernel input rejection can request confirmation and resume the same run', async (t) => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:input-confirmation';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const tool = { toolBindingRef: 'tool-binding:write:g1', name: 'fs.write', description: 'Write a file.',
+    inputSchema: { type: 'object', required: ['path', 'content'], properties: { path: { type: 'string' }, content: { type: 'string' } } },
+    possibleEffects: ['workspaceMutation'], availability: 'callable', origin: 'coreBuiltin' };
+  let calls = 0, turns = 0;
+  const originalError = { code: 'input_resource_read_only', message: 'Input snapshot is read-only. Choose a writable destination.',
+    issues: [{ path: '$.workspaceId', rule: 'readOnlyInput', message: 'Input snapshot is read-only.' }] };
+  const kernel = emptyKernel({ async execute(request) {
+    calls++;
+    const rejection = Object.fromEntries(['sessionId', 'runId', 'extensionGenerationRef', 'kernelCatalogSnapshotRef', 'toolBindingRef', 'callId', 'attemptId', 'toolName', 'input'].map(key => [key, request[key]]));
+    return { schemaVersion: 'deepcode.kernel-reply', type: 'tool.execution', requestId: request.requestId,
+      callId: request.callId, status: 'inputRejected', rejection: { ...rejection, rejectedAt: '2026-09-18T00:00:00Z', error: originalError } };
+  } });
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    turns++;
+    if (turns === 1) {
+      yield providerEvent(request.requestId, 'tool.call', { callId: 'native:write', name: 'fs_write', input: { path: 'preview.html', content: 'Draft' } });
+    } else if (turns === 2) {
+      const result = request.messages.map(jsonMessagePayload).find(value => value?.status === 'inputRejected');
+      assert.deepEqual(result.error, originalError);
+      assert.equal(result.executed, false);
+      yield providerEvent(request.requestId, 'tool.call', { callId: 'native:confirm', name: 'interaction_request', input: {
+        kind: 'confirmation', prompt: 'Use a session working copy?', options: [{ id: 'draft', label: 'Use a working copy' }], allowFreeform: true,
+      } });
+    } else {
+      assert.equal(turns, 3);
+      assert.ok(request.messages.some(message => message.content?.includes('Use a working copy')));
+      yield providerEvent(request.requestId, 'assistant.message', { messageId: 'native:done', content: 'The working-copy destination is confirmed.' });
+    }
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, kernel, fakeRunPreparation({ tools: [tool] }).port, 'input-confirmation');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:start', 'Prepare a preview.'));
+  const waiting = await waitForProjection(actor, value => value.pendingInteraction !== null);
+  assert.equal(waiting.pendingInteraction.kind, 'confirmation');
+  assert.equal(waiting.pendingApproval, null);
+  assert.equal(turns, 2);
+  await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'interaction.respond', commandId: 'command:confirm',
+    sessionId, runId: waiting.run.runId, interactionId: waiting.pendingInteraction.interactionId, response: 'Use a working copy' });
+  const completed = await waitForProjection(actor, value => value.run?.status === 'completed');
+  assert.equal(completed.run.runId, waiting.run.runId);
+  assert.equal(calls, 1, 'confirmation must not replay the rejected write');
+  const events = await readEvents(journal, sessionId);
+  assert.deepEqual(events.find(event => event.type === 'tool.input-rejected').payload.rejection.error, originalError);
+  assert.equal(events.some(event => event.type === 'run.settled' && event.payload.outcome === 'failed'), false);
 });

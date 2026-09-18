@@ -579,6 +579,9 @@ impl Renderer {
         if app.plugin_picker_open() {
             self.draw_plugin_picker(frame, rows[1], app);
         }
+        if app.model_picker_open() {
+            self.draw_model_picker(frame, rows[1], app);
+        }
         self.draw_footer(frame, rows[5], app);
     }
 
@@ -728,6 +731,15 @@ impl Renderer {
                 "下一次请求插件：{}\n",
                 selected_plugins.join(", ")
             ));
+        }
+        if app.model_picker_open() {
+            output.push_str(&format!("{}：\n", app.model_picker_title()));
+            for (id, label, selected) in app.model_picker_entries() {
+                output.push_str(&format!(
+                    "{} {label} ({id})\n",
+                    if selected { ">" } else { " " }
+                ));
+            }
         }
         if app.plugin_picker_open() {
             output.push_str("插件候选：\n");
@@ -1235,6 +1247,37 @@ impl Renderer {
             inner,
         );
         frame.set_cursor_position((inner.x + column.min(inner.width - 1), inner.y + row));
+    }
+
+    fn draw_model_picker(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+        let entries = app.model_picker_entries();
+        let mut lines: Vec<Line<'_>> = entries
+            .iter()
+            .map(|(_, label, selected)| {
+                Line::from(Span::styled(
+                    format!("{} {label}", if *selected { ">" } else { " " }),
+                    Style::default().fg(if *selected { Color::Cyan } else { Color::Reset }),
+                ))
+            })
+            .collect();
+        if lines.is_empty() {
+            lines.push(Line::from("没有已启用的模型，请在设置中添加。"));
+        }
+        let selected = entries
+            .iter()
+            .position(|(_, _, selected)| *selected)
+            .unwrap_or(0);
+        let scroll = selected.saturating_sub(area.height.saturating_sub(4) as usize);
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(lines).scroll((scroll as u16, 0)).block(
+                Block::default().borders(Borders::ALL).title(format!(
+                    " {} · ↑/↓ · Enter · Esc ",
+                    app.model_picker_title()
+                )),
+            ),
+            area,
+        );
     }
 
     fn draw_plugin_picker(&self, frame: &mut Frame<'_>, anchor: Rect, app: &TuiApp) {

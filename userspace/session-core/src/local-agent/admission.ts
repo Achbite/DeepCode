@@ -87,6 +87,7 @@ function admitEvent(snapshot: LoopSnapshot, event: NewSessionEvent): void {
     case 'tool.requested':
     case 'plan.published':
     case 'session.control.rejected':
+    case 'session.plugins.activated':
       if (!pendingProvider) throw new Error('provider_turn_composition_missing');
       break;
     case 'todo.seeded':
