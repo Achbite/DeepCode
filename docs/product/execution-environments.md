@@ -8,7 +8,7 @@ PowerShell user scripts are passed as temporary UTF-8 BOM `.ps1` files, with no 
 
 ## Explicit WSL projects
 
-Select a project in Settings > Execution environment > Project execution environment. Choose WSL, name the distribution and specify the Linux `deepcode-kernel-daemon` executable installed inside it (an absolute path or a command on that distribution's PATH). Use a Linux package built from the current implementation; a Windows `.exe` cannot be used as the Linux worker.
+Open the project menu > Manage workspace > Runtime shell. Choose WSL, name the distribution and specify the Linux `deepcode-kernel-daemon` executable installed inside it (an absolute path or a command on that distribution's PATH). Use a Linux package built from the current implementation; a Windows `.exe` cannot be used as the Linux worker.
 
 Workspace filesystem tools and Bash execute in a single-invocation Linux Kernel worker through `wsl.exe --distribution ... --exec ... --kernel-tool-worker`. The worker does not create a Session, start a Provider, open a service port or write a second journal. The Windows Host and shared Session continue to own conversation identity, Plan admission, tool records and progress. Native Windows paths are translated using `wslpath`; a WSL UNC project must belong to the selected distribution. Output archives remain in the Session-owned storage directory.
 
@@ -16,9 +16,9 @@ The distribution, Kernel executable and project files must already be available.
 
 ## Stable context
 
-The first prepared run captures the selected operating system, architecture, locale, shell dialect/path and detected developer commands. Subsequent runs reuse the Session's saved observation. Shell changes, project environment changes or Refresh environment create a new observation at the next run boundary. A running or restored run keeps its prepared environment. Changing another project's environment does not refresh this project's context.
+Each new run captures the selected operating system, architecture, locale, shell and command search path. A running or restored run keeps its prepared facts. On macOS, the Host reads PATH from the user's login shell at initialization or explicit environment refresh; tool invocations do not reload profiles. Discovery and execution use that same prepared PATH. Windows and WSL use the selected execution endpoint's environment.
 
-The command list records executable discovery, not service readiness. A listed Docker command does not establish that Docker daemon is running. No credentials or unrelated environment variables are included.
+Execution target, project build requirements and sandbox permissions are separate. Read project files to identify the build/test environment; a native shell may invoke Docker for a Linux build. `commandPaths` records commands found on `executionPath`, not an inventory of installed software. A missing command, sandbox denial or unreachable socket cannot establish that the host lacks a tool or a service is stopped. Host scope changes permissions, not the selected target, shell or prepared PATH. Request its existing authority when needed; never retry there automatically. Service readiness is checked on demand in the intended scope.
 
 ## Workspace Shell
 

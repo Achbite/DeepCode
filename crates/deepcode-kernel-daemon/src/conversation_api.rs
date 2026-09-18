@@ -431,6 +431,103 @@ fn read_image_resource(path: &StdPath) -> Result<(&'static str, Vec<u8>), String
     Ok((media, bytes))
 }
 
+pub(crate) fn resolve_provider_images(
+    state: &AppState,
+    session_id: &str,
+    messages: &mut [crate::local_agent_api::LocalProviderMessage],
+    image_input: bool,
+) -> Result<(), String> {
+    use base64::Engine;
+    for message in messages {
+        if !message.tool_images.is_empty() {
+            if !image_input {
+                return Err("当前模型未声明图片输入能力，请使用视觉模型查看工具截图。".into());
+            }
+            if message.role != "tool" {
+                return Err("工具截图必须属于工具结果。".into());
+            }
+            let call_id = message
+                .tool_call_id
+                .as_deref()
+                .ok_or("工具截图缺少 callId。")?;
+            let record = state
+                .local_agent
+                .kernel
+                .read_record(call_id)
+                .map_err(|error| error.message)?
+                .ok_or("工具记录不存在。")?;
+            if record["sessionId"].as_str() != Some(session_id) || record["outcome"] != "completed"
+            {
+                return Err("截图必须来自当前会话已完成的工具记录。".into());
+            }
+            for id in &message.tool_images {
+                let declared = record["output"]["modelImages"]
+                    .as_array()
+                    .is_some_and(|images| images.iter().any(|image| image["artifactId"] == *id));
+                if !declared {
+                    return Err("工具未声明该视觉结果。".into());
+                }
+                let artifact = record["output"]["artifacts"]
+                    .as_array()
+                    .and_then(|items| items.iter().find(|item| item["artifactId"] == *id))
+                    .ok_or("截图产物不存在。")?;
+                if artifact["contentMode"] != "fixed" {
+                    return Err("截图必须是固定归档产物。".into());
+                }
+                let path = artifact["contentRef"]
+                    .as_str()
+                    .ok_or("截图归档内容缺失。")?;
+                let (media, bytes) = read_image_resource(StdPath::new(path))?;
+                message
+                    .image_data
+                    .push(crate::local_agent_api::LocalProviderImage {
+                        media_type: media.into(),
+                        base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    });
+            }
+        }
+        for image in &message.images {
+            if !image_input {
+                return Err(
+                    "当前模型未声明图片输入能力，请切换视觉模型或在模型设置中启用图片输入。".into(),
+                );
+            }
+            let root = {
+                let gui = state.gui.lock().expect("gui state lock");
+                if let Some(error) = &gui.conversation_catalog_error {
+                    return Err(error.clone());
+                }
+                let workspace = gui
+                    .conversation_catalog
+                    .workspace(&image.workspace_id)
+                    .ok_or("图片附件目录不存在。")?;
+                if workspace.owner_session_id.as_deref() != Some(session_id)
+                    || workspace.session_workdir
+                {
+                    return Err("图片必须来自当前会话的输入快照。".into());
+                }
+                workspace.canonical_root.clone()
+            };
+            let path = crate::host_inspection::resolve_workspace_read_path(
+                StdPath::new(&root),
+                &image.logical_path,
+            )
+            .map_err(|error| error.message)?;
+            let (media, bytes) = read_image_resource(&path)?;
+            if media != image.media_type {
+                return Err("图片内容与附件格式不一致。".into());
+            }
+            message
+                .image_data
+                .push(crate::local_agent_api::LocalProviderImage {
+                    media_type: media.into(),
+                    base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                });
+        }
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ReadFileChangeRequest {
@@ -1122,19 +1219,24 @@ pub(crate) async fn conversation_session_delete(
     if let Err(error) = state.local_agent.kernel.delete_session_outputs(&session_id) {
         return ApiResponse::error(error.code, error.message);
     }
-    let attachment_root = {
+    let owned_roots = {
         let gui = state.gui.lock().expect("gui state lock");
-        session_attachment_root(&gui.paths.attachment_store_root, &session_id)
+        [
+            session_attachment_root(&gui.paths.attachment_store_root, &session_id),
+            session_attachment_root(&gui.paths.session_workdir_root, &session_id),
+        ]
     };
-    if let Err(error) = fs::remove_dir_all(&attachment_root) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            return ApiResponse::error(
-                "conversation_attachment_cleanup_failed",
-                format!(
-                    "对话已删除，但 Host 文件引用目录清理失败（{}）：{error}",
-                    attachment_root.display()
-                ),
-            );
+    for root in owned_roots {
+        if let Err(error) = fs::remove_dir_all(&root) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return ApiResponse::error(
+                    "conversation_attachment_cleanup_failed",
+                    format!(
+                        "对话已删除，但 Host 文件引用目录清理失败（{}）：{error}",
+                        root.display()
+                    ),
+                );
+            }
         }
     }
     let gui = state.gui.lock().expect("gui state lock");
@@ -1210,6 +1312,7 @@ fn save_input_resource(
             display_name: display_name.clone(),
             canonical_root,
             owner_session_id: Some(session_id.to_string()),
+            session_workdir: false,
             created_at: crate::now_text(),
         };
         if let Err(error) = persist_catalog_rows(&mut gui, vec![workspace], None, None) {
@@ -1330,6 +1433,11 @@ pub(crate) async fn conversation_command_submit(
             return ApiResponse::error(code, message);
         }
     }
+    if input_field.is_some() {
+        if let Err(error) = ensure_session_workdir(&state, &session_id).await {
+            return session_service_error(error);
+        }
+    }
     let reply = match request_service(
         state.session_service.clone(),
         "submit",
@@ -1420,6 +1528,121 @@ pub(crate) async fn conversation_command_submit(
         }
     }
     ApiResponse::ok(reply)
+}
+
+/// Register and bind the Host-owned working directory before the next run freezes
+/// its workspace list. A directory-index event leaves any active run unchanged.
+async fn ensure_session_workdir(
+    state: &AppState,
+    session_id: &str,
+) -> Result<(), SessionServiceError> {
+    let binding = {
+        let mut gui = state.gui.lock().expect("gui state lock");
+        if let Some(error) = &gui.conversation_catalog_error {
+            return Err(SessionServiceError::new(
+                "conversation_catalog_unavailable",
+                error,
+            ));
+        }
+        let (binding, workspace) = prepare_session_workdir(
+            &gui.conversation_catalog,
+            &gui.paths.session_workdir_root,
+            session_id,
+        )?;
+        if let Some(workspace) = workspace {
+            persist_catalog_rows(&mut gui, vec![workspace], None, None).map_err(|error| {
+                SessionServiceError::new("conversation_catalog_write_failed", error)
+            })?;
+        }
+        binding
+    };
+    let snapshot = request_service(
+        state.session_service.clone(),
+        "snapshot",
+        json!({"sessionId":session_id}),
+    )
+    .await?;
+    if snapshot["workspaceBindings"]
+        .as_array()
+        .is_some_and(|bindings| {
+            bindings
+                .iter()
+                .any(|candidate| candidate["workspaceId"] == binding.workspace_id)
+        })
+    {
+        return Ok(());
+    }
+    let reply = request_service(
+        state.session_service.clone(),
+        "submit",
+        json!({"command":{
+            "schemaVersion":"deepcode.command.v3", "type":"session.directory-index.attach",
+            "commandId": random_id("command")?, "sessionId":session_id, "workspaceBinding":binding
+        }}),
+    )
+    .await?;
+    if reply["status"] != "accepted" {
+        return Err(SessionServiceError::new(
+            "session_workdir_attach_failed",
+            reply.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_session_workdir(
+    catalog: &ConversationCatalog,
+    root: &FsPath,
+    session_id: &str,
+) -> Result<
+    (
+        WorkspaceBindingDisplayRecord,
+        Option<ConversationWorkspaceRecord>,
+    ),
+    SessionServiceError,
+> {
+    if catalog.session(session_id).is_none() {
+        return Err(SessionServiceError::new(
+            "conversation_session_not_found",
+            "对话不存在。",
+        ));
+    }
+    if let Some(workspace) = catalog.workspaces.iter().find(|workspace| {
+        workspace.session_workdir && workspace.owner_session_id.as_deref() == Some(session_id)
+    }) {
+        if !FsPath::new(&workspace.canonical_root).is_dir() {
+            return Err(SessionServiceError::new(
+                "session_workdir_unavailable",
+                "会话工作目录不可用。",
+            ));
+        }
+        return Ok((
+            WorkspaceBindingDisplayRecord {
+                workspace_id: workspace.workspace_id.clone(),
+                display_name: workspace.display_name.clone(),
+            },
+            None,
+        ));
+    }
+    let path = session_attachment_root(root, session_id);
+    fs::create_dir_all(&path).map_err(|error| {
+        SessionServiceError::new("session_workdir_create_failed", error.to_string())
+    })?;
+    let canonical_root = canonical_folder_path(&path.to_string_lossy())
+        .map_err(|error| SessionServiceError::new("session_workdir_create_failed", error))?;
+    let binding = WorkspaceBindingDisplayRecord {
+        workspace_id: random_id("workspace")?,
+        display_name: "会话工作目录（DeepCode 管理，跨轮保留）".into(),
+    };
+    let workspace = ConversationWorkspaceRecord {
+        workspace_id: binding.workspace_id.clone(),
+        display_name: binding.display_name.clone(),
+        canonical_root,
+        owner_session_id: Some(session_id.into()),
+        session_workdir: true,
+        created_at: crate::now_text(),
+    };
+    Ok((binding, Some(workspace)))
 }
 
 pub(crate) async fn conversation_projection_get(
@@ -1659,6 +1882,7 @@ fn resolve_filesystem_references(
                     display_name: display_name.clone(),
                     canonical_root: canonical_snapshot_root,
                     owner_session_id: Some(session_id.to_string()),
+                    session_workdir: false,
                     created_at: now.to_string(),
                 });
                 references.push(json!({
@@ -1713,6 +1937,10 @@ fn filesystem_reference_media_type(path: &FsPath) -> &'static str {
         .as_str()
     {
         "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
         "md" | "mdx" => "text/markdown",
         "json" => "application/json",
         "toml" => "application/toml",
@@ -1751,6 +1979,7 @@ fn prepare_roots(
             display_name: workspace_display_name(&root),
             canonical_root: root,
             owner_session_id: None,
+            session_workdir: false,
             created_at: now.to_string(),
         });
         workspace_ids.push(workspace_id);
@@ -1913,6 +2142,7 @@ fn validate_message_filesystem_references(
                     || object.len() != if pasted { 8 } else { 7 }
                     || logical_path == "."
                     || workspace.owner_session_id.as_deref() != Some(session_id)
+                    || workspace.session_workdir
                     || !metadata.is_file()
                     || metadata.len() != byte_length
                     || filesystem_reference_media_type(&target) != media_type
@@ -2182,6 +2412,55 @@ mod tests {
     }
 
     #[test]
+    fn session_workdir_is_separate_stable_and_retains_contents_after_catalog_reopen() {
+        let tree = TemporaryTree::new("session-workdir");
+        let store = tree.0.join("catalog.sqlite3");
+        let root = tree.0.join("working");
+        let mut catalog = ConversationCatalog::load(&store).unwrap();
+        catalog
+            .write_rows(
+                &store,
+                vec![],
+                None,
+                Some(ConversationSessionRecord {
+                    id: "session:working".into(),
+                    title: "Preview".into(),
+                    workspace_bindings: vec![],
+                    project_id: None,
+                    profile_id: None,
+                    created_at: "now".into(),
+                    updated_at: "now".into(),
+                }),
+            )
+            .unwrap();
+        let (first, workspace) =
+            prepare_session_workdir(&catalog, &root, "session:working").unwrap();
+        let workspace = workspace.unwrap();
+        let draft = FsPath::new(&workspace.canonical_root).join("preview.html");
+        fs::write(&draft, "<h1>Edited draft</h1>").unwrap();
+        catalog
+            .write_rows(&store, vec![workspace], None, None)
+            .unwrap();
+        let mut reopened = ConversationCatalog::load(&store).unwrap();
+        let (second, added) = prepare_session_workdir(&reopened, &root, "session:working").unwrap();
+        assert_eq!(first, second);
+        assert!(added.is_none());
+        assert_eq!(fs::read_to_string(&draft).unwrap(), "<h1>Edited draft</h1>");
+        assert!(
+            reopened
+                .workspace(&first.workspace_id)
+                .unwrap()
+                .session_workdir
+        );
+        assert_eq!(reopened.management_value()["workspaces"], json!([]));
+        reopened.remove_session(&store, "session:working").unwrap();
+        assert!(ConversationCatalog::load(&store)
+            .unwrap()
+            .workspace(&first.workspace_id)
+            .is_none());
+    }
+
+    #[test]
     fn change_read_distinguishes_binary_deletions_text_and_missing_snapshots() {
         let tree = TemporaryTree::new("change-read");
         let binary = tree.0.join("binary-before");
@@ -2217,6 +2496,7 @@ mod tests {
                 display_name: "Test".to_string(),
                 canonical_root: "/private/host/Test".to_string(),
                 owner_session_id: None,
+                session_workdir: false,
                 created_at: "1".to_string(),
             }],
             projects: Vec::new(),

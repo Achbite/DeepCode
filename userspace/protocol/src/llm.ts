@@ -11,10 +11,10 @@ export type LlmHostedWebSearch = 'web_search';
 
 interface LlmProviderProfileFields {
   id: string;
+  connectionId: string;
   name: string;
   kind: LlmProviderKind;
   providerFlavor: LlmProviderFlavor;
-  baseUrl?: string;
   model: string;
   contextWindowTokens?: number;
   maxOutputTokens?: number;
@@ -22,7 +22,7 @@ interface LlmProviderProfileFields {
   reasoningEffort?: LlmReasoningEffort;
   thinking?: LlmThinkingMode;
   hostedWebSearch?: LlmHostedWebSearch;
-  secretRef?: string;
+  imageInput?: boolean;
   enabled: boolean;
 }
 
@@ -43,6 +43,7 @@ export const KIMI_LLM_MODEL_OPTIONS = ['kimi-k3', 'kimi-k2.7-code', 'kimi-k2.7-c
 
 export interface LlmProfilesResult {
   profiles: LlmProviderProfile[];
+  connections: import('./modelServices.js').ModelConnection[];
   defaultProfileId?: string;
   storePath?: string;
 }
@@ -52,7 +53,6 @@ export interface PatchLlmProfilesRequest {
   profile?: LlmProviderProfile;
   removeProfileId?: string;
   defaultProfileId?: string;
-  secrets?: Record<string, string | null>;
 }
 
 export interface LlmProbeRequest {

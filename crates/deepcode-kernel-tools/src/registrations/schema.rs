@@ -112,7 +112,7 @@ pub(super) fn provider_schema_for_tool(tool: KernelToolKind) -> Value {
                     "type": "string",
                     "enum": ["workspace", "host"],
                     "default": "workspace",
-                    "description": "Defaults to workspace, which requires a registered platform workspace sandbox and fails explicitly when unavailable. Explicit host uses the host user environment and requires external-effect authority."
+                    "description": "Defaults to workspace, which requires an available workspace sandbox. Host requires external-effect authority; it changes permissions, not the selected execution target, shell or prepared PATH."
                 },
                 "timeout": {
                     "type": "integer",

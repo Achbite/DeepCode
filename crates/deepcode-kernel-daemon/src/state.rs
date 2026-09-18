@@ -8,6 +8,8 @@ pub(crate) struct AppState {
     pub(crate) host_connection: crate::host_connection::HostConnection,
     pub(crate) gui: Arc<Mutex<GuiState>>,
     pub(crate) host_services: HostServices,
+    pub(crate) model_usage: Arc<crate::model_usage::UsageStore>,
+    pub(crate) model_auth: Arc<crate::model_auth::AuthService>,
 }
 
 #[derive(Debug)]
@@ -16,10 +18,12 @@ pub(crate) struct HostPaths {
     pub(crate) settings_path: PathBuf,
     pub(crate) llm_profiles_path: PathBuf,
     pub(crate) llm_secrets_path: PathBuf,
+    pub(crate) usage_store_path: PathBuf,
     pub(crate) catalog_store_path: PathBuf,
     pub(crate) session_store_path: PathBuf,
     pub(crate) tool_record_store_path: PathBuf,
     pub(crate) attachment_store_root: PathBuf,
+    pub(crate) session_workdir_root: PathBuf,
 }
 
 #[derive(Debug)]
@@ -48,7 +52,8 @@ impl GuiState {
             Some(_) => return Err("本地用户设置文件必须是 JSON 对象。".to_string()),
             None => default_user_settings(),
         };
-        let llm_profiles = LlmProfileStore::load(&paths.llm_profiles_path);
+        let llm_profiles =
+            LlmProfileStore::load_with_secrets(&paths.llm_profiles_path, &paths.llm_secrets_path);
         let (conversation_catalog, conversation_catalog_error) =
             match crate::conversation_catalog::ConversationCatalog::load(&paths.catalog_store_path)
             {
@@ -87,10 +92,12 @@ impl HostPaths {
             settings_path: settings_dir.join("user-settings.json"),
             llm_profiles_path: settings_dir.join("llm-profiles.json"),
             llm_secrets_path: secrets_dir.join("llm-secrets.json"),
+            usage_store_path: runtime_root.join("provider-usage.sqlite3"),
             catalog_store_path: runtime_root.join("catalog.sqlite3"),
             session_store_path: runtime_root.join("session.sqlite3"),
             tool_record_store_path: runtime_root.join("tool-record.sqlite3"),
             attachment_store_root: runtime_root.join("attachments"),
+            session_workdir_root: runtime_root.join("session-workdirs"),
         }
     }
 }

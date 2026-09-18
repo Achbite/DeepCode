@@ -33,6 +33,19 @@ pub(crate) fn build_app(state: AppState) -> Router {
         )
         .route("/api/llm/probe", post(llm_probe))
         .route(
+            "/api/llm/connections",
+            get(model_connections::get).patch(model_connections::patch),
+        )
+        .route("/api/llm/usage", post(model_usage::query))
+        .route("/api/llm/prices", get(model_usage::catalog))
+        .route("/api/llm/auth", post(model_auth::start))
+        .route(
+            "/api/llm/auth/:id",
+            get(model_auth::read).delete(model_auth::cancel),
+        )
+        .route("/api/llm/connections/:id/logout", post(model_auth::logout))
+        .route("/api/llm/connections/:id/quota", get(model_auth::quota))
+        .route(
             "/api/local-agent/journal/sessions",
             post(local_agent_session_create),
         )

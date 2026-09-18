@@ -12,8 +12,8 @@ pub(crate) enum LlmProfileStore {
 }
 
 impl LlmProfileStore {
-    pub(crate) fn load(path: &FsPath) -> Self {
-        let value = match read_optional_json_file(path) {
+    pub(crate) fn load_with_secrets(path: &FsPath, secrets_path: &FsPath) -> Self {
+        let mut value = match read_optional_json_file(path) {
             Ok(Some(value)) => value,
             Ok(None) => match serde_json::from_str(DEFAULT_PROFILES) {
                 Ok(value) => value,
@@ -23,7 +23,10 @@ impl LlmProfileStore {
             },
             Err(error) => return Self::Unavailable(error),
         };
-        if let Err(error) = validate_profile_document(&value) {
+        if let Err(error) =
+            crate::model_connections::separate_connection_fields(&mut value, secrets_path)
+                .and_then(|()| validate_profile_document(&value))
+        {
             return Self::Unavailable(format!("{}: {error}", path.display()));
         }
         match validate_default_profile(&value) {
@@ -49,7 +52,10 @@ impl LlmProfileStore {
         path: &PathBuf,
         profile_id: &str,
     ) -> Result<(), String> {
-        let current = self.usable()?;
+        let current = match self {
+            Self::Ready(value) | Self::InvalidDefault { value, .. } => value,
+            Self::Unavailable(error) => return Err(error.clone()),
+        };
         if !current["profiles"]
             .as_array()
             .expect("validated profile list")
@@ -108,9 +114,9 @@ pub(crate) fn validate_llm_profile(profile: &Value) -> Result<(), String> {
     const FIELDS: &[&str] = &[
         "id",
         "name",
+        "connectionId",
         "kind",
         "providerFlavor",
-        "baseUrl",
         "model",
         "contextWindowTokens",
         "maxOutputTokens",
@@ -118,8 +124,8 @@ pub(crate) fn validate_llm_profile(profile: &Value) -> Result<(), String> {
         "reasoningEffort",
         "thinking",
         "hostedWebSearch",
-        "secretRef",
         "enabled",
+        "imageInput",
     ];
     let profile = profile.as_object().ok_or("Profile 必须是 JSON 对象。")?;
     if let Some(field) = profile
@@ -134,13 +140,19 @@ pub(crate) fn validate_llm_profile(profile: &Value) -> Result<(), String> {
             .and_then(Value::as_str)
             .is_some_and(|value| !value.is_empty() && value.trim() == value)
     };
-    for field in ["id", "name", "model"] {
+    for field in ["id", "name", "model", "connectionId"] {
         if !text(field) {
             return Err(format!("{field} 必须是无首尾空白的非空字符串。"));
         }
     }
     if !profile.get("enabled").is_some_and(Value::is_boolean) {
         return Err("enabled 必须是布尔值。".into());
+    }
+    if profile
+        .get("imageInput")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err("imageInput 必须是布尔值。".into());
     }
     if !matches!(
         profile.get("kind").and_then(Value::as_str),
@@ -155,9 +167,6 @@ pub(crate) fn validate_llm_profile(profile: &Value) -> Result<(), String> {
         )
     }) {
         return Err("providerFlavor 必须是 openai、deepseek、zhipu 或 moonshot。".into());
-    }
-    if profile.contains_key("baseUrl") && !text("baseUrl") {
-        return Err("baseUrl 必须是无首尾空白的非空字符串。".into());
     }
     for field in ["contextWindowTokens", "maxOutputTokens"] {
         if profile.get(field).is_some_and(|value| {
@@ -192,12 +201,6 @@ pub(crate) fn validate_llm_profile(profile: &Value) -> Result<(), String> {
     }) {
         return Err("hostedWebSearch 仅支持 responses Profile 的 web_search。".into());
     }
-    if profile
-        .get("secretRef")
-        .is_some_and(|value| value.as_str().and_then(local_secret_ref_key).is_none())
-    {
-        return Err("secretRef 必须是有效的 local-secret 引用。".into());
-    }
     if let (Some(context), Some(output)) = (
         profile.get("contextWindowTokens").and_then(Value::as_u64),
         profile.get("maxOutputTokens").and_then(Value::as_u64),
@@ -213,20 +216,40 @@ fn validate_profile_document(config: &Value) -> Result<(), String> {
     let config = config
         .as_object()
         .ok_or("LLM Profile 文件必须是 JSON 对象。")?;
-    if config.len() != 2
-        || config
-            .keys()
-            .any(|field| !matches!(field.as_str(), "profiles" | "defaultProfileId"))
+    if config.len() != 3
+        || config.keys().any(|field| {
+            !matches!(
+                field.as_str(),
+                "profiles" | "defaultProfileId" | "connections"
+            )
+        })
     {
-        return Err("LLM Profile 文件必须只包含 profiles 和 defaultProfileId。".into());
+        return Err("LLM 配置必须包含 profiles、connections 和 defaultProfileId。".into());
     }
     let profiles = config
         .get("profiles")
         .and_then(Value::as_array)
         .ok_or("profiles 必须是数组。")?;
+    let connections: Vec<crate::model_connections::ModelConnection> = serde_json::from_value(
+        config
+            .get("connections")
+            .cloned()
+            .ok_or("connections 必須存在。")?,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut connection_ids = HashSet::new();
+    for connection in &connections {
+        connection.validate()?;
+        if !connection_ids.insert(connection.id.as_str()) {
+            return Err("连接 ID 重复。".into());
+        }
+    }
     let mut ids = HashSet::with_capacity(profiles.len());
     for (index, profile) in profiles.iter().enumerate() {
         validate_llm_profile(profile).map_err(|error| format!("profiles[{index}].{error}"))?;
+        if !connection_ids.contains(profile["connectionId"].as_str().unwrap()) {
+            return Err(format!("profiles[{index}] 引用的连接不存在。"));
+        }
         let id = profile["id"].as_str().expect("validated profile id");
         if !ids.insert(id) {
             return Err(format!("profiles[{index}].id 重复：{id}"));
@@ -286,14 +309,6 @@ pub(crate) fn expand_profile_edit(store: &LlmProfileStore, body: Value) -> Resul
         .unwrap_or_default();
     if let Some(profile) = body.get("profile") {
         validate_llm_profile(profile)?;
-        let id = profile["id"].as_str().expect("validated profile id");
-        if body
-            .get("secrets")
-            .and_then(Value::as_object)
-            .is_some_and(|secrets| secrets.keys().any(|key| key != id))
-        {
-            return Err("单个模型保存只能更新该模型的密钥。".into());
-        }
         if let Some(existing) = profiles.iter_mut().find(|item| item["id"] == profile["id"]) {
             *existing = profile.clone();
         } else {
@@ -303,9 +318,6 @@ pub(crate) fn expand_profile_edit(store: &LlmProfileStore, body: Value) -> Resul
         let id = body["removeProfileId"]
             .as_str()
             .ok_or("removeProfileId 必须是模型 ID。")?;
-        if body.get("secrets").is_some() {
-            return Err("移除模型时不能同时修改其他密钥。".into());
-        }
         let Some(index) = profiles
             .iter()
             .position(|profile| profile["id"].as_str() == Some(id))
@@ -314,7 +326,7 @@ pub(crate) fn expand_profile_edit(store: &LlmProfileStore, body: Value) -> Resul
         };
         profiles.remove(index);
     }
-    let default = body
+    let mut default = body
         .get("defaultProfileId")
         .cloned()
         .or_else(|| current.map(|value| value["defaultProfileId"].clone()))
@@ -325,10 +337,10 @@ pub(crate) fn expand_profile_edit(store: &LlmProfileStore, body: Value) -> Resul
                 Value::Null
             }
         });
-    let mut expanded = json!({"profiles": profiles, "defaultProfileId": default});
-    if let Some(secrets) = body.get("secrets") {
-        expanded["secrets"] = secrets.clone();
+    if body.get("removeProfileId").is_some_and(|id| id == &default) {
+        default = Value::Null;
     }
+    let expanded = json!({"profiles": profiles, "defaultProfileId": default});
     Ok(expanded)
 }
 
@@ -365,20 +377,29 @@ mod tests {
     fn last_selected_model_is_persisted_without_changing_profile_contents() {
         let root = ConfigRoot::new();
         let profiles = json!([
-            {"id":"my-model-b", "name":"B", "kind":"responses", "model":"b-model", "enabled":true, "secretRef":"local-secret:b"},
-            {"id":"custom-c", "name":"C", "kind":"anthropic", "model":"c-model", "enabled":true, "secretRef":"local-secret:c"}
+            {"id":"my-model-b", "name":"B", "kind":"responses", "model":"b-model", "enabled":true, "connectionId":"connection:shared"},
+            {"id":"custom-c", "name":"C", "kind":"anthropic", "model":"c-model", "enabled":true, "connectionId":"connection:shared"}
         ]);
-        let original = json!({"profiles":profiles, "defaultProfileId":"my-model-b"});
+        let original = json!({"profiles":profiles, "defaultProfileId":"my-model-b", "connections":[{
+            "id":"connection:shared","name":"API","adapterId":"custom","billingMode":"metered","baseUrl":"https://example.test","credentialKind":"apiKey"
+        }]});
         fs::write(root.profile_path(), serde_json::to_vec(&original).unwrap()).unwrap();
         for id in ["custom-c", "my-model-b"] {
-            let mut store = LlmProfileStore::load(&root.profile_path());
+            let mut store = LlmProfileStore::load_with_secrets(
+                &root.profile_path(),
+                &root.0.join("secrets.json"),
+            );
             store.select_default(&root.profile_path(), id).unwrap();
-            let reloaded = LlmProfileStore::load(&root.profile_path());
+            let reloaded = LlmProfileStore::load_with_secrets(
+                &root.profile_path(),
+                &root.0.join("secrets.json"),
+            );
             assert_eq!(reloaded.usable().unwrap()["defaultProfileId"], id);
             assert_eq!(reloaded.usable().unwrap()["profiles"], profiles);
         }
         let before = fs::read(root.profile_path()).unwrap();
-        let mut store = LlmProfileStore::load(&root.profile_path());
+        let mut store =
+            LlmProfileStore::load_with_secrets(&root.profile_path(), &root.0.join("secrets.json"));
         assert!(store
             .select_default(&root.profile_path(), "unknown")
             .is_err());
@@ -387,25 +408,17 @@ mod tests {
 
     #[test]
     fn saving_one_model_preserves_other_models_and_the_saved_default() {
-        let a = json!({"id":"user-a", "name":"A", "kind":"responses", "model":"a", "enabled":true});
-        let b = json!({"id":"user-b", "name":"B", "kind":"anthropic", "model":"b", "enabled":true});
+        let a = json!({"id":"user-a", "name":"A", "kind":"responses", "model":"a", "enabled":true, "connectionId":"connection:a"});
+        let b = json!({"id":"user-b", "name":"B", "kind":"anthropic", "model":"b", "enabled":true, "connectionId":"connection:b"});
         let original = json!({"profiles":[a,b], "defaultProfileId":"user-b"});
         let store = LlmProfileStore::Ready(original.clone());
         let mut edited = a.clone();
         edited["name"] = json!("Saved A");
-        let expanded = expand_profile_edit(
-            &store,
-            json!({"profile":edited, "secrets":{"user-a":"test-only-key"}}),
-        )
-        .unwrap();
+        let expanded = expand_profile_edit(&store, json!({"profile":edited})).unwrap();
         assert_eq!(expanded["profiles"], json!([edited, b]));
         assert_eq!(expanded["defaultProfileId"], "user-b");
         assert_eq!(store.usable().unwrap(), &original);
-        assert!(expand_profile_edit(
-            &store,
-            json!({"profile":a, "secrets":{"user-b":"wrong-card"}})
-        )
-        .is_err());
+        assert!(expand_profile_edit(&store, json!({"removeProfileId":"missing"})).is_err());
         let removed = expand_profile_edit(&store, json!({"removeProfileId":"user-a"})).unwrap();
         assert_eq!(
             removed,
@@ -413,7 +426,8 @@ mod tests {
         );
         let removed_default =
             expand_profile_edit(&store, json!({"removeProfileId":"user-b"})).unwrap();
-        assert!(validate_llm_profile_store(&removed_default).is_err());
+        assert!(removed_default["defaultProfileId"].is_null());
+        assert_eq!(removed_default["profiles"], json!([a]));
     }
 
     #[test]

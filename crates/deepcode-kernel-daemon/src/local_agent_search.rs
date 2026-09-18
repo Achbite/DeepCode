@@ -67,6 +67,17 @@ mod tests {
 
     fn profile(flavor: &str, base: &str) -> ResolvedLlmProfile {
         ResolvedLlmProfile {
+            connection: crate::model_connections::ModelConnection {
+                id: "connection:test".into(),
+                name: "Test".into(),
+                adapter_id: "openai".into(),
+                billing_mode: "metered".into(),
+                base_url: "https://api.openai.com/v1".into(),
+                credential_kind: "apiKey".into(),
+                credential_ref: None,
+            },
+            account_id: None,
+            image_input: false,
             kind: "openaiCompatible".into(),
             provider_flavor: Some(flavor.into()),
             base_url: Some(base.into()),

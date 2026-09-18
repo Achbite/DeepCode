@@ -27,6 +27,9 @@ mod local_agent_search;
 mod local_agent_store;
 mod local_agent_tool_catalog;
 mod local_agent_tool_prompts;
+mod model_auth;
+mod model_connections;
+mod model_usage;
 mod prelude;
 mod provider_transport;
 mod routes;
@@ -98,6 +101,9 @@ async fn main() {
     );
 
     let gui_state = GuiState::open().expect("打开当前配置根");
+    let model_usage = Arc::new(
+        model_usage::UsageStore::open(&gui_state.paths.usage_store_path).expect("打开用量索引"),
+    );
     let session_store_path = gui_state.paths.session_store_path.clone();
     let tool_record_store_path = gui_state.paths.tool_record_store_path.clone();
     let user_settings = gui_state.user_settings.clone();
@@ -135,6 +141,8 @@ async fn main() {
         host_connection,
         gui,
         host_services: HostServices::new(),
+        model_auth: Arc::new(model_auth::AuthService::default()),
+        model_usage,
     };
     configure_host_lifetime().expect("初始化 Host 生命周期");
     let app = routes::build_app(state.clone());

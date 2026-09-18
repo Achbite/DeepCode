@@ -11,6 +11,7 @@ export const KERNEL_REPLY_VERSION = 'deepcode.kernel-reply' as const;
 export const SESSION_CONTROL_INTERACTION_REQUEST = 'interaction.request' as const;
 export const SESSION_CONTROL_PLAN_PUBLISH = 'plan.publish' as const;
 export const SESSION_CONTROL_PLAN_PROGRESS = 'plan.progress' as const;
+export const SESSION_CONTROL_PLUGIN_ACTIVATE = 'plugin.activate' as const;
 
 export type JsonObject = Record<string, unknown>;
 
@@ -134,7 +135,7 @@ export interface PluginCatalogItem {
   source: 'builtin' | 'mounted';
   category: 'functional' | 'reference';
   management?: {key: 'plugins.disabled' | 'plugins.sources' | 'mcp.servers' | 'skills.mounts'; id: string; path?: string};
-  contributionKind: 'skill' | 'mcp' | 'cli';
+  contributionKind: 'skill' | 'mcp' | 'cli' | 'host';
   discovery: 'default' | 'searchOnly';
   reference?: {toolName:'skill.read'|'doc.read';name:string};
   uri: PluginUri;
@@ -872,6 +873,12 @@ export type SessionEvent =
       payload: { record: ToolExecutionRecord };
     })
   | (SessionEventBase & {
+      type: 'session.plugins.activated';
+      runId: string;
+      callId: string;
+      payload: { providerCallId: string; pluginUris: string[] };
+    })
+  | (SessionEventBase & {
       type: 'session.control.rejected';
       runId: string;
       callId: string;
@@ -1338,6 +1345,9 @@ export interface ConversationReadResult {
 export interface ModelMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  /** Immutable user attachments; the Host resolves bytes only at the Provider transport boundary. */
+  toolImages?: readonly string[];
+  images?: readonly { workspaceId: string; logicalPath: string; mediaType: string }[];
   reasoningContent?: string;
   reasoningSignature?: string;
   toolCallId?: string;

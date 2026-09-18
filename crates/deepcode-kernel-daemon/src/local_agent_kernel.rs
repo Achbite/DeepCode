@@ -95,7 +95,7 @@ impl WorkspaceResolverPort for HostWorkspaceResolver {
             .workspace(workspace_id)
             .map(|workspace| ResolvedWorkspace {
                 root: workspace.canonical_root.clone(),
-                read_only: workspace.owner_session_id.is_some(),
+                read_only: workspace.owner_session_id.is_some() && !workspace.session_workdir,
             })
             .ok_or_else(|| {
                 LocalAgentKernelError::new(
@@ -957,10 +957,10 @@ impl LocalAgentKernel {
                 .iter()
                 .any(|id| id == workspace_id)
             {
-                return Err(LocalAgentKernelError::new(
-                    "workspace_not_bound",
-                    "工具引用的 workspaceId 不在当前 Session creation snapshot 中。",
-                ));
+                let mut error = LocalAgentKernelError::input("$.workspaceId", "workspaceBinding",
+                    "工具引用的 workspace 不在当前运行的目录集合中。请选择已绑定目录；需要其他位置时请向用户确认。", None);
+                error.code = "workspace_not_bound";
+                return Err(error);
             }
         }
         let input = binding.canonicalize(tool_input).map_err(catalog_error)?;
@@ -988,16 +988,23 @@ impl LocalAgentKernel {
         let (workspace_root, private_resolved_targets) = match workspace_id.as_deref() {
             Some(workspace_id) => {
                 let resolved = self.resolver.resolve(workspace_id)?;
+                let snapshot_read_process = matches!(&input,
+                    PreparedToolInput::Builtin(
+                        KernelCanonicalInvocation::ProcessShell { workspace_mode, execution_scope, .. }
+                        | KernelCanonicalInvocation::ProcessPowerShell { workspace_mode, execution_scope, .. }
+                    ) if workspace_mode.as_str() == "read" && execution_scope.as_str() == "workspace"
+                );
                 if resolved.read_only
-                    && matches!(
-                        scope,
-                        PreparedEffectScope::WorkspaceMutation | PreparedEffectScope::Process
-                    )
+                    && (scope == PreparedEffectScope::WorkspaceMutation
+                        || (scope == PreparedEffectScope::Process && !snapshot_read_process))
                 {
-                    return Err(LocalAgentKernelError::new(
-                        "input_resource_read_only",
-                        "会话输入快照只读；请在工作目录中创建处理产物。",
-                    ));
+                    let mut error = LocalAgentKernelError::input(
+                        "$.workspaceId", "readOnlyInput",
+                        "会话输入快照只读。可直接读取或在内部浏览器打开；修改或运行服务请使用可写工作目录中的副本。需要用户选择处理位置时，请发起确认。",
+                        None,
+                    );
+                    error.code = "input_resource_read_only";
+                    return Err(error);
                 }
                 let root = resolved.root;
                 let canonical_root = std::fs::canonicalize(&root).map_err(|error| {
@@ -1115,6 +1122,11 @@ impl LocalAgentKernel {
             return Ok(Admission::denied(
                 "run_already_settled",
                 "当前 run 已 settled，所有 authority 均已失效。",
+            ));
+        }
+        if prepared.binding.is_internal_preview() {
+            return Ok(Admission::Allowed(
+                json!({"decision":"allow","source":"internalPreview"}),
             ));
         }
         match prepared.scope {
@@ -1239,12 +1251,17 @@ impl LocalAgentKernel {
                 }),
             });
         }
-        match prepared
+        let mode = prepared
             .generation
             .permissions
             .mode(scope)
-            .expect("non-workspace policy")
-        {
+            .expect("non-workspace policy");
+        let mode = if prepared.binding.is_computer_control() && mode != PermissionMode::Deny {
+            PermissionMode::Ask
+        } else {
+            mode
+        };
+        match mode {
             PermissionMode::Allow => Ok(Admission::Allowed(json!({
                 "decision": "allow",
                 "source": "userSetting",
@@ -1544,10 +1561,14 @@ fn dispose_generations(
 }
 
 fn catalog_error(error: ToolCatalogError) -> LocalAgentKernelError {
+    let input_issues = error.input_issues.or_else(|| {
+        (error.code == "tool_input_invalid")
+            .then(|| vec![ToolInputIssue::new("$", "toolInput", &error.message, None)])
+    });
     LocalAgentKernelError {
         code: error.code,
         message: error.message,
-        input_issues: error.input_issues,
+        input_issues,
     }
 }
 
@@ -2355,7 +2376,7 @@ mod attempt_control_tests {
                     "runRuntimeSnapshotRef":"runtime:test", "extensionGenerationRef":"extension:test",
                     "kernelCatalogSnapshotRef":catalog["kernelCatalogSnapshotRef"],
                     "provider":{"providerRuntimeRef":"provider:test", "profileId":"profile:test", "contextWindowTokens":4096, "maxOutputTokens":512, "apiSurface":"chatCompletions", "hostedWebSearch":"none"},
-                    "webSearch":{"owner":"unavailable"}, "instructions":[], "tools":tools,
+                    "webSearch":{"owner":"unavailable"}, "environment":{"os":"fixture","arch":"fixture","locale":null,"responseLanguage":null,"userShell":null,"executionTarget":{"kind":"native"},"shell":{"tool":"bash","executable":"bash","dialect":"bash"},"executionPath":"fixture-bin","shellAvailable":true,"workspaceShellSupported":true,"developerCommands":[]}, "instructions":[], "tools":tools,
                     "toolPromptContributions":[], "providerToolAliases":aliases,
                     "selectedPlugins":{"catalogRevision":"plugins:test","plugins":[]}
                 }}
@@ -2468,7 +2489,7 @@ mod attempt_control_tests {
     }
 
     #[test]
-    fn browser_grant_is_explicit_session_scoped_and_does_not_authorize_services() {
+    fn internal_preview_is_allowed_but_computer_control_always_requires_explicit_approval() {
         use std::io::{BufRead, BufReader, Write};
         use std::net::{TcpListener, TcpStream};
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2497,6 +2518,8 @@ mod attempt_control_tests {
         let endpoint = listener.local_addr().unwrap().to_string();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
+        let received = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let incoming = received.clone();
         let thread = std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let mut stream = stream.unwrap();
@@ -2510,7 +2533,10 @@ mod attempt_control_tests {
                 BufReader::new(stream.try_clone().unwrap())
                     .read_line(&mut line)
                     .unwrap();
-                let _: Value = serde_json::from_str(&line).unwrap();
+                incoming
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&line).unwrap());
                 stream.write_all(b"{\"ok\":true,\"data\":{}}\n").unwrap();
             }
         });
@@ -2538,56 +2564,54 @@ mod attempt_control_tests {
         Arc::get_mut(&mut product).unwrap().browser_binding = Some(
             json!({"hostInstanceId":host.registration["hostInstanceId"],"windowLabel":"main"}),
         );
+        Arc::get_mut(&mut product).unwrap().computer_use_instance =
+            Some("plugin-instance:computer-use".into());
         let (kernel, mut request, catalog) = kernel_with_product_tools(
             Arc::new(NoWorkspace),
             "browser.page",
             json!({"action":"act","previewId":"preview-1","operation":"click","selector":"#button"}),
-            product,
+            product.clone(),
         );
         let effect = kernel.prepare_tool(&request).unwrap();
-        let preview = effect.preview("browser.page");
-        assert_eq!(preview["authorizationScope"], "sessionBrowser");
-        assert!(matches!(
-            kernel.admit(&request, &effect).unwrap(),
-            Admission::ApprovalRequired
-        ));
-        let commit = |call: &str, scope: bool, decision: &str| {
-            let mut preview = preview.clone();
-            if !scope {
-                preview
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("authorizationScope");
-            }
-            kernel.journal.append(&json!({"type":"approval.requested","sessionId":request.session_id,"runId":request.run_id,"callId":call,
-                "payload":{"approvalId":call,"preview":preview}})).unwrap();
-            kernel.journal.append(&json!({"type":"approval.resolved","sessionId":request.session_id,"runId":request.run_id,"callId":call,
-                "payload":{"approvalId":call,"commandId":call,"authorityId":call,"decision":decision}})).unwrap();
-        };
-        commit("call:ordinary", false, "allow");
-        assert!(matches!(
-            kernel.admit(&request, &effect).unwrap(),
-            Admission::ApprovalRequired
-        ));
-        commit("call:denied", true, "deny");
-        assert!(matches!(
-            kernel.admit(&request, &effect).unwrap(),
-            Admission::ApprovalRequired
-        ));
-        commit("call:browser", true, "allow");
-        request.call_id = "call:later".into();
-        request.run_id = "run:later".into();
-        let allowed = kernel.admit(&request, &effect).unwrap();
         assert!(
-            matches!(allowed, Admission::Allowed(ref value) if value["authorityId"] == "call:browser" && value["authorizationScope"] == "sessionBrowser")
+            matches!(kernel.admit(&request, &effect).unwrap(), Admission::Allowed(ref value) if value["source"] == "internalPreview")
         );
-        request.session_id = "session:other".into();
-        assert!(matches!(
-            kernel.admit(&request, &effect).unwrap(),
-            Admission::ApprovalRequired
-        ));
-        request.session_id = "session:reject".into();
-        request.run_id = "run:reject".into();
+        struct SnapshotRoot(PathBuf);
+        impl WorkspaceResolverPort for SnapshotRoot {
+            fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
+                Ok(ResolvedWorkspace {
+                    root: self.0.to_string_lossy().into(),
+                    read_only: true,
+                })
+            }
+        }
+        impl Drop for SnapshotRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = std::env::temp_dir().join(random_id("browser-input").unwrap().replace(':', "-"));
+        std::fs::create_dir(&root).unwrap();
+        let root = Arc::new(SnapshotRoot(root));
+        std::fs::write(root.0.join("preview.html"), "<h1>Input</h1>").unwrap();
+        let (file_kernel, file_request, _) = kernel_with_product_tools(
+            root.clone(),
+            "browser.open",
+            json!({"workspaceId":"workspace:test", "path":"preview.html"}),
+            product,
+        );
+        let opened = file_kernel.execute(file_request).unwrap();
+        assert_eq!(opened["record"]["outcome"], "completed");
+        let opened_path = std::fs::canonicalize(root.0.join("preview.html")).unwrap();
+        assert!(received
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|value| value["input"] == json!({"action":"open", "filePath":opened_path})));
+        assert_eq!(
+            std::fs::read_to_string(root.0.join("preview.html")).unwrap(),
+            "<h1>Input</h1>"
+        );
         request.tool_name = "browser.service".into();
         request.tool_binding_ref = catalog["tools"]
             .as_array()
@@ -2604,19 +2628,93 @@ mod attempt_control_tests {
             kernel.admit(&request, &service).unwrap(),
             Admission::ApprovalRequired
         ));
-        let mut denied = effect.clone();
-        denied.generation = Arc::new(KernelGeneration {
-            catalog: effect.generation.catalog.clone(),
-            executor_config: effect.generation.executor_config.clone(),
-            permissions: LocalAgentPermissionPolicy::from_settings(
-                &json!({"agent.permissions.external":"deny"}),
-            )
-            .unwrap(),
-        });
+        request.tool_name = "computer.control".into();
+        request.tool_binding_ref = catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "computer.control")
+            .unwrap()["toolBindingRef"]
+            .as_str()
+            .unwrap()
+            .into();
+        request.input = json!({"action":"listApps"});
+        let computer = kernel.prepare_tool(&request).unwrap();
         assert!(matches!(
-            kernel.admit(&request, &denied).unwrap(),
-            Admission::Denied { .. }
+            kernel.admit(&request, &computer).unwrap(),
+            Admission::ApprovalRequired
         ));
+        for (setting, expects_denial) in [("allow", false), ("deny", true)] {
+            let mut configured = computer.clone();
+            configured.generation = Arc::new(KernelGeneration {
+                catalog: computer.generation.catalog.clone(),
+                executor_config: computer.generation.executor_config.clone(),
+                permissions: LocalAgentPermissionPolicy::from_settings(
+                    &json!({"agent.permissions.external":setting}),
+                )
+                .unwrap(),
+            });
+            assert!(matches!(
+                (kernel.admit(&request, &configured).unwrap(), expects_denial),
+                (Admission::ApprovalRequired, false) | (Admission::Denied { .. }, true)
+            ));
+        }
+        kernel.journal.append(&json!({"type":"tool.requested","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+            "payload":{"providerCallId":"provider:computer","attemptId":request.attempt_id,"toolName":"computer.control","input":request.input}})).unwrap();
+        let preview = computer.preview("computer.control");
+        kernel.journal.append(&json!({"type":"approval.requested","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+            "payload":{"approvalId":"approval:computer","preview":preview}})).unwrap();
+        kernel.journal.append(&json!({"type":"approval.resolved","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+            "payload":{"approvalId":"approval:computer","commandId":"command:computer","authorityId":"authority:computer","decision":"allow"}})).unwrap();
+        request.non_workspace_authority = Some(
+            serde_json::from_value(json!({"authorityId":"authority:computer","decision":"allow"}))
+                .unwrap(),
+        );
+        assert!(
+            matches!(kernel.admit(&request, &computer).unwrap(), Admission::Allowed(ref value) if value["source"] == "user")
+        );
+        request.non_workspace_authority = None;
+        request.call_id = "call:next-computer".into();
+        assert!(matches!(
+            kernel.admit(&request, &computer).unwrap(),
+            Admission::ApprovalRequired
+        ));
+    }
+
+    #[test]
+    fn input_snapshot_read_shell_is_allowed_and_mutation_is_a_call_rejection() {
+        struct Snapshot;
+        impl WorkspaceResolverPort for Snapshot {
+            fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
+                Ok(ResolvedWorkspace {
+                    root: std::env::current_dir().unwrap().to_string_lossy().into(),
+                    read_only: true,
+                })
+            }
+        }
+        let (kernel, mut request, _) = kernel_with_request(
+            Arc::new(Snapshot),
+            "bash",
+            json!({"workspaceId":"workspace:test", "command":"pwd; ls -l Cargo.toml"}),
+        );
+        let effect = kernel.prepare_tool(&request).unwrap();
+        assert_eq!(effect.process_workspace_mode.as_deref(), Some("read"));
+        assert_eq!(effect.process_execution_scope.as_deref(), Some("workspace"));
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::Allowed(_)
+        ));
+        for (mode, scope) in [("write", "workspace"), ("read", "host")] {
+            request.input = json!({"workspaceId":"workspace:test", "command":"pwd", "workspaceMode":mode, "executionScope":scope});
+            let reply = kernel.execute(request.clone()).unwrap();
+            assert_eq!(reply["status"], "inputRejected");
+            assert_eq!(
+                reply["rejection"]["error"]["code"],
+                "input_resource_read_only"
+            );
+            assert_eq!(reply["rejection"]["input"], request.input);
+            assert!(kernel.records.read(&request.call_id).unwrap().is_none());
+        }
     }
 
     #[test]

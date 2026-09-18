@@ -1,6 +1,4 @@
-use crate::llm_transport::{
-    valid_responses_hosted_search_item, LlmChatOutput, LlmToolCall,
-};
+use crate::llm_transport::{valid_responses_hosted_search_item, LlmChatOutput, LlmToolCall};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -131,6 +129,8 @@ pub(crate) struct ProviderStreamAccumulator {
     cache_read_input_tokens: Option<u64>,
     cache_miss_input_tokens: Option<u64>,
     cache_creation_input_tokens: Option<u64>,
+    actual_model: Option<String>,
+    service_tier: Option<String>,
     source_done: bool,
 }
 
@@ -153,6 +153,8 @@ impl ProviderStreamAccumulator {
             cache_read_input_tokens: None,
             cache_miss_input_tokens: None,
             cache_creation_input_tokens: None,
+            actual_model: None,
+            service_tier: None,
             source_done: false,
         }
     }
@@ -185,6 +187,70 @@ impl ProviderStreamAccumulator {
         }
     }
 
+    fn usage_snapshot(&self) -> Result<Option<ProviderUsage>, ProviderStreamError> {
+        Ok(match (self.input_tokens, self.output_tokens) {
+            (Some(input_tokens), Some(output_tokens)) => Some(match self.kind {
+                ProviderStreamKind::Anthropic => anthropic_usage(
+                    input_tokens,
+                    output_tokens,
+                    self.cache_read_input_tokens,
+                    self.cache_creation_input_tokens,
+                )?,
+                ProviderStreamKind::OpenAiCompatible | ProviderStreamKind::Responses => {
+                    let cache = cache_usage_from_total(
+                        input_tokens,
+                        self.cache_read_input_tokens,
+                        self.cache_miss_input_tokens,
+                    )?;
+                    ProviderUsage {
+                        input_tokens,
+                        output_tokens,
+                        cache_read_input_tokens: cache.map(|value| value.0),
+                        cache_miss_input_tokens: cache.map(|value| value.1),
+                    }
+                }
+                ProviderStreamKind::Ollama => ProviderUsage {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_input_tokens: None,
+                    cache_miss_input_tokens: None,
+                },
+            }),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn observed_usage(
+        &self,
+    ) -> Result<crate::model_usage::ObservedUsage, ProviderStreamError> {
+        Ok(crate::model_usage::ObservedUsage {
+            usage: self.usage_snapshot()?,
+            model: self.actual_model.clone(),
+            service_tier: self.service_tier.clone(),
+            cache_write_tokens: self.cache_creation_input_tokens,
+        })
+    }
+
+    fn observe_metadata(&mut self, value: &Value) -> Result<(), ProviderStreamError> {
+        let response = value
+            .get("response")
+            .or_else(|| value.get("message"))
+            .unwrap_or(value);
+        if let Some(model) = response.get("model").and_then(Value::as_str) {
+            self.actual_model = Some(model.into());
+        }
+        if let Some(tier) = response.get("service_tier").and_then(Value::as_str) {
+            self.service_tier = Some(tier.into());
+        }
+        // This optional field is retained only when explicitly reported.
+        set_token_count(
+            &mut self.cache_creation_input_tokens,
+            response.pointer("/usage/input_tokens_details/cache_creation_tokens"),
+            "缓存写入 token",
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn finalize(self) -> Result<ProviderStreamResult, ProviderStreamError> {
         self.finalize_with_call_id_namespace(None)
     }
@@ -200,6 +266,7 @@ impl ProviderStreamAccumulator {
         self,
         request_id: Option<&str>,
     ) -> Result<ProviderStreamResult, ProviderStreamError> {
+        let usage = self.usage_snapshot()?;
         if !self.source_done {
             return Err(ProviderStreamError::new(
                 "provider_stream_native_terminal_missing",
@@ -326,36 +393,7 @@ impl ProviderStreamAccumulator {
             completion: ProviderCompletion {
                 provider_kind: self.kind,
                 finish_reason: self.finish_reason,
-                usage: match (self.input_tokens, self.output_tokens) {
-                    (Some(input_tokens), Some(output_tokens)) => Some(match self.kind {
-                        ProviderStreamKind::Anthropic => anthropic_usage(
-                            input_tokens,
-                            output_tokens,
-                            self.cache_read_input_tokens,
-                            self.cache_creation_input_tokens,
-                        )?,
-                        ProviderStreamKind::OpenAiCompatible | ProviderStreamKind::Responses => {
-                            let cache = cache_usage_from_total(
-                                input_tokens,
-                                self.cache_read_input_tokens,
-                                self.cache_miss_input_tokens,
-                            )?;
-                            ProviderUsage {
-                                input_tokens,
-                                output_tokens,
-                                cache_read_input_tokens: cache.map(|value| value.0),
-                                cache_miss_input_tokens: cache.map(|value| value.1),
-                            }
-                        }
-                        ProviderStreamKind::Ollama => ProviderUsage {
-                            input_tokens,
-                            output_tokens,
-                            cache_read_input_tokens: None,
-                            cache_miss_input_tokens: None,
-                        },
-                    }),
-                    _ => None,
-                },
+                usage,
             },
         })
     }
@@ -369,6 +407,7 @@ impl ProviderStreamAccumulator {
             return Ok(Vec::new());
         }
         let value = parse_json(payload)?;
+        self.observe_metadata(&value)?;
         if let Some(error) = value.get("error") {
             return Err(ProviderStreamError::new(
                 "provider_error",
@@ -457,6 +496,7 @@ impl ProviderStreamAccumulator {
         payload: &str,
     ) -> Result<Vec<ProviderEmission>, ProviderStreamError> {
         let value = parse_json(payload)?;
+        self.observe_metadata(&value)?;
         if let Some(error) = value.get("error") {
             return Err(ProviderStreamError::new(
                 "provider_error",
@@ -707,6 +747,7 @@ impl ProviderStreamAccumulator {
         payload: &str,
     ) -> Result<Vec<ProviderEmission>, ProviderStreamError> {
         let value = parse_json(payload)?;
+        self.observe_metadata(&value)?;
         let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
         let mut emissions = Vec::new();
         match event_type {
@@ -818,6 +859,7 @@ impl ProviderStreamAccumulator {
         payload: &str,
     ) -> Result<Vec<ProviderEmission>, ProviderStreamError> {
         let value = parse_json(payload)?;
+        self.observe_metadata(&value)?;
         if let Some(error) = value.get("error") {
             return Err(ProviderStreamError::new(
                 "provider_error",

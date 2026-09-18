@@ -10,6 +10,8 @@ use thiserror::Error;
 
 mod bootstrap;
 mod conversation;
+mod model_services;
+pub use model_services::*;
 
 use conversation::invalid_filesystem_references;
 

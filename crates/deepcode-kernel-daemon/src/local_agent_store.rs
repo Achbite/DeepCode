@@ -770,6 +770,7 @@ fn validate_new_event(
         "tool.input-rejected",
         "tool.interrupted",
         "session.control.rejected",
+        "session.plugins.activated",
         "context.compaction.requested",
         "context.compacted",
         "context.composed",
@@ -815,6 +816,7 @@ fn validate_new_event(
             | "tool.input-rejected"
             | "tool.interrupted"
             | "session.control.rejected"
+            | "session.plugins.activated"
     );
     if needs_run {
         validate_id("runId", required_string(event, "runId")?)?;
@@ -842,7 +844,11 @@ fn validate_new_event(
     }
     if matches!(
         event_type,
-        "interaction.requested" | "plan.published" | "tool.requested" | "session.control.rejected"
+        "interaction.requested"
+            | "plan.published"
+            | "tool.requested"
+            | "session.control.rejected"
+            | "session.plugins.activated"
     ) || progress_call
     {
         let payload = event.get("payload").expect("validated payload");
@@ -1385,6 +1391,26 @@ fn validate_new_event(
                 }
             }
         }
+        "session.plugins.activated" => {
+            let payload = event.get("payload").expect("validated payload");
+            exact_object(payload, &["providerCallId", "pluginUris"], &[])?;
+            let uris = payload["pluginUris"].as_array().ok_or_else(|| {
+                LocalAgentStoreError::new("session_event_invalid", "pluginUris 必须是数组。")
+            })?;
+            let mut seen = std::collections::HashSet::new();
+            if uris.is_empty()
+                || uris.len() > 16
+                || uris.iter().any(|uri| {
+                    uri.as_str()
+                        .is_none_or(|uri| !uri.starts_with("plugin://") || !seen.insert(uri))
+                })
+            {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "pluginUris 必须包含 1 至 16 个不重复的插件 URI。",
+                ));
+            }
+        }
         "session.control.rejected" => {
             let payload = event.get("payload").expect("validated payload");
             exact_object(
@@ -1394,7 +1420,7 @@ fn validate_new_event(
             )?;
             if !matches!(
                 required_string(payload, "toolName")?,
-                "interaction.request" | "plan.publish" | "plan.progress"
+                "interaction.request" | "plan.publish" | "plan.progress" | "plugin.activate"
             ) {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
@@ -1924,7 +1950,6 @@ fn validate_event_references(
                 | "tool.interrupted"
                 | "approval.requested"
                 | "approval.resolved"
-                | "interaction.resolved"
                 | "plan.confirmed"
                 | "plan.revision.requested"
                 | "plan.cancelled"
@@ -1938,6 +1963,20 @@ fn validate_event_references(
             return Err(LocalAgentStoreError::new(
                 "session_event_call_missing",
                 "Session event references an unknown call.",
+            ));
+        }
+    }
+    if event["type"] == "interaction.resolved" {
+        let interaction_id = required_string(&event["payload"], "interactionId")?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2
+             AND event_type='interaction.requested' AND json_extract(payload_json, '$.interactionId')=?3)",
+            params![session_id, event["runId"].as_str(), interaction_id], |row| row.get(0),
+        ).map_err(sql_error("session_event_reference_read_failed"))?;
+        if !exists {
+            return Err(LocalAgentStoreError::new(
+                "session_event_interaction_missing",
+                "Session event references an unknown interaction.",
             ));
         }
     }
@@ -4454,6 +4493,37 @@ mod tests {
             saved["revision"],
             before.last().unwrap()["sequence"].as_u64().unwrap() + 1
         );
+    }
+
+    #[test]
+    fn interaction_resolution_uses_interaction_identity_without_a_tool_call() {
+        let store = Store::new();
+        let journal = LocalAgentJournal::open(&store.path()).unwrap();
+        journal
+            .create_session("session:loop", "Loop", &json!([]), None)
+            .unwrap();
+        journal.append(&json!({"type":"run.started","sessionId":"session:loop","runId":"run:loop",
+            "payload":{"inputMessageId":"message:loop","workspaceBindings":[],"runtimeSnapshot":runtime_snapshot()}})).unwrap();
+        journal.append(&json!({"type":"interaction.requested","sessionId":"session:loop","runId":"run:loop","callId":"call:question",
+            "payload":{"interactionId":"interaction:destination","providerCallId":"provider:question","kind":"confirmation",
+                "prompt":"Choose a working directory", "options":[{"id":"draft","label":"Session working directory"}],"allowFreeform":false}})).unwrap();
+        let resolved = json!({"type":"interaction.resolved","sessionId":"session:loop","runId":"run:loop",
+            "payload":{"interactionId":"interaction:destination","commandId":"command:answer","response":"Session working directory"}});
+        let mut missing = resolved.clone();
+        missing["payload"]["interactionId"] = json!("interaction:missing");
+        let before = journal.read_events("session:loop", 0).unwrap();
+        assert_eq!(
+            journal.append(&missing).unwrap_err().code,
+            "session_event_interaction_missing"
+        );
+        assert_eq!(journal.read_events("session:loop", 0).unwrap(), before);
+        journal.append(&resolved).unwrap();
+        drop(journal);
+        let reopened = LocalAgentJournal::open(&store.path()).unwrap();
+        let events = reopened.read_events("session:loop", 0).unwrap();
+        assert_eq!(events.last().unwrap()["type"], "interaction.resolved");
+        assert!(events.last().unwrap().get("callId").is_none());
+        assert_eq!(events.last().unwrap()["payload"], resolved["payload"]);
     }
 
     #[test]

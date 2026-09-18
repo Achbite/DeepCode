@@ -226,10 +226,7 @@ fn trusted_cors_origin(origin: &HeaderValue) -> bool {
 }
 
 fn trusted_desktop_origin(origin: &str) -> bool {
-    if matches!(
-        origin,
-        "deepcode-gui://localhost"
-    ) {
+    if matches!(origin, "deepcode-gui://localhost") {
         return true;
     }
     let Some(authority) = origin.strip_prefix("http://") else {
@@ -459,6 +456,11 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("GET", ["api", "llm", "profiles"])
         | ("PATCH", ["api", "llm", "profiles"])
         | ("POST", ["api", "llm", "probe"])
+        | ("GET", ["api", "llm", "connections"])
+        | ("PATCH", ["api", "llm", "connections"])
+        | ("POST", ["api", "llm", "usage"])
+        | ("GET", ["api", "llm", "prices"])
+        | ("POST", ["api", "llm", "auth"])
         | ("GET", ["api", "conversation", "catalog"])
         | ("GET", ["api", "conversation", "statuses"])
         | ("GET", ["api", "conversation", "plugins"])
@@ -482,6 +484,10 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("POST", ["api", "terminal", "sessions", _, "restart"])
         | ("PATCH", ["api", "terminal", "sessions", _])
         | ("DELETE", ["api", "terminal", "sessions", _])
+        | ("GET", ["api", "llm", "auth", _])
+        | ("DELETE", ["api", "llm", "auth", _])
+        | ("POST", ["api", "llm", "connections", _, "logout"])
+        | ("GET", ["api", "llm", "connections", _, "quota"])
         | ("POST", ["api", "conversation", "sessions", _, "commands"])
         | ("PATCH", ["api", "conversation", "projects", _])
         | ("DELETE", ["api", "conversation", "projects", _])
@@ -557,6 +563,28 @@ mod tests {
         assert!(!host_proxy_path_allowed(
             "POST",
             "/api/conversation/plugins/skills"
+        ));
+    }
+
+    #[test]
+    fn host_proxy_exposes_model_services_without_opening_internal_provider_routes() {
+        for (method, path) in [
+            ("GET", "/api/llm/connections"),
+            ("PATCH", "/api/llm/connections"),
+            ("POST", "/api/llm/usage"),
+            ("GET", "/api/llm/prices"),
+            ("POST", "/api/llm/auth"),
+            ("GET", "/api/llm/auth/flow-1"),
+            ("DELETE", "/api/llm/auth/flow-1"),
+            ("POST", "/api/llm/connections/connection-1/logout"),
+            ("GET", "/api/llm/connections/connection-1/quota"),
+        ] {
+            assert!(host_proxy_path_allowed(method, path), "{method} {path}");
+        }
+        assert!(!host_proxy_path_allowed("GET", "/api/llm/secrets"));
+        assert!(!host_proxy_path_allowed(
+            "POST",
+            "/api/local-agent/provider"
         ));
     }
 }

@@ -51,24 +51,30 @@ pub fn find_command_in(name: &str, directories: &[PathBuf]) -> Option<PathBuf> {
 }
 
 fn command_candidates(name: &str) -> impl Iterator<Item = PathBuf> + '_ {
-    let directories = std::env::split_paths(std::env::var_os("PATH").as_deref().unwrap_or(OsStr::new("")))
-        .collect::<Vec<_>>();
+    let directories = std::env::split_paths(
+        std::env::var_os("PATH")
+            .as_deref()
+            .unwrap_or(OsStr::new("")),
+    )
+    .collect::<Vec<_>>();
     command_candidates_in(name, directories.into_iter())
 }
 
-fn command_candidates_in<'a>(name: &'a str, directories: impl Iterator<Item = impl AsRef<Path>> + 'a) -> impl Iterator<Item = PathBuf> + 'a {
-    directories
-        .flat_map(move |directory| {
-            let directory = directory.as_ref();
-            if cfg!(windows) {
-                ["exe", "cmd", "bat", "com"]
-                    .into_iter()
-                    .map(|extension| directory.join(format!("{name}.{extension}")))
-                    .collect::<Vec<_>>()
-            } else {
-                vec![directory.join(name)]
-            }
-        })
+fn command_candidates_in<'a>(
+    name: &'a str,
+    directories: impl Iterator<Item = impl AsRef<Path>> + 'a,
+) -> impl Iterator<Item = PathBuf> + 'a {
+    directories.flat_map(move |directory| {
+        let directory = directory.as_ref();
+        if cfg!(windows) {
+            ["exe", "cmd", "bat", "com"]
+                .into_iter()
+                .map(|extension| directory.join(format!("{name}.{extension}")))
+                .collect::<Vec<_>>()
+        } else {
+            vec![directory.join(name)]
+        }
+    })
 }
 
 fn executable_file(path: &Path) -> bool {
@@ -339,6 +345,10 @@ mod tests {
 
 pub fn resolved_agent_shell_path() -> KernelResult<OsString> {
     let host_path = std::env::var_os("PATH");
+    resolved_agent_shell_path_from(host_path.as_deref())
+}
+
+pub fn resolved_agent_shell_path_from(host_path: Option<&OsStr>) -> KernelResult<OsString> {
     let mut configured_tool_paths = Vec::new();
     for key in ["PNPM_HOME"] {
         if let Some(path) = std::env::var_os(key) {
@@ -355,10 +365,77 @@ pub fn resolved_agent_shell_path() -> KernelResult<OsString> {
         configured_tool_paths.push(root.join("shims"));
         configured_tool_paths.push(root.join("bin"));
     }
-    compose_agent_shell_path(
-        host_path.as_deref(),
-        &configured_tool_paths,
-    )
+    compose_agent_shell_path(host_path, &configured_tool_paths)
+}
+
+/// Host startup/refresh probe. Tool invocations keep using the prepared PATH;
+/// they do not source a user profile or change scope on failure.
+#[cfg(unix)]
+pub fn login_shell_path(shell: &Path) -> KernelResult<OsString> {
+    use std::io::Read;
+    use std::os::unix::{ffi::OsStringExt, process::CommandExt};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let failure = |message: String| {
+        KernelError::InvalidCommand(format!("host_shell_environment_failed: {message}"))
+    };
+    let mut child = Command::new(shell)
+        .args(["-ilc", "/usr/bin/printf '\\0DEEPCODE_HOST_PATH\\0' && /usr/bin/printenv PATH && /usr/bin/printf '\\0'"])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit())
+        .process_group(0).spawn().map_err(|error| failure(error.to_string()))?;
+    let pid = child.id();
+    let stdout = child.stdout.take().expect("piped shell stdout");
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout
+            .take(64 * 1024)
+            .read_to_end(&mut output)
+            .map(|_| output)
+    });
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if start.elapsed() < Duration::from_secs(5) => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Ok(None) => break Err(failure("login shell timed out after 5 seconds".into())),
+            Err(error) => break Err(failure(error.to_string())),
+        }
+    };
+    // Only the process group created by this probe is owned here.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+    let _ = child.wait();
+    let output = reader
+        .join()
+        .map_err(|_| failure("PATH reader failed".into()))?
+        .map_err(|error| failure(error.to_string()))?;
+    let status = status?;
+    if !status.success() {
+        return Err(failure(format!("login shell exited with {status}")));
+    }
+    let marker = b"\0DEEPCODE_HOST_PATH\0";
+    let offset = output
+        .windows(marker.len())
+        .rposition(|part| part == marker)
+        .ok_or_else(|| failure("login shell did not report PATH".into()))?
+        + marker.len();
+    let end = output[offset..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| failure("login shell PATH output is incomplete".into()))?
+        + offset;
+    let path = output[offset..end]
+        .strip_suffix(b"\n")
+        .unwrap_or(&output[offset..end]);
+    if path.is_empty() || output.len() == 64 * 1024 {
+        return Err(failure(
+            "login shell reported an empty, invalid or truncated PATH".into(),
+        ));
+    }
+    Ok(OsString::from_vec(path.to_vec()))
 }
 
 pub(crate) fn compose_agent_shell_path(
@@ -374,7 +451,8 @@ pub(crate) fn compose_agent_shell_path(
             push_unique_path(&mut paths, path);
         }
     }
-    std::env::join_paths(paths).map_err(|error| KernelError::InvalidCommand(format!("Invalid execution PATH: {error}")))
+    std::env::join_paths(paths)
+        .map_err(|error| KernelError::InvalidCommand(format!("Invalid execution PATH: {error}")))
 }
 
 fn push_existing_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {

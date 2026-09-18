@@ -2375,9 +2375,6 @@ mod tests {
                 "purpose": "agent",
                 "runId": "run:test",
                 "responseConstraint": "normal",
-                "stableCoreHash": "context-hash-v1:0000000000000001",
-                "baseToolSchemaHash": "context-hash-v1:0000000000000002",
-                "selectedPluginSnapshotHash": "context-hash-v1:0000000000000003",
                 "dynamicInstructionBytes": 128,
                 "messages": [{
                     "messageIndex": 0,
