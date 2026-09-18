@@ -799,7 +799,12 @@ impl SessionProjection {
                 != self
                     .activities
                     .iter()
-                    .filter(|activity| matches!(activity.kind.as_str(), "tool" | "providerHosted" | "approval"))
+                    .filter(|activity| {
+                        matches!(
+                            activity.kind.as_str(),
+                            "tool" | "providerHosted" | "approval"
+                        )
+                    })
                     .count()
         {
             return Err("shared Session projection canonical timeline is incomplete".to_string());

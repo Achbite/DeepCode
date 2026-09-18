@@ -2410,6 +2410,8 @@ mod attempt_control_tests {
         let preview = effect.preview("bash");
         assert_eq!(preview["authorizationScope"], "runHostShell");
         let commit = |call: &str, scope: bool| {
+            kernel.journal.append(&json!({"type":"tool.requested","sessionId":"session:reject","runId":"run:reject","callId":call,
+                "payload":{"providerCallId":format!("provider:{call}"),"attemptId":format!("attempt:{call}"),"toolName":"bash","input":request.input}})).unwrap();
             kernel.journal.append(&json!({"type":"approval.requested","sessionId":"session:reject","runId":"run:reject","callId":call,
                 "payload":{"approvalId":call,"preview":preview}})).unwrap();
             let mut payload =

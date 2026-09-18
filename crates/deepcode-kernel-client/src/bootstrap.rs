@@ -567,8 +567,8 @@ fn find_kernel_binary() -> KernelClientResult<Option<PathBuf>> {
         )));
     }
 
-    let executable = std::env::current_exe()
-        .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?;
+    let executable =
+        std::env::current_exe().map_err(|error| KernelClientError::Bootstrap(error.to_string()))?;
     let directory = executable.parent().ok_or_else(|| {
         KernelClientError::Bootstrap("executable directory is unavailable".into())
     })?;
@@ -600,7 +600,12 @@ fn spawn_kernel_binary(
     command
         .current_dir(&kernel_dir)
         .env("DEEPCODE_CONFIG_DIR", config_root)
-        .env("DEEPCODE_RUNTIME_DIR", std::env::var_os("DEEPCODE_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| kernel_dir.clone()))
+        .env(
+            "DEEPCODE_RUNTIME_DIR",
+            std::env::var_os("DEEPCODE_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| kernel_dir.clone()),
+        )
         .env("DEEPCODE_HOST", host)
         .env("DEEPCODE_PORT", port)
         .env(HOST_SHELL_TOKEN_ENV, host_shell_token)

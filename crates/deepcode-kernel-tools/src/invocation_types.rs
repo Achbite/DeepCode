@@ -74,13 +74,19 @@ pub enum KernelExecutionScope {
 
 impl KernelWorkspaceMode {
     pub fn as_str(self) -> &'static str {
-        match self { Self::Read => "read", Self::Write => "write" }
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
     }
 }
 
 impl KernelExecutionScope {
     pub fn as_str(self) -> &'static str {
-        match self { Self::Workspace => "workspace", Self::Host => "host" }
+        match self {
+            Self::Workspace => "workspace",
+            Self::Host => "host",
+        }
     }
 }
 
@@ -178,12 +184,24 @@ pub enum KernelCanonicalInvocation {
     },
 }
 
-fn default_start_line() -> u32 { 1 }
-fn default_max_lines() -> u32 { 2_000 }
-fn default_read_bytes() -> u32 { 262_144 }
-fn default_timeout() -> u32 { 120 }
-fn default_search_limit() -> u32 { 5 }
-fn default_fetch_bytes() -> u32 { 98_304 }
+fn default_start_line() -> u32 {
+    1
+}
+fn default_max_lines() -> u32 {
+    2_000
+}
+fn default_read_bytes() -> u32 {
+    262_144
+}
+fn default_timeout() -> u32 {
+    120
+}
+fn default_search_limit() -> u32 {
+    5
+}
+fn default_fetch_bytes() -> u32 {
+    98_304
+}
 
 impl KernelCanonicalInvocation {
     pub fn tool_id(&self) -> KernelToolKind {

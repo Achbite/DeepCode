@@ -1,6 +1,6 @@
-use crate::registrations::{builtin_tool_registrations, KernelToolRegistration};
 use crate::invocation_adapter::canonicalize_invocation;
 use crate::invocation_types::{KernelCanonicalInvocation, KernelToolKind};
+use crate::registrations::{builtin_tool_registrations, KernelToolRegistration};
 use crate::types::{ToolAvailability, ToolDescriptor};
 use serde::Serialize;
 use serde_json::Value;
@@ -94,10 +94,7 @@ impl KernelToolRegistry {
     }
 
     #[doc(hidden)]
-    pub fn executor_bindings(
-        &self,
-    ) -> impl Iterator<Item = (&'static str, KernelToolKind)> + '_
-    {
+    pub fn executor_bindings(&self) -> impl Iterator<Item = (&'static str, KernelToolKind)> + '_ {
         self.registrations
             .values()
             .map(|registration| (registration.tool_id(), registration.kind))

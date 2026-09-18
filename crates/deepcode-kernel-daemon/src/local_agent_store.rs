@@ -4535,7 +4535,7 @@ mod tests {
         journal.append(&json!({"type":"run.started","sessionId":"session:loop","runId":"run:loop",
             "payload":{"inputMessageId":"message:loop","workspaceBindings":[],"runtimeSnapshot":runtime_snapshot()}})).unwrap();
         let started = json!({"type":"tool.started","sessionId":"session:loop","runId":"run:loop","callId":"call:missing",
-            "payload":{"attemptId":"attempt:missing"}});
+            "payload":{"attemptId":"attempt:missing","startedAt":"1"}});
         assert_eq!(
             journal.append(&started).unwrap_err().code,
             "session_event_call_missing"

@@ -1,6 +1,8 @@
 use deepcode_kernel_abi::{KernelError, KernelResult};
 use deepcode_kernel_tools::file_content::read_text_file_for_llm;
-use deepcode_kernel_tools::kernel_internal::{KernelCanonicalInvocation, KernelDeleteTarget, KernelTextEdit, KernelToolKind};
+use deepcode_kernel_tools::kernel_internal::{
+    KernelCanonicalInvocation, KernelDeleteTarget, KernelTextEdit, KernelToolKind,
+};
 use deepcode_kernel_tools::KernelToolRegistry;
 use deepcode_kernel_tools::ToolAvailability;
 use serde::{Deserialize, Serialize};
@@ -354,7 +356,10 @@ struct AppliedTextEdits {
     preview: Value,
 }
 
-fn apply_exact_text_edits(original: &str, edits: &[KernelTextEdit]) -> KernelResult<AppliedTextEdits> {
+fn apply_exact_text_edits(
+    original: &str,
+    edits: &[KernelTextEdit],
+) -> KernelResult<AppliedTextEdits> {
     let mut ranges = Vec::with_capacity(edits.len());
     for (edit_index, edit) in edits.iter().enumerate() {
         let (start, end) = unique_match_range(original, &edit.old_text, edit_index)?;

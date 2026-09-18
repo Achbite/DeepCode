@@ -600,11 +600,21 @@ fn decode_response(
 }
 
 fn resolve_bridge() -> Result<PathBuf, SessionServiceError> {
-    runtime_file("DEEPCODE_SESSION_BRIDGE", "session-core/dist/sessionServiceBridge.js")
+    runtime_file(
+        "DEEPCODE_SESSION_BRIDGE",
+        "session-core/dist/sessionServiceBridge.js",
+    )
 }
 
 fn resolve_node() -> Result<PathBuf, SessionServiceError> {
-    runtime_file("DEEPCODE_NODE", if cfg!(windows) { "node/bin/node.exe" } else { "node/bin/node" })
+    runtime_file(
+        "DEEPCODE_NODE",
+        if cfg!(windows) {
+            "node/bin/node.exe"
+        } else {
+            "node/bin/node"
+        },
+    )
 }
 
 fn runtime_file(environment: &str, relative: &str) -> Result<PathBuf, SessionServiceError> {
@@ -612,11 +622,17 @@ fn runtime_file(environment: &str, relative: &str) -> Result<PathBuf, SessionSer
         return Ok(path);
     }
     let root = std::env::var_os("DEEPCODE_RUNTIME_DIR").ok_or_else(|| {
-        SessionServiceError::new("session_service_asset_root_unavailable", "Host 未设置 DEEPCODE_RUNTIME_DIR。")
+        SessionServiceError::new(
+            "session_service_asset_root_unavailable",
+            "Host 未设置 DEEPCODE_RUNTIME_DIR。",
+        )
     })?;
     let path = PathBuf::from(root).join(relative);
     if !path.is_file() {
-        return Err(SessionServiceError::new("session_service_asset_missing", format!("运行资源不存在：{}", path.display())));
+        return Err(SessionServiceError::new(
+            "session_service_asset_missing",
+            format!("运行资源不存在：{}", path.display()),
+        ));
     }
     Ok(path)
 }
@@ -649,7 +665,7 @@ mod tests {
 
     #[test]
     fn session_eof_keeps_stderr_for_the_failed_and_later_requests() {
-        let child = Command::new(resolve_node().expect("test Node runtime"))
+        let child = Command::new("node")
             .arg("-e")
             .arg(r#"
 const input = require('node:readline').createInterface({ input: process.stdin });
@@ -683,7 +699,7 @@ input.on('line', line => {
 
     #[test]
     fn requests_complete_independently_and_shutdown_releases_the_child() {
-        let child = Command::new(resolve_node().expect("test Node runtime"))
+        let child = Command::new("node")
             .arg("-e")
             .arg(r#"
 const input = require('node:readline').createInterface({ input: process.stdin });
