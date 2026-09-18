@@ -15,6 +15,9 @@ const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, project
   // Each fixed delivery is immutable; its execution timestamp is the last
   // content change of that version. Keep all versions in this Session.
   const display = useDisplayedConversation();
+  const [showAllArtifacts, setShowAllArtifacts] = React.useState(false);
+  const outputListId = React.useId();
+  React.useEffect(() => { setShowAllArtifacts(false); }, [projection?.sessionId]);
   const artifacts = [...display.artifacts].sort(
     (left, right) => artifactTimestamp(right.createdAt) - artifactTimestamp(left.createdAt),
   );
@@ -62,7 +65,14 @@ const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, project
           <div className="deepcode-gui-task-list-card__empty">
             {t(language, 'deepcodeGui.outputs.empty')}
           </div>
-        ) : <ArtifactLinks key={projection?.sessionId} artifacts={artifacts} onOpen={(workspaceId,path)=>requestWorkspacePreview(projection!.sessionId,workspaceId,path)} />}
+        ) : <>
+          <div id={outputListId} className="deepcode-gui-output-list">
+            <ArtifactLinks key={projection?.sessionId} compact artifacts={showAllArtifacts ? artifacts : artifacts.slice(0, 3)} onOpen={(workspaceId,path)=>requestWorkspacePreview(projection!.sessionId,workspaceId,path)} />
+          </div>
+          {artifacts.length > 3 && <button type="button" className="deepcode-gui-output-more" aria-expanded={showAllArtifacts} aria-controls={outputListId} onClick={() => setShowAllArtifacts((value) => !value)}>
+            {t(language, showAllArtifacts ? 'deepcodeGui.outputs.showLess' : 'deepcodeGui.outputs.showAll', { count: artifacts.length })}
+          </button>}
+        </>}
       </section>
     </aside>
   );

@@ -1,3 +1,4 @@
+import { useInterfaceReloadGuard } from '../../services/interfaceReload';
 import React, { useEffect, useState } from 'react';
 import { t, type UiLanguage } from '../../i18n';
 import { useSettingsStore } from '../../state/settingsStore';
@@ -28,6 +29,7 @@ export default function GuiPaletteSettings({ language }: { language: UiLanguage 
 
   const accent = normalizeGuiAccentColor(settings['gui.accentColor']);
   const dirty = draft.text !== encoded;
+  useInterfaceReloadGuard(dirty, language === 'zh-CN' ? '配色' : 'Palette', saving);
   const disabled = loading || saving;
   let values: PaletteOverrides | null = null;
   let configError: string | null = null;

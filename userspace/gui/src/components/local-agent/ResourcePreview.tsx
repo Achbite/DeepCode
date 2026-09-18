@@ -1,3 +1,5 @@
+import { restoredInterfaceView, takeRestoredInterfaceView, useInterfaceReloadView } from '../../services/interfaceReload';
+import type { BrowserAnnotation, BrowserAnnotationDraft, BrowserReviewEdit } from './browserReview';
 import { nextEnabledIndex } from '../shared/keyboardNavigation';
 import { InterfaceLoadBoundary } from '../shared/InterfaceUpdateNotice';
 import { loadInterfaceModule } from '../../services/interfaceUpdates';
@@ -94,8 +96,10 @@ export function useResourcePreview(sessionId: string | null) {
     visible: boolean;
     expanded: boolean;
   }>({ sessionId, tabs: [], activeId: null, visible: false, expanded: false });
+  useInterfaceReloadView('reader', { ...state, tabs: state.tabs.map(tab => tab.page ? { ...tab, target: { kind: 'browser', previewId: tab.page.previewId } } : tab) });
   const [width, setWidth] = useState(() => readViewState('panel-width', 55));
   const [error, setError] = useState<string | null>(null);
+  const [reviewEdit, setReviewEdit] = useState<(BrowserReviewEdit & { sessionId: string | null }) | null>(null);
   const bindings = useRef(new Map<string, NativeHostBinding>());
   const currentSession = useRef(sessionId);
   currentSession.current = sessionId;
@@ -131,11 +135,14 @@ export function useResourcePreview(sessionId: string | null) {
   );
   useEffect(() => {
     bindings.current.clear();
-    setState({ sessionId, tabs: [], activeId: null, visible: false, expanded: false });
+    setState(current => current.sessionId === sessionId ? current : { sessionId, tabs: [], activeId: null, visible: false, expanded: false });
     setError(null);
     if (!sessionId) return;
     const saved = readViewState<ReaderTarget | null>(sessionId + ':selection', null);
-    if (saved && saved.kind !== 'browser') openTarget(saved);
+    const restored = restoredInterfaceView<typeof state | null>('reader', null);
+    if (restored?.sessionId === sessionId) takeRestoredInterfaceView('reader', null);
+    if (restored?.sessionId === sessionId) setState(restored);
+    else if (saved && saved.kind !== 'browser') openTarget(saved);
     const listener = (event: Event) => {
       const detail = (event as CustomEvent<{ sessionId: string; target: ReaderTarget }>).detail;
       if (detail.sessionId === sessionId) openTarget(detail.target);
@@ -252,6 +259,11 @@ export function useResourcePreview(sessionId: string | null) {
     expand,
     selectTab,
     newPage,
+    reviewEdit: reviewEdit?.sessionId === sessionId ? reviewEdit : null,
+    editBrowserReview(review: BrowserAnnotationDraft) {
+      openTarget({ kind: 'browser', previewId: review.previewId, url: review.annotation.url });
+      setReviewEdit({ requestId: crypto.randomUUID(), sessionId, previewId: review.previewId, annotation: review.annotation });
+    },
   };
 }
 
@@ -259,13 +271,28 @@ export function ResourcePreview({
   language,
   preview,
   tabsTarget,
+  onReview,
 }: {
   language: UiLanguage;
   preview: ReturnType<typeof useResourcePreview>;
   tabsTarget?: HTMLElement | null;
+  onReview?: (annotation: BrowserAnnotation, previewId: string, screenshot?: string) => void;
 }) {
   const chinese = language === 'zh-CN';
   const tabsId = useId();
+  const resizeHandle = useRef<HTMLDivElement | null>(null);
+  const resizePointer = useRef<number | null>(null);
+  const endResize = useCallback(() => {
+    const pointer = resizePointer.current;
+    resizePointer.current = null;
+    if (pointer !== null && resizeHandle.current?.hasPointerCapture(pointer)) resizeHandle.current.releasePointerCapture(pointer);
+    document.body.classList.remove('reader-resizing');
+  }, []);
+  useEffect(() => {
+    window.addEventListener('blur', endResize);
+    return () => { window.removeEventListener('blur', endResize); endResize(); };
+  }, [endResize]);
+  useEffect(() => { if (!preview.visible || preview.expanded) endResize(); }, [preview.visible, preview.expanded, endResize]);
   const tabs = (
         <header className="reader-tabs">
           <div
@@ -326,6 +353,7 @@ export function ResourcePreview({
       {preview.visible && (
         <div
           className="reader-resize"
+          ref={resizeHandle}
           role="separator"
           tabIndex={0}
           aria-label={chinese ? '调整预览宽度' : 'Resize preview'}
@@ -333,7 +361,20 @@ export function ResourcePreview({
           aria-valuemin={30}
           aria-valuemax={75}
           aria-valuenow={Math.round(preview.width)}
-          onPointerDown={(event) => event.currentTarget.setPointerCapture(event.pointerId)}
+          onPointerDown={(event) => {
+            if (event.button !== 0) return;
+            event.preventDefault();
+            document.getSelection()?.removeAllRanges();
+            document.body.classList.add('reader-resizing');
+            resizePointer.current = event.pointerId;
+            event.currentTarget.setPointerCapture(event.pointerId);
+          }}
+          onPointerUp={(event) => {
+            if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+            endResize();
+          }}
+          onPointerCancel={endResize}
+          onLostPointerCapture={endResize}
           onPointerMove={(event) => {
             if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
             const rect = event.currentTarget.parentElement!.getBoundingClientRect();
@@ -376,6 +417,8 @@ export function ResourcePreview({
                   initialPath={tab.target.filePath}
                   initialPreviewId={tab.target.previewId}
                   selfPreview={tab.target.selfPreview}
+                  onReview={onReview}
+                  reviewEdit={preview.reviewEdit?.previewId === (tab.page?.previewId ?? tab.target.previewId) ? preview.reviewEdit : null}
                 />
               ) : (
                 preview.sessionId && (

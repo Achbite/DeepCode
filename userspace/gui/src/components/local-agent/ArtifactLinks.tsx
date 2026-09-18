@@ -5,11 +5,12 @@ import type { ArtifactProjection } from '@deepcode/protocol';
 import { workspaceResourceLink } from './documentResources';
 import { requestReader } from './readerState';
 import { useConversationHost } from './ConversationHost';
+import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 
-export function ArtifactLinks({ artifacts, onOpen }: { artifacts: readonly ArtifactProjection[]; onOpen(workspaceId: string, logicalPath: string): Promise<void> }) {
+export function ArtifactLinks({ artifacts, onOpen, compact = false }: { artifacts: readonly ArtifactProjection[]; onOpen(workspaceId: string, logicalPath: string): Promise<void>; compact?: boolean }) {
   const host = useConversationHost();
   const [error, setError] = React.useState<string | null>(null);
-  return <div className="document-artifacts">
+  return <div className={`document-artifacts${compact ? ' document-artifacts--compact' : ''}`}>
     {artifacts.map((artifact) => {
       const fixed = artifact.contentMode === 'fixed';
       const resource = artifact.workspaceId && artifact.logicalPath
@@ -19,20 +20,22 @@ export function ArtifactLinks({ artifacts, onOpen }: { artifacts: readonly Artif
       const imagePreview = artifact.contentType.startsWith('image/') && fixed;
       const label = artifact.label.split(/[\\/]/u).at(-1) ?? artifact.label;
       const location = artifact.logicalPath ?? artifact.uri ?? artifact.label;
-      const content = imagePreview
+      const content = compact
+        ? <><span className="document-artifacts__thumbnail">{imagePreview ? <ArtifactImage artifact={artifact} thumbnail /> : <DeepCodeShellIcon name={artifact.contentType === 'text/html' ? 'browser' : 'artifact'} />}</span><strong>{label}</strong></>
+        : imagePreview
         ? <ArtifactImage artifact={artifact} />
         : <><strong title={location}>{label}</strong><time>{formatArtifactTime(artifact.createdAt)}</time></>;
       return fixed || resource || external ? <button type="button" className="deepcode-gui-output-item document-artifacts__item" key={artifact.artifactId}
-        aria-label={imagePreview ? label : undefined} title={imagePreview ? location : undefined}
+        aria-label={compact || imagePreview ? label : undefined} title={compact ? `${artifact.label}\n${formatArtifactTime(artifact.createdAt)}` : imagePreview ? location : undefined}
         onClick={() => { setError(null); if(fixed) {requestReader(artifact.sessionId,{kind:'artifact',artifact});return;} void (resource ? onOpen(resource.workspaceId, resource.logicalPath) : host.openExternalLink(external!))
           .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason))); }}>{content}</button>
-        : <div className="deepcode-gui-output-item" key={artifact.artifactId}>{content}</div>;
+        : <div className={`deepcode-gui-output-item${compact ? ' document-artifacts__item' : ''}`} title={compact ? artifact.label : location} key={artifact.artifactId}>{content}</div>;
     })}
     {error && <p role="alert" className="local-agent__resource-error">{error}</p>}
   </div>;
 }
 
-function ArtifactImage({artifact}:{artifact:ArtifactProjection}) {
+function ArtifactImage({artifact,thumbnail=false}:{artifact:ArtifactProjection;thumbnail?:boolean}) {
   const language = useUiLanguage();
   const host=useConversationHost();
   const [url,setUrl]=React.useState('');
@@ -45,7 +48,10 @@ function ArtifactImage({artifact}:{artifact:ArtifactProjection}) {
     }).catch((reason:unknown)=>{if(!controller.signal.aborted)setError(String(reason));});
     return ()=>{controller.abort();release?.();};
   },[artifact.sessionId,artifact.artifactId,host]);
-  return error ? <span role="alert">{error}</span> : url ? <img className="document-artifact-image" src={url} alt={artifact.label}/> : <span>{t(language, 'reader.imageLoading')}</span>;
+  return error ? <span role="alert" title={error}>{thumbnail ? '!' : error}</span>
+    : url ? <img className="document-artifact-image" src={url} alt={thumbnail ? '' : artifact.label}/>
+    : thumbnail ? <span aria-label={t(language, 'reader.imageLoading')}><DeepCodeShellIcon name="artifact" /></span>
+    : <span>{t(language, 'reader.imageLoading')}</span>;
 }
 
 function formatArtifactTime(value: string): string {

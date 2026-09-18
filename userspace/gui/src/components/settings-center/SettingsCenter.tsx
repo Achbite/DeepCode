@@ -1,3 +1,4 @@
+import { restoredInterfaceView, useInterfaceReloadView, registerInterfaceReloadView } from '../../services/interfaceReload';
 import { createPortal } from 'react-dom';
 import { UI_ICON_ROLES } from '../../icons/registry';
 import { SettingsSearchContext, SettingsSearchTargets, matchesSettingsQuery, type SettingsSearchEntry } from './settingsSearch';
@@ -10,7 +11,6 @@ import {
   GuiSettingsSection,
 } from './sections/CategorizedSettingsSections';
 import LlmSection from './sections/LlmSection';
-import ModelUsageSettings from './ModelUsageSettings';
 import PluginsSection from './sections/PluginsSection';
 import DeepCodeShellIcon, { type DeepCodeShellIconName } from '../shared/DeepCodeShellIcon';
 import './settingsCenter.css';
@@ -29,14 +29,18 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
   navigationTarget,
 }) => {
   const [activeKey, setActiveKey] = useState<SettingsKey>(
-    'gui',
+    () => restoredInterfaceView<SettingsKey>('settingsPage', 'gui'),
   );
   const [searchEntries, setSearchEntries] = useState<Record<string, SettingsSearchEntry[]>>({});
   const register = useCallback((owner: string, entries: SettingsSearchEntry[]) => setSearchEntries((current) => ({ ...current, [owner]: entries })), []);
+  const scrollRef = useRef<HTMLElement>(null);
+  useEffect(() => registerInterfaceReloadView('settingsScroll', () => scrollRef.current?.scrollTop ?? 0), []);
+  useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = restoredInterfaceView('settingsScroll', 0); }, []);
   const targets = useRef(new Map<string, HTMLElement>());
   const pendingTarget = useRef<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
-  const [visited, setVisited] = useState<SettingsKey[]>(['gui']);
+  const [visited, setVisited] = useState<SettingsKey[]>([activeKey]);
+  useInterfaceReloadView('settingsPage', activeKey);
   const language = normalizeUiLanguage(
     useSettingsStore((state) => state.effectiveSettings['workbench.language']),
   );
@@ -94,7 +98,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
       case 'permissions':
         return <AgentSettingsSection category={key} query="" />;
       case 'llm':
-        return <div className="settings-services"><LlmSection /><AgentSettingsSection category="services" query="" /><ModelUsageSettings language={language} /></div>;
+        return <LlmSection active={!searching && activeKey === 'llm'} />;
       case 'plugins':
         return <PluginsSection query="" />;
     }
@@ -134,7 +138,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
     <SettingsSearchTargets.Provider value={targets.current}><SettingsSearchContext.Provider value={register}><div className="settings-center">
       {navigationTarget ? createPortal(navigation, navigationTarget) : navigation}
 
-      <section className="settings-body">
+      <section className="settings-body" ref={scrollRef}>
         {searching && <div className="settings-search-results">
           <h2 className="settings-title">{t(language, 'settings.search.results')}</h2>
           <p role="status">{t(language, 'settings.search.count', { count: matches.length })}</p>

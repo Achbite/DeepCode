@@ -985,7 +985,7 @@ test('snapshot-scoped wire tool resolves to exact Kernel bindings, durable ToolR
 
 
 
-test('GUI model settings save after acknowledgement, reset effort on model change, and retain the last saved value on failure', async (t) => {
+test('GUI model settings remember effort per model across new conversations and preserve acknowledged values on failure', async (t) => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:gui-settings';
   await createSession(journal, sessionId);
@@ -1003,8 +1003,15 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
     if (url.pathname === '/api/llm/profiles') {
       if (init.method === 'PATCH') {
         const update = JSON.parse(init.body);
-        assert.deepEqual(Object.keys(update), ['defaultProfileId']);
-        defaultProfileId = update.defaultProfileId;
+        if (update.profile) {
+          assert.deepEqual(Object.keys(update), ['profile']);
+          const index = profiles.findIndex(profile => profile.id === update.profile.id);
+          assert.ok(index >= 0);
+          profiles[index] = update.profile;
+        } else {
+          assert.deepEqual(Object.keys(update), ['defaultProfileId']);
+          defaultProfileId = update.defaultProfileId;
+        }
       }
       return Response.json({ ok: true, data: { profiles, defaultProfileId } });
     }
@@ -1049,12 +1056,22 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
   assert.equal((await actor.snapshot()).run, null);
   store.getState().startNewSession();
   assert.equal(store.getState().selectedProfileId, 'profile:one');
+  assert.equal(store.getState().reasoningEffortOverride, 'low');
   await store.getState().selectProfile('profile:two');
+  await store.getState().selectReasoningEffort('medium');
   store.getState().startNewSession();
   assert.equal(store.getState().selectedProfileId, 'profile:one');
+  assert.equal(store.getState().reasoningEffortOverride, 'low');
+  await store.getState().selectProfile('profile:two');
+  assert.equal(store.getState().reasoningEffortOverride, 'medium');
   const reopened = await loadGuiModelStore(t);
   await reopened.getState().refreshProfiles();
   assert.equal(reopened.getState().selectedProfileId, 'profile:one');
+  assert.equal(reopened.getState().reasoningEffortOverride, 'low');
+  await reopened.getState().selectReasoningEffort(null);
+  assert.equal(profiles[0].reasoningEffort, undefined, 'service default clears the remembered explicit effort');
+  reopened.getState().startNewSession();
+  assert.equal(reopened.getState().reasoningEffortOverride, null);
 });
 
 test('starting a draft during initialization preserves navigation and still loads usable model configuration', async (t) => {
@@ -1827,6 +1844,10 @@ test('polling and command reconciliation read draft snapshots in order at the sa
   let reads = 0;
   let commands = 0;
   installGuiFetch(t, async (url, init) => {
+    if (url.pathname === '/api/llm/profiles' && init.method === 'PATCH') {
+      assert.deepEqual(Object.keys(JSON.parse(init.body)), ['profile']);
+      return Response.json({ ok: true, data: {} });
+    }
     if (url.pathname === '/api/conversation/statuses') return Response.json({ ok: true, data: [
       { sessionId, revision: base.revision, run: { runId: base.run.runId, status: base.run.status } },
     ] });
@@ -2050,8 +2071,12 @@ test('conversation follows decision layout changes and final output until the re
 test('composer submission receipts preserve newer text and retain the complete failed draft', async (t) => {
   const { submitComposerState, emptyComposerState } = await loadGuiModule(t, '/src/components/local-agent/composerSubmission.ts');
   const original = { ...emptyComposerState(), draft: 'First request',
-    pastedTexts: [{ inputId: 'paste:one', text: 'Complete pasted content', expanded: false }],
-    filesystemPaths: [{ path: '/project/one.txt', kind: 'file' }],
+    pastedTexts: [{ inputId: 'paste:one', text: 'Complete pasted content', expanded: false,
+      browserReview: { previewId: 'preview:one', screenshot: '/project/capture.png', annotation: {
+        id: 'annotation:one', mode: 'element', url: 'https://example.test', title: 'Example', selector: 'h1', text: 'Heading',
+        rect: { x: 10, y: 20, width: 120, height: 40 }, viewport: { width: 800, height: 600, scrollX: 0, scrollY: 0 }, comment: '调整标题间距',
+      } } }],
+    filesystemPaths: [{ path: '/project/one.txt', kind: 'file' }, { path: '/project/capture.png', kind: 'file' }],
     pluginSelections: [{ selectionId: 'selection:one', uri: 'plugin://example@1', label: 'Example' }] };
   for (const fails of [false, true]) {
     let current = original;
@@ -2743,4 +2768,39 @@ test('startup opens a new draft even when history exists, and status failure doe
   assert.equal(store.getState().statusError, 'original_status_failure');
   assert.equal(store.getState().error, 'command_failure');
   assert.deepEqual(store.getState().projection, history);
+});
+
+
+test('settings contributions compose while tool renderers match their declared operation', async (t) => {
+  const { UiPluginRuntime } = await loadGuiModule(t, '/src/ui-plugins/runtime.ts');
+  const runtime = new UiPluginRuntime(async source => ({ apply(ctx) {
+    ctx.register(source, () => ({ update() {}, dispose() {} }));
+  } }), () => () => {});
+  t.after(() => runtime.dispose());
+  const file = (id, slot, toolId) => ({ path: `/plugins/${id}`, enabled: true,
+    manifest: { id, name:id, entry:'index.js', slots:[slot], ...(toolId ? {toolId} : {}) }, source:slot, error:null });
+  await runtime.replace([file('cost','settings.usage.panel'), file('counts','settings.usage.panel'),
+    file('reader','tool.result','fs.read'), file('shell','tool.result','bash')]);
+  assert.equal(runtime.getSnapshot().length, 4);
+  assert.ok(runtime.getSnapshot().every(item => item.status === 'active'));
+});
+
+test('image attachments reach the Provider as bound visual inputs without embedding bytes in the journal', async (t) => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:image-input';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  let request;
+  const actor = actorWith(journal, sessionId, { async *stream(value) {
+    request = value;
+    yield providerEvent(value.requestId, 'text.delta', {text:'Image received.'});
+    yield providerEvent(value.requestId, 'completed', {});
+  } }, emptyKernel(), fakeRunPreparation().port, 'image-input');
+  t.after(() => actor.dispose());
+  const command = messageCommand(sessionId, 'command:image', 'Describe the attached picture.');
+  command.filesystemReferences = [{ referenceId:'reference:image', workspaceId:workspaceBinding.workspaceId,
+    logicalPath:'picture.png',displayName:'picture.png',kind:'file',mediaType:'image/png',byteLength:100 }];
+  await actor.submit(command);
+  const projection = await waitForProjection(actor, value => value.run?.status === 'completed');
+  assert.deepEqual(request.messages.find(item => item.role === 'user').images,
+    [{workspaceId:workspaceBinding.workspaceId,logicalPath:'picture.png',mediaType:'image/png'}]);
+  assert.deepEqual(projection.messages[0].filesystemReferences, command.filesystemReferences);
 });

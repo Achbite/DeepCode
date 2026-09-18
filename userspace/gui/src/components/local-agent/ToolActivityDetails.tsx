@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import type { ActivityProjection, AssistantDraftBlockProjection, ProviderHostedActivityProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
+import { UiPluginSlotView, useDisplayTheme } from '../../ui-plugins/UiPlugins';
 import { FileChanges } from './FileChanges';
 import { useConversationRowState } from './ConversationVirtualRow';
 
@@ -197,6 +198,7 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
   onOpenWorkspaceResource,
 }) => {
   const [expanded, setExpanded] = useConversationRowState(`tool:${activity.activityId}:expanded`, false);
+  const theme = useDisplayTheme();
   const tool = activity.tool;
   const shell = tool?.shell;
   const result = shell?.result;
@@ -237,6 +239,7 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
       </button>
       {tool?.error && <p className="local-agent__tool-error" role="status"><code>{tool.error.code}</code>: {tool.error.message}</p>}
       {expanded && (
+        <UiPluginSlotView slot="tool.result" input={{ kind: 'tool.result', activity, toolId: tool?.operation ?? activity.label, locale: language, theme }}>
         <div className="local-agent__tool-entry-details">
           <FileChanges activities={[activity]} compact />
           <dl>
@@ -362,6 +365,7 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
             </div>
           )}
         </div>
+        </UiPluginSlotView>
       )}
     </div>
   );

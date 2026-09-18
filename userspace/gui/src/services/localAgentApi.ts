@@ -694,7 +694,7 @@ function decodePluginCatalog(value: unknown): PluginCatalogProjection {
       || new Set(plugin.activationMediaTypes).size !== plugin.activationMediaTypes.length
       || !['builtin', 'mounted'].includes(String(plugin.source))
       || !['functional', 'reference'].includes(String(plugin.category))
-      || !['skill', 'mcp', 'cli'].includes(String(plugin.contributionKind))
+      || !['skill', 'mcp', 'cli', 'host'].includes(String(plugin.contributionKind))
       || !['default', 'searchOnly'].includes(String(plugin.discovery))
       || (plugin.management !== undefined && (!isRecord(plugin.management) || !['plugins.disabled','plugins.sources','mcp.servers','skills.mounts'].includes(String(plugin.management.key)) || !isNonEmptyText(plugin.management.id)))
       || typeof plugin.enabled !== 'boolean'

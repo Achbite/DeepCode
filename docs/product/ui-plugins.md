@@ -30,8 +30,14 @@ Supported slots:
 | `message.plain`, `message.markdown` | Committed message text, format, locale and theme. Session still owns the text and message status. |
 | `document.html`, `document.markdown`, `document.pdf` | The actual document Blob, filename, format, locale and theme. Host retains the dialog and download operation. |
 | `theme` | CSS registered through `context.addStyle`. It is removed when the module unloads. |
+| `settings.models.overview` | Public connection and adapter catalog. Multiple contributions appear in configured order. |
+| `settings.connection.detail` | The current redacted connection; optional `adapterId` scopes the contribution. |
+| `settings.usage.panel` | Current query and usage report, including Session attribution. |
+| `tool.result` | Original activity projection, selected by the manifest's required `toolId` (tool operation). Tool status and failures remain outside this renderer. |
 
-One selected plugin may own each slot, including the theme. Conflicting selections report an error; there is no implicit priority chain. Only the named presentation regions are replaceable; the app root, composer, permission controls and core services are not plugin slots.
+One selected plugin may own each replacement slot, including the theme; `tool.result` ownership is per operation. Settings contributions compose in configured order. Conflicting replacements report an error; there is no implicit priority chain. Only the named presentation regions are replaceable; the app root, composer, permission controls and core services are not plugin slots.
+
+Settings manifests can declare `capabilities: ["usage.read"]` to receive `scope.usage.query(query, signal)`. The optional [Session usage example](../../ui-plugins/session-usage) uses this port; it renders the Host's calculation without introducing another price table or account ledger. `connection.auth` provides login, cancellation, logout and quota operations only in `settings.connection.detail`, bound to that connection. Tokens and keys never enter these inputs. A view can read or cancel only the auth flows it started; disposal cancels pending flows. Message/document renderers retain their display-only boundary.
 
 ```js
 export default {
@@ -97,3 +103,7 @@ Tools prefer CLI. A mature MCP adapter remains suitable when CLI would be substa
 ## Preview surfaces
 
 One conversation-header button, after the run status, toggles the reader. Tabs retain loaded documents and native page instances while collapsed. The separator adjusts width; the upper-right expand/restore control fills the workspace and returns to split mode. Closing a tab closes that page; collapsing only hides it. Task and Session output cards keep their existing appearance. Artifact references use readable names while the reader exposes full locations on demand. Fixed artifacts read archived bytes, including historical screenshots.
+
+The native browser's **Annotate / 批注** button sits immediately to the right of Refresh. Select a DOM element or draw a region, enter a comment and add it to the ordinary conversation draft. Page URL, selector, viewport and selected text are quoted as page evidence, separately from the comment. macOS also attaches the marked viewport capture using the existing image attachment path; other platforms retain region metadata because native capture is currently macOS-only. Frames are selectable as a box; use region selection for details inside a frame. Escape cancels selection, and closing, navigating, resizing or switching away ends annotation. Nothing is automatically submitted to the model.
+
+Dragging the reader separator suppresses text selection only for the drag lifetime. Pointer release, cancellation, loss of capture, window blur and unmount restore normal selection and copying.

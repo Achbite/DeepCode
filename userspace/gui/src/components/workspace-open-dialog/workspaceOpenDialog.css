@@ -256,7 +256,7 @@
 
 /* DeepCode-GUI uses the shared shell palette instead of the editor's legacy dark dialog. */
 :root[data-product='deepcode-gui'] .ws-open-dialog__backdrop {
-  background: color-mix(in srgb, var(--dc-accent) 22%, transparent);
+  background: color-mix(in srgb, var(--dc-shadow-color) 22%, transparent);
   backdrop-filter: blur(7px);
 }
 
@@ -361,13 +361,13 @@
 }
 
 :root[data-product='deepcode-gui'] .ws-open-dialog__btn--primary {
-  border-color: var(--dc-accent);
-  background: var(--dc-accent);
-  color: var(--dc-accent-contrast);
+  border-color: var(--dc-border-strong);
+  background: transparent;
+  color: var(--dc-foreground);
 }
 
 :root[data-product='deepcode-gui'] .ws-open-dialog__btn--primary:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--dc-accent) 88%, black);
+  background: var(--dc-surface-hover);
 }
 
 :root[data-product='deepcode-gui'] .ws-open-dialog__toggle,
@@ -428,7 +428,7 @@
 }
 
 :root[data-product='deepcode-gui'] .ws-open-dialog__entry--selected {
-  background: var(--dc-accent-soft);
+  background: var(--dc-surface-active);
   color: var(--dc-foreground-strong);
 }
 

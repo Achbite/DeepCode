@@ -18,6 +18,7 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
   const approvalRef = useRef<HTMLElement>(null);
   const sessionBrowser = pendingApproval?.preview.authorizationScope === 'sessionBrowser';
   const runHostShell = pendingApproval?.preview.authorizationScope === 'runHostShell';
+  const confirmation = pendingInteraction?.kind === 'confirmation';
   useLayoutEffect(() => {
     if (pendingApproval && document.activeElement === document.body) approvalRef.current?.focus({ preventScroll: true });
   }, [pendingApproval?.approvalId]);
@@ -48,12 +49,12 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
                 <DeepCodeShellIcon name={pendingPlan ? 'artifact' : 'question'} size={17} />
                 {pendingPlan
                   ? (language === 'zh-CN' ? (pendingScopeAddition ? '新增执行范围' : '方案确认') : 'Review plan')
-                  : (language === 'zh-CN' ? '问题' : 'Question')}
+                  : (language === 'zh-CN' ? (confirmation ? '确认' : '问题') : (confirmation ? 'Confirmation' : 'Question'))}
               </span>
               {(pendingPlan || pendingInteraction?.allowFreeform) && <button
                 type="button"
                 className="local-agent__interaction-close"
-                aria-label={language === 'zh-CN' ? (pendingPlan ? '关闭方案确认' : '关闭问题') : (pendingPlan ? 'Close plan review' : 'Close question')}
+                aria-label={language === 'zh-CN' ? (pendingPlan ? '关闭方案确认' : confirmation ? '关闭确认' : '关闭问题') : (pendingPlan ? 'Close plan review' : confirmation ? 'Close confirmation' : 'Close question')}
                 title={t(language, pendingPlan ? 'agent.plan.ignoreAndStop' : 'agent.interaction.skip')}
                 disabled={submitting}
                 onClick={() => pendingPlan

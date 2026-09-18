@@ -1,3 +1,4 @@
+import { formatBrowserAnnotation, type BrowserAnnotation } from './browserReview';
 import { localizePlugin } from '../../pluginLocalization';
 import { nextEnabledIndex } from '../shared/keyboardNavigation';
 import type React from 'react';
@@ -21,7 +22,7 @@ function saveComposerDraft(key:string,state:ComposerState):void {
   catch(error){console.error('Cannot preserve the composer draft across a window reload.',error);}
 }
 
-interface PastedTextDraft extends PastedTextInput { expanded: boolean }
+type PastedTextDraft = ComposerState['pastedTexts'][number];
 
 interface PendingFilesystemPath {
   path: string;
@@ -539,6 +540,30 @@ export function useAgentComposer(
   const canCancel = Boolean(
     projection?.run && ['running', 'waiting'].includes(projection.run.status),
   );
+  const appendBrowserReview = (annotation: BrowserAnnotation, previewId: string, screenshot?: string) => {
+    if (!sessionId) throw new Error('请先打开对话再添加批注。');
+    // An annotation belongs to the normal message draft, including during a pending decision.
+    const key = sessionId;
+    const current = activeComposerStateKeyRef.current === key
+      ? currentComposerStateRef.current : composerStatesRef.current.get(key) ?? readComposerDraft(key);
+    const next = cloneComposerState(current);
+    const previous = next.pastedTexts.find(item => item.browserReview?.annotation.id === annotation.id);
+    next.pastedTexts = next.pastedTexts.filter(item => item !== previous);
+    if (previous?.browserReview?.screenshot)
+      next.filesystemPaths = next.filesystemPaths.filter(item => item.path !== previous.browserReview!.screenshot);
+    if (next.filesystemPaths.length + next.pastedTexts.length + (screenshot ? 2 : 1) > 8)
+      throw new Error(t(language, 'agent.attachment.error.maxFiles'));
+    next.pastedTexts.push({ inputId: nextPanelId('annotation'), text: formatBrowserAnnotation(annotation, language === 'zh-CN'),
+      expanded: false, browserReview: { annotation, previewId, screenshot } });
+    if (screenshot) next.filesystemPaths.push({ path: screenshot, kind: 'file' });
+    setComposerStateForKey(key, next);
+  };
+  const removeBrowserReview = (inputId: string) => {
+    const paste = pastedTexts.find(item => item.inputId === inputId);
+    setPastedTexts(current => current.filter(item => item.inputId !== inputId));
+    if (paste?.browserReview?.screenshot)
+      setPendingFilesystemPaths(current => current.filter(item => item.path !== paste.browserReview!.screenshot));
+  };
   const pasteText = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
     pendingComposerRestoreRef.current = null;
     if (textDecision || editingMessage) return;
@@ -574,6 +599,7 @@ export function useAgentComposer(
   };
 
   return {
+    conversationKey,
     editingMessage,
     canEditMessage,
     beginMessageEdit,
@@ -598,6 +624,8 @@ export function useAgentComposer(
     cancelRun,
     selectProfile,
     selectReasoningEffort,
+    appendBrowserReview,
+    removeBrowserReview,
     draft,
     pastedTexts,
     setPastedTexts,

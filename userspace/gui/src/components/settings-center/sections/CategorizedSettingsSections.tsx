@@ -1,3 +1,4 @@
+import { requestInterfaceReload } from '../../../services/interfaceReload';
 import React, { useMemo } from 'react';
 import type { UserSettingValue } from '@deepcode/protocol';
 import { normalizeUiLanguage, t } from '../../../i18n';
@@ -10,7 +11,6 @@ import {
 } from '../../../state/settingsStore';
 import GuiAppearanceSettings from '../GuiAppearanceSettings';
 import SettingsField from '../SettingsField';
-import ProjectEnvironmentSettings from './ProjectEnvironmentSettings';
 import WorkspaceSandboxSettings from './WorkspaceSandboxSettings';
 import DocumentEnvironmentSettings from './DocumentEnvironmentSettings';
 import FileOpeningSettings from './FileOpeningSettings';
@@ -151,7 +151,7 @@ export const GuiSettingsSection: React.FC<RuntimeProps> = ({
             </tbody>
           </table>
           <div className="settings-card__body">
-            <button type="button" className="settings-button" onClick={() => window.location.reload()}>
+            <button type="button" className="settings-button" onClick={() => requestInterfaceReload()}>
               {language === 'zh-CN' ? '重新加载界面' : 'Reload interface'}
             </button>
           </div>
@@ -233,7 +233,6 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
       {category === 'agent' && renderCard(null, response)}
       {category === 'environment' && environment?.os === 'windows' && renderCard('Windows Shell', shellSettings)}
       {category === 'environment' && <DocumentEnvironmentSettings language={language} query={query} />}
-      {category === 'environment' && !query && <ProjectEnvironmentSettings chinese={chinese} />}
       {category === 'environment' && !query && <WorkspaceSandboxSettings chinese={chinese} />}
       {category === 'environment' && !query && <div className="settings-card">
         <h3 className="settings-card__title">{chinese ? '环境上下文' : 'Environment context'}</h3>

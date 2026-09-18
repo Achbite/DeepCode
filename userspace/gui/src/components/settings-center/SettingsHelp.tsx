@@ -23,11 +23,12 @@ export function useSettingsHelp(description: string | undefined) {
   return {
     helpId: description ? id : undefined,
     helpEvents: {
+      'data-escape-layer': anchor ? 'open' : undefined,
       onMouseEnter: show,
       onMouseLeave: () => setAnchor(null),
       onFocus: show,
       onBlur: (event: React.FocusEvent<HTMLElement>) => { if (!event.currentTarget.contains(event.relatedTarget)) setAnchor(null); },
-      onKeyDownCapture: (event: React.KeyboardEvent) => { if (event.key === 'Escape' && anchor) { setAnchor(null); } },
+      onKeyDownCapture: (event: React.KeyboardEvent) => { if (event.key === 'Escape' && anchor) { event.preventDefault(); event.stopPropagation(); setAnchor(null); } },
     },
     help: description ? <div id={id} ref={ref} role="tooltip" popover="manual" className="settings-help-tooltip">{description}</div> : null,
   };

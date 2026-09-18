@@ -1,3 +1,4 @@
+import { useInterfaceReloadGuard } from '../../services/interfaceReload';
 import React, { useEffect, useState } from 'react';
 import { t, type UiLanguage } from '../../i18n';
 import { useSettingsStore } from '../../state/settingsStore';
@@ -13,6 +14,7 @@ export default function GuiFontSettings({ language }: { language: UiLanguage }) 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [custom, setCustom] = useState(false);
+  useInterfaceReloadGuard(draft.text !== saved, t(language, 'settings.font.title'), saving);
   useEffect(() => setDraft((current) => reconcileSettingDraft(current, saved)), [saved]);
   const [family, size] = JSON.parse(draft.text) as [string, number];
   const preset = !custom && Object.hasOwn(UI_FONT_PRESETS, family) ? family : 'custom';

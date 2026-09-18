@@ -21,6 +21,10 @@ const SLOTS: &[&str] = &[
     "document.markdown",
     "document.pdf",
     "theme",
+    "settings.models.overview",
+    "settings.connection.detail",
+    "settings.usage.panel",
+    "tool.result",
 ];
 
 #[derive(Clone, Deserialize)]
@@ -35,11 +39,18 @@ pub(crate) struct WatchRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Manifest {
     id: String,
     name: String,
     entry: String,
     slots: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adapter_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
 }
@@ -143,6 +154,17 @@ fn read_module(root: &Path) -> Result<(Manifest, String), String> {
         .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
     if manifest.id.trim().is_empty()
         || manifest.name.trim().is_empty()
+        || (manifest.slots.iter().any(|s| s == "tool.result")
+            && manifest.tool_id.as_deref().is_none_or(str::is_empty))
+        || manifest
+            .capabilities
+            .iter()
+            .any(|c| !matches!(c.as_str(), "usage.read" | "connection.auth"))
+        || (manifest.capabilities.iter().any(|c| c == "connection.auth")
+            && !manifest
+                .slots
+                .iter()
+                .any(|s| s == "settings.connection.detail"))
         || manifest.slots.is_empty()
         || manifest
             .slots
