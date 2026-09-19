@@ -16,8 +16,8 @@ usage() {
 Usage: bash build.sh [--stage STAGE]...
   package (default)    Build every available platform; fail if none built.
   package-linux       Linux runtime for the container architecture.
-  package-windows     Windows x64 runtime (GNU cross toolchain).
-  package-macos       macOS arm64 runtime; Docker delegates to its Mac host.
+  package-windows     Windows x64 runtime, ZIP and Setup (GNU cross toolchain + NSIS).
+  package-macos       macOS arm64 runtime, archive and PKG; Docker delegates to its Mac host.
   ui                  Build shared TypeScript + GUI once, publish bin/ui.
   daemon | cli | tui  Build only the selected Linux native executable.
   native-gui          Build only the Linux native GUI shell.

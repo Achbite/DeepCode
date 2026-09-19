@@ -30,7 +30,7 @@ check_platform() {
       pkg-config --exists openssl gtk+-3.0 webkit2gtk-4.1 ayatana-appindicator3-0.1 librsvg-2.0 || { printf 'Linux desktop SDK is incomplete.\n' >&2; exit 1; }
       ;;
     windows)
-      require x86_64-w64-mingw32-gcc; require x86_64-w64-mingw32-g++; require x86_64-w64-mingw32-strip
+      require x86_64-w64-mingw32-gcc; require x86_64-w64-mingw32-g++; require x86_64-w64-mingw32-strip; require makensis
       [ -d "$(rustc --print target-libdir --target "$WINDOWS_TARGET")" ] || { printf 'Rust Windows GNU target is not installed.\n' >&2; exit 1; }
       [ -f "${DEEPCODE_WINDOWS_NODE_BIN}" ]
       ;;
@@ -101,7 +101,13 @@ case "${1:-}" in
     version="$(node -p 'require("./package.json").version')"
     archive="$output/DeepCode-$version-$platform_dir.tar.gz"
     [ "$platform" != windows ] || archive="$output/DeepCode-$version-$platform_dir.zip"
-    python3 scripts/package-runtime.py publish "$stage" "$output/$platform_dir" "$archive"
+    installer_args=()
+    if [ "$platform" = windows ]; then
+      installer="$(dirname "$shared")/DeepCode-$version-win64-setup.exe"
+      python3 scripts/package-installers.py win64 "$stage" "$installer"
+      installer_args=(--installer "$installer")
+    fi
+    python3 scripts/package-runtime.py publish "$stage" "$output/$platform_dir" "$archive" "${installer_args[@]}"
     ;;
   *) printf 'Internal usage: --check platform | --shared directory | --native stage | --package platform shared output\n' >&2; exit 2 ;;
 esac
