@@ -3,6 +3,7 @@ use deepcode_kernel_abi::{
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::fmt;
 use std::time::Duration;
@@ -182,20 +183,23 @@ impl HttpKernelClient {
             .error_for_status()?
             .json::<Value>()
             .await?;
-        let data = api_data(value)?;
-        Ok(DaemonStatus {
-            service: data
-                .get("service")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_string(),
-            ok: data.get("ok").and_then(Value::as_bool).unwrap_or(true),
-            raw: data,
-        })
+        decode_health(value)
     }
 
     pub async fn daemon_status(&self) -> KernelClientResult<DaemonStatus> {
         self.health().await
+    }
+
+    pub async fn user_settings(&self) -> KernelClientResult<Value> {
+        let value = self
+            .http
+            .get(self.url("/api/user-settings"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        api_data(value)
     }
 
     pub async fn create_conversation_session(
@@ -508,6 +512,21 @@ impl HttpKernelClient {
     }
 }
 
+fn decode_health(value: Value) -> KernelClientResult<DaemonStatus> {
+    #[derive(Deserialize)]
+    struct Health {
+        service: String,
+        ok: bool,
+    }
+    let data = api_data(value)?;
+    let health = Health::deserialize(&data)?;
+    Ok(DaemonStatus {
+        service: health.service,
+        ok: health.ok,
+        raw: data,
+    })
+}
+
 fn decode_projection(value: Value) -> KernelClientResult<SessionProjection> {
     let projection: SessionProjection = decode_api_data(value)?;
     projection.validate().map_err(KernelClientError::Api)?;
@@ -533,6 +552,27 @@ fn decode_api_data<T: DeserializeOwned>(value: Value) -> KernelClientResult<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_requires_explicit_typed_status() {
+        for data in [
+            json!({"service": "deepcode-kernel-daemon"}),
+            json!({"service": "deepcode-kernel-daemon", "ok": "true"}),
+            json!({"ok": true}),
+        ] {
+            assert!(matches!(
+                decode_health(json!({"ok": true, "data": data})),
+                Err(KernelClientError::Decode(_))
+            ));
+        }
+        for ok in [true, false] {
+            let data = json!({"service": "deepcode-kernel-daemon", "ok": ok, "pid": 42});
+            let status = decode_health(json!({"ok": true, "data": data})).unwrap();
+            assert_eq!(status.ok, ok);
+            assert_eq!(status.service, "deepcode-kernel-daemon");
+            assert_eq!(status.raw, data);
+        }
+    }
 
     #[test]
     fn trims_base_url_slash() {

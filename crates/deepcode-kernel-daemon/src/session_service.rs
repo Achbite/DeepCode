@@ -1,8 +1,11 @@
+use deepcode_host_connection::process::{
+    spawn_owned_host_process, terminate_owned_process_tree_checked, OwnedHostProcess,
+};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -53,18 +56,18 @@ impl SessionServiceProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let child = command.spawn().map_err(|error| {
+        let child = spawn_owned_host_process(&mut command).map_err(|error| {
             SessionServiceError::new(
                 "session_service_spawn_failed",
                 format!("启动 Node Session Service 失败：{error}"),
             )
         })?;
-        Self::from_child(child)
+        Self::from_process(child)
     }
 
-    fn from_child(child: Child) -> Result<Self, SessionServiceError> {
+    fn from_process(child: OwnedHostProcess) -> Result<Self, SessionServiceError> {
         let mut starting = ChildStartupGuard::new(child);
-        let stdin = starting.child_mut().stdin.take().ok_or_else(|| {
+        let mut stdin = starting.child_mut().stdin.take().ok_or_else(|| {
             SessionServiceError::new(
                 "session_service_pipe_failed",
                 "Node Session Service 缺少标准输入管道。",
@@ -121,10 +124,33 @@ impl SessionServiceProcess {
                 }
             }
         });
+        let (writer, writes) = mpsc::channel::<Vec<u8>>();
+        let writer_responses = Arc::clone(&responses);
+        let stdin_writer = std::thread::spawn(move || {
+            while let Ok(encoded) = writes.recv() {
+                let Ok(pending) = writer_responses.lock() else {
+                    break;
+                };
+                if pending.terminal_error.is_some() {
+                    break;
+                }
+                drop(pending);
+                if let Err(error) = stdin.write_all(&encoded).and_then(|_| stdin.flush()) {
+                    if let Ok(mut pending) = writer_responses.lock() {
+                        pending.fail(SessionServiceError::new(
+                            "session_service_request_write_failed",
+                            format!("写入 Session Service 请求失败：{error}"),
+                        ));
+                    }
+                    break;
+                }
+            }
+        });
         let service = Self {
             process: Arc::new(Mutex::new(OwnedSessionService {
-                child: starting.commit(),
-                stdin: Some(BufWriter::new(stdin)),
+                owned: starting.commit(),
+                writer: Some(writer),
+                stdin_writer: Some(stdin_writer),
                 responses,
                 stdout_reader: Some(stdout_reader),
                 stderr_receipt,
@@ -162,13 +188,14 @@ impl SessionServiceProcess {
         data: Value,
         timeout: Duration,
     ) -> Result<Value, SessionServiceError> {
+        let deadline = Instant::now() + timeout;
         let request_id = format!("host:{}", self.next_request.fetch_add(1, Ordering::Relaxed));
         let receiver = self
             .process
             .lock()
             .map_err(|_| transport_lock_error())?
             .begin_request(&request_id, operation, data)?;
-        self.receive_response(receiver, timeout)
+        self.receive_response(receiver, deadline.saturating_duration_since(Instant::now()))
     }
 
     fn receive_response(
@@ -211,6 +238,7 @@ impl SessionServiceProcess {
     }
 
     pub(crate) fn shutdown(&self) -> Result<(), SessionServiceError> {
+        let deadline = Instant::now() + Duration::from_secs(3);
         let receiver = {
             let mut process = self.process.lock().map_err(|_| transport_lock_error())?;
             if process.stopped {
@@ -220,10 +248,19 @@ impl SessionServiceProcess {
             process.closing = true;
             receiver
         };
-        let result = self.receive_response(receiver, Duration::from_secs(3));
+        let result =
+            self.receive_response(receiver, deadline.saturating_duration_since(Instant::now()));
         let mut process = self.process.lock().map_err(|_| transport_lock_error())?;
-        process.finish_shutdown()?;
-        result.map(|_| ())
+        match (result, process.finish_shutdown()) {
+            (result, Ok(())) => result.map(|_| ()),
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(mut original), Err(cleanup)) => {
+                original
+                    .message
+                    .push_str(&format!(" 清理失败：{}", cleanup.message));
+                Err(original)
+            }
+        }
     }
 }
 
@@ -256,19 +293,23 @@ impl PendingResponses {
 }
 
 struct ChildStartupGuard {
-    child: Option<Child>,
+    child: Option<OwnedHostProcess>,
 }
 
 impl ChildStartupGuard {
-    fn new(child: Child) -> Self {
+    fn new(child: OwnedHostProcess) -> Self {
         Self { child: Some(child) }
     }
 
     fn child_mut(&mut self) -> &mut Child {
-        self.child.as_mut().expect("starting child is present")
+        &mut self
+            .child
+            .as_mut()
+            .expect("starting child is present")
+            .child
     }
 
-    fn commit(mut self) -> Child {
+    fn commit(mut self) -> OwnedHostProcess {
         self.child.take().expect("starting child is present")
     }
 }
@@ -276,15 +317,15 @@ impl ChildStartupGuard {
 impl Drop for ChildStartupGuard {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = terminate_owned_process_tree_checked(child);
         }
     }
 }
 
 struct OwnedSessionService {
-    child: Child,
-    stdin: Option<BufWriter<ChildStdin>>,
+    owned: OwnedHostProcess,
+    writer: Option<mpsc::Sender<Vec<u8>>>,
+    stdin_writer: Option<std::thread::JoinHandle<()>>,
     responses: Arc<Mutex<PendingResponses>>,
     stdout_reader: Option<std::thread::JoinHandle<()>>,
     stderr_receipt: Arc<Mutex<Vec<u8>>>,
@@ -340,20 +381,14 @@ impl OwnedSessionService {
             }
             responses.requests.insert(request_id.to_string(), sender);
         }
-        let write_result = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "Session Service 输入已经关闭。",
-                )
-            })
-            .and_then(|stdin| stdin.write_all(&encoded).and_then(|_| stdin.flush()));
-        if let Err(error) = write_result {
+        if self
+            .writer
+            .as_ref()
+            .is_none_or(|writer| writer.send(encoded).is_err())
+        {
             return Err(self.fail_and_stop(SessionServiceError::new(
                 "session_service_request_write_failed",
-                format!("写入 Session Service 请求失败：{error}"),
+                "Session Service 输入写入线程已经结束。",
             )));
         }
         Ok(receiver)
@@ -373,7 +408,7 @@ impl OwnedSessionService {
             self.fail_and_stop(error);
             return Ok(false);
         }
-        match self.child.try_wait() {
+        match self.owned.child.try_wait() {
             Ok(None) => Ok(true),
             Ok(Some(_)) => {
                 self.fail_and_stop(SessionServiceError::new(
@@ -386,12 +421,30 @@ impl OwnedSessionService {
         }
     }
 
-    fn join_readers(&mut self) {
+    fn join_io(&mut self) -> Result<(), SessionServiceError> {
+        let mut failed = Vec::new();
+        if let Some(writer) = self.stdin_writer.take() {
+            if writer.join().is_err() {
+                failed.push("stdin writer");
+            }
+        }
         if let Some(reader) = self.stdout_reader.take() {
-            let _ = reader.join();
+            if reader.join().is_err() {
+                failed.push("stdout reader");
+            }
         }
         if let Some(reader) = self.stderr_reader.take() {
-            let _ = reader.join();
+            if reader.join().is_err() {
+                failed.push("stderr reader");
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(SessionServiceError::new(
+                "session_service_io_thread_failed",
+                format!("Session Service IO 线程异常结束：{}", failed.join(", ")),
+            ))
         }
     }
 
@@ -404,13 +457,21 @@ impl OwnedSessionService {
         if self.stopped {
             return terminal;
         }
-        self.stdin.take();
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        self.writer.take();
+        self.closing = true;
+        match terminate_owned_process_tree_checked(&mut self.owned) {
+            Ok(()) => {
+                self.stopped = true;
+                if let Err(error) = self.join_io() {
+                    terminal
+                        .message
+                        .push_str(&format!(" 清理失败：{}", error.message));
+                }
+            }
+            Err(error) => terminal
+                .message
+                .push_str(&format!(" 清理 Session Service 进程失败：{error}")),
         }
-        self.stopped = true;
-        self.join_readers();
         terminal.message = message_with_stderr(&terminal.message, &self.stderr_receipt);
         if let Ok(mut responses) = self.responses.lock() {
             responses.terminal_error = Some(terminal.clone());
@@ -422,26 +483,28 @@ impl OwnedSessionService {
         if self.stopped {
             return Ok(());
         }
-        self.stdin.take();
+        self.writer.take();
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
-            if self.child.try_wait().map_err(process_wait_error)?.is_some() {
-                self.stopped = true;
-                self.join_readers();
-                return Ok(());
+            if self
+                .owned
+                .child
+                .try_wait()
+                .map_err(process_wait_error)?
+                .is_some()
+            {
+                break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        self.child.kill().map_err(|error| {
+        terminate_owned_process_tree_checked(&mut self.owned).map_err(|error| {
             SessionServiceError::new(
                 "session_service_kill_failed",
                 format!("终止未退出的 Session Service 失败：{error}"),
             )
         })?;
-        let _ = self.child.wait();
         self.stopped = true;
-        self.join_readers();
-        Ok(())
+        self.join_io()
     }
 }
 
@@ -665,7 +728,7 @@ mod tests {
 
     #[test]
     fn session_eof_keeps_stderr_for_the_failed_and_later_requests() {
-        let child = Command::new("node")
+        let child = spawn_owned_host_process(Command::new("node")
             .arg("-e")
             .arg(r#"
 const input = require('node:readline').createInterface({ input: process.stdin });
@@ -679,8 +742,8 @@ input.on('line', line => {
 });
 "#)
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-            .spawn().expect("spawn test service");
-        let service = SessionServiceProcess::from_child(child).unwrap();
+            ).expect("spawn test service");
+        let service = SessionServiceProcess::from_process(child).unwrap();
         let failure = service
             .request_with_timeout("snapshot", json!({}), Duration::from_secs(3))
             .unwrap_err();
@@ -692,14 +755,15 @@ input.on('line', line => {
         assert_eq!(later.message, failure.message);
         service.shutdown().unwrap();
         let mut process = service.process.lock().unwrap();
-        assert!(process.child.try_wait().unwrap().is_some());
+        assert!(process.owned.child.try_wait().unwrap().is_some());
+        assert!(process.stdin_writer.is_none());
         assert!(process.stdout_reader.is_none());
         assert!(process.stderr_reader.is_none());
     }
 
     #[test]
     fn requests_complete_independently_and_shutdown_releases_the_child() {
-        let child = Command::new("node")
+        let child = spawn_owned_host_process(Command::new("node")
             .arg("-e")
             .arg(r#"
 const input = require('node:readline').createInterface({ input: process.stdin });
@@ -716,8 +780,8 @@ input.on('line', line => {
 });
 "#)
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-            .spawn().expect("spawn test service");
-        let service = SessionServiceProcess::from_child(child).unwrap();
+            ).expect("spawn test service");
+        let service = SessionServiceProcess::from_process(child).unwrap();
         std::thread::scope(|scope| {
             let slow = scope
                 .spawn(|| service.request_with_timeout("slow", json!({}), Duration::from_secs(5)));
@@ -742,9 +806,51 @@ input.on('line', line => {
         });
         service.shutdown().unwrap();
         let mut process = service.process.lock().unwrap();
-        assert!(process.child.try_wait().unwrap().is_some());
+        assert!(process.owned.child.try_wait().unwrap().is_some());
+        assert!(process.stdin_writer.is_none());
         assert!(process.stdout_reader.is_none());
         assert!(process.stderr_reader.is_none());
+    }
+
+    #[test]
+    fn request_deadline_covers_blocked_stdin_and_joins_the_writer() {
+        let child = spawn_owned_host_process(Command::new("node")
+            .arg("-e")
+            .arg(r#"
+const input = require('node:readline').createInterface({ input: process.stdin });
+input.once('line', line => {
+  const request = JSON.parse(line);
+  input.close();
+  process.stdin.pause();
+  process.stdout.write(JSON.stringify({ protocolVersion: 'deepcode.local-agent', requestId: request.requestId, ok: true, data: { state: 'ready' } }) + '\n');
+  setInterval(() => {}, 1000);
+});
+"#)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()))
+            .expect("spawn test service");
+        let service = SessionServiceProcess::from_process(child).unwrap();
+        let started = Instant::now();
+        let failure = service
+            .request_with_timeout(
+                "snapshot",
+                json!({"payload": "x".repeat(512 * 1024)}),
+                Duration::from_millis(150),
+            )
+            .unwrap_err();
+        assert_eq!(failure.code, "session_service_response_timeout");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let mut process = service.process.lock().unwrap();
+        assert!(process.stopped);
+        assert!(process.owned.child.try_wait().unwrap().is_some());
+        assert!(process.stdin_writer.is_none());
+        assert!(process.stdout_reader.is_none());
+        assert!(process.stderr_reader.is_none());
+        drop(process);
+        assert_eq!(
+            service.request("activity", json!({})).unwrap_err().code,
+            failure.code
+        );
+        service.shutdown().unwrap();
     }
 
     #[test]

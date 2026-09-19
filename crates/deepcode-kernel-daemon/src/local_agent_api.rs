@@ -121,7 +121,6 @@ impl LocalAgentRuntime {
         let gui = gui.lock().map_err(|_| {
             RunPreparationError::new("gui_state_lock_failed", "GUI state 锁已损坏。")
         })?;
-        let settings = &gui.user_settings;
         let mut prepared_runs = self.prepared_runs.lock().map_err(|_| {
             RunPreparationError::new(
                 "prepared_run_registry_lock_failed",
@@ -132,6 +131,10 @@ impl LocalAgentRuntime {
             .get(&key)
             .and_then(|views| views.last())
             .cloned();
+        let settings = previous
+            .as_ref()
+            .map(|prepared| &prepared.runtime_settings)
+            .unwrap_or(&gui.user_settings);
         if request.restore_environment {
             return prepared_runs
                 .get(&key)
@@ -284,10 +287,13 @@ impl LocalAgentRuntime {
             .map_err(|message| {
                 RunPreparationError::new("extension_identity_prepare_failed", message)
             })?;
-        let (mut executor_config, mut secrets) =
+        let (mut executor_config, mut secrets) = if let Some(previous) = &previous {
+            (previous.executor_config.clone(), previous.secrets.clone())
+        } else {
             crate::runtime_tool_configuration(&gui).map_err(|message| {
                 RunPreparationError::new("kernel_runtime_config_prepare_failed", message)
-            })?;
+            })?
+        };
         executor_config.shell_program = serde_json::from_value(environment["shell"].clone())
             .map_err(|error| {
                 RunPreparationError::new("session_environment_invalid", error.to_string())
@@ -335,15 +341,15 @@ impl LocalAgentRuntime {
             .map_err(RunPreparationError::from)?;
         let web_search = prepare_web_search_binding(
             &provider_runtime,
-            permissions,
+            permissions.clone(),
             web_search_availability(&executor_config) == ToolAvailability::Callable,
         );
         let enable_kernel_web_search =
             web_search.get("owner").and_then(Value::as_str) == Some("kernelAdapter");
         let prepared = LocalAgentKernel::prepare_generation(
             &extension_generation_ref,
-            executor_config,
-            Arc::new(secrets),
+            executor_config.clone(),
+            Arc::new(secrets.clone()),
             mcp.clone(),
             permissions,
             enable_kernel_web_search,
@@ -366,12 +372,14 @@ impl LocalAgentRuntime {
             ),
         )
         .map_err(RunPreparationError::from)?;
-        *self.active_runtime_settings.lock().map_err(|_| {
-            RunPreparationError::new(
-                "active_runtime_settings_lock_failed",
-                "Agent active runtime settings 锁已损坏。",
-            )
-        })? = settings.clone();
+        if previous.is_none() {
+            *self.active_runtime_settings.lock().map_err(|_| {
+                RunPreparationError::new(
+                    "active_runtime_settings_lock_failed",
+                    "Agent active runtime settings 锁已损坏。",
+                )
+            })? = settings.clone();
+        }
 
         let catalog = self
             .kernel
@@ -434,6 +442,9 @@ impl LocalAgentRuntime {
             .entry(key)
             .or_default()
             .push(PreparedRunRecord {
+                runtime_settings: settings.clone(),
+                executor_config,
+                secrets,
                 kernel_catalog_snapshot_ref,
                 requested_plugin_identity,
                 response: response.clone(),
@@ -545,6 +556,9 @@ struct PreparedRunKey {
 
 #[derive(Clone)]
 struct PreparedRunRecord {
+    runtime_settings: Value,
+    executor_config: deepcode_kernel_runtime::executors::KernelExecutorConfig,
+    secrets: crate::DaemonSecretProvider,
     provider_binding: crate::local_agent_provider_runtime::ProviderRuntimeBinding,
     plugin_selection: crate::local_agent_plugins::ResolvedPluginSelection,
     mcp: crate::local_agent_mcp::McpRuntime,
@@ -1080,7 +1094,6 @@ pub(crate) async fn local_agent_provider_stream(
         messages: body.messages,
         tools: body.tools,
         hosted_tools: body.hosted_tools,
-        require_tool_call: body.response_constraint == "toolRequired",
     };
     if runtime.profile().kind == "openaiCompatible"
         && request_envelope
@@ -1176,21 +1189,13 @@ fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), St
     if !valid_provider_text(&body.profile_id) || !valid_provider_text(&body.provider_runtime_ref) {
         return Err("Provider 请求的 profileId 无效。".to_string());
     }
-    if !matches!(
-        body.response_constraint.as_str(),
-        "normal" | "toolRequired" | "answerOnly"
-    ) {
+    if !matches!(body.response_constraint.as_str(), "normal" | "answerOnly") {
         return Err("Provider 请求的 responseConstraint 无效。".to_string());
     }
     match body.purpose.as_str() {
         "agent" => {
-            if !matches!(body.response_constraint.as_str(), "normal" | "toolRequired")
-                || body.max_output_tokens == 0
-            {
+            if body.response_constraint != "normal" || body.max_output_tokens == 0 {
                 return Err("普通 Agent 请求必须使用固定的完整输出预算。".to_string());
-            }
-            if body.response_constraint == "toolRequired" && body.tools.is_empty() {
-                return Err("execution turn 必须提供至少一个可调用工具。".to_string());
             }
         }
         "contextCompaction" => {

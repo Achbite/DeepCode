@@ -105,16 +105,8 @@ fn is_loopback_origin_token(token: &str) -> bool {
         || token.starts_with("[::1]:")
 }
 
-pub(crate) fn distribution_root() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(PathBuf::from))
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 pub(crate) fn user_config_root() -> PathBuf {
-    deepcode_host_connection::config_root(&distribution_root()).expect("解析 DeepCode 配置目录")
+    deepcode_host_connection::config_root().expect("解析 DeepCode 配置目录")
 }
 
 pub(crate) struct DriveLocation {

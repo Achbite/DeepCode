@@ -14,6 +14,7 @@ pub(crate) struct AppState {
 
 #[derive(Debug)]
 pub(crate) struct HostPaths {
+    pub(crate) temporary_root: PathBuf,
     pub(crate) root_owner_lease_path: PathBuf,
     pub(crate) settings_path: PathBuf,
     pub(crate) llm_profiles_path: PathBuf,
@@ -88,6 +89,7 @@ impl HostPaths {
             .join("secrets");
         let runtime_root = root.join("runtime").join("agent-runtime");
         Self {
+            temporary_root: root.join("tmp"),
             root_owner_lease_path: runtime_root.join("root-owner.lock"),
             settings_path: settings_dir.join("user-settings.json"),
             llm_profiles_path: settings_dir.join("llm-profiles.json"),

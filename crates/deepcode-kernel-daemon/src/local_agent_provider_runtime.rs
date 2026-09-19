@@ -257,7 +257,6 @@ mod tests {
             &[serde_json::from_value(json!({"role":"user","content":"Inspect source."})).unwrap()],
             &[],
             true,
-            false,
         );
         assert_eq!(body["reasoning_effort"], "low");
         assert_eq!(configured.reasoning_effort.as_deref(), Some("max"));

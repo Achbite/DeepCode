@@ -26,6 +26,7 @@ pub struct KernelExecutorConfig {
     pub cloud_web_search: Option<CloudWebSearchConfig>,
     pub shell_program: Option<crate::shell_environment::ShellProgram>,
     pub execution_path: Option<String>,
+    pub temporary_root: Option<PathBuf>,
     pub wsl: Option<crate::wsl_execution::WslExecution>,
 }
 
@@ -298,6 +299,7 @@ fn executor_for_binding(
             Box::new(process::ConfiguredShellExecutor {
                 program: config.shell_program,
                 execution_path: config.execution_path,
+                temporary_root: config.temporary_root,
             })
         }
     }
@@ -339,6 +341,41 @@ fn known_failure(
             code: code.to_string(),
             message: message.into(),
         }),
+    }
+}
+
+// Both operations have already run. Keep the first failure as primary while
+// retaining a later cleanup/reader failure in the same returned diagnostic.
+pub(crate) fn combine_shell_results<T, U>(
+    primary: KernelResult<T>,
+    cleanup: KernelResult<U>,
+) -> KernelResult<(T, U)> {
+    match (primary, cleanup) {
+        (Ok(value), Ok(cleaned)) => Ok((value, cleaned)),
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+        (Err(mut error), Err(cleanup)) => {
+            let cleanup = deepcode_kernel_abi::KernelErrorEnvelope::from(&cleanup);
+            let suffix = format!("; cleanup failed [{}]: {}", cleanup.code, cleanup.message);
+            match &mut error {
+                KernelError::InvalidCommand(message)
+                | KernelError::WorkspaceAccessDenied(message)
+                | KernelError::WorkspaceRootUnreadable(message)
+                | KernelError::AttachmentAccessDenied(message)
+                | KernelError::PendingPermissionUnavailable(message)
+                | KernelError::PermissionDenied(message)
+                | KernelError::Structured { message, .. }
+                | KernelError::Other(message) => message.push_str(&suffix),
+                KernelError::MissingWorkspaceBinding => {
+                    error = KernelError::Structured {
+                        code: "workspace_binding_required",
+                        stage: "execution",
+                        message: format!("{error}{suffix}"),
+                        details: Value::Null,
+                    };
+                }
+            }
+            Err(error)
+        }
     }
 }
 

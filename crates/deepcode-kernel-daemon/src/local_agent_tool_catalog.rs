@@ -650,6 +650,11 @@ impl PreparedCatalogBinding {
             && self.tool_name() == "browser.page"
     }
 
+    pub(crate) fn is_browser_service(&self) -> bool {
+        matches!(&self.entry().binding, ToolExecutorBinding::Browser(_))
+            && self.tool_name() == "browser.service"
+    }
+
     pub(crate) fn is_internal_preview(&self) -> bool {
         matches!(&self.entry().binding, ToolExecutorBinding::Browser(_))
             && matches!(
@@ -677,7 +682,7 @@ impl PreparedCatalogBinding {
                 }
             };
             match (self.tool_name(), action) {
-                ("browser.page", "openSelf" | "list" | "status" | "close") => {
+                ("browser.page", "openSelf" | "list" | "status" | "activate" | "close") => {
                     return Ok(CatalogEffectScope::LocalRead)
                 }
                 ("browser.page", "reload") => {
@@ -1127,7 +1132,15 @@ fn browser_targets(name: &str, input: &Value) -> Result<Vec<String>, ToolCatalog
     let action = text("action")?;
     if !matches!(
         action,
-        "open" | "openSelf" | "list" | "status" | "navigate" | "reload" | "act" | "close"
+        "open"
+            | "openSelf"
+            | "list"
+            | "status"
+            | "activate"
+            | "navigate"
+            | "reload"
+            | "act"
+            | "close"
     ) {
         return Err(ToolCatalogError::new(
             "tool_input_invalid",

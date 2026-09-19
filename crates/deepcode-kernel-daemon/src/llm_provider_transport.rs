@@ -6,7 +6,6 @@ pub(crate) fn anthropic_stream_request_body(
     profile: &ResolvedLlmProfile,
     messages: &[LocalProviderMessage],
     tools: &[LlmToolDefinition],
-    require_tool_call: bool,
 ) -> Result<Value, ProviderTransportError> {
     let (system, chat_messages) = split_system_messages(messages);
     let chat_messages = anthropic_messages(chat_messages)?;
@@ -46,9 +45,6 @@ pub(crate) fn anthropic_stream_request_body(
                 "input_schema": tool.input_schema
             }))
             .collect::<Vec<_>>());
-        if require_tool_call {
-            body["tool_choice"] = json!({ "type": "any" });
-        }
     }
     Ok(body)
 }
@@ -165,7 +161,6 @@ pub(crate) fn ollama_stream_request_body(
     profile: &ResolvedLlmProfile,
     messages: &[LocalProviderMessage],
     tools: &[LlmToolDefinition],
-    require_tool_call: bool,
 ) -> Value {
     let mut body = json!({
         "model": profile.model,
@@ -196,9 +191,6 @@ pub(crate) fn ollama_stream_request_body(
                 }
             }))
             .collect::<Vec<_>>());
-        if require_tool_call {
-            body["tool_choice"] = json!("required");
-        }
     }
     body
 }

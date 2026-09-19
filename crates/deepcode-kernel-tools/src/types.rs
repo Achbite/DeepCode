@@ -51,3 +51,29 @@ pub enum ToolValidationError {
         reason: &'static str,
     },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolInputIssue {
+    pub path: String,
+    pub rule: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<Value>,
+}
+
+impl ToolInputIssue {
+    pub fn new(
+        path: impl Into<String>,
+        rule: impl Into<String>,
+        message: impl Into<String>,
+        expected: Option<Value>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            rule: rule.into(),
+            message: message.into(),
+            expected,
+        }
+    }
+}

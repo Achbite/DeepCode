@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 const SESSION_STORE_SCHEMA: &str = include_str!("../../../contracts/agent-runtime/session.sql");
-const EVENT_VERSION: &str = "deepcode.session-event.v4";
+const EVENT_VERSION: &str = "deepcode.session-event.v5";
 const COMMAND_VERSION: &str = "deepcode.command.v3";
 const REPLY_VERSION: &str = "deepcode.command-reply.v3";
 
@@ -407,37 +407,50 @@ impl LocalAgentJournal {
             .map_err(sql_error("session_run_fact_read_failed"))
     }
 
-    pub(crate) fn plan_authority_is_committed(
+    pub(crate) fn active_plan_authorities(
         &self,
         session_id: &str,
-        authority: &Value,
-    ) -> Result<bool, LocalAgentStoreError> {
+    ) -> Result<Option<Vec<Value>>, LocalAgentStoreError> {
         validate_id("sessionId", session_id)?;
         let connection = self.lock()?;
         let mut statement = connection
             .prepare(
-                "SELECT event_type, payload_json FROM session_events
+                "SELECT event_type, payload_json, run_id FROM session_events
                  WHERE session_id=?1 AND event_type IN (
                    'plan.confirmed', 'plan.revision.requested', 'plan.superseded',
-                   'plan.cancelled', 'plan.completed', 'plan.invalidated'
+                   'plan.cancelled', 'plan.invalidated', 'run.finishing'
                  ) ORDER BY sequence ASC",
             )
             .map_err(sql_error("plan_authority_fact_read_failed"))?;
         let rows = statement
             .query_map(params![session_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .map_err(sql_error("plan_authority_fact_read_failed"))?;
         let mut active_authorities: Option<Vec<Value>> = None;
-        let mut active_plan: Option<(String, u64)> = None;
+        let mut active_plan: Option<(String, u64, String)> = None;
         for row in rows {
-            let (event_type, encoded) =
+            let (event_type, encoded, run_id) =
                 row.map_err(sql_error("plan_authority_fact_read_failed"))?;
+            if event_type == "run.finishing" {
+                if active_plan
+                    .as_ref()
+                    .is_some_and(|active| active.2 == run_id)
+                {
+                    active_plan = None;
+                    active_authorities = None;
+                }
+                continue;
+            }
             let payload = decode_json(&encoded, "plan_authority_fact_corrupt")?;
             let plan_id = required_string(&payload, "planId")?.to_string();
             let revision = required_u64(&payload, "revision")?;
             if event_type == "plan.confirmed" {
-                active_plan = Some((plan_id, revision));
+                active_plan = Some((plan_id, revision, run_id));
                 active_authorities = Some(
                     payload
                         .get("authorities")
@@ -458,8 +471,7 @@ impl LocalAgentJournal {
                 active_authorities = None;
             }
         }
-        Ok(active_authorities
-            .is_some_and(|authorities| authorities.iter().any(|candidate| candidate == authority)))
+        Ok(active_authorities)
     }
 
     pub(crate) fn non_workspace_authority_is_committed(
@@ -757,11 +769,8 @@ fn validate_new_event(
         "plan.revision.requested",
         "plan.superseded",
         "plan.cancelled",
-        "plan.completed",
         "plan.invalidated",
-        "todo.seeded",
-        "todo.reconciled",
-        "todo.progressed",
+        "todo.updated",
         "tool.requested",
         "tool.started",
         "approval.requested",
@@ -828,12 +837,12 @@ fn validate_new_event(
             })?,
         )?;
     }
-    let progress_call = event_type == "todo.progressed"
+    let progress_call = event_type == "todo.updated"
         && event
             .get("payload")
             .and_then(|payload| payload.get("providerCallId"))
             .is_some();
-    if event_type == "todo.progressed" && event.get("callId").is_some() != progress_call {
+    if event_type == "todo.updated" && event.get("callId").is_some() != progress_call {
         return Err(LocalAgentStoreError::new(
             "session_event_invalid",
             "Todo control 调用必须同时携带 callId 和 providerCallId。",
@@ -1310,12 +1319,6 @@ fn validate_new_event(
             required_positive_revision(payload, "revision")?;
             validate_id("commandId", required_string(payload, "commandId")?)?;
         }
-        "plan.completed" => {
-            let payload = event.get("payload").expect("validated payload");
-            exact_object(payload, &["planId", "revision"], &[])?;
-            validate_id("planId", required_string(payload, "planId")?)?;
-            required_positive_revision(payload, "revision")?;
-        }
         "plan.invalidated" => {
             let payload = event.get("payload").expect("validated payload");
             exact_object(
@@ -1328,68 +1331,11 @@ fn validate_new_event(
             required_string(payload, "reason")?;
             validate_id("sourceFactRef", required_string(payload, "sourceFactRef")?)?;
         }
-        "todo.seeded" | "todo.reconciled" => {
+        "todo.updated" => {
             let payload = event.get("payload").expect("validated payload");
-            exact_object(
-                payload,
-                &["sourcePlanId", "sourcePlanRevision", "items"],
-                &[],
-            )?;
-            validate_id("sourcePlanId", required_string(payload, "sourcePlanId")?)?;
-            required_positive_revision(payload, "sourcePlanRevision")?;
+            exact_object(payload, &["revision", "items"], &["providerCallId"])?;
+            required_positive_revision(payload, "revision")?;
             validate_todo_items(payload.get("items").expect("validated todo items"))?;
-        }
-        "todo.progressed" => {
-            let payload = event.get("payload").expect("validated payload");
-            exact_object(
-                payload,
-                &[
-                    "sourcePlanId",
-                    "sourcePlanRevision",
-                    "sourceFactRef",
-                    "updates",
-                ],
-                &["providerCallId"],
-            )?;
-            validate_id("sourcePlanId", required_string(payload, "sourcePlanId")?)?;
-            required_positive_revision(payload, "sourcePlanRevision")?;
-            validate_id("sourceFactRef", required_string(payload, "sourceFactRef")?)?;
-            let updates = payload
-                .get("updates")
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    LocalAgentStoreError::new(
-                        "session_event_invalid",
-                        "todo.progressed updates 必须是数组。",
-                    )
-                })?;
-            if updates.is_empty() {
-                return Err(LocalAgentStoreError::new(
-                    "session_event_invalid",
-                    "todo.progressed 必须包含至少一项更新。",
-                ));
-            }
-            let mut todo_ids = std::collections::HashSet::with_capacity(updates.len());
-            for item in updates {
-                exact_object(item, &["todoId", "status"], &[])?;
-                let todo_id = required_string(item, "todoId")?;
-                validate_id("todoId", todo_id)?;
-                if !todo_ids.insert(todo_id) {
-                    return Err(LocalAgentStoreError::new(
-                        "session_event_invalid",
-                        "todo.progressed 包含重复 todoId。",
-                    ));
-                }
-                if !matches!(
-                    required_string(item, "status")?,
-                    "pending" | "inProgress" | "completed"
-                ) {
-                    return Err(LocalAgentStoreError::new(
-                        "session_event_invalid",
-                        "todo.progressed status 无效。",
-                    ));
-                }
-            }
         }
         "session.plugins.activated" => {
             let payload = event.get("payload").expect("validated payload");
@@ -1420,7 +1366,7 @@ fn validate_new_event(
             )?;
             if !matches!(
                 required_string(payload, "toolName")?,
-                "interaction.request" | "plan.publish" | "plan.progress" | "plugin.activate"
+                "interaction.request" | "plan.publish" | "todo.update" | "plugin.activate"
             ) {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
@@ -1569,7 +1515,7 @@ fn validate_new_event(
             }
             if !matches!(
                 required_string(payload, "responseConstraint")?,
-                "normal" | "toolRequired" | "answerOnly"
+                "normal" | "answerOnly"
             ) {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
@@ -2357,16 +2303,10 @@ fn validate_plan_operations(value: &Value) -> Result<(), LocalAgentStoreError> {
         if matches!(name, "bash" | "powershell") {
             exact_object(
                 operation,
-                &[
-                    "workspaceId",
-                    "operation",
-                    "workspaceMode",
-                    "executionScope",
-                ],
-                &["command", "terminal", "writablePaths"],
+                &["workspaceId", "operation", "writablePaths"],
+                &["command", "terminal"],
             )?;
-            let execution_scope = required_string(operation, "executionScope")?;
-            if execution_scope == "workspace" || operation.get("writablePaths").is_some() {
+            {
                 let paths = operation
                     .get("writablePaths")
                     .and_then(Value::as_array)
@@ -2374,7 +2314,7 @@ fn validate_plan_operations(value: &Value) -> Result<(), LocalAgentStoreError> {
                     .ok_or_else(|| {
                         LocalAgentStoreError::new(
                             "session_event_invalid",
-                            "workspace Bash 必须声明 writablePaths。",
+                            "Shell Plan 必须声明 writablePaths。",
                         )
                     })?;
                 for target in paths {
@@ -2396,13 +2336,10 @@ fn validate_plan_operations(value: &Value) -> Result<(), LocalAgentStoreError> {
                     !command.is_empty() && command.len() <= 16_384 && !command.contains('\0')
                 })
             });
-            if !valid_command
-                || required_string(operation, "workspaceMode")? != "write"
-                || !matches!(execution_scope, "workspace" | "host")
-            {
+            if !valid_command {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
-                    "bash Plan operation 必须声明 workspaceMode=write 和 executionScope；command 可选且有界。",
+                    "Shell Plan command 必须是非空字符串且不超过 16384 bytes。",
                 ));
             }
             if let Some(terminal) = operation.get("terminal") {
@@ -2558,34 +2495,17 @@ fn validate_todo_items(value: &Value) -> Result<(), LocalAgentStoreError> {
     let items = value.as_array().ok_or_else(|| {
         LocalAgentStoreError::new("session_event_invalid", "Todo items 必须是数组。")
     })?;
-    if items.is_empty() {
-        return Err(LocalAgentStoreError::new(
-            "session_event_invalid",
-            "Todo 必须包含至少一个阶段。",
-        ));
-    }
-    let mut todo_ids = std::collections::HashSet::with_capacity(items.len());
-    let mut step_ids = std::collections::HashSet::with_capacity(items.len());
     for item in items {
-        exact_object(item, &["todoId", "sourceStepId", "label", "status"], &[])?;
-        let todo_id = required_string(item, "todoId")?;
-        let step_id = required_string(item, "sourceStepId")?;
-        validate_id("todoId", todo_id)?;
-        validate_id("sourceStepId", step_id)?;
-        if !todo_ids.insert(todo_id) || !step_ids.insert(step_id) {
+        exact_object(item, &["text", "status"], &[])?;
+        if required_string(item, "text")?.trim().is_empty()
+            || !matches!(
+                required_string(item, "status")?,
+                "pending" | "inProgress" | "completed" | "blocked"
+            )
+        {
             return Err(LocalAgentStoreError::new(
                 "session_event_invalid",
-                "Todo todoId/sourceStepId 不能重复。",
-            ));
-        }
-        validate_display_text(item, "label", 240)?;
-        if !matches!(
-            required_string(item, "status")?,
-            "pending" | "inProgress" | "completed"
-        ) {
-            return Err(LocalAgentStoreError::new(
-                "session_event_invalid",
-                "Todo status 无效。",
+                "Todo text 或 status 无效。",
             ));
         }
     }
@@ -4289,6 +4209,63 @@ mod tests {
                 "plugins": []
             }
         })
+    }
+
+    #[test]
+    fn plan_authority_lasts_through_todo_updates_and_expires_on_run_finishing() {
+        let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
+        journal
+            .create_session("session:scope", "Scope", &json!([]), None)
+            .unwrap();
+        journal.append(&json!({"type":"run.started", "sessionId":"session:scope", "runId":"run:scope",
+            "payload":{"inputMessageId":"message:scope","workspaceBindings":[],"runtimeSnapshot":runtime_snapshot()}})).unwrap();
+        journal.append(&json!({"type":"plan.published", "sessionId":"session:scope", "runId":"run:scope", "callId":"call:plan",
+            "payload":{"providerCallId":"provider:plan", "planId":"plan:scope", "revision":1,
+                "title":"Write result", "summary":"Write the approved file.",
+                "steps":[{"stepId":"write","title":"Write result","details":"Write result.txt"}],
+                "mutationManifest":[{"workspaceId":"workspace:scope","operation":"fs.write","target":"result.txt"}]}})).unwrap();
+        let confirmed = json!({
+            "type":"plan.confirmed", "sessionId":"session:scope", "runId":"run:scope", "callId":"call:plan",
+            "payload":{"planId":"plan:scope", "revision":1, "commandId":"command:confirm", "decisionId":"decision:scope", "authorities":[{
+                "authorityId":"authority:scope", "planId":"plan:scope", "revision":1, "decisionId":"decision:scope",
+                "sessionId":"session:scope", "runId":"run:scope", "workspaceId":"workspace:scope",
+                "coveredOperations":[{"workspaceId":"workspace:scope", "operation":"fs.write", "target":"result.txt"}]
+            }]}
+        });
+        journal.append(&confirmed).unwrap();
+        let authorities = journal.active_plan_authorities("session:scope").unwrap();
+        assert_eq!(
+            authorities,
+            Some(
+                confirmed["payload"]["authorities"]
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            )
+        );
+        journal
+            .append(
+                &json!({"type":"todo.updated", "sessionId":"session:scope", "runId":"run:scope",
+            "payload":{"revision":1,"items":[{"text":"Done","status":"completed"}]}}),
+            )
+            .unwrap();
+        assert_eq!(
+            journal.active_plan_authorities("session:scope").unwrap(),
+            authorities
+        );
+        journal
+            .append(
+                &json!({"type":"run.finishing", "sessionId":"session:scope", "runId":"run:scope",
+            "payload":{"outcome":"cancelled"}}),
+            )
+            .unwrap();
+        assert_eq!(
+            journal.active_plan_authorities("session:scope").unwrap(),
+            None
+        );
+        assert!(validate_todo_items(&json!([{"text":"Task","status":"invented"}])).is_err());
+        validate_todo_items(&json!([])).unwrap();
+        validate_todo_items(&json!([{"text":"Task","status":"blocked"}])).unwrap();
     }
 
     #[test]

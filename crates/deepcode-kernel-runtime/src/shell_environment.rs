@@ -193,61 +193,33 @@ pub fn script_arguments(program: &ShellProgram, script: &str) -> Vec<String> {
 
 /// Windows has a short process command-line limit. User scripts are passed as a
 /// UTF-8 BOM file so long scripts, Unicode and multiline quoting remain intact.
-pub(crate) struct ShellScript {
-    pub arguments: Vec<String>,
-    file: Option<PathBuf>,
-}
-
-impl ShellScript {
-    pub fn prepare(program: &ShellProgram, script: &str) -> KernelResult<Self> {
-        if program.tool != "powershell" {
-            return Ok(Self {
-                arguments: script_arguments(program, script),
-                file: None,
-            });
-        }
-        use std::io::Write;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "deepcode-powershell-{}-{nonce}-{id}.ps1",
-            std::process::id()
-        ));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| KernelError::Other(format!("create PowerShell script: {error}")))?;
-        let prepared = Self {
-            arguments: vec![
-                "-NoLogo".into(),
-                "-NoProfile".into(),
-                "-NonInteractive".into(),
-                "-ExecutionPolicy".into(),
-                "Bypass".into(),
-                "-File".into(),
-                path.to_string_lossy().into_owned(),
-            ],
-            file: Some(path),
-        };
-        file.write_all(b"\xef\xbb\xbf[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n$OutputEncoding = [Console]::OutputEncoding\n")
-            .and_then(|_| file.write_all(script.as_bytes()))
-            .map_err(|error| KernelError::Other(format!("write PowerShell script: {error}")))?;
-        Ok(prepared)
+pub(crate) fn prepare_script_arguments(
+    program: &ShellProgram,
+    script: &str,
+    temporary: &Path,
+) -> KernelResult<Vec<String>> {
+    if program.tool != "powershell" {
+        return Ok(script_arguments(program, script));
     }
-}
-
-impl Drop for ShellScript {
-    fn drop(&mut self) {
-        if let Some(path) = &self.file {
-            let _ = std::fs::remove_file(path);
-        }
-    }
+    use std::io::Write;
+    let path = temporary.join("command.ps1");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| KernelError::Other(format!("create PowerShell script: {error}")))?;
+    file.write_all(b"\xef\xbb\xbf[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n$OutputEncoding = [Console]::OutputEncoding\n")
+        .and_then(|_| file.write_all(script.as_bytes()))
+        .map_err(|error| KernelError::Other(format!("write PowerShell script: {error}")))?;
+    Ok(vec![
+        "-NoLogo".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-ExecutionPolicy".into(),
+        "Bypass".into(),
+        "-File".into(),
+        path.to_string_lossy().into_owned(),
+    ])
 }
 
 #[cfg(test)]
@@ -299,14 +271,18 @@ mod tests {
             "{}\nWrite-Output 'Unicode: 中文'; exit 7",
             "# A long script\n".repeat(5000)
         );
-        let script = ShellScript::prepare(&program, &text).unwrap();
-        let path = script.file.clone().unwrap();
+        let temporary =
+            std::env::temp_dir().join(format!("deepcode-script-test-{}", std::process::id()));
+        std::fs::create_dir(&temporary).unwrap();
+        let arguments = prepare_script_arguments(&program, &text, &temporary).unwrap();
+        let path = PathBuf::from(arguments.last().unwrap());
+        assert_eq!(path.parent(), Some(temporary.as_path()));
         let contents = std::fs::read(&path).unwrap();
         assert!(contents.starts_with(b"\xef\xbb\xbf"));
         assert!(contents.ends_with(text.as_bytes()));
-        assert!(script.arguments.iter().map(String::len).sum::<usize>() < 1024);
-        assert_eq!(script.arguments[5], "-File");
-        drop(script);
+        assert!(arguments.iter().map(String::len).sum::<usize>() < 1024);
+        assert_eq!(arguments[5], "-File");
+        std::fs::remove_dir_all(&temporary).unwrap();
         assert!(!path.exists());
     }
     #[test]

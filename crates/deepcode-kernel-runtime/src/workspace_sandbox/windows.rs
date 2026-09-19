@@ -34,13 +34,11 @@ struct Request {
 }
 
 fn installation_path() -> Result<PathBuf, String> {
-    std::env::var_os("LOCALAPPDATA")
-        .map(|root| {
-            PathBuf::from(root)
-                .join("DeepCode")
-                .join("workspace-sandbox.json")
-        })
-        .ok_or_else(|| "LOCALAPPDATA is unavailable.".into())
+    std::env::var_os("DEEPCODE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("APPDATA").map(|root| PathBuf::from(root).join("DeepCode")))
+        .map(|root| root.join("workspace-sandbox.json"))
+        .ok_or_else(|| "APPDATA is unavailable.".into())
 }
 
 fn installation() -> Result<Installation, String> {
@@ -156,19 +154,19 @@ impl WorkspaceGrants {
                 serde_json::to_vec(&request).map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
-            // A PowerShell script may have been materialized outside our temp root.
-            if shell.tool == "powershell" {
-                if let Some(script) = args.last() {
-                    os::grant(Path::new(script), &state.account_sid, FILE_GENERIC_READ)?;
-                }
-            }
             grants.arguments = vec![
                 "--workspace-sandbox-proxy".into(),
                 request_path.into_os_string(),
             ];
             Ok(())
         })();
-        result.map_err(|e| unavailable(&shell.tool, e))?;
+        if let Err(error) = result {
+            return crate::executors::combine_shell_results(
+                Err(unavailable(&shell.tool, error)),
+                grants.release().map_err(KernelError::Other),
+            )
+            .map(|(result, ())| result);
+        }
         Ok(grants)
     }
 
@@ -186,21 +184,26 @@ impl WorkspaceGrants {
             ))),
         };
         let cleanup = self.release().map_err(KernelError::Other);
-        startup.and(cleanup)
+        crate::executors::combine_shell_results(startup, cleanup).map(|_| ())
     }
 }
 
 impl WorkspaceGrants {
     fn release(&mut self) -> Result<(), String> {
-        let mut failure = None;
+        let mut failures = Vec::new();
         for path in std::mem::take(&mut self.paths).into_iter().rev() {
             if path.exists() {
                 if let Err(error) = os::revoke(&path, &self.sid) {
-                    failure.get_or_insert(error);
+                    failures.push(format!("{}: {error}", path.display()));
+                    self.paths.push(path);
                 }
             }
         }
-        failure.map_or(Ok(()), Err)
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
     }
 }
 impl Drop for WorkspaceGrants {
@@ -228,11 +231,12 @@ pub fn entrypoint() -> Option<Result<i32, String>> {
             let path = Path::new(args.get(2).ok_or("Request path missing")?);
             match runner::proxy(path) {
                 Ok(code) => Ok(code),
-                Err(error) => {
-                    fs::write(path.with_file_name("sandbox-error.txt"), &error)
-                        .map_err(|e| e.to_string())?;
-                    Err(error)
-                }
+                Err(error) => match fs::write(path.with_file_name("sandbox-error.txt"), &error) {
+                    Ok(()) => Err(error),
+                    Err(write_error) => Err(format!(
+                        "{error}; write Shell startup result: {write_error}"
+                    )),
+                },
             }
         })()),
         Some("--workspace-sandbox-worker") => Some((|| {

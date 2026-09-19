@@ -255,6 +255,7 @@ pub(crate) fn default_user_settings() -> Value {
         "agent.permissions.engineeringDecisions": "ask",
         "agent.permissions.networkRead": "allow",
         "agent.permissions.external": "ask",
+        "agent.permissions.commandDenylist": crate::command_denylist::DEFAULT_COMMANDS,
         "agent.web.search.endpointTemplate": "",
         "agent.web.search.authHeaderName": "Authorization",
         "agent.web.search.authSecretRef": "",
@@ -274,6 +275,7 @@ pub(crate) fn default_user_settings() -> Value {
 }
 
 pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), String> {
+    crate::command_denylist::CommandDenylist::from_settings(settings)?;
     if settings
         .get("agent.documents.pythonPath")
         .is_some_and(|value| !value.is_string())
@@ -293,6 +295,7 @@ pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), St
                     | "agent.permissions.engineeringDecisions"
                     | "agent.permissions.networkRead"
                     | "agent.permissions.external"
+                    | "agent.permissions.commandDenylist"
             ) {
                 return Err(format!("{key} 不是当前 Agent Runtime 权限设置。"));
             }

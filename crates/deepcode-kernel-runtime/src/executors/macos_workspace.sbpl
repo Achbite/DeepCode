@@ -1,0 +1,13 @@
+(version 1)
+(allow default)
+(deny network*)
+(deny file-write*)
+; Bash heredocs and platform tools use system scratch independently of TMPDIR.
+(allow file-write*
+    (require-all
+        (require-any
+            (subpath "/tmp") (subpath "/private/tmp")
+            (subpath "/var/tmp") (subpath "/private/var/tmp")
+            (subpath (param "USER_TEMP_DIR")))
+        (require-not (subpath (param "WORKSPACE_ROOT")))))
+(allow file-write* (literal "/dev/null"))

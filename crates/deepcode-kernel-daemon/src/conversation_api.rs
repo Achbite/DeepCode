@@ -45,7 +45,17 @@ pub(crate) struct UpdateConversationProjectRequest {
 pub(crate) struct UpdateConversationSessionRequest {
     title: Option<String>,
     /// Missing keeps the current classification; JSON null moves to the independent list.
+    #[serde(default, deserialize_with = "deserialize_project_id_update")]
     project_id: Option<Option<String>>,
+}
+
+fn deserialize_project_id_update<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1086,15 +1096,29 @@ pub(crate) async fn conversation_session_create(
         }
     };
     if let Err((code, error)) = persist_result {
-        let _ = request_service(
+        let rollback = request_service(
             state.session_service.clone(),
             "deleteSession",
             json!({ "sessionId": session_id }),
         )
         .await;
-        return ApiResponse::error(code, error);
+        return session_creation_failure(code, error, rollback);
     }
     ApiResponse::ok(projection)
+}
+
+fn session_creation_failure(
+    code: &'static str,
+    mut message: String,
+    rollback: Result<Value, SessionServiceError>,
+) -> Json<ApiResponse> {
+    if let Err(error) = rollback {
+        message.push_str(&format!(
+            " [deleteSession] {}: {}",
+            error.code, error.message
+        ));
+    }
+    ApiResponse::error(code, message)
 }
 
 pub(crate) async fn conversation_session_update(
@@ -2360,6 +2384,52 @@ fn random_id(prefix: &str) -> Result<String, SessionServiceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_creation_failure_keeps_primary_and_failed_rollback_causes() {
+        let code = "conversation_catalog_write_failed";
+        let original = "original catalog write failure";
+        let Json(rolled_back) = session_creation_failure(code, original.into(), Ok(json!({})));
+        assert!(!rolled_back.ok);
+        assert!(rolled_back.data.is_none());
+        assert_eq!(rolled_back.error.as_deref(), Some(code));
+        assert_eq!(rolled_back.message.as_deref(), Some(original));
+
+        let Json(failed_rollback) = session_creation_failure(
+            code,
+            original.into(),
+            Err(SessionServiceError::new(
+                "session_service_response_timeout",
+                "original delete failure",
+            )),
+        );
+        assert!(!failed_rollback.ok);
+        assert!(failed_rollback.data.is_none());
+        assert_eq!(failed_rollback.error.as_deref(), Some(code));
+        let message = failed_rollback.message.unwrap();
+        assert!(message.starts_with(original));
+        assert!(message.contains("session_service_response_timeout: original delete failure"));
+    }
+
+    #[test]
+    fn session_project_update_distinguishes_omitted_null_and_project_id() {
+        let rename: UpdateConversationSessionRequest =
+            serde_json::from_value(json!({"title": "Renamed"})).unwrap();
+        assert_eq!(rename.title.as_deref(), Some("Renamed"));
+        assert_eq!(rename.project_id, None);
+
+        let independent: UpdateConversationSessionRequest =
+            serde_json::from_value(json!({"projectId": null})).unwrap();
+        assert_eq!(independent.project_id, Some(None));
+
+        let moved: UpdateConversationSessionRequest =
+            serde_json::from_value(json!({"projectId": "project:destination"})).unwrap();
+        assert_eq!(moved.project_id, Some(Some("project:destination".into())));
+        assert!(serde_json::from_value::<UpdateConversationSessionRequest>(
+            json!({"projectId": 42})
+        )
+        .is_err());
+    }
 
     #[test]
     fn document_resource_preserves_full_text_and_rejects_invalid_pdf_bytes() {

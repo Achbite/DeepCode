@@ -109,22 +109,20 @@ fn tool_guidance(tool: KernelToolKind) -> (&'static str, &'static [&'static str]
             ],
         ),
         KernelToolKind::ProcessPowerShell => (
-            "Execute a bounded PowerShell script in the selected native Windows environment. Use PowerShell syntax. Each call starts a fresh noninteractive process with no user profile and UTF-8 output. Scope and Plan authority are the same as other process tools. Check $LASTEXITCODE for native programs and use exit to preserve a failed command status.",
+            "Run a PowerShell script in the selected Windows environment. Kernel applies available filesystem permissions: project files are read-only until writes are authorized; session drafts are writable. The result preserves the actual exit status and output.",
             &[
-                "Use PowerShell syntax directly. Each call starts without a profile and emits UTF-8. Windows PowerShell 5.1 does not support && or ||; use separate statements and explicit exit handling.",
-                "After a native executable, capture $LASTEXITCODE before running another command and exit with that code when validating a build or test. Do not assume a pipeline preserves the original exit code.",
-                "Follow the project's build/test entrypoints. Command-not-found describes the current PATH; denied sandbox access does not prove host tools are absent or services stopped. Check the intended scope and request needed authority. A nonzero test result is not evidence of shell incompatibility.",
-                "Stay within the confirmed Plan targets and execution scope. If the selected environment cannot enforce workspace scope, report that limit and request a permitted host scope or another project environment; changing shell syntax does not grant permission."
+                "Each call starts in the bound workspace root with no profile and UTF-8 output. Use PowerShell syntax; Windows PowerShell 5.1 does not support && or ||. Preserve $LASTEXITCODE for native commands.",
+                "Use the project's required build/test entrypoints. Report the actual command error; missing commands, denied access and connection failures do not prove that tools or services are absent.",
+                "When proposing a Plan, declare intended file and directory writes in writablePaths. Kernel owns temporary resources for each call; keep files needed by later calls in workspace paths."
             ],
         ),
         KernelToolKind::ProcessShell => (
-            "Execute a bounded Bash command in the selected target. workspace scope is sandboxed; host requires Kernel authority and uses the same target, shell and prepared PATH outside that sandbox. Use workspaceMode write for mutations. terminal supplies optional one-call PTY input; otherwise stdin is closed. The result preserves the command's final exit status.",
+            "Run a Bash script from the bound workspace root. Kernel applies the available filesystem permissions: project files are read-only until writes are authorized; session drafts are writable. Commands can fail at the sandbox boundary; the result preserves their exit status and output. Optional terminal input uses a one-call PTY; otherwise stdin is closed.",
             &[
-                "Use this for discovery, search, builds and commands. Run checks independently or save and return their exit status; use conditionals for expected failures and pipefail when pipeline failures must propagate.",
-                "Do not use this as the default way to read a known UTF-8 workspace text file.",
-                "Follow the project's build/test entrypoints in their required environment. Command-not-found describes the current PATH, not all installed tools. Sandbox denial or an unreachable socket does not prove a service is stopped. Check the intended scope before proposing changes. Host execution requires Kernel authorization; a confirmed Plan alone does not provide it.",
-                "A Plan denial means this call was not executed. Stay within confirmed targets and executionScope; routine command details do not require reconfirmation. Revise the Plan only when the authorized scope must change.",
-                "Output is limited to the last 2000 lines or 50 KiB. When truncated, fullOutput contains Session-owned log paths; inspect bounded sections with a read-only Bash command instead of repeating the original command."
+                "Use cd for subdirectories and the project's required build/test entrypoints. Preserve the exit status being checked, including pipeline failures. Use fs.read for known UTF-8 workspace files.",
+                "Report the actual command error; missing commands, denied access and connection failures do not prove that tools or services are absent.",
+                "When proposing a Plan, declare intended file and directory writes in writablePaths. Kernel owns temporary resources for each call; keep files needed by later calls in workspace paths.",
+                "Output is limited to the last 2000 lines or 50 KiB. When truncated, inspect bounded sections of the returned fullOutput log paths instead of repeating the command."
             ],
         ),
     }

@@ -100,19 +100,13 @@ pub(super) fn provider_schema_for_tool(tool: KernelToolKind) -> Value {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 16384,
-                    "description": "Bash script with newlines; use cd for subdirectories and quoted heredocs for literal input. Each-step success: set -e and pipefail in the shell owning the pipeline (including outside docker): set -o pipefail; command 2>&1 | tail -60. For expected nonzero: if command; then rc=0; else rc=$?; fi; inspect rc explicitly."
+                    "description": "Bash script. Each call starts at the bound workspace root; use cd for a subdirectory. Preserve the exit status of the operation being checked."
                 },
-                "workspaceMode": {
+                "requestHostPermission": {
                     "type": "string",
-                    "enum": ["read", "write"],
-                    "default": "read",
-                    "description": "Defaults to read. In workspace scope, read denies workspace writes; write requires Plan mutation authority. Host scope has its separate external-effect authority."
-                },
-                "executionScope": {
-                    "type": "string",
-                    "enum": ["workspace", "host"],
-                    "default": "workspace",
-                    "description": "Defaults to workspace, which requires an available workspace sandbox. Host requires external-effect authority; it changes permissions, not the selected execution target, shell or prepared PATH."
+                    "minLength": 1,
+                    "maxLength": 1024,
+                    "description": "Optional reason to request execution outside the sandbox; Kernel approval is required. Omit for ordinary sandboxed commands, including reads of accessible paths outside the workspace."
                 },
                 "timeout": {
                     "type": "integer",

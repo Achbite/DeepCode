@@ -1,17 +1,25 @@
 use super::*;
 
 pub(super) fn invocation(id: impl Into<String>, tool: &str, input: Value) -> KernelToolInvocation {
+    // Execution mode/scope are prepared Kernel facts, not Provider input.
+    let input: KernelCanonicalInvocation = if matches!(tool, "bash" | "powershell") {
+        serde_json::from_value(serde_json::json!({"toolId": tool, "arguments": input})).unwrap()
+    } else {
+        KernelToolRegistry::default()
+            .canonicalize(tool, input)
+            .unwrap()
+    };
+    input.validate().unwrap();
     KernelToolInvocation {
         id: id.into(),
-        input: KernelToolRegistry::default()
-            .canonicalize(tool, input)
-            .unwrap(),
+        input,
     }
 }
 
 #[cfg(unix)]
 fn shell_executor() -> ConfiguredShellExecutor {
     ConfiguredShellExecutor {
+        temporary_root: None,
         program: Some(
             crate::shell_environment::discover("bash").expect("fixture Bash environment"),
         ),
@@ -563,6 +571,84 @@ fn bash_host_scope_reports_the_host_execution_boundary() {
     assert_eq!(result.output["environment"]["writeScope"], "hostUser");
     assert_eq!(result.output["environment"]["homeWritable"], true);
     assert_eq!(result.output["environment"]["networkAccess"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn host_shell_pipe_and_pty_share_owned_temp_lifetime() {
+    for (terminal, exit_code) in [(false, 0), (true, 7)] {
+        let workspace = TempWorkspace::new("host-shell-owned-temp");
+        let mut arguments = serde_json::json!({
+            "command": format!("test \"$TMPDIR\" = \"$TMP\" && test \"$TMPDIR\" = \"$TEMP\" || exit 99; printf temporary > \"$TMPDIR/owned.txt\"; printf '%s' \"$TMPDIR\"; exit {exit_code}"),
+            "workspaceMode": "read", "executionScope": "host", "timeout": 5
+        });
+        if terminal {
+            arguments["terminal"] = serde_json::json!({"stdin": ""});
+        }
+        let result = shell_executor()
+            .invoke(
+                invocation("host-temp", "bash", arguments),
+                context_with_target(&workspace.0, "."),
+            )
+            .unwrap();
+        assert_eq!(result.output["exitCode"], exit_code);
+        assert_eq!(result.output["terminal"], terminal);
+        let temporary = result.output["stdout"].as_str().unwrap();
+        assert!(temporary.contains("deepcode-agent-shell-"), "{temporary}");
+        assert!(!Path::new(temporary).exists());
+        if exit_code != 0 {
+            assert_eq!(result.error.unwrap().code, "bash_exit_nonzero");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn host_shell_cancellation_releases_pipe_and_pty_temporary_directories() {
+    for terminal in [false, true] {
+        let workspace = TempWorkspace::new("host-shell-cancel-temp");
+        let mut context = context_with_target(&workspace.0, ".");
+        let cancellation = context.cancellation.clone();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = captured.clone();
+        context.progress = KernelProgressSink::new(move |event| {
+            if let KernelToolProgress::Output { bytes, .. } = event {
+                let mut captured = output.lock().unwrap();
+                captured.extend(bytes);
+                if captured.last() == Some(&b'\n')
+                    && String::from_utf8_lossy(&captured).contains("deepcode-agent-shell-")
+                {
+                    cancellation.cancel();
+                }
+            }
+        });
+        let mut arguments = serde_json::json!({
+            "command": "printf temporary > \"$TMPDIR/owned.txt\"; printf '%s\\n' \"$TMPDIR\"; sleep 20",
+            "workspaceMode": "read", "executionScope": "host", "timeout": 5
+        });
+        if terminal {
+            arguments["terminal"] = serde_json::json!({"stdin": ""});
+        }
+        let error = shell_executor()
+            .invoke(invocation("host-cancel", "bash", arguments), context)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                KernelError::Structured {
+                    code: "tool_execution_cancelled",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        let temporary = output
+            .lines()
+            .find(|line| line.contains("deepcode-agent-shell-"))
+            .expect("owned directory emitted before cancellation");
+        assert!(!Path::new(temporary).exists());
+    }
 }
 
 #[cfg(unix)]

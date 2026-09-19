@@ -53,7 +53,6 @@ pub(crate) struct ProviderRequestInput {
     pub(crate) messages: Vec<LocalProviderMessage>,
     pub(crate) tools: Vec<LlmToolDefinition>,
     pub(crate) hosted_tools: Vec<LocalProviderHostedTool>,
-    pub(crate) require_tool_call: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -215,7 +214,6 @@ pub(crate) fn openai_compatible_request_body(
     messages: &[LocalProviderMessage],
     tools: &[LlmToolDefinition],
     stream: bool,
-    require_tool_call: bool,
 ) -> Value {
     let compatibility = provider_thinking_compatibility(profile);
     let mut body = json!({
@@ -271,13 +269,6 @@ pub(crate) fn openai_compatible_request_body(
                 }
             }))
             .collect::<Vec<_>>());
-        if require_tool_call
-            && !(compatibility == ProviderThinkingCompatibility::DeepSeek
-                && profile.thinking.as_deref() == Some("enabled"))
-            && !(compatibility == ProviderThinkingCompatibility::Moonshot && !kimi_k3)
-        {
-            body["tool_choice"] = json!("required");
-        }
     }
     body
 }
@@ -288,7 +279,6 @@ fn responses_request_body(
     tools: &[LlmToolDefinition],
     hosted_tools: &[LocalProviderHostedTool],
     stream: bool,
-    require_tool_call: bool,
 ) -> Result<Value, ProviderTransportError> {
     let mut provider_tools = tools
         .iter()
@@ -334,9 +324,6 @@ fn responses_request_body(
     }
     if !provider_tools.is_empty() {
         body["tools"] = Value::Array(provider_tools);
-        if require_tool_call {
-            body["tool_choice"] = json!("required");
-        }
     }
     if profile.connection.adapter_id == "openai-codex" {
         let instructions = messages
@@ -637,6 +624,26 @@ impl ProviderTransportError {
         }
     }
 
+    fn network(error: reqwest::Error, phase: &str, secret: Option<&str>) -> Self {
+        let failure = crate::provider_transport::network_failure(error, phase, secret);
+        let causes = failure["diagnostics"]["causes"]
+            .as_array()
+            .expect("network_failure supplies a cause array")
+            .iter()
+            .map(|cause| {
+                cause["message"]
+                    .as_str()
+                    .expect("network_failure supplies cause messages")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let code = "provider_transport_failed";
+        Self::message(
+            code,
+            format!("{} [{phase}]\n{causes}", Self::new(code).safe_message()),
+        )
+    }
+
     pub(crate) fn safe_message(&self) -> String {
         if let Some(message) = &self.message {
             return message.clone();
@@ -679,30 +686,15 @@ fn prepare_provider_request(
             "provider_hosted_tool_unsupported",
         ));
     }
-    let require_tool_call = envelope.require_tool_call;
-    if require_tool_call && tools.is_empty() {
-        return Err(ProviderTransportError::new(
-            "provider_required_tool_missing",
-        ));
-    }
     let provider_body = match kind {
         ProviderStreamKind::OpenAiCompatible => {
-            openai_compatible_request_body(profile, messages, &tools, true, require_tool_call)
+            openai_compatible_request_body(profile, messages, &tools, true)
         }
-        ProviderStreamKind::Responses => responses_request_body(
-            profile,
-            messages,
-            &tools,
-            &hosted_tools,
-            true,
-            require_tool_call,
-        )?,
-        ProviderStreamKind::Anthropic => {
-            anthropic_stream_request_body(profile, messages, &tools, require_tool_call)?
+        ProviderStreamKind::Responses => {
+            responses_request_body(profile, messages, &tools, &hosted_tools, true)?
         }
-        ProviderStreamKind::Ollama => {
-            ollama_stream_request_body(profile, messages, &tools, require_tool_call)
-        }
+        ProviderStreamKind::Anthropic => anthropic_stream_request_body(profile, messages, &tools)?,
+        ProviderStreamKind::Ollama => ollama_stream_request_body(profile, messages, &tools),
     };
     let body = serde_json::to_vec(&provider_body).map_err(|error| {
         ProviderTransportError::message(
@@ -931,14 +923,15 @@ async fn probe_profile(
             }],
             tools: vec![],
             hosted_tools: vec![],
-            require_tool_call: false,
         },
     )?;
     let kind = prepared.kind;
     let mut response = build_provider_request(client, profile, &prepared)?
         .send()
         .await
-        .map_err(|_| ProviderTransportError::new("provider_transport_failed"))?;
+        .map_err(|error| {
+            ProviderTransportError::network(error, "send", profile.api_key.as_deref())
+        })?;
     if !response.status().is_success() {
         return Err(ProviderTransportError::http(response.status().as_u16()));
     }
@@ -948,7 +941,13 @@ async fn probe_profile(
         let (payloads, eof) = match response.chunk().await {
             Ok(Some(chunk)) => (framer.push(&chunk)?, false),
             Ok(None) => (framer.finish()?, true),
-            Err(_) => return Err(ProviderTransportError::new("provider_transport_failed")),
+            Err(error) => {
+                return Err(ProviderTransportError::network(
+                    error,
+                    "responseBody",
+                    profile.api_key.as_deref(),
+                ))
+            }
         };
         for payload in payloads {
             accumulator
@@ -1687,17 +1686,113 @@ pub(crate) fn split_system_messages(
 mod tests {
     use super::*;
 
+    async fn failed_loopback_probe(base_url: String) -> ProviderTransportError {
+        let mut profile = test_profile("openaiCompatible");
+        profile.base_url = Some(base_url);
+        profile.api_key = Some("probe-secret".into());
+        let store = Arc::new(
+            crate::model_usage::UsageStore::open(std::path::Path::new(":memory:")).unwrap(),
+        );
+        let mut usage = store.begin(&profile, &json!({"purpose":"probe"})).unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .retry(reqwest::retry::never())
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        probe_llm_profile_stream(&client, &profile, &mut usage)
+            .await
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn probe_send_failure_keeps_native_cause_without_credentials() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let failure = failed_loopback_probe(format!("http://{address}/v1?key=probe-secret")).await;
+        assert_eq!(failure.code, "provider_transport_failed");
+        let message = failure.safe_message();
+        assert!(message.contains("[send]"));
+        assert!(message.contains("Connection refused"), "{message}");
+        assert!(!message.contains("probe-secret"));
+    }
+
+    #[tokio::test]
+    async fn probe_body_failure_keeps_the_read_phase_and_original_cause() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "probe did not connect"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept probe: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut bytes = [0; 4096];
+            let request_length = loop {
+                let read = socket.read(&mut bytes).unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&bytes[..read]);
+                if let Some(end) = request.windows(4).position(|chunk| chunk == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    break end + 4 + length;
+                }
+            };
+            while request.len() < request_length {
+                let read = socket.read(&mut bytes).unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&bytes[..read]);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 64\r\nConnection: close\r\n\r\ndata: ").unwrap();
+        });
+        let failure = failed_loopback_probe(format!("http://{address}/v1?key=probe-secret")).await;
+        server.join().unwrap();
+        assert_eq!(failure.code, "provider_transport_failed");
+        let message = failure.safe_message();
+        assert!(message.contains("[responseBody]"));
+        assert!(
+            message.contains("end of file before message length reached"),
+            "{message}"
+        );
+        assert!(!message.contains("probe-secret"));
+    }
+
     fn provider_input(value: Value) -> ProviderRequestInput {
         ProviderRequestInput {
             messages: serde_json::from_value(value["messages"].clone()).unwrap(),
             tools: serde_json::from_value(value["tools"].clone()).unwrap(),
             hosted_tools: serde_json::from_value(value["hostedTools"].clone()).unwrap(),
-            require_tool_call: value["requireToolCall"].as_bool().unwrap(),
         }
     }
 
     #[test]
-    fn required_tool_constraint_reaches_each_provider_payload() {
+    fn normal_tool_schemas_reach_each_provider_payload_without_forced_choice() {
         let envelope = provider_input(json!({
             "messages": [{ "role": "user", "content": "Execute the confirmed step." }],
             "tools": [{
@@ -1705,24 +1800,23 @@ mod tests {
                 "description": "Execute one fixture action.",
                 "inputSchema": { "type": "object", "additionalProperties": false }
             }],
-            "hostedTools": [],
-            "requireToolCall": true
+            "hostedTools": []
         }));
-        for (kind, expected) in [
-            ("openaiCompatible", json!("required")),
-            ("responses", json!("required")),
-            ("anthropic", json!({ "type": "any" })),
-            ("ollama", json!("required")),
-        ] {
+        for kind in ["openaiCompatible", "responses", "anthropic", "ollama"] {
             let prepared = prepare_provider_request(&test_profile(kind), &envelope)
-                .expect("required-tool request must prepare");
+                .expect("normal tool request must prepare");
             let body: Value =
                 serde_json::from_slice(&prepared.body).expect("provider request body must decode");
-            assert_eq!(
-                body.get("tool_choice"),
-                Some(&expected),
-                "provider kind {kind}"
-            );
+            assert!(body.get("tool_choice").is_none(), "provider kind {kind}");
+            assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+            let tool = &body["tools"][0];
+            let (name, schema) = match kind {
+                "anthropic" => (&tool["name"], &tool["input_schema"]),
+                "responses" => (&tool["name"], &tool["parameters"]),
+                _ => (&tool["function"]["name"], &tool["function"]["parameters"]),
+            };
+            assert_eq!(name, "fixture_tool");
+            assert_eq!(schema, &envelope.tools[0].input_schema);
         }
     }
 
@@ -1737,8 +1831,7 @@ mod tests {
                     "description": "Fixture action.",
                     "inputSchema": { "type": "object" }
                 }],
-                "hostedTools": [],
-                "requireToolCall": false
+                "hostedTools": []
             })),
         )
         .expect("normal request must prepare");
@@ -1761,8 +1854,7 @@ mod tests {
                     "description": "Execute one fixture action.",
                     "inputSchema": { "type": "object", "additionalProperties": false }
                 }],
-                "hostedTools": [],
-                "requireToolCall": true
+                "hostedTools": []
             })),
         )
         .expect("DeepSeek thinking request must prepare");
@@ -1807,8 +1899,7 @@ mod tests {
                 "hostedTools": [{
                     "type": "webSearch",
                     "providerToolType": "web_search"
-                }],
-                "requireToolCall": false
+                }]
             })),
         )
         .expect("Responses request must prepare");
@@ -1902,7 +1993,6 @@ mod tests {
                 ],
                 "tools": [],
                 "hostedTools": [],
-                "requireToolCall": false,
             })),
         )
         .expect("ordered Responses replay must prepare");
@@ -1931,7 +2021,7 @@ mod tests {
                     "outputIndex":0,"kind":"toolCallRejected","callId":"call:bad","providerCallId":"native:bad","toolName":"fs.read","item":item
                 }]},
                 {"role":"tool","toolCallId":"call:bad","providerCallId":"native:bad","content":rejection}
-            ],"tools":[],"hostedTools":[],"requireToolCall":false
+            ],"tools":[],"hostedTools":[]
         }))).unwrap();
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
         assert_eq!(body["input"][1], item);
@@ -1949,8 +2039,7 @@ mod tests {
             "messages": [{ "role": "user", "content": "Inspect the worktree." }],
             "tools": [{ "name": "bash", "description": bash.description,
                 "inputSchema": bash.input_schema }],
-            "hostedTools": [{ "type": "webSearch", "providerToolType": "web_search" }],
-            "requireToolCall": false
+            "hostedTools": [{ "type": "webSearch", "providerToolType": "web_search" }]
         }));
         let prepared = prepare_provider_request(&test_profile("responses"), &input).unwrap();
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
@@ -1995,8 +2084,7 @@ mod tests {
                 "hostedTools": [{
                     "type": "webSearch",
                     "providerToolType": "some_other_tool"
-                }],
-                "requireToolCall": false
+                }]
             })),
         )
         .expect_err("invalid hosted tool must fail");
@@ -2042,12 +2130,12 @@ mod tests {
         kimi.model = "kimi-k3".into();
         kimi.reasoning_effort = Some("max".into());
         kimi.thinking = Some("enabled".into());
-        let body = openai_compatible_request_body(&kimi, &[], &tools, true, true);
+        let body = openai_compatible_request_body(&kimi, &[], &tools, true);
         assert!(body.get("thinking").is_none());
         assert_eq!(body["reasoning_effort"], "max");
-        assert_eq!(body["tool_choice"], "required");
+        assert!(body.get("tool_choice").is_none());
         kimi.model = "kimi-k2.7-code".into();
-        let body = openai_compatible_request_body(&kimi, &[], &tools, true, true);
+        let body = openai_compatible_request_body(&kimi, &[], &tools, true);
         assert_eq!(body["thinking"], json!({"type":"enabled", "keep":"all"}));
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("tool_choice").is_none());
@@ -2055,7 +2143,7 @@ mod tests {
         deepseek.provider_flavor = Some("deepseek".into());
         deepseek.thinking = Some("enabled".into());
         deepseek.reasoning_effort = Some("high".into());
-        let body = anthropic_stream_request_body(&deepseek, &[], &[], false).unwrap();
+        let body = anthropic_stream_request_body(&deepseek, &[], &[]).unwrap();
         assert_eq!(body["thinking"], json!({"type":"enabled"}));
         assert_eq!(body["output_config"], json!({"effort":"high"}));
         let glm = openai_compatible_message(
@@ -2084,7 +2172,6 @@ mod tests {
                 &[],
                 &[],
                 true,
-                false,
             )
             .unwrap();
             assert_eq!(body["input"][0]["arguments"], raw);
@@ -2092,7 +2179,6 @@ mod tests {
                 &test_profile("anthropic"),
                 &[serde_json::from_value(message(json!(raw))).unwrap()],
                 &[],
-                false,
             );
             if raw == r#"{"path":"a.txt"}"# {
                 assert_eq!(
@@ -2178,7 +2264,7 @@ mod tests {
                 None,
                 profile,
                 provider_input(json!({
-                    "messages":[{"role":"user","content":"归档检查"}], "tools":[], "hostedTools":[], "requireToolCall":false,
+                    "messages":[{"role":"user","content":"归档检查"}], "tools":[], "hostedTools":[],
                 })),
                 "request:archive".into(),
                 directory.clone(),
@@ -2241,7 +2327,7 @@ mod tests {
         profile.connection.adapter_id = "openai-codex".into();
         profile.connection.base_url = "https://chatgpt.com/backend-api/codex".into();
         let input = provider_input(
-            json!({"messages":[{"role":"system","content":"Use the project instructions."},{"role":"user","content":"Explain the module."}],"tools":[],"hostedTools":[],"requireToolCall":false}),
+            json!({"messages":[{"role":"system","content":"Use the project instructions."},{"role":"user","content":"Explain the module."}],"tools":[],"hostedTools":[]}),
         );
         let prepared = prepare_provider_request(&profile, &input).unwrap();
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
@@ -2267,7 +2353,7 @@ mod tests {
             });
         let messages = vec![message];
         let profile = test_profile("responses");
-        let result = responses_request_body(&profile, &messages, &[], &[], false, false).unwrap();
+        let result = responses_request_body(&profile, &messages, &[], &[], false).unwrap();
         assert_eq!(result["input"][0]["type"], "function_call_output");
         assert_eq!(result["input"][0]["call_id"], "provider-observe");
         assert_eq!(result["input"][0]["output"][0]["text"], "observed");
@@ -2275,7 +2361,7 @@ mod tests {
             result["input"][0]["output"][1]["image_url"],
             "data:image/png;base64,aW1hZ2U="
         );
-        let result = anthropic_stream_request_body(&profile, &messages, &[], false).unwrap();
+        let result = anthropic_stream_request_body(&profile, &messages, &[]).unwrap();
         assert_eq!(result["messages"][0]["content"][0]["type"], "tool_result");
         assert_eq!(
             result["messages"][0]["content"][0]["content"][1]["source"]["data"],
@@ -2295,22 +2381,22 @@ mod tests {
             });
         let messages = vec![message];
         let profile = test_profile("responses");
-        let responses = responses_request_body(&profile, &messages, &[], &[], true, false).unwrap();
+        let responses = responses_request_body(&profile, &messages, &[], &[], true).unwrap();
         assert_eq!(
             responses["input"][0]["content"][1]["image_url"],
             "data:image/png;base64,aW1hZ2U="
         );
-        let chat = openai_compatible_request_body(&profile, &messages, &[], true, false);
+        let chat = openai_compatible_request_body(&profile, &messages, &[], true);
         assert_eq!(
             chat["messages"][0]["content"][1]["image_url"]["url"],
             "data:image/png;base64,aW1hZ2U="
         );
-        let anthropic = anthropic_stream_request_body(&profile, &messages, &[], false).unwrap();
+        let anthropic = anthropic_stream_request_body(&profile, &messages, &[]).unwrap();
         assert_eq!(
             anthropic["messages"][0]["content"][1]["source"]["data"],
             "aW1hZ2U="
         );
-        let ollama = ollama_stream_request_body(&profile, &messages, &[], false);
+        let ollama = ollama_stream_request_body(&profile, &messages, &[]);
         assert_eq!(ollama["messages"][0]["images"][0], "aW1hZ2U=");
         assert_eq!(ollama["messages"][0]["content"], "Read this image.");
     }

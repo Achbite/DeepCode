@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod api_response;
+mod command_denylist;
 mod config_root_lease;
 mod conversation_api;
 mod conversation_catalog;
@@ -212,6 +213,7 @@ pub(crate) fn runtime_tool_configuration(
         .collect();
     Ok((
         deepcode_kernel_runtime::executors::KernelExecutorConfig {
+            temporary_root: Some(gui.paths.temporary_root.clone()),
             web_search_endpoint_template: setting("agent.web.search.endpointTemplate")?.to_string(),
             web_search_auth_header_name: setting("agent.web.search.authHeaderName")?.to_string(),
             web_search_auth_secret_ref: setting("agent.web.search.authSecretRef")?.to_string(),

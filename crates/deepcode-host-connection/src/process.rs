@@ -63,26 +63,38 @@ fn wait_for_owned_process_group_exit(process: &mut OwnedHostProcess, attempts: u
 }
 
 pub fn terminate_owned_process_tree(process: &mut OwnedHostProcess) {
+    let _ = terminate_owned_process_tree_checked(process);
+}
+
+pub fn terminate_owned_process_tree_checked(process: &mut OwnedHostProcess) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        unsafe {
-            libc::kill(-process.process_group_id, libc::SIGTERM);
-        }
+        signal_owned_process_group(process.process_group_id, libc::SIGTERM)?;
         if !wait_for_owned_process_group_exit(process, 20) {
-            unsafe {
-                libc::kill(-process.process_group_id, libc::SIGKILL);
-            }
-            let _ = wait_for_owned_process_group_exit(process, 20);
+            signal_owned_process_group(process.process_group_id, libc::SIGKILL)?;
         }
     }
     #[cfg(windows)]
     {
-        process.job.close();
-        if !wait_for_child_exit(process, 20) {
-            let _ = process.child.kill();
-        }
+        process.job.close_checked()?;
     }
-    let _ = process.child.wait();
+    process.child.wait().map(|_| ())
+}
+
+#[cfg(unix)]
+fn signal_owned_process_group(
+    process_group_id: libc::pid_t,
+    signal: libc::c_int,
+) -> std::io::Result<()> {
+    if unsafe { libc::kill(-process_group_id, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 pub fn spawn_owned_host_process(command: &mut Command) -> std::io::Result<OwnedHostProcess> {
@@ -178,14 +190,22 @@ impl WindowsKillOnCloseJob {
     }
 
     pub fn close(&mut self) {
+        let _ = self.close_checked();
+    }
+
+    fn close_checked(&mut self) -> std::io::Result<()> {
         if let Some(handle) = self.handle.as_ref() {
-            unsafe {
+            let terminated = unsafe {
                 windows_sys::Win32::System::JobObjects::TerminateJobObject(
                     handle.as_raw_handle() as HANDLE,
                     1,
-                );
+                )
+            };
+            if terminated == 0 {
+                return Err(std::io::Error::last_os_error());
             }
         }
         drop(self.handle.take());
+        Ok(())
     }
 }
