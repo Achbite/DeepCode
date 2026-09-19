@@ -22,7 +22,7 @@ export interface SessionControlWireNames {
 }
 
 export function confirmedPlanExecutionInstruction(): string {
-  return 'The Plan is confirmed. Execute it now. Its approved scope remains valid for this run. Keep Todo progress current as work proceeds.';
+  return 'The Plan is confirmed. Execute it now. Its approved scope remains valid for this run.';
 }
 
 export function sessionControlInstructions(
@@ -32,7 +32,7 @@ export function sessionControlInstructions(
 ): string {
   const decisions = ` Ask for missing information or decisions with ${names.interactionRequest}; confirmation opens a panel and resumes this run after the answer. Correct rejected inputs; Kernel handles permission approval.`;
   const plugins = hasPluginDiscovery ? ` Discover plugins when the task needs unlisted capabilities. ${names.pluginActivate} loads enabled plugins for this run; activation in a previous run does not make those tools available now. The current tool list is authoritative. User mentions are optional guidance. Loading does not grant tool permissions. Call it alone, then use the new tools.` : '';
-  const progress = ` Use ${names.todoUpdate} to replace the complete task list when starting work or changing progress, including blocked work. It needs no Plan or tool record and grants no permissions. One update may accompany ordinary calls. The latest Todo message is current; report outcomes honestly.`;
+  const progress = ` For multi-step work, use ${names.todoUpdate} when useful. Keep phases few and meaningful, merging similar work; choose the count to fit the task. Skip trivial work and unchanged updates; no update is required per tool call or before answering. Send the complete current list in one update, optionally alongside ordinary calls. Todo grants no permissions and does not gate completion; keep unfinished work honest.`;
   if (!hasWorkspaceBindings) {
     return `Explicit commentary is progress and may continue without calls; unphased text without calls is the final answer. ${names.interactionRequest} must be the only call in its turn. No workspace is bound to this run; do not invent a workspace handle or request workspace operations.${progress}${decisions}${plugins}`;
   }
@@ -207,12 +207,12 @@ export function sessionControlToolDefinitions(): readonly ProviderToolDefinition
     },
     {
       name: SESSION_CONTROL_PLAN_PUBLISH,
-      description: 'Propose a Plan for user confirmation. Steps are stable outcome phases, not files, commands or implementation recipes; new tasks need not repeat completed history. For scope additions only, use mode=extendScope with summary explaining why and mutationManifest containing additions; Session preserves the approved phases and verification; Todo stays independent. If the task needs a rewritten Plan, omit mode, retain existing stepIds and submit title, summary, steps and the full effective manifest. Scope expansion and Plan rewrites take effect only after user confirmation. fs.edit/fs.write/document.render/browser.capture share file or explicit directoryTree scope; deletion is separate. When creating a module, propose its specific directoryTree scope upfront so new implementation files within that approved directory need no extra confirmation; list unrelated root files separately. Bash command is an optional example, not an exact script lock. Routine fixes within confirmed scope need no reconfirmation. Titles use inline Markdown; other text uses Markdown.',
+      description: 'Propose a Plan for user confirmation. Keep steps to a few meaningful outcome phases, merging similar work instead of listing files, commands or implementation recipes; choose the count to fit the task. New tasks need not repeat completed history. For scope additions only, use mode=extendScope with summary explaining why and mutationManifest containing additions; Session preserves the approved phases and verification; Todo stays independent. If the task needs a rewritten Plan, omit mode, retain existing stepIds and submit title, summary, steps and the full effective manifest. Scope expansion and Plan rewrites take effect only after user confirmation. fs.edit/fs.write/document.render/browser.capture share file or explicit directoryTree scope; deletion is separate. When creating a module, propose its specific directoryTree scope upfront so new implementation files within that approved directory need no extra confirmation; list unrelated root files separately. Bash command is an optional example, not an exact script lock. Routine fixes within confirmed scope need no reconfirmation. Titles use inline Markdown; other text uses Markdown.',
       inputSchema: structuredClone(PLAN_SCHEMA) as JsonObject,
     },
     {
       name: SESSION_CONTROL_TODO_UPDATE,
-      description: 'Replace the complete ordered task list. Report pending, inProgress, completed or blocked work; an empty list clears it. No Plan, record IDs or user approval needed. Progress does not grant permissions or certify tool results. At most one update per turn; ordinary calls may accompany it.',
+      description: 'Replace the complete ordered task list when progress meaningfully changes. Keep phases few and meaningful, merging similar work; choose the count to fit the task and revise the list as needed. Report pending, inProgress, completed or blocked work; an empty list clears it. No Plan, record IDs or approval needed; unfinished items do not prevent answering. At most one update per turn; ordinary calls may accompany it.',
       inputSchema: {
         type: 'object', additionalProperties: false, required: ['items'],
         properties: { items: { type: 'array', items: {
