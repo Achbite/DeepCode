@@ -5,7 +5,6 @@ import type {
   JsonObject,
   LocalAgentError,
   ModelInteractionRequest,
-  ModelMessage,
   NewSessionEvent,
   PlanAuthority,
   ProviderTokenUsage,

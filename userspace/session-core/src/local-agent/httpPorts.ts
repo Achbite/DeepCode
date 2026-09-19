@@ -61,11 +61,22 @@ class LocalAgentHttpPort {
   readonly apiBase: string;
   readonly serviceToken: string;
   readonly fetchImpl: typeof fetch;
+  readonly #streamFetch?: typeof fetch;
 
   constructor(options: HttpPortOptions) {
     this.apiBase = options.apiBase.replace(/\/+$/u, '');
     this.serviceToken = options.serviceToken;
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.#streamFetch = options.fetchImpl;
+  }
+
+  protected postStream(path: string, value: unknown, signal: AbortSignal): Promise<Response> {
+    const url = `${this.apiBase}${path}`;
+    const headers = { 'x-deepcode-session-service-token': this.serviceToken, 'content-type': 'application/json' };
+    const body = JSON.stringify(value);
+    return this.#streamFetch
+      ? this.#streamFetch(url, { method: 'POST', headers, body, signal })
+      : postLocalStream(url, headers, body, signal);
   }
 
   async json<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -168,21 +179,9 @@ export class HttpCommandJournal extends LocalAgentHttpPort implements CommandJou
 }
 
 export class HttpKernelPort extends LocalAgentHttpPort implements KernelPort {
-  readonly #streamFetch?: typeof fetch;
-
-  constructor(options: HttpPortOptions) {
-    super(options);
-    this.#streamFetch = options.fetchImpl;
-  }
-
   async execute(request: ToolExecutionRequest, onProgress?: (progress: ToolExecutionProgress) => Promise<void>): Promise<ToolExecutionReply> {
-    const url = `${this.apiBase}/api/local-agent/kernel/execute`;
-    const headers = { 'x-deepcode-session-service-token': this.serviceToken, 'content-type': 'application/json' };
-    const body = JSON.stringify(request);
     const controller = new AbortController();
-    const response = this.#streamFetch
-      ? await this.#streamFetch(url, { method: 'POST', headers, body, signal: controller.signal })
-      : await postLocalStream(url, headers, body, controller.signal);
+    const response = await this.postStream('/api/local-agent/kernel/execute', request, controller.signal);
     if (!response.ok || !response.headers.get('content-type')?.includes('application/x-ndjson')) {
       const envelope = await response.json() as { error?: string; message?: string };
       throw new Error(`${envelope.error ?? 'kernel_execution_http_failed'}:${envelope.message ?? response.status}`);
@@ -302,27 +301,12 @@ function decodePreparedToolDescriptors(value: unknown): readonly PreparedToolDes
 }
 
 export class HttpProviderPort extends LocalAgentHttpPort implements ProviderPort {
-  readonly #streamFetch?: typeof fetch;
-
-  constructor(options: HttpPortOptions) {
-    super(options);
-    this.#streamFetch = options.fetchImpl;
-  }
-
   async *stream(
     request: ProviderRequest,
     signal: AbortSignal,
   ): AsyncIterable<ProviderEvent> {
-    const url = `${this.apiBase}/api/local-agent/provider/stream`;
-    const headers = {
-      'content-type': 'application/json',
-      'x-deepcode-session-service-token': this.serviceToken,
-    };
     try {
-      const body = JSON.stringify(request);
-      const response = this.#streamFetch
-        ? await this.#streamFetch(url, { method: 'POST', headers, body, signal })
-        : await postLocalStream(url, headers, body, signal);
+      const response = await this.postStream('/api/local-agent/provider/stream', request, signal);
       if (!response.ok || !response.body) {
         await response.body?.cancel();
         throw new Error(`provider_http_failed:${response.status}`);

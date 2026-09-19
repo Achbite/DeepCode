@@ -67,18 +67,8 @@ export const SETTING_CATALOG: readonly SettingCatalogEntry[] = Object.freeze(
   })),
 );
 
-export function settingCatalogIndex(): readonly SettingCatalogEntry[] {
-  return SETTING_CATALOG;
-}
-
 export function agentSettingsIndex(): readonly SettingCatalogEntry[] {
   return SETTING_CATALOG.filter((entry) => entry.key.startsWith(SHARED_AGENT_PREFIX));
-}
-
-export function pluginSettingsIndex(): readonly SettingCatalogEntry[] {
-  return SETTING_CATALOG.filter((entry) =>
-    PLUGIN_SETTING_PREFIXES.some((prefix) => entry.key.startsWith(prefix)),
-  );
 }
 
 export function shellPreferenceSettingsIndex(

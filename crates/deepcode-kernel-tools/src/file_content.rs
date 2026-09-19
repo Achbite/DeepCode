@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
@@ -33,16 +32,6 @@ pub struct FileContentSkip {
     pub reason: String,
     pub message: String,
     pub classification: Box<FileContentClassification>,
-}
-
-impl FileContentSkip {
-    pub fn to_json(&self) -> Value {
-        serde_json::json!({
-            "reason": self.reason,
-            "message": self.message,
-            "classification": &self.classification
-        })
-    }
 }
 
 pub fn read_text_file_for_llm(path: &Path) -> Result<SafeTextFile, FileContentSkip> {

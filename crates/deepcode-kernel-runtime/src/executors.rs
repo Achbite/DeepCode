@@ -221,10 +221,6 @@ impl KernelExecutorRegistry {
         }
         executor.invoke(invocation, context)
     }
-
-    pub fn tool_ids(&self) -> impl Iterator<Item = &'static str> + '_ {
-        self.executors.keys().copied()
-    }
 }
 
 pub fn builtin_executors(
@@ -232,7 +228,7 @@ pub fn builtin_executors(
     config: KernelExecutorConfig,
     secret_provider: Arc<dyn SecretProvider>,
 ) -> Vec<(&'static str, Box<dyn KernelToolExecutor>)> {
-    let executors = registry
+    registry
         .executor_bindings()
         .map(|(tool_id, binding)| {
             if let Some(wsl) = config
@@ -254,8 +250,7 @@ pub fn builtin_executors(
                 executor_for_binding(binding, config.clone(), Arc::clone(&secret_provider)),
             )
         })
-        .collect::<Vec<_>>();
-    executors
+        .collect()
 }
 
 pub fn web_search_availability(config: &KernelExecutorConfig) -> ToolAvailability {

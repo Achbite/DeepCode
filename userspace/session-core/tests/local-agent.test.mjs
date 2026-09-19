@@ -1382,73 +1382,26 @@ test('filesystem references reach Provider as logical metadata without embedded 
   await actor.dispose();
 });
 
-test('the current RunRuntimeSnapshot contract rejects missing Provider aliases explicitly', async () => {
-  const journal = new InMemoryCommandJournal();
-  const sessionId = 'session:alias-contract';
-  const runId = 'run:alias-contract';
-  await createSession(journal, sessionId, [workspaceBinding]);
-  const runtime = runtimeSnapshot(runId);
-  delete runtime.providerToolAliases;
-  await journal.append({
-    type: 'message.committed',
-    sessionId,
-    payload: {
-      messageId: 'message:alias-contract',
-      role: 'user',
-      content: 'Verify the current runtime snapshot contract.',
-    },
+for (const [field, label, identity, error] of [
+  ['providerToolAliases', 'Provider aliases', 'alias-contract', /run_runtime_provider_tool_aliases_missing/u],
+  ['toolPromptContributions', 'tool prompt contributions', 'tool-prompt-contract', /run_runtime_tool_prompt_contributions_missing/u],
+]) {
+  test(`the current RunRuntimeSnapshot contract rejects missing ${label} explicitly`, async () => {
+    const journal = new InMemoryCommandJournal();
+    const sessionId = `session:${identity}`, runId = `run:${identity}`, messageId = `message:${identity}`;
+    await createSession(journal, sessionId, [workspaceBinding]);
+    const runtime = runtimeSnapshot(runId);
+    delete runtime[field];
+    await journal.append({ type: 'message.committed', sessionId, payload: {
+      messageId, role: 'user', content: 'Verify the current runtime snapshot contract.',
+    } });
+    await journal.append({ type: 'run.started', sessionId, runId, payload: {
+      inputMessageId: messageId, workspaceBindings: [workspaceBinding], runtimeSnapshot: runtime,
+    } });
+    const events = await readEvents(journal, sessionId);
+    assert.throws(() => loopSnapshot(sessionId, events), error);
   });
-  await journal.append({
-    type: 'run.started',
-    sessionId,
-    runId,
-    payload: {
-      inputMessageId: 'message:alias-contract',
-      workspaceBindings: [workspaceBinding],
-      runtimeSnapshot: runtime,
-    },
-  });
-
-  const events = await readEvents(journal, sessionId);
-  assert.throws(
-    () => loopSnapshot(sessionId, events),
-    /run_runtime_provider_tool_aliases_missing/u,
-  );
-});
-
-test('the current RunRuntimeSnapshot contract rejects missing tool prompt contributions explicitly', async () => {
-  const journal = new InMemoryCommandJournal();
-  const sessionId = 'session:tool-prompt-contract';
-  const runId = 'run:tool-prompt-contract';
-  await createSession(journal, sessionId, [workspaceBinding]);
-  const runtime = runtimeSnapshot(runId);
-  delete runtime.toolPromptContributions;
-  await journal.append({
-    type: 'message.committed',
-    sessionId,
-    payload: {
-      messageId: 'message:tool-prompt-contract',
-      role: 'user',
-      content: 'Verify the current runtime snapshot contract.',
-    },
-  });
-  await journal.append({
-    type: 'run.started',
-    sessionId,
-    runId,
-    payload: {
-      inputMessageId: 'message:tool-prompt-contract',
-      workspaceBindings: [workspaceBinding],
-      runtimeSnapshot: runtime,
-    },
-  });
-
-  const events = await readEvents(journal, sessionId);
-  assert.throws(
-    () => loopSnapshot(sessionId, events),
-    /run_runtime_tool_prompt_contributions_missing/u,
-  );
-});
+}
 
 test('tool prompt preparation binds exact callable tools and rejects invalid ownership', () => {
   const readTool = {

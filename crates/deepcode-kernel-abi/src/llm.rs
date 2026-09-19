@@ -33,24 +33,3 @@ impl fmt::Display for LlmProviderDiagnostic {
         write!(formatter, "{}: {}", self.reason, self.message)
     }
 }
-
-impl LlmProviderDiagnostic {
-    pub fn archive_text(&self) -> String {
-        format!(
-            "{}:\n  provider = {}\n  status = {}\n  content_type = {}\n  is_stream = {}\n  body_preview = {}\n  expected_schema = {}",
-            self.reason,
-            self.provider,
-            self.status
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
-            self.content_type,
-            self.is_stream,
-            if self.body_preview.is_empty() {
-                "<empty>"
-            } else {
-                self.body_preview.as_str()
-            },
-            self.expected_schema
-        )
-    }
-}
