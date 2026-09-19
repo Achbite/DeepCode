@@ -3,14 +3,14 @@ import type { LlmReasoningEffort, LlmThinkingMode } from './llm.js';
 export const LOCAL_AGENT_PROTOCOL_VERSION = 'deepcode.local-agent' as const;
 export const CONVERSATION_COMMAND_VERSION = 'deepcode.command.v3' as const;
 export const COMMAND_REPLY_VERSION = 'deepcode.command-reply.v3' as const;
-export const SESSION_EVENT_VERSION = 'deepcode.session-event.v4' as const;
-export const SESSION_PROJECTION_VERSION = 'deepcode.session-projection.v5' as const;
+export const SESSION_EVENT_VERSION = 'deepcode.session-event.v5' as const;
+export const SESSION_PROJECTION_VERSION = 'deepcode.session-projection.v6' as const;
 export const PROVIDER_EVENT_VERSION = 'deepcode.provider-event' as const;
 export const KERNEL_REQUEST_VERSION = 'deepcode.kernel-request' as const;
 export const KERNEL_REPLY_VERSION = 'deepcode.kernel-reply' as const;
 export const SESSION_CONTROL_INTERACTION_REQUEST = 'interaction.request' as const;
 export const SESSION_CONTROL_PLAN_PUBLISH = 'plan.publish' as const;
-export const SESSION_CONTROL_PLAN_PROGRESS = 'plan.progress' as const;
+export const SESSION_CONTROL_TODO_UPDATE = 'todo.update' as const;
 export const SESSION_CONTROL_PLUGIN_ACTIVATE = 'plugin.activate' as const;
 
 export type JsonObject = Record<string, unknown>;
@@ -200,12 +200,10 @@ export type PlanOperation =
   | {
       workspaceId: string;
       operation: 'bash' | 'powershell';
-      /** Representative project entrypoint, for review; authorization uses the declared scope. */
+      /** Representative project entrypoint, for review; Kernel applies configured Shell permissions. */
       command?: string;
-      workspaceMode: 'write';
-      executionScope: 'workspace' | 'host';
-      /** Required for workspace execution. Source paths and build output directories. */
-      writablePaths?: Array<{ path: string; kind: 'file' | 'directory' }>;
+      /** Source paths and output directories this operation may modify. */
+      writablePaths: Array<{ path: string; kind: 'file' | 'directory' }>;
       terminal?: { stdin: string };
     };
 
@@ -377,6 +375,7 @@ export type ProviderOutputBlock = {
       kind: 'toolCallRejected';
       callId: string;
       providerCallId: string;
+      /** Canonical name, or the original wire name when the tool is undeclared. */
       toolName: string;
       error: LocalAgentError & { issues: ToolInputIssue[] };
     }
@@ -392,6 +391,7 @@ export type ProviderOutputBlock = {
 export interface ProviderToolCallInput {
   callId: string;
   providerCallId: string;
+  /** Canonical name, or the original wire name for provider_tool_alias_unknown. */
   toolName: string;
   arguments: string;
   error?: LocalAgentError & { issues: ToolInputIssue[] };
@@ -549,7 +549,7 @@ export interface ContextCompositionPartitionProjection
   tokenSource?: 'sessionEstimated';
 }
 
-export type ProviderResponseConstraint = 'normal' | 'toolRequired' | 'answerOnly';
+export type ProviderResponseConstraint = 'normal' | 'answerOnly';
 
 export interface ContextCompositionReceipt {
   kernelCatalogSnapshotRef?: string;
@@ -581,26 +581,20 @@ export interface ContextCompositionProjection extends ContextCompositionProjecti
   partitions: ContextCompositionPartitionProjection[];
 }
 
-export type TodoStatus = 'pending' | 'inProgress' | 'completed';
+export type TodoStatus = 'pending' | 'inProgress' | 'completed' | 'blocked';
 
+/** Agent-reported progress, independent of execution evidence and permission approval. */
 export interface TodoItem {
-  todoId: string;
-  sourceStepId: string;
-  label: string;
+  text: string;
   status: TodoStatus;
 }
 
 export interface TodoListProjection {
-  sourcePlanId: string;
-  sourcePlanRevision: number;
+  runId: string;
+  revision: number;
   items: TodoItem[];
   sequence: number;
   updatedAt: string;
-}
-
-export interface TodoProgressUpdate {
-  todoId: string;
-  status: TodoStatus;
 }
 
 export type ContextCompactionTrigger = 'pressure' | 'userFocus';
@@ -788,34 +782,18 @@ export type SessionEvent =
       payload: { planId: string; revision: number; commandId: string };
     })
   | (SessionEventBase & {
-      type: 'plan.completed';
-      runId: string;
-      payload: { planId: string; revision: number };
-    })
-  | (SessionEventBase & {
       type: 'plan.invalidated';
       runId: string;
       payload: { planId: string; revision: number; reason: string; sourceFactRef: string };
     })
   | (SessionEventBase & {
-      type: 'todo.seeded' | 'todo.reconciled';
-      runId: string;
-      payload: {
-        sourcePlanId: string;
-        sourcePlanRevision: number;
-        items: TodoItem[];
-      };
-    })
-  | (SessionEventBase & {
-      type: 'todo.progressed';
+      type: 'todo.updated';
       runId: string;
       callId?: string;
       payload: {
         providerCallId?: string;
-        sourcePlanId: string;
-        sourcePlanRevision: number;
-        sourceFactRef: string;
-        updates: TodoProgressUpdate[];
+        revision: number;
+        items: TodoItem[];
       };
     })
   | (SessionEventBase & {
@@ -1091,7 +1069,6 @@ export type PlanProjectionStatus =
   | 'confirmed'
   | 'superseded'
   | 'cancelled'
-  | 'completed'
   | 'invalidated';
 
 export interface PlanProjection extends ExecutionPlan {

@@ -1,13 +1,17 @@
+#[path = "../../shared/conversation_input.rs"]
+mod conversation_input;
+// CLI retains its existing Chinese messages; TUI also uses the shared locale loader.
+#[allow(dead_code)]
+#[path = "../../shared/i18n.rs"]
+mod i18n;
 mod model_services;
 mod render;
 
 use deepcode_kernel_client::{
-    approval_response_command, cancel_command, focus_command, interaction_response_command,
-    is_terminal_run_status, message_command_with_profile_and_plugins, plan_cancel_command,
-    plan_confirm_command, plan_revision_command, CreateConversationSessionRequest,
-    FilesystemReference, FilesystemReferencePathInput, HttpKernelClient, InteractionProjection,
-    KernelBootstrap, KernelBootstrapOptions, PluginCatalogItem, PluginCatalogProjection,
-    PluginSelectionInput, SessionProjection,
+    cancel_command, is_terminal_run_status, plan_cancel_command, CreateConversationSessionRequest,
+    FilesystemReference, FilesystemReferencePathInput, HttpKernelClient, KernelBootstrap,
+    KernelBootstrapOptions, PluginCatalogItem, PluginCatalogProjection, PluginSelectionInput,
+    SessionProjection,
 };
 use render::{
     render_action_required_if_any, render_projection, render_run_state, render_terminal_error,
@@ -745,132 +749,16 @@ fn contextual_input_command(
     filesystem_references: &[FilesystemReference],
     plugin_binding: Option<&PluginBinding>,
 ) -> Result<serde_json::Value, String> {
-    let original_text = text;
-    let text = text.trim();
-    if text.is_empty() {
-        return Err("输入不能为空。".to_string());
-    }
-    if text == "/reply" || text.starts_with("/reply ") {
-        let response = text.strip_prefix("/reply").unwrap().trim();
-        if response.is_empty() {
-            return Err("用法：/reply <答复、确认或修订说明>".to_string());
-        }
-        if plugin_binding.is_some_and(|binding| !binding.selections.is_empty())
-            || !filesystem_references.is_empty()
-        {
-            return Err("插件和文件系统引用不能用于已有 run 的决策回应。".to_string());
-        }
-        if let Some(approval) = projection.pending_approval.as_ref() {
-            let decision = approval_decision_for_input(response)?;
-            if decision == "allow-run"
-                && approval.preview.authorization_scope.as_deref() != Some("runHostShell")
-            {
-                return Err("当前操作未提供本轮宿主 Shell 授权。".into());
-            }
-            return Ok(approval_response_command(
-                &projection.session_id,
-                &new_id("command"),
-                approval,
-                decision,
-            ));
-        }
-        if let Some(plan) = projection.pending_plan.as_ref() {
-            if is_plan_confirmation_input(response) {
-                return Ok(plan_confirm_command(
-                    &projection.session_id,
-                    &new_id("command"),
-                    plan,
-                ));
-            }
-            return Ok(plan_revision_command(
-                &projection.session_id,
-                &new_id("command"),
-                plan,
-                response,
-            ));
-        }
-        if let Some(interaction) = projection.pending_interaction.as_ref() {
-            let response = interaction_response_for_input(interaction, response);
-            return Ok(interaction_response_command(
-                &projection.session_id,
-                &new_id("command"),
-                interaction,
-                &response,
-            ));
-        }
-        return Err("当前没有等待答复的 Plan、交互或 effect 审批。".to_string());
-    }
-    let profile_id = if projection
-        .run
-        .as_ref()
-        .is_some_and(|run| matches!(run.status.as_str(), "running" | "waiting"))
-    {
-        None
-    } else {
-        profile_id
-    };
-    let empty = PluginBinding {
-        catalog_revision: String::new(),
-        selections: Vec::new(),
-    };
-    let plugins = plugin_binding.unwrap_or(&empty);
-    if let Some(task) = text.strip_prefix("/focus") {
-        if !task.is_empty() && !task.chars().next().is_some_and(char::is_whitespace) {
-            return Err("未知命令；/focus 后必须以空格分隔任务正文。".to_string());
-        }
-        let task = task.trim();
-        if task.is_empty() {
-            return Err("/focus 需要非空任务正文。".to_string());
-        }
-        return Ok(focus_command(
-            &projection.session_id,
-            &new_id("command"),
-            task,
-            profile_id,
-            filesystem_references,
-            &plugins.catalog_revision,
-            &plugins.selections,
-        ));
-    }
-    if text.starts_with('/') {
-        return Err(format!("未知命令：{text}"));
-    }
-    let mut command = message_command_with_profile_and_plugins(
-        &projection.session_id,
+    conversation_input::contextual_input_command(
+        i18n::Language::ZhCn,
+        projection,
+        text,
         &new_id("command"),
-        original_text,
         profile_id,
         filesystem_references,
-        &plugins.catalog_revision,
-        &plugins.selections,
-    );
-    if let Some(run) = projection
-        .run
-        .as_ref()
-        .filter(|run| matches!(run.status.as_str(), "running" | "waiting"))
-    {
-        command["runId"] = json!(run.run_id);
-    }
-    Ok(command)
-}
-
-fn approval_decision_for_input(input: &str) -> Result<&'static str, String> {
-    match input.trim().to_lowercase().as_str() {
-        "1" | "allow" | "允许" | "同意" => Ok("allow"),
-        "2" | "deny" | "拒绝" | "不同意" => Ok("deny"),
-        "3" | "allow-run" | "允许本轮" => Ok("allow-run"),
-        _ => Err("当前等待 effect 裁决：输入 /reply 1（允许）或 /reply 2（拒绝）。".to_string()),
-    }
-}
-
-fn interaction_response_for_input(interaction: &InteractionProjection, input: &str) -> String {
-    input
-        .parse::<usize>()
-        .ok()
-        .and_then(|index| index.checked_sub(1))
-        .and_then(|index| interaction.options.as_ref()?.get(index))
-        .map(|option| option.label.clone())
-        .unwrap_or_else(|| input.to_string())
+        plugin_binding.map_or("", |binding| binding.catalog_revision.as_str()),
+        plugin_binding.map_or(&[], |binding| binding.selections.as_slice()),
+    )
 }
 
 async fn submit_checked(
@@ -1276,13 +1164,6 @@ async fn refresh_projection(
         .conversation_projection(session_id)
         .await
         .map_err(|error| error.to_string())
-}
-
-fn is_plan_confirmation_input(input: &str) -> bool {
-    matches!(
-        input.trim().to_ascii_lowercase().as_str(),
-        "1" | "y" | "yes" | "confirm"
-    ) || matches!(input.trim(), "确认" | "同意")
 }
 
 fn outcome_for_projection(projection: &SessionProjection) -> Option<Outcome> {

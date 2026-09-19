@@ -222,14 +222,13 @@ export function cancelNotFound(callId, attemptId) {
   };
 }
 
-export function* planProgressEvents(request, status = 'completed', native = false) {
-  const tool = request.tools.find((candidate) => candidate.inputSchema?.properties?.sourceFactRef);
+export function* todoUpdateEvents(request, status = 'completed', native = false) {
+  const tool = request.tools.find((candidate) => candidate.inputSchema?.properties?.items);
   const payloads = request.messages.map(jsonMessagePayload);
   const todo = payloads.findLast((payload) => payload?.type === 'todo.current');
-  const record = payloads.findLast((payload) => payload?.recordId);
-  assert.ok(tool && todo && record, 'progress requires the control, current Todo and real tool result');
+  assert.ok(tool && todo, 'progress uses the control and current Todo without execution evidence');
   const callId = `provider-call:progress:${request.requestId}`;
-  const input = { sourceFactRef: record.recordId, updates: todo.items.map((item) => ({ todoId: item.todoId, status })) };
+  const input = { items: todo.items.map((item) => ({ text: item.text, status })) };
   yield native
     ? providerEvent(request.requestId, 'output.item.completed', { outputIndex: 0,
       item: { type: 'function_call', call_id: callId, name: tool.name, arguments: JSON.stringify(input), status: 'completed' } })

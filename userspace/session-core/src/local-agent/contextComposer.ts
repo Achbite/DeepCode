@@ -16,7 +16,7 @@ import {
   LOCAL_AGENT_PROTOCOL_VERSION,
   SESSION_CONTROL_INTERACTION_REQUEST,
   SESSION_CONTROL_PLAN_PUBLISH,
-  SESSION_CONTROL_PLAN_PROGRESS,
+  SESSION_CONTROL_TODO_UPDATE,
   SESSION_CONTROL_PLUGIN_ACTIVATE,
 } from '@deepcode/protocol';
 import { LoopFailure } from './loopFailure.js';
@@ -54,7 +54,7 @@ export async function buildAgentProviderRequest(input: {
   runId: string;
   runtime: RunRuntimeSnapshot;
   events: readonly SessionEvent[];
-  responseConstraint: 'normal' | 'toolRequired';
+  responseConstraint: 'normal';
   workspaceBindings: readonly WorkspaceBindingDisplay[];
   providerRequestId: string;
 }): Promise<PreparedProviderRequest> {
@@ -73,7 +73,7 @@ export async function buildAgentProviderRequest(input: {
   const controlNames = {
     interactionRequest: providerWireName(input.runtime, SESSION_CONTROL_INTERACTION_REQUEST),
     planPublish: providerWireName(input.runtime, SESSION_CONTROL_PLAN_PUBLISH),
-    planProgress: providerWireName(input.runtime, SESSION_CONTROL_PLAN_PROGRESS),
+    todoUpdate: providerWireName(input.runtime, SESSION_CONTROL_TODO_UPDATE),
     pluginActivate: providerWireName(input.runtime, SESSION_CONTROL_PLUGIN_ACTIVATE),
   };
   const runtimeTools = hasWorkspaceBindings
@@ -205,6 +205,9 @@ export function messagesFromJournal(
 ): ContextMessageContribution[] {
   const messages: ContextMessageContribution[] = [];
   const completionResults = new Map<string, ContextMessageContribution>();
+  const approvalsByCallId = new Map(events.flatMap((event) => (
+    event.type === 'approval.resolved' ? [[event.callId, event.payload] as const] : []
+  )));
   const completedTurns = new Map(events.filter(isCompletedProviderTurn).map((event) => [event.payload.providerRequestId, event]));
   const orderedProviderTurns = new Map(events.flatMap((event) => (
     event.type === 'provider.turn.settled'
@@ -406,19 +409,17 @@ export function messagesFromJournal(
         },
       });
     } else if (
-      event.type === 'todo.seeded'
-      || event.type === 'todo.reconciled'
-      || event.type === 'todo.progressed'
+      event.type === 'todo.updated'
     ) {
-      if (event.type === 'todo.progressed' && event.callId && event.payload.providerCallId) {
+      if (event.type === 'todo.updated' && event.callId && event.payload.providerCallId) {
         if (!orderedProviderCallIds.has(event.callId)) attachToolCall(messages, {
           callId: event.callId, providerCallId: event.payload.providerCallId,
-          name: SESSION_CONTROL_PLAN_PROGRESS,
-          input: { sourceFactRef: event.payload.sourceFactRef, updates: event.payload.updates },
+          name: SESSION_CONTROL_TODO_UPDATE,
+          input: { items: event.payload.items },
         });
         completionResults.set(event.callId, {
-          contributionId: `plan-progress:${event.callId}`,
-          contributionKind: 'journalMessages', label: 'Plan progress result',
+          contributionId: `todo-update:${event.callId}`,
+          contributionKind: 'journalMessages', label: 'Todo update result',
           message: {
             role: 'tool', toolCallId: event.callId, providerCallId: event.payload.providerCallId,
             content: JSON.stringify({ accepted: true, type: 'todo.current', ...todoList }),
@@ -434,21 +435,9 @@ export function messagesFromJournal(
           role: 'user',
           content: JSON.stringify({
             type: 'todo.current',
-            sourcePlanId: todoList.sourcePlanId,
-            sourcePlanRevision: todoList.sourcePlanRevision,
+            runId: todoList.runId,
+            revision: todoList.revision,
             items: todoList.items,
-          }),
-        },
-      });
-    } else if (event.type === 'plan.completed') {
-      messages.push({
-        contributionId: `plan-completed:${event.eventId}`,
-        contributionKind: 'journalMessages', label: 'Plan phase completed',
-        message: {
-          role: 'user',
-          content: JSON.stringify({
-            type: 'plan.completed', ...event.payload,
-            nextAction: 'All current Todo steps are completed. Plan progress is closed. Provide the final explanation; publish a complete revision only if new scope is required.',
           }),
         },
       });
@@ -460,7 +449,7 @@ export function messagesFromJournal(
       completionResults.set(event.callId, {
         contributionId: `plugin-activation:${event.callId}`, contributionKind: 'journalMessages', label: '插件已加载',
         message: { role: 'tool', toolCallId: event.callId, providerCallId: event.payload.providerCallId,
-          content: JSON.stringify({ activated: event.payload.pluginUris }) },
+          content: JSON.stringify({ activated: event.payload.pluginUris, scope: 'run', runId: event.runId }) },
       });
     } else if (event.type === 'session.control.rejected') {
       if (!orderedProviderCallIds.has(event.callId)) {
@@ -515,6 +504,7 @@ export function messagesFromJournal(
         },
       });
     } else if (event.type === 'tool.completed') {
+      const approval = approvalsByCallId.get(event.callId);
       messages.push({
         contributionId: `tool-result:${event.callId}`,
         contributionKind: 'journalMessages',
@@ -523,7 +513,10 @@ export function messagesFromJournal(
           role: 'tool',
           toolCallId: event.callId,
           providerCallId: requiredProviderCallId(providerCallIdByLogicalCallId, event.callId),
-          content: JSON.stringify(toolResultForModel(event.payload.record)),
+          content: JSON.stringify({
+            ...toolResultForModel(event.payload.record),
+            ...(approval ? { approval: { decision: approval.decision, scope: approval.authorizationScope ?? 'call' } } : {}),
+          }),
           toolImages: toolImagesForModel(event.payload.record),
         },
       });
@@ -758,7 +751,7 @@ export function cloneModelMessage(message: ModelMessage): ModelMessage {
 function providerCallIdsFromEvents(events: readonly SessionEvent[]): Map<string, string> {
   const byLogicalCallId = new Map<string, string>();
   for (const event of events) {
-    if (event.type === 'todo.progressed' && event.callId && event.payload.providerCallId) {
+    if (event.type === 'todo.updated' && event.callId && event.payload.providerCallId) {
       byLogicalCallId.set(event.callId, event.payload.providerCallId);
       continue;
     }
@@ -1080,7 +1073,7 @@ function messageContentForModel(
       binding.workspaceId,
       index === 0 ? 'primary' : `workspace${index + 1}`,
     ]));
-    sections.push(`Filesystem references attached to this message. PNG, JPEG, WebP and GIF attachments are included as image inputs in this user message; inspect their visual content directly. Other file contents require the relevant read tool. Input snapshots are read-only. The listed DeepCode-managed session working directory can hold editable copies and preview drafts across turns, until the session is deleted:\n${JSON.stringify(
+    sections.push(`Filesystem references attached to this message. PNG, JPEG, WebP and GIF attachments are included as image inputs in this user message; inspect their visual content directly. Other file contents require the relevant read tool. Input snapshots are read-only. Use the listed DeepCode-managed session working directory for editable copies and preview drafts; they persist across turns until the session is deleted:\n${JSON.stringify(
       payload.filesystemReferences.map((reference) => ({
         referenceId: reference.referenceId,
         workspace: workspaceHandleById.get(reference.workspaceId) ?? 'unavailable',

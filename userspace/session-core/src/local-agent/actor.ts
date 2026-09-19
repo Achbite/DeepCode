@@ -3,7 +3,7 @@ import { failureSnapshotEvent } from './failureSnapshot.js';
 import { errorFact } from './loopFailure.js';
 import { LiveReasoning } from './reasoningRead.js';
 import { LiveToolOutput } from './liveToolOutput.js';
-import { todoItemsForPlan } from './planStage.js';
+import { todoUpdateFact } from './todoState.js';
 import { savedSessionEnvironment } from './sessionEnvironment.js';
 import type {
   AssistantDraftProjection,
@@ -746,23 +746,11 @@ export class SessionActor {
           authorities,
         },
       });
-      const previousTodo = snapshot.state.todoList;
-      const previousPlan = previousTodo && snapshot.state.plans.find((candidate) => (
-        candidate.planId === previousTodo.sourcePlanId && candidate.revision === previousTodo.sourcePlanRevision
-      ));
-      const todoItems = todoItemsForPlan(plan, previousTodo, previousPlan ?? undefined, this.#nextId);
-      events.push({
-        type: snapshot.state.todoList?.sourcePlanId === plan.planId
-          ? 'todo.reconciled'
-          : 'todo.seeded',
-        sessionId: this.sessionId,
-        runId: command.runId,
-        payload: {
-          sourcePlanId: plan.planId,
-          sourcePlanRevision: plan.revision,
-          items: todoItems,
-        },
-      });
+      // Confirmation may initialize this run's list, but never rewrites an existing Todo.
+      if (snapshot.state.todoList?.runId !== command.runId) {
+        events.push(todoUpdateFact(this.sessionId, command.runId, snapshot.state.todoList,
+          plan.steps.map(step => ({ text: step.title, status: 'pending' }))));
+      }
     } else if (command.response.kind === 'requestRevision') {
       const messageId = this.#nextId('message');
       events.push({

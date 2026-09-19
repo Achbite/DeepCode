@@ -103,12 +103,12 @@ class ProviderState:
             "fs.read 优先于 shell 文本读取的 guidance 缺失",
         )
         fixture.require(
-            f"- {tools_by_name['bash']['wireName']}: Execute a bounded Bash command in the selected target."
+            f"- {tools_by_name['bash']['wireName']}: Run a Bash script from the bound workspace root."
             in guidance,
             "bash prompt snippet 未进入 Provider 请求",
         )
         fixture.require(
-            "Do not use this as the default way to read a known UTF-8 workspace text file."
+            "Use fs.read for known UTF-8 workspace files."
             in guidance,
             "bash 与 fs.read 的职责边界 guidance 缺失",
         )
@@ -125,18 +125,14 @@ class ProviderState:
         fixture.require("filesystem or Bash tools" not in joined, "附件文本仍在指示 Bash 读取")
         mcp_server_id = "fixture-old" if ordinal <= 2 else "fixture-new"
         reverse_tool = tools_by_name.get(f"mcp.{mcp_server_id}.text.reverse")
-        if ordinal == 2:
-            fixture.require(not any(name.startswith("mcp.") for name in tools_by_name),
-                "目录移除旧 MCP 后，下一请求仍暴露旧插件或自动加载未选择的新插件")
-        else:
-            fixture.require(isinstance(reverse_tool, dict),
-                f"Provider 请求 {ordinal} 缺少当前代次的 MCP reverse 工具：{mcp_server_id}；实际工具：{sorted(tools_by_name)}")
-            fixture.require(
-                reverse_tool.get("origin") == "extension"
-                and reverse_tool.get("pluginUri") == f"plugin://{mcp_server_id}@mcp",
-                "MCP reverse 工具没有绑定当前代次的 plugin owner",
-            )
-            wire_name = reverse_tool["wireName"]
+        fixture.require(isinstance(reverse_tool, dict),
+            f"Provider 请求 {ordinal} 缺少 run 已绑定的 MCP reverse 工具：{mcp_server_id}")
+        fixture.require(
+            reverse_tool.get("origin") == "extension"
+            and reverse_tool.get("pluginUri") == f"plugin://{mcp_server_id}@mcp",
+            "MCP reverse 工具没有绑定当前 run 的 plugin owner",
+        )
+        wire_name = reverse_tool["wireName"]
         for name, plugin_uri in FIRST_PARTY_TOOL_OWNERS.items():
             tool = tools_by_name.get(name)
             fixture.require(
@@ -186,8 +182,11 @@ class ProviderState:
                 self._old_wire_name = wire_name
             self.first_request_started.set()
         elif ordinal == 2:
-            fixture.require(GENERATION_ONE not in joined, "下一请求仍使用已移除的旧 Skill")
-            fixture.require(GENERATION_TWO not in joined, "下一请求自动加载未选择的新 Skill")
+            fixture.require(GENERATION_ONE not in joined, "下一请求仍使用旧 Skill 内容")
+            fixture.require(GENERATION_TWO in joined, "已绑定 Skill 的源码更新没有在下一请求加载")
+            fixture.require(wire_name == self.old_wire_name(), "nextRun MCP 配置提前影响了当前 run")
+            settings = fixture.api_json(self._daemon.base_url, "/api/user-settings", token=self._daemon.token)
+            fixture.require(settings["runtimeSettings"]["agent.permissions.networkRead"] == "allow", "内容刷新激活了 nextRun 权限")
             fixture.require(
                 any("ahpla" in content for content in results.values()),
                 "第一轮 MCP ToolRecord 未进入 Provider continuation",
@@ -237,7 +236,7 @@ class ProviderState:
         return {
             "read": tools_by_name["fs.read"]["wireName"],
             **({"readWorkspace": attachment_workspace} if ordinal == 1 else {}),
-            **({"reverse": wire_name} if ordinal != 2 else {}),
+            "reverse": wire_name,
             "pdf": tools_by_name["pdf.read"]["wireName"],
             "search": tools_by_name["web.search"]["wireName"],
             "fetch": tools_by_name["web.fetch"]["wireName"],
@@ -1013,6 +1012,7 @@ def main() -> None:
             )
             provider_url = f"http://127.0.0.1:{provider_server.server_port}/v1"
             user_settings = {
+                "workbench.language": "en-US",
                 "agent.systemPrompt": "",
                 "agent.permissions.workspaceMutation": "plan",
                 "agent.permissions.engineeringDecisions": "ask",
@@ -1071,7 +1071,9 @@ def main() -> None:
             )
 
             skill_file.write_text(f"# Runtime fixture\n\n{GENERATION_TWO}\n", encoding="utf-8")
-            patch_plugins(daemon_one, old_plugins, new_plugins)
+            patch_plugins(daemon_one,
+                {**old_plugins, "agent.permissions.networkRead": "allow"},
+                {**new_plugins, "agent.permissions.networkRead": "deny"})
             provider.release_first_request.set()
             first = fixture.wait_completed(daemon_one, provider, session_id, "first run completed")
             cli_stdout, cli_stderr = cli_ask.communicate(timeout=18)
@@ -1092,6 +1094,9 @@ def main() -> None:
                 "共享 SessionProjection 的文件引用字段不精确",
             )
 
+            # The second run still exercises the existing real web tool coverage.
+            fixture.api_json(daemon_one.base_url, "/api/user-settings", token=daemon_one.token,
+                method="PATCH", body={"patches": {"agent.permissions.networkRead": "allow"}})
             input_path = f"/api/conversation/sessions/{urllib.parse.quote(session_id, safe='')}/input-resources/command-round-two"
             upload = urllib.request.Request(daemon_one.base_url + input_path, method="POST",
                 data=LONG_INPUT.encode("utf-8"), headers={fixture.HOST_TOKEN_HEADER: daemon_one.token, "content-type": "text/plain; charset=utf-8"})

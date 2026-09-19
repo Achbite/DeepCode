@@ -1,4 +1,4 @@
-export type UserSettingValue = string | number | boolean | null;
+export type UserSettingValue = string | number | boolean | null | string[];
 export type UserSettings = Record<string, UserSettingValue>;
 export type SettingsSurface = 'gui' | 'cli' | 'tui';
 
@@ -42,6 +42,7 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'agent.permissions.engineeringDecisions': 'ask',
   'agent.permissions.networkRead': 'allow',
   'agent.permissions.external': 'ask',
+  'agent.permissions.commandDenylist': ['rm -rf /'],
   'agent.web.search.endpointTemplate': '',
   'agent.web.search.authHeaderName': 'Authorization',
   'agent.web.search.authSecretRef': '',

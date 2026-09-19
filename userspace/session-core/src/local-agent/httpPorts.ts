@@ -33,7 +33,7 @@ import {
   LOCAL_AGENT_PROTOCOL_VERSION,
   SESSION_CONTROL_INTERACTION_REQUEST,
   SESSION_CONTROL_PLAN_PUBLISH,
-  SESSION_CONTROL_PLAN_PROGRESS,
+  SESSION_CONTROL_TODO_UPDATE,
   SESSION_CONTROL_PLUGIN_ACTIVATE,
 } from '@deepcode/protocol';
 import { createProviderToolAliases } from './providerToolCodec.js';
@@ -333,7 +333,8 @@ export class HttpProviderPort extends LocalAgentHttpPort implements ProviderPort
       }
       yield* decodeProviderEvents(response.body, request.requestId, signal, request.providerAttemptId);
     } catch (error) {
-      if (signal.aborted) throw signal.reason ?? error;
+      if (signal.aborted && (error === signal.reason
+        || error instanceof Error && error.name === 'AbortError' && error.cause === signal.reason)) throw signal.reason;
       if (error instanceof LoopFailure) throw error;
       const fact = errorFact(error);
       if (error instanceof AggregateError && error.errors[0] instanceof LoopFailure) throw new LoopFailure(fact.code, fact.message, fact.diagnostics);
@@ -444,7 +445,7 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
           ], pluginConfig, {
             interactionRequest: wireName(SESSION_CONTROL_INTERACTION_REQUEST),
             planPublish: wireName(SESSION_CONTROL_PLAN_PUBLISH),
-            planProgress: wireName(SESSION_CONTROL_PLAN_PROGRESS),
+            todoUpdate: wireName(SESSION_CONTROL_TODO_UPDATE),
             pluginActivate: wireName(SESSION_CONTROL_PLUGIN_ACTIVATE),
           })],
           tools,

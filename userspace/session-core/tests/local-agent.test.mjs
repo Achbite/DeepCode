@@ -21,11 +21,12 @@ import {
 } from '../dist/index.js';
 import { messagesFromJournal } from '../dist/local-agent/contextComposer.js';
 import { decodeSessionControlCall } from '../dist/local-agent/sessionControls.js';
-import { publishPlan, todoItemsForPlan } from '../dist/local-agent/planStage.js';
+import { publishPlan } from '../dist/local-agent/planStage.js';
 import { HttpProviderPort } from '../dist/local-agent/httpPorts.js';
 import { responseFrames } from '../dist/responseFrames.js';
 import { environmentInstruction } from '../dist/local-agent/sessionEnvironment.js';
 import { createProviderToolAliases } from '../dist/local-agent/providerToolCodec.js';
+import { LoopFailure } from '../dist/local-agent/loopFailure.js';
 
 test('editing a settled message replaces active history while retaining journal facts and attachments', async (t) => {
   const journal = new InMemoryCommandJournal();
@@ -360,7 +361,7 @@ import {
   completedExecutionReply,
   failedExecutionReply,
   indeterminateExecutionRecord,
-  planProgressEvents,
+  todoUpdateEvents,
   providerEvent,
   messageCommand,
   jsonMessagePayload,
@@ -1837,7 +1838,11 @@ test('explicit run approvals are journaled and only accepted for a Kernel candid
     let calls = 0;
     const actor = actorWith(journal, sessionId, { async *stream(request) {
       if (++calls === 1) yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:approval', name: request.tools.find((tool) => tool.inputSchema.properties?.url).name, input: { url: 'https://example.test' } });
-      else yield providerEvent(request.requestId, 'assistant.message', { messageId: 'message:done', content: 'Done.' });
+      else {
+        const result = request.messages.map(jsonMessagePayload).find((value) => value?.outcome === 'completed');
+        assert.deepEqual(result.approval, { decision: 'allow', scope: candidate ? 'runHostShell' : 'call' });
+        yield providerEvent(request.requestId, 'assistant.message', { messageId: 'message:done', content: 'Done.' });
+      }
       yield providerEvent(request.requestId, 'completed', {});
     } }, emptyKernel({ async execute(request) {
       if (!request.nonWorkspaceAuthority) return { schemaVersion: 'deepcode.kernel-reply', type: 'tool.execution', requestId: request.requestId, callId: request.callId, status: 'approvalRequired', approvalId: 'approval:run', preview };
@@ -1874,11 +1879,9 @@ test('read-only bash result projects its real write scope and continues the Loop
     inputSchema: {
       type: 'object',
       additionalProperties: false,
-      required: ['command', 'workspaceMode', 'executionScope'],
+      required: ['command'],
       properties: {
         command: { type: 'string' },
-        workspaceMode: { type: 'string', enum: ['read', 'write'] },
-        executionScope: { type: 'string', enum: ['workspace', 'host'] },
         timeout: { type: 'integer' },
       },
     },
@@ -1895,8 +1898,8 @@ test('read-only bash result projects its real write scope and continues the Loop
         workspaceId: workspaceBinding.workspaceId,
         command: request.input.command,
         cwd: '.',
-        workspaceMode: request.input.workspaceMode,
-        executionScope: request.input.executionScope,
+        workspaceMode: 'read',
+        executionScope: 'workspace',
         terminal: false,
         stdout: 'probe-ok',
         stderr: '',
@@ -1909,7 +1912,7 @@ test('read-only bash result projects its real write scope and continues the Loop
         environment: {
           shell: '/bin/bash',
           interactive: false,
-          executionScope: request.input.executionScope,
+          executionScope: 'workspace',
           terminal: false,
           pathSource: 'hostPlusStandardDeveloperPaths',
           writeScope: 'kernelTemporaryOnly',
@@ -1918,6 +1921,7 @@ test('read-only bash result projects its real write scope and continues the Loop
         },
       });
       reply.record.preparedEffect.logicalTargets = ['.'];
+      Object.assign(reply.record.preparedEffect.canonicalInvocation.arguments, { workspaceMode: 'read', executionScope: 'workspace' });
       reply.record.preparedEffect.processWorkspaceMode = 'read';
       reply.record.preparedEffect.processExecutionScope = 'workspace';
       return reply;
@@ -1929,7 +1933,7 @@ test('read-only bash result projects its real write scope and continues the Loop
       providerRequests.push(structuredClone(request));
       if (providerRequests.length === 1) {
         const definition = request.tools.find((candidate) => (
-          candidate.inputSchema?.properties?.workspaceMode !== undefined
+          candidate.inputSchema?.properties?.command !== undefined
         ));
         assert.ok(definition, 'bash must be exposed to the Provider');
         yield providerEvent(request.requestId, 'tool.call', {
@@ -1938,8 +1942,6 @@ test('read-only bash result projects its real write scope and continues the Loop
           input: {
             workspace: 'primary',
             command: "printf 'probe-ok'",
-            workspaceMode: 'read',
-            executionScope: 'workspace',
           },
         });
         yield providerEvent(request.requestId, 'completed', {});
@@ -1983,6 +1985,8 @@ test('read-only bash result projects its real write scope and continues the Loop
 
   assert.equal(providerRequests.length, 2);
   assert.equal(kernelRequests.length, 1);
+  assert.equal('workspaceMode' in kernelRequests[0].input, false);
+  assert.equal('executionScope' in kernelRequests[0].input, false);
   const shellActivity = projection.activities.find((activity) => (
     activity.callId === kernelRequests[0].callId
   ));
@@ -2006,8 +2010,8 @@ for (const output of [null, { stage: 'execution', details: { toolId: toolName } 
     await createSession(journal, sessionId, [workspaceBinding]);
     const preparation = fakeRunPreparation({ tools: [{
       toolBindingRef: `tool-binding:${toolName}:g1`, name: toolName, description: 'Run the selected shell.',
-      inputSchema: { type: 'object', required: ['command', 'workspaceMode', 'executionScope'], properties: {
-        command: { type: 'string' }, workspaceMode: { type: 'string' }, executionScope: { type: 'string' },
+      inputSchema: { type: 'object', required: ['command'], properties: {
+        command: { type: 'string' },
       } }, possibleEffects: ['process', 'workspaceMutation', 'external'], availability: 'callable', origin: 'coreBuiltin',
     }] });
     const error = { code: `${toolName}_unavailable`, message: 'No Bash executable is available for the bound workspace.' };
@@ -2016,6 +2020,7 @@ for (const output of [null, { stage: 'execution', details: { toolId: toolName } 
       calls += 1;
       const reply = failedExecutionReply(request, output, error);
       reply.record.preparedEffect.logicalTargets = ['.'];
+      Object.assign(reply.record.preparedEffect.canonicalInvocation.arguments, { workspaceMode: 'read', executionScope: 'workspace' });
       reply.record.preparedEffect.processWorkspaceMode = 'read';
       reply.record.preparedEffect.processExecutionScope = 'workspace';
       return reply;
@@ -2024,7 +2029,7 @@ for (const output of [null, { stage: 'execution', details: { toolId: toolName } 
     const provider = { async *stream(request) {
       if (++turns === 1) {
         yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:shell-unavailable', name: request.tools[0].name,
-          input: { workspace: 'primary', command: 'git status -sb', workspaceMode: 'read', executionScope: 'workspace' } });
+          input: { workspace: 'primary', command: 'git status -sb' } });
       } else {
         const result = request.messages.map(jsonMessagePayload).find((item) => item?.outcome === 'failed');
         assert.deepEqual(result?.error, error);
@@ -2176,6 +2181,167 @@ test('a run without workspace bindings never exposes workspace-scoped tools', as
 test('explicit /focus and same-runtime pressure compact only after a successful summary turn', async () => {
   await verifyExplicitFocusCompaction();
   await verifyPressureCompaction();
+});
+
+test('completed compaction rejects invalid output as a known failure without retrying', async (t) => {
+  for (const [name, output, completion, code] of [
+    ['empty', [], {}, 'context_compaction_empty'],
+    ['mismatch', [
+      ['text.delta', { text: 'Streamed summary.' }],
+      ['assistant.message', { messageId: 'summary:mismatch', content: 'Different summary.' }],
+    ], {}, 'provider_message_mismatch'],
+    ['usage', [], { usage: { inputTokens: -1 } }, 'provider_usage_invalid'],
+  ]) await t.test(name, async (t) => {
+    const journal = new InMemoryCommandJournal(), sessionId = `session:completed-compaction-${name}`;
+    await createSession(journal, sessionId);
+    const preparation = fakeRunPreparation();
+    let sends = 0;
+    const actor = actorWith(journal, sessionId, { async *stream(request) {
+      sends++;
+      assert.equal(request.purpose, 'contextCompaction');
+      for (const [type, data] of output) yield providerEvent(request.requestId, type, data);
+      yield providerEvent(request.requestId, 'completed', completion);
+    } }, emptyKernel(), preparation.port, `completed-compaction-${name}`);
+    t.after(() => actor.dispose());
+    await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'context.focus',
+      sessionId, commandId: 'command:focus', task: 'Summarize the known facts.' });
+    const result = await waitForProjection(actor, value => ['failed', 'indeterminate'].includes(value.run?.status));
+    assert.equal(result.run.status, 'failed');
+    assert.equal(result.terminalError.code, code);
+    assert.equal(sends, 1);
+    assert.equal(preparation.released.length, 1);
+    const events = await readEvents(journal, sessionId);
+    assert.equal(singleEvent(events, 'provider.turn.settled').payload.outcome, 'failed');
+    assert.equal(events.some(event => event.type === 'context.compacted'), false);
+  });
+});
+
+test('completed Provider cleanup failures preserve the original diagnostics and secondary errors', async (t) => {
+  for (const purpose of ['agent', 'contextCompaction']) await t.test(purpose, async (t) => {
+    const journal = new InMemoryCommandJournal(), sessionId = `session:completed-cleanup-${purpose}`;
+    await createSession(journal, sessionId);
+    const diagnostics = { source: 'sessionTransport', phase: 'localStream', category: 'transport', retryable: false,
+      isBody: true, causes: [{ message: 'Stream closed before cleanup finished.', kind: 'ConnectionReset' }] };
+    const primary = new LoopFailure('provider_stream_failed', 'The local stream failed.', diagnostics);
+    const expected = { code: primary.code, message: primary.message, diagnostics: { ...diagnostics,
+      secondary: [{ code: 'agent_loop_failed', message: 'Reader cleanup failed.' }] } };
+    let sends = 0;
+    const preparation = fakeRunPreparation();
+    const actor = actorWith(journal, sessionId, { async *stream(request) {
+      sends++;
+      assert.equal(request.purpose, purpose);
+      yield providerEvent(request.requestId, 'text.delta', { text: 'Completed content.' });
+      yield providerEvent(request.requestId, 'completed', {});
+      throw new AggregateError([primary, new Error('Reader cleanup failed.')], primary.message);
+    } }, emptyKernel(), preparation.port, `completed-cleanup-${purpose}`);
+    t.after(() => actor.dispose());
+    await actor.submit(purpose === 'agent'
+      ? messageCommand(sessionId, 'command:start', 'Answer the question.')
+      : { schemaVersion: 'deepcode.command.v3', type: 'context.focus', sessionId,
+          commandId: 'command:focus', task: 'Summarize the known facts.' });
+    const result = await waitForProjection(actor, value => ['failed', 'indeterminate'].includes(value.run?.status));
+    assert.equal(result.run.status, 'failed');
+    assert.deepEqual(result.terminalError, expected);
+    assert.deepEqual(result.failureSnapshot.error, expected);
+    assert.equal(sends, 1);
+    assert.equal(preparation.released.length, 1);
+    const events = await readEvents(journal, sessionId);
+    assert.deepEqual(singleEvent(events, 'provider.turn.settled').payload.error, expected);
+    assert.equal(result.providerAttempts[0].phase, 'failed');
+  });
+});
+
+test('completed Provider cancellation preserves pure cancellation and independent failures', async (t) => {
+  for (const purpose of ['agent', 'contextCompaction']) for (const kind of ['cancel', 'failure', 'secondary']) await t.test(`${purpose}:${kind}`, async (t) => {
+    const journal = new InMemoryCommandJournal(), sessionId = `session:completed-cancel-${purpose}-${kind}`;
+    await createSession(journal, sessionId);
+    let completed = false, runId, sends = 0;
+    const failure = new LoopFailure('provider_stream_failed', 'Independent cleanup failure.');
+    const preparation = fakeRunPreparation();
+    const actor = actorWith(journal, sessionId, { async *stream(request, signal) {
+      sends++;
+      runId = request.runId;
+      yield providerEvent(request.requestId, 'text.delta', { text: 'Completed content.' });
+      yield providerEvent(request.requestId, 'completed', {});
+      completed = true;
+      await waitForAbort(signal);
+      if (kind === 'failure') throw failure;
+      if (kind === 'secondary') throw new AggregateError([signal.reason, failure], String(signal.reason));
+      throw signal.reason;
+    } }, emptyKernel(), preparation.port, `completed-cancel-${purpose}-${kind}`);
+    t.after(() => actor.dispose());
+    await actor.submit(purpose === 'agent'
+      ? messageCommand(sessionId, 'command:start', 'Answer the question.')
+      : { schemaVersion: 'deepcode.command.v3', type: 'context.focus', sessionId,
+          commandId: 'command:focus', task: 'Summarize the known facts.' });
+    await waitUntil(() => completed, 'Provider completion observed before cancellation');
+    await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'run.cancel',
+      commandId: 'command:cancel', sessionId, runId });
+    const result = await waitForProjection(actor, value => ['failed', 'indeterminate'].includes(value.run?.status));
+    assert.equal(result.run.status, kind === 'cancel' ? 'indeterminate' : 'failed');
+    if (kind === 'cancel') assert.equal(result.terminalError.code, 'provider_turn_outcome_unknown');
+    if (kind === 'failure') assert.deepEqual(result.terminalError, { code: failure.code, message: failure.message });
+    if (kind === 'secondary') assert.deepEqual(result.terminalError.diagnostics.secondary,
+      [{ code: failure.code, message: failure.message }]);
+    assert.equal(sends, 1);
+    assert.equal(preparation.released.length, 1);
+  });
+});
+
+test('Provider HTTP cancellation does not replace an independent error or secondary cleanup failure', async () => {
+  const controller = new AbortController();
+  controller.abort('user_cancelled');
+  const failure = new LoopFailure('provider_event_json_invalid', 'Invalid Provider frame.');
+  for (const error of [controller.signal.reason, failure, new AggregateError([controller.signal.reason, failure])]) {
+    const port = new HttpProviderPort({ apiBase: 'http://fixture', serviceToken: 'fixture', fetchImpl: async () => { throw error; } });
+    const iterator = port.stream({ requestId: 'request:cancel-error' }, controller.signal)[Symbol.asyncIterator]();
+    await assert.rejects(iterator.next(), actual => {
+      if (error === controller.signal.reason || error === failure) assert.equal(actual, error);
+      else assert.deepEqual(actual.diagnostics.secondary, [{ code: failure.code, message: failure.message }]);
+      return true;
+    });
+  }
+});
+
+test('completed Provider persistence failures stay failed and never resend generation', async (t) => {
+  for (const purpose of ['agent', 'contextCompaction']) for (const phase of ['attempt', 'settlement']) await t.test(`${purpose}:${phase}`, async (t) => {
+    const journal = new InMemoryCommandJournal(), sessionId = `session:completed-journal-${purpose}-${phase}`;
+    await createSession(journal, sessionId);
+    const append = journal.append.bind(journal);
+    const appendBatch = journal.appendBatch.bind(journal);
+    const diagnostics = { source: 'session', phase: 'journal', category: 'transport', retryable: false,
+      causes: [{ message: 'Journal write failed.', kind: 'ConnectionReset' }] };
+    const failure = new LoopFailure('journal_append_failed', `Could not persist the completed ${phase}.`, diagnostics);
+    journal.append = async event => {
+      if (phase === 'attempt' && event.type === 'provider.attempt.updated' && event.payload.phase === 'completed') throw failure;
+      return append(event);
+    };
+    journal.appendBatch = async events => {
+      if (phase === 'settlement' && events.some(event => event.type === 'provider.turn.settled' && event.payload.outcome === 'completed')) throw failure;
+      return appendBatch(events);
+    };
+    let sends = 0;
+    const preparation = fakeRunPreparation();
+    const actor = actorWith(journal, sessionId, { async *stream(request) {
+      sends++;
+      assert.equal(request.purpose, purpose);
+      yield providerEvent(request.requestId, 'text.delta', { text: 'Completed content.' });
+      yield providerEvent(request.requestId, 'completed', {});
+    } }, emptyKernel(), preparation.port, `completed-journal-${purpose}`);
+    t.after(() => actor.dispose());
+    await actor.submit(purpose === 'agent'
+      ? messageCommand(sessionId, 'command:start', 'Answer the question.')
+      : { schemaVersion: 'deepcode.command.v3', type: 'context.focus', sessionId,
+          commandId: 'command:focus', task: 'Summarize the known facts.' });
+    const result = await waitForProjection(actor, value => ['failed', 'indeterminate'].includes(value.run?.status));
+    assert.equal(result.run.status, 'failed');
+    assert.deepEqual(result.terminalError, { code: failure.code, message: failure.message, diagnostics });
+    assert.equal(sends, 1);
+    assert.equal(preparation.released.length, 1);
+    const events = await readEvents(journal, sessionId);
+    assert.equal(singleEvent(events, 'provider.turn.settled').payload.outcome, 'failed');
+    assert.equal(events.some(event => event.type === 'context.compacted'), false);
+  });
 });
 
 test('cancel and service disposal close their owned runtime boundaries in order', async () => {
@@ -2442,8 +2608,8 @@ test('one Plan confirmation resumes the same run into Todo-backed execution', as
         assert.ok(writeDefinition, 'confirmed execution tool must remain available');
         assert.equal(
           request.tools.some((candidate) => candidate.name.includes('todo')),
-          false,
-          'Todo progress is Session-owned and must not be a Provider tool',
+          true,
+          'Todo is a Session control available independently of Plan approval',
         );
 
         yield providerEvent(request.requestId, 'tool.call', {
@@ -2460,7 +2626,7 @@ test('one Plan confirmation resumes the same run into Todo-backed execution', as
       }
 
       if (providerRequests.length === 3) {
-        yield* planProgressEvents(request, 'completed', true);
+        yield* todoUpdateEvents(request, 'completed', true);
         return;
       }
       assert.equal(providerRequests.length, 4);
@@ -2531,18 +2697,18 @@ test('one Plan confirmation resumes the same run into Todo-backed execution', as
   await waitUntil(() => preparation.released.length === 1, 'confirmed Plan runtime release');
   assert.equal(providerRequests.length, 4);
   assert.equal(kernelRequests.length, 1);
-  assert.equal(completed.plans[0].status, 'completed');
+  assert.equal(completed.plans[0].status, 'confirmed');
+  assert.equal(completed.activePlanRef, null);
   assert.equal(completed.todoList.items[0].status, 'completed');
 
   const events = await readEvents(journal, sessionId);
   assert.equal(events.filter((event) => event.type === 'input.accepted').length, 1);
   const published = singleEvent(events, 'plan.published');
   const confirmed = singleEvent(events, 'plan.confirmed');
-  const seeded = singleEvent(events, 'todo.seeded');
+  const seeded = events.find(event => event.type === 'todo.updated' && !event.callId);
   const requested = singleEvent(events, 'tool.requested');
-  const progressed = singleEvent(events, 'todo.progressed');
+  const progressed = events.find(event => event.type === 'todo.updated' && event.callId);
   const toolCompleted = singleEvent(events, 'tool.completed');
-  const planCompleted = singleEvent(events, 'plan.completed');
   const finalMessage = events.find((event) => (
     event.type === 'message.committed' && event.payload.role === 'assistant'
   ));
@@ -2557,7 +2723,6 @@ test('one Plan confirmation resumes the same run into Todo-backed execution', as
     requested,
     toolCompleted,
     progressed,
-    planCompleted,
     finalMessage,
     finishing,
     released,
@@ -2567,7 +2732,7 @@ test('one Plan confirmation resumes the same run into Todo-backed execution', as
   await actor.dispose();
 });
 
-test('confirmed Host Bash uses composite authority and only a successful retry completes Todo', async () => {
+test('confirmed Host Bash preserves failed execution and reports later Todo progress separately', async () => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:confirmed-bash-retry';
   await createSession(journal, sessionId, [workspaceBinding]);
@@ -2581,11 +2746,9 @@ test('confirmed Host Bash uses composite authority and only a successful retry c
     inputSchema: {
       type: 'object',
       additionalProperties: false,
-      required: ['command', 'workspaceMode', 'executionScope'],
+      required: ['command'],
       properties: {
         command: { type: 'string' },
-        workspaceMode: { type: 'string', enum: ['read', 'write'] },
-        executionScope: { type: 'string', enum: ['workspace', 'host'] },
         timeout: { type: 'integer', minimum: 1, maximum: 600 },
         terminal: {
           type: 'object',
@@ -2605,8 +2768,8 @@ test('confirmed Host Bash uses composite authority and only a successful retry c
     workspaceId: workspaceBinding.workspaceId,
     command: request.input.command,
     cwd: '.',
-    workspaceMode: request.input.workspaceMode,
-    executionScope: request.input.executionScope,
+    workspaceMode: 'write',
+    executionScope: 'host',
     terminal: request.input.terminal !== undefined,
     stdout: exitCode === 0 ? 'ready' : '',
     stderr,
@@ -2619,7 +2782,7 @@ test('confirmed Host Bash uses composite authority and only a successful retry c
     environment: {
       shell: '/bin/bash',
       interactive: request.input.terminal !== undefined,
-      executionScope: request.input.executionScope,
+      executionScope: 'host',
       terminal: request.input.terminal !== undefined,
       pathSource: 'hostPlusStandardDeveloperPaths',
       writeScope: 'hostUser',
@@ -2635,8 +2798,7 @@ test('confirmed Host Bash uses composite authority and only a successful retry c
         workspaceId: workspaceBinding.workspaceId,
         operation: 'bash',
         command,
-        workspaceMode: 'write',
-        executionScope: 'host',
+        writablePaths: [{ path: 'marker.txt', kind: 'file' }],
         terminal,
       }]);
       const reply = kernelRequests.length === 1
@@ -2647,6 +2809,7 @@ test('confirmed Host Bash uses composite authority and only a successful retry c
           )
         : completedExecutionReply(request, shellOutput(request, 0));
       reply.record.preparedEffect.logicalTargets = ['.'];
+      Object.assign(reply.record.preparedEffect.canonicalInvocation.arguments, { workspaceMode: 'write', executionScope: 'host' });
       reply.record.preparedEffect.processWorkspaceMode = 'write';
       reply.record.preparedEffect.processExecutionScope = 'host';
       reply.record.authority = {
@@ -2670,8 +2833,7 @@ test('confirmed Host Bash uses composite authority and only a successful retry c
         candidate.inputSchema?.properties?.mutationManifest !== undefined
       ));
       const bashDefinition = request.tools.find((candidate) => (
-        candidate.inputSchema?.properties?.workspaceMode !== undefined
-        && candidate.inputSchema?.properties?.command !== undefined
+        candidate.inputSchema?.properties?.command !== undefined
       ));
 
       if (providerRequests.length === 1) {
@@ -2690,8 +2852,7 @@ test('confirmed Host Bash uses composite authority and only a successful retry c
               workspace: 'primary',
               operation: 'bash',
               command,
-              workspaceMode: 'write',
-              executionScope: 'host',
+              writablePaths: [{ path: 'marker.txt', kind: 'file' }],
               terminal,
             }],
           },
@@ -2708,8 +2869,6 @@ test('confirmed Host Bash uses composite authority and only a successful retry c
           input: {
             workspace: 'primary',
             command,
-            workspaceMode: 'write',
-            executionScope: 'host',
             terminal,
           },
         });
@@ -2730,7 +2889,7 @@ test('confirmed Host Bash uses composite authority and only a successful retry c
           .map(jsonMessagePayload)
           .find((payload) => payload?.type === 'todo.current');
         assert.equal(todo?.items[0].status, 'pending');
-        yield* planProgressEvents(request, 'inProgress');
+        yield* todoUpdateEvents(request, 'inProgress');
         return;
       }
       if (providerRequests.length === 4) {
@@ -2740,8 +2899,6 @@ test('confirmed Host Bash uses composite authority and only a successful retry c
           input: {
             workspace: 'primary',
             command,
-            workspaceMode: 'write',
-            executionScope: 'host',
             terminal,
           },
         });
@@ -2750,7 +2907,7 @@ test('confirmed Host Bash uses composite authority and only a successful retry c
       }
 
       if (providerRequests.length === 5) {
-        yield* planProgressEvents(request);
+        yield* todoUpdateEvents(request);
         return;
       }
       assert.equal(providerRequests.length, 6);
@@ -2810,7 +2967,7 @@ test('confirmed Host Bash uses composite authority and only a successful retry c
     .filter((event) => event.type === 'tool.completed')
     .map((event) => event.payload.record);
   assert.deepEqual(toolRecords.map((record) => record.outcome), ['failed', 'completed']);
-  assert.equal(events.filter((event) => event.type === 'todo.progressed').length, 2);
+  assert.equal(events.filter((event) => event.type === 'todo.updated' && event.callId).length, 2);
 
   await actor.dispose();
 });
@@ -2899,7 +3056,7 @@ test('confirmed fs.delete reads targetKind from canonical arguments and complete
         return;
       }
       if (providerRequests.length === 3) {
-        yield* planProgressEvents(request);
+        yield* todoUpdateEvents(request);
         return;
       }
       assert.equal(providerRequests.length, 4);
@@ -2946,12 +3103,13 @@ test('confirmed fs.delete reads targetKind from canonical arguments and complete
   await waitUntil(() => preparation.released.length === 1, 'confirmed delete runtime release');
   assert.equal(kernelRequests.length, 1);
   assert.equal(completed.todoList.items[0].status, 'completed');
-  assert.equal(completed.plans[0].status, 'completed');
+  assert.equal(completed.plans[0].status, 'confirmed');
+  assert.equal(completed.activePlanRef, null);
 
   await actor.dispose();
 });
 
-test('unfinished Plan preserves final explanation and pending Todo without reporting success', async () => {
+test('unfinished Todo preserves final explanation and progress while the run ends normally', async () => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:confirmed-plan-answer-rejected';
   await createSession(journal, sessionId, [workspaceBinding]);
@@ -3029,21 +3187,21 @@ test('unfinished Plan preserves final explanation and pending Todo without repor
   });
   assert.equal(confirmationReply.status, 'accepted');
 
-  const failed = await waitForProjection(actor, (value) => value.run?.status === 'failed');
-  await waitUntil(() => preparation.released.length === 1, 'failed execution runtime release');
+  const failed = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  await waitUntil(() => preparation.released.length === 1, 'completed run runtime release');
   assert.equal(providerRequests.length, 2);
   assert.equal(failed.plans[0].status, 'confirmed');
   assert.equal(failed.todoList.items[0].status, 'pending');
-  assert.equal(failed.terminalError.code, 'plan_incomplete');
+  assert.equal(failed.terminalError, null);
+  assert.equal(failed.activePlanRef, null);
 
   const events = await readEvents(journal, sessionId);
   const confirmed = singleEvent(events, 'plan.confirmed');
-  const seeded = singleEvent(events, 'todo.seeded');
+  const seeded = events.find(event => event.type === 'todo.updated' && !event.callId);
   const completions = events.filter((event) => event.type === 'provider.turn.settled');
   const settlement = singleEvent(events, 'run.settled');
   assert.equal(completions.length, 2);
-  assert.equal(settlement.payload.outcome, 'failed');
-  assert.equal(settlement.payload.error.code, 'plan_incomplete');
+  assert.equal(settlement.payload.outcome, 'completed');
   const finalMessage = events.find((event) => event.type === 'message.committed' && event.payload.role === 'assistant');
   assert.equal(finalMessage?.payload.content, 'Execution is blocked. The confirmed work has not been completed.');
   assert.equal(events.some((event) => event.type === 'plan.completed'), false);
@@ -3071,8 +3229,6 @@ test('scope-only proposals preserve phase definitions and cannot silently rewrit
   assert.equal(event.payload.summary, `${previous.summary}\n\n${input.summary}`);
   assert.deepEqual(event.payload.mutationManifest, [...previous.mutationManifest, ...input.mutationManifest]);
   assert.equal('mode' in event.payload, false, 'the journal keeps a complete Plan fact');
-  const todo = { sourcePlanId: previous.planId, items: [{ todoId: 'todo:core', sourceStepId: 'core', label: 'Core', status: 'completed' }] };
-  assert.deepEqual(todoItemsForPlan(event.payload, todo, previous, () => 'todo:new'), todo.items);
   assert.throws(() => decodeSessionControlCall('call:mixed', 'plan.publish', { ...input, steps: [] }),
     (error) => error.code === 'session_control_shape_invalid');
   const absent = publishPlan({ plans: [] }, previous.runId, decoded.callId, 'provider:scope', decoded.draft, ['workspace:scope'], () => 'plan:new');
@@ -3083,7 +3239,7 @@ test('scope-only proposals preserve phase definitions and cannot silently rewrit
   assert.equal(repeated.payload.error.code, 'plan_scope_extension_unchanged');
 });
 
-test('execution-time Plan revisions retain Todo identity and rejected progress cannot consume final output', async (t) => {
+test('Plan revisions preserve independent Todo and completed Todo does not revoke approved scope', async (t) => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:plan-revision-progress';
   await createSession(journal, sessionId, [workspaceBinding]);
@@ -3112,7 +3268,7 @@ test('execution-time Plan revisions retain Todo identity and rejected progress c
   const kernel = emptyKernel({ async execute(request) {
     executions.push(structuredClone(request));
     const authority = request.planAuthorities[0];
-    assert.equal(authority.revision, executions.length);
+    assert.equal(authority.revision, Math.min(executions.length, 2));
     assert.deepEqual(authority.coveredOperations.map((operation) => operation.target), executions.length === 1 ? ['README.md'] : ['README.md', '.gitignore']);
     return completedExecutionReply(request, { written: true });
   } });
@@ -3130,7 +3286,7 @@ test('execution-time Plan revisions retain Todo identity and rejected progress c
     const todo = payloads.findLast((payload) => payload?.type === 'todo.current');
     const record = payloads.find((payload) => payload?.recordId);
     const planTool = request.tools.find((tool) => tool.inputSchema.properties?.mutationManifest);
-    const progressTool = request.tools.find((tool) => tool.inputSchema.properties?.sourceFactRef);
+    const progressTool = request.tools.find((tool) => tool.inputSchema.properties?.items);
     const writeTool = request.tools.find((tool) => tool.inputSchema.properties?.content);
     let name, input;
     if (turn === 1) { name = planTool.name; input = initial; }
@@ -3138,7 +3294,7 @@ test('execution-time Plan revisions retain Todo identity and rejected progress c
       originalTodo = structuredClone(todo);
       name = writeTool.name; input = { workspace: 'primary', path: 'README.md', content: 'Implemented.' };
     } else if (turn === 3) {
-      name = progressTool.name; input = { sourceFactRef: record.recordId, updates: todo.items.map((item, index) => ({ todoId: item.todoId, status: index === 0 ? 'completed' : 'inProgress' })) };
+      name = progressTool.name; input = { items: todo.items.map((item, index) => ({ text: item.text, status: index === 0 ? 'completed' : 'inProgress' })) };
     } else if (turn === 4) {
       name = planTool.name; input = { ...revised, steps: [cleanup] };
     } else if (turn === 5) {
@@ -3147,27 +3303,24 @@ test('execution-time Plan revisions retain Todo identity and rejected progress c
       assert.match(error.message, /implement.*verify/);
       name = planTool.name; input = revised;
     } else if (turn === 6) {
-      assert.equal(todo.sourcePlanId, originalTodo.sourcePlanId);
-      assert.equal(todo.sourcePlanRevision, 2);
-      assert.deepEqual(todo.items.slice(0, 2).map((item) => item.todoId), originalTodo.items.map((item) => item.todoId));
-      assert.deepEqual(todo.items.map((item) => item.status), ['completed', 'pending', 'pending']);
+      assert.equal(todo.runId, originalTodo.runId);
+      assert.equal(todo.revision, 2);
+      assert.deepEqual(todo.items.map(item => item.text), originalTodo.items.map(item => item.text));
+      assert.deepEqual(todo.items.map(item => item.status), ['completed', 'inProgress']);
       name = writeTool.name; input = { workspace: 'primary', path: '.gitignore', content: 'core\n' };
     } else if (turn === 7) {
-      name = progressTool.name; input = { sourceFactRef: record.recordId, updates: [
-        { todoId: todo.items[2].todoId, status: 'completed' }, { todoId: 'todo:unknown', status: 'completed' },
+      name = progressTool.name; input = { items: [
+        { text: todo.items[0].text, status: 'completed' }, { text: 'Clean up', status: 'invented' },
       ] };
     } else if (turn === 8) {
-      const error = payloads.findLast((payload) => payload?.accepted === false).error;
-      assert.equal(error.code, 'plan_progress_todo_unknown');
-      assert.ok(error.message.includes(todo.items[2].todoId));
-      assert.match(error.message, /Nearest valid Todo IDs/);
-      assert.equal(todo.items[2].status, 'pending', 'invalid progress applies no partial update');
-      name = progressTool.name; input = { sourceFactRef: record.recordId, updates: todo.items.map((item) => ({ todoId: item.todoId, status: 'completed' })) };
+      const error = payloads.findLast(payload => payload?.accepted === false).error;
+      assert.equal(error.code, 'todo_update_invalid');
+      assert.equal(todo.items[1].status, 'inProgress', 'invalid progress applies no partial update');
+      name = progressTool.name; input = { items: [...todo.items.map(item => ({ text: item.text, status: 'completed' })), { text: 'Clean up', status: 'completed' }] };
     } else if (turn === 9) {
-      assert.ok(payloads.some((payload) => payload?.type === 'plan.completed' && payload.revision === 2));
-      name = progressTool.name; input = { sourceFactRef: record.recordId, updates: [{ todoId: originalTodo.items[0].todoId, status: 'completed' }] };
+      assert.ok(todo.items.every(item => item.status === 'completed'));
+      name = writeTool.name; input = { workspace: 'primary', path: '.gitignore', content: 'core\nbuild\n' };
     } else {
-      assert.equal(payloads.findLast((payload) => payload?.accepted === false).error.code, 'plan_progress_not_active');
       yield providerEvent(request.requestId, 'assistant.message', { messageId: 'message:revision-finished', content: 'The revised work and cleanup are complete.' });
       yield providerEvent(request.requestId, 'completed', {});
       return;
@@ -3185,8 +3338,8 @@ test('execution-time Plan revisions retain Todo identity and rejected progress c
       waiting = await waitForProjection(actor, (value) => value.pendingPlan?.revision === 2);
       assert.equal(waiting.pendingPlan.planId, firstId);
       assert.equal(waiting.todoList.items.length, 2, 'the proposed revision cannot replace Todo before confirmation');
-      assert.deepEqual(waiting.todoList.items.map((item) => ({ id: item.todoId, label: item.label, status: item.status })),
-        originalTodo.items.map((item, index) => ({ id: item.todoId, label: item.label, status: index === 0 ? 'completed' : 'inProgress' })),
+      assert.deepEqual(waiting.todoList.items.map((item) => ({ text: item.text, status: item.status })),
+        originalTodo.items.map((item, index) => ({ text: item.text, status: index === 0 ? 'completed' : 'inProgress' })),
         'proposal and rejected calls preserve phase identities, labels and observed progress until the user decides');
       assert.equal(executions.length, 1, 'new scope must wait for user confirmation');
     }
@@ -3194,17 +3347,17 @@ test('execution-time Plan revisions retain Todo identity and rejected progress c
       runId: waiting.run.runId, planId: firstId, revision, response: { kind: 'confirm' } });
   }
   const completed = await waitForProjection(actor, (value) => value.run?.status === 'completed');
-  assert.deepEqual(completed.plans.map((plan) => plan.status), ['superseded', 'completed']);
+  assert.deepEqual(completed.plans.map((plan) => plan.status), ['superseded', 'confirmed']);
   assert.ok(completed.todoList.items.every((item) => item.status === 'completed'));
   assert.equal(requests.length, 10);
-  assert.equal(executions.length, 2);
+  assert.equal(executions.length, 3);
   const events = await readEvents(journal, sessionId);
-  assert.equal(events.filter((event) => event.type === 'todo.seeded').length, 1);
-  assert.equal(events.filter((event) => event.type === 'todo.reconciled').length, 1);
+  assert.equal(events.filter(event => event.type === 'todo.updated').length, 3);
+  assert.equal(completed.activePlanRef, null);
   assert.deepEqual(events.filter((event) => event.type === 'session.control.rejected').map((event) => event.payload.error.code),
-    ['plan_revision_steps_missing', 'plan_progress_todo_unknown', 'plan_progress_not_active']);
+    ['plan_revision_steps_missing', 'todo_update_invalid']);
   const final = events.find((event) => event.type === 'message.committed' && event.payload.role === 'assistant');
-  assertEventOrder(singleEvent(events, 'plan.completed'), final, singleEvent(events, 'run.finishing'), singleEvent(events, 'run.runtime.released'), singleEvent(events, 'run.settled'));
+  assertEventOrder(events.findLast(event => event.type === 'todo.updated'), final, singleEvent(events, 'run.finishing'), singleEvent(events, 'run.runtime.released'), singleEvent(events, 'run.settled'));
   assert.equal(preparation.released.length, 1);
 });
 
@@ -3237,8 +3390,9 @@ test('built-in runtime and control prompts stay concise and policy-scoped', () =
   ))?.text ?? '';
   assert.ok(planInstruction.includes('publish_plan_wire'));
   assert.ok(planInstruction.includes('ask_user_wire'));
-  assert.ok(planInstruction.includes('Then execute within its file and execution scope'));
-  assert.ok(planInstruction.includes('Routine command or edit details do not require reconfirmation'));
+  assert.ok(planInstruction.includes('Its declared scope authorizes project changes'));
+  assert.ok(planInstruction.includes('session working directories hold editable drafts and previews; changes there do not require a Plan'));
+  assert.ok(planInstruction.includes('Reading and inspecting a project do not require a Plan'));
   const allowInstruction = allowDelegate.find((instruction) => (
     instruction.id === 'deepcode.workspace-autonomy'
   ))?.text ?? '';
@@ -3252,13 +3406,16 @@ test('built-in runtime and control prompts stay concise and policy-scoped', () =
   assert.ok(pluginInstruction.includes('Read the explicitly selected fixture instructions.'));
   const controls = sessionControlToolDefinitions();
   const publish = controls.find((tool) => tool.name === 'plan.publish');
-  const progress = controls.find((tool) => tool.name === 'plan.progress');
+  const progress = controls.find((tool) => tool.name === 'todo.update');
   assert.ok(controls.some((tool) => tool.name === 'interaction.request'));
   assert.match(publish.description, /not an exact script lock/u);
-  assert.match(progress.description, /sourceFactRef is its recordId/u);
+  assert.match(progress.description, /complete ordered task list/u);
+  assert.deepEqual(progress.inputSchema.required, ['items']);
   const bashScope = publish.inputSchema.properties.mutationManifest.items.oneOf.find((branch) => branch.properties.operation.enum?.includes('bash'));
   assert.equal(bashScope.required.includes('command'), false);
-  assert.ok(bashScope.required.includes('executionScope'));
+  assert.ok(bashScope.required.includes('writablePaths'));
+  assert.equal(bashScope.properties.workspaceMode, undefined);
+  assert.equal(bashScope.properties.executionScope, undefined);
 });
 
 test('plan rejection names the invalid manifest field and preserves the Provider prefix for correction', async (t) => {
@@ -3403,7 +3560,7 @@ test('current Todo state precedes later inserted user input without splitting it
   const runId = 'run:todo-user-boundary';
   const events = [
     {
-      schemaVersion: 'deepcode.session-event.v4',
+      schemaVersion: 'deepcode.session-event.v5',
       eventId: 'event:1',
       sessionId,
       sequence: 1,
@@ -3417,26 +3574,23 @@ test('current Todo state precedes later inserted user input without splitting it
       },
     },
     {
-      schemaVersion: 'deepcode.session-event.v4',
+      schemaVersion: 'deepcode.session-event.v5',
       eventId: 'event:2',
       sessionId,
       sequence: 2,
       occurredAt: '2026-09-02T00:00:01.000Z',
-      type: 'todo.seeded',
+      type: 'todo.updated',
       runId,
       payload: {
-        sourcePlanId: 'plan:todo-user-boundary',
-        sourcePlanRevision: 1,
+        revision: 1,
         items: [{
-          todoId: 'todo:one',
-          sourceStepId: 'step:one',
-          label: 'Execute the fixture step.',
+          text: 'Execute the fixture step.',
           status: 'inProgress',
         }],
       },
     },
     {
-      schemaVersion: 'deepcode.session-event.v4',
+      schemaVersion: 'deepcode.session-event.v5',
       eventId: 'event:3',
       sessionId,
       sequence: 3,
@@ -3453,7 +3607,7 @@ test('current Todo state precedes later inserted user input without splitting it
       },
     },
     {
-      schemaVersion: 'deepcode.session-event.v4',
+      schemaVersion: 'deepcode.session-event.v5',
       eventId: 'event:4',
       sessionId,
       sequence: 4,
@@ -3469,7 +3623,7 @@ test('current Todo state precedes later inserted user input without splitting it
       },
     },
     {
-      schemaVersion: 'deepcode.session-event.v4',
+      schemaVersion: 'deepcode.session-event.v5',
       eventId: 'event:5',
       sessionId,
       sequence: 5,
@@ -3483,7 +3637,7 @@ test('current Todo state precedes later inserted user input without splitting it
       },
     },
     {
-      schemaVersion: 'deepcode.session-event.v4',
+      schemaVersion: 'deepcode.session-event.v5',
       eventId: 'event:6',
       sessionId,
       sequence: 6,
@@ -3625,18 +3779,18 @@ test('phase plans and progress accept lists beyond the former item counts while 
       verification: Array.from({ length: 9 }, (_, check) => `Verify outcome ${check}`) })),
     mutationManifest: Array.from({ length: 129 }, (_, index) => ({ workspaceId: 'workspace:primary', operation: 'fs.write', target: `src/file-${index}.ts` })),
   };
-  input.mutationManifest.push({ workspaceId: 'workspace:primary', operation: 'bash', workspaceMode: 'write', executionScope: 'workspace',
+  input.mutationManifest.push({ workspaceId: 'workspace:primary', operation: 'bash',
     writablePaths: Array.from({ length: 129 }, (_, index) => ({ path: `build/output-${index}`, kind: 'directory' })) });
   assert.deepEqual(decodeSessionControlCall('call:large-plan', 'plan.publish', input).draft, input);
-  const updates = input.steps.map((step, index) => ({ todoId: `todo:${index}`, status: 'inProgress' }));
-  assert.deepEqual(decodeSessionControlCall('call:large-progress', 'plan.progress', { sourceFactRef: 'record:observed', updates }).updates, updates);
+  const items = input.steps.map(step => ({ text: step.title, status: 'inProgress' }));
+  assert.deepEqual(decodeSessionControlCall('call:large-progress', 'todo.update', { items }).items, items);
   const schema = sessionControlToolDefinitions().find((tool) => tool.name === 'plan.publish').inputSchema;
   assert.equal(schema.properties.steps.maxItems, undefined);
   assert.equal(schema.properties.mutationManifest.maxItems, undefined);
   assert.throws(() => decodeSessionControlCall('call:duplicate', 'plan.publish', { ...input, steps: [input.steps[0], input.steps[0]] }),
     (error) => error.code === 'session_control_plan_step_duplicate');
-  assert.throws(() => decodeSessionControlCall('call:invalid-progress', 'plan.progress', { sourceFactRef: 'record:observed', updates: [{ todoId: 'todo:0', status: 'invented' }] }),
-    (error) => error.code === 'plan_progress_invalid');
+  assert.throws(() => decodeSessionControlCall('call:invalid-progress', 'todo.update', { items: [{ text: 'Task', status: 'invented' }] }),
+    (error) => error.code === 'todo_update_invalid');
 });
 
 test('Plan title schema advertises the same single-line boundary enforced during publication', () => {
@@ -4031,7 +4185,7 @@ async function verifyExecutingToolDisposeCleanup() {
   assert.equal(events.some((event) => event.type === 'run.settled'), false);
 }
 
-test('missing completion stays indeterminate; a completed unknown alias fails without correction or execution', async () => {
+test('missing completion stays indeterminate; a completed unknown alias returns an unexecuted rejection', async () => {
   for (const completed of [false, true]) {
     const journal = new InMemoryCommandJournal();
     const sessionId = `session:native-terminal-${completed}`;
@@ -4040,21 +4194,42 @@ test('missing completion stays indeterminate; a completed unknown alias fails wi
     let turns = 0;
     const actor = actorWith(journal, sessionId, { async *stream(request) {
       turns += 1;
+      assert.ok(turns <= 2);
+      if (turns === 2) {
+        const rejected = request.messages.map(jsonMessagePayload).find((value) => value?.status === 'inputRejected');
+        assert.equal(rejected.executed, false);
+        assert.equal(rejected.error.code, 'provider_tool_alias_unknown');
+        const raw = request.messages.flatMap((message) => message.providerOutputBlocks ?? []).find((block) => block.kind === 'toolCallRejected');
+        assert.equal(raw.item.name, 'undeclared_tool');
+        assert.equal(raw.item.arguments, '{');
+        assert.ok(request.tools.every((tool) => tool.name !== 'undeclared_tool'));
+        yield providerEvent(request.requestId, 'assistant.message', { messageId: 'native:corrected-answer', content: 'This tool is unavailable.' });
+        yield providerEvent(request.requestId, 'completed', {});
+        return;
+      }
       yield providerEvent(request.requestId, 'output.item.completed', { outputIndex: 0,
         item: { type: 'function_call', call_id: 'native-terminal', name: completed ? 'undeclared_tool' : request.tools[0].name, arguments: '{', status: 'completed' } });
       if (completed) yield providerEvent(request.requestId, 'completed', {});
       else throw new Error('fixture_connection_closed');
     } }, emptyKernel(), preparation.port, `terminal-${completed}`);
     await actor.submit(messageCommand(sessionId, 'command:terminal', 'Inspect.'));
-    const result = await waitForProjection(actor, (value) => value.run?.status === (completed ? 'failed' : 'indeterminate'));
-    assert.equal(result.terminalError.code, completed ? 'provider_tool_alias_unknown' : 'provider_turn_outcome_unknown');
-    if (!completed) assert.match(result.terminalError.message, /fixture_connection_closed/);
-    assert.equal(turns, 1);
+    const result = await waitForProjection(actor, (value) => value.run?.status === (completed ? 'completed' : 'indeterminate'));
+    if (!completed) {
+      assert.equal(result.terminalError.code, 'provider_turn_outcome_unknown');
+      assert.match(result.terminalError.message, /fixture_connection_closed/);
+    }
+    assert.equal(turns, completed ? 2 : 1);
     const events = await readEvents(journal, sessionId);
     assert.equal(events.some((event) => event.type === 'tool.requested' || event.type === 'tool.input-rejected'), false);
-    const settlement = singleEvent(events, 'provider.turn.settled');
-    assert.equal(settlement.payload.outcome, completed ? 'failed' : 'indeterminate');
-    assert.equal('orderedOutputBlocks' in settlement.payload, false);
+    const settlement = events.find((event) => event.type === 'provider.turn.settled');
+    assert.equal(settlement.payload.outcome, completed ? 'completed' : 'indeterminate');
+    if (completed) {
+      assert.deepEqual(settlement.payload.orderedCallIds, []);
+      assert.equal(settlement.payload.orderedOutputBlocks[0].kind, 'toolCallRejected');
+      assert.equal(result.activities.find((activity) => activity.status === 'rejected').inputRejection.code, 'provider_tool_alias_unknown');
+    } else {
+      assert.equal('orderedOutputBlocks' in settlement.payload, false);
+    }
     await actor.dispose();
   }
 });
@@ -4267,19 +4442,42 @@ test('new file inputs preserve the existing Provider prefix and keep historical 
   await actor.dispose();
 });
 
-test('workspace Bash Plan declares paths without locking its command text', () => {
+for (const shell of ['bash', 'powershell']) {
+test(`workspace ${shell} Plan declares paths without locking its command text`, () => {
   const definition = sessionControlToolDefinitions().find((tool) => tool.inputSchema.properties?.mutationManifest);
   const input = { title: 'Build project', summary: 'Build in the allowed directory.',
     steps: [{ stepId: 'build', title: 'Build', details: 'Compile the project.' }],
-    mutationManifest: [{ workspaceId: 'workspace:test', operation: 'bash', command: 'make build', workspaceMode: 'write', executionScope: 'workspace', writablePaths: [{ path: 'build', kind: 'directory' }, { path: 'src/main.cpp', kind: 'file' }] }] };
+    mutationManifest: [{ workspaceId: 'workspace:test', operation: shell, command: 'make build', writablePaths: [{ path: 'build', kind: 'directory' }, { path: 'src/main.cpp', kind: 'file' }] }] };
   const decoded = decodeSessionControlCall('call:plan-paths', definition.name, input);
   assert.deepEqual(decoded.draft.mutationManifest, input.mutationManifest);
   const absentPaths = structuredClone(input);
   delete absentPaths.mutationManifest[0].writablePaths;
   assert.throws(() => decodeSessionControlCall('call:missing-paths', definition.name, absentPaths), /writablePaths/);
+  const withoutCommand = structuredClone(input);
+  delete withoutCommand.mutationManifest[0].command;
+  assert.deepEqual(decodeSessionControlCall('call:scope-only', definition.name, withoutCommand).draft.mutationManifest,
+    withoutCommand.mutationManifest);
+  for (const [field, value] of [['workspaceMode', 'write'], ['executionScope', 'host']]) {
+    const authorityField = structuredClone(input);
+    authorityField.mutationManifest[0][field] = value;
+    assert.throws(() => decodeSessionControlCall('call:authority-field', definition.name, authorityField), new RegExp(field));
+  }
   const outside = structuredClone(input);
   outside.mutationManifest[0].writablePaths[0].path = '../outside';
   assert.throws(() => decodeSessionControlCall('call:outside', definition.name, outside), (error) => error.code === 'session_control_plan_target_invalid');
+});
+
+}
+
+test('Todo replacement is atomic, accepts blocked and empty lists, and has no evidence or Plan fields', () => {
+  const items = [{ text: 'Investigate', status: 'completed' }, { text: 'Missing input', status: 'blocked' }];
+  assert.deepEqual(decodeSessionControlCall('call:todo', 'todo.update', { items }).items, items);
+  assert.deepEqual(decodeSessionControlCall('call:clear', 'todo.update', { items: [] }).items, []);
+  assert.throws(() => decodeSessionControlCall('call:invalid', 'todo.update', {
+    items: [...items, { text: 'Wrong status', status: 'invented' }],
+  }), error => error.code === 'todo_update_invalid');
+  assert.throws(() => decodeSessionControlCall('call:evidence', 'todo.update', { items, sourceFactRef: 'record:old' }), /sourceFactRef/);
+  assert.throws(() => decodeSessionControlCall('call:status-type', 'todo.update', { items: [{ text: 'Task', status: ['blocked'] }] }), error => error.code === 'todo_update_invalid');
 });
 
 test('reasoning display bounds real text and summary independently without changing replay data', async () => {
@@ -4454,6 +4652,7 @@ test('aggregate input admission preserves raw errors, permits correction, and ne
     ['json', '{"workspace":"primary","path":', 'provider_tool_call_arguments_invalid'],
     ['workspace', '{"workspace":"unknown","path":"probe.txt"}', 'provider_workspace_handle_not_bound'],
     ['empty', '{"workspace":"","path":"probe.txt"}', 'provider_workspace_handle_required'],
+    ['unknown', '{"workspace":"primary","path":"probe.txt"}', 'provider_tool_alias_unknown'],
   ]) {
     const journal = new InMemoryCommandJournal();
     const sessionId = `session:aggregate-input-${suffix}`;
@@ -4472,11 +4671,12 @@ test('aggregate input admission preserves raw errors, permits correction, and ne
       const name = request.tools.find((candidate) => candidate.inputSchema.properties?.path).name;
       if (requests.length === 1) {
         yield providerEvent(request.requestId, 'tool.call', { callId: 'native:ok', name, arguments: '{"workspace":"primary","path":"first.txt"}' });
-        yield providerEvent(request.requestId, 'tool.call', { callId: 'native:bad', name, arguments: invalid });
+        yield providerEvent(request.requestId, 'tool.call', { callId: 'native:bad', name: suffix === 'unknown' ? 'undeclared_tool' : name, arguments: invalid });
       } else if (requests.length === 2) {
         assert.equal(executions.length, 1);
         const raw = request.messages.flatMap((message) => message.toolCalls ?? []).find((call) => call.providerCallId === 'native:bad');
         assert.equal(raw.input, invalid, 'the model sees its exact original arguments');
+        assert.equal(raw.name, suffix === 'unknown' ? 'undeclared_tool' : name);
         const rejected = request.messages.map(jsonMessagePayload).find((value) => value?.status === 'inputRejected');
         assert.equal(rejected.executed, false);
         assert.equal(rejected.error.code, code);
@@ -4490,7 +4690,7 @@ test('aggregate input admission preserves raw errors, permits correction, and ne
         if (requests.length === 4) {
           assert.equal(name, 'read_current_run');
           const historical = request.messages.flatMap((message) => message.toolCalls ?? []).find((call) => call.providerCallId === 'native:bad');
-          assert.equal(historical.name, requests[0].tools.find((candidate) => candidate.inputSchema.properties?.path).name);
+          assert.equal(historical.name, suffix === 'unknown' ? 'undeclared_tool' : requests[0].tools.find((candidate) => candidate.inputSchema.properties?.path).name);
           assert.equal(historical.input, invalid, 'rejected history keeps the original owner alias and arguments');
         }
         yield providerEvent(request.requestId, 'assistant.message', { messageId: `native:answer:${requests.length}`, content: 'Both files read.' });
@@ -4707,4 +4907,58 @@ test('a Kernel input rejection can request confirmation and resume the same run'
   const events = await readEvents(journal, sessionId);
   assert.deepEqual(events.find(event => event.type === 'tool.input-rejected').payload.rejection.error, originalError);
   assert.equal(events.some(event => event.type === 'run.settled' && event.payload.outcome === 'failed'), false);
+});
+
+test('Todo can start before tools without a Plan, preserve a failed record and end with blocked work', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:independent-todo';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const preparation = fakeRunPreparation({ tools: [{
+    toolBindingRef: 'tool-binding:read:g1', name: 'fs.read', description: 'Read a file.',
+    inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } },
+    possibleEffects: ['workspaceRead'], availability: 'callable', origin: 'coreBuiltin',
+  }] });
+  let turn = 0;
+  const kernel = emptyKernel({ async execute(request) {
+    assert.equal(request.planAuthorities, undefined);
+    return failedExecutionReply(request, null, { code: 'file_missing', message: 'The requested file does not exist.' });
+  } });
+  const provider = { async *stream(request) {
+    turn += 1;
+    const tool = request.tools.find(tool => tool.inputSchema.properties?.items);
+    assert.ok(tool, 'Todo must be available without Plan approval');
+    if (turn === 1) {
+      yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:todo-start', name: tool.name,
+        input: { items: [{ text: 'Investigate input', status: 'inProgress' }, { text: 'Process input', status: 'pending' }] } });
+      const read = request.tools.find(tool => tool.inputSchema.properties?.path);
+      yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:read', name: read.name, input: { path: 'missing.txt' } });
+    } else if (turn === 2) {
+      const record = request.messages.map(jsonMessagePayload).find(payload => payload?.recordId);
+      assert.equal(record.outcome, 'failed');
+      yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:todo-blocked', name: tool.name,
+        input: { items: [{ text: 'Process input', status: 'blocked' }, { text: 'Investigate input', status: 'completed' }] } });
+    } else {
+      assert.equal(turn, 3);
+      const todo = request.messages.map(jsonMessagePayload).findLast(payload => payload?.type === 'todo.current');
+      assert.deepEqual(todo.items.map(item => item.status), ['blocked', 'completed']);
+      yield providerEvent(request.requestId, 'text.delta', { text: 'Input is missing; processing remains blocked.' });
+    }
+    yield providerEvent(request.requestId, 'completed', {});
+  } };
+  const actor = actorWith(journal, sessionId, provider, kernel, preparation.port, 'independent-todo');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:start', 'Inspect and process the input.'));
+  const finished = await waitForProjection(actor, value => value.run?.status === 'completed');
+  assert.equal(finished.plans.length, 0);
+  assert.equal(finished.terminalError, null);
+  assert.equal(finished.todoList.revision, 2);
+  assert.deepEqual(finished.todoList.items.map(item => item.status), ['blocked', 'completed']);
+  const events = await readEvents(journal, sessionId);
+  assert.equal(events.filter(event => event.type === 'session.control.rejected').length, 0);
+  const updates = events.filter(event => event.type === 'todo.updated');
+  const failure = singleEvent(events, 'tool.completed');
+  assert.equal(failure.payload.record.outcome, 'failed');
+  assert.equal(failure.payload.record.error.code, 'file_missing');
+  assertEventOrder(updates[0], singleEvent(events, 'tool.requested'), failure, updates[1], singleEvent(events, 'run.finishing'));
+  assert.equal(preparation.released.length, 1);
 });

@@ -497,29 +497,6 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       }));
       if (samePlanRef(next.activePlanRef, event.payload)) next.activePlanRef = null;
       break;
-    case 'plan.completed':
-      if (
-        !samePlanRef(next.activePlanRef, event.payload)
-        || planFor(next, event.payload.planId, event.payload.revision).status !== 'confirmed'
-        || !next.todoList
-        || next.todoList.sourcePlanId !== event.payload.planId
-        || next.todoList.sourcePlanRevision !== event.payload.revision
-        || next.todoList.items.length === 0
-        || next.todoList.items.some((item) => item.status !== 'completed')
-      ) throw new Error('plan_completion_state_invalid');
-      updatePlan(next, event.payload.planId, event.payload.revision, (plan) => ({
-        ...plan,
-        status: 'completed',
-        sequence: event.sequence,
-        updatedAt: event.occurredAt,
-      }));
-      if (samePlanRef(next.activePlanRef, event.payload)) next.activePlanRef = null;
-      settleActivity(
-        next,
-        planActivityId(event.payload.planId, event.payload.revision),
-        'completed',
-      );
-      break;
     case 'plan.invalidated':
       if (!['published', 'confirmed', 'revisionRequested'].includes(
         planFor(next, event.payload.planId, event.payload.revision).status,
@@ -542,58 +519,11 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         if (invalidatedPending) resumeRun(next, event.runId);
       }
       break;
-    case 'todo.seeded':
-    case 'todo.reconciled': {
+    case 'todo.updated': {
       assertRunningRun(next, event.runId, 'todo_run_not_active');
-      const sourcePlan = planFor(
-        next,
-        event.payload.sourcePlanId,
-        event.payload.sourcePlanRevision,
-      );
-      if (sourcePlan.status !== 'confirmed') throw new Error('todo_source_plan_not_confirmed');
-      const expectedSteps = new Map(sourcePlan.steps.map((step) => [step.stepId, step.title]));
-      const todoIds = new Set<string>();
-      const sourceStepIds = new Set<string>();
-      let itemsMatchPlan = event.payload.items.length === sourcePlan.steps.length;
-      for (const item of event.payload.items) {
-        if (
-          todoIds.has(item.todoId)
-          || sourceStepIds.has(item.sourceStepId)
-          || expectedSteps.get(item.sourceStepId) !== item.label
-        ) {
-          itemsMatchPlan = false;
-          break;
-        }
-        todoIds.add(item.todoId);
-        sourceStepIds.add(item.sourceStepId);
-      }
-      if (!itemsMatchPlan) throw new Error('todo_seed_plan_steps_mismatch');
-      next.todoList = advanceTodoList(next.todoList, event);
-      break;
-    }
-    case 'todo.progressed': {
-      assertRunningRun(next, event.runId, 'todo_run_not_active');
+      if (Boolean(event.callId) !== Boolean(event.payload.providerCallId)) throw new Error('todo_call_identity_invalid');
       if (event.callId && event.payload.providerCallId) {
-        recordProviderCallFact(next, event.callId, event.runId, event.payload.providerCallId, 'plan.progress', event.sequence);
-      }
-      if (
-        !next.todoList
-        || next.todoList.sourcePlanId !== event.payload.sourcePlanId
-        || next.todoList.sourcePlanRevision !== event.payload.sourcePlanRevision
-        || !samePlanRef(next.activePlanRef, {
-          planId: event.payload.sourcePlanId,
-          revision: event.payload.sourcePlanRevision,
-        })
-        || planFor(
-          next,
-          event.payload.sourcePlanId,
-          event.payload.sourcePlanRevision,
-        ).status !== 'confirmed'
-      ) throw new Error('todo_source_plan_mismatch');
-      if (new Set(event.payload.updates.map((update) => update.todoId)).size
-        !== event.payload.updates.length) throw new Error('todo_update_duplicate');
-      for (const { todoId } of event.payload.updates) {
-        if (!next.todoList.items.some((item) => item.todoId === todoId)) throw new Error('todo_item_missing');
+        recordProviderCallFact(next, event.callId, event.runId, event.payload.providerCallId, 'todo.update', event.sequence);
       }
       next.todoList = advanceTodoList(next.todoList, event);
       break;
@@ -1008,6 +938,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         || !['running', 'waiting'].includes(next.run!.status)
       ) throw new Error('run_finishing_state_invalid');
       next.pendingRunSettlements[event.runId] = cloneRunSettlement(event.payload);
+      next.activePlanRef = null;
       next.run = {
         runId: event.runId,
         status: 'releasing',

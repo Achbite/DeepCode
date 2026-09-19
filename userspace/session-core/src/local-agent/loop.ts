@@ -32,7 +32,7 @@ import {
   KERNEL_REQUEST_VERSION,
   SESSION_CONTROL_INTERACTION_REQUEST,
   SESSION_CONTROL_PLAN_PUBLISH,
-  SESSION_CONTROL_PLAN_PROGRESS,
+  SESSION_CONTROL_TODO_UPDATE,
   SESSION_CONTROL_PLUGIN_ACTIVATE,
 } from '@deepcode/protocol';
 import type { AgentComposition } from './plugins.js';
@@ -54,7 +54,8 @@ import { recoverSession, type SessionState } from './reducer.js';
 import { activeConversationEvents } from './conversationHistory.js';
 import { providerTextStreamId } from './streamIdentity.js';
 import { PlanPreviewBuffer } from './planPreview.js';
-import { completedPlanAwaitingLifecycle, planFinalSettlement, planProgressFact, publishPlan } from './planStage.js';
+import { publishPlan } from './planStage.js';
+import { todoUpdateFact } from './todoState.js';
 import {
   decodeSessionControlCall,
   SessionControlError,
@@ -161,7 +162,7 @@ interface ExpectedToolRecordIdentity {
   input: Record<string, unknown>;
 }
 
-type ProviderPlanProgress = Extract<SessionControlCall, { kind: 'planProgress' }> & {
+type ProviderTodoUpdate = Extract<SessionControlCall, { kind: 'todoUpdate' }> & {
   providerCallId: string;
 };
 
@@ -200,7 +201,7 @@ type ProviderTurn =
         name: string;
         input: Record<string, unknown>;
       }>;
-      progress?: ProviderPlanProgress | {
+      progress?: ProviderTodoUpdate | {
         kind: 'controlRejected';
         rejection: ProviderControlRejection;
       };
@@ -337,8 +338,8 @@ export async function runAgentLoop(
           toolName: requestEvent.payload.toolName,
           input: requestEvent.payload.input,
           workspaceBindings: runWorkspaceBindings(snapshot, runId).map((binding) => binding.workspaceId),
-          ...(selectedPlanAuthorities(snapshot.events).length
-            ? { planAuthorities: selectedPlanAuthorities(snapshot.events) }
+          ...(selectedPlanAuthorities(snapshot.events, runId).length
+            ? { planAuthorities: selectedPlanAuthorities(snapshot.events, runId) }
             : {}),
           ...(approval.resolved
             ? {
@@ -397,15 +398,6 @@ export async function runAgentLoop(
       snapshot = await deps.takeQueuedInputs(runId);
       runtime = runRuntimeSnapshot(snapshot, runId);
       throwIfAborted(signal);
-      const completedPlan = completedPlanAwaitingLifecycle(snapshot.state, runId);
-      if (completedPlan) {
-        await commit({
-          type: 'plan.completed',
-          sessionId: snapshot.state.sessionId,
-          runId,
-          payload: completedPlan,
-        });
-      }
       const preparedProviderRequest = await buildAgentProviderRequest({
         sessionId: snapshot.state.sessionId,
         runId,
@@ -576,7 +568,7 @@ export async function runAgentLoop(
         }
         case 'answer': {
           const messageId = turn.messageId ?? deps.nextId('message');
-          const settlement = planFinalSettlement(snapshot.state, runId, messageId);
+          const settlement = { outcome: 'completed' as const, finalMessageId: messageId };
           await commit((current) => [
             ...orderedProviderCallFacts(turn.completion, providerCallFacts),
             providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
@@ -605,11 +597,10 @@ export async function runAgentLoop(
         case 'tools': {
           const seenCalls = new Set<string>();
           const callFacts: NewSessionEvent[] = [...providerCallFacts];
-          // Progress describes results already observed by the Provider. Validate it
-          // before this batch's ordinary calls are requested or executed.
+          // Commit reported progress before executing the accompanying ordinary calls.
           if (turn.progress) {
-            callFacts.push(turn.progress.kind === 'planProgress'
-              ? planProgressFact(snapshot, runId, turn.progress)
+            callFacts.push(turn.progress.kind === 'todoUpdate'
+              ? todoUpdateFact(snapshot.state.sessionId, runId, snapshot.state.todoList, turn.progress.items, turn.progress)
               : controlRejectionFact(snapshot.state.sessionId, runId, turn.progress.rejection));
           }
           for (const call of turn.calls) {
@@ -655,16 +646,20 @@ export async function runAgentLoop(
       }
     }
   } catch (error) {
-    if (error instanceof ProviderReportedFailure || error instanceof ProviderCompletedFailure) {
+    const pendingProvider = uncompletedProviderComposition(snapshot, runId);
+    const completedAttempt = pendingProvider && Object.values(snapshot.state.providerAttempts).some((attempt) => (
+      attempt.providerRequestId === pendingProvider.providerRequestId && attempt.phase === 'completed'
+    ));
+    if (error instanceof ProviderReportedFailure || error instanceof ProviderCompletedFailure
+      || completedAttempt && !(signal.aborted && error === signal.reason)) {
       const failure = localAgentError(error);
       if (!hasSettlement(snapshot.events, runId)) {
-        const pending = uncompletedProviderComposition(snapshot, runId);
         await commit([
-          ...(pending
+          ...(pendingProvider
             ? [providerTurnTerminalEvent(
                 snapshot.state.sessionId,
                 runId,
-                pending,
+                pendingProvider,
                 runRuntimeSnapshot(snapshot, runId).provider.providerRuntimeRef,
                 { outcome: 'failed', error: failure },
               )]
@@ -679,7 +674,7 @@ export async function runAgentLoop(
       }
       return finishingResult(runId, { outcome: 'failed', error: failure });
     }
-    const unknownTurn = uncompletedProviderComposition(snapshot, runId);
+    const unknownTurn = pendingProvider;
     if (unknownTurn && !hasSettlement(snapshot.events, runId)) {
       const cause = localAgentError(error);
       const settlement: RunSettlement = {
@@ -787,13 +782,16 @@ async function performContextCompaction(
 }
 
 async function consumeCompactionProvider(request: ProviderRequest, deps: AgentLoopDeps, signal: AbortSignal) {
-  return withProviderAttempts(request, deps, signal, (attempt) => consumeCompactionAttempt(attempt, deps, signal));
+  return withProviderAttempts(request, deps, signal, (attempt, onCompleted) => (
+    consumeCompactionAttempt(attempt, deps, signal, onCompleted)
+  ));
 }
 
 async function consumeCompactionAttempt(
   request: ProviderRequest,
   deps: AgentLoopDeps,
   signal: AbortSignal,
+  onCompleted: () => void,
 ): Promise<{
   summary: string;
   completion: ProviderTurnCompletion;
@@ -870,8 +868,9 @@ async function consumeCompactionAttempt(
           '上下文压缩请求不能调用 Provider hosted search。',
         );
       case 'completed':
-        contextUsage = decodeContextUsage(event.data);
         completed = true;
+        onCompleted();
+        contextUsage = decodeContextUsage(event.data);
         break;
       case 'failed':
         throw new ProviderReportedFailure(event.data.code, event.data.message, event.data.diagnostics);
@@ -944,18 +943,9 @@ async function consumeProvider(
   deps: AgentLoopDeps,
   signal: AbortSignal,
 ): Promise<ProviderTurn> {
-  let completed = false;
-  try {
-    return await withProviderAttempts(request, deps, signal, (attempt) => consumeProviderOutput(attempt, toolCodec, runId, deps, signal, () => {
-      completed = true;
-    }));
-  } catch (error) {
-    if (completed && !signal.aborted && !(error instanceof ProviderReportedFailure)) {
-      const failure = localAgentError(error);
-      throw new ProviderCompletedFailure(failure.code, failure.message);
-    }
-    throw error;
-  }
+  return withProviderAttempts(request, deps, signal, (attempt, onCompleted) => (
+    consumeProviderOutput(attempt, toolCodec, runId, deps, signal, onCompleted)
+  ));
 }
 
 async function consumeProviderOutput(
@@ -1175,8 +1165,8 @@ async function consumeProviderOutput(
       || block.name === SESSION_CONTROL_PLUGIN_ACTIVATE
   )) && inputBlocks.length > 1
     ? 'interaction.request、plan.publish 与 plugin.activate 必须独占 Provider turn；本批次未执行，请单独提交。'
-    : inputBlocks.filter((block) => block.name === SESSION_CONTROL_PLAN_PROGRESS).length > 1
-      ? '每个 Provider turn 最多包含一个 plan.progress；本批次未执行，请合并步骤更新。'
+    : inputBlocks.filter((block) => block.name === SESSION_CONTROL_TODO_UPDATE).length > 1
+      ? '每个 Provider turn 最多包含一个 todo.update；本批次未执行，请合并步骤更新。'
       : undefined;
   if (conflict) {
     for (const blocks of [decodedOutputBlocks, aggregateBlocks]) {
@@ -1443,7 +1433,7 @@ async function consumeProviderOutput(
   for (const call of calls) {
     try {
       const control = decodeSessionControlCall(call.callId, call.name, call.input);
-      if (control?.kind === 'planProgress') progress = { ...control, providerCallId: call.providerCallId };
+      if (control?.kind === 'todoUpdate') progress = { ...control, providerCallId: call.providerCallId };
       else if (control) controlCalls.push({ ...control, providerCallId: call.providerCallId });
       else kernelCalls.push(call);
     } catch (error) {
@@ -1455,7 +1445,7 @@ async function consumeProviderOutput(
         input: { ...call.input },
         error: { code: error.code, message: error.message },
       };
-      if (call.name === SESSION_CONTROL_PLAN_PROGRESS) {
+      if (call.name === SESSION_CONTROL_TODO_UPDATE) {
         progress = { kind: 'controlRejected', rejection };
         continue;
       }
@@ -1600,13 +1590,26 @@ function decodeProviderOutputBlock(
       const providerCallId = typeof item.call_id === 'string' ? item.call_id : '';
       const wireName = typeof item.name === 'string' ? item.name : '';
       const canonicalName = toolCodec.canonicalByWire.get(wireName);
-      if (!providerCallId || !wireName || !canonicalName || typeof item.arguments !== 'string') {
+      if (!providerCallId || !wireName || typeof item.arguments !== 'string') {
         throw new LoopFailure(
-          canonicalName ? 'provider_tool_call_invalid' : 'provider_tool_alias_unknown',
-          canonicalName
-            ? 'Provider function_call 终态事实无效。'
-            : `Provider 返回了当前 run 未声明的工具别名：${wireName}`,
+          'provider_tool_call_invalid',
+          'Provider function_call 终态事实无效。',
         );
+      }
+      if (!canonicalName) {
+        const message = `Tool ${wireName} is not available in this request. Use the currently declared tools; discover and activate a plugin in this run before calling its tools.`;
+        return {
+          outputIndex: output.outputIndex,
+          kind: 'toolCallRejected',
+          providerCallId,
+          name: wireName,
+          item,
+          error: {
+            code: 'provider_tool_alias_unknown',
+            message,
+            issues: [{ path: '$.name', rule: 'declared_tool', message }],
+          },
+        };
       }
       let input: unknown;
       const rejectInput = (message: string): DecodedProviderOutputBlock => ({
@@ -1814,10 +1817,10 @@ function providerOutputItemText(
   return text;
 }
 
-function selectedPlanAuthorities(events: readonly SessionEvent[]): PlanAuthority[] {
+function selectedPlanAuthorities(events: readonly SessionEvent[], runId: string): PlanAuthority[] {
   const confirmed = events.findLast(
     (event): event is Extract<SessionEvent, { type: 'plan.confirmed' }> => (
-      event.type === 'plan.confirmed'
+      event.type === 'plan.confirmed' && event.runId === runId
     ),
   );
   if (!confirmed) return [];
@@ -1827,13 +1830,13 @@ function selectedPlanAuthorities(events: readonly SessionEvent[]): PlanAuthority
       event.type === 'plan.revision.requested'
       || event.type === 'plan.superseded'
       || event.type === 'plan.cancelled'
-      || event.type === 'plan.completed'
       || event.type === 'plan.invalidated'
     )
     && event.payload.planId === confirmed.payload.planId
     && event.payload.revision === confirmed.payload.revision
   ));
-  return inactive ? [] : confirmed.payload.authorities.map(cloneAuthority);
+  const finishing = events.some(event => event.type === 'run.finishing' && event.runId === runId);
+  return inactive || finishing ? [] : confirmed.payload.authorities.map(cloneAuthority);
 }
 
 function cloneAuthority(authority: PlanAuthority): PlanAuthority {
