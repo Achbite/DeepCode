@@ -683,6 +683,13 @@
   text-align: center;
 }
 
+.deepcode-gui-task-list-card__note {
+  display: block;
+  margin-top: 10px;
+  color: var(--dc-muted);
+  font-size: var(--dc-font-caption);
+}
+
 .deepcode-gui-task-list {
   display: grid;
 }
@@ -714,7 +721,8 @@
   box-shadow: 0 0 0 4px var(--dc-accent-soft);
 }
 
-.deepcode-gui-task-item--waiting .deepcode-gui-task-item__dot {
+.deepcode-gui-task-item--waiting .deepcode-gui-task-item__dot,
+.deepcode-gui-task-item--blocked .deepcode-gui-task-item__dot {
   background: var(--dc-warning);
 }
 

@@ -279,9 +279,9 @@ test('document Plan scope and completed artifacts pass through Session to the GU
         input: { workspace: 'primary', path: '报告.pdf', format: 'pdf', content: '<h1>Report</h1>' } });
     } else if (calls === 3) {
       const current = await actor.snapshot();
-      const progress = request.tools.find((entry) => entry.inputSchema.properties?.sourceFactRef);
+      const progress = request.tools.find((entry) => entry.inputSchema.properties?.items);
       yield providerEvent(request.requestId, 'tool.call', { callId: 'provider-call:document-progress', name: progress.name,
-        input: { sourceFactRef: documentRecordId, updates: [{ todoId: current.todoList.items[0].todoId, status: 'completed' }] } });
+        input: { items: [{ text: current.todoList.items[0].text, status: 'completed' }] } });
     } else {
       yield providerEvent(request.requestId, 'assistant.message', { messageId: 'provider-message:document-done', content: 'Report is ready.' });
     }
@@ -416,6 +416,102 @@ test('native path selection preserves OS paths, cancellation and dialog errors',
   const callCount = calls.length;
   await assert.rejects(pickNativePath({ kind: 'directory', title: 'Choose folder' }), /native_path_picker_unavailable/);
   assert.equal(calls.length, callCount);
+});
+
+test('Windows sandbox initialization uses the injected Host origin and preserves setup failures', async (t) => {
+  const previousWindow = globalThis.window;
+  t.after(() => { if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow; });
+  const uiToken = `dcui_${'12'.repeat(32)}`;
+  globalThis.window = {
+    location: { protocol: 'http:', hostname: 'deepcode-gui.localhost', origin: 'http://deepcode-gui.localhost' },
+    __DEEPCODE_HOST_BOOT__: { schemaVersion: 'deepcode.host-ui-bootstrap', host: '127.0.0.1', port: '49123', uiToken, windowChrome: 'custom' },
+  };
+  const [{ initializeWorkspaceSandbox }] = await loadGuiModules(t, ['/src/services/apiClient.ts']);
+  let calls = 0;
+  installGuiFetch(t, (url, init) => {
+    calls += 1;
+    assert.equal(url.href, 'http://127.0.0.1:49123/api/user-settings/workspace-sandbox');
+    assert.equal(init.method, 'POST');
+    assert.equal(init.headers['x-deepcode-host-ui-token'], uiToken);
+    assert.deepEqual(JSON.parse(init.body), {});
+    return Response.json({ ok: false, error: 'workspace_sandbox_setup_failed', message: 'administrator request declined' });
+  });
+  const result = await initializeWorkspaceSandbox();
+  assert.equal(calls, 1);
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'workspace_sandbox_setup_failed');
+  assert.equal(result.message, 'administrator request declined');
+});
+
+test('Host workspace initialization preserves the current workspace or opens the native default directory', async (t) => {
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  t.after(() => {
+    if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow;
+    if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument;
+  });
+  const { initializeHostWorkspace } = await loadGuiModule(t, '/src/services/workspaceInitialization.ts');
+  globalThis.document = { documentElement: { dataset: { product: 'deepcode-gui' } } };
+  let defaultPath = '/Users/developer/DeepCode workspace';
+  const calls = [];
+  globalThis.window = { __TAURI__: { core: { invoke: async (command) => {
+    calls.push(command);
+    assert.equal(command, 'deepcode_default_workspace_path');
+    return defaultPath;
+  } } } };
+  const workspace = { id: 'workspace:current', name: 'Existing', source: 'directory', sourcePath: null,
+    folders: [{ id: 'folder:current', name: 'Existing', absolutePath: '/existing', originalPath: '/existing', isAbsolute: true }],
+    unsupportedFields: [], openedAt: '2026-09-18T00:00:00Z' };
+  let current = workspace;
+  installGuiFetch(t, (url, init) => {
+    calls.push(url.pathname);
+    if (url.pathname === '/api/workspaces/current') return Response.json({ ok: true, data: { current, fallbackUsed: false, lastError: null } });
+    assert.equal(url.pathname, '/api/workspaces/open');
+    assert.equal(init.method, 'POST');
+    assert.deepEqual(JSON.parse(init.body), { path: defaultPath });
+    return Response.json({ ok: true, data: { workspace } });
+  });
+  await initializeHostWorkspace();
+  assert.deepEqual(calls.splice(0), ['/api/workspaces/current']);
+  current = null;
+  await initializeHostWorkspace();
+  assert.deepEqual(calls.splice(0), ['/api/workspaces/current', 'deepcode_default_workspace_path', '/api/workspaces/open']);
+  defaultPath = null;
+  await initializeHostWorkspace();
+  assert.deepEqual(calls, ['/api/workspaces/current', 'deepcode_default_workspace_path']);
+});
+
+test('Host workspace initialization propagates the failing request without opening or retrying', async (t) => {
+  const previousDocument = globalThis.document;
+  t.after(() => { if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument; });
+  globalThis.document = { documentElement: { dataset: {} } };
+  const { initializeHostWorkspace } = await loadGuiModule(t, '/src/services/workspaceInitialization.ts');
+  const paths = ['/api/workspaces/current', '/api/workspaces/default-path', '/api/workspaces/open'];
+  const replies = [
+    { ok: true, data: { current: null, fallbackUsed: false, lastError: null } },
+    { ok: true, data: { path: '/workspace/default' } },
+  ];
+  let failureAt;
+  let invalidSuccess;
+  let calls;
+  installGuiFetch(t, (url) => {
+    const index = calls.length;
+    calls.push(url.pathname);
+    assert.equal(url.pathname, paths[index]);
+    return Response.json(index === failureAt
+      ? invalidSuccess ? { ok: true } : { ok: false, error: 'workspace_failed', message: `Original failure: ${paths[index]}` }
+      : replies[index]);
+  });
+  for (failureAt = 0; failureAt < paths.length; failureAt += 1) {
+    calls = [];
+    invalidSuccess = false;
+    await assert.rejects(initializeHostWorkspace(), { message: `Original failure: ${paths[failureAt]}` });
+    assert.deepEqual(calls, paths.slice(0, failureAt + 1));
+    calls = [];
+    invalidSuccess = true;
+    await assert.rejects(initializeHostWorkspace());
+    assert.deepEqual(calls, paths.slice(0, failureAt + 1));
+  }
 });
 
 test('one native reference request returns the actual file or folder kind', async (t) => {
@@ -751,7 +847,7 @@ test('GUI consumes complete phase plans and Todo beyond the former item count', 
     runId: waiting.run.runId, planId: waiting.pendingPlan.planId, revision: 1, response: { kind: 'confirm' } });
   const confirmed = await waitForProjection(actor, (value) => value.todoList?.items.length === 13);
   assert.deepEqual(await decodeGuiProjection(confirmed), confirmed);
-  assert.deepEqual(confirmed.todoList.items.map((item) => item.sourceStepId), waiting.pendingPlan.steps.map((step) => step.stepId));
+  assert.deepEqual(confirmed.todoList.items.map((item) => item.text), waiting.pendingPlan.steps.map((step) => step.title));
 });
 
 test('Provider status separates request elapsed time from the last observed content', async (t) => {
@@ -1424,7 +1520,7 @@ test('Plan documents and previews render Markdown entities, code names and verif
     planId: 'plan:document', revision: 1, runId: 'run:document', callId: 'call:document', status: 'published',
     title: '对象池 ObjectPool&lt;T,N&gt; 升级', summary: '保留 **互斥访问** 与 `C++17`。',
     steps: [{ stepId: 'write', title: '实现 `ObjectPool<T,N>`', details: '修改 `src/pool.hpp`。\n\n- 构造对象\n- 归还对象', verification: ['编译 **通过**；`exit 0`。'] }],
-    mutationManifest: [{ workspaceId: 'workspace:private-id', operation: 'bash', workspaceMode: 'write', executionScope: 'workspace' }],
+    mutationManifest: [{ workspaceId: 'workspace:private-id', operation: 'bash', writablePaths: [{ path: 'build', kind: 'directory' }] }],
   };
   const published = renderToStaticMarkup(createElement(PlanCard, { plan, active: false, language: 'zh-CN' }));
   assert.ok(published.includes('aria-expanded="false"'), 'published plans wait for the reader to expand');
@@ -1437,7 +1533,8 @@ test('Plan documents and previews render Markdown entities, code names and verif
   assert.match(html, /<code>exit 0<\/code>/);
   assert.equal(html.includes('undefined'), false, 'optional command examples must not leak undefined');
   assert.equal(html.includes('workspace:private-id'), false, 'single-workspace review does not need internal IDs');
-  assert.ok(html.includes('允许修改'));
+  assert.ok(html.includes('写入范围'));
+  assert.ok(html.includes('build/'));
   const revisedPlan = { ...plan, revision: 2,
     steps: [{ ...plan.steps[0], verification: ['ctest 通过'] }],
     mutationManifest: [{ workspaceId: 'workspace:private-id', operation: 'fs.edit', target: 'src', targetKind: 'directoryTree' }],
@@ -1568,6 +1665,41 @@ test('GUI refresh accepts plan preview changes without a new journal revision or
   delete incoming.assistantDraft.planPreview;
   await store.getState().refresh();
   assert.equal(store.getState().projection.assistantDraft.planPreview, undefined);
+});
+
+test('decision prose displays escaped paragraphs without rewriting code or raw content', async (t) => {
+  const { formatDecisionProse } = await loadGuiModule(t, '/src/components/local-agent/streamingMarkdown.ts');
+  const source = '请确认范围。\\n\\n保留源码。';
+  assert.equal(formatDecisionProse(source), '请确认范围。\n\n保留源码。');
+  assert.equal(source, '请确认范围。\\n\\n保留源码。');
+  const protectedText = [
+    '`printf "\\n\\n"`', '```sh\nprintf "\\n\\n"\n```',
+    '    printf "\\n\\n"', '[path](https://example.test/\\n\\n)',
+    'C:\\new\\next', 'Actual\n\nparagraph', String.raw`Literal \\n\\n`,
+  ];
+  for (const text of protectedText) assert.equal(formatDecisionProse(text), text);
+  assert.equal(formatDecisionProse('Before\\n\\n`\\n\\n` and **after**'), 'Before\n\n`\\n\\n` and **after**');
+  const { MarkdownContent } = await loadGuiModule(t, '/src/components/local-agent/BufferedMarkdown.tsx');
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const render = (decisionProse) => renderToStaticMarkup(createElement(MarkdownContent, { children: source, decisionProse }));
+  assert.equal((render(true).match(/<p>/g) ?? []).length, 2);
+  assert.match(render(false), /\\n\\n/);
+});
+
+test('browser annotations preserve the exact preview identity and separate the user comment', async (t) => {
+  const { formatBrowserAnnotation } = await loadGuiModule(t, '/src/components/local-agent/browserReview.ts');
+  const annotation = { id: 'annotation:1', mode: 'element', url: 'file:///input/interactive-test.html',
+    title: 'Page', selector: '#btn', text: 'Page content', rect: { x: 1, y: 2, width: 3, height: 4 },
+    viewport: { width: 800, height: 600, scrollX: 0, scrollY: 0 }, comment: 'Make this button white.' };
+  for (const chinese of [true, false]) {
+    const text = formatBrowserAnnotation(annotation, 'preview-12', chinese);
+    const evidence = JSON.parse(text.split('\n').filter(line => line.startsWith('> ')).map(line => line.slice(2)).join('\n'));
+    assert.equal(evidence.previewId, 'preview-12');
+    assert.equal(evidence.url, annotation.url);
+    assert.equal(evidence.selector, '#btn');
+    assert.ok(text.endsWith('\n\n' + annotation.comment));
+  }
 });
 
 test('streaming Markdown retains stable blocks and reconciles GFM and references on completion', async (t) => {
@@ -1899,6 +2031,13 @@ test('desktop startup diagnostics render the Host failure and log reference verb
   assert.match(html, /Kernel exited: exit status: 71/);
   assert.match(html, /\/runtime\/logs\/startup.log/);
   assert.equal(renderToStaticMarkup(createElement(HostStartupDiagnostic, { status: { ...status, phase: 'ready' }, language: 'zh-CN' })), '');
+  const workspaceFailure = renderToStaticMarkup(createElement(HostStartupDiagnostic, {
+    status: { ...status, phase: 'ready' }, workspaceError: 'Workspace open denied: /workspace/default',
+    language: 'zh-CN', onRetry() {},
+  }));
+  assert.match(workspaceFailure, /Workspace open denied: \/workspace\/default/);
+  assert.match(workspaceFailure, /role="alert"/);
+  assert.doesNotMatch(workspaceFailure, /host_startup_process_exited|startup.log|<button/);
 });
 
 test('conversation reading intent survives native scroll deliveries and layout growth', async (t) => {

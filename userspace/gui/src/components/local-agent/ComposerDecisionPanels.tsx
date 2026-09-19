@@ -65,7 +65,7 @@ export function ComposerDecisionPanels({ language, composer }: { language: UiLan
             <div className="local-agent__interaction-prompt">
               {pendingPlan
                 ? <MarkdownInline>{pendingPlan.title}</MarkdownInline>
-                : <MarkdownContent>{pendingInteraction?.prompt ?? ''}</MarkdownContent>}
+                : <MarkdownContent decisionProse>{pendingInteraction?.prompt ?? ''}</MarkdownContent>}
             </div>
             <ol className="local-agent__interaction-options">
               {pendingPlan ? <li>

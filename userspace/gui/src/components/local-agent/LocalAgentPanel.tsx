@@ -45,7 +45,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
   const title = activeSummary?.title.trim()
     || projection?.display.creationTitle.trim()
     || t(language, 'agent.session.newTitle');
-  const conversationItems = useMemo(() => projectionItems(projection), [projection?.sessionId, projection?.revision]);
+  const conversationItems = projectionItems(projection);
   const assistantDraft = projection?.assistantDraft ?? null;
   const display = useDisplayedConversation();
   const showChangeBar = projection?.run && !display.displaySettledRunIds.has(projection.run.runId)

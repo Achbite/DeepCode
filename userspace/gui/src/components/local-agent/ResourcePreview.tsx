@@ -19,9 +19,10 @@ import { READER_OPEN_EVENT, readViewState, saveViewState, type ReaderTarget } fr
 import { NativeBrowserPreview } from './NativeBrowserPreview';
 import {
   hasNativeBrowser,
-  listenNativePages,
+  listenNativeActivation,
   nativeBrowserCommand,
   nativeHostBinding,
+  nativeNavigationInput,
   type NativeHostBinding,
   type NativePage,
 } from '../../services/nativeBrowser';
@@ -34,7 +35,9 @@ const DocumentPreview = lazy(() =>
   loadInterfaceModule(() => import('./DocumentPreview').then((module) => ({ default: module.DocumentPreview }))),
 );
 const SourceFileView = lazy(() => loadInterfaceModule(() => import('./SourceFileView')));
-type ReaderTab = { id: string; target: ReaderTarget; page?: NativePage };
+type ResolvedReaderTarget = Exclude<ReaderTarget, { kind: 'browser' }>
+  | (Extract<ReaderTarget, { kind: 'browser' }> & { previewId: string });
+type ReaderTab = { id: string; target: ResolvedReaderTarget; page?: NativePage };
 type DocumentState =
   | { status: 'loading' }
   | { status: 'document'; blob: Blob; format: DocumentFormat | 'image' }
@@ -59,18 +62,12 @@ export function readerPageName(url: string): string {
     return url;
   }
 }
-function targetKey(target: ReaderTarget): string {
+function targetKey(target: ResolvedReaderTarget): string {
   if (target.kind === 'file') return 'file:' + target.path;
   if (target.kind === 'workspace')
     return 'workspace:' + target.workspaceId + ':' + target.logicalPath;
   if (target.kind === 'artifact') return 'artifact:' + target.artifact.artifactId;
-  return (
-    'browser:' +
-    (target.previewId ??
-      target.filePath ??
-      target.url ??
-      (target.selfPreview ? 'self' : crypto.randomUUID()))
-  );
+  return 'browser:' + target.previewId;
 }
 function tabName(tab: ReaderTab, language: UiLanguage): string {
   if (tab.page) return readerPageName(tab.page.url);
@@ -107,8 +104,8 @@ export function useResourcePreview(sessionId: string | null) {
     state.sessionId === sessionId
       ? state
       : { sessionId, tabs: [], activeId: null, visible: false, expanded: false };
-  const openTarget = useCallback(
-    (target: ReaderTarget) => {
+  const selectTarget = useCallback(
+    (target: ResolvedReaderTarget) => {
       if (!sessionId) return;
       const key = targetKey(target);
       setState((old) => {
@@ -133,6 +130,26 @@ export function useResourcePreview(sessionId: string | null) {
     },
     [sessionId],
   );
+  const openTarget = useCallback((target: ReaderTarget) => {
+    if (!sessionId) return;
+    if (target.kind !== 'browser') {
+      selectTarget(target);
+      return;
+    }
+    if (target.previewId) {
+      selectTarget({ ...target, previewId: target.previewId });
+      return;
+    }
+    const open = async () => {
+      const binding = await nativeHostBinding();
+      if (!binding) throw new Error('Native browser requires the desktop GUI Host.');
+      const page = await nativeBrowserCommand<NativePage>({ ...binding, sessionId }, target.selfPreview
+        ? { action: 'openSelf' }
+        : { action: 'open', ...(target.filePath ? { filePath: target.filePath } : nativeNavigationInput(target.url ?? '')) });
+      if (currentSession.current === sessionId) selectTarget({ kind: 'browser', previewId: page.previewId });
+    };
+    void open().catch((reason) => { if (currentSession.current === sessionId) setError(String(reason)); });
+  }, [sessionId, selectTarget]);
   useEffect(() => {
     bindings.current.clear();
     setState(current => current.sessionId === sessionId ? current : { sessionId, tabs: [], activeId: null, visible: false, expanded: false });
@@ -154,17 +171,8 @@ export function useResourcePreview(sessionId: string | null) {
     if (!sessionId || !hasNativeBrowser()) return;
     let ended = false;
     let unlisten: (() => void) | undefined;
-    const seen = new Set<string>();
-    void listenNativePages((page) => {
-      if (
-        ended ||
-        page.sessionId !== sessionId ||
-        page.openedBy !== 'tool' ||
-        page.status === 'closed' ||
-        seen.has(page.previewId)
-      )
-        return;
-      seen.add(page.previewId);
+    void listenNativeActivation((page) => {
+      if (ended || page.sessionId !== sessionId) return;
       openTarget({ kind: 'browser', previewId: page.previewId });
     })
       .then((dispose) => {
@@ -211,11 +219,14 @@ export function useResourcePreview(sessionId: string | null) {
     });
   };
   const closeTab = async (id: string) => {
-    const tab = live.tabs.find((tab) => tab.id === id),
-      binding = bindings.current.get(id);
+    if (!sessionId) return;
+    const tab = live.tabs.find((tab) => tab.id === id);
     try {
-      if (tab?.page && binding)
-        await nativeBrowserCommand(binding, { action: 'close', previewId: tab.page.previewId });
+      if (tab?.target.kind === 'browser') {
+        const binding = bindings.current.get(id) ?? await nativeHostBinding();
+        if (!binding) throw new Error('Native browser requires the desktop GUI Host.');
+        await nativeBrowserCommand({ ...binding, sessionId }, { action: 'close', previewId: tab.target.previewId });
+      }
       if (currentSession.current === sessionId) removeTab(id);
     } catch (reason) {
       if (currentSession.current === sessionId) setError(String(reason));
@@ -413,10 +424,7 @@ export function ResourcePreview({
                   active={preview.visible && preview.activeId === tab.id}
                   onReady={(page, binding) => preview.ready(tab.id, page, binding)}
                   onClose={() => preview.removeTab(tab.id)}
-                  initialUrl={tab.target.url}
-                  initialPath={tab.target.filePath}
-                  initialPreviewId={tab.target.previewId}
-                  selfPreview={tab.target.selfPreview}
+                  previewId={tab.target.previewId}
                   onReview={onReview}
                   reviewEdit={preview.reviewEdit?.previewId === (tab.page?.previewId ?? tab.target.previewId) ? preview.reviewEdit : null}
                 />

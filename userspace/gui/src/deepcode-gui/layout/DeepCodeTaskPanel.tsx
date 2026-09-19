@@ -22,6 +22,9 @@ const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, project
     (left, right) => artifactTimestamp(right.createdAt) - artifactTimestamp(left.createdAt),
   );
   const todos = projection?.todoList?.items ?? [];
+  const todoRun = projection?.todoList && projection.tokenUsageHistory.find(run => run.runId === projection.todoList!.runId);
+  const remaining = todos.filter(todo => todo.status !== 'completed').length;
+  const ended = Boolean(todoRun?.outcome);
   return (
     <aside className="deepcode-gui-context-panel">
       <section className="deepcode-gui-task-list-card">
@@ -29,8 +32,8 @@ const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, project
           <span>{t(language, 'deepcodeGui.tasks.title')}</span>
           {projection?.todoList && (
             <small>
-              {t(language, 'agent.plan.revision', {
-                revision: projection.todoList.sourcePlanRevision,
+              {t(language, 'deepcodeGui.tasks.revision', {
+                revision: projection.todoList.revision,
               })}
             </small>
           )}
@@ -41,20 +44,23 @@ const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, project
           </div>
         ) : (
           <div className="deepcode-gui-task-list">
-            {todos.map((todo) => (
+            {todos.map((todo, index) => (
               <div
                 className={`deepcode-gui-task-item deepcode-gui-task-item--${todo.status === 'inProgress' ? 'active' : todo.status}`}
-                key={todo.todoId}
+                key={index}
               >
                 <span className="deepcode-gui-task-item__dot" aria-hidden="true" />
                 <div>
-                  <div className="deepcode-gui-task-item__title"><MarkdownInline>{todo.label}</MarkdownInline></div>
+                  <div className="deepcode-gui-task-item__title"><MarkdownInline>{todo.text}</MarkdownInline></div>
                 </div>
                 <strong>{todoStatus(todo.status, language)}</strong>
               </div>
             ))}
           </div>
         )}
+        {todos.length > 0 && <small className="deepcode-gui-task-list-card__note">
+          {t(language, ended && remaining > 0 ? 'deepcodeGui.tasks.endedRemaining' : 'deepcodeGui.tasks.reported', { count: remaining })}
+        </small>}
       </section>
 
       <section className="deepcode-gui-task-list-card deepcode-gui-output-card">
@@ -67,7 +73,7 @@ const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, project
           </div>
         ) : <>
           <div id={outputListId} className="deepcode-gui-output-list">
-            <ArtifactLinks key={projection?.sessionId} compact artifacts={showAllArtifacts ? artifacts : artifacts.slice(0, 3)} onOpen={(workspaceId,path)=>requestWorkspacePreview(projection!.sessionId,workspaceId,path)} />
+            <ArtifactLinks key={projection?.sessionId} artifacts={showAllArtifacts ? artifacts : artifacts.slice(0, 3)} onOpen={(workspaceId,path)=>requestWorkspacePreview(projection!.sessionId,workspaceId,path)} />
           </div>
           {artifacts.length > 3 && <button type="button" className="deepcode-gui-output-more" aria-expanded={showAllArtifacts} aria-controls={outputListId} onClick={() => setShowAllArtifacts((value) => !value)}>
             {t(language, showAllArtifacts ? 'deepcodeGui.outputs.showLess' : 'deepcodeGui.outputs.showAll', { count: artifacts.length })}
@@ -82,7 +88,7 @@ function artifactTimestamp(value: string): number {
   return /^\d+$/u.test(value) ? Number(value) : Date.parse(value);
 }
 
-function todoStatus(status: 'pending' | 'inProgress' | 'completed', language: UiLanguage): string {
+function todoStatus(status: 'pending' | 'inProgress' | 'completed' | 'blocked', language: UiLanguage): string {
   return t(language, `deepcodeGui.tasks.status.${status}`);
 }
 

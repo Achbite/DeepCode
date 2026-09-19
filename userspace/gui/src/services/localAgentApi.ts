@@ -466,10 +466,6 @@ function decodeProjection(value: unknown): SessionProjection {
   const plans = value.plans as Array<{planId: string; revision: number}>;
   const activePlanRef = value.activePlanRef as {planId: string; revision: number} | null;
   const pendingPlan = value.pendingPlan as {planId: string; revision: number} | null;
-  const todoList = value.todoList as {
-    sourcePlanId: string;
-    sourcePlanRevision: number;
-  } | null;
   const timeline = value.timeline as Array<Record<string, unknown>>;
   const projectionRevision = value.revision as number;
   const messages = value.messages as Array<Record<string, unknown>>;
@@ -482,11 +478,6 @@ function decodeProjection(value: unknown): SessionProjection {
       && !planKeys.includes(planReferenceKey(activePlanRef)))
     || (pendingPlan !== null
       && !planKeys.includes(planReferenceKey(pendingPlan)))
-    || (todoList !== null
-      && !planKeys.includes(planReferenceKey({
-        planId: todoList.sourcePlanId,
-        revision: todoList.sourcePlanRevision,
-      })))
     || timeline.some((item) => (item.sequence as number) > projectionRevision)
     || !timelineReferencesAreValid(timeline, messages, narratives, plans, activities)
   ) {
@@ -928,7 +919,6 @@ const PLAN_STATUSES = [
   'confirmed',
   'superseded',
   'cancelled',
-  'completed',
   'invalidated',
 ] as const;
 
@@ -998,17 +988,13 @@ function isPlanOperation(value: unknown): boolean {
   if ((value.operation === 'bash' || value.operation === 'powershell')) {
     return isExactRecord(
       value,
-      ['workspaceId', 'operation', 'workspaceMode', 'executionScope'],
-      ['command', 'terminal', 'writablePaths'],
+      ['workspaceId', 'operation', 'writablePaths'],
+      ['command', 'terminal'],
     )
       && (value.command === undefined || isNonEmptyText(value.command))
-      && value.workspaceMode === 'write'
-      && (value.executionScope === 'workspace' || value.executionScope === 'host')
-      // Read stored Plan facts as declared. Required execution scope is enforced
-      // at Plan admission and execution, not while displaying historical plans.
-      && (value.writablePaths === undefined || isArrayOf(value.writablePaths, (entry) => (
+      && isArrayOf(value.writablePaths, (entry) => (
         isExactRecord(entry, ['path', 'kind']) && isNonEmptyText(entry.path) && ['file', 'directory'].includes(String(entry.kind))
-      )) && value.writablePaths.length > 0)
+      )) && value.writablePaths.length > 0
       && (value.terminal === undefined || (
         isExactRecord(value.terminal, ['stdin'])
         && typeof value.terminal.stdin === 'string'
@@ -1037,29 +1023,19 @@ function planReferenceKey(value: { planId: string; revision: number }): string {
 }
 
 function isTodoList(value: unknown): boolean {
-  if (
-    !isExactRecord(value, [
-      'sourcePlanId',
-      'sourcePlanRevision',
-      'items',
-      'sequence',
-      'updatedAt',
-    ])
-    || !isIdentifier(value.sourcePlanId)
-    || !isPositiveNaturalNumber(value.sourcePlanRevision)
-    || !isNaturalNumber(value.sequence)
-    || !isNonEmptyText(value.updatedAt)
-    || !isArrayOf(value.items, isTodoItem)
-  ) return false;
-  return new Set(value.items.map((item) => item.todoId)).size === value.items.length;
+  return isExactRecord(value, ['runId', 'revision', 'items', 'sequence', 'updatedAt'])
+    && isIdentifier(value.runId)
+    && isPositiveNaturalNumber(value.revision)
+    && isPositiveNaturalNumber(value.sequence)
+    && isNonEmptyText(value.updatedAt)
+    && isArrayOf(value.items, isTodoItem);
 }
 
-function isTodoItem(value: unknown): value is Record<string, unknown> & { todoId: string } {
-  return isExactRecord(value, ['todoId', 'sourceStepId', 'label', 'status'])
-    && isIdentifier(value.todoId)
-    && isIdentifier(value.sourceStepId)
-    && isNonEmptyText(value.label)
-    && ['pending', 'inProgress', 'completed'].includes(String(value.status));
+function isTodoItem(value: unknown): boolean {
+  return isExactRecord(value, ['text', 'status'])
+    && isNonEmptyText(value.text)
+    && typeof value.status === 'string'
+    && ['pending', 'inProgress', 'completed', 'blocked'].includes(value.status);
 }
 
 function isContextUsage(value: unknown): boolean {
@@ -1115,7 +1091,7 @@ function isContextComposition(value: unknown): boolean {
     && (value.kernelCatalogSnapshotRef === undefined || isIdentifier(value.kernelCatalogSnapshotRef))
     && isIdentifier(value.providerRequestId)
     && ['agent', 'contextCompaction'].includes(String(value.purpose))
-    && ['normal', 'toolRequired', 'answerOnly'].includes(String(value.responseConstraint))
+    && ['normal', 'answerOnly'].includes(String(value.responseConstraint))
     && isNaturalNumber(value.dynamicInstructionBytes)
     && isIdentifier(value.runId)
     && isNaturalNumber(value.sequence)

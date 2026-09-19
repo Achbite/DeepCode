@@ -553,7 +553,7 @@ export function useAgentComposer(
       next.filesystemPaths = next.filesystemPaths.filter(item => item.path !== previous.browserReview!.screenshot);
     if (next.filesystemPaths.length + next.pastedTexts.length + (screenshot ? 2 : 1) > 8)
       throw new Error(t(language, 'agent.attachment.error.maxFiles'));
-    next.pastedTexts.push({ inputId: nextPanelId('annotation'), text: formatBrowserAnnotation(annotation, language === 'zh-CN'),
+    next.pastedTexts.push({ inputId: nextPanelId('annotation'), text: formatBrowserAnnotation(annotation, previewId, language === 'zh-CN'),
       expanded: false, browserReview: { annotation, previewId, screenshot } });
     if (screenshot) next.filesystemPaths.push({ path: screenshot, kind: 'file' });
     setComposerStateForKey(key, next);

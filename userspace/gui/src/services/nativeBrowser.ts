@@ -1,7 +1,7 @@
 export interface NativeHostBinding { hostInstanceId: string; windowLabel: string; sessionId?:string }
 export interface NativePage extends NativeHostBinding {
   previewId: string; url: string; status: string; visible: boolean; serviceOwner: string;
-  kind:string; openedBy:string; serviceId?:string;
+  kind:string; serviceId?:string;
 }
 /** Translate a user's address into the existing Host navigation contract. */
 export function nativeNavigationInput(address: string): { url: string } | { filePath: string } {
@@ -28,6 +28,11 @@ export async function listenNativePages(listener:(page:NativePage)=>void):Promis
   if (!hasNativeBrowser()) return ()=>{};
   if (!window.__TAURI__?.event) throw new Error('Native browser page events are unavailable.');
   return window.__TAURI__.event.listen<NativePage>('deepcode:browser-page',({payload})=>listener(payload));
+}
+export async function listenNativeActivation(listener: (page: NativePage) => void): Promise<() => void> {
+  if (!hasNativeBrowser()) return () => {};
+  if (!window.__TAURI__?.event) throw new Error('Native browser page events are unavailable.');
+  return window.__TAURI__.event.listen<NativePage>('deepcode:browser-activate', ({ payload }) => listener(payload));
 }
 export async function nativeHostBinding(): Promise<NativeHostBinding | undefined> {
   if (!hasNativeBrowser()) return undefined;

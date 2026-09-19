@@ -246,6 +246,7 @@ function isSupportedSettingValue(value: unknown): value is UserSettingValue {
     typeof value === 'string' ||
     typeof value === 'number' ||
     typeof value === 'boolean' ||
+    (Array.isArray(value) && value.every((entry) => typeof entry === 'string')) ||
     value === null
   );
 }
@@ -261,6 +262,12 @@ function normalizeSettingValue(key: string, value: unknown): UserSettingValue {
   }
   if (key === 'gui.accentColor') {
     return normalizeGuiAccentColor(value);
+  }
+  if (Array.isArray(defaultValue)) {
+    if (!Array.isArray(value) || !value.every((entry) => typeof entry === 'string')) {
+      throw new Error(activeT('settings.commandDenylist.invalid'));
+    }
+    return value;
   }
   if (typeof defaultValue === 'boolean') return Boolean(value);
   if (typeof defaultValue === 'number') {
@@ -304,7 +311,12 @@ function hasPendingNextRunActivation(
 ): boolean {
   const keys = new Set([...Object.keys(saved), ...Object.keys(runtime)]);
   for (const key of keys) {
-    if (!Object.is(saved[key], runtime[key])) return true;
+    const savedValue = saved[key];
+    const runtimeValue = runtime[key];
+    if (Array.isArray(savedValue) && Array.isArray(runtimeValue)) {
+      if (savedValue.length !== runtimeValue.length
+        || savedValue.some((value, index) => value !== runtimeValue[index])) return true;
+    } else if (!Object.is(savedValue, runtimeValue)) return true;
   }
   return false;
 }
@@ -410,7 +422,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
         });
         return;
       }
-      applyCanonicalSettings(result.data);
+      try {
+        applyCanonicalSettings(result.data);
+      } catch (reason) {
+        set({ loading: false, errorMessage: reason instanceof Error ? reason.message : String(reason) });
+      }
     },
 
     patchUserSetting: async (key, value) => {

@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, WebviewUrl};
 #[cfg(target_os = "macos")]
@@ -36,12 +36,29 @@ struct Page {
     session_id: Option<String>,
     service_id: Option<String>,
     kind: String,
-    opened_by: String,
+}
+
+impl Page {
+    fn matches_target(
+        &self,
+        session_id: &Option<String>,
+        url: &str,
+        service_id: &Option<String>,
+        kind: &str,
+    ) -> bool {
+        self.session_id == *session_id
+            && self.url == url
+            && self.service_id == *service_id
+            && self.kind == kind
+    }
 }
 
 pub struct NativeBrowser {
+    data_root: PathBuf,
     binding: HostBinding,
     pages: Mutex<HashMap<String, Page>>,
+    page_changed: Condvar,
+    opening: tauri::async_runtime::Mutex<()>,
     stop: Arc<AtomicBool>,
     services: Mutex<HashMap<String, services::DevelopmentService>>,
     self_bootstrap: String,
@@ -62,6 +79,7 @@ impl NativeBrowser {
 
 pub fn start(
     app: &tauri::AppHandle,
+    data_root: PathBuf,
     host_instance_id: String,
     token: String,
     self_bootstrap: String,
@@ -77,11 +95,14 @@ pub fn start(
         .map_err(|error| error.to_string())?;
     let stop = Arc::new(AtomicBool::new(false));
     app.manage(NativeBrowser {
+        data_root,
         binding: HostBinding {
             host_instance_id,
             window_label: "main".into(),
         },
         pages: Mutex::new(HashMap::new()),
+        page_changed: Condvar::new(),
+        opening: tauri::async_runtime::Mutex::new(()),
         stop: Arc::clone(&stop),
         services: Mutex::new(HashMap::new()),
         self_bootstrap,
@@ -200,6 +221,23 @@ fn publish(app: &tauri::AppHandle, page: &Page) {
     let _ = app.emit_to("main", "deepcode:browser-page", page);
 }
 
+async fn activate(app: tauri::AppHandle, page: Page) -> Result<Value, String> {
+    app.emit_to("main", "deepcode:browser-activate", &page)
+        .map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<NativeBrowser>();
+        let pages = state.pages.lock().map_err(|_| "native_browser_state_unavailable")?;
+        let (pages, _) = state.page_changed.wait_timeout_while(pages, Duration::from_secs(5), |pages| {
+            pages.get(&page.preview_id).is_some_and(|page| !page.visible)
+        }).map_err(|_| "native_browser_state_unavailable")?;
+        let page = pages.get(&page.preview_id).ok_or_else(|| format!("native_browser_page_closed: {}", page.preview_id))?;
+        if !page.visible {
+            return Err(format!("native_browser_page_not_visible: {}; select this session and close any dialog covering the Reader", page.preview_id));
+        }
+        serde_json::to_value(page).map_err(|error| error.to_string())
+    }).await.map_err(|error| error.to_string())?
+}
+
 fn page_url(input: &Value) -> Result<tauri::Url, String> {
     if let Some(path) = input.get("filePath").and_then(Value::as_str) {
         let path = PathBuf::from(path)
@@ -223,11 +261,7 @@ fn page_url(input: &Value) -> Result<tauri::Url, String> {
 /// require an exact preview id. No lookup by the most recently focused window.
 pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Result<Value, String> {
     let session_id = binding["sessionId"].as_str().map(str::to_string);
-    let opened_by = if binding["runId"].is_string() {
-        "tool"
-    } else {
-        "user"
-    };
+    let tool_request = binding["runId"].is_string();
     let binding = checked_binding(&app, &binding)?;
     let action = string(&input, "action")?;
     if action.starts_with("computer:") {
@@ -238,10 +272,9 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
     }
     if action.starts_with("service") {
         let directory = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| error.to_string())?
-            .join("development-services")
+            .state::<NativeBrowser>()
+            .data_root
+            .join("logs/development-services")
             .join(&binding.host_instance_id);
         let state = app.state::<NativeBrowser>();
         let mut services = state
@@ -268,6 +301,8 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
         return Ok(json!({"pages":pages}));
     }
     if matches!(action, "open" | "openSelf") {
+        let state = app.state::<NativeBrowser>();
+        let opening = state.opening.lock().await;
         let service_id = input["serviceId"].as_str().map(str::to_string);
         let url = if action == "openSelf" {
             tauri::Url::parse("deepcode-gui://localhost/index.html")
@@ -290,6 +325,26 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
         } else {
             page_url(&input)?
         };
+        let kind = if action == "openSelf" {
+            "deepcode"
+        } else {
+            "page"
+        };
+        let existing = state
+            .pages
+            .lock()
+            .map_err(|_| "native_browser_state_unavailable")?
+            .values()
+            .find(|page| page.matches_target(&session_id, url.as_str(), &service_id, kind))
+            .cloned();
+        if let Some(page) = existing {
+            drop(opening);
+            return if tool_request {
+                activate(app.clone(), page).await
+            } else {
+                serde_json::to_value(page).map_err(|error| error.to_string())
+            };
+        }
         let id = format!("preview-{}", PAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed));
         let page = Page {
             binding: binding.clone(),
@@ -309,13 +364,7 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
             .into(),
             session_id,
             service_id,
-            kind: if action == "openSelf" {
-                "deepcode"
-            } else {
-                "page"
-            }
-            .into(),
-            opened_by: opened_by.into(),
+            kind: kind.into(),
         };
         app.state::<NativeBrowser>()
             .pages
@@ -334,6 +383,12 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
                     .ok_or("native_browser_window_closed")?;
                 let mut builder =
                     tauri::webview::WebviewBuilder::new(&id_for_create, WebviewUrl::External(url))
+                        .data_directory(
+                            app_for_create
+                                .state::<NativeBrowser>()
+                                .data_root
+                                .join("cache/webview"),
+                        )
                         .on_page_load(|webview, payload| {
                             let app = webview.app_handle();
                             let state = app.state::<NativeBrowser>();
@@ -384,6 +439,10 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
         }
         let page = page_state(&app, &id)?;
         publish(&app, &page);
+        drop(opening);
+        if tool_request {
+            return activate(app.clone(), page).await;
+        }
         return serde_json::to_value(page).map_err(|error| error.to_string());
     }
     let id = string(&input, "previewId")?;
@@ -393,27 +452,16 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
     }
     let view = app.get_webview(id).ok_or("native_browser_page_closed")?;
     match action {
+        "activate" => return activate(app.clone(), page).await,
         "reviewStart" => {
             if !page.visible {
                 return Err("Open the page before annotating it.".into());
             }
-            let options = json!({"language": input["language"], "mode": input["mode"], "annotation": input["annotation"], "reviewId": input["reviewId"]});
+            let options = json!({"labels": input["labels"], "annotation": input["annotation"], "reviewId": input["reviewId"]});
             return eval(view, format!("{}({options})", include_str!("review.js"))).await;
         }
-        "reviewMode" => {
-            let mode = string(&input, "mode")?;
-            if !matches!(mode, "element" | "region") {
-                return Err("Invalid annotation mode".into());
-            }
-            let mode = serde_json::to_string(mode).map_err(|error| error.to_string())?;
-            return eval(
-                view,
-                format!("(()=>{{window.__deepcodeReview?.setMode({mode});return {{ok:true}}}})()"),
-            )
-            .await;
-        }
         "reviewRead" => {
-            return eval(view, "JSON.parse(JSON.stringify({active:Boolean(window.__deepcodeReview?.active),exitReason:window.__deepcodeReview?.exitReason??null,pending:window.__deepcodeReview?.pending??null,mode:window.__deepcodeReview?.mode??\"element\"}))".into()).await;
+            return eval(view, "JSON.parse(JSON.stringify({active:Boolean(window.__deepcodeReview?.active),exitReason:window.__deepcodeReview?.exitReason??null,pending:window.__deepcodeReview?.pending??null}))".into()).await;
         }
         "reviewAcknowledge" => {
             let id =
@@ -499,6 +547,7 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
                 .get_mut(id)
                 .ok_or("native_browser_page_closed")?
                 .visible = visible;
+            app.state::<NativeBrowser>().page_changed.notify_all();
         }
         "focus" => {
             view.set_focus().map_err(|error| error.to_string())?;
@@ -527,7 +576,9 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
         }
         "capture" => {
             if !page.visible {
-                return Err("Cannot capture a hidden page; open its preview first.".into());
+                return Err(format!(
+                    "Cannot capture a hidden page; activate previewId {id} first."
+                ));
             }
             page.url = view.url().map_err(|error| error.to_string())?.to_string();
             let capture = capture(view).await?;
@@ -538,10 +589,9 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
             let directory = match input.get("captureDirectory").and_then(Value::as_str) {
                 Some(path) => PathBuf::from(path),
                 None => app
-                    .path()
-                    .app_data_dir()
-                    .map_err(|error| error.to_string())?
-                    .join("browser-captures")
+                    .state::<NativeBrowser>()
+                    .data_root
+                    .join("cache/browser-captures")
                     .join(&binding.host_instance_id),
             };
             std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
@@ -568,6 +618,7 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
                 .lock()
                 .map_err(|_| "native_browser_state_unavailable")?
                 .remove(id);
+            app.state::<NativeBrowser>().page_changed.notify_all();
             page.status = "closed".into();
             page.visible = false;
             publish(&app, &page);
@@ -654,4 +705,45 @@ async fn capture(view: tauri::Webview) -> Result<Capture, String> {
 #[cfg(not(target_os = "macos"))]
 async fn capture(_view: tauri::Webview) -> Result<Capture, String> {
     Err("Native viewport capture is not implemented for this platform.".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_reuse_preserves_resource_and_session_identity() {
+        let page = Page {
+            binding: HostBinding {
+                host_instance_id: "host".into(),
+                window_label: "main".into(),
+            },
+            preview_id: "preview-1".into(),
+            url: "file:///input/interactive-test.html".into(),
+            session_id: Some("session:one".into()),
+            service_id: None,
+            kind: "page".into(),
+            service_owner: "file".into(),
+            status: "ready".into(),
+            visible: false,
+        };
+        assert!(
+            page.matches_target(&page.session_id, &page.url, &None, "page"),
+            "a hidden user page can be reused by a tool"
+        );
+        assert!(!page.matches_target(&Some("session:two".into()), &page.url, &None, "page"));
+        assert!(!page.matches_target(
+            &page.session_id,
+            "file:///project/interactive-test.html",
+            &None,
+            "page"
+        ));
+        assert!(!page.matches_target(
+            &page.session_id,
+            &page.url,
+            &Some("service:one".into()),
+            "page"
+        ));
+        assert!(!page.matches_target(&page.session_id, &page.url, &None, "deepcode"));
+    }
 }

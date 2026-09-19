@@ -128,11 +128,9 @@ export function PlanCardContent({ plan, previousPlan, workspaceBindings = [], la
 
 function planOperationDetail(operation: PlanOperation, language: UiLanguage = 'zh-CN'): string {
   const chinese = language === 'zh-CN';
-  if ('workspaceMode' in operation) {
-    const scope = operation.executionScope === 'host' ? (chinese ? '宿主机' : 'Host') : (chinese ? '工作区' : 'Workspace');
-    const paths = operation.writablePaths?.map((target) => target.path + (target.kind === 'directory' ? '/' : '')).join(', ');
-    const mode = (chinese ? '允许修改' : 'May modify') + (paths ? `: ${paths}` : '');
-    return `${chinese ? '执行命令' : 'Run command'} · ${scope} · ${mode}${operation.command ? `\n${operation.command}` : ''}${operation.terminal ? (chinese ? ' · 交互终端' : ' · Interactive terminal') : ''}`;
+  if ('writablePaths' in operation) {
+    const paths = operation.writablePaths.map((target) => target.path + (target.kind === 'directory' ? '/' : '')).join(', ');
+    return `${t(language, 'agent.tool.shell.command')} · ${t(language, 'agent.tool.shell.writeScope')}: ${paths}${operation.command ? `\n${operation.command}` : ''}${operation.terminal ? ` · ${t(language, 'agent.plan.interactiveTerminal')}` : ''}`;
   }
   const label = operation.operation === 'fs.delete' ? (chinese ? '删除' : 'Delete')
     : operation.operation === 'fs.write' ? (chinese ? '写入' : 'Write') : (chinese ? '编辑' : 'Edit');

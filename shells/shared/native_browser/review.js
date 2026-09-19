@@ -1,6 +1,5 @@
-(function startReview({ language, mode: initialMode, annotation, reviewId }) {
+(function startReview({ labels, annotation, reviewId }) {
   window.__deepcodeReview?.dispose();
-  const zh = language === 'zh-CN';
   const host = document.createElement('div');
   host.style.cssText = 'all:initial;position:fixed;inset:0;z-index:2147483647;pointer-events:none';
   const root = host.attachShadow({ mode: 'closed' });
@@ -22,33 +21,33 @@
     [hidden] { display:none !important; }
   </style>
   <div class="box" hidden><span class="label">1</span></div>
-  <form class="editor" role="dialog" aria-label="${zh ? '区域批注' : 'Annotation'}" hidden>
-    <div class="heading">${zh ? '批注' : 'Annotation'}</div>
-    <textarea required aria-label="${zh ? '区域点评' : 'Comment'}" placeholder="${zh ? '描述需要调整的地方…' : 'Describe the change…'}"></textarea>
-    <div class="actions"><button type="button" data-cancel>${zh ? '取消' : 'Cancel'}</button><button type="submit">${zh ? '保存批注' : 'Save annotation'}</button></div>
+  <form class="editor" role="dialog" aria-label="${labels.annotation}" hidden>
+    <div class="heading">${labels.annotation}</div>
+    <textarea required aria-label="${labels.comment}" placeholder="${labels.placeholder}"></textarea>
+    <div class="actions"><button type="button" data-cancel>${labels.cancel}</button><button type="submit">${labels.save}</button></div>
   </form><div class="hint"></div>`;
   document.documentElement.append(host);
   const box = root.querySelector('.box'), editor = root.querySelector('.editor'), input = root.querySelector('textarea');
   const hint = root.querySelector('.hint');
   const events = new AbortController();
-  let mode = initialMode === 'region' ? 'region' : 'element';
-  let selected = null, origin = null, pending = null, pressTimer = null, dragging = false, editingId = null;
-  const state = { reviewId, active: true, mode, pending: null, dispose, acknowledge, setMode };
+  let selected = null, origin = null, pending = null, pressTimer = null, dragging = false, editingId = null, pointerId = null;
+  const state = { reviewId, active: true, pending: null, dispose, acknowledge };
   window.__deepcodeReview = state;
   function clearPress() { clearTimeout(pressTimer); pressTimer = null; }
   function dispose(reason) {
-    clearPress(); events.abort(); host.remove(); state.active = false;
+    endGesture(); events.abort(); host.remove(); state.active = false;
     state.exitReason = reason === 'escape' ? 'escape' : null;
   }
-  function updateHint() { hint.textContent = zh ? (mode === 'region' ? '拖动选取区域 · Esc 退出' : '点击选取元素 · 长按拖动框选 · Esc 退出') : (mode === 'region' ? 'Drag to select · Esc to exit' : 'Click an element · Hold and drag a region · Esc to exit'); }
-  function cancel() { clearPress(); origin = null; editor.hidden = true; selected = null; box.hidden = true; input.value = ''; editingId = null; }
-  function setMode(next) {
-    if (pending) throw new Error(zh ? '正在保存批注。' : 'Annotation is being saved.');
-    cancel(); mode = next === 'region' ? 'region' : 'element'; state.mode = mode; updateHint();
+  function updateHint() { hint.textContent = labels.hint; }
+  function endGesture() {
+    clearPress(); origin = null; dragging = false;
+    if (pointerId !== null && shield.hasPointerCapture(pointerId)) shield.releasePointerCapture(pointerId);
+    pointerId = null;
   }
+  function cancel() { endGesture(); editor.hidden = true; selected = null; box.hidden = true; input.value = ''; editingId = null; }
   function acknowledge(id) {
     if (pending?.id !== id) return;
-    pending = null; state.pending = null; cancel(); mode = 'element'; state.mode = mode; updateHint();
+    pending = null; state.pending = null; cancel();
   }
   function paint(rect) {
     box.hidden = false;
@@ -69,7 +68,7 @@
     if (!element) return null;
     const rect = element.getBoundingClientRect();
     const x = Math.max(0, rect.x), y = Math.max(0, rect.y);
-    return { rect: { x, y, width: Math.max(0, Math.min(innerWidth, rect.right) - x), height: Math.max(0, Math.min(innerHeight, rect.bottom) - y) }, selector: selector(element),
+    return { mode: 'element', rect: { x, y, width: Math.max(0, Math.min(innerWidth, rect.right) - x), height: Math.max(0, Math.min(innerHeight, rect.bottom) - y) }, selector: selector(element),
       text: (element.innerText ?? element.getAttribute('aria-label') ?? '').trim().slice(0, 1600), tag: element.localName };
   }
   function targetAt(x, y) {
@@ -79,7 +78,7 @@
   }
   function region(x, y) {
     const endX = Math.max(0, Math.min(innerWidth, x)), endY = Math.max(0, Math.min(innerHeight, y));
-    return { rect: { x: Math.min(origin.x, endX), y: Math.min(origin.y, endY), width: Math.abs(endX - origin.x), height: Math.abs(endY - origin.y) }, selector: null, text: '', tag: null };
+    return { mode: 'region', rect: { x: Math.min(origin.x, endX), y: Math.min(origin.y, endY), width: Math.abs(endX - origin.x), height: Math.abs(endY - origin.y) }, selector: null, text: '', tag: null };
   }
   function positionEditor() {
     if (!selected || editor.hidden) return;
@@ -104,30 +103,31 @@
     if (origin && dragging) selected = region(event.clientX,event.clientY);
     else {
       if (origin && Math.hypot(event.clientX-origin.x,event.clientY-origin.y)>7) clearPress();
-      if (mode === 'element') selected = targetAt(event.clientX,event.clientY);
+      selected = targetAt(event.clientX,event.clientY);
     }
     if (selected) paint(selected.rect); else box.hidden = true;
   });
   shield.addEventListener('pointerdown', event => {
-    if (event.button !== 0 || !editor.hidden || pending) return;
+    if (event.button !== 0 || origin || !editor.hidden || pending) return;
     event.preventDefault(); event.stopPropagation(); document.getSelection()?.removeAllRanges();
-    shield.setPointerCapture(event.pointerId); origin = { x: event.clientX, y: event.clientY }; dragging = mode === 'region';
-    selected = dragging ? region(event.clientX,event.clientY) : targetAt(event.clientX,event.clientY);
-    clearPress(); pressTimer = setTimeout(() => { if (origin) { dragging = true; mode = 'region'; state.mode = mode; updateHint(); } },420);
+    pointerId = event.pointerId; shield.setPointerCapture(pointerId); origin = { x: event.clientX, y: event.clientY }; dragging = false;
+    selected = targetAt(event.clientX,event.clientY);
+    clearPress(); pressTimer = setTimeout(() => { if (origin) { dragging = true; selected = region(origin.x, origin.y); paint(selected.rect); } },420);
   });
   shield.addEventListener('pointerup', event => {
     clearPress(); if (!shield.hasPointerCapture(event.pointerId)) return;
-    event.preventDefault(); event.stopPropagation(); shield.releasePointerCapture(event.pointerId);
+    event.preventDefault(); event.stopPropagation();
     if (origin && dragging) selected = region(event.clientX,event.clientY);
-    origin = null;
+    endGesture();
     if (selected) { paint(selected.rect); openEditor(); }
   });
   shield.addEventListener('pointercancel', cancel);
+  shield.addEventListener('lostpointercapture', () => { if (origin) cancel(); });
   shield.addEventListener('wheel', event => event.preventDefault(), { passive: false });
   root.querySelector('[data-cancel]').addEventListener('click', cancel);
   editor.addEventListener('submit', event => {
     event.preventDefault(); if (!selected || !input.value.trim()) return;
-    pending = { id: editingId ?? crypto.randomUUID(), mode, ...selected, url: location.href, title: document.title,
+    pending = { id: editingId ?? crypto.randomUUID(), ...selected, url: location.href, title: document.title,
       viewport: { width: innerWidth, height: innerHeight, scrollX, scrollY }, comment: input.value.trim() };
     state.pending = pending; editor.hidden = true;
   });
@@ -136,7 +136,7 @@
     else if (!event.composedPath().includes(host)) { event.preventDefault(); event.stopPropagation(); }
   }, { capture: true, signal: events.signal });
   window.addEventListener('resize', () => {
-    clearPress(); origin = null;
+    endGesture();
     if (selected?.selector) {
       selected = elementTarget(document.querySelector(selected.selector));
       if (selected) { paint(selected.rect); positionEditor(); return; }
@@ -150,15 +150,15 @@
   updateHint();
   if (annotation) {
     try {
-      if (annotation.url !== location.href) throw new Error(zh ? '页面地址已变化，请重新选取批注区域。' : 'The page has changed. Select the annotation region again.');
+      if (annotation.url !== location.href) throw new Error(labels.pageChanged);
       if (annotation.mode === 'element') selected = elementTarget(document.querySelector(annotation.selector));
       else {
         const v = annotation.viewport;
         if (v.width !== innerWidth || v.height !== innerHeight || v.scrollX !== scrollX || v.scrollY !== scrollY)
-          throw new Error(zh ? '视口已变化，请重新选取批注区域。' : 'The viewport has changed. Select the annotation region again.');
-        selected = { rect: annotation.rect, selector: null, text: annotation.text };
+          throw new Error(labels.viewportChanged);
+        selected = { mode: 'region', rect: annotation.rect, selector: null, text: annotation.text, tag: null };
       }
-      if (!selected || selected.rect.width < 2 || selected.rect.height < 2) throw new Error(zh ? '原批注区域当前不可见。' : 'The original annotation region is not visible.');
+      if (!selected || selected.rect.width < 2 || selected.rect.height < 2) throw new Error(labels.notVisible);
       editingId = annotation.id; input.value = annotation.comment; paint(selected.rect); openEditor();
     } catch (error) { dispose(); throw error; }
   }

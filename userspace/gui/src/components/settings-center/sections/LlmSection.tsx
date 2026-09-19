@@ -23,6 +23,10 @@ export function LlmProfileReadNotice({ state, hasProfiles, language }: { state: 
 function newModel(connection: ModelConnection, adapter: ProviderAdapterDescriptor): LlmProviderProfile {
   return { ...(adapter.models[0] ?? { name: '', model: '', kind: adapter.protocols[0], providerFlavor: 'openai', enabled: true, contextWindowTokens: 128000, maxOutputTokens: 16000 }), id: `model:${crypto.randomUUID()}`, connectionId: connection.id };
 }
+function connectionSettings(connection: ModelConnection): ModelConnection {
+  const { id, name, adapterId, billingMode, baseUrl, credentialKind } = connection;
+  return { id, name, adapterId, billingMode, baseUrl, credentialKind };
+}
 
 function ConnectionDetail({ current, adapters, profiles, defaultId, mode, onSaved, onBack }: {
   current?: ConnectionSummary; adapters: ProviderAdapterDescriptor[]; profiles: LlmProviderProfile[];
@@ -32,7 +36,7 @@ function ConnectionDetail({ current, adapters, profiles, defaultId, mode, onSave
   const theme = useDisplayTheme();
   const available = adapters.filter(a => a.billingModes.includes(mode));
   const first = available[0];
-  const [draft, setDraft] = useState<ModelConnection>(current ?? {
+  const [draft, setDraft] = useState<ModelConnection>(current ? connectionSettings(current) : {
     id: `connection:${crypto.randomUUID()}`, name: first.name, adapterId: first.id, billingMode: mode,
     baseUrl: first.defaultBaseUrl, credentialKind: mode === 'subscription' ? 'oauth' : first.authMethods.includes('none') ? 'none' : 'apiKey',
   });
@@ -44,11 +48,11 @@ function ConnectionDetail({ current, adapters, profiles, defaultId, mode, onSave
   const [saved, setSaved] = useState(false);
   const models = profiles.filter(p => p.connectionId === draft.id);
   const baseline = useRef(JSON.stringify(draft));
-  useInterfaceReloadGuard(!!apiKey || JSON.stringify(draft) !== (current ? JSON.stringify(current) : baseline.current), draft.name, busy);
+  useInterfaceReloadGuard(!!apiKey || JSON.stringify(draft) !== (current ? JSON.stringify(connectionSettings(current)) : baseline.current), draft.name, busy);
   const save = async () => {
     setBusy(true); setError(''); setSaved(false);
     try {
-      data(await patchModelConnections({ connection: draft, ...(apiKey ? { apiKey } : {}), ...(!current && adapter.models.length ? { profile: newModel(draft, adapter) } : {}) }));
+      data(await patchModelConnections({ connection: draft, ...(apiKey ? { apiKey } : {}) }));
       setApiKey(''); await onSaved(draft.id); setSaved(true);
     } catch (e) { setError(message(e)); } finally { setBusy(false); }
   };

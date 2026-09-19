@@ -482,8 +482,13 @@ const store = create<LocalAgentState>((set, get) => ({
     onSessionCreated,
   ) => {
     const trimmed = text.trim();
-    if (!trimmed && !pastedTexts.length) throw new Error('message_empty');
-    if (trimmed.startsWith('/')) throw new Error(`conversation_command_unknown:${trimmed}`);
+    const inputError = !trimmed && !pastedTexts.length
+      ? 'message_empty'
+      : trimmed.startsWith('/') ? `conversation_command_unknown:${trimmed}` : null;
+    if (inputError) {
+      set({ error: inputError, errorSource: 'command' });
+      throw new Error(inputError);
+    }
     return await submitNewRun(
       set,
       get,

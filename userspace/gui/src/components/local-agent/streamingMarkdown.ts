@@ -5,12 +5,31 @@ import remarkMath from 'remark-math';
 import remarkRehype from 'remark-rehype';
 import rehypeKatex from 'rehype-katex';
 import { defaultUrlTransform } from 'react-markdown';
-import type { Root as MarkdownRoot } from 'mdast';
+import type { Root as MarkdownRoot, Nodes as MarkdownNode } from 'mdast';
 import type { Root, RootContent } from 'hast';
 
 const parser = unified().use(remarkParse).use(remarkGfm).use(remarkMath);
 const converter = unified().use(remarkRehype, { allowDangerousHtml: true }).use(rehypeKatex);
 export interface MarkdownBlock { key: string; tree: Root; streaming: boolean }
+
+/** Display escaped paragraph separators only in decision prose; preserve the source and code. */
+export function formatDecisionProse(text: string): string {
+  if (!text.includes('\\n\\n')) return text;
+  const replacements: Array<{ start: number; end: number; value: string }> = [];
+  const visit = (node: MarkdownNode): void => {
+    if (node.type === 'text' && node.position) {
+      const start = node.position.start.offset!, end = node.position.end.offset!;
+      const raw = text.slice(start, end);
+      const value = raw.replace(/(?<!\\)(?:\\n){2,}/g, (separator) => '\n'.repeat(separator.length / 2));
+      if (value !== raw) replacements.push({ start, end, value });
+    } else if ('children' in node && node.type !== 'link' && node.type !== 'linkReference') {
+      node.children.forEach(visit);
+    }
+  };
+  visit(parser.parse(text));
+  for (const { start, end, value } of replacements.reverse()) text = text.slice(0, start) + value + text.slice(end);
+  return text;
+}
 
 function renderTree(root: MarkdownRoot): Root {
   const tree = converter.runSync(root) as Root;

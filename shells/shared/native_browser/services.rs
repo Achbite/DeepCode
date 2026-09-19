@@ -1,20 +1,28 @@
+use deepcode_host_connection::process::{
+    spawn_owned_host_process, terminate_owned_process_tree_checked, OwnedHostProcess,
+};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     fs::OpenOptions,
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
 };
 
 pub(super) struct DevelopmentService {
-    child: Child,
+    process: OwnedHostProcess,
     stopped: bool,
     pub(super) description: Value,
 }
 
 impl DevelopmentService {
     fn status(&mut self) -> Result<Value, String> {
-        if let Some(status) = self.child.try_wait().map_err(|error| error.to_string())? {
+        if let Some(status) = self
+            .process
+            .child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+        {
             self.description["status"] = json!("exited");
             self.description["exitCode"] = json!(status.code());
             self.stop()?;
@@ -26,36 +34,8 @@ impl DevelopmentService {
         if self.stopped {
             return Ok(());
         }
-        // Only this Child's process group was created here. Never search by port
-        // or executable name; connected services have no Child in this registry.
-        #[cfg(unix)]
-        unsafe {
-            if libc::kill(-(self.child.id() as i32), libc::SIGTERM) != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(error.to_string());
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        self.child.kill().map_err(|error| error.to_string())?;
-        for _ in 0..20 {
-            if self
-                .child
-                .try_wait()
-                .map_err(|error| error.to_string())?
-                .is_some()
-            {
-                self.stopped = true;
-                return Ok(());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
-        }
-        self.child.wait().map_err(|error| error.to_string())?;
+        terminate_owned_process_tree_checked(&mut self.process)
+            .map_err(|error| error.to_string())?;
         self.stopped = true;
         Ok(())
     }
@@ -63,7 +43,9 @@ impl DevelopmentService {
 
 impl Drop for DevelopmentService {
     fn drop(&mut self) {
-        let _ = self.stop();
+        if let Err(error) = self.stop() {
+            eprintln!("Development service cleanup failed: {error}");
+        }
     }
 }
 
@@ -127,20 +109,14 @@ pub(super) fn execute(
             .stdin(Stdio::null())
             .stdout(log.try_clone().map_err(|error| error.to_string())?)
             .stderr(log);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-        let child = command
-            .spawn()
+        let process = spawn_owned_host_process(&mut command)
             .map_err(|error| format!("Development service start failed: {error}"))?;
         let description = json!({"serviceId":id,"owner":"host","sessionId":session_id,"url":url.as_str(),
-            "directory":root,"command":executable,"args":input["args"],"pid":child.id(),"status":"started","logPath":log_path});
+            "directory":root,"command":executable,"args":input["args"],"pid":process.child.id(),"status":"started","logPath":log_path});
         services.insert(
             id,
             DevelopmentService {
-                child,
+                process,
                 stopped: false,
                 description: description.clone(),
             },
