@@ -2,15 +2,17 @@
 
 **0.6.2** · [English](README.md)
 
+DeepCode 是优先在本机工作的编程 Agent，提供桌面 GUI、用于脚本的 CLI 和交互式 TUI。三种入口共享对话、工具记录、模型连接和权限设置。
+
 ## 快速使用
 
-从 [Releases](https://github.com/Achbite/DeepCode/releases) 下载对应平台的程序包，解压后打开 GUI：
+按[从源码编译](#从源码编译)生成当前程序包，也可在 [Releases](https://github.com/Achbite/DeepCode/releases) 有对应产物时下载。安装包与解压版的入口如下：
 
-| 平台 | 启动方式 |
+| 平台 | 安装或启动方式 |
 | --- | --- |
-| macOS Apple Silicon | `open DeepCode-GUI.app` |
-| Windows x64 | `DeepCode-GUI.exe` |
-| Linux x64 / ARM64 | `./DeepCode-GUI` |
+| macOS Apple Silicon | 运行 `DeepCode-<version>-macos-arm64.pkg`，再打开 `/Applications/DeepCode-GUI.app`；解压版直接打开包内的 `DeepCode-GUI.app`。 |
+| Windows x64 | 运行 `DeepCode-<version>-win64-setup.exe`，再从开始菜单打开 DeepCode；解压版打开 `DeepCode-GUI.exe`。 |
+| Linux x64 / ARM64 | 解压对应架构的程序包后运行 `./DeepCode-GUI`。 |
 
 在 **设置 → 模型与服务** 中添加 API 连接，或登录支持的 Coding Plan。新建对话、选择模型，即可描述任务。项目菜单中的 **管理工作区** 用于配置文件夹和执行环境；Windows 项目可以选择本地 Shell 或 WSL。
 
@@ -25,18 +27,20 @@
 ./deepcode-tui -C /path/to/project
 ```
 
+通过 PKG 或 Windows Setup 安装后，可在终端直接使用 `deepcode-cli` 和 `deepcode-tui`；Windows 需重新打开终端以读取更新后的 PATH。
+
 `-C` 显式选择工作目录；省略时创建独立对话，使用 `--session <id>` 可以继续已有对话。更多命令见 `--help`，连接与订阅配置见 [模型与服务](docs/product/model-services.md)。
 
-GUI 支持向消息附加文件或文件夹、查看产物和 diff，以及让 Agent 打开 HTML 预览。浏览器批注仅通过工具栏按钮或 Esc 退出。新对话继承上次选择的模型及该模型记住的推理强度。重载界面使用 macOS 的 **Cmd+Shift+R**，其他平台使用 **Ctrl+Shift+R**。
+GUI 支持向消息附加文件或文件夹、查看产物和 diff，以及让 Agent 打开 HTML 预览。浏览器批注仅通过工具栏按钮或 Esc 退出。新对话继承上次提交任务使用的模型及该模型记住的推理强度。重载界面使用 macOS 的 **Cmd+Shift+R**，其他平台使用 **Ctrl+Shift+R**。
 
-Windows GUI 需要 WebView2 Evergreen Runtime，Linux GUI 需要 GTK/WebKitGTK。macOS 程序包使用 ad-hoc 签名，详见 [程序包说明](docs/distribution.md)。
+Windows Setup 会在缺少 WebView2 Evergreen Runtime 时安装它，解压版需自行准备该依赖。Linux GUI 需要 GTK/WebKitGTK。macOS 程序包使用 ad-hoc 签名。配置、持久数据、缓存、临时文件和日志分别使用对应的平台目录，详见[安装与用户文件](docs/distribution.md)。
 
 ## 从源码编译
 
 先安装 Docker 和 GNU Make。Windows 请在已启用 Docker 集成的 WSL2 中运行构建命令。打包 macOS 还需要宿主机的 Xcode Command Line Tools、`rust-toolchain.toml` 指定的 Rust 工具链和 Node.js。
 
 ```bash
-git clone https://github.com/Achbite/DeepCode.git
+git clone --branch dev-main https://github.com/Achbite/DeepCode.git
 cd DeepCode
 make shell
 ```
@@ -50,7 +54,7 @@ make shell
 | Linux，与容器架构一致 | `bash ./build.sh --stage package-linux` | `bin/linux-x64/` 或 `bin/linux-arm64/` |
 | 所有可用平台 | `bash ./build.sh` | 上述受支持平台的目录 |
 
-共享 TypeScript、GUI、Linux 程序和 Windows 交叉编译都在 Docker 中执行。macOS 原生编译与签名通过通道交给 Mac 宿主。不可用的平台会明确列出，构建错误仍会返回失败。每个平台也会在 `bin/` 生成带版本号的压缩包；已有用户配置和会话会保留，且不会进入压缩包。
+共享 TypeScript、GUI、Linux 程序和 Windows 交叉编译都在 Docker 中执行。macOS 原生编译与签名通过通道交给 Mac 宿主。不可用的平台会明确列出，构建错误仍会返回失败。每个平台也会在 `bin/` 生成带版本号的压缩包，macOS 另生成 PKG，Windows 另生成 Setup 安装包。用户配置和会话保存在程序目录之外，不会进入程序包。
 
 只更新已有程序包的前端：
 
@@ -58,17 +62,16 @@ make shell
 make ui-update UI_PACKAGE=bin/macos-arm64
 ```
 
-其他平台替换为 `bin/win64` 或对应 Linux 目录。macOS 资源更新在宿主机运行以完成签名，随后重载界面。后端发生变化时仍需构建对应服务或程序包。详见 [分发与构建说明](docs/distribution.md)。
+其他平台替换为 `bin/win64` 或对应 Linux 目录。此命令构建并复制 GUI 资源；macOS 资源更新在宿主机运行以完成签名，随后重载界面。它不会替换正在运行的 Session 或 Kernel；修改这些服务的源码或内置产品说明后，需要构建对应服务或程序包并重启。插件的更新时机见[运行管理](docs/product/operations.md#updates)。
 
 ## 产品介绍
 
-DeepCode 是优先在本机工作的编程 Agent，提供桌面 GUI、用于脚本的 CLI 和交互式 TUI。三种入口共享对话、工具记录、模型连接和权限设置。
-
 - **处理项目任务：** 读取和修改文件、搜索代码、执行 Bash 或 PowerShell、检查 diff。工作区访问和外部操作遵循配置的权限策略。
+- **查看任务进度：** 任务面板展示 Agent 维护的阶段列表和状态，同类工作可以合并为一个阶段。阶段进度与工具结果、Plan 审批分别呈现。
 - **预览并持续修改：** 通过截图和页面交互检查内置浏览器，选取元素或区域批注，在同一对话中继续修改。原始附件保持只读，可编辑副本可以放在 DeepCode 管理的会话目录中。
 - **使用模型服务：** API 连接与订阅服务分别配置和查看用量。Provider 返回的 Token、缓存计数与上下文估算分开呈现。
 - **扩展工具与界面：** 通过 Skill、CLI 工具、MCP 和 UI 插件扩展能力。Agent 可以发现并激活可用插件，用户也可以显式引用。外部电脑控制目前支持 macOS，每次调用需要额外授权。
-- **生成与阅读文档：** 生成 HTML、Markdown、PDF 产物并在界面中预览。PDF 生成需要安装 [文档运行环境](skills/deepcode-documents/SKILL.md)。
+- **生成与阅读文档：** 生成 HTML、Markdown、PDF 产物。文件阅读器展示文本源码和 PDF，HTML 页面可在内置浏览器中打开。PDF 阅读使用内置 Web 阅读器，PDF 生成需要安装[文档运行环境](skills/deepcode-documents/SKILL.md)。
 
 工作区数据、会话日志和工具执行保留在本机。选中的提示词、上下文和图片会发送给配置的模型服务；如果模型服务也在本机运行，则无需发送到远程 Provider。
 

@@ -64,7 +64,7 @@ Reloading the plugin replaces its own DOM and effects; conversation state, draft
 
 ## Application updates
 
-Close and reopen DeepCode after installing an application update. Editing an enabled UI plugin updates that plugin in the current window and keeps the conversation draft intact. Native application or backend changes require a program update.
+Editing an enabled UI plugin's compiled module updates that plugin in the current window and keeps the conversation draft intact. Rebuilt application UI resources take effect after an interface reload; Session, Kernel and native changes require the corresponding build and process restart. For complete application updates and persistent Host shutdown, see [update timing](operations.md#updates).
 
 ## Component preview and source template
 
@@ -82,8 +82,8 @@ A local CLI plugin uses a `deepcode-tool.json` manifest and its declared executa
 
 ## Preview surfaces
 
-One conversation-header button, after the run status, toggles the reader. Tabs retain loaded documents and native page instances while collapsed. The separator adjusts width; the upper-right expand/restore control fills the workspace and returns to split mode. Closing a tab closes that page; collapsing only hides it. Task and Session output cards keep their existing appearance. Artifact references use readable names while the reader exposes full locations on demand. Fixed artifacts read archived bytes, including historical screenshots.
+The conversation header's browser and preview button toggles the reader. Tabs retain loaded documents and native page instances while collapsed. The separator adjusts width; the upper-right expand/restore control fills the workspace and returns to split mode. Closing a tab closes that page; collapsing only hides it. The task panel shows phase descriptions and statuses, while the output panel lists artifacts. Artifact references use readable names while the reader exposes full locations on demand. Fixed artifacts read archived bytes, including historical screenshots.
 
-The native browser's **Annotate / 批注** button sits immediately to the right of Refresh. Select a DOM element or draw a region, enter a comment and add it to the ordinary conversation draft. Page URL, selector, viewport and selected text are quoted as page evidence, separately from the comment. macOS also attaches the marked viewport capture using the existing image attachment path; other platforms retain region metadata because native capture is currently macOS-only. Frames are selectable as a box; use region selection for details inside a frame. Escape cancels selection, and closing, navigating, resizing or switching away ends annotation. Nothing is automatically submitted to the model.
+The native browser's **Annotate / 批注** button sits immediately to the right of Refresh. Select a DOM element or draw a region, enter a comment and add it to the ordinary conversation draft. Page URL, selector, viewport and selected text are quoted as page evidence, separately from the comment. macOS also attaches the marked viewport capture using the existing image attachment path; other platforms retain region metadata because native capture is currently macOS-only. Frames are selectable as a box; use region selection for details inside a frame. Adding a comment keeps annotation mode active for another selection. Exit with the toolbar's close button or Escape. Resizing refreshes the selected element's geometry or clears the selection, without leaving annotation mode. While a page is hidden or loading, its overlay is removed; an active annotation mode resumes when that page is visible and ready. Closing a tab disposes that page and its annotation state. Nothing is automatically submitted to the model.
 
 Dragging the reader separator suppresses text selection only for the drag lifetime. Pointer release, cancellation, loss of capture, window blur and unmount restore normal selection and copying.

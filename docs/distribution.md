@@ -44,8 +44,16 @@ GUI 需要 WebView2 Evergreen Runtime。Setup 检测到缺失时会下载并运�
 
 ## 更新与功能配置
 
-更新前关闭 DeepCode，再运行新安装包或替换解压版程序。设置、会话和附件位于用户目录，更新程序不会覆盖这些文件。
+更新前结束或取消正在执行的任务，并关闭 DeepCode 的各个入口。若曾用 `deepcode-cli start-host` 启动常驻后台服务，先执行 `deepcode-cli stop-host`，再运行新安装包或替换解压版程序。设置、会话和附件位于用户目录，更新程序不会覆盖这些文件。
 
-UI 插件保存已编译的入口模块后可在窗口中更新；已启用 Skill 和 CLI 插件的内容修改在下一次模型请求前读取，正在执行的调用保留其已准备内容。模型、权限和执行环境等设置在下一次运行生效。完整程序更新后重新启动 DeepCode。详见[插件说明](product/ui-plugins.md)和[模型服务](product/model-services.md)。
+| 调整内容 | 生效时机 |
+| --- | --- |
+| 已启用 UI 插件的编译后入口模块或 manifest | 保存后在当前 GUI 窗口更新；TypeScript 源码需先编译为插件声明的 JavaScript 入口。 |
+| 当前运行已选用的 Skill、CLI 插件内容 | 下一次模型请求前重新准备；已有请求、待审批调用和正在执行的调用保留原内容与绑定。 |
+| 模型、权限、插件注册和执行环境设置 | 下一次运行生效。 |
+| 更新后的 GUI 资源 | macOS 使用 Cmd+Shift+R，其他平台使用 Ctrl+Shift+R 重载界面。 |
+| Session、Kernel、原生程序或内置产品说明 | 安装对应构建产物并重启相关进程，修改源码不会直接更新运行中的程序。 |
 
-PDF 导出需要可用的 WeasyPrint Python 环境，可在设置中指定 Python 路径。
+Skill、CLI 插件及运行设置的生效边界适用于 GUI、CLI 和 TUI；UI 插件仅影响图形界面。完整程序更新后重新打开 DeepCode。详见[插件说明](product/ui-plugins.md)和[模型服务](product/model-services.md)。
+
+PDF 阅读使用包内 Web 阅读器，不需要安装 Python。PDF 导出需要可用的 WeasyPrint Python 环境，可在设置中指定 Python 路径。
