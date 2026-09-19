@@ -8,7 +8,7 @@ PowerShell user scripts are passed as temporary UTF-8 BOM `.ps1` files, with no 
 
 ## Explicit WSL projects
 
-Open the project menu > Manage workspace > Runtime shell. Choose WSL, name the distribution and specify the Linux `deepcode-kernel-daemon` executable installed inside it (an absolute path or a command on that distribution's PATH). Use a Linux package built from the current implementation; a Windows `.exe` cannot be used as the Linux worker.
+Open the project menu > Manage workspace > Runtime shell. Choose WSL, name the distribution and specify the Linux package's `deepcode-kernel` executable installed inside it, for example `/opt/deepcode/deepcode-kernel` (an absolute path or a command on that distribution's PATH). Set this field to the actual installed executable. Use a Linux package built from the current implementation; a Windows `.exe` cannot be used as the Linux worker.
 
 Workspace filesystem tools and Bash execute in a single-invocation Linux Kernel worker through `wsl.exe --distribution ... --exec ... --kernel-tool-worker`. The worker does not create a Session, start a Provider, open a service port or write a second journal. The Windows Host and shared Session continue to own conversation identity, Plan admission, tool records and progress. Native Windows paths are translated using `wslpath`; a WSL UNC project must belong to the selected distribution. Output archives remain in the Session-owned storage directory.
 
