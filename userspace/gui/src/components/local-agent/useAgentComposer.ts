@@ -8,7 +8,7 @@ import { t, type UiLanguage } from '../../i18n';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import { shouldOfferFocusCommand, shouldSubmitComposerKey } from './composerKeyboard';
 import { planScopeAddition } from './planReview';
-import { isLongPastedText, type PastedTextInput } from '../../services/pastedText';
+import { isLongPastedText } from '../../services/pastedText';
 import { cloneComposerState, composerStateIsEmpty, emptyComposerState, submitComposerState, type ComposerState } from './composerSubmission';
 
 function readComposerDraft(key:string):ComposerState {

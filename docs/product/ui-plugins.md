@@ -78,7 +78,7 @@ The same management list includes tool and guidance sources. Existing owners rem
 
 Local CLI bundles, MCP servers and text Skills can contribute capabilities. Registration, activation and execution permissions are separate: adding a source does not authorize its tools to access files or run commands.
 
-A local CLI plugin uses a `deepcode-tool.json` manifest and its declared executable entry. The Host reads metadata before adding; it does not run the entry during inspection. Enabled sources become available when mentioned by the user or activated for a relevant task. The Session checks selected implementations at the next request boundary, refreshing definitions, prompt contributions, aliases and bindings together. Disabled sources withdraw from that next request; prior requests and approvals retain their captured implementation. Kernel still authorizes and records execution. Changing the interpreter, native binary or Host requires the corresponding process/package update; the local source watcher does not reload Host services.
+A local CLI plugin uses a `deepcode-tool.json` manifest and its declared executable entry. The Host reads metadata before adding; it does not run the entry during inspection. See [plugin activation and update timing](operations.md#models-and-context) for user mentions, Agent activation and the distinction between source updates and saved configuration changes. Changing an interpreter, native binary or Host requires the corresponding process/package update.
 
 ## Preview surfaces
 

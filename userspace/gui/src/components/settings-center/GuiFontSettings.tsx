@@ -1,5 +1,5 @@
 import { useInterfaceReloadGuard } from '../../services/interfaceReload';
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { t, type UiLanguage } from '../../i18n';
 import { useSettingsStore } from '../../state/settingsStore';
 import { UI_FONT_FAMILY_SETTING, UI_FONT_SIZE_SETTING, UI_FONT_PRESETS, uiFontFamily, uiFontSize } from '../../theme/typography';

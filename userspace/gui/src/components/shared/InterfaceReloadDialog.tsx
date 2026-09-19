@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { interfaceReloadGuards, reloadInterface } from '../../services/interfaceReload';
 import { useUiLanguage } from '../../useUiLanguage';
 import ModalDialog from './ModalDialog';

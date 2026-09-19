@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import { useEffect } from 'react';
 import { normalizeUiLanguage, t } from '../i18n';
 import { useSettingsStore } from '../state/settingsStore';
 import { UI_FONT_FAMILY_SETTING, UI_FONT_SIZE_SETTING, uiFontFamily, uiFontSize } from './typography';

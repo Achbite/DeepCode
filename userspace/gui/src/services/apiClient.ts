@@ -206,6 +206,3 @@ export function getModelQuota(id: string, signal?: AbortSignal) {
 export function queryModelUsage(query: import('@deepcode/protocol').UsageQuery, signal?: AbortSignal) {
   return sendJson<import('@deepcode/protocol').UsageReport>(`${API_BASE}/llm/usage`, 'POST', query, { signal });
 }
-export function getModelPrices(signal?: AbortSignal) {
-  return getJson<import('@deepcode/protocol').ModelPrice[]>(`${API_BASE}/llm/prices`, signal);
-}

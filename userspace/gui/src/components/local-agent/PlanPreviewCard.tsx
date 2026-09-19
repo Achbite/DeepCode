@@ -1,4 +1,4 @@
-import React, { useRef } from 'react';
+import { useRef } from 'react';
 import { useConversationRowState } from './ConversationVirtualRow';
 import type { PlanPreviewProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';

@@ -52,10 +52,3 @@ export function lastCallInputCacheMetric(
     complete: true,
   };
 }
-
-export function completeInputCacheMetric(
-  usage: CanonicalProviderInputCacheUsage | null | undefined,
-): InputCacheMetric | null {
-  const metric = inputCacheMetric(usage);
-  return metric?.complete ? metric : null;
-}

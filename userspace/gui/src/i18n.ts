@@ -45,10 +45,6 @@ export function setActiveUiLanguage(value: unknown): UiLanguage {
   return activeLanguage;
 }
 
-export function getActiveUiLanguage(): UiLanguage {
-  return activeLanguage;
-}
-
 function formatMessage(template: string, variables: I18nVariables = {}): string {
   return template.replace(/\{([A-Za-z0-9_.-]+)\}/g, (match, key) => {
     const value = variables[key];

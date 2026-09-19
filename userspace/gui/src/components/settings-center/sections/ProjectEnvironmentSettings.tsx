@@ -1,6 +1,6 @@
 import { useInterfaceReloadGuard } from '../../../services/interfaceReload';
 import '../settingsCenter.css';
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useSettingsStore } from '../../../state/settingsStore';
 
 type ProjectEnvironment = { kind: 'native'; shell?: 'auto' | 'powershell7' | 'windowsPowerShell' | 'gitBash'; gitBashPath?: string } | { kind: 'wsl'; distribution: string; worker: string };

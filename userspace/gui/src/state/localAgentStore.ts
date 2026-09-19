@@ -1,6 +1,5 @@
 import { takeRestoredInterfaceView } from '../services/interfaceReload';
-import { create, useStore } from 'zustand';
-import { createContext, createElement, useContext, type ReactNode } from 'react';
+import { create } from 'zustand';
 import type {
   CommandReply,
   ConversationCatalog,
@@ -1079,14 +1078,4 @@ function errorMessage(error: unknown): string {
 return store;
 }
 
-export type LocalAgentStore = ReturnType<typeof createLocalAgentStore>;
-const defaultStore = createLocalAgentStore();
-const LocalAgentStoreContext = createContext<LocalAgentStore>(defaultStore);
-export function LocalAgentStoreProvider({ store, children }: { store: LocalAgentStore; children: ReactNode }) {
-  return createElement(LocalAgentStoreContext.Provider, { value: store }, children);
-}
-export const useLocalAgentStore = Object.assign(
-  function useLocalAgentStore<Selected>(selector: (state: LocalAgentState) => Selected): Selected {
-    return useStore(useContext(LocalAgentStoreContext), selector);
-  }, defaultStore,
-);
+export const useLocalAgentStore = createLocalAgentStore();

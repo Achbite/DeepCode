@@ -1,5 +1,5 @@
 import { useInterfaceReloadGuard } from '../../services/interfaceReload';
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { t, type UiLanguage } from '../../i18n';
 import { useSettingsStore } from '../../state/settingsStore';
 import { normalizeGuiAccentColor, normalizeGuiThemePreference, resolveGuiTheme, type GuiResolvedTheme } from '../../theme/deepcodeGuiTheme';

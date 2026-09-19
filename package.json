@@ -19,7 +19,6 @@
     "build:gui-native": "bash ./build.sh --stage native-gui"
   },
   "devDependencies": {
-    "concurrently": "^9.1.0",
     "typescript": "^5.7.0"
   },
   "engines": {

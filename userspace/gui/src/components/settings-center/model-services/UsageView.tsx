@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { ConnectionSummary, UsageQuery, UsageReport, UsageBucket } from '@deepcode/protocol';
 import { queryModelUsage } from '../../../services/apiClient';
 import { UiSettingsContributions, useDisplayTheme } from '../../../ui-plugins/UiPlugins';

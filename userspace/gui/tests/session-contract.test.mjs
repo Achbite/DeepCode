@@ -549,15 +549,19 @@ test('one native reference request returns the actual file or folder kind', asyn
   assert.equal(calls, references.length + 2);
 });
 
-test('Skill settings load the existing read-only catalog route', async (t) => {
-  const items = [{ id: 'skill:example', displayName: 'Example', description: 'A text Skill.', source: 'mounted' }];
+test('Skill settings read mounted guidance from the live plugin catalog', async (t) => {
+  const catalog = { revision: 'catalog:skills', plugins: [{ uri: 'plugin://example@local',
+    displayName: 'Example', shortDescription: 'A text Skill.', source: 'mounted',
+    category: 'reference', contributionKind: 'skill', discovery: 'default',
+    activationMediaTypes: [], enabled: true, available: true,
+    management: { key: 'skills.mounts', id: 'skill:example' } }] };
   installGuiFetch(t, async (url, init) => {
-    assert.equal(url.pathname, '/api/conversation/plugins/skills');
+    assert.equal(url.pathname, '/api/conversation/plugins');
     assert.equal(init.method ?? 'GET', 'GET');
-    return Response.json({ ok: true, data: { skills: items } });
+    return Response.json({ ok: true, data: catalog });
   });
-  const [{ getSkillSettings }] = await loadGuiModules(t, ['/src/services/localAgentApi.ts']);
-  assert.deepEqual(await getSkillSettings(), items);
+  const { getPluginCatalog } = await loadGuiModule(t, '/src/services/localAgentApi.ts');
+  assert.deepEqual(await getPluginCatalog(), catalog);
 });
 
 test('GUI receives and renders live tool output at the same journal revision before completion', async (t) => {
@@ -2542,32 +2546,21 @@ test('new-session submission identifies the draft destination before publishing 
 test('model settings distinguish a failed read from a successfully empty catalog and retain loaded profiles', async (t) => {
   const { createElement } = await import('react');
   const { renderToStaticMarkup } = await import('react-dom/server');
-  const [{ default: LlmSection, LlmProfileReadNotice }, api, { t: translate }] = await loadGuiModules(t, [
-    '/src/components/settings-center/sections/LlmSection.tsx', '/src/services/apiClient.ts', '/src/i18n.ts',
+  const [{ default: LlmSection }, api] = await loadGuiModules(t, [
+    '/src/components/settings-center/sections/LlmSection.tsx', '/src/services/apiClient.ts',
   ]);
-  const emptyMessage = translate('zh-CN', 'settings.llm.empty');
-  const notice = (state, hasProfiles = false) => renderToStaticMarkup(createElement(LlmProfileReadNotice, {
-    state, hasProfiles, language: 'zh-CN',
-  }));
-  assert.equal(notice({ status: 'loading' }), '');
   const initial = renderToStaticMarkup(createElement(LlmSection));
-  assert.equal(initial.includes(emptyMessage), false, 'the first render has not read the catalog');
-  assert.equal(initial.includes(translate('en-US', 'settings.llm.empty')), false);
+  assert.match(initial, /role="status"/);
+  assert.doesNotMatch(initial, /暂无连接|No connections/, 'unread connections are not an empty catalog');
+  let unavailable = true;
   installGuiFetch(t, (url) => {
     assert.equal(url.pathname, '/api/llm/profiles');
-    throw new TypeError('Failed to fetch');
+    if (unavailable) throw new TypeError('Failed to fetch');
+    return Response.json({ ok: true, data: { profiles: [], connections: [] } });
   });
   const failed = await api.getLlmProfiles();
   assert.equal(failed.ok, false);
   assert.match(failed.message, /Failed to fetch/);
-  for (const hasProfiles of [false, true]) {
-    const html = notice({ status: 'failed', error: failed.message }, hasProfiles);
-    assert.match(html, /role="alert"/);
-    assert.match(html, /Failed to fetch/);
-    assert.equal(html.includes(emptyMessage), false);
-  }
-  assert.equal(notice({ status: 'loaded' }).includes(emptyMessage), true);
-  assert.equal(notice({ status: 'loaded' }, true), '');
   const profiles = [
     { id: 'profile:existing', name: 'Existing model', enabled: true },
     { id: 'profile:disabled', name: 'Disabled model', enabled: false },
@@ -2579,6 +2572,15 @@ test('model settings distinguish a failed read from a successfully empty catalog
   assert.equal(store.getState().defaultProfileId, profiles[0].id);
   assert.equal(store.getState().selectedProfileId, profiles[0].id);
   assert.match(store.getState().error, /Failed to fetch/);
+  unavailable = false;
+  const empty = await api.getLlmProfiles();
+  assert.equal(empty.ok, true);
+  assert.deepEqual(empty.data.profiles, []);
+  await store.getState().refreshProfiles();
+  assert.deepEqual(store.getState().profiles, []);
+  assert.equal(store.getState().defaultProfileId, null);
+  assert.equal(store.getState().error, null);
+  assert.equal(store.getState().selectedProfileId, profiles[0].id, 'reading an empty catalog does not silently change the selected model');
 });
 
 test('invalid default profiles retain editable settings and do not prevent reading conversation history', async (t) => {

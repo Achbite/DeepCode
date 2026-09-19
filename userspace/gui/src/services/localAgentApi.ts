@@ -11,7 +11,6 @@ import type {
   FilesystemReference,
   PluginCatalogProjection,
   SessionProjection,
-  SkillSettingsItem,
 } from '@deepcode/protocol';
 import {
   COMMAND_REPLY_VERSION,
@@ -110,17 +109,6 @@ export async function getPluginCatalog(
     `${API_BASE}/conversation/plugins`,
     { signal },
   ));
-}
-
-export async function getSkillSettings(signal?: AbortSignal): Promise<SkillSettingsItem[]> {
-  const value = await request<unknown>(`${API_BASE}/conversation/plugins/skills`, { signal });
-  if (!isExactRecord(value, ['skills']) || !Array.isArray(value.skills)
-    || !value.skills.every((item) => isExactRecord(item, ['id', 'displayName', 'description', 'source'])
-      && isNonEmptyText(item.id) && isNonEmptyText(item.displayName)
-      && isNonEmptyText(item.description) && ['builtin', 'mounted'].includes(String(item.source)))) {
-    throw new Error('skill_settings_invalid');
-  }
-  return value.skills as SkillSettingsItem[];
 }
 
 export async function getConversationCatalogManagement(

@@ -1,4 +1,3 @@
-import React from 'react';
 import type { SessionProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { inputCacheMetric } from '../../utils/providerUsage';

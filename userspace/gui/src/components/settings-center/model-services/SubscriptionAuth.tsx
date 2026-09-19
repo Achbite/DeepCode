@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { AuthFlow, ConnectionSummary, QuotaSnapshot } from '@deepcode/protocol';
 import { cancelModelAuth, getModelAuth, getModelQuota, logoutModelConnection, startModelAuth } from '../../../services/apiClient';
 import { openExternalUrl } from '../../../services/runtimeAdapter';

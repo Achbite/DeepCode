@@ -4,7 +4,6 @@ const storageKey = 'deepcode:interface-reload';
 const views = new Map<string, () => unknown>();
 const guards = new Map<symbol, () => { label: string; busy: boolean } | null>();
 let restored: Record<string, unknown> = {};
-let reloading = false;
 try {
   const saved = typeof sessionStorage === 'undefined' ? null : sessionStorage.getItem(storageKey);
   if (saved) restored = JSON.parse(saved);
@@ -39,12 +38,10 @@ export function useInterfaceReloadGuard(dirty: boolean, label: string, busy = fa
   }, []);
 }
 export function interfaceReloadGuards() { return [...guards.values()].flatMap(read => read() ?? []); }
-export function isInterfaceReloading() { return reloading; }
 export function requestInterfaceReload() { window.dispatchEvent(new Event('deepcode:request-interface-reload')); }
 export function reloadInterface() {
   if (interfaceReloadGuards().some(guard => guard.busy)) return;
   sessionStorage.setItem(storageKey, JSON.stringify(Object.fromEntries([...views].map(([key, read]) => [key, read()]))));
-  reloading = true;
   window.location.reload();
 }
 export function installInterfaceReloadShortcut() {

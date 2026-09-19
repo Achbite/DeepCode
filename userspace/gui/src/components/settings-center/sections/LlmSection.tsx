@@ -1,11 +1,10 @@
 import { useInterfaceReloadGuard } from '../../../services/interfaceReload';
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ConnectionSummary, ConnectionsResult, LlmProviderProfile, LlmProfilesResult, ModelConnection, ProviderAdapterDescriptor, UsageReport } from '@deepcode/protocol';
 import { getLlmProfiles, getModelConnections, patchModelConnections, queryModelUsage } from '../../../services/apiClient';
 import { useLocalAgentStore } from '../../../state/localAgentStore';
 import { useSettingsSearchEntries } from '../settingsSearch';
 import { AgentSettingsSection } from './CategorizedSettingsSections';
-import { t, type UiLanguage } from '../../../i18n';
 import ModelEditor from '../model-services/ModelEditor';
 import SubscriptionAuth from '../model-services/SubscriptionAuth';
 import UsageView from '../model-services/UsageView';
@@ -15,11 +14,6 @@ import '../model-services/modelServices.css';
 
 type Page = { kind: 'list' } | { kind: 'usage'; connectionId?: string } | { kind: 'web' } |
   { kind: 'connection'; id: string } | { kind: 'new'; mode: 'metered' | 'subscription' };
-type ProfileReadState = { status: 'loading' | 'loaded' } | { status: 'failed'; error: string };
-export function LlmProfileReadNotice({ state, hasProfiles, language }: { state: ProfileReadState; hasProfiles: boolean; language: UiLanguage }) {
-  if (state.status === 'failed') return <div className="settings-error" role="alert">{t(language, 'settings.llm.loadFailed')}: {state.error}</div>;
-  return state.status === 'loaded' && !hasProfiles ? <div>{t(language, 'settings.llm.empty')}</div> : null;
-}
 function newModel(connection: ModelConnection, adapter: ProviderAdapterDescriptor): LlmProviderProfile {
   return { ...(adapter.models[0] ?? { name: '', model: '', kind: adapter.protocols[0], providerFlavor: 'openai', enabled: true, contextWindowTokens: 128000, maxOutputTokens: 16000 }), id: `model:${crypto.randomUUID()}`, connectionId: connection.id };
 }
@@ -92,7 +86,7 @@ export default function LlmSection({ active = true }: { active?: boolean }) {
   const [usage, setUsage] = useState<UsageReport | null>(null);
   const [error, setError] = useState('');
   const [usageError, setUsageError] = useState('');
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [revision, setRevision] = useState(0);
   const [showAdd, setShowAdd] = useState(false);
   const addButton = useRef<HTMLButtonElement>(null);
@@ -140,8 +134,8 @@ export default function LlmSection({ active = true }: { active?: boolean }) {
     {page.kind === 'list' && <>
       <div className="model-heading"><h2>{text('模型与服务', 'Models & services')}</h2><div className="model-add"><button ref={addButton} className="model-primary" aria-expanded={showAdd} onClick={() => setShowAdd(v => !v)}>{text('添加连接', 'Add connection')} +</button>{showAdd && <div className="model-add-menu"><button onClick={() => { setPage({ kind: 'new', mode: 'metered' }); setShowAdd(false); }}>{text('API 连接', 'API connection')}</button><button onClick={() => { setPage({ kind: 'new', mode: 'subscription' }); setShowAdd(false); }}>Coding Plan</button></div>}</div></div>
       <div className="model-actions model-subheading"><span>{text('最近使用', 'Last used')} · {profiles?.profiles.find(p => p.id === profiles.defaultProfileId)?.name ?? '—'}</span><button className="model-push" onClick={() => setPage({ kind: 'usage' })}>{text('用量统计', 'Usage')} ↗</button></div>
-      {(['metered', 'subscription'] as const).map(mode => {
-        const list = catalog?.connections.filter(c => c.billingMode === mode) ?? [];
+      {catalog && (['metered', 'subscription'] as const).map(mode => {
+        const list = catalog.connections.filter(c => c.billingMode === mode);
         return <section className="model-connection-group" key={mode}><div className="model-heading"><h3>{mode === 'metered' ? text('API 连接', 'API connections') : 'Coding Plan'}</h3><span>{text('近 30 天', 'Last 30 days')}{mode === 'metered' && <Hint>{text('显示已记录请求的 API 费用估算，非服务方账单。', 'Estimated cost of recorded requests; not a provider invoice.')}</Hint>}</span></div>
           {list.length === 0 ? <div className="model-empty">{text('暂无连接', 'No connections')}</div> : list.map(c => {
             const stat = usage?.connections.find(v => v.connectionId === c.id);

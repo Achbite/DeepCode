@@ -1,5 +1,4 @@
 import UiIcon from '../../icons/registry';
-import React from 'react';
 import type { HostStartupStatusV1 } from '../../services/runtimeAdapter';
 import { t, type UiLanguage } from '../../i18n';
 import './hostStartupDiagnostic.css';

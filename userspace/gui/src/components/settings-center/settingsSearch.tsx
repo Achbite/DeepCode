@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect } from 'react';
+import { createContext, useCallback, useContext, useEffect } from 'react';
 
 export interface SettingsSearchEntry { id: string; title: string; keywords?: string; category: string }
 export const SettingsSearchContext = createContext<(owner: string, entries: SettingsSearchEntry[]) => void>(() => {});

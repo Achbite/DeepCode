@@ -4,7 +4,7 @@ import { nextEnabledIndex } from '../shared/keyboardNavigation';
 import { InterfaceLoadBoundary } from '../shared/InterfaceUpdateNotice';
 import { loadInterfaceModule } from '../../services/interfaceUpdates';
 import { createPortal } from 'react-dom';
-import React, { useId, lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { useId, lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useConversationHost } from './ConversationHost';
 import type { SourcePosition } from './resourceLinks';
 import { t, type UiLanguage } from '../../i18n';

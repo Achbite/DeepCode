@@ -1,4 +1,3 @@
-import React from 'react';
 import type { UiLanguage } from '../../../i18n';
 import { agentSettingDefinitions, useSettingsStore } from '../../../state/settingsStore';
 import { localizeSettingDefinition } from '../../../settingsLocalization';

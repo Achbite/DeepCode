@@ -1,5 +1,4 @@
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
-import React from 'react';
 import type { ConversationSessionStatus } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 
