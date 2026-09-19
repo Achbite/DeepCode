@@ -2583,6 +2583,39 @@ test('model settings distinguish a failed read from a successfully empty catalog
   assert.equal(store.getState().selectedProfileId, profiles[0].id, 'reading an empty catalog does not silently change the selected model');
 });
 
+test('compact display math fences retain aligned formulas and following Markdown in streamed and settled views', async (t) => {
+  const [{ StreamingMarkdownParser }, { MarkdownContent }] = await loadGuiModules(t, [
+    '/src/components/local-agent/streamingMarkdown.ts', '/src/components/local-agent/BufferedMarkdown.tsx',
+  ]);
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const formula = String.raw`$$\begin{aligned}
+\text{buy1}_i &= \max_{i_1 \le i}(-p_{i_1})\\
+\text{sell1}_i &= \max_{i_1 \le j_1 \le i}(p_{j_1}-p_{i_1})
+\end{aligned}$$`;
+  const following = '\n\n## Verification\n\n- **Result** stays outside math.\n\n| Cost | Space |\n| --- | --- |\n| $O(n)$ | $O(1)$ |';
+  const text = '# Proof\n\n' + formula + following;
+  const render = (source, streaming) => renderToStaticMarkup(createElement(MarkdownContent, { children: source, streaming }));
+  const completed = render(text, false);
+  assert.doesNotMatch(completed, /katex-error/);
+  assert.match(completed, /class="katex-display"/);
+  assert.match(completed, /<h2>Verification<\/h2>/);
+  assert.match(completed, /<strong>Result<\/strong>/);
+  assert.match(completed, /<table>/);
+  assert.equal(render(text, true), completed);
+  const stream = new StreamingMarkdownParser();
+  for (const end of [text.indexOf('sell1'), text.indexOf('aligned}$$') + 9, text.indexOf('## Verification'), text.length]) {
+    stream.update(text.slice(0, end), true);
+  }
+  assert.deepEqual(stream.update(text, false), new StreamingMarkdownParser().update(text, false));
+  const fencedCode = render('```tex\n' + formula + '\n```', false);
+  assert.doesNotMatch(fencedCode, /class="katex/);
+  assert.match(fencedCode, /\$\$\\begin\{aligned\}/);
+  const inlineCode = render('`$$\\begin{aligned} a &= b \\end{aligned}$$`', false);
+  assert.doesNotMatch(inlineCode, /class="katex/);
+  assert.match(render('$$\na &= b\n$$\n\n## Original error', false), /katex-error/);
+});
+
 test('invalid default profiles retain editable settings and do not prevent reading conversation history', async (t) => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:profile-error-history';

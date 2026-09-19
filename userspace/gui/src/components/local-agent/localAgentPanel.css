@@ -153,7 +153,6 @@
   height: 100%;
   min-height: 0;
   overflow: auto;
-  scrollbar-gutter: stable;
   overflow-anchor: none;
 }
 
@@ -163,12 +162,12 @@
 }
 
 /* Keep wheel, touch and keyboard scrolling; the conversation rail provides navigation. */
-:root[data-product='deepcode-gui'] :is(
-  .local-agent__body,
-  .local-agent__interaction-document-scroll,
-  .local-agent__composer textarea,
-  .conversation-answered-question-body
-) {
+:root[data-product='deepcode-gui'] .local-agent__body {
+  scrollbar-width: none;
+}
+
+:root[data-product='deepcode-gui'] .local-agent__body::-webkit-scrollbar {
+  display: none;
 }
 
 .conversation-navigation {

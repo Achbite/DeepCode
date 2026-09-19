@@ -20,7 +20,7 @@
 .conversation-markdown > :first-child { margin-top: 0; }
 .conversation-markdown > :last-child { margin-bottom: 0; }
 .conversation-markdown img, .conversation-diagram svg { max-width: 100%; height: auto; }
-.conversation-code, .conversation-diagram, .conversation-markdown .katex-display { max-width: 100%; overflow: auto; }
+.conversation-code, .conversation-diagram { max-width: 100%; overflow: auto; }
 .conversation-code { border: 1px solid var(--dc-border); border-radius: 6px; background: var(--dc-code-background); }
 .conversation-code header { display: flex; align-items: center; gap: 12px; min-height: 24px; padding: 5px 12px; color: var(--dc-muted); font-size: calc(11px * var(--dc-ui-font-scale, 1)); }
 .conversation-code header button { margin-left: auto; }
