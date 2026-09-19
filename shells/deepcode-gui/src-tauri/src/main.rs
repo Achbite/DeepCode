@@ -40,7 +40,7 @@ const APP_ASSET_DIR: &str = "web-deepcode-gui";
 
 struct RuntimeLocations {
     resources: PathBuf,
-    config: PathBuf,
+    user: deepcode_host_connection::UserDirectories,
 }
 
 static RUNTIME_LOCATIONS: OnceLock<RuntimeLocations> = OnceLock::new();
@@ -50,9 +50,10 @@ fn initialize_runtime_locations(app: &tauri::App) -> std::io::Result<()> {
     let executable_dir = current_exe_dir()
         .ok_or_else(|| std::io::Error::other("executable directory is unavailable"))?;
     let resources = deepcode_host_connection::runtime_root(&executable_dir);
-    let config = deepcode_host_connection::config_root()?;
+    let user = deepcode_host_connection::UserDirectories::resolve()?;
+    user.create()?;
     RUNTIME_LOCATIONS
-        .set(RuntimeLocations { resources, config })
+        .set(RuntimeLocations { resources, user })
         .map_err(|_| std::io::Error::other("runtime locations already initialized"))
 }
 
@@ -318,7 +319,7 @@ fn main() {
             let callback_token = host_tokens.browser_token.clone();
             host_tokens.browser_endpoint = native_browser::start(
                 app.handle(),
-                runtime_locations().config.clone(),
+                runtime_locations().user.clone(),
                 host_tokens.browser_instance_id.clone(),
                 host_tokens.browser_token.clone(),
                 host_bootstrap_script(&target, &host_tokens, true),
@@ -663,7 +664,7 @@ fn create_main_window(
     let boot_url = format!("{APP_ASSET_SCHEME}://localhost/index.html");
     let initialization_script = host_bootstrap_script(target, host_tokens, false);
     let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(boot_url.parse()?))
-        .data_directory(runtime_locations().config.join("cache/webview"))
+        .data_directory(runtime_locations().user.cache_dir.join("webview"))
         .initialization_script(initialization_script)
         .on_navigation(trusted_app_navigation)
         .title("DeepCode-GUI")
@@ -1014,9 +1015,9 @@ fn spawn_host_processes_if_available(
             })?;
     let daemon_dir = parent_dir(&daemon_path).unwrap_or_else(|| exe_dir.clone());
     let proxy_dir = parent_dir(&proxy_path).unwrap_or_else(|| exe_dir.clone());
-    let config_root = runtime_locations().config.clone();
+    let data_root = runtime_locations().user.data_dir.clone();
 
-    let shared_start_guard = deepcode_host_connection::HostStartGuard::acquire(&config_root)
+    let shared_start_guard = deepcode_host_connection::HostStartGuard::acquire(&data_root)
         .map_err(|error| {
             startup_failure(
                 "sharedHost",
@@ -1026,17 +1027,17 @@ fn spawn_host_processes_if_available(
                 true,
             )
         })?;
-    let config_root = config_root.canonicalize().map_err(|error| {
+    let data_root = data_root.canonicalize().map_err(|error| {
         startup_failure(
             "sharedHost",
-            "host_config_root_invalid",
+            "host_data_root_invalid",
             None,
             error.to_string(),
             false,
         )
     })?;
     let shared =
-        deepcode_host_connection::LocalHostConnection::discover(&config_root).map_err(|error| {
+        deepcode_host_connection::LocalHostConnection::discover(&data_root).map_err(|error| {
             startup_failure(
                 "sharedHost",
                 "host_connection_discovery_failed",
@@ -1098,11 +1099,13 @@ fn spawn_host_processes_if_available(
             return Err(startup_stopped_failure());
         }
         let mut daemon_command = Command::new(daemon_path);
+        runtime_locations()
+            .user
+            .configure_child(&mut daemon_command);
         daemon_command
             .current_dir(&daemon_dir)
             .env("DEEPCODE_HOST", &target.host)
             .env("DEEPCODE_PORT", &target.daemon_port)
-            .env("DEEPCODE_CONFIG_DIR", config_root)
             .env("DEEPCODE_RUNTIME_DIR", &runtime_locations().resources)
             .env_remove(HOST_UI_TOKEN_ENV)
             .env(HOST_SHELL_TOKEN_ENV, host_tokens.daemon_token())
@@ -1447,8 +1450,7 @@ fn startup_stopped_failure() -> HostStartupFailure {
 }
 
 fn prepare_host_startup_diagnostics(attempt_id: &str) -> std::io::Result<HostDiagnosticAttempt> {
-    let base = &runtime_locations().config;
-    let root = base.join("diagnostics").join("host-startup");
+    let root = runtime_locations().user.log_dir.join("host-startup");
     let directory = root.join(attempt_id);
     std::fs::create_dir_all(&directory)?;
     set_private_directory_permissions(&root)?;
@@ -1517,7 +1519,7 @@ impl Drop for KernelStartLock {
 }
 
 fn acquire_kernel_start_lock(host: &str, port: &str) -> std::io::Result<Option<KernelStartLock>> {
-    let path = std::env::temp_dir().join(format!(
+    let path = runtime_locations().user.temp_dir.join(format!(
         "deepcode-kernel-start-{}-{}.lock",
         sanitize_lock_component(host),
         sanitize_lock_component(port)

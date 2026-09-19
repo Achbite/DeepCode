@@ -304,7 +304,7 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual((payload / 'Applications/DeepCode-GUI.app/Contents/MacOS/deepcode-cli').read_bytes(), b'CLI')
                 launcher = (payload / 'usr/local/bin/deepcode').read_text()
                 self.assertIn('DEEPCODE_RUNTIME_DIR="$APP_DIR/Resources"', launcher)
-                self.assertNotIn('DEEPCODE_CONFIG_DIR=', launcher)
+                self.assertNotIn('DEEPCODE_USER_ROOT=', launcher)
                 self.assertIn('exec "$APP_DIR/MacOS/deepcode-cli" "$@"', launcher)
                 self.assertFalse((payload / 'Users').exists())
             with patch.object(installers.subprocess, 'run', side_effect=inspect):

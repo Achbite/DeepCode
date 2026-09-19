@@ -34,11 +34,10 @@ struct Request {
 }
 
 fn installation_path() -> Result<PathBuf, String> {
-    std::env::var_os("DEEPCODE_CONFIG_DIR")
+    std::env::var_os("DEEPCODE_SANDBOX_STATE_PATH")
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("APPDATA").map(|root| PathBuf::from(root).join("DeepCode")))
-        .map(|root| root.join("workspace-sandbox.json"))
-        .ok_or_else(|| "APPDATA is unavailable.".into())
+        .ok_or_else(|| "Host did not supply the Windows sandbox state path.".into())
 }
 
 fn installation() -> Result<Installation, String> {
@@ -219,7 +218,6 @@ impl Drop for WorkspaceGrants {
 pub fn entrypoint() -> Option<Result<i32, String>> {
     let args: Vec<_> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some("--workspace-sandbox-init") => Some(request_setup().map(|_| 0)),
         Some("--workspace-sandbox-setup") => Some((|| {
             setup::install(
                 Path::new(args.get(2).ok_or("Setup path missing")?),

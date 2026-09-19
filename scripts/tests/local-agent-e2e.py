@@ -668,7 +668,7 @@ def assert_projection_flow(value: dict[str, Any]) -> None:
 
 
 def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: str) -> None:
-    runtime_root = config_root / "runtime" / "agent-runtime"
+    runtime_root = config_root / "data" / "agent-runtime"
     with fixture.sqlite_read_only(runtime_root / "session.sqlite3") as connection:
         started_rows = connection.execute(
             "SELECT run_id, payload_json FROM session_events "
@@ -950,7 +950,7 @@ def assert_shells_read_projection(
     discovered_environment = os.environ.copy()
     for key in ("DEEPCODE_API_URL", "DEEPCODE_PORT", "DEEPCODE_HOST_SHELL_TOKEN", "DEEPCODE_HOST_INSTANCE_ID"):
         discovered_environment.pop(key, None)
-    discovered_environment["DEEPCODE_CONFIG_DIR"] = str(daemon.config_root)
+    discovered_environment["DEEPCODE_USER_ROOT"] = str(daemon.config_root)
     for binary, action in ((fixture.TUI_BINARY, "--smoke"), (fixture.CLI_BINARY, "show")):
         attached = subprocess.run(
             [str(binary), "--no-auto-start-kernel", "--session", session_id, action],
@@ -1151,7 +1151,7 @@ def main() -> None:
             fixture.require(len(segments) > 1 and "".join(segments) == LONG_INPUT, "分页读取未完整保留 Unicode 原文")
             assert_provider_count_stable(provider, 4)
             assert_shells_read_projection(daemon_two, session_id, final_revision)
-            attachment_root = config_root / "runtime" / "agent-runtime" / "attachments"
+            attachment_root = config_root / "data" / "agent-runtime" / "attachments"
             fixture.require(any(attachment_root.rglob("e2e-note.txt")), "Host 文件快照未持有到 Session 生命周期")
             path_id = urllib.parse.quote(session_id, safe="")
             fixture.api_json(

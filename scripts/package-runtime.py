@@ -29,6 +29,7 @@ def shared(root, destination, dependency_list):
     copy_js_package(root / 'userspace/session-core', destination / 'session-core')
     copy_js_package(root / 'userspace/protocol', destination / 'node_modules/@deepcode/protocol')
     shutil.copytree(root / 'userspace/gui/dist-deepcode-gui', destination / 'web-deepcode-gui')
+    shutil.copytree(root / 'docs', destination / 'docs')
     shutil.copy2(root / 'LICENSE', destination / 'LICENSE')
     dependencies = {}
 
@@ -105,7 +106,8 @@ exec "$APP_DIR/MacOS/deepcode-''' + shell.lower() + '''" "$@"
             launcher.chmod(0o755)
         subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(app)], check=True)
         subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
-    shutil.copy2(root / 'docs/distribution.md', stage / 'README.md')
+    documentation = 'DeepCode-GUI.app/Contents/Resources/docs/' if macos else 'docs/'
+    (stage / 'README.md').write_text((root / 'docs/distribution.md').read_text().replace('(product/', '(' + documentation + 'product/'))
 
 
 # Only program entries belong to the publisher. config/runtime/logs/sessions and
@@ -117,7 +119,7 @@ PROGRAM_ENTRIES = {
     'deepcode-kernel', 'deepcode-kernel.exe', 'deepcode-first-party-provider', 'deepcode-first-party-provider.exe',
     'deepcode-host-web', 'deepcode-host-web.exe', 'deepcode-cli', 'deepcode-cli.exe', 'deepcode-tui', 'deepcode-tui.exe',
     'node', 'node_modules', 'session-core', 'web', 'web-deepcode-gui', 'bwrap', 'WebView2Loader.dll',
-    'BUILDINFO.json', 'build-info.json', 'build-info.txt', 'README.md', 'README.txt', 'LICENSE', 'licenses', 'THIRD-PARTY.json',
+    'BUILDINFO.json', 'build-info.json', 'build-info.txt', 'README.md', 'README.txt', 'LICENSE', 'licenses', 'THIRD-PARTY.json', 'docs',
 }
 
 

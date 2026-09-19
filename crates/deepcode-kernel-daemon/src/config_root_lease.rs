@@ -55,7 +55,7 @@ mod tests {
                 .expect("clock after epoch")
                 .as_nanos()
         ));
-        let path = root.join("runtime/agent-runtime/root-owner.lock");
+        let path = root.join("data/agent-runtime/root-owner.lock");
         let first = ConfigRootLease::acquire(&path).expect("first owner");
         assert_eq!(first.path(), path.as_path());
 

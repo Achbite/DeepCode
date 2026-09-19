@@ -1,4 +1,6 @@
-//! Local Host transport discovery. This owns no Session or Kernel business state.
+//! Local Host transport discovery and user directories. No Session or Kernel business state.
+mod user_directories;
+pub use user_directories::UserDirectories;
 mod client_lease;
 pub mod loopback_http;
 pub mod process;
@@ -38,7 +40,7 @@ pub struct HostStartupStatusV1 {
     pub updated_at: String,
 }
 
-const CONNECTION_FILE: &str = "runtime/agent-runtime/host-connection.json";
+const CONNECTION_FILE: &str = "agent-runtime/host-connection.json";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -204,7 +206,7 @@ pub struct HostStartGuard {
 
 impl HostStartGuard {
     pub fn acquire(root: &Path) -> io::Result<Self> {
-        let path = root.join("runtime/agent-runtime/host-start.lock");
+        let path = root.join("agent-runtime/host-start.lock");
         std::fs::create_dir_all(path.parent().expect("startup parent"))?;
         let file = OpenOptions::new()
             .create(true)
@@ -229,48 +231,6 @@ impl HostStartGuard {
             }
         }
     }
-}
-
-pub fn config_root() -> io::Result<PathBuf> {
-    let requested = resolve_config_root(std::env::consts::OS, |key| std::env::var_os(key))?;
-    std::fs::create_dir_all(&requested)?;
-    requested.canonicalize()
-}
-
-fn resolve_config_root(
-    platform: &str,
-    environment: impl Fn(&str) -> Option<std::ffi::OsString>,
-) -> io::Result<PathBuf> {
-    let value = |key| {
-        environment(key)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    };
-    if let Some(path) = environment("DEEPCODE_CONFIG_DIR") {
-        if path.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "DEEPCODE_CONFIG_DIR must not be empty",
-            ));
-        }
-        return Ok(PathBuf::from(path));
-    }
-    let (key, suffix) = if platform == "windows" {
-        ("APPDATA", "DeepCode")
-    } else {
-        if platform != "macos" {
-            if let Some(path) = value("XDG_CONFIG_HOME") {
-                return Ok(path.join("DeepCode"));
-            }
-        }
-        ("HOME", ".config/DeepCode")
-    };
-    value(key).map(|root| root.join(suffix)).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{key} is required to locate DeepCode user data"),
-        )
-    })
 }
 
 /// Packaged resources are independent of the writable user data directory.
@@ -313,44 +273,6 @@ fn lock_file(file: &File) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn user_data_location_is_shared_by_installed_and_unpacked_hosts() {
-        let environment = |key: &str| match key {
-            "HOME" => Some("/Users/example".into()),
-            "APPDATA" => Some("C:/Users/example/AppData/Roaming".into()),
-            "XDG_CONFIG_HOME" => Some("/xdg".into()),
-            _ => None,
-        };
-        assert_eq!(
-            resolve_config_root("macos", environment).unwrap(),
-            PathBuf::from("/Users/example/.config/DeepCode")
-        );
-        assert_eq!(
-            resolve_config_root("windows", environment).unwrap(),
-            PathBuf::from("C:/Users/example/AppData/Roaming/DeepCode")
-        );
-        assert_eq!(
-            resolve_config_root("linux", environment).unwrap(),
-            PathBuf::from("/xdg/DeepCode")
-        );
-        assert_eq!(
-            resolve_config_root("macos", |key| (key == "DEEPCODE_CONFIG_DIR")
-                .then(|| "/explicit/DeepCode".into()))
-            .unwrap(),
-            PathBuf::from("/explicit/DeepCode")
-        );
-        assert_eq!(
-            resolve_config_root("windows", |_| None).unwrap_err().kind(),
-            io::ErrorKind::NotFound
-        );
-        assert_eq!(
-            resolve_config_root("macos", |key| (key == "DEEPCODE_CONFIG_DIR")
-                .then(Default::default))
-            .unwrap_err()
-            .kind(),
-            io::ErrorKind::InvalidInput
-        );
-    }
     use deepcode_kernel_abi::{HOST_INSTANCE_ID_PREFIX, HOST_SHELL_TOKEN_PREFIX};
     use std::net::TcpListener;
 
@@ -437,7 +359,7 @@ mod tests {
         let another = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(root.join("runtime/agent-runtime/host-start.lock"))
+            .open(root.join("agent-runtime/host-start.lock"))
             .unwrap();
         assert_eq!(
             lock_file(&another).unwrap_err().kind(),

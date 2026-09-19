@@ -92,7 +92,7 @@ class OwnedDaemon:
         environment.update({
             "DEEPCODE_HOST": "127.0.0.1",
             "DEEPCODE_PORT": str(self.port),
-            "DEEPCODE_CONFIG_DIR": str(self.config_root),
+            "DEEPCODE_USER_ROOT": str(self.config_root),
             "DEEPCODE_HOST_SHELL_TOKEN": self.token,
             "DEEPCODE_HOST_INSTANCE_ID": self.instance_id,
             "DEEPCODE_SESSION_BRIDGE": str(SESSION_BRIDGE),

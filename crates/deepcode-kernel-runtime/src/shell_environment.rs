@@ -355,10 +355,23 @@ pub fn login_shell_path(shell: &Path) -> KernelResult<OsString> {
     let failure = |message: String| {
         KernelError::InvalidCommand(format!("host_shell_environment_failed: {message}"))
     };
-    let mut child = Command::new(shell)
+    let mut command = Command::new(shell);
+    command
         .args(["-ilc", "/usr/bin/printf '\\0DEEPCODE_HOST_PATH\\0' && /usr/bin/printenv PATH && /usr/bin/printf '\\0'"])
-        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit())
-        .process_group(0).spawn().map_err(|error| failure(error.to_string()))?;
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+    // An interactive login shell must not inherit the TUI's controlling terminal:
+    // a background process group can be stopped before it reports PATH.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| failure(error.to_string()))?;
     let pid = child.id();
     let stdout = child.stdout.take().expect("piped shell stdout");
     let reader = std::thread::spawn(move || {

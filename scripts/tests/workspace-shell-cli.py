@@ -126,7 +126,7 @@ def main():
             require(not (workspace / 'readonly.txt').exists(), 'Plan sandbox allowed an undeclared workspace file')
             projection = fixture.projection(daemon, session)
             require(projection['run']['status'] == 'completed', projection['run'])
-            with closing(sqlite3.connect(f'{(daemon.config_root / "runtime/agent-runtime/session.sqlite3").as_uri()}?mode=ro', uri=True)) as database:
+            with closing(sqlite3.connect(f'{(daemon.config_root / "data/agent-runtime/session.sqlite3").as_uri()}?mode=ro', uri=True)) as database:
                 require(database.execute("select count(*) from session_events where event_type='approval.requested'").fetchone()[0] == 0, 'Sandboxed reads and Plan-authorized writes must not request Host approval')
                 runtime = json.loads(database.execute("select payload_json from session_events where event_type='run.started' order by sequence limit 1").fetchone()[0])['runtimeSnapshot']
                 print('[workspace-shell-cli] selected environment:', json.dumps(runtime['environment']['shell']))
@@ -134,7 +134,7 @@ def main():
             print('[workspace-shell-cli] PASS: read-only Shell without approval, confirmed directory grant, unapproved workspace path rejection, Unicode write, outside write rejection, exit 7, real PTY, offline policy, timeout, final settlement and owned Host shutdown; 7 fixture Provider requests.')
         except BaseException:
             print(daemon.log_tail())
-            store = daemon.config_root / 'runtime/agent-runtime/session.sqlite3'
+            store = daemon.config_root / 'data/agent-runtime/session.sqlite3'
             if store.exists():
                 with closing(sqlite3.connect(f'{store.as_uri()}?mode=ro', uri=True)) as database:
                     for kind, payload in database.execute("select event_type,payload_json from session_events where event_type in ('tool.requested','tool.started','tool.completed','run.settled') order by sequence"):

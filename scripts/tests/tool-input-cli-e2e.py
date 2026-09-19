@@ -219,7 +219,7 @@ def require_unexecuted_approval(daemon, projection):
     approval = projection["pendingApproval"]
     require(approval is not None and projection["run"]["status"] == "waiting"
             and projection["run"]["waitingReason"] == "approval", "调用未停在审批门禁")
-    runtime = daemon.config_root / "runtime" / "agent-runtime"
+    runtime = daemon.config_root / "data" / "agent-runtime"
     with fixture.sqlite_read_only(runtime / "session.sqlite3") as connection:
         started = connection.execute("SELECT COUNT(*) FROM session_events WHERE session_id=? AND call_id=? AND event_type='tool.started'",
                                      (projection["sessionId"], approval["callId"])).fetchone()[0]
@@ -329,7 +329,7 @@ def main() -> None:
             native_projection = fixture.projection(daemon, native_session_id)
             require(native_projection["run"]["status"] == "completed", "commentary 续跑未完成")
             daemon.shutdown()
-            runtime = daemon.config_root / "runtime" / "agent-runtime"
+            runtime = daemon.config_root / "data" / "agent-runtime"
             with fixture.sqlite_read_only(runtime / "session.sqlite3") as connection:
                 rows = connection.execute("SELECT event_type, call_id, payload_json FROM session_events WHERE session_id IN (?,?) ORDER BY session_id, sequence", (session_id, native_session_id)).fetchall()
                 requested = {call_id for kind, call_id, _ in rows if kind == "tool.requested"}

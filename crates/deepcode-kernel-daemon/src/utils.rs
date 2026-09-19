@@ -105,10 +105,6 @@ fn is_loopback_origin_token(token: &str) -> bool {
         || token.starts_with("[::1]:")
 }
 
-pub(crate) fn user_config_root() -> PathBuf {
-    deepcode_host_connection::config_root().expect("解析 DeepCode 配置目录")
-}
-
 pub(crate) struct DriveLocation {
     pub(crate) display: String,
     pub(crate) path: PathBuf,

@@ -2,7 +2,8 @@ use crate::prelude::*;
 use crate::read_optional_json_file;
 use std::collections::HashSet;
 
-const DEFAULT_PROFILES: &str = include_str!("../../../config/defaults/llm-profiles.json");
+pub(crate) const DEFAULT_PROFILES: &str =
+    include_str!("../../../config/defaults/llm-profiles.json");
 
 #[derive(Debug)]
 pub(crate) enum LlmProfileStore {
@@ -160,12 +161,10 @@ pub(crate) fn validate_llm_profile(profile: &Value) -> Result<(), String> {
     ) {
         return Err("kind 必须是 openaiCompatible、responses、anthropic 或 ollama。".into());
     }
-    if profile.get("providerFlavor").is_some_and(|value| {
-        !matches!(
-            value.as_str(),
-            Some("openai" | "deepseek" | "zhipu" | "moonshot")
-        )
-    }) {
+    if !matches!(
+        profile.get("providerFlavor").and_then(Value::as_str),
+        Some("openai" | "deepseek" | "zhipu" | "moonshot")
+    ) {
         return Err("providerFlavor 必须是 openai、deepseek、zhipu 或 moonshot。".into());
     }
     for field in ["contextWindowTokens", "maxOutputTokens"] {
@@ -212,7 +211,7 @@ pub(crate) fn validate_llm_profile(profile: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_profile_document(config: &Value) -> Result<(), String> {
+pub(crate) fn validate_profile_document(config: &Value) -> Result<(), String> {
     let config = config
         .as_object()
         .ok_or("LLM Profile 文件必须是 JSON 对象。")?;
@@ -377,8 +376,8 @@ mod tests {
     fn last_selected_model_is_persisted_without_changing_profile_contents() {
         let root = ConfigRoot::new();
         let profiles = json!([
-            {"id":"my-model-b", "name":"B", "kind":"responses", "model":"b-model", "enabled":true, "connectionId":"connection:shared"},
-            {"id":"custom-c", "name":"C", "kind":"anthropic", "model":"c-model", "enabled":true, "connectionId":"connection:shared"}
+            {"id":"my-model-b", "name":"B", "kind":"responses", "providerFlavor":"openai", "model":"b-model", "enabled":true, "connectionId":"connection:shared"},
+            {"id":"custom-c", "name":"C", "kind":"anthropic", "providerFlavor":"openai", "model":"c-model", "enabled":true, "connectionId":"connection:shared"}
         ]);
         let original = json!({"profiles":profiles, "defaultProfileId":"my-model-b", "connections":[{
             "id":"connection:shared","name":"API","adapterId":"custom","billingMode":"metered","baseUrl":"https://example.test","credentialKind":"apiKey"
@@ -408,8 +407,8 @@ mod tests {
 
     #[test]
     fn saving_one_model_preserves_other_models_and_the_saved_default() {
-        let a = json!({"id":"user-a", "name":"A", "kind":"responses", "model":"a", "enabled":true, "connectionId":"connection:a"});
-        let b = json!({"id":"user-b", "name":"B", "kind":"anthropic", "model":"b", "enabled":true, "connectionId":"connection:b"});
+        let a = json!({"id":"user-a", "name":"A", "kind":"responses", "providerFlavor":"openai", "model":"a", "enabled":true, "connectionId":"connection:a"});
+        let b = json!({"id":"user-b", "name":"B", "kind":"anthropic", "providerFlavor":"openai", "model":"b", "enabled":true, "connectionId":"connection:b"});
         let original = json!({"profiles":[a,b], "defaultProfileId":"user-b"});
         let store = LlmProfileStore::Ready(original.clone());
         let mut edited = a.clone();
@@ -451,6 +450,14 @@ mod tests {
         assert!(validate_llm_profile_store(&invalid)
             .unwrap_err()
             .contains("profiles[0].maxOutputTokens"));
+        let mut missing_flavor: Value = serde_json::from_str(DEFAULT_PROFILES).unwrap();
+        missing_flavor["profiles"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("providerFlavor");
+        assert!(validate_llm_profile_store(&missing_flavor)
+            .unwrap_err()
+            .contains("profiles[0].providerFlavor"));
     }
 
     #[test]

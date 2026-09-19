@@ -31,7 +31,7 @@ Section "DeepCode" Main
   File /r "${STAGE}/*"
   ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\libexec\windows-environment.ps1"' $0
   ${If} $0 != 0
-    MessageBox MB_ICONSTOP "DeepCode environment setup failed (exit $0). Check WebView2 installation and rerun Setup."
+    MessageBox MB_ICONSTOP "DeepCode environment or user configuration setup failed (exit $0). Close DeepCode, check the setup error, and rerun Setup."
     Abort
   ${EndIf}
   System::Call 'user32::SendMessageTimeoutW(p 0xffff, i 0x1a, p 0, w "Environment", i 2, i 5000, *p .r0)'

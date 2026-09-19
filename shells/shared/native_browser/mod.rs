@@ -54,7 +54,7 @@ impl Page {
 }
 
 pub struct NativeBrowser {
-    data_root: PathBuf,
+    directories: deepcode_host_connection::UserDirectories,
     binding: HostBinding,
     pages: Mutex<HashMap<String, Page>>,
     page_changed: Condvar,
@@ -79,7 +79,7 @@ impl NativeBrowser {
 
 pub fn start(
     app: &tauri::AppHandle,
-    data_root: PathBuf,
+    directories: deepcode_host_connection::UserDirectories,
     host_instance_id: String,
     token: String,
     self_bootstrap: String,
@@ -95,7 +95,7 @@ pub fn start(
         .map_err(|error| error.to_string())?;
     let stop = Arc::new(AtomicBool::new(false));
     app.manage(NativeBrowser {
-        data_root,
+        directories,
         binding: HostBinding {
             host_instance_id,
             window_label: "main".into(),
@@ -273,8 +273,9 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
     if action.starts_with("service") {
         let directory = app
             .state::<NativeBrowser>()
-            .data_root
-            .join("logs/development-services")
+            .directories
+            .log_dir
+            .join("development-services")
             .join(&binding.host_instance_id);
         let state = app.state::<NativeBrowser>();
         let mut services = state
@@ -386,8 +387,9 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
                         .data_directory(
                             app_for_create
                                 .state::<NativeBrowser>()
-                                .data_root
-                                .join("cache/webview"),
+                                .directories
+                                .cache_dir
+                                .join("webview"),
                         )
                         .on_page_load(|webview, payload| {
                             let app = webview.app_handle();
@@ -590,8 +592,9 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
                 Some(path) => PathBuf::from(path),
                 None => app
                     .state::<NativeBrowser>()
-                    .data_root
-                    .join("cache/browser-captures")
+                    .directories
+                    .cache_dir
+                    .join("browser-captures")
                     .join(&binding.host_instance_id),
             };
             std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;

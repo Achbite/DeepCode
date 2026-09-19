@@ -24,9 +24,10 @@ if (-not $Remove) {
             }
         } finally { Remove-Item -LiteralPath $scratch -Recurse -Force }
     }
-    $dataRoot = if ($env:DEEPCODE_CONFIG_DIR) { $env:DEEPCODE_CONFIG_DIR } else { Join-Path $env:APPDATA 'DeepCode' }
-    foreach ($relative in @('config\user\local', 'runtime\agent-runtime', 'logs', 'cache', 'tmp')) {
-        [IO.Directory]::CreateDirectory((Join-Path $dataRoot $relative)) | Out-Null
+    # The Host owns platform directory creation, configuration validation and backups.
+    & (Join-Path $programRoot 'deepcode-kernel.exe') --prepare-user-config
+    if ($LASTEXITCODE -ne 0) {
+        throw "DeepCode user configuration preparation failed (exit $LASTEXITCODE)."
     }
 }
 

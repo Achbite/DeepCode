@@ -37,4 +37,4 @@ Attach PNG, JPEG, WebP or GIF through the existing Files and folders control, or
 
 The built-in DeepSeek Flash and GPT-6 Astra presets declare image input. Other/custom models can explicitly enable it under the model's advanced settings when supported by the service. An unsupported model reports an error instead of silently receiving filenames as images. The current local image read limit is 8 MiB per image. The request size limit includes the encoded image data.
 
-Service adapters are currently built-in registrations. External Provider process loading and GLM Coding Plan authentication remain the next separately planned stage; display/plugin ports do not grant Provider execution or Kernel permission authority.
+Available service adapters are listed in Models and services. Display plugins can customize the supported settings panels; they do not add model transport or execution permissions.

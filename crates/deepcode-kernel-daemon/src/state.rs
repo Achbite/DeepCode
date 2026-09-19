@@ -14,6 +14,7 @@ pub(crate) struct AppState {
 
 #[derive(Debug)]
 pub(crate) struct HostPaths {
+    pub(crate) directories: deepcode_host_connection::UserDirectories,
     pub(crate) temporary_root: PathBuf,
     pub(crate) root_owner_lease_path: PathBuf,
     pub(crate) settings_path: PathBuf,
@@ -38,13 +39,24 @@ pub(crate) struct GuiState {
 }
 
 impl GuiState {
-    pub(crate) fn open() -> Result<Self, String> {
-        Self::open_at(&user_config_root())
+    #[cfg(test)]
+    pub(crate) fn open_at(root: &FsPath) -> Result<Self, String> {
+        Self::open_in(&deepcode_host_connection::UserDirectories::isolated(root))
     }
 
-    pub(crate) fn open_at(root: &FsPath) -> Result<Self, String> {
-        let paths = HostPaths::at(root);
+    pub(crate) fn open_in(
+        directories: &deepcode_host_connection::UserDirectories,
+    ) -> Result<Self, String> {
+        directories.create().map_err(|error| error.to_string())?;
+        let paths = HostPaths::in_directories(directories);
         let config_root_lease = ConfigRootLease::acquire(&paths.root_owner_lease_path)?;
+        let preparation = crate::config_setup::prepare_locked(&paths)?;
+        if let Some(backup) = preparation.backup_directory {
+            eprintln!(
+                "DeepCode 已清理冲突配置；原始文件及错误备份：{}",
+                backup.display()
+            );
+        }
         let user_settings = match read_optional_json_file(&paths.settings_path)? {
             Some(value @ Value::Object(_)) => {
                 validate_agent_runtime_settings(&value)?;
@@ -76,20 +88,18 @@ impl GuiState {
 }
 
 impl HostPaths {
-    fn at(root: &FsPath) -> Self {
-        let settings_dir = root
-            .join("config")
-            .join("user")
-            .join("local")
-            .join("settings");
-        let secrets_dir = root
-            .join("config")
-            .join("user")
-            .join("local")
-            .join("secrets");
-        let runtime_root = root.join("runtime").join("agent-runtime");
+    #[cfg(test)]
+    pub(crate) fn at(root: &FsPath) -> Self {
+        Self::in_directories(&deepcode_host_connection::UserDirectories::isolated(root))
+    }
+
+    pub(crate) fn in_directories(directories: &deepcode_host_connection::UserDirectories) -> Self {
+        let settings_dir = directories.config_dir.join("user/local/settings");
+        let secrets_dir = directories.config_dir.join("user/local/secrets");
+        let runtime_root = directories.data_dir.join("agent-runtime");
         Self {
-            temporary_root: root.join("tmp"),
+            directories: directories.clone(),
+            temporary_root: directories.temp_dir.clone(),
             root_owner_lease_path: runtime_root.join("root-owner.lock"),
             settings_path: settings_dir.join("user-settings.json"),
             llm_profiles_path: settings_dir.join("llm-profiles.json"),

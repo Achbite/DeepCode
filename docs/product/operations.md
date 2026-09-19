@@ -6,7 +6,7 @@
 
 Settings > Tool permissions > Command denylist stores one command per line. Rules match command names and argument prefixes before Shell approval or execution, including when other permissions allow execution. The default rule blocks recursive forced root removal with `rm`; ordinary project cleanup is unaffected. An explicitly empty list disables these rules. Changes apply to the next run. This is syntactic matching, not script evaluation.
 
-The project README, build scripts and user instructions determine the validation environment. If the user requires a container, run the declared scripts in that container; the presence of a host compiler does not authorize a host build. Interactive input belongs to its individual tool invocation. One invocation does not permanently change the shell or working directory of later calls.
+Tasks follow the execution environment specified by the user and project instructions. A task requiring a container uses that container for its commands. Interactive input belongs to its individual tool invocation. One invocation does not permanently change the shell or working directory of later calls.
 
 Tool results retain success, failure and denial facts. Read a denial and the current Plan scope before correcting arguments or scope; do not repeat an unchanged rejected call. `plan.progress` references current-run ToolRecord IDs and current Todo IDs. Failed records cannot prove completion. Reports distinguish executed, passed, not executed and unsupported-environment results.
 
@@ -52,12 +52,8 @@ The GUI reads artifact bytes through the Session-bound resource API. The file re
 
 The TUI header shows the current run's model profile and state; a selected next-message profile appears beside the input. Pending decisions stay above the input: use `/reply` to answer and `/decision` for full details. Ordinary input retains the Session's existing queue behavior. Use `/tool <activity-id>` for complete tool output and `/error` for the original error chain and failure-state index. Mouse-wheel and page-key scrolling retain the reading position until reaching the latest output. The welcome mark is shown only for an empty transcript; the CLI keeps its plain, compact output.
 
-## UI resource updates
+## Display plugin updates
 
-`make ui` builds only the frontend and its shared presentation/types dependencies in Docker. `python3 scripts/update-ui.py --package <existing-package>` publishes those resources, or `make ui-update UI_PACKAGE=<existing-package>` performs both steps. The updater preserves Kernel, Session runtime, user data and the original package identity. macOS updates run on the host and refresh the App resource signature. Reload the interface from settings or reopen the window after saving edits and unsent input. Changes that introduce a Host/Session interface or a tool executor need the corresponding normal service build.
+Add a local standalone JavaScript module in Settings → Plugins → UI plugins. Saving the module updates that plugin in the open window; disabling it releases its views and styles. Conversation drafts and history remain available. Plugins receive the supported display inputs and ports described in the [UI plugin API and example](ui-plugins.md).
 
-## Display plugin hot replacement and package builds
-
-Add a local standalone JavaScript module in Settings → Plugins → UI plugins. Saved files update that plugin; disabling it releases its views and styles. Plugins receive display text, document data and theme inputs, without Session or tool ports. See the [UI plugin API and example](ui-plugins.md).
-
-Native shells read Web resources from the package instead of embedding a duplicate copy in the executable. Normal packaging still builds current source with Cargo and Vite. Use `make ui-update UI_PACKAGE=...` for UI-only edits; this retains native binaries and Session runtime.
+After installing a complete application update, close and reopen DeepCode. User configuration, conversation history and artifacts remain in their separate user directories.
