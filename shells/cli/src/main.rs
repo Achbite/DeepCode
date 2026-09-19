@@ -651,7 +651,7 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
                     binding.display_name, binding.workspace_id
                 );
             } else {
-                println!("目录索引集合已更新；从下一次 run 起使用共享投影中的有效目录集合。");
+                println!("对话目录已更新，下次运行生效。");
             }
             Ok(Outcome::Done)
         }
@@ -1003,7 +1003,7 @@ async fn run_chat(
                     .detach_conversation_directory_index(&projection.session_id, workspace_id)
                     .await
                     .map_err(|error| error.to_string())?;
-                println!("目录索引已移除；运行中的 run 保留其冻结快照。");
+                println!("目录已移除，下次运行生效。");
             }
             value if value.starts_with('@') => {
                 let query = value.trim_start_matches('@').trim();
@@ -1221,69 +1221,17 @@ fn print_help() {
   deepcode-cli stop-host
   deepcode-cli status
 
-只有显式 -C/--workspace 会为新 Session 创建 creation binding；已有 Session 通过 attach-directory/detach-directory 管理对话目录索引。
-chat 普通文本随时发送，运行中按序排队；/reply 1 确认 Plan，/reply <说明> 修订 Plan 或回答交互，/reply 1/2 允许/拒绝 effect；cancel-plan 明确取消 Plan。
+使用 -C/--workspace 为新对话指定工作目录；已有对话通过 attach-directory/detach-directory 管理目录。
+chat 普通文本随时发送，运行中按序排队；/reply 1 确认计划，/reply <说明> 修改计划或回答问题，/reply 1/2 允许/拒绝操作；cancel-plan 取消计划。
 文件与目录引用只在 ask 中显式选择；--file 与 --directory 均可重复。图片以视觉内容发送给支持图片的模型，其他文件保留只读引用。
-ask/chat 支持 --plugin 显式引用，参数可重复；Agent 也可按任务发现并加载已启用插件。PDF 文件按 mediaType 要求一个已配置的 Skill 插件。交互 chat 使用 @ 查看并选择下一次请求的插件，/focus <task> 作为类型化命令提交。
-所有终端命令都通过 ConversationPort，并只读取共享 SessionProjection。"#,
+ask/chat 支持重复使用 --plugin 指定插件；Agent 也可按任务发现并加载已启用插件。PDF 文件需要已配置且支持 PDF 的 Skill。chat 使用 @ 选择下一次请求的插件，/focus <task> 开始任务。"#,
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn waiting_projection(field: &str, decision: serde_json::Value) -> SessionProjection {
-        let mut value = json!({
-            "schemaVersion": deepcode_kernel_client::SESSION_PROJECTION_VERSION,
-            "sessionId":"session:test", "revision":1, "display":{"creationTitle":"input"},
-            "workspaceBindings":[], "sessionDirectoryIndexes":[], "timeline":[], "messages":[],
-            "queuedInputs":[], "narratives":[], "plans":[], "contextCompositions":[],
-            "tokenUsageHistory":[], "activities":[], "artifacts":[],
-            "tokenUsage":{"providerCallCount":0,"reportedCallCount":0,"inputTokens":0,"outputTokens":0,
-              "cacheReadInputTokens":0,"cacheMissInputTokens":0,"cacheAvailable":false,"cacheComplete":false},
-            "run":{"runId":"run:test","profileId":"profile:current","workspaceBindings":[],"status":"waiting"}
-        });
-        value[field] = decision;
-        serde_json::from_value(value).unwrap()
-    }
-
-    fn pending_decisions() -> [(
-        &'static str,
-        serde_json::Value,
-        &'static str,
-        &'static str,
-        serde_json::Value,
-    ); 3] {
-        [
-            (
-                "pendingPlan",
-                json!({"planId":"plan:test","revision":1,"runId":"run:test","callId":"call:plan",
-                "title":"Plan","summary":"Review","steps":[],"mutationManifest":[],"status":"published",
-                "responseMode":"confirmReviseOrCancel","sequence":1,"createdAt":"now","updatedAt":"now"}),
-                "plan.respond",
-                "response",
-                json!({"kind":"confirm"}),
-            ),
-            (
-                "pendingInteraction",
-                json!({"interactionId":"interaction:test","runId":"run:test","callId":"call:question",
-                "kind":"question","prompt":"Choose","options":[{"id":"a","label":"Option A"}],
-                "allowFreeform":true,"sequence":1,"createdAt":"now"}),
-                "interaction.respond",
-                "response",
-                json!("Option A"),
-            ),
-            (
-                "pendingApproval",
-                json!({"approvalId":"approval:test","runId":"run:test","callId":"call:effect",
-                "preview":{"summary":"Write","effects":[],"logicalTargets":[]},"sequence":1,"createdAt":"now"}),
-                "approval.respond",
-                "decision",
-                json!("allow"),
-            ),
-        ]
-    }
+    use crate::conversation_input::fixtures::{pending_decisions, waiting_projection};
 
     #[test]
     fn pending_plain_input_queues_while_explicit_reply_keeps_decision_semantics() {

@@ -21,7 +21,6 @@
     "workbench.mode.browser": "浏览器",
     "workbench.sourceControl": "源代码管理",
     "workbench.search": "搜索",
-    "workbench.searchReserved": "搜索面板预留给工作区搜索阶段。",
     "workbench.accounts": "账户",
     "workbench.loading.explorer": "正在加载资源管理器...",
     "workbench.loading.browser": "正在加载浏览器...",
@@ -33,8 +32,6 @@
     "workbench.resize.agent": "调整 Agent 面板宽度",
     "workbench.resize.terminal": "调整终端面板高度",
     "git.placeholder": "源代码管理",
-    "git.stageHint": "Git 写操作需通过 Kernel 权限链执行。",
-    "git.reservedTitle": "写操作由 Kernel 权限工具处理",
     "git.statusUnavailable": "当前无法读取 Git 状态。",
     "git.noRepository": "未检测到 Git 工作区",
     "git.refresh": "刷新 Git 状态",
@@ -119,8 +116,6 @@
     "settings.group.gui": "DeepCode-GUI",
     "settings.group.skills": "Skill",
     "settings.group.mcp": "MCP",
-    "settings.workbench.i18n.prefix": "语言包预留在 ",
-    "settings.workbench.i18n.suffix": " 下。当前会保存显示语言；完整界面热切换与本地化接线将在后续阶段补齐。",
     "settings.workspaceHint": "来自工作区的值由当前工作区控制，需要在工作区设置中修改。",
     "settings.source.workspace": "工作区",
     "settings.source.user": "用户",
@@ -220,12 +215,9 @@
     "deepcodeGui.session.copyId": "复制对话 ID",
     "deepcodeGui.session.addToProject": "添加到项目",
     "deepcodeGui.session.deleteConfirm": "删除对话“{title}”？它将从侧栏移除。",
-    "deepcodeGui.tasks.revision": "进度版本 {revision}",
-    "deepcodeGui.tasks.reported": "Agent 报告的任务进度",
-    "deepcodeGui.tasks.endedRemaining": "任务所属轮次已结束，仍有 {count} 项待处理或受阻",
+    "deepcodeGui.tasks.endedRemaining": "本次运行已结束，{count} 项未完成",
     "deepcodeGui.tasks.status.blocked": "受阻",
-    "tui.todoReported": "Agent 报告的任务进度",
-    "tui.todoEndedRemaining": "任务所属轮次已结束，仍有 {0} 项待处理或受阻",
+    "tui.todoEndedRemaining": "本次运行已结束，{0} 项未完成",
     "tui.status.blocked": "受阻",
     "reader.annotation.annotation": "批注",
     "reader.annotation.comment": "区域点评",
@@ -305,7 +297,6 @@
     "app.closeConfirm.message": "当前有未保存的文件。退出前是否保存这些更改？",
     "app.closeConfirm.detail": "选择“不保存”会放弃当前编辑器中的未保存内容；选择“取消”将返回 DeepCode。",
     "api.error.networkUnavailable": "网络不可达: {message}",
-    "runtime.workspacePickerUnsupported": "当前统一 GUI Host 通过 Rust Kernel Web Host 访问工作区，请使用浏览对话框选择路径。",
     "heartbeat.error.parse": "WebSocket 消息解析失败",
     "heartbeat.error.connection": "WebSocket 连接错误",
     "codeWorkspaceChoice.title": "打开 .code-workspace 文件",
@@ -328,8 +319,8 @@
     "deepcodeGui.bootstrap.startFailedBody": "前端工作台没有完成渲染。下面是启动阶段错误，便于定位打包白屏问题。",
     "deepcodeGui.bootstrap.renderFailedTitle": "DeepCode-GUI 渲染失败",
     "deepcodeGui.bootstrap.renderFailedBody": "React 工作台启动后遇到异常。",
-    "deepcodeGui.kernelStart.failed": "Kernel 启动失败",
-    "deepcodeGui.kernelStart.waitingHealth": "Kernel 启动请求已发送，正在等待 API 健康检查。",
+    "deepcodeGui.kernelStart.failed": "核心服务启动失败",
+    "deepcodeGui.kernelStart.waitingHealth": "正在等待服务就绪。",
     "deepcodeGui.hostStartup.idle": "Host 启动尚未开始。",
     "deepcodeGui.hostStartup.statusUnavailable": "Host 启动状态不可用。",
     "deepcodeGui.hostStartup.permissionBlocked": "启动权限预检未完成。",
@@ -402,7 +393,6 @@
     "settings.mcp.title": "MCP 服务",
     "settings.mcp.defaultName": "本地 MCP",
     "settings.mcp.autoLoad": "启动本地 stdio MCP Server",
-    "settings.mcp.scopeHint": "MCP 工具并入同一个工具目录，并沿同一 Kernel 执行与用户决定路径运行。",
     "settings.mcp.localServers": "本地服务",
     "settings.mcp.displayName": "显示名称",
     "settings.mcp.commandPlaceholder": "可执行文件绝对路径或命令",
@@ -410,22 +400,18 @@
     "settings.mcp.empty": "尚未配置 MCP Server。",
     "settings.skill.title": "Skills",
     "settings.skill.autoLoad": "启动时加载本地 SKILL.md",
-    "settings.skill.scopeHint": "每个挂载目录中的 SKILL.md 作为指令插件参与同一个 Agent Loop，不产生独立运行时。",
     "settings.skill.localMounts": "本地挂载",
     "settings.skill.pathPlaceholder": "SKILL.md 或其父目录的绝对路径",
     "settings.skill.activationMediaTypesPlaceholder": "激活媒体类型，逗号分隔（例如 application/pdf）",
     "settings.skill.empty": "尚未配置 Skill。",
     "settings.gui.usage.title": "当前会话总用量",
-    "settings.gui.usage.description": "查看当前会话实际使用的 Token 和缓存统计。",
     "settings.gui.usage.providerCalls": "Provider 调用",
     "settings.gui.usage.inputTokens": "输入 Token",
     "settings.gui.usage.outputTokens": "输出 Token",
     "settings.gui.usage.totalCacheHitRate": "总缓存命中率",
     "settings.gui.usage.cacheReadTokens": "缓存读取 Token",
     "settings.gui.usage.cacheMissTokens": "缓存未命中 Token",
-    "settings.gui.usage.cacheCoverage": "Provider 缓存字段报告 {reported}/{total} 次；仅全部调用均报告时，按缓存读取输入 / 输入 Token 显示精确命中率。",
     "settings.gui.usage.historyTitle": "Provider 缓存命中历史",
-    "settings.gui.usage.historyDescription": "从新到旧排列；每页 10 条。每条汇总当前会话该轮内全部 Provider 调用。",
     "settings.gui.usage.historyEmpty": "当前对话还没有用量记录。",
     "settings.gui.usage.roundProviderCalls": "{count} 次 Provider 调用",
     "settings.gui.usage.cacheHit": "缓存命中",
@@ -655,7 +641,7 @@
     "deepcodeGui.session.removeFromProject": "移出项目",
     "deepcodeGui.project.manageWorkspaces": "管理工作区",
     "deepcodeGui.project.workspacesTitle": "管理工作区",
-    "deepcodeGui.project.workspaceTemplateHint": "这些目录只作为新对话的绑定模板；已有对话的创建快照不会改变。",
+    "deepcodeGui.project.workspaceTemplateHint": "用于新对话，已有对话不受影响。",
     "deepcodeGui.project.noWorkspaces": "尚未附加工作目录",
     "deepcodeGui.project.addFolder": "添加文件夹",
     "deepcodeGui.common.done": "完成",
@@ -874,8 +860,8 @@
     "tui.pluginCatalogLoadFailed": "插件目录加载失败：{0}",
     "tui.readyHelp": "就绪 · /help 查看命令",
     "tui.sessionInitializationFailed": "Session 初始化失败：{0}",
-    "tui.projectionRefreshFailed": "刷新共享投影失败：{0}",
-    "tui.inputCleared": "可见输入与下一次请求的插件选择已清理；durable Session 未修改",
+    "tui.projectionRefreshFailed": "刷新会话失败：{0}",
+    "tui.inputCleared": "输入和下次请求的插件选择已清空",
     "tui.reasoningEnabled": "推理详情已开启；使用 /reasoning <request-id> [offset] 展开，/reasoning-history 查阅历史。",
     "tui.reasoningDisabled": "推理详情已关闭，仅显示状态。",
     "tui.viewClosed": "已关闭辅助视图。",
@@ -907,18 +893,18 @@
     "tui.readOnlyResource": "只读资源 {0} · {1} bytes",
     "tui.resourceReadFailed": "资源读取失败：{0}",
     "tui.attachUsage": "用法：/attach <path>",
-    "tui.directoryAttached": "目录索引已附加；从下一次 run 起生效。",
+    "tui.directoryAttached": "目录已添加，下次运行生效。",
     "tui.directoryAttachFailed": "目录索引附加失败：{0}",
     "tui.detachUsage": "用法：/detach <workspace-id>",
-    "tui.directoryDetached": "目录索引已移除；运行中的 run 保留冻结快照。",
+    "tui.directoryDetached": "目录已移除，下次运行生效。",
     "tui.directoryDetachFailed": "目录索引移除失败：{0}",
-    "tui.commandAccepted": "命令已接纳 · revision {0}",
+    "tui.commandAccepted": "已接收",
     "tui.commandRejected": "命令被拒绝。",
     "tui.pluginRefreshSecondary": "{0}；插件目录刷新失败：{1}",
     "tui.pluginRefreshed": "；插件目录已刷新，请重新选择。",
-    "tui.actionPlan": "Agent 正在等待 /reply 1 确认 Plan、/reply <修订说明> 或 /cancel-plan。",
+    "tui.actionPlan": "输入 /reply 1 确认计划、/reply <修改说明> 修改计划，或 /cancel-plan 取消。",
     "tui.actionReply": "Agent 正在等待 /reply <答复> 回答中间问题。",
-    "tui.actionApproval": "Agent 正在等待 /reply 1 允许或 /reply 2 拒绝 effect。",
+    "tui.actionApproval": "输入 /reply 1 允许或 /reply 2 拒绝操作。",
     "tui.pluginAlreadySelected": "插件已为下一次请求选择：{0}",
     "tui.pluginSelected": "已为下一次请求选择插件：{0}",
     "tui.noPlugins": "当前没有可用插件。",
@@ -1069,7 +1055,7 @@
     "tui.languageMissing": "用户设置缺少合法的 workbench.language。",
     "tui.languageInvalid": "不支持的显示语言：{0}；请选择 zh-CN 或 en-US。",
     "tui.settingsReadFailed": "语言设置读取失败：{0}",
-    "tui.help": "DeepCode TUI\n\n用法：\n  deepcode-tui [-C <workspace>] [--session <id>] [--plugin <plugin://uri>]...\n  deepcode-tui [--language zh-CN|en-US] [--api <url>] [--no-auto-start-kernel] [--smoke]\n\n--language 覆盖已有 workbench.language 设置；启动前默认使用简体中文。\n只有显式 -C/--workspace 会给新 Session 创建 workspace binding。\n--plugin 可重复且只选择下一次请求的插件；交互输入 @ 打开同一插件目录。\n普通文本随时发送，运行中按序排队；/reply 1 确认计划，/reply <说明> 修订计划或回答交互；/reply 1/2 允许/拒绝操作；/reply 3 允许本轮宿主 Shell（仅在提供该选项时）。\n/cancel-plan 取消计划，/cancel 或 Ctrl-C 取消运行；Esc 清空输入。\n/focus <task> 开始任务；/attach <path> 附加目录；/detach <workspace-id> 移除目录；/model <profile> 选择模型；/context 查看上下文。\n/help 查看完整交互命令。",
+    "tui.help": "DeepCode TUI\n\n用法：\n  deepcode-tui [-C <workspace>] [--session <id>] [--plugin <plugin://uri>]...\n  deepcode-tui [--language zh-CN|en-US] [--api <url>] [--no-auto-start-kernel] [--smoke]\n\n--language 覆盖已有 workbench.language 设置；启动前默认使用简体中文。\n使用 -C/--workspace 为新对话指定工作目录。\n--plugin 可重复且只选择下一次请求的插件；交互输入 @ 打开同一插件目录。\n普通文本随时发送，运行中按序排队；/reply 1 确认计划，/reply <说明> 修订计划或回答交互；/reply 1/2 允许/拒绝操作；/reply 3 允许本轮宿主 Shell（仅在提供该选项时）。\n/cancel-plan 取消计划，/cancel 或 Ctrl-C 取消运行；Esc 清空输入。\n/focus <task> 开始任务；/attach <path> 附加目录；/detach <workspace-id> 移除目录；/model <profile> 选择模型；/context 查看上下文。\n/help 查看完整交互命令。",
     "tui.commandHelp": "DeepCode 命令\n\n@ 选择下一次请求的插件\n/tasks 查看任务\n/context 查看上下文\n/focus <task> 开始任务\n/model 选择连接和模型；/model <profile> 直接选择已配置模型\n/attach <path> 附加目录\n/detach <workspace-id> 移除目录索引\n/open <workspace-id> <logical-path> 读取文件\n/next 继续读取\n/diff <record-id> <index> 查看修改\n/reasoning 开关推理详情\n/reasoning <request-id> [offset] 按需读取推理\n/reasoning-history 查阅推理历史\n/cancel 取消运行\n/cancel-plan 取消计划\n/close 返回会话\n/clear 清空输入\n/show 查看会话信息\n/error 失败诊断与快照\n/decision 当前决策详情\n/tool <activity-id> 工具详情\n/quit 退出\n\nPgUp / PgDn / 滚轮滚动当前视图；普通消息随时排队；/reply <答复> 回应交互或修订计划，/reply 1 确认计划；/reply 1/2 允许/拒绝操作，/reply 3 允许本轮宿主 Shell（仅在提供该选项时）。",
     "deepcodeGui.hostStartup.lockFailed": "Host 启动锁操作失败。请查看原始错误后重试。",
     "tui.connectionFailed": "DeepCode TUI 无法连接 Daemon：{0}",
@@ -1152,7 +1138,7 @@
     },
     "gui.showContextRail": {
       "label": "显示上下文栏",
-      "description": "在右侧显示任务和当前会话的产物。"
+      "description": "在右侧显示任务和产出。"
     },
     "workbench.styleTokenOverrides": {
       "label": "自定义配色",
@@ -1183,7 +1169,7 @@
     },
     "agent.systemPrompt": {
       "label": "系统提示词",
-      "description": "附加到内置编码 Agent 指令之后；所有 UI 壳启动的新会话共享该内容。"
+      "description": "附加到内置指令后，应用于新对话。"
     },
     "agent.permissions.workspaceMutation": {
       "label": "工作区修改",
@@ -1195,7 +1181,7 @@
     },
     "agent.permissions.engineeringDecisions": {
       "label": "工程路线抉择",
-      "description": "控制 Agent 在工程路线不明确时询问用户，还是依据当前代码事实自行裁决。缺少需求事实和工作区外操作仍会询问。",
+      "description": "工程路线不明确时，选择询问你或由 Agent 决定。需求缺失或工作区外操作仍会询问。",
       "options": {
         "ask": "询问用户",
         "delegate": "委托给 Agent"
@@ -1203,7 +1189,7 @@
     },
     "agent.permissions.networkRead": {
       "label": "读取公网",
-      "description": "Kernel 对公网搜索与读取工具采用的默认决策。",
+      "description": "公网搜索与网页读取的默认权限。",
       "options": {
         "allow": "允许",
         "ask": "每次询问",
@@ -1221,11 +1207,11 @@
     },
     "agent.web.search.endpointTemplate": {
       "label": "Web 搜索覆盖端点模板",
-      "description": "留空使用内建 Brave Web Search adapter；也可填写包含 {query} 和可选 {limit} 的显式 JSON HTTP 端点模板。配置端点绝不作为 fallback。"
+      "description": "留空使用 Brave 搜索。自定义 JSON HTTP 端点须包含 {query}，可选 {limit}。"
     },
     "agent.web.search.authHeaderName": {
       "label": "Web 搜索认证头",
-      "description": "仅供显式配置的搜索端点使用；内建 Brave adapter 固定使用 X-Subscription-Token。"
+      "description": "自定义搜索端点使用的认证头；Brave 使用 X-Subscription-Token。"
     },
     "agent.documents.pythonPath": {
       "label": "PDF 渲染 Python",
@@ -1233,7 +1219,7 @@
     },
     "agent.web.search.authSecretRef": {
       "label": "Web 搜索认证 Secret",
-      "description": "内建 Brave adapter 必需、显式配置端点可选的 Secret 引用；缺失时内建 web.search 为 blocked。"
+      "description": "搜索密钥的引用；Brave 必填，自定义端点按需填写。"
     },
     "skills.mounts": {
       "label": "项目 Skill 挂载",

@@ -794,10 +794,7 @@ impl TuiApp {
             .await
         {
             Ok(reply) if reply.status != "rejected" => {
-                self.status = self
-                    .host
-                    .language
-                    .format("tui.commandAccepted", &[format!("{}", reply.revision)]);
+                self.status = self.host.language.text("tui.commandAccepted").to_string();
                 self.poll().await;
                 true
             }
@@ -1362,6 +1359,7 @@ fn new_id(kind: &str) -> String {
 #[cfg(test)]
 mod input_tests {
     use super::*;
+    use crate::conversation_input::fixtures::{pending_decisions, waiting_projection};
     fn test_app() -> TuiApp {
         let client = HttpKernelClient::new(
             deepcode_kernel_client::KernelClientConfig::new("http://127.0.0.1:1")
@@ -1378,57 +1376,6 @@ mod input_tests {
                 plugin_uris: vec![],
             },
         )
-    }
-    fn waiting_projection(field: &str, decision: serde_json::Value) -> SessionProjection {
-        let mut value = json!({
-            "schemaVersion": deepcode_kernel_client::SESSION_PROJECTION_VERSION,
-            "sessionId":"session:test", "revision":1, "display":{"creationTitle":"input"},
-            "workspaceBindings":[], "sessionDirectoryIndexes":[], "timeline":[], "messages":[],
-            "queuedInputs":[], "narratives":[], "plans":[], "contextCompositions":[],
-            "tokenUsageHistory":[], "activities":[], "artifacts":[],
-            "tokenUsage":{"providerCallCount":0,"reportedCallCount":0,"inputTokens":0,"outputTokens":0,
-              "cacheReadInputTokens":0,"cacheMissInputTokens":0,"cacheAvailable":false,"cacheComplete":false},
-            "run":{"runId":"run:test","profileId":"profile:current","workspaceBindings":[],"status":"waiting"}
-        });
-        value[field] = decision;
-        serde_json::from_value(value).unwrap()
-    }
-
-    fn pending_decisions() -> [(
-        &'static str,
-        serde_json::Value,
-        &'static str,
-        &'static str,
-        serde_json::Value,
-    ); 3] {
-        [
-            (
-                "pendingPlan",
-                json!({"planId":"plan:test","revision":1,"runId":"run:test","callId":"call:plan",
-                "title":"Plan","summary":"Review","steps":[],"mutationManifest":[],"status":"published",
-                "responseMode":"confirmReviseOrCancel","sequence":1,"createdAt":"now","updatedAt":"now"}),
-                "plan.respond",
-                "response",
-                json!({"kind":"confirm"}),
-            ),
-            (
-                "pendingInteraction",
-                json!({"interactionId":"interaction:test","runId":"run:test","callId":"call:question",
-                "kind":"question","prompt":"Choose","options":[{"id":"a","label":"Option A"}],
-                "allowFreeform":true,"sequence":1,"createdAt":"now"}),
-                "interaction.respond",
-                "response",
-                json!("Option A"),
-            ),
-            (
-                "pendingApproval",
-                json!({"approvalId":"approval:test","runId":"run:test","callId":"call:effect",
-                "preview":{"summary":"Write","effects":[],"logicalTargets":[]},"sequence":1,"createdAt":"now"}),
-                "approval.respond",
-                "decision",
-                json!("allow"),
-            ),
-        ]
     }
     #[test]
     fn pending_plain_input_queues_while_explicit_reply_keeps_decision_semantics() {

@@ -666,11 +666,7 @@ pub(crate) fn render_todo(out: &mut impl Write, projection: &SessionProjection) 
     let Some(todo) = projection.todo_list.as_ref() else {
         return Ok(());
     };
-    writeln!(
-        out,
-        "Todo · {}",
-        crate::i18n::Language::default().text("tui.todoReported")
-    )?;
+    writeln!(out, "任务")?;
     if todo.items.is_empty() {
         writeln!(out, "  （空）")?;
         return Ok(());

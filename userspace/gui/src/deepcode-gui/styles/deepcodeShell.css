@@ -668,12 +668,6 @@
   font-weight: var(--dc-weight-semibold);
 }
 
-.deepcode-gui-task-list-card__title small {
-  color: var(--dc-faint);
-  font-size: var(--dc-font-micro);
-  font-weight: var(--dc-weight-regular);
-}
-
 .deepcode-gui-task-list-card__empty {
   min-height: 64px;
   display: grid;

@@ -2,8 +2,9 @@ use crate::app::TuiApp;
 use crate::i18n::Language;
 use deepcode_kernel_client::{
     ActivityProjection, AssistantDraftProjection, ContextCompositionProjection,
-    ContextUsageProjection, NarrativeProjection, PendingPlanProjection, PlanProjection,
-    ProjectionMessage, SessionProjection, SessionTimelineItem, TokenUsageProjection,
+    ContextUsageProjection, ExecutionPlanStep, NarrativeProjection, PendingPlanProjection,
+    PlanProjection, ProjectionMessage, SessionProjection, SessionTimelineItem,
+    TokenUsageProjection,
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
@@ -705,7 +706,7 @@ impl Renderer {
                     }
                 }
             }
-            if let Some(draft) = visible_assistant_draft(projection) {
+            if let Some(draft) = projection.assistant_draft.as_ref() {
                 if let Some(preview) = draft.plan_preview.as_ref() {
                     output.push_str(&language.format(
                         "tui.generatingPlan",
@@ -1217,7 +1218,7 @@ impl Renderer {
                     ));
                 }
             }
-            if let Some(draft) = visible_assistant_draft(projection) {
+            if let Some(draft) = projection.assistant_draft.as_ref() {
                 if let Some(preview) = draft.plan_preview.as_ref() {
                     lines.push(Line::from(language.format(
                         "tui.generatingPlanInline",
@@ -2097,11 +2098,8 @@ fn todo_note(language: Language, projection: &SessionProjection) -> Option<Strin
         .token_usage_history
         .iter()
         .any(|run| run.run_id == todo.run_id && run.outcome.is_some());
-    Some(if ended && remaining > 0 {
-        language.format("tui.todoEndedRemaining", &[remaining.to_string()])
-    } else {
-        language.text("tui.todoReported").to_string()
-    })
+    (ended && remaining > 0)
+        .then(|| language.format("tui.todoEndedRemaining", &[remaining.to_string()]))
 }
 
 fn render_todo_plain(language: Language, output: &mut String, projection: &SessionProjection) {
@@ -2243,22 +2241,9 @@ fn cache_coverage_label(language: Language, usage: &TokenUsageProjection) -> &'s
     }
 }
 
-fn visible_assistant_draft(projection: &SessionProjection) -> Option<&AssistantDraftProjection> {
-    projection.assistant_draft.as_ref()
-}
-
 fn render_plan_plain(language: Language, output: &mut String, plan: &PendingPlanProjection) {
     output.push_str(&language.format("tui.pendingPlanTitle", &[format!("{}", plan.revision)]));
-    output.push_str(&format!("{}\n{}\n", plan.title, plan.summary));
-    for (index, step) in plan.steps.iter().enumerate() {
-        output.push_str(&format!("{}. {}\n", index + 1, step.title));
-        output.push_str(&format!("   {}\n", step.details));
-        if let Some(verification) = step.verification.as_ref() {
-            for item in verification {
-                output.push_str(&language.format("tui.verification", &[format!("{}", item)]));
-            }
-        }
-    }
+    render_plan_body_plain(language, output, &plan.title, &plan.summary, &plan.steps);
     output.push_str(language.text("tui.planResponseHint"));
 }
 
@@ -2270,8 +2255,18 @@ fn render_timeline_plan_plain(language: Language, output: &mut String, plan: &Pl
             status_label(language, &plan.status).to_string(),
         ],
     ));
-    output.push_str(&format!("{}\n{}\n", plan.title, plan.summary));
-    for (index, step) in plan.steps.iter().enumerate() {
+    render_plan_body_plain(language, output, &plan.title, &plan.summary, &plan.steps);
+}
+
+fn render_plan_body_plain(
+    language: Language,
+    output: &mut String,
+    title: &str,
+    summary: &str,
+    steps: &[ExecutionPlanStep],
+) {
+    output.push_str(&format!("{title}\n{summary}\n"));
+    for (index, step) in steps.iter().enumerate() {
         output.push_str(&format!("{}. {}\n", index + 1, step.title));
         output.push_str(&format!("   {}\n", step.details));
         if let Some(verification) = step.verification.as_ref() {

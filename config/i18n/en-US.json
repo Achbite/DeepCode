@@ -21,7 +21,6 @@
     "workbench.mode.browser": "Browser",
     "workbench.sourceControl": "Source Control",
     "workbench.search": "Search",
-    "workbench.searchReserved": "Search panel is reserved for the workspace search stage.",
     "workbench.accounts": "Accounts",
     "workbench.loading.explorer": "Loading Explorer...",
     "workbench.loading.browser": "Loading Browser...",
@@ -33,8 +32,6 @@
     "workbench.resize.agent": "Resize Agent panel",
     "workbench.resize.terminal": "Resize Terminal panel",
     "git.placeholder": "Source Control",
-    "git.stageHint": "Git write operations are handled through Kernel permission tools.",
-    "git.reservedTitle": "Write operations are handled by Kernel permission tools",
     "git.statusUnavailable": "Git status is not available.",
     "git.noRepository": "No Git workspace detected",
     "git.refresh": "Refresh Git status",
@@ -119,8 +116,6 @@
     "settings.group.gui": "DeepCode-GUI",
     "settings.group.skills": "Skill",
     "settings.group.mcp": "MCP",
-    "settings.workbench.i18n.prefix": "Language packs are loaded from ",
-    "settings.workbench.i18n.suffix": ". Changing the display language is stored now; full UI reload/localization wiring lands in a later stage.",
     "settings.workspaceHint": "Workspace-sourced values are controlled by the current workspace and must be changed in workspace settings.",
     "settings.source.workspace": "Workspace",
     "settings.source.user": "User",
@@ -220,12 +215,9 @@
     "deepcodeGui.session.copyId": "Copy chat ID",
     "deepcodeGui.session.addToProject": "Add to project",
     "deepcodeGui.session.deleteConfirm": "Delete chat “{title}”? It will be removed from the sidebar.",
-    "deepcodeGui.tasks.revision": "Progress revision {revision}",
-    "deepcodeGui.tasks.reported": "Task progress reported by the agent",
-    "deepcodeGui.tasks.endedRemaining": "Task run ended with {count} unfinished or blocked items",
+    "deepcodeGui.tasks.endedRemaining": "Run ended with {count} unfinished task(s)",
     "deepcodeGui.tasks.status.blocked": "Blocked",
-    "tui.todoReported": "Task progress reported by the agent",
-    "tui.todoEndedRemaining": "Task run ended with {0} unfinished or blocked items",
+    "tui.todoEndedRemaining": "Run ended with {0} unfinished task(s)",
     "tui.status.blocked": "Blocked",
     "reader.annotation.annotation": "Annotate",
     "reader.annotation.comment": "Comment",
@@ -305,7 +297,6 @@
     "app.closeConfirm.message": "There are unsaved files. Save these changes before exiting?",
     "app.closeConfirm.detail": "Choosing “Don't Save” discards unsaved editor contents; choosing “Cancel” returns to DeepCode.",
     "api.error.networkUnavailable": "Network unavailable: {message}",
-    "runtime.workspacePickerUnsupported": "The unified GUI Host accesses workspaces through the Rust Kernel Web Host. Use the browse dialog to choose a path.",
     "heartbeat.error.parse": "Failed to parse WebSocket message",
     "heartbeat.error.connection": "WebSocket connection error",
     "codeWorkspaceChoice.title": "Open .code-workspace File",
@@ -328,8 +319,8 @@
     "deepcodeGui.bootstrap.startFailedBody": "The frontend workbench did not finish rendering. The startup error is shown below to help diagnose packaging blank screens.",
     "deepcodeGui.bootstrap.renderFailedTitle": "DeepCode-GUI Render Failed",
     "deepcodeGui.bootstrap.renderFailedBody": "The React workbench encountered an error after startup.",
-    "deepcodeGui.kernelStart.failed": "Kernel start failed",
-    "deepcodeGui.kernelStart.waitingHealth": "Kernel start was requested; waiting for API health.",
+    "deepcodeGui.kernelStart.failed": "Core service failed to start",
+    "deepcodeGui.kernelStart.waitingHealth": "Waiting for the service to be ready.",
     "deepcodeGui.hostStartup.idle": "Host startup has not started.",
     "deepcodeGui.hostStartup.statusUnavailable": "Host startup status is unavailable.",
     "deepcodeGui.hostStartup.permissionBlocked": "Startup permission preflight did not complete.",
@@ -402,7 +393,6 @@
     "settings.mcp.title": "MCP Services",
     "settings.mcp.defaultName": "Local MCP",
     "settings.mcp.autoLoad": "Start local stdio MCP servers",
-    "settings.mcp.scopeHint": "MCP tools join the same tool catalog and use the same Kernel execution and user-decision path.",
     "settings.mcp.localServers": "Local servers",
     "settings.mcp.displayName": "Display name",
     "settings.mcp.commandPlaceholder": "Executable path or command",
@@ -410,22 +400,18 @@
     "settings.mcp.empty": "No MCP servers configured.",
     "settings.skill.title": "Skills",
     "settings.skill.autoLoad": "Load local SKILL.md files at startup",
-    "settings.skill.scopeHint": "SKILL.md files contribute instructions to the same Agent loop; they do not create another runtime.",
     "settings.skill.localMounts": "Local mounts",
     "settings.skill.pathPlaceholder": "Absolute path to SKILL.md or its parent",
     "settings.skill.activationMediaTypesPlaceholder": "Activation media types, comma-separated (for example application/pdf)",
     "settings.skill.empty": "No Skills configured.",
     "settings.gui.usage.title": "Current session totals",
-    "settings.gui.usage.description": "Read-only Provider usage and cache facts from the shared Session projection.",
     "settings.gui.usage.providerCalls": "Provider calls",
     "settings.gui.usage.inputTokens": "Input tokens",
     "settings.gui.usage.outputTokens": "Output tokens",
     "settings.gui.usage.totalCacheHitRate": "Total cache hit rate",
     "settings.gui.usage.cacheReadTokens": "Cache-read tokens",
     "settings.gui.usage.cacheMissTokens": "Cache-miss tokens",
-    "settings.gui.usage.cacheCoverage": "Provider cache fields were reported for {reported}/{total} calls; an exact hit rate is shown only when every call reports it, using cache-read input divided by input tokens.",
     "settings.gui.usage.historyTitle": "Provider cache hit history",
-    "settings.gui.usage.historyDescription": "Newest first, 10 per page. Each row aggregates every Provider call in that round for the current session.",
     "settings.gui.usage.historyEmpty": "No usage rounds for this conversation yet.",
     "settings.gui.usage.roundProviderCalls": "{count} Provider call(s)",
     "settings.gui.usage.cacheHit": "Cache hit",
@@ -655,7 +641,7 @@
     "deepcodeGui.session.removeFromProject": "Move out of project",
     "deepcodeGui.project.manageWorkspaces": "Manage workspaces",
     "deepcodeGui.project.workspacesTitle": "Manage workspace",
-    "deepcodeGui.project.workspaceTemplateHint": "These folders are a template for new chats. Existing creation snapshots stay unchanged.",
+    "deepcodeGui.project.workspaceTemplateHint": "Applies to new chats; existing chats are unchanged.",
     "deepcodeGui.project.noWorkspaces": "No workspace attached",
     "deepcodeGui.project.addFolder": "Add folder",
     "deepcodeGui.common.done": "Done",
@@ -874,8 +860,8 @@
     "tui.pluginCatalogLoadFailed": "Cannot load plugin catalog: {0}",
     "tui.readyHelp": "Ready · /help for commands",
     "tui.sessionInitializationFailed": "Session initialization failed: {0}",
-    "tui.projectionRefreshFailed": "Cannot refresh shared projection: {0}",
-    "tui.inputCleared": "Input and next-request plugins cleared; saved Session unchanged",
+    "tui.projectionRefreshFailed": "Cannot refresh conversation: {0}",
+    "tui.inputCleared": "Input and next-request plugin selection cleared",
     "tui.reasoningEnabled": "Reasoning details enabled; /reasoning <request-id> [offset] to read, /reasoning-history for history.",
     "tui.reasoningDisabled": "Reasoning details disabled; showing status only.",
     "tui.viewClosed": "Auxiliary view closed.",
@@ -907,12 +893,12 @@
     "tui.readOnlyResource": "Read-only resource {0} · {1} bytes",
     "tui.resourceReadFailed": "Resource read failed: {0}",
     "tui.attachUsage": "Usage: /attach <path>",
-    "tui.directoryAttached": "Directory index attached; effective from the next run.",
+    "tui.directoryAttached": "Directory added; takes effect on the next run.",
     "tui.directoryAttachFailed": "Directory index attachment failed: {0}",
     "tui.detachUsage": "Usage: /detach <workspace-id>",
-    "tui.directoryDetached": "Directory index removed; active run retains its frozen snapshot.",
+    "tui.directoryDetached": "Directory removed; takes effect on the next run.",
     "tui.directoryDetachFailed": "Directory index removal failed: {0}",
-    "tui.commandAccepted": "Command accepted · revision {0}",
+    "tui.commandAccepted": "Accepted",
     "tui.commandRejected": "Command rejected.",
     "tui.pluginRefreshSecondary": "{0}; plugin catalog refresh failed: {1}",
     "tui.pluginRefreshed": "; plugin catalog refreshed, please select again.",
@@ -1069,7 +1055,7 @@
     "tui.languageMissing": "User settings are missing a valid workbench.language.",
     "tui.languageInvalid": "Unsupported display language: {0}; choose zh-CN or en-US.",
     "tui.settingsReadFailed": "Cannot read language settings: {0}",
-    "tui.help": "DeepCode TUI\n\nUsage:\n  deepcode-tui [-C <workspace>] [--session <id>] [--plugin <plugin://uri>]...\n  deepcode-tui [--language zh-CN|en-US] [--api <url>] [--no-auto-start-kernel] [--smoke]\n\n--language overrides workbench.language; startup defaults to Simplified Chinese.\nOnly explicit -C/--workspace creates a workspace binding for a new Session.\n--plugin is repeatable and selects plugins for the next request; type @ to open the same catalog.\nRegular messages can be sent at any time and queue during a run; /reply 1 confirms a plan, /reply <text> revises a plan or answers a question; /reply 1/2 allows/denies an operation; /reply 3 allows host Shell for this run (when offered).\n/cancel-plan cancels the plan; /cancel or Ctrl-C cancels the run; Esc clears input.\n/focus <task> starts a task; /attach <path> attaches a directory; /detach <workspace-id> removes it; /model <profile> selects a model; /context shows context.\n/help lists all interactive commands.",
+    "tui.help": "DeepCode TUI\n\nUsage:\n  deepcode-tui [-C <workspace>] [--session <id>] [--plugin <plugin://uri>]...\n  deepcode-tui [--language zh-CN|en-US] [--api <url>] [--no-auto-start-kernel] [--smoke]\n\n--language overrides workbench.language; startup defaults to Simplified Chinese.\nUse -C/--workspace to set the working directory for a new conversation.\n--plugin is repeatable and selects plugins for the next request; type @ to open the same catalog.\nRegular messages can be sent at any time and queue during a run; /reply 1 confirms a plan, /reply <text> revises a plan or answers a question; /reply 1/2 allows/denies an operation; /reply 3 allows host Shell for this run (when offered).\n/cancel-plan cancels the plan; /cancel or Ctrl-C cancels the run; Esc clears input.\n/focus <task> starts a task; /attach <path> attaches a directory; /detach <workspace-id> removes it; /model <profile> selects a model; /context shows context.\n/help lists all interactive commands.",
     "tui.commandHelp": "DeepCode commands\n\n@ Select plugins for the next request\n/tasks View tasks\n/context View context\n/focus <task> Start a task\n/model Choose connection and model; /model <profile> select a configured model directly\n/attach <path> Attach a directory\n/detach <workspace-id> Remove a directory index\n/open <workspace-id> <logical-path> Read a file\n/next Read the next section\n/diff <record-id> <index> View changes\n/reasoning Toggle reasoning details\n/reasoning <request-id> [offset] Read reasoning on demand\n/reasoning-history View reasoning history\n/cancel Cancel the run\n/cancel-plan Cancel the plan\n/close Return to the conversation\n/clear Clear input\n/show View session information\n/error Failure diagnostics and snapshot\n/decision Current decision details\n/tool <activity-id> Tool details\n/quit Exit\n\nPgUp / PgDn / mouse wheel scroll the current view; regular messages queue at any time; /reply <text> answers an interaction or revises a plan; /reply 1 confirms a plan; /reply 1/2 allows/denies an operation; /reply 3 allows host Shell for this run (when offered).",
     "deepcodeGui.hostStartup.lockFailed": "The Host startup lock operation failed. Review the original error before retrying.",
     "tui.connectionFailed": "DeepCode TUI cannot connect to Daemon: {0}",
@@ -1152,7 +1138,7 @@
     },
     "gui.showContextRail": {
       "label": "Show context rail",
-      "description": "Show the shared run, tool, and artifact projection in the DeepCode-GUI right rail."
+      "description": "Show tasks and outputs in the right sidebar."
     },
     "workbench.styleTokenOverrides": {
       "label": "Custom palette",
@@ -1183,7 +1169,7 @@
     },
     "agent.systemPrompt": {
       "label": "System prompt",
-      "description": "Appended after the built-in coding Agent instruction and shared by new sessions from every UI shell."
+      "description": "Append to the built-in instructions for new conversations."
     },
     "agent.permissions.workspaceMutation": {
       "label": "Workspace changes",
@@ -1195,7 +1181,7 @@
     },
     "agent.permissions.engineeringDecisions": {
       "label": "Engineering decisions",
-      "description": "Choose whether the Agent asks about unclear engineering routes or decides from current code facts. Missing product facts and out-of-workspace actions still require a question.",
+      "description": "Choose whether to ask you or let the Agent decide an unclear engineering approach. Missing requirements and out-of-workspace actions still require a question.",
       "options": {
         "ask": "Ask the user",
         "delegate": "Delegate to Agent"
@@ -1203,7 +1189,7 @@
     },
     "agent.permissions.networkRead": {
       "label": "Public network read",
-      "description": "Default Kernel decision for public search and read tools.",
+      "description": "Default permission for web search and reading public pages.",
       "options": {
         "allow": "Allow",
         "ask": "Ask every time",
@@ -1221,11 +1207,11 @@
     },
     "agent.web.search.endpointTemplate": {
       "label": "Web Search Endpoint Override",
-      "description": "Leave empty for the built-in Brave Web Search adapter, or provide an explicit JSON HTTP endpoint template containing {query} and optional {limit}. The configured endpoint is never used as fallback."
+      "description": "Leave empty for Brave search. A custom JSON HTTP endpoint must contain {query} and may include {limit}."
     },
     "agent.web.search.authHeaderName": {
       "label": "Web Search Auth Header",
-      "description": "Header name used only by an explicitly configured search endpoint. The built-in Brave adapter always uses X-Subscription-Token."
+      "description": "Authentication header for a custom search endpoint; Brave uses X-Subscription-Token."
     },
     "agent.documents.pythonPath": {
       "label": "PDF renderer Python",
@@ -1233,7 +1219,7 @@
     },
     "agent.web.search.authSecretRef": {
       "label": "Web Search Auth Secret",
-      "description": "Secret reference required by the built-in Brave adapter and optional for an explicitly configured search endpoint. Without it, built-in web.search is blocked."
+      "description": "Search secret reference. Required for Brave; optional for custom endpoints."
     },
     "skills.mounts": {
       "label": "Project Skill Mounts",

@@ -144,3 +144,63 @@ fn is_plan_confirmation_input(input: &str) -> bool {
         "1" | "y" | "yes" | "confirm"
     ) || matches!(input.trim(), "确认" | "同意")
 }
+
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::*;
+
+    pub(crate) fn waiting_projection(
+        field: &str,
+        decision: serde_json::Value,
+    ) -> SessionProjection {
+        let mut value = json!({
+            "schemaVersion": deepcode_kernel_client::SESSION_PROJECTION_VERSION,
+            "sessionId":"session:test", "revision":1, "display":{"creationTitle":"input"},
+            "workspaceBindings":[], "sessionDirectoryIndexes":[], "timeline":[], "messages":[],
+            "queuedInputs":[], "narratives":[], "plans":[], "contextCompositions":[],
+            "tokenUsageHistory":[], "activities":[], "artifacts":[],
+            "tokenUsage":{"providerCallCount":0,"reportedCallCount":0,"inputTokens":0,"outputTokens":0,
+              "cacheReadInputTokens":0,"cacheMissInputTokens":0,"cacheAvailable":false,"cacheComplete":false},
+            "run":{"runId":"run:test","profileId":"profile:current","workspaceBindings":[],"status":"waiting"}
+        });
+        value[field] = decision;
+        serde_json::from_value(value).unwrap()
+    }
+
+    pub(crate) fn pending_decisions() -> [(
+        &'static str,
+        serde_json::Value,
+        &'static str,
+        &'static str,
+        serde_json::Value,
+    ); 3] {
+        [
+            (
+                "pendingPlan",
+                json!({"planId":"plan:test","revision":1,"runId":"run:test","callId":"call:plan",
+                "title":"Plan","summary":"Review","steps":[],"mutationManifest":[],"status":"published",
+                "responseMode":"confirmReviseOrCancel","sequence":1,"createdAt":"now","updatedAt":"now"}),
+                "plan.respond",
+                "response",
+                json!({"kind":"confirm"}),
+            ),
+            (
+                "pendingInteraction",
+                json!({"interactionId":"interaction:test","runId":"run:test","callId":"call:question",
+                "kind":"question","prompt":"Choose","options":[{"id":"a","label":"Option A"}],
+                "allowFreeform":true,"sequence":1,"createdAt":"now"}),
+                "interaction.respond",
+                "response",
+                json!("Option A"),
+            ),
+            (
+                "pendingApproval",
+                json!({"approvalId":"approval:test","runId":"run:test","callId":"call:effect",
+                "preview":{"summary":"Write","effects":[],"logicalTargets":[]},"sequence":1,"createdAt":"now"}),
+                "approval.respond",
+                "decision",
+                json!("allow"),
+            ),
+        ]
+    }
+}
