@@ -279,9 +279,9 @@ test('document Plan scope and completed artifacts pass through Session to the GU
         input: { workspace: 'primary', path: '报告.pdf', format: 'pdf', content: '<h1>Report</h1>' } });
     } else if (calls === 3) {
       const current = await actor.snapshot();
-      const progress = request.tools.find((entry) => entry.inputSchema.properties?.sourceFactRef);
+      const progress = request.tools.find((entry) => entry.inputSchema.properties?.items);
       yield providerEvent(request.requestId, 'tool.call', { callId: 'provider-call:document-progress', name: progress.name,
-        input: { sourceFactRef: documentRecordId, updates: [{ todoId: current.todoList.items[0].todoId, status: 'completed' }] } });
+        input: { items: [{ text: current.todoList.items[0].text, status: 'completed' }] } });
     } else {
       yield providerEvent(request.requestId, 'assistant.message', { messageId: 'provider-message:document-done', content: 'Report is ready.' });
     }
@@ -418,6 +418,102 @@ test('native path selection preserves OS paths, cancellation and dialog errors',
   assert.equal(calls.length, callCount);
 });
 
+test('Windows sandbox initialization uses the injected Host origin and preserves setup failures', async (t) => {
+  const previousWindow = globalThis.window;
+  t.after(() => { if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow; });
+  const uiToken = `dcui_${'12'.repeat(32)}`;
+  globalThis.window = {
+    location: { protocol: 'http:', hostname: 'deepcode-gui.localhost', origin: 'http://deepcode-gui.localhost' },
+    __DEEPCODE_HOST_BOOT__: { schemaVersion: 'deepcode.host-ui-bootstrap', host: '127.0.0.1', port: '49123', uiToken, windowChrome: 'custom' },
+  };
+  const [{ initializeWorkspaceSandbox }] = await loadGuiModules(t, ['/src/services/apiClient.ts']);
+  let calls = 0;
+  installGuiFetch(t, (url, init) => {
+    calls += 1;
+    assert.equal(url.href, 'http://127.0.0.1:49123/api/user-settings/workspace-sandbox');
+    assert.equal(init.method, 'POST');
+    assert.equal(init.headers['x-deepcode-host-ui-token'], uiToken);
+    assert.deepEqual(JSON.parse(init.body), {});
+    return Response.json({ ok: false, error: 'workspace_sandbox_setup_failed', message: 'administrator request declined' });
+  });
+  const result = await initializeWorkspaceSandbox();
+  assert.equal(calls, 1);
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'workspace_sandbox_setup_failed');
+  assert.equal(result.message, 'administrator request declined');
+});
+
+test('Host workspace initialization preserves the current workspace or opens the native default directory', async (t) => {
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  t.after(() => {
+    if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow;
+    if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument;
+  });
+  const { initializeHostWorkspace } = await loadGuiModule(t, '/src/services/workspaceInitialization.ts');
+  globalThis.document = { documentElement: { dataset: { product: 'deepcode-gui' } } };
+  let defaultPath = '/Users/developer/DeepCode workspace';
+  const calls = [];
+  globalThis.window = { __TAURI__: { core: { invoke: async (command) => {
+    calls.push(command);
+    assert.equal(command, 'deepcode_default_workspace_path');
+    return defaultPath;
+  } } } };
+  const workspace = { id: 'workspace:current', name: 'Existing', source: 'directory', sourcePath: null,
+    folders: [{ id: 'folder:current', name: 'Existing', absolutePath: '/existing', originalPath: '/existing', isAbsolute: true }],
+    unsupportedFields: [], openedAt: '2026-09-18T00:00:00Z' };
+  let current = workspace;
+  installGuiFetch(t, (url, init) => {
+    calls.push(url.pathname);
+    if (url.pathname === '/api/workspaces/current') return Response.json({ ok: true, data: { current, fallbackUsed: false, lastError: null } });
+    assert.equal(url.pathname, '/api/workspaces/open');
+    assert.equal(init.method, 'POST');
+    assert.deepEqual(JSON.parse(init.body), { path: defaultPath });
+    return Response.json({ ok: true, data: { workspace } });
+  });
+  await initializeHostWorkspace();
+  assert.deepEqual(calls.splice(0), ['/api/workspaces/current']);
+  current = null;
+  await initializeHostWorkspace();
+  assert.deepEqual(calls.splice(0), ['/api/workspaces/current', 'deepcode_default_workspace_path', '/api/workspaces/open']);
+  defaultPath = null;
+  await initializeHostWorkspace();
+  assert.deepEqual(calls, ['/api/workspaces/current', 'deepcode_default_workspace_path']);
+});
+
+test('Host workspace initialization propagates the failing request without opening or retrying', async (t) => {
+  const previousDocument = globalThis.document;
+  t.after(() => { if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument; });
+  globalThis.document = { documentElement: { dataset: {} } };
+  const { initializeHostWorkspace } = await loadGuiModule(t, '/src/services/workspaceInitialization.ts');
+  const paths = ['/api/workspaces/current', '/api/workspaces/default-path', '/api/workspaces/open'];
+  const replies = [
+    { ok: true, data: { current: null, fallbackUsed: false, lastError: null } },
+    { ok: true, data: { path: '/workspace/default' } },
+  ];
+  let failureAt;
+  let invalidSuccess;
+  let calls;
+  installGuiFetch(t, (url) => {
+    const index = calls.length;
+    calls.push(url.pathname);
+    assert.equal(url.pathname, paths[index]);
+    return Response.json(index === failureAt
+      ? invalidSuccess ? { ok: true } : { ok: false, error: 'workspace_failed', message: `Original failure: ${paths[index]}` }
+      : replies[index]);
+  });
+  for (failureAt = 0; failureAt < paths.length; failureAt += 1) {
+    calls = [];
+    invalidSuccess = false;
+    await assert.rejects(initializeHostWorkspace(), { message: `Original failure: ${paths[failureAt]}` });
+    assert.deepEqual(calls, paths.slice(0, failureAt + 1));
+    calls = [];
+    invalidSuccess = true;
+    await assert.rejects(initializeHostWorkspace());
+    assert.deepEqual(calls, paths.slice(0, failureAt + 1));
+  }
+});
+
 test('one native reference request returns the actual file or folder kind', async (t) => {
   const previousWindow = globalThis.window;
   t.after(() => { if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow; });
@@ -453,15 +549,19 @@ test('one native reference request returns the actual file or folder kind', asyn
   assert.equal(calls, references.length + 2);
 });
 
-test('Skill settings load the existing read-only catalog route', async (t) => {
-  const items = [{ id: 'skill:example', displayName: 'Example', description: 'A text Skill.', source: 'mounted' }];
+test('Skill settings read mounted guidance from the live plugin catalog', async (t) => {
+  const catalog = { revision: 'catalog:skills', plugins: [{ uri: 'plugin://example@local',
+    displayName: 'Example', shortDescription: 'A text Skill.', source: 'mounted',
+    category: 'reference', contributionKind: 'skill', discovery: 'default',
+    activationMediaTypes: [], enabled: true, available: true,
+    management: { key: 'skills.mounts', id: 'skill:example' } }] };
   installGuiFetch(t, async (url, init) => {
-    assert.equal(url.pathname, '/api/conversation/plugins/skills');
+    assert.equal(url.pathname, '/api/conversation/plugins');
     assert.equal(init.method ?? 'GET', 'GET');
-    return Response.json({ ok: true, data: { skills: items } });
+    return Response.json({ ok: true, data: catalog });
   });
-  const [{ getSkillSettings }] = await loadGuiModules(t, ['/src/services/localAgentApi.ts']);
-  assert.deepEqual(await getSkillSettings(), items);
+  const { getPluginCatalog } = await loadGuiModule(t, '/src/services/localAgentApi.ts');
+  assert.deepEqual(await getPluginCatalog(), catalog);
 });
 
 test('GUI receives and renders live tool output at the same journal revision before completion', async (t) => {
@@ -751,7 +851,7 @@ test('GUI consumes complete phase plans and Todo beyond the former item count', 
     runId: waiting.run.runId, planId: waiting.pendingPlan.planId, revision: 1, response: { kind: 'confirm' } });
   const confirmed = await waitForProjection(actor, (value) => value.todoList?.items.length === 13);
   assert.deepEqual(await decodeGuiProjection(confirmed), confirmed);
-  assert.deepEqual(confirmed.todoList.items.map((item) => item.sourceStepId), waiting.pendingPlan.steps.map((step) => step.stepId));
+  assert.deepEqual(confirmed.todoList.items.map((item) => item.text), waiting.pendingPlan.steps.map((step) => step.title));
 });
 
 test('Provider status separates request elapsed time from the last observed content', async (t) => {
@@ -985,7 +1085,7 @@ test('snapshot-scoped wire tool resolves to exact Kernel bindings, durable ToolR
 
 
 
-test('GUI model settings save after acknowledgement, reset effort on model change, and retain the last saved value on failure', async (t) => {
+test('GUI model settings remember effort per model across new conversations and preserve acknowledged values on failure', async (t) => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:gui-settings';
   await createSession(journal, sessionId);
@@ -1003,8 +1103,15 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
     if (url.pathname === '/api/llm/profiles') {
       if (init.method === 'PATCH') {
         const update = JSON.parse(init.body);
-        assert.deepEqual(Object.keys(update), ['defaultProfileId']);
-        defaultProfileId = update.defaultProfileId;
+        if (update.profile) {
+          assert.deepEqual(Object.keys(update), ['profile']);
+          const index = profiles.findIndex(profile => profile.id === update.profile.id);
+          assert.ok(index >= 0);
+          profiles[index] = update.profile;
+        } else {
+          assert.deepEqual(Object.keys(update), ['defaultProfileId']);
+          defaultProfileId = update.defaultProfileId;
+        }
       }
       return Response.json({ ok: true, data: { profiles, defaultProfileId } });
     }
@@ -1049,12 +1156,22 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
   assert.equal((await actor.snapshot()).run, null);
   store.getState().startNewSession();
   assert.equal(store.getState().selectedProfileId, 'profile:one');
+  assert.equal(store.getState().reasoningEffortOverride, 'low');
   await store.getState().selectProfile('profile:two');
+  await store.getState().selectReasoningEffort('medium');
   store.getState().startNewSession();
   assert.equal(store.getState().selectedProfileId, 'profile:one');
+  assert.equal(store.getState().reasoningEffortOverride, 'low');
+  await store.getState().selectProfile('profile:two');
+  assert.equal(store.getState().reasoningEffortOverride, 'medium');
   const reopened = await loadGuiModelStore(t);
   await reopened.getState().refreshProfiles();
   assert.equal(reopened.getState().selectedProfileId, 'profile:one');
+  assert.equal(reopened.getState().reasoningEffortOverride, 'low');
+  await reopened.getState().selectReasoningEffort(null);
+  assert.equal(profiles[0].reasoningEffort, undefined, 'service default clears the remembered explicit effort');
+  reopened.getState().startNewSession();
+  assert.equal(reopened.getState().reasoningEffortOverride, null);
 });
 
 test('starting a draft during initialization preserves navigation and still loads usable model configuration', async (t) => {
@@ -1407,7 +1524,7 @@ test('Plan documents and previews render Markdown entities, code names and verif
     planId: 'plan:document', revision: 1, runId: 'run:document', callId: 'call:document', status: 'published',
     title: '对象池 ObjectPool&lt;T,N&gt; 升级', summary: '保留 **互斥访问** 与 `C++17`。',
     steps: [{ stepId: 'write', title: '实现 `ObjectPool<T,N>`', details: '修改 `src/pool.hpp`。\n\n- 构造对象\n- 归还对象', verification: ['编译 **通过**；`exit 0`。'] }],
-    mutationManifest: [{ workspaceId: 'workspace:private-id', operation: 'bash', workspaceMode: 'write', executionScope: 'workspace' }],
+    mutationManifest: [{ workspaceId: 'workspace:private-id', operation: 'bash', writablePaths: [{ path: 'build', kind: 'directory' }] }],
   };
   const published = renderToStaticMarkup(createElement(PlanCard, { plan, active: false, language: 'zh-CN' }));
   assert.ok(published.includes('aria-expanded="false"'), 'published plans wait for the reader to expand');
@@ -1420,7 +1537,8 @@ test('Plan documents and previews render Markdown entities, code names and verif
   assert.match(html, /<code>exit 0<\/code>/);
   assert.equal(html.includes('undefined'), false, 'optional command examples must not leak undefined');
   assert.equal(html.includes('workspace:private-id'), false, 'single-workspace review does not need internal IDs');
-  assert.ok(html.includes('允许修改'));
+  assert.ok(html.includes('写入范围'));
+  assert.ok(html.includes('build/'));
   const revisedPlan = { ...plan, revision: 2,
     steps: [{ ...plan.steps[0], verification: ['ctest 通过'] }],
     mutationManifest: [{ workspaceId: 'workspace:private-id', operation: 'fs.edit', target: 'src', targetKind: 'directoryTree' }],
@@ -1551,6 +1669,41 @@ test('GUI refresh accepts plan preview changes without a new journal revision or
   delete incoming.assistantDraft.planPreview;
   await store.getState().refresh();
   assert.equal(store.getState().projection.assistantDraft.planPreview, undefined);
+});
+
+test('decision prose displays escaped paragraphs without rewriting code or raw content', async (t) => {
+  const { formatDecisionProse } = await loadGuiModule(t, '/src/components/local-agent/streamingMarkdown.ts');
+  const source = '请确认范围。\\n\\n保留源码。';
+  assert.equal(formatDecisionProse(source), '请确认范围。\n\n保留源码。');
+  assert.equal(source, '请确认范围。\\n\\n保留源码。');
+  const protectedText = [
+    '`printf "\\n\\n"`', '```sh\nprintf "\\n\\n"\n```',
+    '    printf "\\n\\n"', '[path](https://example.test/\\n\\n)',
+    'C:\\new\\next', 'Actual\n\nparagraph', String.raw`Literal \\n\\n`,
+  ];
+  for (const text of protectedText) assert.equal(formatDecisionProse(text), text);
+  assert.equal(formatDecisionProse('Before\\n\\n`\\n\\n` and **after**'), 'Before\n\n`\\n\\n` and **after**');
+  const { MarkdownContent } = await loadGuiModule(t, '/src/components/local-agent/BufferedMarkdown.tsx');
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const render = (decisionProse) => renderToStaticMarkup(createElement(MarkdownContent, { children: source, decisionProse }));
+  assert.equal((render(true).match(/<p>/g) ?? []).length, 2);
+  assert.match(render(false), /\\n\\n/);
+});
+
+test('browser annotations preserve the exact preview identity and separate the user comment', async (t) => {
+  const { formatBrowserAnnotation } = await loadGuiModule(t, '/src/components/local-agent/browserReview.ts');
+  const annotation = { id: 'annotation:1', mode: 'element', url: 'file:///input/interactive-test.html',
+    title: 'Page', selector: '#btn', text: 'Page content', rect: { x: 1, y: 2, width: 3, height: 4 },
+    viewport: { width: 800, height: 600, scrollX: 0, scrollY: 0 }, comment: 'Make this button white.' };
+  for (const chinese of [true, false]) {
+    const text = formatBrowserAnnotation(annotation, 'preview-12', chinese);
+    const evidence = JSON.parse(text.split('\n').filter(line => line.startsWith('> ')).map(line => line.slice(2)).join('\n'));
+    assert.equal(evidence.previewId, 'preview-12');
+    assert.equal(evidence.url, annotation.url);
+    assert.equal(evidence.selector, '#btn');
+    assert.ok(text.endsWith('\n\n' + annotation.comment));
+  }
 });
 
 test('streaming Markdown retains stable blocks and reconciles GFM and references on completion', async (t) => {
@@ -1827,6 +1980,10 @@ test('polling and command reconciliation read draft snapshots in order at the sa
   let reads = 0;
   let commands = 0;
   installGuiFetch(t, async (url, init) => {
+    if (url.pathname === '/api/llm/profiles' && init.method === 'PATCH') {
+      assert.deepEqual(Object.keys(JSON.parse(init.body)), ['profile']);
+      return Response.json({ ok: true, data: {} });
+    }
     if (url.pathname === '/api/conversation/statuses') return Response.json({ ok: true, data: [
       { sessionId, revision: base.revision, run: { runId: base.run.runId, status: base.run.status } },
     ] });
@@ -1878,6 +2035,13 @@ test('desktop startup diagnostics render the Host failure and log reference verb
   assert.match(html, /Kernel exited: exit status: 71/);
   assert.match(html, /\/runtime\/logs\/startup.log/);
   assert.equal(renderToStaticMarkup(createElement(HostStartupDiagnostic, { status: { ...status, phase: 'ready' }, language: 'zh-CN' })), '');
+  const workspaceFailure = renderToStaticMarkup(createElement(HostStartupDiagnostic, {
+    status: { ...status, phase: 'ready' }, workspaceError: 'Workspace open denied: /workspace/default',
+    language: 'zh-CN', onRetry() {},
+  }));
+  assert.match(workspaceFailure, /Workspace open denied: \/workspace\/default/);
+  assert.match(workspaceFailure, /role="alert"/);
+  assert.doesNotMatch(workspaceFailure, /host_startup_process_exited|startup.log|<button/);
 });
 
 test('conversation reading intent survives native scroll deliveries and layout growth', async (t) => {
@@ -2050,8 +2214,12 @@ test('conversation follows decision layout changes and final output until the re
 test('composer submission receipts preserve newer text and retain the complete failed draft', async (t) => {
   const { submitComposerState, emptyComposerState } = await loadGuiModule(t, '/src/components/local-agent/composerSubmission.ts');
   const original = { ...emptyComposerState(), draft: 'First request',
-    pastedTexts: [{ inputId: 'paste:one', text: 'Complete pasted content', expanded: false }],
-    filesystemPaths: [{ path: '/project/one.txt', kind: 'file' }],
+    pastedTexts: [{ inputId: 'paste:one', text: 'Complete pasted content', expanded: false,
+      browserReview: { previewId: 'preview:one', screenshot: '/project/capture.png', annotation: {
+        id: 'annotation:one', mode: 'element', url: 'https://example.test', title: 'Example', selector: 'h1', text: 'Heading',
+        rect: { x: 10, y: 20, width: 120, height: 40 }, viewport: { width: 800, height: 600, scrollX: 0, scrollY: 0 }, comment: '调整标题间距',
+      } } }],
+    filesystemPaths: [{ path: '/project/one.txt', kind: 'file' }, { path: '/project/capture.png', kind: 'file' }],
     pluginSelections: [{ selectionId: 'selection:one', uri: 'plugin://example@1', label: 'Example' }] };
   for (const fails of [false, true]) {
     let current = original;
@@ -2378,32 +2546,21 @@ test('new-session submission identifies the draft destination before publishing 
 test('model settings distinguish a failed read from a successfully empty catalog and retain loaded profiles', async (t) => {
   const { createElement } = await import('react');
   const { renderToStaticMarkup } = await import('react-dom/server');
-  const [{ default: LlmSection, LlmProfileReadNotice }, api, { t: translate }] = await loadGuiModules(t, [
-    '/src/components/settings-center/sections/LlmSection.tsx', '/src/services/apiClient.ts', '/src/i18n.ts',
+  const [{ default: LlmSection }, api] = await loadGuiModules(t, [
+    '/src/components/settings-center/sections/LlmSection.tsx', '/src/services/apiClient.ts',
   ]);
-  const emptyMessage = translate('zh-CN', 'settings.llm.empty');
-  const notice = (state, hasProfiles = false) => renderToStaticMarkup(createElement(LlmProfileReadNotice, {
-    state, hasProfiles, language: 'zh-CN',
-  }));
-  assert.equal(notice({ status: 'loading' }), '');
   const initial = renderToStaticMarkup(createElement(LlmSection));
-  assert.equal(initial.includes(emptyMessage), false, 'the first render has not read the catalog');
-  assert.equal(initial.includes(translate('en-US', 'settings.llm.empty')), false);
+  assert.match(initial, /role="status"/);
+  assert.doesNotMatch(initial, /暂无连接|No connections/, 'unread connections are not an empty catalog');
+  let unavailable = true;
   installGuiFetch(t, (url) => {
     assert.equal(url.pathname, '/api/llm/profiles');
-    throw new TypeError('Failed to fetch');
+    if (unavailable) throw new TypeError('Failed to fetch');
+    return Response.json({ ok: true, data: { profiles: [], connections: [] } });
   });
   const failed = await api.getLlmProfiles();
   assert.equal(failed.ok, false);
   assert.match(failed.message, /Failed to fetch/);
-  for (const hasProfiles of [false, true]) {
-    const html = notice({ status: 'failed', error: failed.message }, hasProfiles);
-    assert.match(html, /role="alert"/);
-    assert.match(html, /Failed to fetch/);
-    assert.equal(html.includes(emptyMessage), false);
-  }
-  assert.equal(notice({ status: 'loaded' }).includes(emptyMessage), true);
-  assert.equal(notice({ status: 'loaded' }, true), '');
   const profiles = [
     { id: 'profile:existing', name: 'Existing model', enabled: true },
     { id: 'profile:disabled', name: 'Disabled model', enabled: false },
@@ -2415,6 +2572,48 @@ test('model settings distinguish a failed read from a successfully empty catalog
   assert.equal(store.getState().defaultProfileId, profiles[0].id);
   assert.equal(store.getState().selectedProfileId, profiles[0].id);
   assert.match(store.getState().error, /Failed to fetch/);
+  unavailable = false;
+  const empty = await api.getLlmProfiles();
+  assert.equal(empty.ok, true);
+  assert.deepEqual(empty.data.profiles, []);
+  await store.getState().refreshProfiles();
+  assert.deepEqual(store.getState().profiles, []);
+  assert.equal(store.getState().defaultProfileId, null);
+  assert.equal(store.getState().error, null);
+  assert.equal(store.getState().selectedProfileId, profiles[0].id, 'reading an empty catalog does not silently change the selected model');
+});
+
+test('compact display math fences retain aligned formulas and following Markdown in streamed and settled views', async (t) => {
+  const [{ StreamingMarkdownParser }, { MarkdownContent }] = await loadGuiModules(t, [
+    '/src/components/local-agent/streamingMarkdown.ts', '/src/components/local-agent/BufferedMarkdown.tsx',
+  ]);
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const formula = String.raw`$$\begin{aligned}
+\text{buy1}_i &= \max_{i_1 \le i}(-p_{i_1})\\
+\text{sell1}_i &= \max_{i_1 \le j_1 \le i}(p_{j_1}-p_{i_1})
+\end{aligned}$$`;
+  const following = '\n\n## Verification\n\n- **Result** stays outside math.\n\n| Cost | Space |\n| --- | --- |\n| $O(n)$ | $O(1)$ |';
+  const text = '# Proof\n\n' + formula + following;
+  const render = (source, streaming) => renderToStaticMarkup(createElement(MarkdownContent, { children: source, streaming }));
+  const completed = render(text, false);
+  assert.doesNotMatch(completed, /katex-error/);
+  assert.match(completed, /class="katex-display"/);
+  assert.match(completed, /<h2>Verification<\/h2>/);
+  assert.match(completed, /<strong>Result<\/strong>/);
+  assert.match(completed, /<table>/);
+  assert.equal(render(text, true), completed);
+  const stream = new StreamingMarkdownParser();
+  for (const end of [text.indexOf('sell1'), text.indexOf('aligned}$$') + 9, text.indexOf('## Verification'), text.length]) {
+    stream.update(text.slice(0, end), true);
+  }
+  assert.deepEqual(stream.update(text, false), new StreamingMarkdownParser().update(text, false));
+  const fencedCode = render('```tex\n' + formula + '\n```', false);
+  assert.doesNotMatch(fencedCode, /class="katex/);
+  assert.match(fencedCode, /\$\$\\begin\{aligned\}/);
+  const inlineCode = render('`$$\\begin{aligned} a &= b \\end{aligned}$$`', false);
+  assert.doesNotMatch(inlineCode, /class="katex/);
+  assert.match(render('$$\na &= b\n$$\n\n## Original error', false), /katex-error/);
 });
 
 test('invalid default profiles retain editable settings and do not prevent reading conversation history', async (t) => {
@@ -2743,4 +2942,39 @@ test('startup opens a new draft even when history exists, and status failure doe
   assert.equal(store.getState().statusError, 'original_status_failure');
   assert.equal(store.getState().error, 'command_failure');
   assert.deepEqual(store.getState().projection, history);
+});
+
+
+test('settings contributions compose while tool renderers match their declared operation', async (t) => {
+  const { UiPluginRuntime } = await loadGuiModule(t, '/src/ui-plugins/runtime.ts');
+  const runtime = new UiPluginRuntime(async source => ({ apply(ctx) {
+    ctx.register(source, () => ({ update() {}, dispose() {} }));
+  } }), () => () => {});
+  t.after(() => runtime.dispose());
+  const file = (id, slot, toolId) => ({ path: `/plugins/${id}`, enabled: true,
+    manifest: { id, name:id, entry:'index.js', slots:[slot], ...(toolId ? {toolId} : {}) }, source:slot, error:null });
+  await runtime.replace([file('cost','settings.usage.panel'), file('counts','settings.usage.panel'),
+    file('reader','tool.result','fs.read'), file('shell','tool.result','bash')]);
+  assert.equal(runtime.getSnapshot().length, 4);
+  assert.ok(runtime.getSnapshot().every(item => item.status === 'active'));
+});
+
+test('image attachments reach the Provider as bound visual inputs without embedding bytes in the journal', async (t) => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:image-input';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  let request;
+  const actor = actorWith(journal, sessionId, { async *stream(value) {
+    request = value;
+    yield providerEvent(value.requestId, 'text.delta', {text:'Image received.'});
+    yield providerEvent(value.requestId, 'completed', {});
+  } }, emptyKernel(), fakeRunPreparation().port, 'image-input');
+  t.after(() => actor.dispose());
+  const command = messageCommand(sessionId, 'command:image', 'Describe the attached picture.');
+  command.filesystemReferences = [{ referenceId:'reference:image', workspaceId:workspaceBinding.workspaceId,
+    logicalPath:'picture.png',displayName:'picture.png',kind:'file',mediaType:'image/png',byteLength:100 }];
+  await actor.submit(command);
+  const projection = await waitForProjection(actor, value => value.run?.status === 'completed');
+  assert.deepEqual(request.messages.find(item => item.role === 'user').images,
+    [{workspaceId:workspaceBinding.workspaceId,logicalPath:'picture.png',mediaType:'image/png'}]);
+  assert.deepEqual(projection.messages[0].filesystemReferences, command.filesystemReferences);
 });

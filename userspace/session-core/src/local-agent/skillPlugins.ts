@@ -69,12 +69,13 @@ export function runtimeInstructions(
   controlNames: SessionControlWireNames = {
     interactionRequest: 'interaction_request',
     planPublish: 'plan_publish',
-    planProgress: 'plan_progress',
+    todoUpdate: 'todo_update',
+    pluginActivate: 'plugin_activate',
   },
 ): readonly InstructionContribution[] {
   const workspaceAutonomyInstruction = config.workspaceMutation === 'allow'
-    ? `Workspace mutations do not require a Plan. Use ${controlNames.interactionRequest} only for a required user decision.`
-    : `Before workspace mutation, call ${controlNames.planPublish} and wait for confirmation. Then execute within its file and execution scope. Routine command or edit details do not require reconfirmation. Use ${controlNames.interactionRequest} only for a required decision. Read-only workspace tools do not require a Plan.`;
+    ? `User project mutations do not require a Plan. Use ${controlNames.interactionRequest} only for a required user decision.`
+    : `Before mutating user project files, call ${controlNames.planPublish} and wait for confirmation. Its declared scope authorizes project changes. Reading and inspecting a project do not require a Plan. Use ${controlNames.interactionRequest} only for a required user decision.`;
   const engineeringDecisionInstruction = config.engineeringDecisions === 'delegate'
     ? 'Choose the smallest sound engineering approach supported by workspace evidence.'
     : 'Ask the user before materially changing requirements, public contracts, fact ownership, or the engineering approach.';
@@ -82,11 +83,11 @@ export function runtimeInstructions(
     ...stableCore.map((instruction) => ({ ...instruction })),
     {
       id: 'deepcode.workspace-autonomy',
-      text: `${workspaceAutonomyInstruction}\n${engineeringDecisionInstruction}`,
+      text: `${workspaceAutonomyInstruction}\nDeepCode-managed session working directories hold editable drafts and previews; changes there do not require a Plan. Kernel manages their permissions and lifetime.\n${engineeringDecisionInstruction}`,
     },
     ...config.selectedPlugins.map((plugin) => ({
       id: `plugin.${instructionId(plugin.uri)}`,
-      text: `The \`${plugin.displayName}\` plugin is activated for this request by structured user input.
+      text: `The \`${plugin.displayName}\` plugin is loaded for this request. User mentions and Agent-requested activation are independent ways to select capabilities.
 
 Available capabilities:
 ${plugin.capabilitySummary}

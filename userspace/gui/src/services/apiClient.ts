@@ -52,7 +52,7 @@ async function httpErrorMessage(response: Response, url: string): Promise<string
         : null;
     return message ? `${fallback} - ${message}` : fallback;
   } catch {
-    return fallback;
+    return `${fallback} - ${body.trim()}`;
   }
 }
 
@@ -87,7 +87,7 @@ async function getJson<T>(url: string, signal?: AbortSignal): Promise<ApiRespons
 }
 
 export async function initializeWorkspaceSandbox(): Promise<ApiResponse<unknown>> {
-  return sendJson('/api/user-settings/workspace-sandbox', 'POST', {});
+  return sendJson(`${API_BASE}/user-settings/workspace-sandbox`, 'POST', {});
 }
 
 async function sendJson<T>(
@@ -178,4 +178,31 @@ export function probeLlmProfile(
   request: LlmProbeRequest,
 ): Promise<ApiResponse<LlmProbeResult>> {
   return sendJson(`${API_BASE}/llm/probe`, 'POST', request);
+}
+
+
+// Model services use the same authenticated Host connection as ConversationPort.
+export function getModelConnections(signal?: AbortSignal) {
+  return getJson<import('@deepcode/protocol').ConnectionsResult>(`${API_BASE}/llm/connections`, signal);
+}
+export function patchModelConnections(edit: import('@deepcode/protocol').ConnectionEdit) {
+  return sendJson<import('@deepcode/protocol').ConnectionsResult>(`${API_BASE}/llm/connections`, 'PATCH', edit);
+}
+export function startModelAuth(connectionId: string, method: 'browser' | 'deviceCode') {
+  return sendJson<import('@deepcode/protocol').AuthFlow>(`${API_BASE}/llm/auth`, 'POST', { connectionId, method });
+}
+export function getModelAuth(id: string, signal?: AbortSignal) {
+  return getJson<import('@deepcode/protocol').AuthFlow>(`${API_BASE}/llm/auth/${encodeURIComponent(id)}`, signal);
+}
+export function cancelModelAuth(id: string) {
+  return sendJson<import('@deepcode/protocol').AuthFlow>(`${API_BASE}/llm/auth/${encodeURIComponent(id)}`, 'DELETE', {});
+}
+export function logoutModelConnection(id: string) {
+  return sendJson<unknown>(`${API_BASE}/llm/connections/${encodeURIComponent(id)}/logout`, 'POST', {});
+}
+export function getModelQuota(id: string, signal?: AbortSignal) {
+  return getJson<import('@deepcode/protocol').QuotaSnapshot>(`${API_BASE}/llm/connections/${encodeURIComponent(id)}/quota`, signal);
+}
+export function queryModelUsage(query: import('@deepcode/protocol').UsageQuery, signal?: AbortSignal) {
+  return sendJson<import('@deepcode/protocol').UsageReport>(`${API_BASE}/llm/usage`, 'POST', query, { signal });
 }

@@ -4,6 +4,15 @@
   outline-offset: 2px;
 }
 
+/* Native WebView controls also use the neutral focus color on pointer focus. */
+:root[data-product='deepcode-gui'] :is(button, input, select, textarea, summary, a, [tabindex], [contenteditable]):focus {
+  outline-color: var(--dc-focus-ring);
+}
+
+:root[data-product='deepcode-gui'] :is(input[type='checkbox'], input[type='radio'], input[type='range']) {
+  accent-color: var(--dc-foreground);
+}
+
 /* Buttons use a surface change for keyboard focus, including body-portalled dialogs. */
 :root[data-product='deepcode-gui'] body :is(button, [role='button'], [role='tab'], summary):focus-visible {
   outline: none;

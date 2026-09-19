@@ -12,7 +12,7 @@ use windows_sys::Win32::{
 
 struct Child {
     process: Handle,
-    _job: job::ProcessJob,
+    job: job::ProcessJob,
     active: bool,
 }
 impl Child {
@@ -22,26 +22,31 @@ impl Child {
         let job = match job::ProcessJob::attach_handle(process.0) {
             Ok(job) => job,
             Err(error) => {
-                unsafe {
-                    TerminateProcess(process.0, 1);
-                    WaitForSingleObject(process.0, INFINITE);
-                }
-                return Err(error.to_string());
+                return finish(
+                    Err(error.to_string()),
+                    terminate_suspended_process(process.0),
+                );
             }
         };
         if unsafe { ResumeThread(thread.0) } == u32::MAX {
-            unsafe {
-                TerminateProcess(process.0, 1);
-                WaitForSingleObject(process.0, INFINITE);
-            }
-            return Err(error("Resume sandbox process"));
+            let failure = error("Resume sandbox process");
+            return finish(Err(failure), terminate_suspended_process(process.0));
         }
         Ok(Self {
             process,
-            _job: job,
+            job,
             active: true,
         })
     }
+    fn stop(&mut self) -> Result<(), String> {
+        self.job.terminate().map_err(|error| error.to_string())?;
+        if unsafe { WaitForSingleObject(self.process.0, INFINITE) } != WAIT_OBJECT_0 {
+            return Err(error("Reap sandbox process"));
+        }
+        self.active = false;
+        Ok(())
+    }
+
     fn poll(&self) -> Result<Option<i32>, String> {
         let wait = unsafe { WaitForSingleObject(self.process.0, 0) };
         if wait == WAIT_TIMEOUT {
@@ -69,12 +74,41 @@ impl Child {
 impl Drop for Child {
     fn drop(&mut self) {
         if self.active {
-            unsafe {
-                TerminateProcess(self.process.0, 1);
-                WaitForSingleObject(self.process.0, INFINITE);
+            if let Err(error) = self.stop() {
+                eprintln!("{error}");
             }
         }
     }
+}
+
+fn finish<T>(result: Result<T, String>, cleanup: Result<(), String>) -> Result<T, String> {
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
+    }
+}
+
+fn finish_exit_status(
+    result: Result<i32, String>,
+    subsequent: Result<(), String>,
+) -> Result<i32, String> {
+    match (result, subsequent) {
+        (Ok(code), Err(error)) => Err(format!(
+            "Shell exited with status {code}; subsequent operation failed: {error}"
+        )),
+        (result, subsequent) => finish(result, subsequent),
+    }
+}
+
+fn terminate_suspended_process(process: HANDLE) -> Result<(), String> {
+    if unsafe { TerminateProcess(process, 1) } == 0 {
+        return Err(error("Terminate suspended sandbox process"));
+    }
+    if unsafe { WaitForSingleObject(process, INFINITE) } != WAIT_OBJECT_0 {
+        return Err(error("Reap suspended sandbox process"));
+    }
+    Ok(())
 }
 
 fn as_file(handle: Handle) -> fs::File {
@@ -165,68 +199,70 @@ pub(super) fn proxy(path: &Path) -> Result<i32, String> {
         return Err(error("Start sandbox account worker"));
     }
     let mut child = Child::from_info(info)?;
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let connected = unsafe { ConnectNamedPipe(pipe.0, null_mut()) };
-        let pipe_error = unsafe { GetLastError() };
-        // A fast worker may already have written its result and disconnected.
-        // Read that buffered result before inspecting its process exit status.
-        if connected != 0 || matches!(pipe_error, ERROR_PIPE_CONNECTED | ERROR_NO_DATA) {
-            break;
-        }
-        if pipe_error != ERROR_PIPE_LISTENING {
-            return Err(error("Connect Shell output pipe"));
-        }
-        if let Some(code) = child.poll()? {
-            return Err(format!(
-                "Sandbox worker exited before connecting (exit {code})."
-            ));
-        }
-        if Instant::now() >= deadline {
-            return Err("Sandbox worker connection timed out.".into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let mode = PIPE_READMODE_BYTE | PIPE_WAIT;
-    if unsafe { SetNamedPipeHandleState(pipe.0, &mode, null(), null()) } == 0 {
-        return Err(error("Configure Shell output pipe"));
-    }
-    let mut reader = as_file(pipe);
-    loop {
-        let mut header = [0u8; 5];
-        reader
-            .read_exact(&mut header)
-            .map_err(|e| format!("Read sandbox output: {e}"))?;
-        let len = u32::from_le_bytes(header[1..].try_into().unwrap()) as usize;
-        let mut payload = vec![0u8; len];
-        reader.read_exact(&mut payload).map_err(|e| e.to_string())?;
-        match header[0] {
-            1 => {
-                std::io::stdout()
-                    .write_all(&payload)
-                    .and_then(|_| std::io::stdout().flush())
-                    .map_err(|e| e.to_string())?;
+    let result = (|| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let connected = unsafe { ConnectNamedPipe(pipe.0, null_mut()) };
+            let pipe_error = unsafe { GetLastError() };
+            // A fast worker may already have written its result and disconnected.
+            // Read that buffered result before inspecting its process exit status.
+            if connected != 0 || matches!(pipe_error, ERROR_PIPE_CONNECTED | ERROR_NO_DATA) {
+                break;
             }
-            2 => {
-                std::io::stderr()
-                    .write_all(&payload)
-                    .and_then(|_| std::io::stderr().flush())
-                    .map_err(|e| e.to_string())?;
+            if pipe_error != ERROR_PIPE_LISTENING {
+                return Err(error("Connect Shell output pipe"));
             }
-            3 => return Err(String::from_utf8_lossy(&payload).into_owned()),
-            4 => {
-                let code = i32::from_le_bytes(
-                    payload
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| "Invalid sandbox exit result")?,
-                );
-                child.wait()?;
-                return Ok(code);
+            if let Some(code) = child.poll()? {
+                return Err(format!(
+                    "Sandbox worker exited before connecting (exit {code})."
+                ));
             }
-            _ => return Err("Invalid sandbox output frame.".into()),
+            if Instant::now() >= deadline {
+                return Err("Sandbox worker connection timed out.".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-    }
+        let mode = PIPE_READMODE_BYTE | PIPE_WAIT;
+        if unsafe { SetNamedPipeHandleState(pipe.0, &mode, null(), null()) } == 0 {
+            return Err(error("Configure Shell output pipe"));
+        }
+        let mut reader = as_file(pipe);
+        loop {
+            let mut header = [0u8; 5];
+            reader
+                .read_exact(&mut header)
+                .map_err(|e| format!("Read sandbox output: {e}"))?;
+            let len = u32::from_le_bytes(header[1..].try_into().unwrap()) as usize;
+            let mut payload = vec![0u8; len];
+            reader.read_exact(&mut payload).map_err(|e| e.to_string())?;
+            match header[0] {
+                1 => {
+                    std::io::stdout()
+                        .write_all(&payload)
+                        .and_then(|_| std::io::stdout().flush())
+                        .map_err(|e| e.to_string())?;
+                }
+                2 => {
+                    std::io::stderr()
+                        .write_all(&payload)
+                        .and_then(|_| std::io::stderr().flush())
+                        .map_err(|e| e.to_string())?;
+                }
+                3 => return Err(String::from_utf8_lossy(&payload).into_owned()),
+                4 => {
+                    let code = i32::from_le_bytes(
+                        payload
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| "Invalid sandbox exit result")?,
+                    );
+                    return finish_exit_status(Ok(code), child.wait().map(|_| ()));
+                }
+                _ => return Err("Invalid sandbox output frame.".into()),
+            }
+        }
+    })();
+    finish_exit_status(result, child.stop())
 }
 
 type Output = Arc<Mutex<fs::File>>;
@@ -279,13 +315,10 @@ pub(super) fn worker(path: &Path, pipe: &str) -> Result<i32, String> {
         run(request, output.clone())
     })();
     match result {
-        Ok(code) => {
-            send(&output, 4, &code.to_le_bytes())?;
-            Ok(code)
-        }
+        Ok(code) => finish_exit_status(Ok(code), send(&output, 4, &code.to_le_bytes())),
         Err(error) => {
-            send(&output, 3, error.as_bytes())?;
-            Err(error)
+            let sent = send(&output, 3, error.as_bytes());
+            finish(Err(error), sent)
         }
     }
 }
@@ -463,18 +496,34 @@ fn run(request: Request, output: Output) -> Result<i32, String> {
         Ok::<_, std::io::Error>(terminal.then_some(input))
     });
     let status = child.wait();
-    // Closing the job stops remaining descendants before joining pipe readers.
+    // Stop descendants before joining streams that they may still hold open.
+    let cleanup = child.stop();
+    if cleanup.is_err() {
+        return finish_exit_status(status, cleanup);
+    }
     drop(child);
     drop(console);
-    input_thread
+    let input_result = input_thread
         .join()
-        .map_err(|_| "Shell input writer failed")?
-        .map_err(|e| format!("Write Shell input: {e}"))?;
-    stdout_thread
+        .map_err(|_| "Shell input writer failed".to_string())
+        .and_then(|result| {
+            result
+                .map(|_| ())
+                .map_err(|error| format!("Write Shell input: {error}"))
+        });
+    let stdout_result = stdout_thread
         .join()
-        .map_err(|_| "Shell stdout reader failed")??;
-    if let Some(reader) = stderr_thread {
-        reader.join().map_err(|_| "Shell stderr reader failed")??;
-    }
-    status
+        .map_err(|_| "Shell stdout reader failed".to_string())
+        .and_then(|result| result);
+    let stderr_result = match stderr_thread {
+        Some(reader) => reader
+            .join()
+            .map_err(|_| "Shell stderr reader failed".to_string())
+            .and_then(|result| result),
+        None => Ok(()),
+    };
+    finish_exit_status(
+        status,
+        finish(finish(input_result, stdout_result), stderr_result),
+    )
 }

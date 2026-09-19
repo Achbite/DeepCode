@@ -12,8 +12,17 @@ impl KernelToolExecutor for FsReadExecutor {
         invocation: KernelToolInvocation,
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        let KernelCanonicalInvocation::FsRead { path, start_line, start_byte, max_lines, max_bytes } = invocation.input else {
-            return Err(KernelError::InvalidCommand("fs.read invocation required".into()));
+        let KernelCanonicalInvocation::FsRead {
+            path,
+            start_line,
+            start_byte,
+            max_lines,
+            max_bytes,
+        } = invocation.input
+        else {
+            return Err(KernelError::InvalidCommand(
+                "fs.read invocation required".into(),
+            ));
         };
         let target = prepared_workspace_target(&context)?;
         let metadata = std::fs::metadata(&target).map_err(|error| KernelError::Structured {
@@ -48,8 +57,15 @@ impl KernelToolExecutor for FsWriteExecutor {
         invocation: KernelToolInvocation,
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
-        let KernelCanonicalInvocation::FsWrite { path, content, executable } = invocation.input else {
-            return Err(KernelError::InvalidCommand("fs.write invocation required".into()));
+        let KernelCanonicalInvocation::FsWrite {
+            path,
+            content,
+            executable,
+        } = invocation.input
+        else {
+            return Err(KernelError::InvalidCommand(
+                "fs.write invocation required".into(),
+            ));
         };
         let target = prepared_workspace_target(&context)?;
         let existed = target.exists();
@@ -101,7 +117,9 @@ impl KernelToolExecutor for FsEditExecutor {
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
         let KernelCanonicalInvocation::FsEdit { path, edits } = invocation.input else {
-            return Err(KernelError::InvalidCommand("fs.edit invocation required".into()));
+            return Err(KernelError::InvalidCommand(
+                "fs.edit invocation required".into(),
+            ));
         };
         let target = prepared_workspace_target(&context)?;
         if !target.is_file() {
@@ -150,7 +168,9 @@ impl KernelToolExecutor for FsDeleteExecutor {
         context: KernelToolExecutionContext,
     ) -> KernelResult<KernelToolExecutionResult> {
         let KernelCanonicalInvocation::FsDelete(delete) = invocation.input else {
-            return Err(KernelError::InvalidCommand("fs.delete invocation required".into()));
+            return Err(KernelError::InvalidCommand(
+                "fs.delete invocation required".into(),
+            ));
         };
         let (path, target_kind) = match delete {
             KernelDeleteTarget::File { path } => (path, "file"),

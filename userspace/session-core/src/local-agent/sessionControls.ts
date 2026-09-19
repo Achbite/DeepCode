@@ -5,32 +5,38 @@ import type {
   ModelInteractionRequest,
   PlanOperation,
   ProviderToolDefinition,
-  TodoProgressUpdate,
+  TodoItem,
 } from '@deepcode/protocol';
 import {
   SESSION_CONTROL_INTERACTION_REQUEST,
   SESSION_CONTROL_PLAN_PUBLISH,
-  SESSION_CONTROL_PLAN_PROGRESS,
+  SESSION_CONTROL_TODO_UPDATE,
+  SESSION_CONTROL_PLUGIN_ACTIVATE,
 } from '@deepcode/protocol';
 
 export interface SessionControlWireNames {
   interactionRequest: string;
   planPublish: string;
-  planProgress: string;
+  todoUpdate: string;
+  pluginActivate: string;
 }
 
 export function confirmedPlanExecutionInstruction(): string {
-  return 'The Plan is confirmed. Execute it now. Use the current Todo state and report progress from observed tool results.';
+  return 'The Plan is confirmed. Execute it now. Its approved scope remains valid for this run.';
 }
 
 export function sessionControlInstructions(
   names: SessionControlWireNames,
   hasWorkspaceBindings = true,
+  hasPluginDiscovery = false,
 ): string {
+  const decisions = ` Ask for missing information or decisions with ${names.interactionRequest}; confirmation opens a panel and resumes this run after the answer. Correct rejected inputs; Kernel handles permission approval.`;
+  const plugins = hasPluginDiscovery ? ` Discover plugins when the task needs unlisted capabilities. ${names.pluginActivate} loads enabled plugins for this run; activation in a previous run does not make those tools available now. The current tool list is authoritative. User mentions are optional guidance. Loading does not grant tool permissions. Call it alone, then use the new tools.` : '';
+  const progress = ` For multi-step work, use ${names.todoUpdate} when useful. Keep phases few and meaningful, merging similar work; choose the count to fit the task. Skip trivial work and unchanged updates; no update is required per tool call or before answering. Send the complete current list in one update, optionally alongside ordinary calls. Todo grants no permissions and does not gate completion; keep unfinished work honest.`;
   if (!hasWorkspaceBindings) {
-    return `Explicit commentary is progress and may continue without calls; unphased text without calls is the final answer. ${names.interactionRequest} must be the only call in its turn. No workspace is bound to this run; do not invent a workspace handle or request workspace operations.`;
+    return `Explicit commentary is progress and may continue without calls; unphased text without calls is the final answer. ${names.interactionRequest} must be the only call in its turn. No workspace is bound to this run; do not invent a workspace handle or request workspace operations.${progress}${decisions}${plugins}`;
   }
-  return `Explicit commentary is progress and may continue without calls; unphased text without calls is the final answer. ${names.interactionRequest} and ${names.planPublish} must each be the only call in their turn. One ${names.planProgress} may accompany ordinary tool calls, reporting confirmed Todo progress from a tool result recordId already received before this turn; never anticipate results of calls in the same turn. Command counts do not determine step completion. Session Todo messages are chronological state updates; the latest update is current. Use a logical workspace handle from the Session binding list and workspace-relative paths; never invent or expose a workspaceId.`;
+  return `Explicit commentary is progress and may continue without calls; unphased text without calls is the final answer. ${names.interactionRequest} and ${names.planPublish} must each be the only call in their turn. Use a logical workspace handle from the Session binding list and workspace-relative paths; never invent or expose a workspaceId.${progress}${decisions}${plugins}`;
 }
 
 const INTERACTION_SCHEMA: JsonObject = {
@@ -39,7 +45,7 @@ const INTERACTION_SCHEMA: JsonObject = {
   required: ['kind', 'prompt', 'allowFreeform'],
   properties: {
     kind: { type: 'string', enum: ['question', 'confirmation'] },
-    prompt: { type: 'string', minLength: 1 },
+    prompt: { type: 'string', minLength: 1, description: 'Markdown prose. Use actual paragraph breaks, not literal backslash-n text.' },
     options: {
       type: 'array',
       maxItems: 8,
@@ -88,16 +94,14 @@ const PLAN_OPERATION_SCHEMA: JsonObject = {
     {
       type: 'object',
       additionalProperties: false,
-      required: ['workspace', 'operation', 'workspaceMode', 'executionScope'],
+      required: ['workspace', 'operation', 'writablePaths'],
       properties: {
         workspace: { type: 'string', minLength: 1 },
         operation: { type: 'string', enum: ['bash', 'powershell'] },
         command: { type: 'string', minLength: 1, maxLength: 16_384 },
-        workspaceMode: { type: 'string', enum: ['write'] },
-        executionScope: { type: 'string', enum: ['workspace', 'host'] },
         writablePaths: {
           type: 'array', minItems: 1,
-          description: 'Required for workspace Bash writes: list the source files or directories and build/output/cache directories that may be modified. A directory includes its descendants. Command text is not an authorization lock.',
+          description: 'Declared files and directories this operation may modify, including build/output directories. A directory includes its descendants. Kernel applies the configured Shell permissions; command text is not an authorization lock.',
           items: { type: 'object', additionalProperties: false, required: ['path', 'kind'], properties: {
             path: { type: 'string', minLength: 1 }, kind: { type: 'string', enum: ['file', 'directory'] },
           } },
@@ -129,7 +133,7 @@ const PLAN_SCHEMA: JsonObject = {
   properties: {
     mode: { type: 'string', enum: ['extendScope'], description: 'Only to add scope to the current confirmed Plan: submit summary (reason) and mutationManifest (additions), omitting title and steps. Existing phases and verification are preserved; user confirmation is still required.' },
     title: PLAN_TITLE_SCHEMA,
-    summary: { type: 'string', minLength: 1 },
+    summary: { type: 'string', minLength: 1, description: 'Markdown prose. Use actual paragraph breaks, not literal backslash-n text.' },
     steps: {
       type: 'array',
       minItems: 1,
@@ -156,11 +160,11 @@ const PLAN_SCHEMA: JsonObject = {
 };
 
 export type SessionControlCall =
+  | { kind: 'pluginActivate'; callId: string; pluginUris: string[] }
   | {
-      kind: 'planProgress';
+      kind: 'todoUpdate';
       callId: string;
-      sourceFactRef: string;
-      updates: TodoProgressUpdate[];
+      items: TodoItem[];
     }
   | {
       kind: 'interaction';
@@ -189,30 +193,35 @@ export interface PlanScopeExtension {
 export function sessionControlToolDefinitions(): readonly ProviderToolDefinition[] {
   return [
     {
+      name: SESSION_CONTROL_PLUGIN_ACTIVATE,
+      description: 'Load installed, enabled plugins needed for the current task. Discover exact URIs with plugin search first. User mentions are optional and remain separate user guidance. This adds plugin tools/instructions to the next request in this run; it does not install, enable disabled plugins, change settings or authorize their effects. Must be the only call in its turn.',
+      inputSchema: { type: 'object', additionalProperties: false, required: ['pluginUris'], properties: {
+        pluginUris: { type: 'array', minItems: 1, maxItems: 16, uniqueItems: true,
+          items: { type: 'string', pattern: '^plugin://[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$' } },
+      } },
+    },
+    {
       name: SESSION_CONTROL_INTERACTION_REQUEST,
       description: 'Ask the user for missing information or a required decision, then pause the run.',
       inputSchema: structuredClone(INTERACTION_SCHEMA) as JsonObject,
     },
     {
       name: SESSION_CONTROL_PLAN_PUBLISH,
-      description: 'Propose a Plan for user confirmation. Steps are stable outcome phases, not files, commands or implementation recipes; new tasks need not repeat completed history. For scope additions only, use mode=extendScope with summary explaining why and mutationManifest containing additions; Session preserves the current phases, verification and progress. If the task needs a rewritten Plan, omit mode, retain existing stepIds and submit title, summary, steps and the full effective manifest. Scope expansion and Plan rewrites take effect only after user confirmation. fs.edit/fs.write/document.render/browser.capture share file or explicit directoryTree scope; deletion is separate. When creating a module, propose its specific directoryTree scope upfront so new implementation files within that approved directory need no extra confirmation; list unrelated root files separately. Bash command is an optional example, not an exact script lock. Routine fixes within confirmed scope need no reconfirmation. Titles use inline Markdown; other text uses Markdown.',
+      description: 'Propose a Plan for user confirmation. Keep steps to a few meaningful outcome phases, merging similar work instead of listing files, commands or implementation recipes; choose the count to fit the task. New tasks need not repeat completed history. For scope additions only, use mode=extendScope with summary explaining why and mutationManifest containing additions; Session preserves the approved phases and verification; Todo stays independent. If the task needs a rewritten Plan, omit mode, retain existing stepIds and submit title, summary, steps and the full effective manifest. Scope expansion and Plan rewrites take effect only after user confirmation. fs.edit/fs.write/document.render/browser.capture share file or explicit directoryTree scope; deletion is separate. When creating a module, propose its specific directoryTree scope upfront so new implementation files within that approved directory need no extra confirmation; list unrelated root files separately. Bash command is an optional example, not an exact script lock. Routine fixes within confirmed scope need no reconfirmation. Titles use inline Markdown; other text uses Markdown.',
       inputSchema: structuredClone(PLAN_SCHEMA) as JsonObject,
     },
     {
-      name: SESSION_CONTROL_PLAN_PROGRESS,
-      description: 'Report confirmed phase progress when entering or finishing a phase, or when progress changes; no update is needed for every operation. sourceFactRef is its recordId from a tool result already received in this run, including investigation before Plan confirmation. Mark completed only when the phase and its verification are done. Batch related updates, optionally alongside ordinary tool calls whose future results cannot be evidence. This does not request user confirmation or change phase entries.',
+      name: SESSION_CONTROL_TODO_UPDATE,
+      description: 'Replace the complete ordered task list when progress meaningfully changes. Keep phases few and meaningful, merging similar work; choose the count to fit the task and revise the list as needed. Report pending, inProgress, completed or blocked work; an empty list clears it. No Plan, record IDs or approval needed; unfinished items do not prevent answering. At most one update per turn; ordinary calls may accompany it.',
       inputSchema: {
-        type: 'object', additionalProperties: false, required: ['sourceFactRef', 'updates'],
-        properties: {
-          sourceFactRef: { type: 'string', minLength: 1 },
-          updates: { type: 'array', minItems: 1, items: {
-            type: 'object', additionalProperties: false, required: ['todoId', 'status'],
-            properties: {
-              todoId: { type: 'string', minLength: 1 },
-              status: { type: 'string', enum: ['pending', 'inProgress', 'completed'] },
-            },
-          } },
-        },
+        type: 'object', additionalProperties: false, required: ['items'],
+        properties: { items: { type: 'array', items: {
+          type: 'object', additionalProperties: false, required: ['text', 'status'],
+          properties: {
+            text: { type: 'string', minLength: 1 },
+            status: { type: 'string', enum: ['pending', 'inProgress', 'completed', 'blocked'] },
+          },
+        } } },
       },
     },
   ];
@@ -226,26 +235,33 @@ export function decodeSessionControlCall(
   if (
     name !== SESSION_CONTROL_INTERACTION_REQUEST
     && name !== SESSION_CONTROL_PLAN_PUBLISH
-    && name !== SESSION_CONTROL_PLAN_PROGRESS
+    && name !== SESSION_CONTROL_TODO_UPDATE
+    && name !== SESSION_CONTROL_PLUGIN_ACTIVATE
   ) return null;
   const canonicalCallId = requiredIdentifier(callId, 'callId');
-  if (name === SESSION_CONTROL_PLAN_PROGRESS) {
-    assertExactKeys(input, ['sourceFactRef', 'updates']);
-    if (!Array.isArray(input.updates) || input.updates.length < 1) {
-      throw new SessionControlError('plan_progress_invalid', 'updates 必须包含至少一个阶段进度更新。');
+  if (name === SESSION_CONTROL_PLUGIN_ACTIVATE) {
+    assertExactKeys(input, ['pluginUris']);
+    if (!Array.isArray(input.pluginUris) || input.pluginUris.length < 1 || input.pluginUris.length > 16
+      || input.pluginUris.some(uri => typeof uri !== 'string' || !/^plugin:\/\/[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(uri))
+      || new Set(input.pluginUris).size !== input.pluginUris.length) {
+      throw new SessionControlError('plugin_selection_invalid', 'pluginUris 必须包含 1 至 16 个不重复的已发现插件 URI。');
     }
-    const seen = new Set<string>();
-    const updates = input.updates.map((item): TodoProgressUpdate => {
-      if (!isRecord(item)) throw new SessionControlError('plan_progress_invalid', '步骤更新必须是对象。');
-      assertExactKeys(item, ['todoId', 'status']);
-      const todoId = requiredIdentifier(item.todoId, 'todoId');
-      if (seen.has(todoId) || !['pending', 'inProgress', 'completed'].includes(String(item.status))) {
-        throw new SessionControlError('plan_progress_invalid', '步骤更新重复或状态无效。');
+    return { kind: 'pluginActivate', callId: canonicalCallId, pluginUris: input.pluginUris as string[] };
+  }
+  if (name === SESSION_CONTROL_TODO_UPDATE) {
+    assertExactKeys(input, ['items']);
+    if (!Array.isArray(input.items)) {
+      throw new SessionControlError('todo_update_invalid', 'items must be the complete ordered task list.');
+    }
+    const items = input.items.map((item): TodoItem => {
+      if (!isRecord(item)) throw new SessionControlError('todo_update_invalid', 'Each task must be an object.');
+      assertExactKeys(item, ['text', 'status']);
+      if (typeof item.status !== 'string' || !['pending', 'inProgress', 'completed', 'blocked'].includes(item.status)) {
+        throw new SessionControlError('todo_update_invalid', 'Task status must be pending, inProgress, completed or blocked.');
       }
-      seen.add(todoId);
-      return { todoId, status: item.status as TodoProgressUpdate['status'] };
+      return { text: requiredText(item.text, 'text'), status: item.status as TodoItem['status'] };
     });
-    return { kind: 'planProgress', callId: canonicalCallId, sourceFactRef: requiredIdentifier(input.sourceFactRef, 'sourceFactRef'), updates };
+    return { kind: 'todoUpdate', callId: canonicalCallId, items };
   }
   if (name === SESSION_CONTROL_INTERACTION_REQUEST) {
     return {
@@ -376,50 +392,32 @@ function decodePlanOperation(value: unknown, index: number): PlanOperation {
   if (operation === 'bash' || operation === 'powershell') {
     assertExactKeys(
       value,
-      ['workspaceId', 'operation', 'command', 'workspaceMode', 'executionScope', 'terminal', 'writablePaths'],
-      ['command', 'terminal', 'writablePaths'],
+      ['workspaceId', 'operation', 'command', 'terminal', 'writablePaths'],
+      ['command', 'terminal'],
       `mutationManifest[${index}]`,
     );
     const command = value.command === undefined ? undefined : requiredText(value.command, 'command');
-    if (
-      command !== undefined && command.length > 16_384
-      || value.workspaceMode !== 'write'
-      || value.executionScope !== 'workspace' && value.executionScope !== 'host'
-    ) {
-      throw new SessionControlError(
-        'session_control_plan_shell_invalid',
-        'bash Plan operation 必须声明 workspaceMode=write 和 executionScope。',
-      );
+    if (command !== undefined && command.length > 16_384) {
+      throw new SessionControlError('session_control_plan_shell_invalid', 'Shell Plan command 不得超过 16384 个字符。');
     }
-    const terminal = value.terminal === undefined
-      ? undefined
-      : decodeTerminalInput(value.terminal);
-    const writablePaths = value.writablePaths;
-    if (value.executionScope === 'workspace' && (!Array.isArray(writablePaths) || !writablePaths.length)) {
-      throw new SessionControlError('session_control_plan_shell_invalid', 'workspace Bash 必须在 writablePaths 中声明可写文件/目录，包含构建产出目录。');
+    const terminal = value.terminal === undefined ? undefined : decodeTerminalInput(value.terminal);
+    if (!Array.isArray(value.writablePaths) || !value.writablePaths.length) {
+      throw new SessionControlError('session_control_plan_shell_invalid', 'writablePaths 必须包含至少一个可写文件或目录。');
     }
-    const paths = writablePaths === undefined ? undefined : (() => {
-      if (!Array.isArray(writablePaths) || !writablePaths.length) {
-        throw new SessionControlError('session_control_plan_shell_invalid', 'writablePaths 必须包含至少一个文件或目录。');
+    const writablePaths = value.writablePaths.map((entry) => {
+      if (!isRecord(entry) || entry.kind !== 'file' && entry.kind !== 'directory') {
+        throw new SessionControlError('session_control_plan_shell_invalid', 'writablePaths 项必须包含 path 和 kind=file|directory。');
       }
-      return writablePaths.map((entry) => {
-        if (!isRecord(entry) || entry.kind !== 'file' && entry.kind !== 'directory') {
-          throw new SessionControlError('session_control_plan_shell_invalid', 'writablePaths 项必须包含 path 和 kind=file|directory。');
-        }
-        assertExactKeys(entry, ['path', 'kind'], [], 'writablePaths');
-        return { path: normalizedTarget(entry.path), kind: entry.kind as 'file' | 'directory' };
-      });
-    })();
+      assertExactKeys(entry, ['path', 'kind'], [], 'writablePaths');
+      return { path: normalizedTarget(entry.path), kind: entry.kind as 'file' | 'directory' };
+    });
     return {
-      workspaceId,
-      operation,
+      workspaceId, operation, writablePaths,
       ...(command === undefined ? {} : { command }),
-      workspaceMode: 'write',
-      executionScope: value.executionScope,
-      ...(paths ? { writablePaths: paths } : {}),
       ...(terminal ? { terminal } : {}),
     };
   }
+
   const target = normalizedTarget(value.target);
   if (operation === 'fs.delete') {
     assertExactKeys(value, ['workspaceId', 'operation', 'target', 'targetKind'], [], `mutationManifest[${index}]`);

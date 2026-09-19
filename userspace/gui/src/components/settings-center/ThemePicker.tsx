@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import UiIcon from '../../icons/registry';
 import type { GuiAccentColor, GuiResolvedTheme } from '../../theme/deepcodeGuiTheme';
 import { paletteColor, type PaletteOverrides } from '../../theme/palette';

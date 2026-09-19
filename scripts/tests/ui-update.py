@@ -36,7 +36,7 @@ class UiUpdateTests(unittest.TestCase):
         write(self.assets, "pdfjs/wasm/decoder.wasm", b"local renderer asset")
         write(self.target, "index.html", b"previous frontend")
         write(self.target, "assets/obsolete.js", b"old chunk")
-        for name in ["deepcode-kernel", "session-core/dist/sessionServiceBridge.js", "config/user-settings.json", "runtime/agent-runtime/session.sqlite3"]:
+        for name in ["deepcode-kernel", "session-core/dist/sessionServiceBridge.js", "config/user-settings.json", "data/agent-runtime/session.sqlite3"]:
             write(self.package, name, f"keep original {name}".encode())
 
     def test_command_replaces_complete_gui_and_retains_other_files(self):

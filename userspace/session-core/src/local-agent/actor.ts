@@ -3,7 +3,7 @@ import { failureSnapshotEvent } from './failureSnapshot.js';
 import { errorFact } from './loopFailure.js';
 import { LiveReasoning } from './reasoningRead.js';
 import { LiveToolOutput } from './liveToolOutput.js';
-import { todoItemsForPlan } from './planStage.js';
+import { todoUpdateFact } from './todoState.js';
 import { savedSessionEnvironment } from './sessionEnvironment.js';
 import type {
   AssistantDraftProjection,
@@ -746,23 +746,11 @@ export class SessionActor {
           authorities,
         },
       });
-      const previousTodo = snapshot.state.todoList;
-      const previousPlan = previousTodo && snapshot.state.plans.find((candidate) => (
-        candidate.planId === previousTodo.sourcePlanId && candidate.revision === previousTodo.sourcePlanRevision
-      ));
-      const todoItems = todoItemsForPlan(plan, previousTodo, previousPlan ?? undefined, this.#nextId);
-      events.push({
-        type: snapshot.state.todoList?.sourcePlanId === plan.planId
-          ? 'todo.reconciled'
-          : 'todo.seeded',
-        sessionId: this.sessionId,
-        runId: command.runId,
-        payload: {
-          sourcePlanId: plan.planId,
-          sourcePlanRevision: plan.revision,
-          items: todoItems,
-        },
-      });
+      // Confirmation may initialize this run's list, but never rewrites an existing Todo.
+      if (snapshot.state.todoList?.runId !== command.runId) {
+        events.push(todoUpdateFact(this.sessionId, command.runId, snapshot.state.todoList,
+          plan.steps.map(step => ({ text: step.title, status: 'pending' }))));
+      }
     } else if (command.response.kind === 'requestRevision') {
       const messageId = this.#nextId('message');
       events.push({
@@ -892,11 +880,7 @@ export class SessionActor {
           if (!runtime) throw new Error('run_runtime_snapshot_missing');
           const activeView = current.state.runToolViews[runId] ?? runtime;
           const initialSelections = recoveryPluginSelection(current, runId, runtime).pluginSelections ?? [];
-          const previousSelections = current.events.flatMap((event) => (
-            event.type === 'message.committed' && event.runId === runId && event.payload.role === 'user'
-              ? event.payload.pluginSelections ?? [] : []
-          ));
-          const selections = [...new Map([...initialSelections, ...previousSelections, ...queued.flatMap((input) => input.pluginSelections)]
+          const selections = [...new Map([...initialSelections, ...queued.flatMap((input) => input.pluginSelections)]
             .map((selection) => [selection.uri, selection])).values()];
           const events: NewSessionEvent[] = [];
           if (selections.length || activeView.selectedPlugins.plugins.length) {
@@ -1359,10 +1343,14 @@ function recoveryPluginSelection(
     event.type === 'input.accepted'
     && event.payload.messageId === started.payload.inputMessageId
   ));
-  const selections = input?.payload.pluginSelections ?? [];
+  const active = snapshot.state.runToolViews[runId]?.selectedPlugins ?? runtime.selectedPlugins;
+  const selections = active.plugins.map((plugin, index) => (
+    input?.payload.pluginSelections?.find(selection => selection.uri === plugin.uri)
+    ?? { selectionId: `plugin-selection:${runId}:${index}`, uri: plugin.uri, label: plugin.uri.slice(0, 160) }
+  ));
   if (selections.length === 0) return {};
   return {
-    pluginCatalogRevision: runtime.selectedPlugins.catalogRevision,
+    pluginCatalogRevision: active.catalogRevision,
     pluginSelections: selections.map((selection) => ({ ...selection })),
   };
 }

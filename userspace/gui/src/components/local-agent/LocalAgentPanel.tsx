@@ -16,7 +16,6 @@ import { ConversationComposer } from './ConversationComposer';
 import { ConversationTranscript } from './ConversationTranscript';
 import { ReaderControls, ResourcePreview, useResourcePreview } from './ResourcePreview';
 import { ArtifactLinks } from './ArtifactLinks';
-import { SessionRunStatus } from './SessionRunStatus';
 import './localAgentPanel.css';
 
 interface LocalAgentPanelProps {
@@ -46,7 +45,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
   const title = activeSummary?.title.trim()
     || projection?.display.creationTitle.trim()
     || t(language, 'agent.session.newTitle');
-  const conversationItems = useMemo(() => projectionItems(projection), [projection?.sessionId, projection?.revision]);
+  const conversationItems = projectionItems(projection);
   const assistantDraft = projection?.assistantDraft ?? null;
   const display = useDisplayedConversation();
   const showChangeBar = projection?.run && !display.displaySettledRunIds.has(projection.run.runId)
@@ -102,13 +101,6 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
             {!headerTarget && activeProject && <span>{activeProject.title}</span>}
           </div>
         </div>
-          <SessionRunStatus
-            run={projection?.run ?? null}
-            language={language}
-            emptyLabel={!projection
-              ? t(language, loading ? 'agent.chat.connecting' : 'agent.chat.new')
-              : undefined}
-          />
         </div>
         <div className="local-agent__header-preview">
           {resourcePreview.visible && <div className="reader-header-tabs" ref={setReaderHeader} />}
@@ -163,12 +155,13 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
       </div>
 
       <ConversationComposer
+        onEditBrowserReview={resourcePreview.editBrowserReview}
         changeBar={showChangeBar && <FileChanges key={`${sessionId}:${projection.run!.runId}`} activities={roundChangeActivities(projection, projection.run!.runId)} compact />}
         language={language}
         composer={composer}
         uiActionError={uiActionError}
       />
-      <ResourcePreview language={language} preview={resourcePreview} tabsTarget={readerHeader} />
+      <ResourcePreview language={language} preview={resourcePreview} tabsTarget={readerHeader} onReview={composer.appendBrowserReview} />
       {composer.attachmentDialogOpen && (
         <ProjectFolderDialog
           language={language}

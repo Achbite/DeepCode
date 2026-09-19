@@ -4,16 +4,26 @@
       "id": "deepseek-v4-flash-openai",
       "name": "DeepSeek Flash",
       "kind": "responses",
+      "hostedWebSearch": "web_search",
       "providerFlavor": "deepseek",
-      "baseUrl": "https://api.deepseek.com",
       "model": "deepseek-flash",
       "contextWindowTokens": 1000000,
       "maxOutputTokens": 384000,
       "temperature": 0.2,
-      "reasoningEffort": "high",
       "thinking": "enabled",
-      "enabled": true
+      "enabled": true,
+      "connectionId": "deepseek-api"
     }
   ],
-  "defaultProfileId": "deepseek-v4-flash-openai"
+  "defaultProfileId": "deepseek-v4-flash-openai",
+  "connections": [
+    {
+      "id": "deepseek-api",
+      "name": "DeepSeek",
+      "adapterId": "deepseek",
+      "billingMode": "metered",
+      "baseUrl": "https://api.deepseek.com",
+      "credentialKind": "apiKey"
+    }
+  ]
 }

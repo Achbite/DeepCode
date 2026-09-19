@@ -248,7 +248,10 @@ impl KernelToolExecutor for WslExecutor {
                 context,
                 distribution: self.target.distribution.clone(),
                 shell,
-                execution_path: self.execution_path.clone().ok_or_else(|| failure("The prepared WSL PATH is missing."))?,
+                execution_path: self
+                    .execution_path
+                    .clone()
+                    .ok_or_else(|| failure("The prepared WSL PATH is missing."))?,
             },
             &cancellation,
             timeout,

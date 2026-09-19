@@ -1,3 +1,4 @@
+import { requestInterfaceReload } from '../../../services/interfaceReload';
 import React, { useMemo } from 'react';
 import type { UserSettingValue } from '@deepcode/protocol';
 import { normalizeUiLanguage, t } from '../../../i18n';
@@ -10,10 +11,11 @@ import {
 } from '../../../state/settingsStore';
 import GuiAppearanceSettings from '../GuiAppearanceSettings';
 import SettingsField from '../SettingsField';
-import ProjectEnvironmentSettings from './ProjectEnvironmentSettings';
 import WorkspaceSandboxSettings from './WorkspaceSandboxSettings';
 import DocumentEnvironmentSettings from './DocumentEnvironmentSettings';
 import FileOpeningSettings from './FileOpeningSettings';
+import CommandDenylistSettings from './CommandDenylistSettings';
+import { matchesSettingsQuery } from '../settingsSearch';
 
 interface RuntimeProps {
   apiStatus: string;
@@ -151,7 +153,7 @@ export const GuiSettingsSection: React.FC<RuntimeProps> = ({
             </tbody>
           </table>
           <div className="settings-card__body">
-            <button type="button" className="settings-button" onClick={() => window.location.reload()}>
+            <button type="button" className="settings-button" onClick={() => requestInterfaceReload()}>
               {language === 'zh-CN' ? '重新加载界面' : 'Reload interface'}
             </button>
           </div>
@@ -200,11 +202,13 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
   const groups = category === 'agent' ? [response, instructions]
     : category === 'environment' ? [shellSettings]
       : category === 'permissions' ? [permissions] : [web];
+  const commandDenylistMatches = category === 'permissions' && matchesSettingsQuery(query,
+    t(language, 'settings.commandDenylist.title'), t(language, 'settings.commandDenylist.description'));
   const onChange = (key: string, value: UserSettingValue) => {
     return patchUserSetting(key, value);
   };
-  const renderCard = (title: string | null, definitions: readonly SettingDefinition[]) => {
-    if (definitions.length === 0) return null;
+  const renderCard = (title: string | null, definitions: readonly SettingDefinition[], extra?: React.ReactNode) => {
+    if (definitions.length === 0 && !extra) return null;
     return (
       <section className="settings-group">
         {title && <h3 className="settings-card__title">{title}</h3>}
@@ -222,6 +226,7 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
               onReset={(key) => resetUserSetting(key)}
             />
           ))}
+          {extra}
         </div>
       </section>
     );
@@ -233,7 +238,6 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
       {category === 'agent' && renderCard(null, response)}
       {category === 'environment' && environment?.os === 'windows' && renderCard('Windows Shell', shellSettings)}
       {category === 'environment' && <DocumentEnvironmentSettings language={language} query={query} />}
-      {category === 'environment' && !query && <ProjectEnvironmentSettings chinese={chinese} />}
       {category === 'environment' && !query && <WorkspaceSandboxSettings chinese={chinese} />}
       {category === 'environment' && !query && <div className="settings-card">
         <h3 className="settings-card__title">{chinese ? '环境上下文' : 'Environment context'}</h3>
@@ -253,10 +257,10 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
       </div>}
 
       {category === 'agent' && renderCard(t(language, 'settings.agent.instructions'), instructions)}
-      {category === 'permissions' && renderCard(null, permissions)}
+      {category === 'permissions' && renderCard(null, permissions, commandDenylistMatches ? <CommandDenylistSettings language={language} /> : null)}
       {category === 'services' && renderCard(null, web)}
       {errorMessage && <div className="settings-error">{errorMessage}</div>}
-      {category !== 'environment' && groups.every((group) => group.length === 0) && (
+      {category !== 'environment' && !commandDenylistMatches && groups.every((group) => group.length === 0) && (
         <div className="settings-card">
           <div className="settings-card__body">{t(language, 'settings.noSearchMatch')}</div>
         </div>

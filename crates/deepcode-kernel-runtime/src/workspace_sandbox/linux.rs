@@ -4,6 +4,22 @@ use std::ffi::OsString;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+const BASE_ARGS: [&str; 13] = [
+    "--unshare-user",
+    "--unshare-pid",
+    "--unshare-net",
+    "--die-with-parent",
+    "--cap-drop",
+    "ALL",
+    "--ro-bind",
+    "/",
+    "/",
+    "--dev",
+    "/dev",
+    "--proc",
+    "/proc",
+];
+
 fn executable() -> Option<PathBuf> {
     // The distribution carries the helper beside the Kernel; development uses
     // the installed helper from the container image.
@@ -18,17 +34,8 @@ pub(super) fn probe() -> SandboxStatus {
     let result = (|| {
         let helper = executable().ok_or("Bubblewrap is not installed. Install bubblewrap in this Linux environment, then refresh the environment.".to_string())?;
         let mut child = Command::new(helper)
-            .args([
-                "--unshare-user",
-                "--unshare-pid",
-                "--unshare-net",
-                "--die-with-parent",
-                "--ro-bind",
-                "/",
-                "/",
-                "--",
-                "/bin/true",
-            ])
+            .args(BASE_ARGS)
+            .args(["--", "/bin/true"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -101,26 +108,8 @@ pub(crate) fn command(
     .collect();
     command.push(filter.into_os_string());
     command.push(helper.into_os_string());
-    command.extend(
-        [
-            "--unshare-user",
-            "--unshare-pid",
-            "--unshare-net",
-            "--die-with-parent",
-            "--cap-drop",
-            "ALL",
-            "--ro-bind",
-            "/",
-            "/",
-            "--dev",
-            "/dev",
-            "--proc",
-            "/proc",
-            "--bind",
-        ]
-        .into_iter()
-        .map(OsString::from),
-    );
+    command.extend(BASE_ARGS.into_iter().map(OsString::from));
+    command.push("--bind".into());
     command.push(temp.into());
     command.push(temp.into());
     for target in writable_paths(root, mode, targets)? {

@@ -8,17 +8,20 @@ use bytes::Bytes;
 use std::convert::Infallible;
 
 const LLM_PROFILE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
-const PROVIDER_REQUEST_LIMIT: usize = 8 * 1024 * 1024;
+const PROVIDER_REQUEST_LIMIT: usize = 96 * 1024 * 1024;
 const PROVIDER_ENVELOPE_LIMIT: usize = 1024 * 1024;
 const PROVIDER_ERROR_BODY_LIMIT: usize = 16 * 1024;
 const PROVIDER_ERROR_MESSAGE_LIMIT: usize = 512;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ResolvedLlmProfile {
+    pub(crate) connection: crate::model_connections::ModelConnection,
+    pub(crate) account_id: Option<String>,
     pub(crate) kind: String,
     pub(crate) provider_flavor: Option<String>,
     pub(crate) base_url: Option<String>,
     pub(crate) model: String,
+    pub(crate) image_input: bool,
     pub(crate) context_window_tokens: Option<u64>,
     pub(crate) max_output_tokens: Option<u32>,
     pub(crate) temperature: Option<f64>,
@@ -26,6 +29,16 @@ pub(crate) struct ResolvedLlmProfile {
     pub(crate) thinking: Option<String>,
     pub(crate) hosted_web_search: Option<String>,
     pub(crate) api_key: Option<String>,
+}
+
+impl std::fmt::Debug for ResolvedLlmProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedLlmProfile")
+            .field("connection", &self.connection.id)
+            .field("kind", &self.kind)
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -40,7 +53,6 @@ pub(crate) struct ProviderRequestInput {
     pub(crate) messages: Vec<LocalProviderMessage>,
     pub(crate) tools: Vec<LlmToolDefinition>,
     pub(crate) hosted_tools: Vec<LocalProviderHostedTool>,
-    pub(crate) require_tool_call: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -118,43 +130,52 @@ pub(crate) fn resolve_llm_profile(
     if u64::from(max_output_tokens) >= context_window_tokens {
         return Err("LLM Profile 的 maxOutputTokens 必须小于 contextWindowTokens。".to_string());
     }
-    let id = profile
-        .get("id")
-        .and_then(Value::as_str)
-        .expect("validated profile id")
-        .to_string();
-    let secret_store = match read_optional_json_file(&gui.paths.llm_secrets_path)? {
-        Some(value) if llm_secret_store_is_current(&value) => {
-            value.as_object().cloned().expect("validated secret store")
-        }
-        Some(_) => return Err("LLM secret 文件不是当前字符串映射格式。".to_string()),
-        None => serde_json::Map::new(),
-    };
-    let api_key = match profile.get("secretRef").and_then(Value::as_str) {
-        Some(secret_ref) => {
-            let key = local_secret_ref_key(secret_ref)
-                .ok_or_else(|| "LLM Profile 的 secretRef 无效。".to_string())?;
-            Some(
-                secret_store
-                    .get(key)
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| "LLM Profile 的本地 secret 不存在。".to_string())?
-                    .to_string(),
-            )
-        }
-        None => secret_store
-            .get(&id)
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_string)
-            .or_else(|| {
+    let connection = crate::model_connections::connection(
+        gui,
+        profile["connectionId"]
+            .as_str()
+            .expect("validated connection ID"),
+    )?;
+    let secret = crate::model_connections::read_secret(gui, &connection)?;
+    if connection.credential_ref.is_some() && secret.is_none() {
+        return Err("连接的本地凭据不存在。".into());
+    }
+    let (api_key, account_id) = if connection.credential_kind == "oauth" {
+        let credential = crate::model_auth::decode_credential(&secret.ok_or("订阅需要登录。")?)?;
+        (None, Some(credential.account_id))
+    } else if connection.credential_kind == "none" {
+        (None, None)
+    } else {
+        (
+            secret.or_else(|| {
                 std::env::var("DEEPCODE_LLM_API_KEY")
                     .ok()
-                    .filter(|value| !value.trim().is_empty())
+                    .filter(|s| !s.trim().is_empty())
             }),
+            None,
+        )
     };
     Ok(ResolvedLlmProfile {
+        image_input: profile
+            .get("imageInput")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| {
+                crate::model_connections::adapter_descriptors()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|adapter| adapter["id"] == connection.adapter_id)
+                    .and_then(|adapter| adapter["models"].as_array())
+                    .and_then(|models| {
+                        models
+                            .iter()
+                            .find(|model| model["model"] == profile["model"])
+                    })
+                    .is_some_and(|model| model["imageInput"] == true)
+            }),
+        base_url: Some(connection.base_url.clone()),
+        connection,
+        account_id,
         kind: profile
             .get("kind")
             .and_then(Value::as_str)
@@ -162,10 +183,6 @@ pub(crate) fn resolve_llm_profile(
             .to_string(),
         provider_flavor: profile
             .get("providerFlavor")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        base_url: profile
-            .get("baseUrl")
             .and_then(Value::as_str)
             .map(str::to_string),
         model: profile
@@ -197,7 +214,6 @@ pub(crate) fn openai_compatible_request_body(
     messages: &[LocalProviderMessage],
     tools: &[LlmToolDefinition],
     stream: bool,
-    require_tool_call: bool,
 ) -> Value {
     let compatibility = provider_thinking_compatibility(profile);
     let mut body = json!({
@@ -253,13 +269,6 @@ pub(crate) fn openai_compatible_request_body(
                 }
             }))
             .collect::<Vec<_>>());
-        if require_tool_call
-            && !(compatibility == ProviderThinkingCompatibility::DeepSeek
-                && profile.thinking.as_deref() == Some("enabled"))
-            && !(compatibility == ProviderThinkingCompatibility::Moonshot && !kimi_k3)
-        {
-            body["tool_choice"] = json!("required");
-        }
     }
     body
 }
@@ -270,7 +279,6 @@ fn responses_request_body(
     tools: &[LlmToolDefinition],
     hosted_tools: &[LocalProviderHostedTool],
     stream: bool,
-    require_tool_call: bool,
 ) -> Result<Value, ProviderTransportError> {
     let mut provider_tools = tools
         .iter()
@@ -280,6 +288,8 @@ fn responses_request_body(
                 "name": tool.name,
                 "description": tool.description,
                 "parameters": tool.input_schema,
+                // Preserve optional Kernel arguments, including explicit terminal opt-in.
+                "strict": false,
             })
         })
         .collect::<Vec<_>>();
@@ -314,8 +324,26 @@ fn responses_request_body(
     }
     if !provider_tools.is_empty() {
         body["tools"] = Value::Array(provider_tools);
-        if require_tool_call {
-            body["tool_choice"] = json!("required");
+    }
+    if profile.connection.adapter_id == "openai-codex" {
+        let instructions = messages
+            .iter()
+            .filter(|m| m.role == "system")
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        body["instructions"] = json!(instructions);
+        body["input"]
+            .as_array_mut()
+            .expect("Responses input")
+            .retain(|v| v["role"] != "system");
+        body["store"] = json!(false);
+        body["include"] = json!(["reasoning.encrypted_content"]);
+        body.as_object_mut().unwrap().remove("max_output_tokens");
+        body.as_object_mut().unwrap().remove("temperature");
+        body["parallel_tool_calls"] = json!(true);
+        if body.get("reasoning").is_some() {
+            body["reasoning"]["summary"] = json!("auto");
         }
     }
     Ok(body)
@@ -380,21 +408,28 @@ fn responses_input(
                         "Responses tool 消息缺少 providerCallId。",
                     )
                 })?;
-            input.push(json!({
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": content,
-            }));
+            let output = if message.image_data.is_empty() {
+                json!(content)
+            } else {
+                let mut parts = vec![json!({"type":"input_text","text":content})];
+                parts.extend(message.image_data.iter().map(|image| json!({"type":"input_image","image_url":image.data_url(),"detail":"auto"})));
+                json!(parts)
+            };
+            input.push(json!({"type":"function_call_output","call_id":call_id,"output":output}));
             continue;
         }
-        if !content.is_empty() {
+        if !content.is_empty() || !message.image_data.is_empty() {
+            let mut parts = Vec::new();
+            if !content.is_empty() {
+                parts.push(json!({"type": if role == "assistant" {"output_text"} else {"input_text"}, "text":content}));
+            }
+            parts.extend(message.image_data.iter().map(
+                |image| json!({"type":"input_image","image_url":image.data_url(),"detail":"auto"}),
+            ));
             input.push(json!({
                 "type": "message",
                 "role": role,
-                "content": [{
-                    "type": if role == "assistant" { "output_text" } else { "input_text" },
-                    "text": content,
-                }],
+                "content": parts,
             }));
         }
         for call in message.tool_calls.iter().flatten() {
@@ -503,6 +538,16 @@ fn openai_compatible_message(
                 .expect("validated tool message has providerCallId"),
             "content": provider_tool_content(&message.content, compatibility)
         }),
+        "user" if !message.image_data.is_empty() => {
+            let mut parts = vec![json!({"type":"text","text":message.content})];
+            parts.extend(
+                message
+                    .image_data
+                    .iter()
+                    .map(|image| json!({"type":"image_url","image_url":{"url":image.data_url()}})),
+            );
+            json!({"role":role,"content":parts})
+        }
         _ => json!({
             "role": role,
             "content": message.content
@@ -579,6 +624,26 @@ impl ProviderTransportError {
         }
     }
 
+    fn network(error: reqwest::Error, phase: &str, secret: Option<&str>) -> Self {
+        let failure = crate::provider_transport::network_failure(error, phase, secret);
+        let causes = failure["diagnostics"]["causes"]
+            .as_array()
+            .expect("network_failure supplies a cause array")
+            .iter()
+            .map(|cause| {
+                cause["message"]
+                    .as_str()
+                    .expect("network_failure supplies cause messages")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let code = "provider_transport_failed";
+        Self::message(
+            code,
+            format!("{} [{phase}]\n{causes}", Self::new(code).safe_message()),
+        )
+    }
+
     pub(crate) fn safe_message(&self) -> String {
         if let Some(message) = &self.message {
             return message.clone();
@@ -621,30 +686,15 @@ fn prepare_provider_request(
             "provider_hosted_tool_unsupported",
         ));
     }
-    let require_tool_call = envelope.require_tool_call;
-    if require_tool_call && tools.is_empty() {
-        return Err(ProviderTransportError::new(
-            "provider_required_tool_missing",
-        ));
-    }
     let provider_body = match kind {
         ProviderStreamKind::OpenAiCompatible => {
-            openai_compatible_request_body(profile, messages, &tools, true, require_tool_call)
+            openai_compatible_request_body(profile, messages, &tools, true)
         }
-        ProviderStreamKind::Responses => responses_request_body(
-            profile,
-            messages,
-            &tools,
-            &hosted_tools,
-            true,
-            require_tool_call,
-        )?,
-        ProviderStreamKind::Anthropic => {
-            anthropic_stream_request_body(profile, messages, &tools, require_tool_call)?
+        ProviderStreamKind::Responses => {
+            responses_request_body(profile, messages, &tools, &hosted_tools, true)?
         }
-        ProviderStreamKind::Ollama => {
-            ollama_stream_request_body(profile, messages, &tools, require_tool_call)
-        }
+        ProviderStreamKind::Anthropic => anthropic_stream_request_body(profile, messages, &tools)?,
+        ProviderStreamKind::Ollama => ollama_stream_request_body(profile, messages, &tools),
     };
     let body = serde_json::to_vec(&provider_body).map_err(|error| {
         ProviderTransportError::message(
@@ -663,6 +713,12 @@ fn prepare_provider_request(
 }
 
 fn provider_request_url(profile: &ResolvedLlmProfile, kind: ProviderStreamKind) -> String {
+    if profile.connection.adapter_id == "openai-codex" {
+        return format!(
+            "{}/responses",
+            profile.connection.base_url.trim_end_matches('/')
+        );
+    }
     match kind {
         ProviderStreamKind::OpenAiCompatible => normalize_openai_base_url(profile),
         ProviderStreamKind::Responses => normalize_responses_base_url(profile),
@@ -699,6 +755,23 @@ fn build_provider_request(
                 .header("anthropic-version", "2023-06-01");
         }
         ProviderStreamKind::Ollama => {}
+    }
+    if profile.connection.adapter_id == "openai-codex" {
+        request = request
+            .header(
+                "ChatGPT-Account-Id",
+                profile
+                    .account_id
+                    .as_deref()
+                    .ok_or_else(|| ProviderTransportError::new("provider_account_missing"))?,
+            )
+            .header("originator", "deepcode")
+            .header(
+                "User-Agent",
+                concat!("DeepCode/", env!("CARGO_PKG_VERSION")),
+            )
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("Accept", "text/event-stream");
     }
     Ok(request)
 }
@@ -816,15 +889,20 @@ fn trimmed_payload(raw: &[u8]) -> Option<Vec<u8>> {
 pub(crate) async fn probe_llm_profile_stream(
     client: &reqwest::Client,
     profile: &ResolvedLlmProfile,
+    usage_call: &mut crate::model_usage::UsageCall,
 ) -> Result<LlmStreamProbeResult, ProviderTransportError> {
-    tokio::time::timeout(LLM_PROFILE_PROBE_TIMEOUT, probe_profile(client, profile))
-        .await
-        .unwrap_or_else(|_| Err(ProviderTransportError::new("provider_probe_timeout")))
+    tokio::time::timeout(
+        LLM_PROFILE_PROBE_TIMEOUT,
+        probe_profile(client, profile, usage_call),
+    )
+    .await
+    .unwrap_or_else(|_| Err(ProviderTransportError::new("provider_probe_timeout")))
 }
 
 async fn probe_profile(
     client: &reqwest::Client,
     profile: &ResolvedLlmProfile,
+    usage_call: &mut crate::model_usage::UsageCall,
 ) -> Result<LlmStreamProbeResult, ProviderTransportError> {
     let prepared = prepare_provider_request(
         profile,
@@ -832,6 +910,9 @@ async fn probe_profile(
             messages: vec![LocalProviderMessage {
                 role: "user".into(),
                 content: "Reply with OK.".into(),
+                images: vec![],
+                image_data: vec![],
+                tool_images: vec![],
                 reasoning_content: None,
                 reasoning_signature: None,
                 tool_call_id: None,
@@ -842,14 +923,15 @@ async fn probe_profile(
             }],
             tools: vec![],
             hosted_tools: vec![],
-            require_tool_call: false,
         },
     )?;
     let kind = prepared.kind;
     let mut response = build_provider_request(client, profile, &prepared)?
         .send()
         .await
-        .map_err(|_| ProviderTransportError::new("provider_transport_failed"))?;
+        .map_err(|error| {
+            ProviderTransportError::network(error, "send", profile.api_key.as_deref())
+        })?;
     if !response.status().is_success() {
         return Err(ProviderTransportError::http(response.status().as_u16()));
     }
@@ -859,12 +941,24 @@ async fn probe_profile(
         let (payloads, eof) = match response.chunk().await {
             Ok(Some(chunk)) => (framer.push(&chunk)?, false),
             Ok(None) => (framer.finish()?, true),
-            Err(_) => return Err(ProviderTransportError::new("provider_transport_failed")),
+            Err(error) => {
+                return Err(ProviderTransportError::network(
+                    error,
+                    "responseBody",
+                    profile.api_key.as_deref(),
+                ))
+            }
         };
         for payload in payloads {
             accumulator
                 .ingest_payload(&payload)
                 .map_err(|error| ProviderTransportError::message(error.code, error.message))?;
+            let observed = accumulator
+                .observed_usage()
+                .map_err(|error| ProviderTransportError::message(error.code, error.message))?;
+            usage_call
+                .observe(observed)
+                .map_err(|error| ProviderTransportError::message("usage_record_failed", error))?;
         }
         if accumulator.source_done() || eof {
             break;
@@ -900,13 +994,14 @@ pub(crate) fn local_agent_provider_stream_response(
     request_id: String,
     archive_directory: std::path::PathBuf,
     archive_identity: Value,
+    usage_store: Arc<crate::model_usage::UsageStore>,
 ) -> Response {
     let response_request_id = request_id.clone();
     let response_attempt_id = provider_attempt_id.clone();
     let stream = async_stream::stream! {
         let mut archive = match deepcode_kernel_runtime::execution_archive::ExecutionArchive::open(
             Some(&archive_directory),
-            archive_identity,
+            archive_identity.clone(),
         ) {
             Ok(archive) => archive,
             Err(error) => {
@@ -966,6 +1061,14 @@ pub(crate) fn local_agent_provider_stream_response(
                 if archive_failed {
                     return;
                 }
+                return;
+            }
+        };
+        let mut usage_call = match usage_store.begin(&profile, &archive_identity) {
+            Ok(call) => call,
+            Err(error) => {
+                yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(&request_id, provider_attempt_id.as_deref(), "failed",
+                    json!({"code":"usage_record_failed","message":error}))));
                 return;
             }
         };
@@ -1099,6 +1202,13 @@ pub(crate) fn local_agent_provider_stream_response(
                         return;
                     }
                 };
+                let observed = accumulator.observed_usage().map_err(|error| error.message)
+                    .and_then(|observed| usage_call.observe(observed));
+                if let Err(error) = observed {
+                    yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(&request_id, provider_attempt_id.as_deref(), "failed",
+                        json!({"code":"usage_record_failed","message":error}))));
+                    return;
+                }
                 for emission in emissions {
                     let event_type = emission.event.get("type").and_then(Value::as_str);
                     match event_type {
@@ -1576,17 +1686,113 @@ pub(crate) fn split_system_messages(
 mod tests {
     use super::*;
 
+    async fn failed_loopback_probe(base_url: String) -> ProviderTransportError {
+        let mut profile = test_profile("openaiCompatible");
+        profile.base_url = Some(base_url);
+        profile.api_key = Some("probe-secret".into());
+        let store = Arc::new(
+            crate::model_usage::UsageStore::open(std::path::Path::new(":memory:")).unwrap(),
+        );
+        let mut usage = store.begin(&profile, &json!({"purpose":"probe"})).unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .retry(reqwest::retry::never())
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        probe_llm_profile_stream(&client, &profile, &mut usage)
+            .await
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn probe_send_failure_keeps_native_cause_without_credentials() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let failure = failed_loopback_probe(format!("http://{address}/v1?key=probe-secret")).await;
+        assert_eq!(failure.code, "provider_transport_failed");
+        let message = failure.safe_message();
+        assert!(message.contains("[send]"));
+        assert!(message.contains("Connection refused"), "{message}");
+        assert!(!message.contains("probe-secret"));
+    }
+
+    #[tokio::test]
+    async fn probe_body_failure_keeps_the_read_phase_and_original_cause() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "probe did not connect"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept probe: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut bytes = [0; 4096];
+            let request_length = loop {
+                let read = socket.read(&mut bytes).unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&bytes[..read]);
+                if let Some(end) = request.windows(4).position(|chunk| chunk == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    break end + 4 + length;
+                }
+            };
+            while request.len() < request_length {
+                let read = socket.read(&mut bytes).unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&bytes[..read]);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 64\r\nConnection: close\r\n\r\ndata: ").unwrap();
+        });
+        let failure = failed_loopback_probe(format!("http://{address}/v1?key=probe-secret")).await;
+        server.join().unwrap();
+        assert_eq!(failure.code, "provider_transport_failed");
+        let message = failure.safe_message();
+        assert!(message.contains("[responseBody]"));
+        assert!(
+            message.contains("end of file before message length reached"),
+            "{message}"
+        );
+        assert!(!message.contains("probe-secret"));
+    }
+
     fn provider_input(value: Value) -> ProviderRequestInput {
         ProviderRequestInput {
             messages: serde_json::from_value(value["messages"].clone()).unwrap(),
             tools: serde_json::from_value(value["tools"].clone()).unwrap(),
             hosted_tools: serde_json::from_value(value["hostedTools"].clone()).unwrap(),
-            require_tool_call: value["requireToolCall"].as_bool().unwrap(),
         }
     }
 
     #[test]
-    fn required_tool_constraint_reaches_each_provider_payload() {
+    fn normal_tool_schemas_reach_each_provider_payload_without_forced_choice() {
         let envelope = provider_input(json!({
             "messages": [{ "role": "user", "content": "Execute the confirmed step." }],
             "tools": [{
@@ -1594,24 +1800,23 @@ mod tests {
                 "description": "Execute one fixture action.",
                 "inputSchema": { "type": "object", "additionalProperties": false }
             }],
-            "hostedTools": [],
-            "requireToolCall": true
+            "hostedTools": []
         }));
-        for (kind, expected) in [
-            ("openaiCompatible", json!("required")),
-            ("responses", json!("required")),
-            ("anthropic", json!({ "type": "any" })),
-            ("ollama", json!("required")),
-        ] {
+        for kind in ["openaiCompatible", "responses", "anthropic", "ollama"] {
             let prepared = prepare_provider_request(&test_profile(kind), &envelope)
-                .expect("required-tool request must prepare");
+                .expect("normal tool request must prepare");
             let body: Value =
                 serde_json::from_slice(&prepared.body).expect("provider request body must decode");
-            assert_eq!(
-                body.get("tool_choice"),
-                Some(&expected),
-                "provider kind {kind}"
-            );
+            assert!(body.get("tool_choice").is_none(), "provider kind {kind}");
+            assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+            let tool = &body["tools"][0];
+            let (name, schema) = match kind {
+                "anthropic" => (&tool["name"], &tool["input_schema"]),
+                "responses" => (&tool["name"], &tool["parameters"]),
+                _ => (&tool["function"]["name"], &tool["function"]["parameters"]),
+            };
+            assert_eq!(name, "fixture_tool");
+            assert_eq!(schema, &envelope.tools[0].input_schema);
         }
     }
 
@@ -1626,8 +1831,7 @@ mod tests {
                     "description": "Fixture action.",
                     "inputSchema": { "type": "object" }
                 }],
-                "hostedTools": [],
-                "requireToolCall": false
+                "hostedTools": []
             })),
         )
         .expect("normal request must prepare");
@@ -1650,8 +1854,7 @@ mod tests {
                     "description": "Execute one fixture action.",
                     "inputSchema": { "type": "object", "additionalProperties": false }
                 }],
-                "hostedTools": [],
-                "requireToolCall": true
+                "hostedTools": []
             })),
         )
         .expect("DeepSeek thinking request must prepare");
@@ -1696,8 +1899,7 @@ mod tests {
                 "hostedTools": [{
                     "type": "webSearch",
                     "providerToolType": "web_search"
-                }],
-                "requireToolCall": false
+                }]
             })),
         )
         .expect("Responses request must prepare");
@@ -1791,7 +1993,6 @@ mod tests {
                 ],
                 "tools": [],
                 "hostedTools": [],
-                "requireToolCall": false,
             })),
         )
         .expect("ordered Responses replay must prepare");
@@ -1820,7 +2021,7 @@ mod tests {
                     "outputIndex":0,"kind":"toolCallRejected","callId":"call:bad","providerCallId":"native:bad","toolName":"fs.read","item":item
                 }]},
                 {"role":"tool","toolCallId":"call:bad","providerCallId":"native:bad","content":rejection}
-            ],"tools":[],"hostedTools":[],"requireToolCall":false
+            ],"tools":[],"hostedTools":[]
         }))).unwrap();
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
         assert_eq!(body["input"][1], item);
@@ -1828,6 +2029,49 @@ mod tests {
             body["input"][2],
             json!({"type":"function_call_output","call_id":"native:bad","output":rejection})
         );
+    }
+
+    #[test]
+    fn responses_keeps_kernel_optional_arguments_and_validation() {
+        let registry = deepcode_kernel_tools::KernelToolRegistry::new();
+        let bash = registry.descriptor("bash").unwrap();
+        let input = provider_input(json!({
+            "messages": [{ "role": "user", "content": "Inspect the worktree." }],
+            "tools": [{ "name": "bash", "description": bash.description,
+                "inputSchema": bash.input_schema }],
+            "hostedTools": [{ "type": "webSearch", "providerToolType": "web_search" }]
+        }));
+        let prepared = prepare_provider_request(&test_profile("responses"), &input).unwrap();
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        let function = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["type"] == "function")
+            .unwrap();
+        assert_eq!(function["strict"], false);
+        assert_eq!(function["parameters"], bash.input_schema);
+        assert!(!function["parameters"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("terminal")));
+        assert!(body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["type"] == "web_search"));
+        assert!(registry
+            .canonicalize("bash", json!({"command":"git diff --stat"}))
+            .is_ok());
+        assert!(registry
+            .canonicalize("bash", json!({"command":42}))
+            .is_err());
+        assert!(registry
+            .canonicalize(
+                "bash",
+                json!({"command":"git status", "terminal":{"stdin":42}})
+            )
+            .is_err());
     }
 
     #[test]
@@ -1840,8 +2084,7 @@ mod tests {
                 "hostedTools": [{
                     "type": "webSearch",
                     "providerToolType": "some_other_tool"
-                }],
-                "requireToolCall": false
+                }]
             })),
         )
         .expect_err("invalid hosted tool must fail");
@@ -1887,12 +2130,12 @@ mod tests {
         kimi.model = "kimi-k3".into();
         kimi.reasoning_effort = Some("max".into());
         kimi.thinking = Some("enabled".into());
-        let body = openai_compatible_request_body(&kimi, &[], &tools, true, true);
+        let body = openai_compatible_request_body(&kimi, &[], &tools, true);
         assert!(body.get("thinking").is_none());
         assert_eq!(body["reasoning_effort"], "max");
-        assert_eq!(body["tool_choice"], "required");
+        assert!(body.get("tool_choice").is_none());
         kimi.model = "kimi-k2.7-code".into();
-        let body = openai_compatible_request_body(&kimi, &[], &tools, true, true);
+        let body = openai_compatible_request_body(&kimi, &[], &tools, true);
         assert_eq!(body["thinking"], json!({"type":"enabled", "keep":"all"}));
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("tool_choice").is_none());
@@ -1900,7 +2143,7 @@ mod tests {
         deepseek.provider_flavor = Some("deepseek".into());
         deepseek.thinking = Some("enabled".into());
         deepseek.reasoning_effort = Some("high".into());
-        let body = anthropic_stream_request_body(&deepseek, &[], &[], false).unwrap();
+        let body = anthropic_stream_request_body(&deepseek, &[], &[]).unwrap();
         assert_eq!(body["thinking"], json!({"type":"enabled"}));
         assert_eq!(body["output_config"], json!({"effort":"high"}));
         let glm = openai_compatible_message(
@@ -1929,7 +2172,6 @@ mod tests {
                 &[],
                 &[],
                 true,
-                false,
             )
             .unwrap();
             assert_eq!(body["input"][0]["arguments"], raw);
@@ -1937,7 +2179,6 @@ mod tests {
                 &test_profile("anthropic"),
                 &[serde_json::from_value(message(json!(raw))).unwrap()],
                 &[],
-                false,
             );
             if raw == r#"{"path":"a.txt"}"# {
                 assert_eq!(
@@ -2023,11 +2264,14 @@ mod tests {
                 None,
                 profile,
                 provider_input(json!({
-                    "messages":[{"role":"user","content":"归档检查"}], "tools":[], "hostedTools":[], "requireToolCall":false,
+                    "messages":[{"role":"user","content":"归档检查"}], "tools":[], "hostedTools":[],
                 })),
                 "request:archive".into(),
                 directory.clone(),
                 json!({"sessionId":"session:archive","runId":"run:archive","requestId":"request:archive"}),
+                Arc::new(
+                    crate::model_usage::UsageStore::open(&directory.join("usage.sqlite3")).unwrap(),
+                ),
             );
             let delivered = axum::body::to_bytes(response.into_body(), 1024 * 1024)
                 .await
@@ -2077,12 +2321,103 @@ mod tests {
         }
     }
 
+    #[test]
+    fn codex_subscription_uses_its_own_wire_shape_and_shared_responses_parser() {
+        let mut profile = test_profile("responses");
+        profile.connection.adapter_id = "openai-codex".into();
+        profile.connection.base_url = "https://chatgpt.com/backend-api/codex".into();
+        let input = provider_input(
+            json!({"messages":[{"role":"system","content":"Use the project instructions."},{"role":"user","content":"Explain the module."}],"tools":[],"hostedTools":[]}),
+        );
+        let prepared = prepare_provider_request(&profile, &input).unwrap();
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(body["store"], false);
+        assert_eq!(body["instructions"], "Use the project instructions.");
+        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            provider_request_url(&profile, prepared.kind),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(prepared.kind, ProviderStreamKind::Responses);
+    }
+
+    #[test]
+    fn tool_observations_send_real_image_parts_in_the_call_output() {
+        let mut message: LocalProviderMessage = serde_json::from_value(json!({"role":"tool","content":"observed","toolCallId":"call:observe","providerCallId":"provider-observe"})).unwrap();
+        message
+            .image_data
+            .push(crate::local_agent_api::LocalProviderImage {
+                media_type: "image/png".into(),
+                base64: "aW1hZ2U=".into(),
+            });
+        let messages = vec![message];
+        let profile = test_profile("responses");
+        let result = responses_request_body(&profile, &messages, &[], &[], false).unwrap();
+        assert_eq!(result["input"][0]["type"], "function_call_output");
+        assert_eq!(result["input"][0]["call_id"], "provider-observe");
+        assert_eq!(result["input"][0]["output"][0]["text"], "observed");
+        assert_eq!(
+            result["input"][0]["output"][1]["image_url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+        let result = anthropic_stream_request_body(&profile, &messages, &[]).unwrap();
+        assert_eq!(result["messages"][0]["content"][0]["type"], "tool_result");
+        assert_eq!(
+            result["messages"][0]["content"][0]["content"][1]["source"]["data"],
+            "aW1hZ2U="
+        );
+    }
+
+    #[test]
+    fn image_inputs_keep_bytes_and_text_across_provider_surfaces() {
+        let mut message: LocalProviderMessage =
+            serde_json::from_value(json!({"role":"user","content":"Read this image."})).unwrap();
+        message
+            .image_data
+            .push(crate::local_agent_api::LocalProviderImage {
+                media_type: "image/png".into(),
+                base64: "aW1hZ2U=".into(),
+            });
+        let messages = vec![message];
+        let profile = test_profile("responses");
+        let responses = responses_request_body(&profile, &messages, &[], &[], true).unwrap();
+        assert_eq!(
+            responses["input"][0]["content"][1]["image_url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+        let chat = openai_compatible_request_body(&profile, &messages, &[], true);
+        assert_eq!(
+            chat["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+        let anthropic = anthropic_stream_request_body(&profile, &messages, &[]).unwrap();
+        assert_eq!(
+            anthropic["messages"][0]["content"][1]["source"]["data"],
+            "aW1hZ2U="
+        );
+        let ollama = ollama_stream_request_body(&profile, &messages, &[]);
+        assert_eq!(ollama["messages"][0]["images"][0], "aW1hZ2U=");
+        assert_eq!(ollama["messages"][0]["content"], "Read this image.");
+    }
+
     fn test_profile(kind: &str) -> ResolvedLlmProfile {
         ResolvedLlmProfile {
+            connection: crate::model_connections::ModelConnection {
+                id: "connection:test".into(),
+                name: "Test".into(),
+                adapter_id: "openai".into(),
+                billing_mode: "metered".into(),
+                base_url: "https://api.openai.com/v1".into(),
+                credential_kind: "apiKey".into(),
+                credential_ref: None,
+            },
+            account_id: None,
             kind: kind.to_string(),
             provider_flavor: None,
             base_url: None,
             model: "fixture-model".to_string(),
+            image_input: true,
             context_window_tokens: Some(4_096),
             max_output_tokens: Some(512),
             temperature: None,

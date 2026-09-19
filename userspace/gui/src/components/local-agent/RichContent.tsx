@@ -2,7 +2,7 @@ import { t } from '../../i18n';
 import { useUiLanguage } from '../../useUiLanguage';
 import { useConversationHost } from './ConversationHost';
 import { highlightCode, type CodeSpan } from './codeLanguage';
-import React, { memo, useEffect, useId, useState } from 'react';
+import { memo, useEffect, useId, useState } from 'react';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 

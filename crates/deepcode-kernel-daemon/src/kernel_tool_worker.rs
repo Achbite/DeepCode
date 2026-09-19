@@ -34,7 +34,10 @@ pub(crate) fn run() -> Result<(), String> {
             if tool_id != "bash" && !tool_id.starts_with("fs.") {
                 return Err("WSL worker accepts workspace filesystem and Bash tools only.".into());
             }
-            invocation.input.validate().map_err(|error| error.to_string())?;
+            invocation
+                .input
+                .validate()
+                .map_err(|error| error.to_string())?;
             let cancellation = context.cancellation.clone();
             context.progress = KernelProgressSink::new(|progress| {
                 let _ = write_frame(&WorkerFrame::Progress { progress });

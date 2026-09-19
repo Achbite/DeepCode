@@ -1,10 +1,10 @@
 # Display plugins and UI updates
 
-DeepCode UI plugins customize presentation. Their lifecycle borrows two ideas from DeepSeek Harness: named slots with real consumers, and an owning scope that releases registrations, styles and effects when a plugin is replaced. DeepCode does not embed Cordis or its dynamic Host execution system. The Session loop, Provider, tool catalog, permissions and journal retain their existing owners.
+DeepCode UI plugins customize messages, document readers, themes and supported settings panels. Replacing a plugin releases its registrations, styles and effects. Plugins receive the published display inputs; they do not control conversation execution or permissions.
 
 ## Use a plugin
 
-In **Settings → Plugins → Add**, choose a local folder or manifest file containing `deepcode-ui.json`. The sample [`ui-plugins/reading-style`](../../ui-plugins/reading-style) can be used directly. Add the folder through the normal file picker, or enter its absolute path. Only add JavaScript you intend to run in the application window.
+In **Settings → Plugins → Add**, choose a local folder or manifest file containing `deepcode-ui.json`. Add the folder through the normal file picker, or enter its absolute path. Only add JavaScript you intend to run in the application window.
 
 The Host checks the selected files while the window is connected and publishes changed contents. Saving the entry bundle or manifest replaces that plugin in the open window; no UI reload, Rust build, daemon restart or new conversation is required. **Refresh list** reconnects the source watch; **Reload** in one plugin’s details reloads only that module. Disabling or removing a plugin releases its resources and restores the built-in renderer for its slots.
 
@@ -30,8 +30,14 @@ Supported slots:
 | `message.plain`, `message.markdown` | Committed message text, format, locale and theme. Session still owns the text and message status. |
 | `document.html`, `document.markdown`, `document.pdf` | The actual document Blob, filename, format, locale and theme. Host retains the dialog and download operation. |
 | `theme` | CSS registered through `context.addStyle`. It is removed when the module unloads. |
+| `settings.models.overview` | Public connection and adapter catalog. Multiple contributions appear in configured order. |
+| `settings.connection.detail` | The current redacted connection; optional `adapterId` scopes the contribution. |
+| `settings.usage.panel` | Current query and usage report, including Session attribution. |
+| `tool.result` | Original activity projection, selected by the manifest's required `toolId` (tool operation). Tool status and failures remain outside this renderer. |
 
-One selected plugin may own each slot, including the theme. Conflicting selections report an error; there is no implicit priority chain. Only the named presentation regions are replaceable; the app root, composer, permission controls and core services are not plugin slots.
+One selected plugin may own each replacement slot, including the theme; `tool.result` ownership is per operation. Settings contributions compose in configured order. Conflicting replacements report an error; there is no implicit priority chain. Only the named presentation regions are replaceable; the app root, composer, permission controls and core services are not plugin slots.
+
+Settings manifests can declare `capabilities: ["usage.read"]` to receive `scope.usage.query(query, signal)`. Usage panels render the supplied usage report and retain its query interval and Session attribution. `connection.auth` provides login, cancellation, logout and quota operations only in `settings.connection.detail`, bound to that connection. Tokens and keys never enter these inputs. A view can read or cancel only the auth flows it started; disposal cancels pending flows. Message/document renderers retain their display-only boundary.
 
 ```js
 export default {
@@ -54,46 +60,30 @@ export default {
 - `addStyle(css)`: append an owned stylesheet that is removed automatically.
 - `reportError(error)`: report asynchronous failures for this plugin; the error is displayed and its active presentation is released.
 
-The current TypeScript declaration is [types.ts](../../userspace/gui/src/ui-plugins/types.ts). UI generations are local loading identities, never substitutes for tool generations or version-equality gates. Reloading the plugin replaces its own DOM and effects; conversation state, drafts and scroll containers remain owned by the shell. Plugin-owned internal view state can reset on replacement.
+Reloading the plugin replaces its own DOM and effects; conversation state, drafts and scroll containers remain owned by the shell. Plugin-owned internal view state can reset on replacement.
 
-## Whole UI and package builds
+## Application updates
 
-```sh
-make ui
-make ui-update UI_PACKAGE=/absolute/path/to/package
-```
-
-`make ui` compiles shared TypeScript and one GUI in Docker, writing `bin/ui/web-deepcode-gui`. `ui-update` stages the complete GUI directory and replaces the package's single Web directory. Native executables, Session resources and user configuration are retained. Close and reopen the window after updating the whole UI. Plugin hot replacement keeps the window and draft intact.
-
-The native shells read Web resources through their filesystem protocols. Their Tauri configuration therefore has an empty embedded asset list; UI files are not copied into a second `shells/*/dist` tree or duplicated inside the executable. A normal platform package still invokes Cargo on current source and uses Cargo's dependency cache. No timestamp marker is used to skip source changes.
-
-macOS packages place Web files in `Contents/Resources`. The local updater refreshes the outer app signature after replacing these resources, using the platform signing tools. Run it on macOS; Windows and Linux use the flat package Web directories.
-
-New Host endpoints require a package containing this implementation once. Later display plugin edits and compatible whole-UI edits use these fast paths. Kernel, Session or native feature changes still use normal platform packaging.
+Close and reopen DeepCode after installing an application update. Editing an enabled UI plugin updates that plugin in the current window and keeps the conversation draft intact. Native application or backend changes require a program update.
 
 ## Component preview and source template
 
 Each display plugin’s details in Settings → Plugins includes a component preview using the actual message and HTML Reader components. The content is labeled as examples. It shows the currently loaded plugin generations and uses the same mount/update/dispose path as a conversation.
 
-Copy `ui-plugins/template` to a new plugin directory, edit its manifest and `src/index.ts`, then build inside Docker:
-
-```sh
-make ui-plugin UI_PLUGIN=ui-plugins/template
-make ui-plugin-watch UI_PLUGIN=ui-plugins/template
-make ui
-make ui-update UI_PACKAGE=/absolute/path/to/package
-```
-
-Plugin builds produce `dist/index.js`; source watching rebuilds that module, while the existing Host watcher loads the finished module. Reader selection, scroll position, PDF page and zoom are owned by the shell and retained in the window session storage. Closing the window ends this view state. Native bridge changes still require packaging and restarting the Host.
+A plugin folder contains its manifest and declared standalone JavaScript module. TypeScript sources must be compiled to that module; the Host watches the finished module and manifest. Reader selection, scroll position, PDF page and zoom stay with the open window.
 
 ## Tool contributions and CLI preference
 
 The same management list includes tool and guidance sources. Existing owners remain separate: `plugins.sources` owns local CLI bundles, `plugins.disabled` records disabled built-in tools, `mcp.servers` owns external protocol servers, `skills.mounts` owns task guidance, and `workbench.uiPlugins` owns display modules. Inventory reads these sources and the display runtime; it is not another activation database.
 
-Tools prefer CLI. A mature MCP adapter remains suitable when CLI would be substantially more complex. Built-in GitHub, PDF and arXiv tools now invoke `deepcode-first-party-provider --plugin <name> --call` directly: one JSON input and one result, no MCP initialization or persistent server. The legacy optional server entry remains available for explicit external use.
+Local CLI bundles, MCP servers and text Skills can contribute capabilities. Registration, activation and execution permissions are separate: adding a source does not authorize its tools to access files or run commands.
 
-[CLI template](../../examples/plugins/cli-text/README.md) demonstrates a local `deepcode-tool.json` and a single-file entry. The Host reads metadata before adding; it does not run the entry during inspection. Registration and enabling do not expose tools until the user selects them. The Session checks selected implementations at the next request boundary, refreshing definitions, prompt contributions, aliases and bindings together. Disabled sources withdraw from that next request; prior requests and approvals retain their captured implementation. Kernel still authorizes and records execution. Changing the interpreter, native binary or Host requires the corresponding process/package update; the local source watcher does not reload Host services.
+A local CLI plugin uses a `deepcode-tool.json` manifest and its declared executable entry. The Host reads metadata before adding; it does not run the entry during inspection. See [plugin activation and update timing](operations.md#models-and-context) for user mentions, Agent activation and the distinction between source updates and saved configuration changes. Changing an interpreter, native binary or Host requires the corresponding process/package update.
 
 ## Preview surfaces
 
 One conversation-header button, after the run status, toggles the reader. Tabs retain loaded documents and native page instances while collapsed. The separator adjusts width; the upper-right expand/restore control fills the workspace and returns to split mode. Closing a tab closes that page; collapsing only hides it. Task and Session output cards keep their existing appearance. Artifact references use readable names while the reader exposes full locations on demand. Fixed artifacts read archived bytes, including historical screenshots.
+
+The native browser's **Annotate / 批注** button sits immediately to the right of Refresh. Select a DOM element or draw a region, enter a comment and add it to the ordinary conversation draft. Page URL, selector, viewport and selected text are quoted as page evidence, separately from the comment. macOS also attaches the marked viewport capture using the existing image attachment path; other platforms retain region metadata because native capture is currently macOS-only. Frames are selectable as a box; use region selection for details inside a frame. Escape cancels selection, and closing, navigating, resizing or switching away ends annotation. Nothing is automatically submitted to the model.
+
+Dragging the reader separator suppresses text selection only for the drag lifetime. Pointer release, cancellation, loss of capture, window blur and unmount restore normal selection and copying.

@@ -1,4 +1,3 @@
-import React from 'react';
 import type { UiLanguage } from '../../../i18n';
 import { useSettingsStore } from '../../../state/settingsStore';
 

@@ -58,8 +58,7 @@ test('Plan response admission requires its matching decision and Todo in one bat
   const reply = { schemaVersion: COMMAND_REPLY_VERSION, commandId: input.commandId, sessionId, status: 'accepted' };
   const confirmed = event('plan.confirmed', { commandId: input.commandId, planId: 'plan:one', revision: 1,
     decisionId: 'decision:one', authorities: [] }, { callId: 'call:plan' });
-  const todos = event('todo.seeded', { sourcePlanId: 'plan:one', sourcePlanRevision: 1,
-    items: [{ todoId: 'todo:one', sourceStepId: 'step:one', label: 'Inspect', status: 'pending' }] });
+  const todos = event('todo.updated', { revision: 1, items: [{ text: 'Inspect', status: 'pending' }] });
   assert.throws(() => admitSessionEvents(current, [], { input, reply }), /plan_command_event_batch_invalid/);
   assert.throws(() => admitSessionEvents(current, [confirmed], { input, reply }), /plan_command_event_batch_invalid/);
   assert.doesNotThrow(() => admitSessionEvents(current, [confirmed, todos], { input, reply }));
@@ -91,4 +90,15 @@ test('reading an inactive history does not open a runtime or append recovery eve
   assert.deepEqual(await journal.readCommand(sessionId, 'command:read'), null);
   assert.deepEqual(await readEvents(journal, sessionId), before);
   assert.deepEqual(await service.activity(), { active: false });
+});
+
+test('Todo reports require a current Provider run and an atomic Session revision', async () => {
+  const { current } = await snapshot(started, composition);
+  const update = event('todo.updated', { revision: 1, providerCallId: 'provider:todo',
+    items: [{ text: 'Inspect', status: 'inProgress' }] }, { callId: 'call:todo' });
+  assert.doesNotThrow(() => admitSessionEvents(current, [update]));
+  assert.throws(() => admitSessionEvents(current, [{ ...update, runId: 'run:previous' }]), /session_event_run_not_active/);
+  assert.throws(() => admitSessionEvents(current, [{ ...update, payload: { ...update.payload, revision: 2 } }]), /todo_revision_invalid/);
+  assert.throws(() => admitSessionEvents(current, [settled(), finishing, update]), /todo_run_not_active|provider_turn_composition_missing/);
+  assert.equal(current.state.todoList, null);
 });

@@ -11,7 +11,6 @@ import type {
   FilesystemReference,
   PluginCatalogProjection,
   SessionProjection,
-  SkillSettingsItem,
 } from '@deepcode/protocol';
 import {
   COMMAND_REPLY_VERSION,
@@ -110,17 +109,6 @@ export async function getPluginCatalog(
     `${API_BASE}/conversation/plugins`,
     { signal },
   ));
-}
-
-export async function getSkillSettings(signal?: AbortSignal): Promise<SkillSettingsItem[]> {
-  const value = await request<unknown>(`${API_BASE}/conversation/plugins/skills`, { signal });
-  if (!isExactRecord(value, ['skills']) || !Array.isArray(value.skills)
-    || !value.skills.every((item) => isExactRecord(item, ['id', 'displayName', 'description', 'source'])
-      && isNonEmptyText(item.id) && isNonEmptyText(item.displayName)
-      && isNonEmptyText(item.description) && ['builtin', 'mounted'].includes(String(item.source)))) {
-    throw new Error('skill_settings_invalid');
-  }
-  return value.skills as SkillSettingsItem[];
 }
 
 export async function getConversationCatalogManagement(
@@ -466,10 +454,6 @@ function decodeProjection(value: unknown): SessionProjection {
   const plans = value.plans as Array<{planId: string; revision: number}>;
   const activePlanRef = value.activePlanRef as {planId: string; revision: number} | null;
   const pendingPlan = value.pendingPlan as {planId: string; revision: number} | null;
-  const todoList = value.todoList as {
-    sourcePlanId: string;
-    sourcePlanRevision: number;
-  } | null;
   const timeline = value.timeline as Array<Record<string, unknown>>;
   const projectionRevision = value.revision as number;
   const messages = value.messages as Array<Record<string, unknown>>;
@@ -482,11 +466,6 @@ function decodeProjection(value: unknown): SessionProjection {
       && !planKeys.includes(planReferenceKey(activePlanRef)))
     || (pendingPlan !== null
       && !planKeys.includes(planReferenceKey(pendingPlan)))
-    || (todoList !== null
-      && !planKeys.includes(planReferenceKey({
-        planId: todoList.sourcePlanId,
-        revision: todoList.sourcePlanRevision,
-      })))
     || timeline.some((item) => (item.sequence as number) > projectionRevision)
     || !timelineReferencesAreValid(timeline, messages, narratives, plans, activities)
   ) {
@@ -694,7 +673,7 @@ function decodePluginCatalog(value: unknown): PluginCatalogProjection {
       || new Set(plugin.activationMediaTypes).size !== plugin.activationMediaTypes.length
       || !['builtin', 'mounted'].includes(String(plugin.source))
       || !['functional', 'reference'].includes(String(plugin.category))
-      || !['skill', 'mcp', 'cli'].includes(String(plugin.contributionKind))
+      || !['skill', 'mcp', 'cli', 'host'].includes(String(plugin.contributionKind))
       || !['default', 'searchOnly'].includes(String(plugin.discovery))
       || (plugin.management !== undefined && (!isRecord(plugin.management) || !['plugins.disabled','plugins.sources','mcp.servers','skills.mounts'].includes(String(plugin.management.key)) || !isNonEmptyText(plugin.management.id)))
       || typeof plugin.enabled !== 'boolean'
@@ -928,7 +907,6 @@ const PLAN_STATUSES = [
   'confirmed',
   'superseded',
   'cancelled',
-  'completed',
   'invalidated',
 ] as const;
 
@@ -998,17 +976,13 @@ function isPlanOperation(value: unknown): boolean {
   if ((value.operation === 'bash' || value.operation === 'powershell')) {
     return isExactRecord(
       value,
-      ['workspaceId', 'operation', 'workspaceMode', 'executionScope'],
-      ['command', 'terminal', 'writablePaths'],
+      ['workspaceId', 'operation', 'writablePaths'],
+      ['command', 'terminal'],
     )
       && (value.command === undefined || isNonEmptyText(value.command))
-      && value.workspaceMode === 'write'
-      && (value.executionScope === 'workspace' || value.executionScope === 'host')
-      // Read stored Plan facts as declared. Required execution scope is enforced
-      // at Plan admission and execution, not while displaying historical plans.
-      && (value.writablePaths === undefined || isArrayOf(value.writablePaths, (entry) => (
+      && isArrayOf(value.writablePaths, (entry) => (
         isExactRecord(entry, ['path', 'kind']) && isNonEmptyText(entry.path) && ['file', 'directory'].includes(String(entry.kind))
-      )) && value.writablePaths.length > 0)
+      )) && value.writablePaths.length > 0
       && (value.terminal === undefined || (
         isExactRecord(value.terminal, ['stdin'])
         && typeof value.terminal.stdin === 'string'
@@ -1037,29 +1011,19 @@ function planReferenceKey(value: { planId: string; revision: number }): string {
 }
 
 function isTodoList(value: unknown): boolean {
-  if (
-    !isExactRecord(value, [
-      'sourcePlanId',
-      'sourcePlanRevision',
-      'items',
-      'sequence',
-      'updatedAt',
-    ])
-    || !isIdentifier(value.sourcePlanId)
-    || !isPositiveNaturalNumber(value.sourcePlanRevision)
-    || !isNaturalNumber(value.sequence)
-    || !isNonEmptyText(value.updatedAt)
-    || !isArrayOf(value.items, isTodoItem)
-  ) return false;
-  return new Set(value.items.map((item) => item.todoId)).size === value.items.length;
+  return isExactRecord(value, ['runId', 'revision', 'items', 'sequence', 'updatedAt'])
+    && isIdentifier(value.runId)
+    && isPositiveNaturalNumber(value.revision)
+    && isPositiveNaturalNumber(value.sequence)
+    && isNonEmptyText(value.updatedAt)
+    && isArrayOf(value.items, isTodoItem);
 }
 
-function isTodoItem(value: unknown): value is Record<string, unknown> & { todoId: string } {
-  return isExactRecord(value, ['todoId', 'sourceStepId', 'label', 'status'])
-    && isIdentifier(value.todoId)
-    && isIdentifier(value.sourceStepId)
-    && isNonEmptyText(value.label)
-    && ['pending', 'inProgress', 'completed'].includes(String(value.status));
+function isTodoItem(value: unknown): boolean {
+  return isExactRecord(value, ['text', 'status'])
+    && isNonEmptyText(value.text)
+    && typeof value.status === 'string'
+    && ['pending', 'inProgress', 'completed', 'blocked'].includes(value.status);
 }
 
 function isContextUsage(value: unknown): boolean {
@@ -1115,7 +1079,7 @@ function isContextComposition(value: unknown): boolean {
     && (value.kernelCatalogSnapshotRef === undefined || isIdentifier(value.kernelCatalogSnapshotRef))
     && isIdentifier(value.providerRequestId)
     && ['agent', 'contextCompaction'].includes(String(value.purpose))
-    && ['normal', 'toolRequired', 'answerOnly'].includes(String(value.responseConstraint))
+    && ['normal', 'answerOnly'].includes(String(value.responseConstraint))
     && isNaturalNumber(value.dynamicInstructionBytes)
     && isIdentifier(value.runId)
     && isNaturalNumber(value.sequence)

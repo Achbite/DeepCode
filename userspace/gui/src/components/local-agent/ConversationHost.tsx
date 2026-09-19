@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { readConversation, readConversationResource, readConversationImage, readConversationDocument, readFileChange, resolveConversationResource, readConversationArtifact } from '../../services/localAgentApi';
 import { openExternalUrl } from '../../services/runtimeAdapter';
 import type { SourcePosition } from './resourceLinks';
@@ -17,7 +17,6 @@ export interface ConversationHost {
   resolveResource: typeof resolveConversationResource;
   openFile?(path: string, position?: SourcePosition): Promise<void>;
   locatePath?(path: string): Promise<void>;
-  openDiff?(sessionId: string, recordId: string, index: number): Promise<void>;
 }
 
 const defaultHost: ConversationHost = {
@@ -59,9 +58,7 @@ const defaultHost: ConversationHost = {
     return { url, release: () => URL.revokeObjectURL(url) };
   },
 };
-const HostContext = createContext<ConversationHost>(defaultHost);
-export const ConversationHostProvider = HostContext.Provider;
-export const useConversationHost = () => useContext(HostContext);
+export const useConversationHost = () => defaultHost;
 
 export function useConversationTheme(): 'vs' | 'vs-dark' {
   const read = () => document.documentElement.dataset.theme === 'dark' ? 'vs-dark' as const : 'vs' as const;

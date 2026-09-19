@@ -33,7 +33,8 @@ import {
   LOCAL_AGENT_PROTOCOL_VERSION,
   SESSION_CONTROL_INTERACTION_REQUEST,
   SESSION_CONTROL_PLAN_PUBLISH,
-  SESSION_CONTROL_PLAN_PROGRESS,
+  SESSION_CONTROL_TODO_UPDATE,
+  SESSION_CONTROL_PLUGIN_ACTIVATE,
 } from '@deepcode/protocol';
 import { createProviderToolAliases } from './providerToolCodec.js';
 import { LoopFailure, errorFact } from './loopFailure.js';
@@ -60,11 +61,22 @@ class LocalAgentHttpPort {
   readonly apiBase: string;
   readonly serviceToken: string;
   readonly fetchImpl: typeof fetch;
+  readonly #streamFetch?: typeof fetch;
 
   constructor(options: HttpPortOptions) {
     this.apiBase = options.apiBase.replace(/\/+$/u, '');
     this.serviceToken = options.serviceToken;
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.#streamFetch = options.fetchImpl;
+  }
+
+  protected postStream(path: string, value: unknown, signal: AbortSignal): Promise<Response> {
+    const url = `${this.apiBase}${path}`;
+    const headers = { 'x-deepcode-session-service-token': this.serviceToken, 'content-type': 'application/json' };
+    const body = JSON.stringify(value);
+    return this.#streamFetch
+      ? this.#streamFetch(url, { method: 'POST', headers, body, signal })
+      : postLocalStream(url, headers, body, signal);
   }
 
   async json<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -167,21 +179,9 @@ export class HttpCommandJournal extends LocalAgentHttpPort implements CommandJou
 }
 
 export class HttpKernelPort extends LocalAgentHttpPort implements KernelPort {
-  readonly #streamFetch?: typeof fetch;
-
-  constructor(options: HttpPortOptions) {
-    super(options);
-    this.#streamFetch = options.fetchImpl;
-  }
-
   async execute(request: ToolExecutionRequest, onProgress?: (progress: ToolExecutionProgress) => Promise<void>): Promise<ToolExecutionReply> {
-    const url = `${this.apiBase}/api/local-agent/kernel/execute`;
-    const headers = { 'x-deepcode-session-service-token': this.serviceToken, 'content-type': 'application/json' };
-    const body = JSON.stringify(request);
     const controller = new AbortController();
-    const response = this.#streamFetch
-      ? await this.#streamFetch(url, { method: 'POST', headers, body, signal: controller.signal })
-      : await postLocalStream(url, headers, body, controller.signal);
+    const response = await this.postStream('/api/local-agent/kernel/execute', request, controller.signal);
     if (!response.ok || !response.headers.get('content-type')?.includes('application/x-ndjson')) {
       const envelope = await response.json() as { error?: string; message?: string };
       throw new Error(`${envelope.error ?? 'kernel_execution_http_failed'}:${envelope.message ?? response.status}`);
@@ -301,27 +301,12 @@ function decodePreparedToolDescriptors(value: unknown): readonly PreparedToolDes
 }
 
 export class HttpProviderPort extends LocalAgentHttpPort implements ProviderPort {
-  readonly #streamFetch?: typeof fetch;
-
-  constructor(options: HttpPortOptions) {
-    super(options);
-    this.#streamFetch = options.fetchImpl;
-  }
-
   async *stream(
     request: ProviderRequest,
     signal: AbortSignal,
   ): AsyncIterable<ProviderEvent> {
-    const url = `${this.apiBase}/api/local-agent/provider/stream`;
-    const headers = {
-      'content-type': 'application/json',
-      'x-deepcode-session-service-token': this.serviceToken,
-    };
     try {
-      const body = JSON.stringify(request);
-      const response = this.#streamFetch
-        ? await this.#streamFetch(url, { method: 'POST', headers, body, signal })
-        : await postLocalStream(url, headers, body, signal);
+      const response = await this.postStream('/api/local-agent/provider/stream', request, signal);
       if (!response.ok || !response.body) {
         await response.body?.cancel();
         throw new Error(`provider_http_failed:${response.status}`);
@@ -332,7 +317,8 @@ export class HttpProviderPort extends LocalAgentHttpPort implements ProviderPort
       }
       yield* decodeProviderEvents(response.body, request.requestId, signal, request.providerAttemptId);
     } catch (error) {
-      if (signal.aborted) throw signal.reason ?? error;
+      if (signal.aborted && (error === signal.reason
+        || error instanceof Error && error.name === 'AbortError' && error.cause === signal.reason)) throw signal.reason;
       if (error instanceof LoopFailure) throw error;
       const fact = errorFact(error);
       if (error instanceof AggregateError && error.errors[0] instanceof LoopFailure) throw new LoopFailure(fact.code, fact.message, fact.diagnostics);
@@ -443,7 +429,8 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
           ], pluginConfig, {
             interactionRequest: wireName(SESSION_CONTROL_INTERACTION_REQUEST),
             planPublish: wireName(SESSION_CONTROL_PLAN_PUBLISH),
-            planProgress: wireName(SESSION_CONTROL_PLAN_PROGRESS),
+            todoUpdate: wireName(SESSION_CONTROL_TODO_UPDATE),
+            pluginActivate: wireName(SESSION_CONTROL_PLUGIN_ACTIVATE),
           })],
           tools,
           toolPromptContributions: toolPromptContributions as PreparedToolPromptContribution[],

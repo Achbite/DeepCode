@@ -1,4 +1,6 @@
-use deepcode_kernel_abi::{HostBrowseEntry, HostBrowseResult, HostBrowseEntryKind, KernelErrorEnvelope};
+use deepcode_kernel_abi::{
+    HostBrowseEntry, HostBrowseEntryKind, HostBrowseResult, KernelErrorEnvelope,
+};
 use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::fs;

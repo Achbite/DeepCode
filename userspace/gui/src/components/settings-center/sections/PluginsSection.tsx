@@ -2,7 +2,7 @@ import { localizePlugin } from '../../../pluginLocalization';
 import { useUiLanguage } from '../../../useUiLanguage';
 import { useSettingsSearchEntries } from '../settingsSearch';
 import ModalDialog from '../../shared/ModalDialog';
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { PluginCatalogItem } from '@deepcode/protocol';
 import { normalizeUiLanguage, t, activeT } from '../../../i18n';
 import { getPluginCatalog } from '../../../services/localAgentApi';

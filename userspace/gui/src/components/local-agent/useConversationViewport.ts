@@ -1,3 +1,4 @@
+import { registerInterfaceReloadView, restoredInterfaceView } from '../../services/interfaceReload';
 import type React from 'react';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { SessionProjection } from '@deepcode/protocol';
@@ -31,7 +32,7 @@ export function useConversationViewport({
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const activeViewRef = useRef<string | null>(sessionId);
-  const sessionViewportsRef = useRef(new Map<string, SessionViewport>());
+  const sessionViewportsRef = useRef(new Map<string, SessionViewport>(restoredInterfaceView<[string, SessionViewport][]>('conversationViewports', [])));
   const pendingViewportRestoreRef = useRef<string | null>(null);
   const followingLatestRef = useRef(true);
   // Every programmatic write records its actual, browser-clamped position.
@@ -47,6 +48,11 @@ export function useConversationViewport({
       .find((node) => node.getClientRects().length > 0 && node.getBoundingClientRect().bottom > top);
     return { scrollTop: body.scrollTop, ...(node ? { anchor: { key: node.dataset.conversationAnchor!, offset: node.getBoundingClientRect().top - top } } : {}) };
   }, []);
+  useEffect(() => registerInterfaceReloadView('conversationViewports', () => {
+    const id = activeViewRef.current;
+    if (id) sessionViewportsRef.current.set(id, { mode: followingLatestRef.current ? 'following' : 'detached', ...capturePosition() });
+    return [...sessionViewportsRef.current];
+  }), [capturePosition]);
   const writeScrollTop = useCallback((top: number) => {
     const body = bodyRef.current;
     if (!body) return;

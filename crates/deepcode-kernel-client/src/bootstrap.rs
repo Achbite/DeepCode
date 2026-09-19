@@ -115,20 +115,9 @@ impl KernelBootstrap {
             && std::env::var_os("DEEPCODE_PORT").is_none();
         let _shared_start_guard;
         let shared_connection = if implicit_endpoint {
-            let distribution = find_kernel_binary()?
-                .and_then(|path| path.parent().map(Path::to_path_buf))
-                .or_else(|| {
-                    std::env::current_exe()
-                        .ok()
-                        .and_then(|path| path.parent().map(Path::to_path_buf))
-                })
-                .ok_or_else(|| {
-                    KernelClientError::Bootstrap(
-                        "cannot resolve the Host distribution directory".into(),
-                    )
-                })?;
-            let root = deepcode_host_connection::config_root(&distribution)
+            let directories = deepcode_host_connection::UserDirectories::resolve()
                 .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?;
+            let root = directories.data_dir;
             _shared_start_guard = Some(
                 deepcode_host_connection::HostStartGuard::acquire(&root)
                     .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?,
@@ -567,8 +556,8 @@ fn find_kernel_binary() -> KernelClientResult<Option<PathBuf>> {
         )));
     }
 
-    let executable = std::env::current_exe()
-        .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?;
+    let executable =
+        std::env::current_exe().map_err(|error| KernelClientError::Bootstrap(error.to_string()))?;
     let directory = executable.parent().ok_or_else(|| {
         KernelClientError::Bootstrap("executable directory is unavailable".into())
     })?;
@@ -590,17 +579,20 @@ fn spawn_kernel_binary(
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    let (log_file, log_path) = open_kernel_log_file(&kernel_dir)?;
+    let directories = deepcode_host_connection::UserDirectories::resolve()
+        .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?;
+    let (log_file, log_path) = open_kernel_log_file(&directories.log_dir)?;
     let stderr = log_file.try_clone().map_err(|error| {
         KernelClientError::Bootstrap(format!("failed to clone kernel log handle: {error}"))
     })?;
     let mut command = Command::new(kernel_bin);
-    let config_root = deepcode_host_connection::config_root(&kernel_dir)
-        .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?;
+    directories.configure_child(&mut command);
     command
         .current_dir(&kernel_dir)
-        .env("DEEPCODE_CONFIG_DIR", config_root)
-        .env("DEEPCODE_RUNTIME_DIR", std::env::var_os("DEEPCODE_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| kernel_dir.clone()))
+        .env(
+            "DEEPCODE_RUNTIME_DIR",
+            deepcode_host_connection::runtime_root(&kernel_dir),
+        )
         .env("DEEPCODE_HOST", host)
         .env("DEEPCODE_PORT", port)
         .env(HOST_SHELL_TOKEN_ENV, host_shell_token)
@@ -742,7 +734,13 @@ fn acquire_kernel_start_lock(
     host: &str,
     port: &str,
 ) -> KernelClientResult<Option<KernelStartLock>> {
-    let path = std::env::temp_dir().join(format!(
+    let temporary = deepcode_host_connection::UserDirectories::resolve()
+        .and_then(|directories| {
+            std::fs::create_dir_all(&directories.temp_dir)?;
+            Ok(directories.temp_dir)
+        })
+        .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?;
+    let path = temporary.join(format!(
         "deepcode-kernel-start-{}-{}.lock",
         sanitize_lock_component(host),
         sanitize_lock_component(port)
@@ -792,25 +790,13 @@ fn sanitize_lock_component(value: &str) -> String {
         .collect()
 }
 
-fn open_kernel_log_file(kernel_dir: &Path) -> KernelClientResult<(File, PathBuf)> {
-    let log_dir = std::env::var_os("DEEPCODE_LOG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| kernel_dir.join("logs"));
-    match open_log_in_dir(&log_dir) {
-        Ok(file) => Ok(file),
-        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
-            open_log_in_dir(&std::env::temp_dir().join("deepcode")).map_err(|fallback_error| {
-                KernelClientError::Bootstrap(format!(
-                    "failed to open kernel log at {}: {error}; fallback failed: {fallback_error}",
-                    log_dir.display()
-                ))
-            })
-        }
-        Err(error) => Err(KernelClientError::Bootstrap(format!(
+fn open_kernel_log_file(log_dir: &Path) -> KernelClientResult<(File, PathBuf)> {
+    open_log_in_dir(log_dir).map_err(|error| {
+        KernelClientError::Bootstrap(format!(
             "failed to open kernel log at {}: {error}",
             log_dir.display()
-        ))),
-    }
+        ))
+    })
 }
 
 fn open_log_in_dir(log_dir: &Path) -> std::io::Result<(File, PathBuf)> {

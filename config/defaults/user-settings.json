@@ -5,6 +5,8 @@
   "agent.responseLanguage": "auto",
   "agent.permissions.engineeringDecisions": "ask",
   "agent.permissions.networkRead": "allow",
+  "agent.permissions.external": "ask",
+  "agent.permissions.commandDenylist": ["rm -rf /"],
   "agent.web.search.endpointTemplate": "",
   "agent.web.search.authHeaderName": "Authorization",
   "agent.web.search.authSecretRef": "",

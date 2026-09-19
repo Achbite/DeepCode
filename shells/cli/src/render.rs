@@ -433,9 +433,6 @@ fn render_plan_document(
             if let Some(target) = &operation.target {
                 write!(out, " {target}")?;
             }
-            if let Some(scope) = &operation.execution_scope {
-                write!(out, " · {scope}")?;
-            }
             if let Some(paths) = &operation.writable_paths {
                 for target in paths {
                     write!(
@@ -669,7 +666,7 @@ pub(crate) fn render_todo(out: &mut impl Write, projection: &SessionProjection) 
     let Some(todo) = projection.todo_list.as_ref() else {
         return Ok(());
     };
-    writeln!(out, "Todo")?;
+    writeln!(out, "任务")?;
     if todo.items.is_empty() {
         writeln!(out, "  （空）")?;
         return Ok(());
@@ -678,9 +675,20 @@ pub(crate) fn render_todo(out: &mut impl Write, projection: &SessionProjection) 
         let marker = match item.status.as_str() {
             "completed" => "[x]",
             "inProgress" => "[>]",
+            "blocked" => "[!]",
             _ => "[ ]",
         };
-        writeln!(out, "  {marker} {}", item.label)?;
+        writeln!(
+            out,
+            "  {marker} {} · {}",
+            item.text,
+            crate::i18n::Language::default().text(match item.status.as_str() {
+                "completed" => "deepcodeGui.tasks.status.completed",
+                "inProgress" => "deepcodeGui.tasks.status.inProgress",
+                "blocked" => "deepcodeGui.tasks.status.blocked",
+                _ => "deepcodeGui.tasks.status.pending",
+            })
+        )?;
     }
     Ok(())
 }
@@ -770,6 +778,27 @@ pub(crate) fn render_run_state(
 ) -> io::Result<()> {
     if let Some(run) = projection.run.as_ref() {
         writeln!(out, "run {}: {}", run.run_id, run.status)?;
+        if deepcode_kernel_client::is_terminal_run_status(&run.status) {
+            if let Some(todo) = projection
+                .todo_list
+                .as_ref()
+                .filter(|todo| todo.run_id == run.run_id)
+            {
+                let remaining = todo
+                    .items
+                    .iter()
+                    .filter(|item| item.status != "completed")
+                    .count();
+                if remaining > 0 {
+                    writeln!(
+                        out,
+                        "{}",
+                        crate::i18n::Language::default()
+                            .format("tui.todoEndedRemaining", &[remaining.to_string()])
+                    )?;
+                }
+            }
+        }
         render_usage(out, projection)?;
     }
     Ok(())

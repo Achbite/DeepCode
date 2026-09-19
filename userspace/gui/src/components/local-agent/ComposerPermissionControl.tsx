@@ -9,6 +9,7 @@ export function ComposerPermissionControl({ language, composer }: { language: Ui
   const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
   const runtimeEffectiveSettings = useSettingsStore((state) => state.runtimeEffectiveSettings);
   const patchUserSetting = useSettingsStore((state) => state.patchUserSetting);
+  const errorMessage = useSettingsStore((state) => state.errorMessage);
   const summary = t(language,
     runtimeEffectiveSettings['agent.permissions.workspaceMutation'] === 'allow'
       ? 'agent.permission.summary.allow' : 'agent.permission.summary.plan',
@@ -96,6 +97,7 @@ export function ComposerPermissionControl({ language, composer }: { language: Ui
             ],
             'ask',
           )}
+          {errorMessage && <div className="local-agent__error" role="alert">{errorMessage}</div>}
         </div>
       )}
     </div>

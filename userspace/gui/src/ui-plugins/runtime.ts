@@ -167,7 +167,9 @@ export class UiPluginRuntime {
           (other) =>
             other.path !== file.path &&
             other.enabled &&
-            other.manifest?.slots.some((slot) => file.manifest?.slots.includes(slot)),
+            other.manifest?.slots.some((slot) => file.manifest?.slots.includes(slot)
+              && !slot.startsWith('settings.')
+              && (slot !== 'tool.result' || other.manifest?.toolId === file.manifest?.toolId)),
         );
         const error = duplicate
           ? `Duplicate UI plugin id: ${file.manifest.id}`

@@ -1,10 +1,12 @@
-import React, { useId, useLayoutEffect } from 'react';
+import type { BrowserAnnotationDraft } from './browserReview';
+import React, { useId, useLayoutEffect, useRef } from 'react';
 import { t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import SessionModelSelector from './SessionModelSelector';
 import TotalCacheUsage from './TotalCacheUsage';
 import { ComposerDecisionPanels } from './ComposerDecisionPanels';
 import { ComposerPermissionControl } from './ComposerPermissionControl';
+import { useLocalAgentStore } from '../../state/localAgentStore';
 import type { AgentComposer } from './useAgentComposer';
 import { pastedTextTitle } from '../../services/pastedText';
 
@@ -13,6 +15,7 @@ interface ConversationComposerProps {
   language: UiLanguage;
   composer: AgentComposer;
   uiActionError: string | null;
+  onEditBrowserReview(review: BrowserAnnotationDraft): void;
 }
 
 export function ConversationComposer({
@@ -20,7 +23,9 @@ export function ConversationComposer({
   language,
   composer,
   uiActionError,
+  onEditBrowserReview,
 }: ConversationComposerProps) {
+  const connections = useLocalAgentStore(state => state.connections);
   const {
     pendingPlan,
     pendingInteraction,
@@ -72,10 +77,25 @@ export function ConversationComposer({
     showStopAction,
   } = composer;
   const pickerId = useId();
+  const annotations = composer.pastedTexts.filter(item => item.browserReview);
+  const attachmentRail = useRef<HTMLDivElement>(null);
+  const previousAttachments = useRef(new Set<string>());
   const inputMode = pendingApproval ? 'approval' : pendingPlan ? 'plan' : pendingInteraction ? 'interaction' : 'message';
   const compactInput = inputMode !== 'message';
   const currentRequest = projection?.contextCompositions.filter((item)=>item.runId===projection.run?.runId).at(-1);
   const readyPlugins = new Set(currentRequest?.tools.filter((tool)=>tool.availability==='callable').map((tool)=>tool.pluginUri));
+
+  useLayoutEffect(() => {
+    const rail = attachmentRail.current;
+    const items = [...(rail?.querySelectorAll<HTMLElement>('[data-attachment-id]') ?? [])];
+    const added = items.filter(item => !previousAttachments.current.has(item.dataset.attachmentId!));
+    previousAttachments.current = new Set(items.map(item => item.dataset.attachmentId!));
+    const latest = added.at(-1);
+    if (!rail || !latest) return;
+    const bounds = rail.getBoundingClientRect(), item = latest.getBoundingClientRect();
+    if (item.left < bounds.left) rail.scrollLeft -= bounds.left - item.left + 13;
+    else if (item.right > bounds.right) rail.scrollLeft += item.right - bounds.right + 13;
+  }, [composer.pastedTexts, pendingFilesystemPaths, pluginSelections]);
 
   useLayoutEffect(() => {
     if (textareaRef.current) resizeComposerTextarea(textareaRef.current);
@@ -222,19 +242,76 @@ export function ConversationComposer({
         {selectedProfileId && !profiles.some((profile) => profile.id === selectedProfileId && profile.enabled) && (
           <p className="local-agent__profile-notice" role="status">{t(language, 'agent.profile.boundUnavailable')}</p>
         )}
-        {composer.pastedTexts.map((paste, index) => (
-          <div className="local-agent__pasted-text" key={index}>
-            <div className="local-agent__pasted-text-header">
-              <DeepCodeShellIcon name="artifact" />
-              <span><strong>{pastedTextTitle(paste.text)}</strong><small>TXT · {(new TextEncoder().encode(paste.text).byteLength / 1024).toFixed(1)} KiB</small></span>
-              <button type="button" aria-label={t(language, 'agent.paste.remove')} onClick={() => composer.setPastedTexts((current) => current.filter((item) => item.inputId !== paste.inputId))}><DeepCodeShellIcon name="close" size={14} /></button>
-            </div>
-            <button type="button" className="local-agent__paste-toggle" aria-expanded={paste.expanded} onClick={() => composer.setPastedTexts((current) => current.map((item) => item.inputId === paste.inputId ? { ...item, expanded: !item.expanded } : item))}>
-              {t(language, paste.expanded ? 'agent.paste.collapse' : 'agent.paste.expand')}
-            </button>
-            {paste.expanded && <textarea aria-label={t(language, 'agent.paste.original')} value={paste.text} onChange={(event) => composer.editPastedText(paste.inputId, event.target.value)} rows={8} />}
+        {(composer.pastedTexts.length > 0 || pendingFilesystemPaths.length > 0 || pluginSelections.length > 0) && (
+          <div ref={attachmentRail} className="local-agent__draft-attachments" role="group" tabIndex={0}
+            aria-label={language === 'zh-CN' ? '消息附件，可左右滚动查看' : 'Message attachments, scroll horizontally to browse'}>
+            {composer.pastedTexts.map(paste => paste.browserReview ? (
+              <div className="local-agent__browser-annotation" key={paste.inputId} data-attachment-id={paste.inputId}>
+                <button type="button" className="local-agent__annotation-edit"
+                  title={`${paste.browserReview.annotation.title || paste.browserReview.annotation.url}\n\n${paste.browserReview.annotation.comment}`}
+                  onClick={() => onEditBrowserReview(paste.browserReview!)}>
+                  <DeepCodeShellIcon name="compose" />
+                  <span><strong>{language === 'zh-CN' ? '批注' : 'Annotation'} {annotations.indexOf(paste) + 1} · {paste.browserReview.annotation.title || paste.browserReview.annotation.url}</strong><small>{paste.browserReview.annotation.comment}</small></span>
+                </button>
+                <button type="button" aria-label={language === 'zh-CN' ? '移除批注' : 'Remove annotation'} onClick={() => composer.removeBrowserReview(paste.inputId)}><DeepCodeShellIcon name="close" size={14} /></button>
+              </div>
+            ) : (
+              <div className="local-agent__pasted-text" key={paste.inputId} data-attachment-id={paste.inputId}>
+                <div className="local-agent__pasted-text-header">
+                  <DeepCodeShellIcon name="artifact" />
+                  <span><strong>{pastedTextTitle(paste.text)}</strong><small>TXT · {(new TextEncoder().encode(paste.text).byteLength / 1024).toFixed(1)} KiB</small></span>
+                  <button type="button" aria-label={t(language, 'agent.paste.remove')} onClick={() => composer.setPastedTexts((current) => current.filter((item) => item.inputId !== paste.inputId))}><DeepCodeShellIcon name="close" size={14} /></button>
+                </div>
+                <button type="button" className="local-agent__paste-toggle" aria-expanded={paste.expanded} onClick={() => composer.setPastedTexts((current) => current.map((item) => item.inputId === paste.inputId ? { ...item, expanded: !item.expanded } : item))}>
+                  {t(language, paste.expanded ? 'agent.paste.collapse' : 'agent.paste.expand')}
+                </button>
+                {paste.expanded && <textarea aria-label={t(language, 'agent.paste.original')} value={paste.text} onChange={(event) => composer.editPastedText(paste.inputId, event.target.value)} rows={8} />}
+              </div>
+            ))}
+            {pluginSelections.map((selection) => (
+              <span className="local-agent__draft-plugin" key={selection.selectionId} data-attachment-id={selection.selectionId}>
+                <DeepCodeShellIcon name="extension" />
+                <span className="local-agent__attachment-name" title={selection.label}>@{selection.label}</span>
+                <button
+                  type="button"
+                  aria-label={t(language, 'agent.plugin.remove', { name: selection.label })}
+                  onClick={() => {
+                    setPluginSelections((current) => current.filter((item) => (
+                      item.selectionId !== selection.selectionId
+                    )));
+                    setDraft((current) => current.replace(`@${selection.label}`, '').trimStart());
+                  }}
+                ><DeepCodeShellIcon name="close" size={14} /></button>
+              </span>
+            ))}
+            {pendingFilesystemPaths.filter(reference => !composer.pastedTexts.some(paste => paste.browserReview?.screenshot === reference.path)).map((reference) => (
+              <span
+                className={reference.kind === 'directory'
+                  ? 'local-agent__draft-directory'
+                  : undefined}
+                key={`${reference.kind}:${reference.path}`}
+                data-attachment-id={`${reference.kind}:${reference.path}`}
+              >
+                <DeepCodeShellIcon name={reference.kind === 'directory'
+                  ? 'folder'
+                  : 'artifact'} />
+                <span className="local-agent__attachment-name" title={reference.path}>
+                  {reference.kind === 'directory' ? `${t(language, 'agent.attachment.folder')} · ` : ''}
+                  {filesystemPathDisplayName(reference.path)}
+                </span>
+                <button
+                  type="button"
+                  aria-label={t(language, 'agent.attachment.remove', {
+                    name: filesystemPathDisplayName(reference.path),
+                  })}
+                  onClick={() => setPendingFilesystemPaths((current) => current.filter((item) => (
+                    item.path !== reference.path || item.kind !== reference.kind
+                  )))}
+                ><DeepCodeShellIcon name="close" size={14} /></button>
+              </span>
+            ))}
           </div>
-        ))}
+        )}
         {composer.textDecision && <span className="local-agent__decision-input-mark" aria-hidden="true"><DeepCodeShellIcon name="compose" size={16} /></span>}
         <textarea
           ref={textareaRef}
@@ -258,51 +335,6 @@ export function ConversationComposer({
           onKeyDown={submitOnComposerEnter}
           onPaste={composer.pasteText}
         />
-        {(pendingFilesystemPaths.length > 0 || pluginSelections.length > 0) && (
-          <div className="local-agent__draft-attachments">
-            {pluginSelections.map((selection) => (
-              <span className="local-agent__draft-plugin" key={selection.selectionId}>
-                <DeepCodeShellIcon name="extension" />
-                @{selection.label}
-                <button
-                  type="button"
-                  aria-label={t(language, 'agent.plugin.remove', { name: selection.label })}
-                  onClick={() => {
-                    setPluginSelections((current) => current.filter((item) => (
-                      item.selectionId !== selection.selectionId
-                    )));
-                    setDraft((current) => current.replace(`@${selection.label}`, '').trimStart());
-                  }}
-                ><DeepCodeShellIcon name="close" size={14} /></button>
-              </span>
-            ))}
-            {pendingFilesystemPaths.map((reference) => (
-              <span
-                className={reference.kind === 'directory'
-                  ? 'local-agent__draft-directory'
-                  : undefined}
-                key={`${reference.kind}:${reference.path}`}
-              >
-                <DeepCodeShellIcon name={reference.kind === 'directory'
-                  ? 'folder'
-                  : 'artifact'} />
-                {reference.kind === 'directory'
-                  ? `${t(language, 'agent.attachment.folder')} · `
-                  : ''}
-                {filesystemPathDisplayName(reference.path)}
-                <button
-                  type="button"
-                  aria-label={t(language, 'agent.attachment.remove', {
-                    name: filesystemPathDisplayName(reference.path),
-                  })}
-                  onClick={() => setPendingFilesystemPaths((current) => current.filter((item) => (
-                    item.path !== reference.path || item.kind !== reference.kind
-                  )))}
-                ><DeepCodeShellIcon name="close" size={14} /></button>
-              </span>
-            ))}
-          </div>
-        )}
         <div className="local-agent__composer-footer">
           {!composer.textDecision && !composer.editingMessage && <div className="local-agent__composer-tools">
             <div ref={attachmentControlRef} className="local-agent__attachment-control">
@@ -366,8 +398,10 @@ export function ConversationComposer({
           </div>}
           <div className="local-agent__composer-actions">
             {!composer.textDecision && !composer.editingMessage && <SessionModelSelector
+              key={composer.conversationKey}
               language={language}
               profiles={profiles}
+              connections={connections}
               selectedProfileId={selectedProfileId}
               reasoningEffortOverride={reasoningEffortOverride}
               contextUsage={projection?.contextUsage ?? null}

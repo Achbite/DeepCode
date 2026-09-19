@@ -1,5 +1,5 @@
 import ModalDialog from '../shared/ModalDialog';
-import React, { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { t, type UiLanguage } from '../../i18n';
 import { pickNativePath, type NativePathOptions, type NativePathSelection } from '../../services/runtimeAdapter';
 import './workspaceOpenDialog.css';

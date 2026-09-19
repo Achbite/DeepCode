@@ -78,7 +78,7 @@
 
 .deepcode-local-agent-overlay {
   grid-column: 2;
-  grid-row: 1 / -1;
+  grid-row: 2;
   z-index: 20;
   display: flex;
   min-width: 0;
@@ -86,7 +86,6 @@
   background: var(--dc-surface);
 }
 
-.deepcode-gui-workbench--settings > .deepcode-gui-titlebar,
 .deepcode-gui-workbench--settings .deepcode-gui-main-surfaces > * { visibility: hidden; }
 
 @media (max-width: 1120px) {
@@ -105,3 +104,10 @@
   .deepcode-gui-workbench:not(.deepcode-gui-workbench--settings) .deepcode-gui-navigation-box { display: none; }
   .deepcode-gui-workbench.deepcode-gui-workbench--settings { --dc-sidebar-width: min(210px, 38vw); }
 }
+
+.deepcode-gui-session-header[hidden] { display: none; }
+.deepcode-gui-settings-header { display: flex; align-items: center; gap: 16px; padding: 0 16px; min-width: 0; }
+.deepcode-gui-settings-header > strong { font-size: calc(13px * var(--dc-ui-font-scale, 1)); font-weight: 600; }
+.deepcode-gui-settings-header > button { margin-left: auto; }
+.deepcode-gui-titlebar { position: relative; z-index: 21; }
+.deepcode-gui-workbench--settings > .deepcode-gui-titlebar::after { content: ''; position: absolute; top: 100%; left: 0; right: 0; height: 12px; pointer-events: none; background: linear-gradient(var(--dc-surface), transparent); }

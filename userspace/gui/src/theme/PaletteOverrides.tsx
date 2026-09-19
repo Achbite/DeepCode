@@ -1,4 +1,3 @@
-import React from 'react';
 import { useSettingsStore } from '../state/settingsStore';
 import { PALETTE_SETTING, paletteOverrideCss } from './palette';
 

@@ -29,6 +29,7 @@ def shared(root, destination, dependency_list):
     copy_js_package(root / 'userspace/session-core', destination / 'session-core')
     copy_js_package(root / 'userspace/protocol', destination / 'node_modules/@deepcode/protocol')
     shutil.copytree(root / 'userspace/gui/dist-deepcode-gui', destination / 'web-deepcode-gui')
+    shutil.copytree(root / 'docs', destination / 'docs')
     shutil.copy2(root / 'LICENSE', destination / 'LICENSE')
     dependencies = {}
 
@@ -80,10 +81,15 @@ def assemble(args):
     if args.platform.startswith('linux-'):
         shutil.copy2(shutil.which('bwrap'), binaries / 'bwrap')
     if windows:
+        (stage / 'libexec').mkdir()
+        shutil.copy2(root / 'scripts/installers/windows-environment.ps1', stage / 'libexec/windows-environment.ps1')
+        (stage / 'deepcode.cmd').write_text('@echo off\ncall "%~dp0deepcode-cli.bat" %*\nexit /b %errorlevel%\n')
         shutil.copy2(args.webview_loader, binaries / 'WebView2Loader.dll')
         for shell in ('cli', 'tui'):
             launcher = stage / f'deepcode-{shell}.bat'
             launcher.write_text('@echo off\nsetlocal\nset "DEEPCODE_RUNTIME_DIR=%~dp0"\nset "DEEPCODE_KERNEL_BIN=%~dp0deepcode-kernel.exe"\n"%~dp0deepcode-' + shell + '.exe" %*\nexit /b %errorlevel%\n')
+    metadata = {'version': version, 'platform': args.platform, 'sourceCommit': os.environ.get('DEEPCODE_BUILD_COMMIT', 'unknown'), 'builtAt': os.environ['DEEPCODE_BUILD_TIME']}
+    (resources / 'BUILDINFO.json').write_text(json.dumps(metadata, indent=2) + '\n')
     if macos:
         info = {'CFBundleDevelopmentRegion': 'en', 'CFBundleDisplayName': 'DeepCode-GUI', 'CFBundleExecutable': 'DeepCode-GUI', 'CFBundleIdentifier': 'com.achbite.deepcode.gui', 'CFBundleInfoDictionaryVersion': '6.0', 'CFBundleName': 'DeepCode-GUI', 'CFBundlePackageType': 'APPL', 'CFBundleShortVersionString': version, 'CFBundleVersion': version, 'LSMinimumSystemVersion': '12.0', 'NSHighResolutionCapable': True, 'NSPrincipalClass': 'NSApplication'}
         (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
@@ -93,7 +99,6 @@ def assemble(args):
 set -euo pipefail
 PACKAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_DIR="$PACKAGE_DIR/DeepCode-GUI.app/Contents"
-export DEEPCODE_CONFIG_DIR="${DEEPCODE_CONFIG_DIR:-$PACKAGE_DIR}"
 export DEEPCODE_RUNTIME_DIR="$APP_DIR/Resources"
 export DEEPCODE_KERNEL_BIN="$APP_DIR/MacOS/deepcode-kernel"
 exec "$APP_DIR/MacOS/deepcode-''' + shell.lower() + '''" "$@"
@@ -101,9 +106,8 @@ exec "$APP_DIR/MacOS/deepcode-''' + shell.lower() + '''" "$@"
             launcher.chmod(0o755)
         subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(app)], check=True)
         subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
-    metadata = {'version': version, 'platform': args.platform, 'sourceCommit': os.environ.get('DEEPCODE_BUILD_COMMIT', 'unknown'), 'builtAt': os.environ['DEEPCODE_BUILD_TIME']}
-    (stage / 'BUILDINFO.json').write_text(json.dumps(metadata, indent=2) + '\n')
-    shutil.copy2(root / 'docs/distribution.md', stage / 'README.md')
+    documentation = 'DeepCode-GUI.app/Contents/Resources/docs/' if macos else 'docs/'
+    (stage / 'README.md').write_text((root / 'docs/distribution.md').read_text().replace('(product/', '(' + documentation + 'product/'))
 
 
 # Only program entries belong to the publisher. config/runtime/logs/sessions and
@@ -115,11 +119,11 @@ PROGRAM_ENTRIES = {
     'deepcode-kernel', 'deepcode-kernel.exe', 'deepcode-first-party-provider', 'deepcode-first-party-provider.exe',
     'deepcode-host-web', 'deepcode-host-web.exe', 'deepcode-cli', 'deepcode-cli.exe', 'deepcode-tui', 'deepcode-tui.exe',
     'node', 'node_modules', 'session-core', 'web', 'web-deepcode-gui', 'bwrap', 'WebView2Loader.dll',
-    'BUILDINFO.json', 'build-info.json', 'build-info.txt', 'README.md', 'README.txt', 'LICENSE', 'licenses', 'THIRD-PARTY.json',
+    'BUILDINFO.json', 'build-info.json', 'build-info.txt', 'README.md', 'README.txt', 'LICENSE', 'licenses', 'THIRD-PARTY.json', 'docs',
 }
 
 
-def publish(stage, destination, archive):
+def publish(stage, destination, archive, installer=None):
     destination.mkdir(parents=True, exist_ok=True)
     # Windows locks mapped images. Detect this before replacing any entries.
     if destination.name == 'win64':
@@ -141,6 +145,12 @@ def publish(stage, destination, archive):
         else:
             with tarfile.open(packaged, 'w:gz', compresslevel=6) as output:
                 output.add(stage, arcname=destination.name)
+        artifacts = [(packaged, archive)]
+        if installer is not None:
+            artifacts.append((installer, destination.parent / installer.name))
+        previous_artifacts = temporary / 'artifacts'
+        previous_artifacts.mkdir()
+        moved_artifacts, installed_artifacts = [], []
         moved, installed = [], []
         try:
             for name in sorted(PROGRAM_ENTRIES | {entry.name for entry in stage.iterdir()}):
@@ -151,9 +161,18 @@ def publish(stage, destination, archive):
             for entry in stage.iterdir():
                 entry.rename(destination / entry.name)
                 installed.append(entry.name)
-            packaged.replace(archive)
+            for source, target in artifacts:
+                if target.exists():
+                    target.rename(previous_artifacts / target.name)
+                    moved_artifacts.append(target)
+                source.replace(target)
+                installed_artifacts.append(target)
             published = True
         except BaseException:
+            for target in reversed(installed_artifacts):
+                target.unlink()
+            for target in reversed(moved_artifacts):
+                (previous_artifacts / target.name).rename(target)
             for name in reversed(installed):
                 (destination / name).rename(stage / name)
             for name in reversed(moved):
@@ -165,6 +184,8 @@ def publish(stage, destination, archive):
         else:
             print(f'Original program files retained at {previous}', file=sys.stderr)
     print(f'Published {destination}\nArchive {archive} ({archive.stat().st_size:,} bytes)')
+    if installer is not None:
+        print(f'Installer {destination.parent / installer.name}')
 
 
 def main():
@@ -182,13 +203,14 @@ def main():
     publication = sub.add_parser('publish')
     for name in ('stage', 'destination', 'archive'):
         publication.add_argument(name, type=Path)
+    publication.add_argument('--installer', type=Path)
     args = parser.parse_args()
     if args.action == 'shared':
         shared(args.root, args.destination, args.dependency_list)
     elif args.action == 'assemble':
         assemble(args)
     else:
-        publish(args.stage, args.destination, args.archive)
+        publish(args.stage, args.destination, args.archive, args.installer)
 
 
 if __name__ == '__main__':

@@ -1,9 +1,10 @@
 import type { PluginSelectionInput } from '@deepcode/protocol';
+import type { BrowserAnnotationDraft } from './browserReview';
 import type { PastedTextInput } from '../../services/pastedText';
 
 export interface ComposerState {
   draft: string;
-  pastedTexts: Array<PastedTextInput & { expanded: boolean }>;
+  pastedTexts: Array<PastedTextInput & { expanded: boolean; browserReview?: BrowserAnnotationDraft }>;
   filesystemPaths: Array<{ path: string; kind: 'file' | 'directory' }>;
   pluginSelections: PluginSelectionInput[];
   selectionStart: number;

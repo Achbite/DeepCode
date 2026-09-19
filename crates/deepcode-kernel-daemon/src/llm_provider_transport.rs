@@ -1,12 +1,11 @@
+use crate::local_agent_api::LocalProviderMessage;
 use crate::prelude::*;
 use crate::*;
-use crate::local_agent_api::LocalProviderMessage;
 
 pub(crate) fn anthropic_stream_request_body(
     profile: &ResolvedLlmProfile,
     messages: &[LocalProviderMessage],
     tools: &[LlmToolDefinition],
-    require_tool_call: bool,
 ) -> Result<Value, ProviderTransportError> {
     let (system, chat_messages) = split_system_messages(messages);
     let chat_messages = anthropic_messages(chat_messages)?;
@@ -46,24 +45,33 @@ pub(crate) fn anthropic_stream_request_body(
                 "input_schema": tool.input_schema
             }))
             .collect::<Vec<_>>());
-        if require_tool_call {
-            body["tool_choice"] = json!({ "type": "any" });
-        }
     }
     Ok(body)
 }
 
-fn anthropic_messages(messages: Vec<&LocalProviderMessage>) -> Result<Vec<Value>, ProviderTransportError> {
+fn anthropic_messages(
+    messages: Vec<&LocalProviderMessage>,
+) -> Result<Vec<Value>, ProviderTransportError> {
     let mut output = Vec::with_capacity(messages.len());
     for message in messages {
         match message.role.as_str() {
             "assistant" => output.push(anthropic_assistant_message(message)?),
             "tool" => append_anthropic_tool_result(&mut output, message),
+            "user" if !message.image_data.is_empty() => {
+                let mut content = vec![json!({"type":"text","text":message.content})];
+                content.extend(message.image_data.iter().map(|image| json!({"type":"image", "source":{"type":"base64","media_type":image.media_type,"data":image.base64}})));
+                output.push(json!({"role":"user","content":content}));
+            }
             "user" => output.push(json!({
                 "role": "user",
                 "content": message.content
             })),
-            _ => return Err(ProviderTransportError::message("provider_envelope_invalid", "Anthropic message role is invalid.")),
+            _ => {
+                return Err(ProviderTransportError::message(
+                    "provider_envelope_invalid",
+                    "Anthropic message role is invalid.",
+                ))
+            }
         }
     }
     Ok(output)
@@ -73,11 +81,15 @@ fn anthropic_assistant_message(
     message: &LocalProviderMessage,
 ) -> Result<Value, ProviderTransportError> {
     let mut content = Vec::new();
-    if let Some(reasoning) = message.reasoning_content.as_deref()
+    if let Some(reasoning) = message
+        .reasoning_content
+        .as_deref()
         .filter(|value| !value.is_empty())
     {
         let mut block = json!({ "type": "thinking", "thinking": reasoning });
-        if let Some(signature) = message.reasoning_signature.as_deref()
+        if let Some(signature) = message
+            .reasoning_signature
+            .as_deref()
             .filter(|value| !value.is_empty())
         {
             block["signature"] = json!(signature);
@@ -114,15 +126,19 @@ fn anthropic_assistant_message(
     Ok(json!({ "role": "assistant", "content": content }))
 }
 
-fn append_anthropic_tool_result(
-    messages: &mut Vec<Value>,
-    message: &LocalProviderMessage,
-) {
+fn append_anthropic_tool_result(messages: &mut Vec<Value>, message: &LocalProviderMessage) {
+    let content = if message.image_data.is_empty() {
+        json!(message.content)
+    } else {
+        let mut parts = vec![json!({"type":"text","text":message.content})];
+        parts.extend(message.image_data.iter().map(|image| json!({"type":"image","source":{"type":"base64","media_type":image.media_type,"data":image.base64}})));
+        json!(parts)
+    };
     let block = json!({
         "type": "tool_result",
         "tool_use_id": message.provider_call_id.as_deref()
             .expect("validated tool message has providerCallId"),
-        "content": message.content
+        "content": content
     });
     if let Some(content) = messages
         .last_mut()
@@ -145,11 +161,16 @@ pub(crate) fn ollama_stream_request_body(
     profile: &ResolvedLlmProfile,
     messages: &[LocalProviderMessage],
     tools: &[LlmToolDefinition],
-    require_tool_call: bool,
 ) -> Value {
     let mut body = json!({
         "model": profile.model,
-        "messages": messages,
+        "messages": messages.iter().map(|message| {
+            let mut value = serde_json::to_value(message).expect("Provider message serializes");
+            value.as_object_mut().unwrap().remove("images");
+            value.as_object_mut().unwrap().remove("toolImages");
+            if !message.image_data.is_empty() { value["images"] = json!(message.image_data.iter().map(|image| &image.base64).collect::<Vec<_>>()); }
+            value
+        }).collect::<Vec<_>>(),
         "stream": true,
         "think": profile.thinking.as_deref() == Some("enabled"),
     });
@@ -170,9 +191,6 @@ pub(crate) fn ollama_stream_request_body(
                 }
             }))
             .collect::<Vec<_>>());
-        if require_tool_call {
-            body["tool_choice"] = json!("required");
-        }
     }
     body
 }

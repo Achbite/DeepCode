@@ -1,4 +1,4 @@
-import React,{useMemo,useState} from 'react';
+import {useMemo,useState} from 'react';
 import {t,type UiLanguage} from '../i18n';
 import {MarkdownContent} from '../components/local-agent/BufferedMarkdown';
 import {DocumentPreview} from '../components/local-agent/DocumentPreview';

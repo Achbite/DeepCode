@@ -74,13 +74,19 @@ pub enum KernelExecutionScope {
 
 impl KernelWorkspaceMode {
     pub fn as_str(self) -> &'static str {
-        match self { Self::Read => "read", Self::Write => "write" }
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
     }
 }
 
 impl KernelExecutionScope {
     pub fn as_str(self) -> &'static str {
-        match self { Self::Workspace => "workspace", Self::Host => "host" }
+        match self {
+            Self::Workspace => "workspace",
+            Self::Host => "host",
+        }
     }
 }
 
@@ -145,6 +151,8 @@ pub enum KernelCanonicalInvocation {
     #[serde(rename = "bash")]
     ProcessShell {
         command: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_host_permission: Option<String>,
         #[serde(default)]
         workspace_mode: KernelWorkspaceMode,
         #[serde(default)]
@@ -156,6 +164,8 @@ pub enum KernelCanonicalInvocation {
     #[serde(rename = "powershell")]
     ProcessPowerShell {
         command: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_host_permission: Option<String>,
         #[serde(default)]
         workspace_mode: KernelWorkspaceMode,
         #[serde(default)]
@@ -178,12 +188,24 @@ pub enum KernelCanonicalInvocation {
     },
 }
 
-fn default_start_line() -> u32 { 1 }
-fn default_max_lines() -> u32 { 2_000 }
-fn default_read_bytes() -> u32 { 262_144 }
-fn default_timeout() -> u32 { 120 }
-fn default_search_limit() -> u32 { 5 }
-fn default_fetch_bytes() -> u32 { 98_304 }
+fn default_start_line() -> u32 {
+    1
+}
+fn default_max_lines() -> u32 {
+    2_000
+}
+fn default_read_bytes() -> u32 {
+    262_144
+}
+pub(crate) fn default_timeout() -> u32 {
+    120
+}
+fn default_search_limit() -> u32 {
+    5
+}
+fn default_fetch_bytes() -> u32 {
+    98_304
+}
 
 impl KernelCanonicalInvocation {
     pub fn tool_id(&self) -> KernelToolKind {
@@ -249,6 +271,7 @@ impl KernelCanonicalInvocation {
             },
             Self::ProcessShell {
                 command,
+                request_host_permission,
                 workspace_mode: _,
                 execution_scope: _,
                 timeout,
@@ -256,20 +279,24 @@ impl KernelCanonicalInvocation {
             }
             | Self::ProcessPowerShell {
                 command,
+                request_host_permission,
                 workspace_mode: _,
                 execution_scope: _,
                 timeout,
                 terminal,
             } => {
                 validate_text("command", command, false)?;
+                if let Some(reason) = request_host_permission {
+                    validate_text("requestHostPermission", reason, false)?;
+                    if reason.len() > 1024 {
+                        return Err(field_too_large("requestHostPermission", 1024));
+                    }
+                }
                 validate_u32("timeout", *timeout, 1, 600)?;
                 if let Some(terminal) = terminal {
                     if terminal.stdin.len() > MAX_TERMINAL_STDIN_BYTES {
                         return Err(field_too_large("terminal.stdin", MAX_TERMINAL_STDIN_BYTES));
                     }
-                }
-                if let Some(reason) = process_shell_hard_deny_reason(command) {
-                    return Err(invalid_value("command", reason));
                 }
             }
             Self::WebSearch { query, limit } => {
@@ -330,6 +357,7 @@ impl KernelCanonicalInvocation {
             }),
             Self::ProcessShell {
                 command,
+                request_host_permission,
                 workspace_mode,
                 execution_scope,
                 timeout,
@@ -337,6 +365,7 @@ impl KernelCanonicalInvocation {
             }
             | Self::ProcessPowerShell {
                 command,
+                request_host_permission,
                 workspace_mode,
                 execution_scope,
                 timeout,
@@ -351,236 +380,15 @@ impl KernelCanonicalInvocation {
                 if let Some(terminal) = terminal {
                     value["terminal"] = json!(terminal);
                 }
+                if let Some(reason) = request_host_permission {
+                    value["requestHostPermission"] = json!(reason);
+                }
                 value
             }
             Self::WebSearch { query, limit } => json!({ "query": query, "limit": limit }),
             Self::WebFetch { url, max_bytes } => json!({ "url": url, "maxBytes": max_bytes }),
         }
     }
-}
-
-/// Returns the narrow, non-configurable reason that a shell command must not
-/// be spawned. This is deliberately limited to disk/volume formatting and
-/// obvious recursive cleanup of operating-system roots; it is not a general
-/// shell policy engine.
-pub fn process_shell_hard_deny_reason(command: &str) -> Option<&'static str> {
-    process_shell_hard_deny_reason_at_depth(command, 0)
-}
-
-fn process_shell_hard_deny_reason_at_depth(
-    command: &str,
-    nesting_depth: usize,
-) -> Option<&'static str> {
-    for segment in shell_command_segments(command) {
-        let words = shell_words(segment);
-        let Some(program_index) = shell_program_index(&words) else {
-            continue;
-        };
-        let program = executable_basename(&words[program_index]).to_ascii_lowercase();
-        let arguments = &words[program_index + 1..];
-        if program == "mkfs"
-            || program.starts_with("mkfs.")
-            || program == "newfs"
-            || program.starts_with("newfs_")
-            || matches!(program.as_str(), "format" | "format.com")
-        {
-            return Some("is always denied because it formats a disk or volume");
-        }
-        if program == "diskutil"
-            && arguments.iter().any(|argument| {
-                matches!(
-                    argument.to_ascii_lowercase().as_str(),
-                    "erasedisk" | "erasevolume" | "partitiondisk" | "zerodisk"
-                )
-            })
-        {
-            return Some("is always denied because it formats or erases a disk or volume");
-        }
-        if program == "rm" && rm_recursively_forces_system_root(arguments) {
-            return Some("is always denied because it recursively removes a system root");
-        }
-        if nesting_depth < 4 && matches!(program.as_str(), "sh" | "bash" | "zsh" | "dash" | "ksh") {
-            if let Some(nested) = shell_command_argument(arguments) {
-                if let Some(reason) =
-                    process_shell_hard_deny_reason_at_depth(nested, nesting_depth + 1)
-                {
-                    return Some(reason);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn shell_command_argument(arguments: &[String]) -> Option<&str> {
-    arguments.windows(2).find_map(|pair| {
-        let option = pair[0].as_str();
-        (option == "-c" || option.starts_with('-') && option[1..].contains('c'))
-            .then_some(pair[1].as_str())
-    })
-}
-
-fn shell_command_segments(command: &str) -> Vec<&str> {
-    let mut segments = Vec::new();
-    let mut start = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, character) in command.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if character == '\\' && quote != Some('\'') {
-            escaped = true;
-            continue;
-        }
-        if matches!(character, '\'' | '"') {
-            if quote == Some(character) {
-                quote = None;
-            } else if quote.is_none() {
-                quote = Some(character);
-            }
-            continue;
-        }
-        if quote.is_none() && matches!(character, ';' | '\n' | '&' | '|') {
-            segments.push(&command[start..index]);
-            start = index + character.len_utf8();
-        }
-    }
-    segments.push(&command[start..]);
-    segments
-}
-
-fn shell_words(segment: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    let mut escaped = false;
-    for character in segment.chars() {
-        if escaped {
-            current.push(character);
-            escaped = false;
-            continue;
-        }
-        if character == '\\' && quote != Some('\'') {
-            escaped = true;
-            continue;
-        }
-        if matches!(character, '\'' | '"') {
-            if quote == Some(character) {
-                quote = None;
-            } else if quote.is_none() {
-                quote = Some(character);
-            } else {
-                current.push(character);
-            }
-            continue;
-        }
-        if character.is_whitespace() && quote.is_none() {
-            if !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
-            continue;
-        }
-        current.push(character);
-    }
-    if escaped {
-        current.push('\\');
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    words
-}
-
-fn shell_program_index(words: &[String]) -> Option<usize> {
-    let mut index = 0usize;
-    while index < words.len() {
-        let word = executable_basename(&words[index]).to_ascii_lowercase();
-        if is_environment_assignment(&words[index]) {
-            index += 1;
-            continue;
-        }
-        if matches!(word.as_str(), "command" | "builtin" | "exec") {
-            index += 1;
-            continue;
-        }
-        if word == "env" || word == "sudo" {
-            index += 1;
-            while index < words.len()
-                && (words[index].starts_with('-') || is_environment_assignment(&words[index]))
-            {
-                index += 1;
-            }
-            continue;
-        }
-        return Some(index);
-    }
-    None
-}
-
-fn executable_basename(value: &str) -> &str {
-    value
-        .rsplit(['/', '\\'])
-        .find(|part| !part.is_empty())
-        .unwrap_or(value)
-}
-
-fn is_environment_assignment(value: &str) -> bool {
-    let Some((name, _)) = value.split_once('=') else {
-        return false;
-    };
-    !name.is_empty()
-        && name.chars().enumerate().all(|(index, character)| {
-            character == '_'
-                || character.is_ascii_alphanumeric() && (index > 0 || !character.is_ascii_digit())
-        })
-}
-
-fn rm_recursively_forces_system_root(arguments: &[String]) -> bool {
-    let mut recursive = false;
-    let mut force = false;
-    let mut targets = Vec::new();
-    let mut options_finished = false;
-    for argument in arguments {
-        if !options_finished && argument == "--" {
-            options_finished = true;
-            continue;
-        }
-        if !options_finished && argument.starts_with("--") {
-            recursive |= argument == "--recursive";
-            force |= argument == "--force";
-            continue;
-        }
-        if !options_finished && argument.starts_with('-') && argument != "-" {
-            recursive |= argument[1..].chars().any(|flag| matches!(flag, 'r' | 'R'));
-            force |= argument[1..].chars().any(|flag| flag == 'f');
-            continue;
-        }
-        targets.push(argument.as_str());
-    }
-    recursive && force && targets.into_iter().any(is_system_root_target)
-}
-
-fn is_system_root_target(target: &str) -> bool {
-    let mut normalized = target.replace('\\', "/");
-    while normalized.len() > 1 && normalized.ends_with('/') {
-        normalized.pop();
-    }
-    let lower = normalized.to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "/" | "/*"
-            | "/."
-            | "/system"
-            | "/system/*"
-            | "/system/volumes"
-            | "/system/volumes/*"
-            | "/system/volumes/data"
-            | "/system/volumes/data/*"
-            | "c:"
-            | "c:/*"
-    )
 }
 
 fn validate_path(value: &str, allow_dot: bool) -> Result<(), ToolValidationError> {

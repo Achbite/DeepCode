@@ -111,14 +111,39 @@ def request_host(operation, shared=None, output=None, timeout=3600):
 
 
 def stop_process(process):
-    if process.poll() is None:
-        # Interrupt the entire owned build group, including Cargo and the packager.
+    # The packager may have exited while Cargo still owns its output pipe.
+    try:
         os.killpg(process.pid, signal.SIGINT)
-        try:
-            process.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
+    except ProcessLookupError:
+        process.wait()
+        return
+    try:
+        process.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def finish_process(directory, request, child, log, code=None, message=''):
+    try:
+        stop_process(child)
+    except OSError as error:
+        status = child.poll()
+        status = 1 if status in (None, 0) else status if status > 0 else 128 - status
+        # Retain the transaction marker: cleanup did not acknowledge quiescence.
+        write_json(directory / 'result.json', {
+            'exitCode': status, 'message': f'Mac build process cleanup failed: {error}',
+        })
+        raise
+    finally:
+        log.close()
+    if code is None:
+        code = child.returncode if child.returncode >= 0 else 128 - child.returncode
+    finish(directory, request, code, message)
 
 
 def serve(container_id):
@@ -133,18 +158,14 @@ def serve(container_id):
             signal.signal(sig, lambda signum, _frame: stopping.append(signum))
         active = None
         stop_requests = []
-        write_json(WORKER, worker)
         try:
+            write_json(WORKER, worker)
             while not stopping and watcher.poll() is None:
                 if active:
                     directory, request, child, log = active
-                    if (directory / 'cancel').exists():
-                        stop_process(child)
-                    if child.poll() is not None:
-                        log.close()
-                        code = child.returncode if child.returncode >= 0 else 128 - child.returncode
-                        finish(directory, request, code)
+                    if (directory / 'cancel').exists() or child.poll() is not None:
                         active = None
+                        finish_process(directory, request, child, log)
                 for pending in sorted(BRIDGE.glob('request-*/request.json')):
                     directory = pending.parent
                     pending.rename(directory / 'running.json')
@@ -188,15 +209,16 @@ def serve(container_id):
                         active = directory, request, child, log
                 time.sleep(0.2)
         finally:
-            if active:
-                directory, request, child, log = active
-                stop_process(child)
-                log.close()
-                finish(directory, request, 130, 'Mac build stopped with its host bridge.')
-            if watcher.poll() is None:
-                watcher.terminate()
-                watcher.wait()
-            WORKER.unlink(missing_ok=True)
+            try:
+                if active:
+                    finish_process(*active, code=130, message='Mac build stopped with its host bridge.')
+            finally:
+                try:
+                    if watcher.poll() is None:
+                        watcher.terminate()
+                    watcher.wait()
+                finally:
+                    WORKER.unlink(missing_ok=True)
     # A stop reply means the worker has released its process lock as well.
     for directory, request in stop_requests:
         finish(directory, request, 0)

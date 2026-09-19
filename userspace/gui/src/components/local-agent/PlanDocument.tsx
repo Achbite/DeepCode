@@ -17,14 +17,14 @@ export function PlanDocument({ title, summary, steps, language, streaming = fals
   return <div className="conversation-plan-document-body">
     <div className="conversation-markdown conversation-plan-document-content">
       {title && <h2 className="conversation-plan-title"><MarkdownInline>{title}</MarkdownInline></h2>}
-      {summary && <MarkdownContent streaming={streaming}>{summary}</MarkdownContent>}
+      {summary && <MarkdownContent decisionProse streaming={streaming}>{summary}</MarkdownContent>}
       {steps.map((step, index) => <section className="conversation-plan-step" key={step.stepId ?? index}>
         <h3><span className="conversation-plan-step-number">{index + 1}.</span> <MarkdownInline>{step.title}</MarkdownInline></h3>
-        {step.details && <MarkdownContent streaming={streaming}>{step.details}</MarkdownContent>}
+        {step.details && <MarkdownContent decisionProse streaming={streaming}>{step.details}</MarkdownContent>}
         {step.verification && step.verification.length > 0 && <div className="conversation-plan-verification">
           <h4>{t(language, 'agent.plan.verification')}</h4>
           <ul>{step.verification.map((item, itemIndex) => <li key={itemIndex}>
-            <MarkdownContent streaming={streaming}>{item}</MarkdownContent>
+            <MarkdownContent decisionProse streaming={streaming}>{item}</MarkdownContent>
           </li>)}</ul>
         </div>}
       </section>)}

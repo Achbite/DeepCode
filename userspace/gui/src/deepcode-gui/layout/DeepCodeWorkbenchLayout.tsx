@@ -1,5 +1,6 @@
+import ProjectEnvironmentSettings from '../../components/settings-center/sections/ProjectEnvironmentSettings';
+import { restoredInterfaceView, useInterfaceReloadView } from '../../services/interfaceReload';
 import DeepCodeNavigationBox from './DeepCodeNavigationBox';
-import WindowControls from '../../components/window-controls/WindowControls';
 import { InterfaceLoadBoundary } from '../../components/shared/InterfaceUpdateNotice';
 import { loadInterfaceModule } from '../../services/interfaceUpdates';
 import ModalDialog from '../../components/shared/ModalDialog';
@@ -91,7 +92,9 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const updateSession = useLocalAgentStore((state) => state.updateSession);
   const deleteSession = useLocalAgentStore((state) => state.deleteSession);
 
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(() => restoredInterfaceView('settingsOpen', false));
+  useInterfaceReloadView('settingsOpen', settingsOpen);
+  useInterfaceReloadView('conversation', { sessionId: activeSessionId, draftProjectId });
   const [settingsNavigation, setSettingsNavigation] = useState<HTMLDivElement | null>(null);
   const settingsClose = useRef<HTMLButtonElement>(null);
   const settingsOpener = useRef<HTMLElement | null>(null);
@@ -291,7 +294,12 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       onKeyDown={(event) => {
         if (settingsOpen && event.key !== 'Escape') event.stopPropagation();
       }}>
-      <DeepCodeTitlebar sessionHeaderRef={setSessionHeader} language={language} hidden={settingsOpen} />
+      <DeepCodeTitlebar sessionHeaderRef={setSessionHeader} language={language} settings={settingsOpen ? <>
+        <strong>{t(language, 'settings.title')}</strong>
+        <button type="button" ref={settingsClose} className="deepcode-local-agent-settings__close" onClick={() => setSettingsOpen(false)}>
+          {t(language, 'deepcodeGui.settings.close')} <kbd>esc</kbd>
+        </button>
+      </> : undefined} />
 
       <DeepCodeNavigationBox settingsOpen={settingsOpen} settingsTargetRef={setSettingsNavigation}>
         <DeepCodeSidebar
@@ -591,7 +599,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
         <ModalDialog className="deepcode-gui-text-dialog-backdrop" aria-label={t(language, 'deepcodeGui.project.workspacesTitle')} busy={workspaceManager.loading} onClose={() => setWorkspaceManager(null)}>
           <div className="deepcode-gui-text-dialog deepcode-gui-workspace-manager" onMouseDown={(event) => event.stopPropagation()}>
             <header>
-              <h2>{t(language, 'deepcodeGui.project.workspacesTitle')}</h2>
+              <h2>{workspaceManager.project.title} · {t(language, 'deepcodeGui.project.workspacesTitle')}</h2>
               <button
                 type="button"
                 aria-label={t(language, 'window.close')}
@@ -602,6 +610,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
             <p className="deepcode-gui-text-dialog__message">
               {t(language, 'deepcodeGui.project.workspaceTemplateHint')}
             </p>
+            <h3 className="deepcode-gui-workspace-manager__heading">{language === 'zh-CN' ? '源文件夹' : 'Source folders'}</h3>
             <div className="deepcode-gui-workspace-manager__list" onMouseDown={(event) => event.stopPropagation()}>
               {!workspaceManager.loading && workspaceManager.records.length === 0 && (
                 <div className="deepcode-gui-workspace-manager__empty">
@@ -610,6 +619,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
               )}
               {workspaceManager.records.map((record) => (
                 <div className="deepcode-gui-workspace-manager__row" key={record.workspaceId}>
+                  <DeepCodeShellIcon name="folder" size={18} />
                   <span>
                     <strong>{record.displayName}</strong>
                     <small>{record.canonicalRoot}</small>
@@ -623,20 +633,12 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                   </button>
                 </div>
               ))}
-            </div>
-            {workspaceManager.error && (
-              <p className="deepcode-gui-text-dialog__error" role="alert">{workspaceManager.error}</p>
-            )}
-            <footer>
-              <button type="button" onClick={() => setWorkspaceManager(null)}>
-                {t(language, 'deepcodeGui.common.done')}
-              </button>
               <button
                 type="button"
+                className="deepcode-gui-workspace-manager__add"
                 disabled={workspaceManager.loading}
                 onClick={() => {
                   const project = workspaceManager.project;
-                  setWorkspaceManager(null);
                   setFolderAction({
                     kind: 'bind',
                     project,
@@ -645,8 +647,18 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
                   });
                 }}
               >
-                {t(language, 'deepcodeGui.project.addFolder')}
+                <DeepCodeShellIcon name="plus" size={18} />{t(language, 'deepcodeGui.project.addFolder')}
               </button>
+            </div>
+            <ProjectEnvironmentSettings key={workspaceManager.project.id} projectId={workspaceManager.project.id} chinese={language === 'zh-CN'} />
+            {workspaceManager.error && (
+              <p className="deepcode-gui-text-dialog__error" role="alert">{workspaceManager.error}</p>
+            )}
+            <footer>
+              <button type="button" onClick={() => setWorkspaceManager(null)}>
+                {t(language, 'deepcodeGui.common.done')}
+              </button>
+
             </footer>
           </div>
         </ModalDialog>
@@ -655,16 +667,6 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       {settingsOpen && (
         <section className="deepcode-local-agent-overlay" aria-label={t(language, 'settings.title')}>
           <div className="deepcode-local-agent-settings" onMouseDown={(event) => event.stopPropagation()}>
-            <div className="deepcode-local-agent-settings__drag-region" data-tauri-drag-region aria-hidden="true" />
-            <button
-              type="button"
-              ref={settingsClose}
-              className="deepcode-local-agent-settings__close"
-              onClick={() => setSettingsOpen(false)}
-            >
-              {t(language, 'deepcodeGui.settings.close')}
-            </button>
-            <div className="deepcode-local-agent-settings__window-controls"><WindowControls language={language} /></div>
             <InterfaceLoadBoundary><Suspense fallback={null}>
               <SettingsCenter
                 apiStatus={apiStatus}

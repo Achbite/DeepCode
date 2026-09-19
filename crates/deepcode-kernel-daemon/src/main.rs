@@ -1,7 +1,9 @@
 #![recursion_limit = "256"]
 
 mod api_response;
+mod command_denylist;
 mod config_root_lease;
+mod config_setup;
 mod conversation_api;
 mod conversation_catalog;
 mod host_connection;
@@ -27,6 +29,9 @@ mod local_agent_search;
 mod local_agent_store;
 mod local_agent_tool_catalog;
 mod local_agent_tool_prompts;
+mod model_auth;
+mod model_connections;
+mod model_usage;
 mod prelude;
 mod provider_transport;
 mod routes;
@@ -71,6 +76,35 @@ async fn main() {
             }
         }
     }
+    if std::env::args().nth(1).as_deref() == Some("--kernel-tool-worker") {
+        if let Err(error) = kernel_tool_worker::run() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let user_directories =
+        deepcode_host_connection::UserDirectories::resolve().expect("解析 DeepCode 用户目录");
+    #[cfg(windows)]
+    std::env::set_var(
+        "DEEPCODE_SANDBOX_STATE_PATH",
+        user_directories.data_dir.join("workspace-sandbox.json"),
+    );
+    #[cfg(windows)]
+    if std::env::args().nth(1).as_deref() == Some("--workspace-sandbox-init") {
+        if let Err(error) = deepcode_kernel_runtime::workspace_sandbox::windows::request_setup() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("--user-directories") {
+        println!(
+            "{}",
+            serde_json::to_string(&user_directories).expect("user directories")
+        );
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--workspace-sandbox-status") {
         println!(
             "{}",
@@ -79,10 +113,13 @@ async fn main() {
         );
         return;
     }
-    if std::env::args().nth(1).as_deref() == Some("--kernel-tool-worker") {
-        if let Err(error) = kernel_tool_worker::run() {
-            eprintln!("{error}");
-            std::process::exit(1);
+    if std::env::args().nth(1).as_deref() == Some("--prepare-user-config") {
+        match config_setup::prepare(&user_directories) {
+            Ok(report) => println!("{}", serde_json::to_string(&report).expect("config report")),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
         }
         return;
     }
@@ -97,7 +134,10 @@ async fn main() {
         "DeepCode 本地 daemon 只监听 loopback"
     );
 
-    let gui_state = GuiState::open().expect("打开当前配置根");
+    let gui_state = GuiState::open_in(&user_directories).expect("打开当前用户目录");
+    let model_usage = Arc::new(
+        model_usage::UsageStore::open(&gui_state.paths.usage_store_path).expect("打开用量索引"),
+    );
     let session_store_path = gui_state.paths.session_store_path.clone();
     let tool_record_store_path = gui_state.paths.tool_record_store_path.clone();
     let user_settings = gui_state.user_settings.clone();
@@ -135,6 +175,8 @@ async fn main() {
         host_connection,
         gui,
         host_services: HostServices::new(),
+        model_auth: Arc::new(model_auth::AuthService::default()),
+        model_usage,
     };
     configure_host_lifetime().expect("初始化 Host 生命周期");
     let app = routes::build_app(state.clone());
@@ -145,7 +187,7 @@ async fn main() {
         host_process_identity().clone(),
         std::env::var(HOST_SHELL_TOKEN_ENV).expect("Host shell token"),
     )
-    .and_then(|connection| connection.publish(&user_config_root()))
+    .and_then(|connection| connection.publish(&user_directories.data_dir))
     .expect("发布共享 Host 本地连接");
     println!("DeepCode local Agent daemon listening on http://{addr}");
     let result = axum::serve(listener, app)
@@ -204,6 +246,7 @@ pub(crate) fn runtime_tool_configuration(
         .collect();
     Ok((
         deepcode_kernel_runtime::executors::KernelExecutorConfig {
+            temporary_root: Some(gui.paths.temporary_root.clone()),
             web_search_endpoint_template: setting("agent.web.search.endpointTemplate")?.to_string(),
             web_search_auth_header_name: setting("agent.web.search.authHeaderName")?.to_string(),
             web_search_auth_secret_ref: setting("agent.web.search.authSecretRef")?.to_string(),

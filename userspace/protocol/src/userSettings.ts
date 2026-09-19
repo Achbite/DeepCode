@@ -1,4 +1,4 @@
-export type UserSettingValue = string | number | boolean | null;
+export type UserSettingValue = string | number | boolean | null | string[];
 export type UserSettings = Record<string, UserSettingValue>;
 export type SettingsSurface = 'gui' | 'cli' | 'tui';
 
@@ -42,6 +42,7 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'agent.permissions.engineeringDecisions': 'ask',
   'agent.permissions.networkRead': 'allow',
   'agent.permissions.external': 'ask',
+  'agent.permissions.commandDenylist': ['rm -rf /'],
   'agent.web.search.endpointTemplate': '',
   'agent.web.search.authHeaderName': 'Authorization',
   'agent.web.search.authSecretRef': '',
@@ -66,18 +67,8 @@ export const SETTING_CATALOG: readonly SettingCatalogEntry[] = Object.freeze(
   })),
 );
 
-export function settingCatalogIndex(): readonly SettingCatalogEntry[] {
-  return SETTING_CATALOG;
-}
-
 export function agentSettingsIndex(): readonly SettingCatalogEntry[] {
   return SETTING_CATALOG.filter((entry) => entry.key.startsWith(SHARED_AGENT_PREFIX));
-}
-
-export function pluginSettingsIndex(): readonly SettingCatalogEntry[] {
-  return SETTING_CATALOG.filter((entry) =>
-    PLUGIN_SETTING_PREFIXES.some((prefix) => entry.key.startsWith(prefix)),
-  );
 }
 
 export function shellPreferenceSettingsIndex(

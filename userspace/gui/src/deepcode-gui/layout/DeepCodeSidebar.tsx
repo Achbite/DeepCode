@@ -186,6 +186,39 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
     };
   }, [busy, onActivateSession, shortcutSessions]);
 
+  const renderSession = (session: ConversationSessionSummary) => {
+    const shortcut = shortcutBySessionId.get(session.id);
+    return (
+      <div
+        className={`deepcode-gui-session-row${session.id === activeSessionId ? ' deepcode-gui-session-row--active' : ''}`}
+        key={session.id}
+        {...dragProps({ kind: 'session', id: session.id, projectId: session.projectId })}
+      >
+        <button
+          type="button"
+          className={session.id === activeSessionId ? 'active' : ''}
+          onClick={() => onActivateSession(session)}
+          onContextMenu={(event) => onOpenSessionContextMenu(event, session)}
+          disabled={busy}
+          title={session.title || session.id}
+          aria-keyshortcuts={shortcut ? `Meta+${shortcut}` : undefined}
+        >
+          <span className="deepcode-gui-session-row__title">{sessionTitle(session, language)}</span>
+          {renderStatus(session.id)}
+          {commandPressed && shortcut && <kbd>⌘{shortcut}</kbd>}
+        </button>
+        <button
+          type="button"
+          className="deepcode-gui-session-row__menu"
+          onClick={(event) => onOpenSessionContextMenu(event, session)}
+          aria-label={t(language, 'deepcodeGui.session.actions')}
+        >
+          <DeepCodeShellIcon name="more" />
+        </button>
+      </div>
+    );
+  };
+
   return (
     <div
       className="deepcode-gui-left-rail"
@@ -315,38 +348,7 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
                         <div className="deepcode-gui-sidebar-empty deepcode-gui-sidebar-empty--nested">
                           {t(language, 'deepcodeGui.sidebar.noChats')}
                         </div>
-                      ) : projectSessions.map((session) => {
-                        const shortcut = shortcutBySessionId.get(session.id);
-                        return (
-                          <div
-                            className={`deepcode-gui-session-row${session.id === activeSessionId ? ' deepcode-gui-session-row--active' : ''}`}
-                            key={session.id}
-                            {...dragProps({ kind: 'session', id: session.id, projectId: session.projectId })}
-                          >
-                            <button
-                              type="button"
-                              className={session.id === activeSessionId ? 'active' : ''}
-                              onClick={() => onActivateSession(session)}
-                              onContextMenu={(event) => onOpenSessionContextMenu(event, session)}
-                              disabled={busy}
-                              title={session.title || session.id}
-                              aria-keyshortcuts={shortcut ? `Meta+${shortcut}` : undefined}
-                            >
-                              <span className="deepcode-gui-session-row__title">{sessionTitle(session, language)}</span>
-                              {renderStatus(session.id)}
-                              {commandPressed && shortcut && <kbd>⌘{shortcut}</kbd>}
-                            </button>
-                            <button
-                              type="button"
-                              className="deepcode-gui-session-row__menu"
-                              onClick={(event) => onOpenSessionContextMenu(event, session)}
-                              aria-label={t(language, 'deepcodeGui.session.actions')}
-                            >
-                              <DeepCodeShellIcon name="more" />
-                            </button>
-                          </div>
-                        );
-                      })}
+                      ) : projectSessions.map(renderSession)}
                     </div>
                   )}
                 </div>
@@ -376,38 +378,7 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
           </div>
         ) : (
           <div className="deepcode-gui-session-list">
-            {standalone.map((session) => {
-              const shortcut = shortcutBySessionId.get(session.id);
-              return (
-                <div
-                  className={`deepcode-gui-session-row${session.id === activeSessionId ? ' deepcode-gui-session-row--active' : ''}`}
-                  key={session.id}
-                  {...dragProps({ kind: 'session', id: session.id, projectId: session.projectId })}
-                >
-                  <button
-                    type="button"
-                    className={session.id === activeSessionId ? 'active' : ''}
-                    onClick={() => onActivateSession(session)}
-                    onContextMenu={(event) => onOpenSessionContextMenu(event, session)}
-                    disabled={busy}
-                    title={session.title || session.id}
-                    aria-keyshortcuts={shortcut ? `Meta+${shortcut}` : undefined}
-                  >
-                    <span className="deepcode-gui-session-row__title">{sessionTitle(session, language)}</span>
-                    {renderStatus(session.id)}
-                    {commandPressed && shortcut && <kbd>⌘{shortcut}</kbd>}
-                  </button>
-                  <button
-                    type="button"
-                    className="deepcode-gui-session-row__menu"
-                    onClick={(event) => onOpenSessionContextMenu(event, session)}
-                    aria-label={t(language, 'deepcodeGui.session.actions')}
-                  >
-                    <DeepCodeShellIcon name="more" />
-                  </button>
-                </div>
-              );
-            })}
+            {standalone.map(renderSession)}
           </div>
         )}
       </section>

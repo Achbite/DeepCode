@@ -1,11 +1,12 @@
-import { create, useStore } from 'zustand';
-import { createContext, createElement, useContext, type ReactNode } from 'react';
+import { takeRestoredInterfaceView } from '../services/interfaceReload';
+import { create } from 'zustand';
 import type {
   CommandReply,
   ConversationCatalog,
   ConversationCommand,
   ConversationSessionStatus,
   LlmProviderProfile,
+  ModelConnection,
   LlmReasoningEffort,
   SessionModelSettings,
   MessageFeedback,
@@ -61,6 +62,7 @@ export interface LocalAgentState {
   reasoningEffortOverride: LlmReasoningEffort | null;
   modelSettingsBusy: boolean;
   profiles: LlmProviderProfile[];
+  connections: ModelConnection[];
   defaultProfileId: string | null;
   catalog: ConversationCatalog;
   sessionStatuses: Record<string, ConversationSessionStatus>;
@@ -176,6 +178,7 @@ const store = create<LocalAgentState>((set, get) => ({
   reasoningEffortOverride: null,
   modelSettingsBusy: false,
   profiles: [],
+  connections: [],
   defaultProfileId: null,
   catalog: EMPTY_CATALOG,
   sessionStatuses: {},
@@ -207,11 +210,14 @@ const store = create<LocalAgentState>((set, get) => ({
           profileResult.ok ? profileResult.data?.defaultProfileId : undefined,
         );
         // Catalog readiness is independent of navigation during startup.
-        set({ catalog, pluginCatalog, profiles, defaultProfileId });
+        set({ catalog, pluginCatalog, profiles, connections: profileResult.data?.connections ?? [], defaultProfileId });
         void get().refresh();
         if (currentGeneration !== generation) {
           set({
             selectedProfileId: get().selectedProfileId ?? defaultProfileId,
+            ...(!get().selectedProfileId && !get().sessionId ? {
+              reasoningEffortOverride: profiles.find(profile => profile.id === defaultProfileId)?.reasoningEffort ?? null,
+            } : {}),
           });
           if (!profileResult.ok) {
             set({
@@ -227,7 +233,7 @@ const store = create<LocalAgentState>((set, get) => ({
           profiles,
           defaultProfileId,
           selectedProfileId: defaultProfileId,
-          reasoningEffortOverride: null,
+          reasoningEffortOverride: profiles.find(profile => profile.id === defaultProfileId)?.reasoningEffort ?? null,
           sessionId: null,
           projection: null,
           draftProjectId: null,
@@ -235,6 +241,9 @@ const store = create<LocalAgentState>((set, get) => ({
           error: profileResult.ok ? null : (profileResult.message ?? 'llm_profiles_unavailable'),
           errorSource: profileResult.ok ? null : 'profiles',
         });
+        const restored = takeRestoredInterfaceView<{ sessionId: string | null; draftProjectId: string | null } | null>('conversation', null);
+        if (restored?.sessionId && catalog.sessions.some(item => item.id === restored.sessionId)) await get().activateSession(restored.sessionId);
+        else if (restored?.draftProjectId && catalog.projects.some(item => item.id === restored.draftProjectId)) set({ draftProjectId: restored.draftProjectId });
       } catch (error) {
         if (currentGeneration === generation) {
           set({
@@ -272,8 +281,12 @@ const store = create<LocalAgentState>((set, get) => ({
         : undefined;
       return {
         profiles,
+        connections: profileResult.data?.connections ?? [],
         defaultProfileId,
         selectedProfileId: state.selectedProfileId ?? summary?.profileId ?? defaultProfileId,
+        ...(!state.selectedProfileId && !state.sessionId ? {
+          reasoningEffortOverride: profiles.find(profile => profile.id === defaultProfileId)?.reasoningEffort ?? null,
+        } : {}),
         ...(state.errorSource === 'profiles' ? { error: null, errorSource: null } : {}),
       };
     });
@@ -312,8 +325,9 @@ const store = create<LocalAgentState>((set, get) => ({
       sessionId: null,
       projection: null,
       draftProjectId: projectId,
+      modelSettingsBusy: false,
       selectedProfileId: get().defaultProfileId,
-      reasoningEffortOverride: null,
+      reasoningEffortOverride: get().profiles.find(profile => profile.id === get().defaultProfileId)?.reasoningEffort ?? null,
       loading: false,
       submitting: activeSubmissionCount > 0,
       error: null,
@@ -375,13 +389,14 @@ const store = create<LocalAgentState>((set, get) => ({
   selectProfile: async (profileId) => {
     if (!get().profiles.some((profile) => profile.id === profileId && profile.enabled)) return;
     if (get().selectedProfileId === profileId) return;
-    await saveModelSettings(set, get, { profileId, reasoningEffortOverride: null });
+    await saveModelSettings(set, get, { profileId,
+      reasoningEffortOverride: get().profiles.find(profile => profile.id === profileId)?.reasoningEffort ?? null });
   },
 
   selectReasoningEffort: async (reasoningEffortOverride) => {
     const { selectedProfileId, profiles } = get();
     if (!selectedProfileId || profiles.find((profile) => profile.id === selectedProfileId)?.thinking === 'disabled') return;
-    await saveModelSettings(set, get, { profileId: selectedProfileId, reasoningEffortOverride });
+    await saveModelSettings(set, get, { profileId: selectedProfileId, reasoningEffortOverride }, true);
   },
 
   refresh: async () => {
@@ -466,8 +481,13 @@ const store = create<LocalAgentState>((set, get) => ({
     onSessionCreated,
   ) => {
     const trimmed = text.trim();
-    if (!trimmed && !pastedTexts.length) throw new Error('message_empty');
-    if (trimmed.startsWith('/')) throw new Error(`conversation_command_unknown:${trimmed}`);
+    const inputError = !trimmed && !pastedTexts.length
+      ? 'message_empty'
+      : trimmed.startsWith('/') ? `conversation_command_unknown:${trimmed}` : null;
+    if (inputError) {
+      set({ error: inputError, errorSource: 'command' });
+      throw new Error(inputError);
+    }
     return await submitNewRun(
       set,
       get,
@@ -893,23 +913,30 @@ function projectModelSettings(projection: SessionProjection | null): Partial<Loc
   } : {};
 }
 
-async function saveModelSettings(set: StoreSet, get: StoreGet, settings: SessionModelSettings): Promise<void> {
+async function saveModelSettings(set: StoreSet, get: StoreGet, settings: SessionModelSettings, rememberEffort = false): Promise<void> {
   if (get().modelSettingsBusy) return;
   const sessionId = get().sessionId;
   const settingsGeneration = generation;
   set({ modelSettingsBusy: true });
   try {
-    if (!sessionId) {
-      if (generation === settingsGeneration && !get().sessionId) {
-        set({ selectedProfileId: settings.profileId, reasoningEffortOverride: settings.reasoningEffortOverride,
-          error: null, errorSource: null });
-      }
-      return;
+    if (sessionId) {
+      await submitCommandAndReconcile(set, get, {
+        schemaVersion: CONVERSATION_COMMAND_VERSION, type: 'session.model-settings.set',
+        sessionId, commandId: nextId('command'), settings,
+      });
     }
-    await submitCommandAndReconcile(set, get, {
-      schemaVersion: CONVERSATION_COMMAND_VERSION, type: 'session.model-settings.set',
-      sessionId, commandId: nextId('command'), settings,
-    });
+    if (rememberEffort) {
+      const profile = get().profiles.find(item => item.id === settings.profileId);
+      if (!profile) throw new Error('llm_profile_unavailable');
+      const remembered = { ...profile, reasoningEffort: settings.reasoningEffortOverride ?? undefined };
+      const saved = await patchLlmProfiles({ profile: remembered });
+      if (!saved.ok) throw new Error(saved.message ?? saved.error ?? 'reasoning_preference_save_failed');
+      set(state => ({ profiles: state.profiles.map(item => item.id === profile.id ? remembered : item) }));
+    }
+    if (!sessionId && generation === settingsGeneration && !get().sessionId) {
+      set({ selectedProfileId: settings.profileId, reasoningEffortOverride: settings.reasoningEffortOverride,
+        error: null, errorSource: null });
+    }
   } catch (error) {
     if (generation === settingsGeneration && get().sessionId === sessionId) set({ error: errorMessage(error), errorSource: 'command' });
   } finally {
@@ -1051,14 +1078,4 @@ function errorMessage(error: unknown): string {
 return store;
 }
 
-export type LocalAgentStore = ReturnType<typeof createLocalAgentStore>;
-const defaultStore = createLocalAgentStore();
-const LocalAgentStoreContext = createContext<LocalAgentStore>(defaultStore);
-export function LocalAgentStoreProvider({ store, children }: { store: LocalAgentStore; children: ReactNode }) {
-  return createElement(LocalAgentStoreContext.Provider, { value: store }, children);
-}
-export const useLocalAgentStore = Object.assign(
-  function useLocalAgentStore<Selected>(selector: (state: LocalAgentState) => Selected): Selected {
-    return useStore(useContext(LocalAgentStoreContext), selector);
-  }, defaultStore,
-);
+export const useLocalAgentStore = createLocalAgentStore();

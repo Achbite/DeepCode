@@ -1,12 +1,17 @@
+#[path = "../../shared/conversation_input.rs"]
+mod conversation_input;
+// CLI retains its existing Chinese messages; TUI also uses the shared locale loader.
+#[allow(dead_code)]
+#[path = "../../shared/i18n.rs"]
+mod i18n;
+mod model_services;
 mod render;
 
 use deepcode_kernel_client::{
-    approval_response_command, cancel_command, focus_command, interaction_response_command,
-    is_terminal_run_status, message_command_with_profile_and_plugins, plan_cancel_command,
-    plan_confirm_command, plan_revision_command, CreateConversationSessionRequest,
-    FilesystemReference, FilesystemReferencePathInput, HttpKernelClient, InteractionProjection,
-    KernelBootstrap, KernelBootstrapOptions, PluginCatalogItem, PluginCatalogProjection,
-    PluginSelectionInput, SessionProjection,
+    cancel_command, is_terminal_run_status, plan_cancel_command, CreateConversationSessionRequest,
+    FilesystemReference, FilesystemReferencePathInput, HttpKernelClient, KernelBootstrap,
+    KernelBootstrapOptions, PluginCatalogItem, PluginCatalogProjection, PluginSelectionInput,
+    SessionProjection,
 };
 use render::{
     render_action_required_if_any, render_projection, render_run_state, render_terminal_error,
@@ -77,6 +82,21 @@ async fn main() {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     Help,
+    Connections,
+    AuthLogin {
+        selector: String,
+        device_code: bool,
+    },
+    AuthLogout {
+        connection_id: String,
+    },
+    Quota {
+        connection_id: String,
+    },
+    Usage {
+        connection_id: Option<String>,
+        days: u64,
+    },
     Status,
     StopHost,
     StartHost,
@@ -114,6 +134,7 @@ struct Args {
     workspace: Option<PathBuf>,
     session_id: Option<String>,
     plain: bool,
+    profile_id: Option<String>,
     plugins: Vec<String>,
     files: Vec<String>,
     directories: Vec<String>,
@@ -127,6 +148,7 @@ impl Args {
         let mut workspace = None;
         let mut session_id = None;
         let mut plain = false;
+        let mut profile_id = None;
         let mut plugins = Vec::new();
         let mut files = Vec::new();
         let mut directories = Vec::new();
@@ -138,6 +160,10 @@ impl Args {
                 "--api" => {
                     index += 1;
                     api = Some(required_arg(&values, index, "--api")?.to_string());
+                }
+                "--model" => {
+                    index += 1;
+                    profile_id = Some(required_arg(&values, index, "--model")?.to_owned());
                 }
                 "--no-auto-start-kernel" => no_auto_start_kernel = true,
                 "--workspace" | "-C" => {
@@ -204,6 +230,23 @@ impl Args {
             None => Command::Chat,
             Some("help") => Command::Help,
             Some("status") => Command::Status,
+            Some("connections" | "models") if positional.len()==1 => Command::Connections,
+            Some("auth") => match positional.get(1).map(String::as_str) {
+                Some("status") if positional.len()==2 => Command::Connections,
+                Some("login") if (3..=4).contains(&positional.len()) => {
+                    let method=positional.get(3).map(String::as_str).unwrap_or("browser");
+                    if !matches!(method,"browser"|"device") { return Err("登录方式为 browser 或 device。".into()); }
+                    Command::AuthLogin { selector:positional[2].clone(),device_code:method=="device" }
+                }
+                Some("logout") if positional.len()==3 => Command::AuthLogout { connection_id:positional[2].clone() },
+                _ => return Err("用法：auth login <connection-id|openai-codex> [browser|device] / auth status / auth logout <connection-id>".into()),
+            },
+            Some("quota") if positional.len()==2 => Command::Quota { connection_id:positional[1].clone() },
+            Some("usage") if positional.len()<=3 => {
+                let days:u64=positional.get(2).map(|v|v.parse()).transpose().map_err(|_|"统计天数无效。")?.unwrap_or(30);
+                if !(1..=366).contains(&days) { return Err("统计天数必须在 1 至 366 之间。".into()); }
+                Command::Usage { connection_id:positional.get(1).filter(|v|v.as_str()!="all").cloned(),days }
+            },
             Some("stop-host") if positional.len() == 1 => Command::StopHost,
             Some("start-host") if positional.len() == 1 => Command::StartHost,
             Some("diff") if positional.len() == 3 => Command::Diff {
@@ -286,6 +329,7 @@ impl Args {
             workspace,
             session_id,
             plain,
+            profile_id,
             plugins,
             files,
             directories,
@@ -423,6 +467,42 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
     }
     match args.command {
         Command::Help => Ok(Outcome::Done),
+        Command::Connections => model_services::connections(client).await,
+        Command::AuthLogin {
+            selector,
+            device_code,
+        } => model_services::login(client, &selector, device_code).await,
+        Command::AuthLogout { connection_id } => {
+            client
+                .logout_model_connection(&connection_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            println!("已退出登录。{}　", connection_id);
+            Ok(Outcome::Done)
+        }
+        Command::Quota { connection_id } => {
+            let value = client
+                .model_quota(&connection_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+            );
+            Ok(Outcome::Done)
+        }
+        Command::Usage {
+            connection_id,
+            days,
+        } => {
+            model_services::usage(
+                client,
+                connection_id.as_deref(),
+                days,
+                args.session_id.as_deref(),
+            )
+            .await
+        }
         Command::StartHost => {
             println!("共享 Host 已启动为常驻服务。");
             Ok(Outcome::Done)
@@ -457,8 +537,13 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
             Ok(Outcome::Done)
         }
         Command::Ask(text) => {
-            let projection =
-                open_session(client, args.session_id.as_deref(), args.workspace.as_ref()).await?;
+            let projection = open_session(
+                client,
+                args.session_id.as_deref(),
+                args.workspace.as_ref(),
+                args.profile_id.as_deref(),
+            )
+            .await?;
             let filesystem_references = resolve_cli_filesystem_references(
                 client,
                 &projection.session_id,
@@ -475,7 +560,7 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
                 client,
                 &projection,
                 &text,
-                None,
+                args.profile_id.as_deref(),
                 &filesystem_references,
                 plugin_binding.as_ref(),
                 args.plain,
@@ -488,6 +573,7 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
                 args.session_id.as_deref(),
                 args.workspace.as_ref(),
                 &args.plugins,
+                args.profile_id.as_deref(),
             )
             .await
         }
@@ -565,7 +651,7 @@ async fn run(client: &HttpKernelClient, args: Args) -> Result<Outcome, String> {
                     binding.display_name, binding.workspace_id
                 );
             } else {
-                println!("目录索引集合已更新；从下一次 run 起使用共享投影中的有效目录集合。");
+                println!("对话目录已更新，下次运行生效。");
             }
             Ok(Outcome::Done)
         }
@@ -609,6 +695,7 @@ async fn open_session(
     client: &HttpKernelClient,
     session_id: Option<&str>,
     workspace: Option<&PathBuf>,
+    profile_id: Option<&str>,
 ) -> Result<SessionProjection, String> {
     if let Some(session_id) = session_id {
         return client
@@ -629,7 +716,7 @@ async fn open_session(
             session_id: None,
             workspace_paths,
             project_id: None,
-            profile_id: None,
+            profile_id: profile_id.map(str::to_owned),
         })
         .await
         .map_err(|error| error.to_string())
@@ -662,132 +749,16 @@ fn contextual_input_command(
     filesystem_references: &[FilesystemReference],
     plugin_binding: Option<&PluginBinding>,
 ) -> Result<serde_json::Value, String> {
-    let original_text = text;
-    let text = text.trim();
-    if text.is_empty() {
-        return Err("输入不能为空。".to_string());
-    }
-    if text == "/reply" || text.starts_with("/reply ") {
-        let response = text.strip_prefix("/reply").unwrap().trim();
-        if response.is_empty() {
-            return Err("用法：/reply <答复、确认或修订说明>".to_string());
-        }
-        if plugin_binding.is_some_and(|binding| !binding.selections.is_empty())
-            || !filesystem_references.is_empty()
-        {
-            return Err("插件和文件系统引用不能用于已有 run 的决策回应。".to_string());
-        }
-        if let Some(approval) = projection.pending_approval.as_ref() {
-            let decision = approval_decision_for_input(response)?;
-            if decision == "allow-run"
-                && approval.preview.authorization_scope.as_deref() != Some("runHostShell")
-            {
-                return Err("当前操作未提供本轮宿主 Shell 授权。".into());
-            }
-            return Ok(approval_response_command(
-                &projection.session_id,
-                &new_id("command"),
-                approval,
-                decision,
-            ));
-        }
-        if let Some(plan) = projection.pending_plan.as_ref() {
-            if is_plan_confirmation_input(response) {
-                return Ok(plan_confirm_command(
-                    &projection.session_id,
-                    &new_id("command"),
-                    plan,
-                ));
-            }
-            return Ok(plan_revision_command(
-                &projection.session_id,
-                &new_id("command"),
-                plan,
-                response,
-            ));
-        }
-        if let Some(interaction) = projection.pending_interaction.as_ref() {
-            let response = interaction_response_for_input(interaction, response);
-            return Ok(interaction_response_command(
-                &projection.session_id,
-                &new_id("command"),
-                interaction,
-                &response,
-            ));
-        }
-        return Err("当前没有等待答复的 Plan、交互或 effect 审批。".to_string());
-    }
-    let profile_id = if projection
-        .run
-        .as_ref()
-        .is_some_and(|run| matches!(run.status.as_str(), "running" | "waiting"))
-    {
-        None
-    } else {
-        profile_id
-    };
-    let empty = PluginBinding {
-        catalog_revision: String::new(),
-        selections: Vec::new(),
-    };
-    let plugins = plugin_binding.unwrap_or(&empty);
-    if let Some(task) = text.strip_prefix("/focus") {
-        if !task.is_empty() && !task.chars().next().is_some_and(char::is_whitespace) {
-            return Err("未知命令；/focus 后必须以空格分隔任务正文。".to_string());
-        }
-        let task = task.trim();
-        if task.is_empty() {
-            return Err("/focus 需要非空任务正文。".to_string());
-        }
-        return Ok(focus_command(
-            &projection.session_id,
-            &new_id("command"),
-            task,
-            profile_id,
-            filesystem_references,
-            &plugins.catalog_revision,
-            &plugins.selections,
-        ));
-    }
-    if text.starts_with('/') {
-        return Err(format!("未知命令：{text}"));
-    }
-    let mut command = message_command_with_profile_and_plugins(
-        &projection.session_id,
+    conversation_input::contextual_input_command(
+        i18n::Language::ZhCn,
+        projection,
+        text,
         &new_id("command"),
-        original_text,
         profile_id,
         filesystem_references,
-        &plugins.catalog_revision,
-        &plugins.selections,
-    );
-    if let Some(run) = projection
-        .run
-        .as_ref()
-        .filter(|run| matches!(run.status.as_str(), "running" | "waiting"))
-    {
-        command["runId"] = json!(run.run_id);
-    }
-    Ok(command)
-}
-
-fn approval_decision_for_input(input: &str) -> Result<&'static str, String> {
-    match input.trim().to_lowercase().as_str() {
-        "1" | "allow" | "允许" | "同意" => Ok("allow"),
-        "2" | "deny" | "拒绝" | "不同意" => Ok("deny"),
-        "3" | "allow-run" | "允许本轮" => Ok("allow-run"),
-        _ => Err("当前等待 effect 裁决：输入 /reply 1（允许）或 /reply 2（拒绝）。".to_string()),
-    }
-}
-
-fn interaction_response_for_input(interaction: &InteractionProjection, input: &str) -> String {
-    input
-        .parse::<usize>()
-        .ok()
-        .and_then(|index| index.checked_sub(1))
-        .and_then(|index| interaction.options.as_ref()?.get(index))
-        .map(|option| option.label.clone())
-        .unwrap_or_else(|| input.to_string())
+        plugin_binding.map_or("", |binding| binding.catalog_revision.as_str()),
+        plugin_binding.map_or(&[], |binding| binding.selections.as_slice()),
+    )
 }
 
 async fn submit_checked(
@@ -894,11 +865,12 @@ async fn run_chat(
     session_id: Option<&str>,
     workspace: Option<&PathBuf>,
     initial_plugin_uris: &[String],
+    initial_profile_id: Option<&str>,
 ) -> Result<Outcome, String> {
     if !io::stdin().is_terminal() {
         return Err("chat 需要交互式终端；非交互调用请使用 ask。".to_string());
     }
-    let mut projection = open_session(client, session_id, workspace).await?;
+    let mut projection = open_session(client, session_id, workspace, initial_profile_id).await?;
     let mut plugin_catalog = client
         .conversation_plugin_catalog()
         .await
@@ -917,7 +889,7 @@ async fn run_chat(
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut output = CliRenderState::after(&projection);
     let mut rendered_revision = projection.revision;
-    let mut next_message_profile_id: Option<String> = None;
+    let mut next_message_profile_id: Option<String> = initial_profile_id.map(str::to_owned);
     let mut prompt_needed = true;
     loop {
         if prompt_needed {
@@ -997,6 +969,9 @@ async fn run_chat(
                         .map_err(|error| error.to_string())?;
                 }
             }
+            "/model" | "/connections" => {
+                model_services::connections(client).await?;
+            }
             value if value.starts_with("/model ") => {
                 let profile_id = value.trim_start_matches("/model ").trim();
                 if profile_id.is_empty() {
@@ -1028,7 +1003,7 @@ async fn run_chat(
                     .detach_conversation_directory_index(&projection.session_id, workspace_id)
                     .await
                     .map_err(|error| error.to_string())?;
-                println!("目录索引已移除；运行中的 run 保留其冻结快照。");
+                println!("目录已移除，下次运行生效。");
             }
             value if value.starts_with('@') => {
                 let query = value.trim_start_matches('@').trim();
@@ -1191,13 +1166,6 @@ async fn refresh_projection(
         .map_err(|error| error.to_string())
 }
 
-fn is_plan_confirmation_input(input: &str) -> bool {
-    matches!(
-        input.trim().to_ascii_lowercase().as_str(),
-        "1" | "y" | "yes" | "confirm"
-    ) || matches!(input.trim(), "确认" | "同意")
-}
-
 fn outcome_for_projection(projection: &SessionProjection) -> Option<Outcome> {
     outcome_for_status(&projection.run.as_ref()?.status)
 }
@@ -1234,6 +1202,7 @@ fn new_id(kind: &str) -> String {
 }
 
 fn print_help() {
+    println!("模型服务：connections | auth login <connection-id|openai-codex> [browser|device] | auth status | auth logout <id> | quota <id> | usage [connection-id|all] [days=30]\nask/chat 支持 --model <profile-id>；usage 使用 UTC 日界线。");
     println!(
         r#"DeepCode 本地编码 Agent
 
@@ -1252,69 +1221,17 @@ fn print_help() {
   deepcode-cli stop-host
   deepcode-cli status
 
-只有显式 -C/--workspace 会为新 Session 创建 creation binding；已有 Session 通过 attach-directory/detach-directory 管理对话目录索引。
-chat 普通文本随时发送，运行中按序排队；/reply 1 确认 Plan，/reply <说明> 修订 Plan 或回答交互，/reply 1/2 允许/拒绝 effect；cancel-plan 明确取消 Plan。
-文件与目录引用只在 ask 中显式选择；--file 与 --directory 均可重复，文件内容不会嵌入首轮 Provider 请求。
-插件只在 ask/chat 中显式选择；--plugin 可重复。PDF 文件按 mediaType 要求一个已配置的 Skill 插件。交互 chat 使用 @ 查看并选择下一次请求的插件，/focus <task> 作为类型化命令提交。
-所有终端命令都通过 ConversationPort，并只读取共享 SessionProjection。"#,
+使用 -C/--workspace 为新对话指定工作目录；已有对话通过 attach-directory/detach-directory 管理目录。
+chat 普通文本随时发送，运行中按序排队；/reply 1 确认计划，/reply <说明> 修改计划或回答问题，/reply 1/2 允许/拒绝操作；cancel-plan 取消计划。
+文件与目录引用只在 ask 中显式选择；--file 与 --directory 均可重复。图片以视觉内容发送给支持图片的模型，其他文件保留只读引用。
+ask/chat 支持重复使用 --plugin 指定插件；Agent 也可按任务发现并加载已启用插件。PDF 文件需要已配置且支持 PDF 的 Skill。chat 使用 @ 选择下一次请求的插件，/focus <task> 开始任务。"#,
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn waiting_projection(field: &str, decision: serde_json::Value) -> SessionProjection {
-        let mut value = json!({
-            "schemaVersion": deepcode_kernel_client::SESSION_PROJECTION_VERSION,
-            "sessionId":"session:test", "revision":1, "display":{"creationTitle":"input"},
-            "workspaceBindings":[], "sessionDirectoryIndexes":[], "timeline":[], "messages":[],
-            "queuedInputs":[], "narratives":[], "plans":[], "contextCompositions":[],
-            "tokenUsageHistory":[], "activities":[], "artifacts":[],
-            "tokenUsage":{"providerCallCount":0,"reportedCallCount":0,"inputTokens":0,"outputTokens":0,
-              "cacheReadInputTokens":0,"cacheMissInputTokens":0,"cacheAvailable":false,"cacheComplete":false},
-            "run":{"runId":"run:test","profileId":"profile:current","workspaceBindings":[],"status":"waiting"}
-        });
-        value[field] = decision;
-        serde_json::from_value(value).unwrap()
-    }
-
-    fn pending_decisions() -> [(
-        &'static str,
-        serde_json::Value,
-        &'static str,
-        &'static str,
-        serde_json::Value,
-    ); 3] {
-        [
-            (
-                "pendingPlan",
-                json!({"planId":"plan:test","revision":1,"runId":"run:test","callId":"call:plan",
-                "title":"Plan","summary":"Review","steps":[],"mutationManifest":[],"status":"published",
-                "responseMode":"confirmReviseOrCancel","sequence":1,"createdAt":"now","updatedAt":"now"}),
-                "plan.respond",
-                "response",
-                json!({"kind":"confirm"}),
-            ),
-            (
-                "pendingInteraction",
-                json!({"interactionId":"interaction:test","runId":"run:test","callId":"call:question",
-                "kind":"question","prompt":"Choose","options":[{"id":"a","label":"Option A"}],
-                "allowFreeform":true,"sequence":1,"createdAt":"now"}),
-                "interaction.respond",
-                "response",
-                json!("Option A"),
-            ),
-            (
-                "pendingApproval",
-                json!({"approvalId":"approval:test","runId":"run:test","callId":"call:effect",
-                "preview":{"summary":"Write","effects":[],"logicalTargets":[]},"sequence":1,"createdAt":"now"}),
-                "approval.respond",
-                "decision",
-                json!("allow"),
-            ),
-        ]
-    }
+    use crate::conversation_input::fixtures::{pending_decisions, waiting_projection};
 
     #[test]
     fn pending_plain_input_queues_while_explicit_reply_keeps_decision_semantics() {

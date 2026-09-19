@@ -1,4 +1,9 @@
 mod app;
+#[path = "../../shared/conversation_input.rs"]
+mod conversation_input;
+#[path = "../../shared/i18n.rs"]
+mod i18n;
+use i18n::Language;
 mod markdown;
 mod renderer;
 
@@ -24,16 +29,19 @@ const EXIT_ACTION_REQUIRED: i32 = 5;
 
 #[tokio::main]
 async fn main() {
-    let args = match Args::parse(env::args().skip(1).collect()) {
+    let values: Vec<String> = env::args().skip(1).collect();
+    // Language used before connecting only affects startup diagnostics.
+    let mut language = startup_language(&values);
+    let args = match Args::parse(values) {
         Ok(args) => args,
         Err(error) => {
             eprintln!("{error}");
-            print_help();
+            print_help(language);
             std::process::exit(2);
         }
     };
     if args.help {
-        print_help();
+        print_help(language);
         return;
     }
     let bootstrap = match KernelBootstrap::connect(
@@ -43,7 +51,17 @@ async fn main() {
     {
         Ok(bootstrap) => bootstrap,
         Err(error) => {
-            eprintln!("DeepCode TUI 无法连接 Daemon：{error}");
+            eprintln!(
+                "{}",
+                language.format("tui.connectionFailed", &[error.to_string()])
+            );
+            std::process::exit(1);
+        }
+    };
+    language = match language_for_app(bootstrap.client(), args.language).await {
+        Ok(language) => language,
+        Err(error) => {
+            eprintln!("{}", language.format("tui.settingsReadFailed", &[error]));
             std::process::exit(1);
         }
     };
@@ -51,13 +69,14 @@ async fn main() {
         bootstrap.client().clone(),
         Renderer::default(),
         TuiHostOptions {
+            language,
             workspace_path: args.workspace,
             session_id: args.session_id,
             plugin_uris: args.plugins,
         },
     );
     if let Err(error) = app.bootstrap().await {
-        eprintln!("DeepCode TUI 初始化失败：{error}");
+        eprintln!("{}", language.format("tui.initializationFailed", &[error]));
         std::process::exit(1);
     }
 
@@ -78,13 +97,37 @@ async fn main() {
         }
         Ok(None) => {}
         Err(error) => {
-            eprintln!("DeepCode TUI 失败：{error}");
+            eprintln!("{}", language.format("tui.failed", &[error.to_string()]));
             std::process::exit(1);
         }
     }
 }
 
+fn startup_language(values: &[String]) -> Language {
+    values
+        .windows(2)
+        .filter(|pair| pair[0] == "--language")
+        .filter_map(|pair| Language::parse(&pair[1]))
+        .last()
+        .unwrap_or_default()
+}
+
+async fn language_for_app(
+    client: &deepcode_kernel_client::HttpKernelClient,
+    explicit: Option<Language>,
+) -> Result<Language, String> {
+    if let Some(language) = explicit {
+        return Ok(language);
+    }
+    let settings = client
+        .user_settings()
+        .await
+        .map_err(|error| error.to_string())?;
+    Language::from_settings(&settings)
+}
+
 struct Args {
+    language: Option<Language>,
     api: Option<String>,
     help: bool,
     smoke: bool,
@@ -96,7 +139,9 @@ struct Args {
 
 impl Args {
     fn parse(values: Vec<String>) -> Result<Self, String> {
+        let language = startup_language(&values);
         let mut parsed = Self {
+            language: None,
             api: None,
             help: false,
             smoke: false,
@@ -110,41 +155,51 @@ impl Args {
             match values[index].as_str() {
                 "--help" | "-h" => parsed.help = true,
                 "--smoke" => parsed.smoke = true,
+                "--language" => {
+                    index += 1;
+                    let value = required_arg(language, &values, index, "--language")?;
+                    parsed.language = Some(Language::parse(value).ok_or_else(|| {
+                        language.format("tui.languageInvalid", &[value.to_string()])
+                    })?);
+                }
                 "--api" => {
                     index += 1;
-                    parsed.api = Some(required_arg(&values, index, "--api")?.to_string());
+                    parsed.api = Some(required_arg(language, &values, index, "--api")?.to_string());
                 }
                 "--no-auto-start-kernel" => parsed.no_auto_start_kernel = true,
                 "--workspace" | "-C" => {
                     index += 1;
-                    parsed.workspace =
-                        Some(PathBuf::from(required_arg(&values, index, "--workspace")?));
+                    parsed.workspace = Some(PathBuf::from(required_arg(
+                        language,
+                        &values,
+                        index,
+                        "--workspace",
+                    )?));
                 }
                 "--session" => {
                     index += 1;
                     parsed.session_id =
-                        Some(required_arg(&values, index, "--session")?.to_string());
+                        Some(required_arg(language, &values, index, "--session")?.to_string());
                 }
                 "--plugin" => {
                     index += 1;
                     parsed
                         .plugins
-                        .push(required_arg(&values, index, "--plugin")?.to_string());
+                        .push(required_arg(language, &values, index, "--plugin")?.to_string());
                 }
-                value => return Err(format!("未知选项：{value}")),
+                value => return Err(language.format("tui.unknownOption", &[value.to_string()])),
             }
             index += 1;
         }
         if parsed.session_id.is_some() && parsed.workspace.is_some() {
-            return Err(
-                "--session 指向已有 creation snapshot，不能同时使用 -C/--workspace。".to_string(),
-            );
+            return Err(language.text("tui.sessionWorkspaceConflict").to_string());
         }
         Ok(parsed)
     }
 }
 
 async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
+    let language = app.language();
     let _guard = TerminalGuard::enter()?;
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
@@ -168,7 +223,7 @@ async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
                 continue;
             };
             input_task = spawn_terminal_event_task();
-            let Some(next_event) = terminal_event_result(event_task_result)? else {
+            let Some(next_event) = terminal_event_result(language, event_task_result)? else {
                 continue;
             };
             let keep_running = match next_event {
@@ -178,7 +233,9 @@ async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
                         false
                     }
                     KeyCode::Esc => {
-                        if app.plugin_picker_open() {
+                        if app.model_picker_open() {
+                            app.model_picker_back();
+                        } else if app.plugin_picker_open() {
                             app.dismiss_plugin_picker();
                         } else {
                             app.clear_input();
@@ -190,7 +247,10 @@ async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
                         true
                     }
                     KeyCode::Enter => {
-                        if app.plugin_picker_open() && app.plugin_picker_select() {
+                        if app.model_picker_open() {
+                            app.model_picker_select();
+                            true
+                        } else if app.plugin_picker_open() && app.plugin_picker_select() {
                             true
                         } else {
                             let input = app.take_input();
@@ -198,11 +258,21 @@ async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
                         }
                     }
                     KeyCode::Tab => {
-                        if app.plugin_picker_open() {
+                        if app.model_picker_open() {
+                            app.model_picker_select();
+                        } else if app.plugin_picker_open() {
                             app.plugin_picker_select();
                         } else {
                             app.push_input('\t');
                         }
+                        true
+                    }
+                    KeyCode::Up if app.model_picker_open() => {
+                        app.model_picker_move(-1);
+                        true
+                    }
+                    KeyCode::Down if app.model_picker_open() => {
+                        app.model_picker_move(1);
                         true
                     }
                     KeyCode::Up if app.plugin_picker_open() => {
@@ -247,7 +317,7 @@ async fn run_terminal(mut app: TuiApp) -> io::Result<()> {
         }
     }
     .await;
-    let pump_result = terminal_event_result(input_task.await).map(|_| ());
+    let pump_result = terminal_event_result(language, input_task.await).map(|_| ());
     match loop_result {
         Err(error) => Err(error),
         Ok(()) => pump_result,
@@ -265,9 +335,12 @@ fn spawn_terminal_event_task() -> tokio::task::JoinHandle<io::Result<Option<Cros
 }
 
 fn terminal_event_result(
+    language: Language,
     result: Result<io::Result<Option<CrosstermEvent>>, tokio::task::JoinError>,
 ) -> io::Result<Option<CrosstermEvent>> {
-    result.map_err(|error| io::Error::other(format!("terminal event pump failed: {error}")))?
+    result.map_err(|error| {
+        io::Error::other(language.format("tui.terminalEventFailed", &[error.to_string()]))
+    })?
 }
 
 async fn run_plain(mut app: TuiApp) -> io::Result<Option<String>> {
@@ -351,27 +424,20 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn required_arg<'a>(values: &'a [String], index: usize, option: &str) -> Result<&'a str, String> {
+fn required_arg<'a>(
+    language: Language,
+    values: &'a [String],
+    index: usize,
+    option: &str,
+) -> Result<&'a str, String> {
     values
         .get(index)
         .map(String::as_str)
-        .ok_or_else(|| format!("{option} 缺少参数。"))
+        .ok_or_else(|| language.format("tui.missingArgument", &[option.to_string()]))
 }
 
-fn print_help() {
-    println!(
-        r#"DeepCode TUI
-
-用法：
-  deepcode-tui [-C <workspace>] [--session <id>] [--plugin <plugin://uri>]...
-  deepcode-tui --smoke
-
-只有显式 -C/--workspace 会给新 Session 创建 workspace binding。
---plugin 可重复且只选择下一次请求的插件；交互输入 @ 打开同一插件目录。
-普通文本随时发送，运行中按序排队；/reply 1 确认 Plan，/reply <说明> 修订 Plan 或回答交互；/reply 1/2 允许/拒绝 effect；/cancel-plan 取消 Plan，/cancel 或 Ctrl-C 取消运行；Esc 清空输入。
-普通文本、/focus <task>、/attach <path>、/detach <workspace-id>、/cancel-plan、/model <profile>、/cancel 都通过 ConversationPort。
-上下文视图：/context。"#,
-    );
+fn print_help(language: Language) {
+    println!("{}", language.text("tui.help"));
 }
 
 #[cfg(test)]
@@ -394,5 +460,49 @@ mod tests {
                 "plugin://pdf@builtin".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn language_argument_selects_help_and_rejects_invalid_values() {
+        use super::{startup_language, Language};
+        for (locale, language, usage) in [
+            ("zh-CN", Language::ZhCn, "用法："),
+            ("en-US", Language::EnUs, "Usage:"),
+        ] {
+            let values = vec!["--help".into(), "--language".into(), locale.into()];
+            assert_eq!(startup_language(&values), language);
+            let args = Args::parse(values).unwrap();
+            assert_eq!(args.language, Some(language));
+            assert!(args.help);
+            assert!(language.text("tui.help").contains(usage));
+            assert!(language.text("tui.help").contains("--language zh-CN|en-US"));
+        }
+        assert_eq!(Args::parse(vec![]).unwrap().language, None);
+        assert!(Args::parse(vec!["--language".into()]).is_err());
+        assert!(Args::parse(vec!["--language".into(), "fr-FR".into()]).is_err());
+        assert!(Args::parse(vec![
+            "--language".into(),
+            "en-US".into(),
+            "--unknown".into()
+        ])
+        .err()
+        .unwrap()
+        .contains("Unknown option: --unknown"));
+    }
+
+    #[tokio::test]
+    async fn explicit_language_bypasses_settings_but_read_failure_is_returned() {
+        use super::{language_for_app, Language};
+        use deepcode_kernel_client::{HttpKernelClient, KernelClientConfig};
+        let client = HttpKernelClient::new(
+            KernelClientConfig::new("http://127.0.0.1:0")
+                .with_host_shell_token(format!("dchost_{}", "01".repeat(32))),
+        )
+        .unwrap();
+        assert_eq!(
+            language_for_app(&client, Some(Language::EnUs)).await,
+            Ok(Language::EnUs)
+        );
+        assert!(language_for_app(&client, None).await.is_err());
     }
 }

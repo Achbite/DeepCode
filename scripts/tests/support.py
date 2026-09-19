@@ -92,7 +92,7 @@ class OwnedDaemon:
         environment.update({
             "DEEPCODE_HOST": "127.0.0.1",
             "DEEPCODE_PORT": str(self.port),
-            "DEEPCODE_CONFIG_DIR": str(self.config_root),
+            "DEEPCODE_USER_ROOT": str(self.config_root),
             "DEEPCODE_HOST_SHELL_TOKEN": self.token,
             "DEEPCODE_HOST_INSTANCE_ID": self.instance_id,
             "DEEPCODE_SESSION_BRIDGE": str(SESSION_BRIDGE),
@@ -269,7 +269,7 @@ def projection(daemon: OwnedDaemon, session_id: str) -> dict[str, Any]:
         token=daemon.token,
     )
     require(isinstance(value, dict), "SessionProjection 不是对象")
-    require(value.get("schemaVersion") == "deepcode.session-projection.v5", "投影协议不是当前值")
+    require(value.get("schemaVersion") == "deepcode.session-projection.v6", "投影协议不是当前值")
     require(value.get("sessionId") == session_id, "SessionProjection identity 漂移")
     return value
 
@@ -415,7 +415,7 @@ class ProviderState:
                 names["bash"] = function["name"]
             elif "mutationManifest" in properties:
                 names["plan"] = function["name"]
-            elif "sourceFactRef" in properties:
+            elif "items" in properties and "status" in properties["items"].get("items", {}).get("properties", {}):
                 names["progress"] = function["name"]
         require({"read", "edit", "write", "bash", "plan", "progress"} <= names.keys(), f"缺少本次工具目录：{names}")
         return ordinal, names, results

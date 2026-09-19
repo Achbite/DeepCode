@@ -1,6 +1,6 @@
 import { t } from '../../i18n';
 import { useUiLanguage } from '../../useUiLanguage';
-import React, { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   nativeBrowserCommand,
   nativeHostBinding,
@@ -10,38 +10,48 @@ import {
   type NativePage,
 } from '../../services/nativeBrowser';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
+import { type BrowserAnnotation, type BrowserReviewEdit } from './browserReview';
 
 export function NativeBrowserPreview({
   sessionId,
   active,
   onClose,
   onReady,
-  initialUrl,
-  initialPath,
-  initialPreviewId,
-  selfPreview,
+  previewId,
+  onReview,
+  reviewEdit,
 }: {
   sessionId: string;
   active: boolean;
   onClose(): void;
   onReady(page: NativePage, binding: NativeHostBinding): void;
-  initialUrl?: string;
-  initialPath?: string;
-  initialPreviewId?: string;
-  selfPreview?: boolean;
+  previewId: string;
+  onReview?: (annotation: BrowserAnnotation, previewId: string, screenshot?: string) => void;
+  reviewEdit?: BrowserReviewEdit | null;
 }) {
-  const callbacks = useRef({ onClose, onReady });
-  callbacks.current = { onClose, onReady };
+  const callbacks = useRef({ onClose, onReady, onReview });
+  callbacks.current = { onClose, onReady, onReview };
   const surface = useRef<HTMLDivElement>(null);
-  const owner = useRef<{ binding: NativeHostBinding; page: NativePage; owned: boolean } | null>(
+  const owner = useRef<{ binding: NativeHostBinding; page: NativePage } | null>(
     null,
   );
   const language = useUiLanguage();
   const [page, setPage] = useState<NativePage | null>(null);
-  const [url, setUrl] = useState(initialUrl ?? '');
+  const [url, setUrl] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [editingAddress, setEditingAddress] = useState(false);
+  const [reviewing, setReviewing] = useState(false);
+  const [reviewOptions, setReviewOptions] = useState<{ annotation?: BrowserAnnotation }>({});
+  const handledEdit = useRef<string | null>(null);
+  const startReview = () => { setError(null); setReviewOptions({}); setReviewing(true); };
+  useEffect(() => {
+    if (!reviewEdit || !active || page?.status !== 'ready' || handledEdit.current === reviewEdit.requestId) return;
+    handledEdit.current = reviewEdit.requestId;
+    setError(null);
+    setReviewOptions({ annotation: reviewEdit.annotation });
+    setReviewing(true);
+  }, [reviewEdit?.requestId, active, page?.status]);
   const shortAddress = () => {
     try {
       const address = new URL(url);
@@ -61,6 +71,23 @@ export function NativeBrowserPreview({
       ...input,
     });
   };
+  const updateLayout = useCallback(async () => {
+    const current = owner.current;
+    if (!surface.current || !current) return null;
+    const rect = surface.current.getBoundingClientRect();
+    const overlay = Boolean(document.querySelector(
+      'dialog[open], [role="dialog"][aria-modal="true"], .deepcode-local-agent-overlay, .settings-center-overlay, details[data-native-overlay][open], [data-native-overlay]:not(details)',
+    ));
+    return nativeBrowserCommand<NativePage>(current.binding, {
+      action: 'layout',
+      previewId: current.page.previewId,
+      visible: active && !overlay && rect.width > 0 && rect.height > 0,
+      x: Math.max(0, rect.x),
+      y: Math.max(0, rect.y),
+      width: rect.width,
+      height: rect.height,
+    });
+  }, [active]);
   useEffect(() => {
     let ended = false;
     const create = async () => {
@@ -69,21 +96,10 @@ export function NativeBrowserPreview({
       binding.sessionId = sessionId;
       const page = await nativeBrowserCommand<NativePage>(
         binding,
-        initialPreviewId
-          ? { action: 'status', previewId: initialPreviewId }
-          : selfPreview
-            ? { action: 'openSelf' }
-            : {
-                action: 'open',
-                ...(initialPath ? { filePath: initialPath } : nativeNavigationInput(initialUrl ?? '')),
-              },
+        { action: 'status', previewId },
       );
-      if (ended) {
-        if (!initialPreviewId)
-          await nativeBrowserCommand(binding, { action: 'close', previewId: page.previewId });
-        return;
-      }
-      owner.current = { binding, page, owned: !initialPreviewId };
+      if (ended) return;
+      owner.current = { binding, page };
       setPage(page);
       setUrl(page.url);
       callbacks.current.onReady(page, binding);
@@ -97,12 +113,12 @@ export function NativeBrowserPreview({
       owner.current = null;
       if (current)
         void nativeBrowserCommand(current.binding, {
-          action: current.owned ? 'close' : 'layout',
+          action: 'layout',
           previewId: current.page.previewId,
           visible: false,
         }).catch(console.error);
     };
-  }, [sessionId, initialPreviewId, initialPath, initialUrl, selfPreview]);
+  }, [sessionId, previewId]);
   useEffect(() => {
     let ended = false;
     let unlisten: (() => void) | undefined;
@@ -134,20 +150,7 @@ export function NativeBrowserPreview({
       cancelAnimationFrame(scheduled);
       scheduled = requestAnimationFrame(() => {
         if (ended || !surface.current || !owner.current) return;
-        const rect = surface.current.getBoundingClientRect();
-        const overlay = Boolean(
-          document.querySelector(
-            'dialog[open], [role="dialog"][aria-modal="true"], .deepcode-local-agent-overlay, .settings-center-overlay, details[data-native-overlay][open], [data-native-overlay]:not(details)',
-          ),
-        );
-        void command({
-          action: 'layout',
-          visible: active && !overlay && rect.width > 0 && rect.height > 0,
-          x: Math.max(0, rect.x),
-          y: Math.max(0, rect.y),
-          width: rect.width,
-          height: rect.height,
-        }).catch((reason: unknown) => {
+        void updateLayout().catch((reason: unknown) => {
           if (!ended) setError(String(reason));
         });
       });
@@ -172,7 +175,7 @@ export function NativeBrowserPreview({
       window.removeEventListener('resize', layout);
       window.removeEventListener('scroll', layout, true);
     };
-  }, [page?.previewId, page?.status, active]);
+  }, [page?.previewId, page?.status, updateLayout]);
   const act = async (action: Record<string, unknown>) => {
     setBusy(true);
     setError(null);
@@ -190,6 +193,52 @@ export function NativeBrowserPreview({
       setBusy(false);
     }
   };
+  useEffect(() => {
+    if (!reviewing || !active || page?.status !== 'ready' || !owner.current) return;
+    const current = owner.current;
+    let ended = false, timer = 0;
+    const delivered = new Set<string>();
+    const reviewId = crypto.randomUUID();
+    const request = <T,>(input: Record<string, unknown>) => nativeBrowserCommand<T>(current.binding, { previewId: current.page.previewId, reviewId, ...input });
+    const read = async () => {
+      try {
+        const state = await request<{ active: boolean; exitReason: string | null; pending: BrowserAnnotation | null }>({ action: 'reviewRead' });
+        if (ended) return;
+        if (!state.active) { if (state.exitReason === 'escape') setReviewing(false); return; }
+        if (state.pending) {
+          const note = state.pending;
+          if (!delivered.has(note.id)) {
+            const status = await request<{ captureAvailable: boolean }>({ action: 'hostStatus' });
+            const screenshot = status.captureAvailable ? await request<{ contentRef: string }>({ action: 'capture' }) : null;
+            if (ended) return;
+            callbacks.current.onReview?.(note, current.page.previewId, screenshot?.contentRef);
+            delivered.add(note.id);
+          }
+          await request({ action: 'reviewAcknowledge', id: note.id });
+        }
+        if (!ended) timer = window.setTimeout(read, 400);
+      } catch (reason) {
+        if (!ended) { setError(String(reason)); }
+      }
+    };
+    const begin = async () => {
+      // Reopening a draft can mount a hidden native page. Its layout must be
+      // acknowledged before the review command checks visibility and geometry.
+      const displayed = await updateLayout();
+      if (ended) return;
+      if (!displayed?.visible) throw new Error(t(language, 'reader.annotation.covered'));
+      await request({ action: 'reviewStart', labels: Object.fromEntries(
+        ['annotation', 'comment', 'placeholder', 'cancel', 'save', 'hint', 'pageChanged', 'viewportChanged', 'notVisible'].map(key => [key, t(language, `reader.annotation.${key}`)])), ...reviewOptions });
+      if (!ended) void read();
+      else void request({ action: 'reviewEnd' }).catch(console.error);
+    };
+    void begin()
+      .catch(reason => { if (!ended) { setError(String(reason)); } });
+    return () => {
+      ended = true; clearTimeout(timer);
+      void request({ action: 'reviewEnd' }).catch(console.error);
+    };
+  }, [reviewing, active, page?.previewId, page?.status, language, reviewOptions, updateLayout]);
   return (
     <section className="native-browser-preview">
       <form
@@ -222,6 +271,18 @@ export function NativeBrowserPreview({
         >
           <DeepCodeShellIcon name="refresh" />
         </button>
+        {reviewing ? <div className="native-browser-review-controls" onKeyDown={event => { if (event.key === 'Escape') { event.preventDefault(); setReviewing(false); } }}>
+          <span title={t(language, 'reader.annotation.hint')}>{t(language, 'reader.annotation.gesture')}</span>
+          <kbd>esc</kbd><button type="button" aria-label={t(language, 'reader.annotation.exit')} onClick={() => setReviewing(false)}><DeepCodeShellIcon name="close" size={14} /></button>
+        </div> : <button
+          disabled={!page || page.status !== 'ready' || busy || !onReview}
+          type="button"
+          onClick={startReview}
+          title={t(language, 'reader.annotation.hint')}
+        >
+          <DeepCodeShellIcon name="compose" />
+          <span>{t(language, 'reader.annotation.annotation')}</span>
+        </button>}
       </form>
       {error && (
         <p role="alert" className="local-agent__resource-error">

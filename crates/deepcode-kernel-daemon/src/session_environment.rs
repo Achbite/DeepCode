@@ -50,7 +50,7 @@ pub(crate) fn prepare(
     let locale = system_locale();
     let preference = response_language_setting(settings)?;
     let shell = selected_shell(settings);
-    let execution_path = shell_environment::resolved_agent_shell_path().map_err(|error| error.to_string())?;
+    let execution_path = host_execution_path(configuration["revision"].as_u64().unwrap_or(0))?;
     let path_directories = std::env::split_paths(&execution_path).collect::<Vec<_>>();
     let command_paths: serde_json::Map<String, Value> = [
         "git", "rg", "node", "npm", "pnpm", "python", "python3", "cargo", "rustc", "go", "java",
@@ -58,7 +58,8 @@ pub(crate) fn prepare(
     ]
     .into_iter()
     .filter_map(|name| {
-        shell_environment::find_command_in(name, &path_directories).map(|path| (name.to_string(), json!(path)))
+        shell_environment::find_command_in(name, &path_directories)
+            .map(|path| (name.to_string(), json!(path)))
     })
     .collect();
     let commands: Vec<_> = command_paths.keys().cloned().collect();
@@ -79,6 +80,43 @@ pub(crate) fn prepare(
         "workspaceShellSupported": sandbox.available,
         "workspaceSandbox": sandbox,
     }))
+}
+
+/// The macOS GUI does not inherit the user's terminal startup environment.
+/// Capture its PATH once per Host refresh, then share it between discovery and execution.
+fn host_execution_path(_revision: u64) -> Result<std::ffi::OsString, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::{Mutex, OnceLock};
+        type CapturedPath = Option<(u64, Result<std::ffi::OsString, String>)>;
+        static USER_PATH: OnceLock<Mutex<CapturedPath>> = OnceLock::new();
+        let mut captured = USER_PATH
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if captured
+            .as_ref()
+            .is_none_or(|(revision, _)| *revision != _revision)
+        {
+            let path = std::env::var_os("SHELL")
+                .ok_or_else(|| "host_shell_environment_failed: user SHELL is not set".to_string())
+                .and_then(|shell| {
+                    shell_environment::login_shell_path(std::path::Path::new(&shell))
+                        .map_err(|error| error.to_string())
+                });
+            *captured = Some((_revision, path));
+        }
+        let path = captured
+            .as_ref()
+            .expect("captured user PATH")
+            .1
+            .as_ref()
+            .map_err(Clone::clone)?;
+        shell_environment::resolved_agent_shell_path_from(Some(path))
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    shell_environment::resolved_agent_shell_path().map_err(|error| error.to_string())
 }
 
 fn validate_snapshot(snapshot: &Value) -> Result<(), String> {
@@ -192,7 +230,19 @@ pub(crate) fn project_environments(settings: &Value) -> Result<Value, String> {
             .as_object()
             .ok_or("Project execution environment must be an object")?;
         match target["kind"].as_str() {
-            Some("native") if object.len() == 1 => {}
+            Some("native")
+                if object
+                    .keys()
+                    .all(|key| ["kind", "shell", "gitBashPath"].contains(&key.as_str()))
+                    && target.get("shell").is_none_or(|value| {
+                        matches!(
+                            value.as_str(),
+                            Some("auto" | "powershell7" | "windowsPowerShell" | "gitBash")
+                        )
+                    })
+                    && target.get("gitBashPath").is_none_or(|value| {
+                        value.as_str().is_some_and(|path| !path.contains('\0'))
+                    }) => {}
             Some("wsl")
                 if object.len() == 3
                     && ["distribution", "worker"].iter().all(|key| {
@@ -209,6 +259,23 @@ pub(crate) fn project_environments(settings: &Value) -> Result<Value, String> {
         }
     }
     Ok(value)
+}
+
+pub(crate) fn apply_project_environment(settings: &mut Value, target: &Value) {
+    if target["kind"] == "native" {
+        settings["_executionTarget"] = json!({"kind":"native"});
+        if let Some(shell) = target.get("shell") {
+            settings["agent.windows.shell"] = shell.clone();
+        }
+        if target["shell"] == "gitBash" {
+            settings["agent.windows.gitBashPath"] = target
+                .get("gitBashPath")
+                .cloned()
+                .unwrap_or_else(|| json!(""));
+        }
+    } else {
+        settings["_executionTarget"] = target.clone();
+    }
 }
 
 pub(crate) fn response_language_setting(settings: &Value) -> Result<&str, String> {
@@ -304,6 +371,29 @@ fn system_locale() -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn project_shell_configuration_is_scoped_and_keeps_native_execution_target() {
+        let settings =
+            json!({"agent.windows.shell":"auto","agent.windows.gitBashPath":"global-bash"});
+        let mut project = settings.clone();
+        apply_project_environment(
+            &mut project,
+            &json!({"kind":"native","shell":"gitBash","gitBashPath":"project-bash"}),
+        );
+        assert_eq!(project["agent.windows.shell"], "gitBash");
+        assert_eq!(project["agent.windows.gitBashPath"], "project-bash");
+        assert_eq!(project["_executionTarget"], json!({"kind":"native"}));
+        assert_eq!(settings["agent.windows.shell"], "auto");
+        assert!(project_environments(
+            &json!({"agent.projectEnvironments":r#"{"p":{"kind":"native","shell":"powershell7"}}"#})
+        )
+        .is_ok());
+        assert!(project_environments(
+            &json!({"agent.projectEnvironments":r#"{"p":{"kind":"native","shell":"unknown"}}"#})
+        )
+        .is_err());
+    }
+
     #[cfg(windows)]
     #[test]
     fn store_shell_snapshot_refreshes_for_new_runs_but_not_during_restore() {
@@ -344,9 +434,13 @@ mod tests {
         assert_ne!(rechecked["developerCommands"], saved["developerCommands"]);
         assert_eq!(rechecked["configuration"], saved["configuration"]);
         for (name, path) in rechecked["commandPaths"].as_object().unwrap() {
+            let directories = std::env::split_paths(std::ffi::OsStr::new(
+                rechecked["executionPath"].as_str().unwrap(),
+            ))
+            .collect::<Vec<_>>();
             assert_eq!(
                 Some(PathBuf::from(path.as_str().unwrap())),
-                shell_environment::find_command(name)
+                shell_environment::find_command_in(name, &directories)
             );
         }
         assert_eq!(

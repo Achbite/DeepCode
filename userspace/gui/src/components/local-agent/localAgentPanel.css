@@ -153,26 +153,20 @@
   height: 100%;
   min-height: 0;
   overflow: auto;
-  scrollbar-gutter: stable;
   overflow-anchor: none;
 }
 
+/* This viewport keeps keyboard scrolling and restored focus without a control outline. */
+:root[data-product='deepcode-gui'] .local-agent__body:focus {
+  outline: none;
+}
+
 /* Keep wheel, touch and keyboard scrolling; the conversation rail provides navigation. */
-:root[data-product='deepcode-gui'] :is(
-  .local-agent__body,
-  .local-agent__interaction-document-scroll,
-  .local-agent__composer textarea,
-  .conversation-answered-question-body
-) {
+:root[data-product='deepcode-gui'] .local-agent__body {
   scrollbar-width: none;
 }
 
-:root[data-product='deepcode-gui'] :is(
-  .local-agent__body,
-  .local-agent__interaction-document-scroll,
-  .local-agent__composer textarea,
-  .conversation-answered-question-body
-)::-webkit-scrollbar {
+:root[data-product='deepcode-gui'] .local-agent__body::-webkit-scrollbar {
   display: none;
 }
 
@@ -195,11 +189,6 @@
   flex-direction: column;
   max-height: min(360px, 55vh);
   overflow-y: auto;
-  scrollbar-width: none;
-}
-
-.conversation-navigation__ticks::-webkit-scrollbar {
-  display: none;
 }
 
 /* Override the shared .local-agent button surface without changing other controls. */
@@ -1265,7 +1254,6 @@
   min-height: 0;
   overflow: auto;
   overscroll-behavior: contain;
-  scrollbar-width: thin;
 }
 
 :root[data-product='deepcode-gui'] .local-agent__interaction-document-scroll:focus-visible {
@@ -1332,7 +1320,6 @@
   max-height: 280px;
   overflow: auto;
   overscroll-behavior: contain;
-  scrollbar-width: thin;
 }
 
 .local-agent .local-agent__interaction-close {
@@ -1497,9 +1484,13 @@
 }
 
 .local-agent__button--primary {
-  border-color: var(--dc-accent) !important;
-  background: var(--dc-accent) !important;
-  color: var(--dc-accent-contrast) !important;
+  border-color: var(--dc-control-border) !important;
+  background: var(--dc-control-background) !important;
+  color: var(--dc-control-foreground) !important;
+}
+
+.local-agent__button--primary:is(:hover, :focus-visible):not(:disabled) {
+  background: var(--dc-surface-hover) !important;
 }
 
 .local-agent__button--danger {
@@ -1832,7 +1823,8 @@
   color: var(--dc-accent) !important;
 }
 
-.local-agent__draft-attachments button {
+.local-agent__draft-attachments > span > button {
+  flex: 0 0 18px;
   width: 18px;
   min-height: 18px !important;
   padding: 0 !important;
@@ -1842,8 +1834,8 @@
   opacity: 0;
 }
 
-.local-agent__draft-attachments > span:hover button,
-.local-agent__draft-attachments button:focus-visible {
+.local-agent__draft-attachments > span:hover > button,
+.local-agent__draft-attachments > span > button:focus-visible {
   opacity: 1;
 }
 
@@ -2323,3 +2315,16 @@
 .local-agent__recovery-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
 .local-agent__recovery-actions button { font:inherit; color:inherit; background:var(--dc-surface); border:1px solid var(--dc-border); border-radius:8px; padding:6px 12px; cursor:pointer; }
 .local-agent__recovery-actions button:disabled { opacity:0.5; cursor:default; }
+
+.local-agent__draft-attachments { flex-wrap: nowrap; align-items: flex-start; min-width: 0; overflow-x: auto; overflow-y: hidden; overflow-anchor: none; overscroll-behavior-x: contain; }
+.local-agent__draft-attachments > * { flex-shrink: 0; }
+.local-agent__draft-attachments > span { max-width: min(240px, 100%); min-height: 42px; margin: 2px 0; box-sizing: border-box; }
+.local-agent__attachment-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.local-agent__draft-attachments > .local-agent__pasted-text { flex-basis: min(300px, 100%); min-width: 0; margin-block: 2px; }
+.local-agent__browser-annotation { display: flex; flex: 0 0 min(220px, 100%); min-width: 0; align-items: center; gap: 4px; margin: 2px 0; border: 1px solid var(--dc-border); border-radius: 8px; padding: 5px; box-sizing: border-box; }
+.local-agent__browser-annotation .local-agent__annotation-edit { min-width: 0; min-height: 0; flex: 1; display: flex; align-items: flex-start; gap: 6px; padding: 1px; text-align: left; border: 0; color: var(--dc-foreground); background: transparent; }
+.local-agent__annotation-edit > svg { flex: none; margin-top: 2px; }
+.local-agent__annotation-edit > span { min-width: 0; flex: 1; display: grid; gap: 2px; }
+.local-agent__annotation-edit strong, .local-agent__annotation-edit small { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: var(--dc-font-caption); line-height: 1.4; }
+.local-agent__annotation-edit small { color: var(--dc-muted); }
+.local-agent__browser-annotation > button:last-child { flex: none; min-height: 20px; padding: 2px; border: 0; color: var(--dc-muted); background: transparent; }

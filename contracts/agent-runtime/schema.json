@@ -742,37 +742,20 @@
     "TodoItem": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["todoId", "sourceStepId", "label", "status"],
+      "required": ["text", "status"],
       "properties": {
-        "todoId": { "$ref": "#/$defs/Id" },
-        "sourceStepId": { "$ref": "#/$defs/Id" },
-        "label": { "type": "string", "minLength": 1, "maxLength": 240 },
-        "status": { "enum": ["pending", "inProgress", "completed"] }
+        "text": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["pending", "inProgress", "completed", "blocked"] }
       }
     },
-    "TodoProgressUpdate": {
+    "TodoUpdatedPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["todoId", "status"],
+      "required": ["revision", "items"],
       "properties": {
-        "todoId": { "$ref": "#/$defs/Id" },
-        "status": { "enum": ["pending", "inProgress", "completed"] }
-      }
-    },
-    "TodoProgressedPayload": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["sourcePlanId", "sourcePlanRevision", "sourceFactRef", "updates"],
-      "properties": {
-        "sourcePlanId": { "$ref": "#/$defs/Id" },
-        "sourcePlanRevision": { "type": "integer", "minimum": 1 },
-        "sourceFactRef": { "$ref": "#/$defs/Id" },
-        "updates": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 12,
-          "items": { "$ref": "#/$defs/TodoProgressUpdate" }
-        }
+        "providerCallId": { "$ref": "#/$defs/Id" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/TodoItem" } }
       }
     },
     "RunSettlement": {
@@ -1052,7 +1035,7 @@
         "providerRequestId": { "$ref": "#/$defs/Id" },
         "runId": { "$ref": "#/$defs/Id" },
         "purpose": { "enum": ["agent", "contextCompaction"] },
-        "responseConstraint": { "enum": ["normal", "toolRequired", "answerOnly"] },
+        "responseConstraint": { "enum": ["normal", "answerOnly"] },
         "stableCoreHash": { "$ref": "#/$defs/Id" },
         "baseToolSchemaHash": { "$ref": "#/$defs/Id" },
         "selectedPluginSnapshotHash": { "$ref": "#/$defs/Id" },
@@ -1116,14 +1099,23 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "workspaceId", "operation", "command", "workspaceMode", "executionScope"
+            "workspaceId", "operation", "writablePaths"
           ],
           "properties": {
             "workspaceId": { "$ref": "#/$defs/Id" },
-            "operation": { "const": "bash" },
+            "operation": { "enum": ["bash", "powershell"] },
             "command": { "type": "string", "minLength": 1, "maxLength": 16384 },
-            "workspaceMode": { "const": "write" },
-            "executionScope": { "enum": ["workspace", "host"] },
+            "writablePaths": {
+              "type": "array", "minItems": 1,
+              "items": {
+                "type": "object", "additionalProperties": false,
+                "required": ["path", "kind"],
+                "properties": {
+                  "path": { "type": "string", "minLength": 1 },
+                  "kind": { "enum": ["file", "directory"] }
+                }
+              }
+            },
             "terminal": {
               "type": "object",
               "additionalProperties": false,
@@ -1242,7 +1234,7 @@
         "status": {
           "enum": [
             "published", "revisionRequested", "confirmed", "superseded", "cancelled",
-            "completed", "invalidated"
+            "invalidated"
           ]
         },
         "decisionId": { "$ref": "#/$defs/Id" },
@@ -1743,7 +1735,7 @@
       "additionalProperties": false,
       "required": ["schemaVersion", "eventId", "sessionId", "sequence", "occurredAt", "type", "payload"],
       "properties": {
-        "schemaVersion": { "const": "deepcode.session-event.v4" },
+        "schemaVersion": { "const": "deepcode.session-event.v5" },
         "eventId": { "$ref": "#/$defs/Id" },
         "sessionId": { "$ref": "#/$defs/Id" },
         "sequence": { "type": "integer", "minimum": 1 },
@@ -1756,8 +1748,8 @@
             "input.accepted", "run.started",
             "message.committed", "message.feedback.updated", "narrative.committed", "interaction.requested",
             "interaction.resolved", "plan.published", "plan.confirmed", "plan.revision.requested",
-            "plan.superseded", "plan.cancelled", "plan.completed", "plan.invalidated",
-            "todo.seeded", "todo.reconciled", "todo.progressed",
+            "plan.superseded", "plan.cancelled", "plan.invalidated",
+            "todo.updated",
             "tool.requested", "tool.started", "approval.requested", "approval.resolved", "tool.completed",
             "session.control.rejected",
             "context.compaction.requested", "context.compacted",
@@ -1775,8 +1767,8 @@
                 "enum": [
                   "run.started", "narrative.committed",
                   "interaction.requested", "interaction.resolved", "plan.published", "plan.confirmed",
-                  "plan.revision.requested", "plan.superseded", "plan.cancelled", "plan.completed",
-                  "plan.invalidated", "todo.seeded", "todo.reconciled", "todo.progressed",
+                  "plan.revision.requested", "plan.superseded", "plan.cancelled",
+                  "plan.invalidated", "todo.updated",
                   "tool.requested", "tool.started", "approval.requested", "approval.resolved", "tool.completed",
                   "session.control.rejected", "context.compaction.requested", "context.compacted",
                   "context.composed", "provider.turn.settled", "context.updated", "run.waiting",
@@ -1881,8 +1873,8 @@
           "then": { "properties": { "payload": { "$ref": "#/$defs/ContextUpdatedPayload" } } }
         },
         {
-          "if": { "properties": { "type": { "const": "todo.progressed" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/TodoProgressedPayload" } } }
+          "if": { "properties": { "type": { "const": "todo.updated" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/TodoUpdatedPayload" } } }
         },
         {
           "if": { "properties": { "type": { "const": "run.finishing" } } },
@@ -1906,7 +1898,7 @@
               "type": {
                 "enum": [
                   "plan.published", "plan.confirmed", "plan.revision.requested", "plan.superseded",
-                  "plan.cancelled", "plan.completed", "plan.invalidated"
+                  "plan.cancelled", "plan.invalidated"
                 ]
               }
             }
@@ -1918,24 +1910,6 @@
                 "properties": {
                   "planId": { "$ref": "#/$defs/Id" },
                   "revision": { "type": "integer", "minimum": 1 }
-                }
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "type": { "enum": ["todo.seeded", "todo.reconciled", "todo.progressed"] }
-            }
-          },
-          "then": {
-            "properties": {
-              "payload": {
-                "required": ["sourcePlanId", "sourcePlanRevision"],
-                "properties": {
-                  "sourcePlanId": { "$ref": "#/$defs/Id" },
-                  "sourcePlanRevision": { "type": "integer", "minimum": 1 }
                 }
               }
             }
@@ -2030,7 +2004,7 @@
         "run", "activities", "artifacts", "terminalError"
       ],
       "properties": {
-        "schemaVersion": { "const": "deepcode.session-projection.v5" },
+        "schemaVersion": { "const": "deepcode.session-projection.v6" },
         "sessionId": { "$ref": "#/$defs/Id" },
         "revision": { "type": "integer", "minimum": 0 },
         "display": { "$ref": "#/$defs/SessionDisplayProjection" },
@@ -2068,14 +2042,12 @@
             {
               "type": "object",
               "additionalProperties": false,
-              "required": ["sourcePlanId", "sourcePlanRevision", "items", "sequence", "updatedAt"],
+              "required": ["runId", "revision", "items", "sequence", "updatedAt"],
               "properties": {
-                "sourcePlanId": { "$ref": "#/$defs/Id" },
-                "sourcePlanRevision": { "type": "integer", "minimum": 1 },
+                "runId": { "$ref": "#/$defs/Id" },
+                "revision": { "type": "integer", "minimum": 1 },
                 "items": {
                   "type": "array",
-                  "minItems": 1,
-                  "maxItems": 12,
                   "items": { "$ref": "#/$defs/TodoItem" }
                 },
                 "sequence": { "type": "integer", "minimum": 1 },

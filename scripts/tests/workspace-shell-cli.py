@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused CLI/Plan/workspace Shell check on Linux or initialized native Windows.
+"""Focused CLI/Plan/workspace Shell check on macOS, Linux or initialized Windows.
 
 Uses the existing local-agent fixture only for deterministic Provider input and
 owned Host lifecycle. Commands, Plan confirmation and outputs use the real CLI.
@@ -36,11 +36,10 @@ class Provider(fixture.MockProviderHandler):
             self.send_header('connection', 'close')
             self.end_headers()
             def shell(call, command, **extra):
-                return (call, names['bash'], {'command': command, 'executionScope': 'workspace', 'workspaceMode': 'read', **extra})
+                return (call, names['bash'], {'command': command, **extra})
             if ordinal == 1:
                 self._send_tool_calls([
                     shell('read', command("printf 'workspace-cli 中文\\n'; git branch --show-current; node --version; cat README.txt", "Write-Output 'workspace-cli 中文'; whoami; node --version; Get-ChildItem -Force; Get-Content -LiteralPath README.txt -Encoding UTF8")),
-                    shell('readonly', command('printf unexpected > readonly.txt', "$ErrorActionPreference = 'Stop'; Set-Content readonly.txt unexpected")),
                 ])
             elif ordinal == 2:
                 require(results['read']['outcome'] == 'completed', results['read'])
@@ -48,25 +47,27 @@ class Provider(fixture.MockProviderHandler):
                 require('workspace-read-ok' in results['read']['output']['stdout'], 'Workspace file was not read')
                 if WINDOWS:
                     require('deepcode_' in results['read']['output']['stdout'].lower(), 'Shell did not run under the dedicated account')
-                require(results['readonly']['outcome'] == 'failed', results['readonly'])
-                require(results['readonly']['output']['exitCode'] != 0, 'Read-only write reported success')
                 self._send_tool_calls([('plan', names['plan'], {
                     'title': 'Generate an output file', 'summary': 'Write only within build, then verify command results.',
                     'steps': [{'stepId': 'generate', 'title': 'Generate and verify', 'details': 'Exercise the workspace Shell.', 'verification': ['Output exists; unrelated paths remain unchanged.']}],
-                    'mutationManifest': [{'workspace': 'primary', 'operation': SHELL, 'executionScope': 'workspace', 'workspaceMode': 'write', 'command': 'generate build output', 'writablePaths': [{'path': 'build', 'kind': 'directory'}]}],
+                    'mutationManifest': [{'workspace': 'primary', 'operation': SHELL, 'command': 'generate build output', 'writablePaths': [{'path': 'build', 'kind': 'directory'}]}],
                 })])
             elif ordinal == 3:
-                self._send_tool_calls([shell('write', command("printf 'generated 中文\\n' > build/output.txt; cat build/output.txt", "$ErrorActionPreference = 'Stop'; [IO.File]::WriteAllText((Join-Path (Get-Location) 'build/output.txt'), \"generated 中文`n\"); Get-Content build/output.txt"), workspaceMode='write')])
+                self._send_tool_calls([shell('write', command("mkdir -p build && printf 'generated 中文\\n' > build/output.txt && cat build/output.txt", "$ErrorActionPreference = 'Stop'; New-Item -ItemType Directory -Force build | Out-Null; [IO.File]::WriteAllText((Join-Path (Get-Location) 'build/output.txt'), \"generated 中文`n\"); Get-Content build/output.txt")),
+                    shell('readonly', command('printf unexpected > readonly.txt', "$ErrorActionPreference = 'Stop'; Set-Content readonly.txt unexpected")),
+                ])
             elif ordinal == 4:
                 require(results['write']['outcome'] == 'completed', results['write'])
-                self._send_tool_calls([shell('outside', command("printf unexpected > ../outside.txt", "$ErrorActionPreference = 'Stop'; Set-Content ../outside.txt unexpected"), workspaceMode='write')])
+                require(results['readonly']['outcome'] == 'failed', results['readonly'])
+                require(results['readonly']['output']['exitCode'] != 0, 'Unapproved workspace path was writable')
+                self._send_tool_calls([shell('outside', command("printf unexpected > ../outside.txt", "$ErrorActionPreference = 'Stop'; Set-Content ../outside.txt unexpected"))])
             elif ordinal == 5:
                 require(results['outside']['outcome'] == 'failed', results['outside'])
                 require(results['outside']['output']['exitCode'] != 0, 'Outside write reported success')
                 self._send_tool_calls([
                     shell('nonzero', command("printf 'expected-failure\\n'; exit 7", "Write-Output 'expected-failure'; exit 7")),
                     shell('pty', command('read -r value; printf "PTY:%s\\n" "$value"; test -t 0', "$value = [Console]::ReadLine(); Write-Output \"PTY:$value\"; if ([Console]::IsInputRedirected) { exit 9 }"), terminal={'stdin': 'hello-terminal\n'}),
-                    shell('network', command("python3 - <<'PY'\nimport socket\ntry:\n    socket.socket()\nexcept PermissionError:\n    print('offline-workspace')\nelse:\n    raise AssertionError('workspace socket was allowed')\nPY", f"$ErrorActionPreference = 'Stop'; $client = [Net.Sockets.TcpClient]::new(); try {{ $client.Connect('127.0.0.1', {self.server.server_port}); throw 'workspace network was allowed' }} catch {{ if ($_.Exception.InnerException -isnot [Net.Sockets.SocketException] -or $_.Exception.InnerException.SocketErrorCode -ne [Net.Sockets.SocketError]::AccessDenied) {{ throw }}; Write-Output 'offline-workspace' }} finally {{ $client.Dispose() }}")),
+                    shell('network', command(f"python3 - <<'PY'\nimport socket\ntry:\n    socket.create_connection(('127.0.0.1', {self.server.server_port}), timeout=2)\nexcept PermissionError:\n    print('offline-workspace')\nelse:\n    raise AssertionError('workspace connection was allowed')\nPY", f"$ErrorActionPreference = 'Stop'; $client = [Net.Sockets.TcpClient]::new(); try {{ $client.Connect('127.0.0.1', {self.server.server_port}); throw 'workspace network was allowed' }} catch {{ if ($_.Exception.InnerException -isnot [Net.Sockets.SocketException] -or $_.Exception.InnerException.SocketErrorCode -ne [Net.Sockets.SocketError]::AccessDenied) {{ throw }}; Write-Output 'offline-workspace' }} finally {{ $client.Dispose() }}")),
                     shell('timeout', command('sleep 30 & wait', 'Start-Sleep -Seconds 30'), timeout=1),
                 ])
             elif ordinal == 6:
@@ -78,8 +79,7 @@ class Provider(fixture.MockProviderHandler):
                 require(results['timeout']['output']['timedOut'] is True, results['timeout'])
                 todo = next(value for value in reversed(fixture.json_payloads(body)) if value.get('type') == 'todo.current')
                 self._send_tool_calls([('complete-stage', names['progress'], {
-                    'sourceFactRef': results['write']['recordId'],
-                    'updates': [{'todoId': item['todoId'], 'status': 'completed'} for item in todo['items']],
+                    'items': [{'text': item['text'], 'status': 'completed'} for item in todo['items']],
                 })])
             elif ordinal == 7:
                 self._send_text('workspace-shell-cli-complete')
@@ -92,7 +92,11 @@ class Provider(fixture.MockProviderHandler):
 def main():
     status = json.loads(subprocess.check_output([str(fixture.DAEMON_BINARY), '--workspace-sandbox-status'], text=True, encoding='utf-8'))
     require(status['available'], f'Unsupported runtime environment: {status}')
-    with tempfile.TemporaryDirectory(prefix='deepcode-workspace-shell-') as directory:
+    # OS scratch is deliberately writable by macOS tools. Exercise project
+    # boundaries outside that grant, while retaining disposable fixture ownership.
+    scratch = fixture.ROOT / '.build-cache'
+    scratch.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='workspace-shell-', dir=scratch) as directory:
         root = Path(directory); workspace = root / 'workspace'; workspace.mkdir()
         (workspace / 'README.txt').write_text('workspace-read-ok\n', encoding='utf-8')
         subprocess.run(['git', 'init', '-q', '-b', 'workspace-test', str(workspace)], check=True)
@@ -103,31 +107,34 @@ def main():
         daemon = fixture.OwnedDaemon(root / 'config')
         try:
             fixture.write_configuration(daemon.config_root, f'http://127.0.0.1:{server.server_port}/v1', {
-                'agent.permissions.workspaceMutation': 'plan', 'agent.permissions.external': 'deny',
+                'agent.permissions.workspaceMutation': 'plan', 'agent.permissions.external': 'ask',
                 **({'agent.windows.shell': 'auto'} if WINDOWS else {}),
             })
             daemon.start()
             session = fixture.create_session(daemon, workspace)['sessionId']
             fixture.cli(daemon, session, 'Inspect this workspace and generate the authorized output.', expected=5)
             state.assert_healthy()
+            waiting = fixture.projection(daemon, session)
+            require(waiting['pendingApproval'] is None and waiting['pendingPlan'] is not None, 'Read-only Shell should continue directly to the Plan')
+            require(len(state.requests) == 2, 'Provider did not advance after the read-only Shell')
             require(not (workspace / 'build/output.txt').exists(), 'Output created before Plan confirmation')
             result = fixture.cli(daemon, session, '/reply 1')
             state.assert_healthy()
             require('workspace-shell-cli-complete' in result.stdout, result.stdout)
             require((workspace / 'build/output.txt').read_text(encoding='utf-8') == 'generated 中文\n', 'Output file mismatch')
             require(not (root / 'outside.txt').exists(), 'Outside file was modified')
-            require(not (workspace / 'readonly.txt').exists(), 'Read-only command created a file')
+            require(not (workspace / 'readonly.txt').exists(), 'Plan sandbox allowed an undeclared workspace file')
             projection = fixture.projection(daemon, session)
             require(projection['run']['status'] == 'completed', projection['run'])
-            with closing(sqlite3.connect(f'{(daemon.config_root / "runtime/agent-runtime/session.sqlite3").as_uri()}?mode=ro', uri=True)) as database:
-                require(database.execute("select count(*) from session_events where event_type='approval.requested'").fetchone()[0] == 0, 'Workspace execution unexpectedly requested approval')
+            with closing(sqlite3.connect(f'{(daemon.config_root / "data/agent-runtime/session.sqlite3").as_uri()}?mode=ro', uri=True)) as database:
+                require(database.execute("select count(*) from session_events where event_type='approval.requested'").fetchone()[0] == 0, 'Sandboxed reads and Plan-authorized writes must not request Host approval')
                 runtime = json.loads(database.execute("select payload_json from session_events where event_type='run.started' order by sequence limit 1").fetchone()[0])['runtimeSnapshot']
                 print('[workspace-shell-cli] selected environment:', json.dumps(runtime['environment']['shell']))
             daemon.shutdown()
-            print('[workspace-shell-cli] PASS: read, confirmed directory grant, Unicode write, outside write rejection, exit 7, real PTY, offline policy, timeout, final settlement and owned Host shutdown; 7 fixture Provider requests.')
+            print('[workspace-shell-cli] PASS: read-only Shell without approval, confirmed directory grant, unapproved workspace path rejection, Unicode write, outside write rejection, exit 7, real PTY, offline policy, timeout, final settlement and owned Host shutdown; 7 fixture Provider requests.')
         except BaseException:
             print(daemon.log_tail())
-            store = daemon.config_root / 'runtime/agent-runtime/session.sqlite3'
+            store = daemon.config_root / 'data/agent-runtime/session.sqlite3'
             if store.exists():
                 with closing(sqlite3.connect(f'{store.as_uri()}?mode=ro', uri=True)) as database:
                     for kind, payload in database.execute("select event_type,payload_json from session_events where event_type in ('tool.requested','tool.started','tool.completed','run.settled') order by sequence"):

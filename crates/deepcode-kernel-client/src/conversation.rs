@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 
 pub const CONVERSATION_COMMAND_VERSION: &str = "deepcode.command.v3";
-pub const SESSION_PROJECTION_VERSION: &str = "deepcode.session-projection.v5";
+pub const SESSION_PROJECTION_VERSION: &str = "deepcode.session-projection.v6";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -458,22 +458,17 @@ impl SessionProjection {
             return Err("shared Session projection has an invalid pending plan".to_string());
         }
         if self.todo_list.as_ref().is_some_and(|todo_list| {
-            let mut ids = HashSet::new();
-            let mut step_ids = HashSet::new();
-            todo_list.source_plan_id.is_empty()
-                || todo_list.source_plan_revision == 0
-                || todo_list.items.is_empty()
-                || self.plans.iter().all(|plan| {
-                    plan.plan_id != todo_list.source_plan_id
-                        || plan.revision != todo_list.source_plan_revision
-                })
+            todo_list.run_id.is_empty()
+                || todo_list.revision == 0
+                || todo_list.sequence == 0
+                || todo_list.sequence > self.revision
+                || todo_list.updated_at.is_empty()
                 || todo_list.items.iter().any(|item| {
-                    item.todo_id.is_empty()
-                        || item.source_step_id.is_empty()
-                        || item.label.is_empty()
-                        || !matches!(item.status.as_str(), "pending" | "inProgress" | "completed")
-                        || !ids.insert(item.todo_id.as_str())
-                        || !step_ids.insert(item.source_step_id.as_str())
+                    item.text.trim().is_empty()
+                        || !matches!(
+                            item.status.as_str(),
+                            "pending" | "inProgress" | "completed" | "blocked"
+                        )
                 })
         }) {
             return Err("shared Session projection has an invalid todo list".to_string());
@@ -513,7 +508,7 @@ impl SessionProjection {
                 || !provider_request_ids.insert(receipt.provider_request_id.as_str())
                 || !matches!(
                     receipt.response_constraint.as_str(),
-                    "normal" | "toolRequired" | "answerOnly"
+                    "normal" | "answerOnly"
                 )
                 || invalid_context_composition_shape(receipt)
         }) || self
@@ -799,7 +794,12 @@ impl SessionProjection {
                 != self
                     .activities
                     .iter()
-                    .filter(|activity| matches!(activity.kind.as_str(), "tool" | "providerHosted" | "approval"))
+                    .filter(|activity| {
+                        matches!(
+                            activity.kind.as_str(),
+                            "tool" | "providerHosted" | "approval"
+                        )
+                    })
                     .count()
         {
             return Err("shared Session projection canonical timeline is incomplete".to_string());
@@ -1418,8 +1418,6 @@ pub struct PlanOperation {
     pub target: Option<String>,
     pub target_kind: Option<String>,
     pub command: Option<String>,
-    pub workspace_mode: Option<String>,
-    pub execution_scope: Option<String>,
     pub terminal: Option<PlanTerminalInput>,
     pub writable_paths: Option<Vec<PlanWritePath>>,
 }
@@ -1491,21 +1489,19 @@ pub struct PendingPlanProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TodoListProjection {
-    pub source_plan_id: String,
-    pub source_plan_revision: u64,
+    pub run_id: String,
+    pub revision: u64,
     pub items: Vec<TodoItem>,
     pub sequence: u64,
     pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TodoItem {
-    pub todo_id: String,
-    pub source_step_id: String,
-    pub label: String,
+    pub text: String,
     pub status: String,
 }
 
@@ -2061,7 +2057,6 @@ fn valid_plan_projection(plan: &PlanProjection) -> bool {
                 | "confirmed"
                 | "superseded"
                 | "cancelled"
-                | "completed"
                 | "invalidated"
         )
         && plan.sequence > 0
@@ -2111,8 +2106,6 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                             .as_deref()
                             .is_some_and(|target| !target.is_empty())
                             && operation.command.is_none()
-                            && operation.workspace_mode.is_none()
-                            && operation.execution_scope.is_none()
                             && operation.terminal.is_none()
                             && operation.writable_paths.is_none()
                     }
@@ -2126,8 +2119,6 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                                 None | Some("file" | "directoryTree")
                             )
                             && operation.command.is_none()
-                            && operation.workspace_mode.is_none()
-                            && operation.execution_scope.is_none()
                             && operation.terminal.is_none()
                             && operation.writable_paths.is_none()
                     }
@@ -2138,25 +2129,14 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                                 .command
                                 .as_deref()
                                 .is_none_or(|command| !command.is_empty())
-                            && operation.workspace_mode.as_deref() == Some("write")
-                            && matches!(
-                                operation.execution_scope.as_deref(),
-                                Some("workspace" | "host")
-                            )
-                            && match &operation.writable_paths {
-                                None => operation.execution_scope.as_deref() == Some("host"),
-                                Some(paths) => {
-                                    !paths.is_empty()
-                                        && paths.iter().all(|target| {
-                                            target.path != "."
-                                                && is_normalized_logical_path(&target.path)
-                                                && matches!(
-                                                    target.kind.as_str(),
-                                                    "file" | "directory"
-                                                )
-                                        })
-                                }
-                            }
+                            && operation.writable_paths.as_ref().is_some_and(|paths| {
+                                !paths.is_empty()
+                                    && paths.iter().all(|target| {
+                                        target.path != "."
+                                            && is_normalized_logical_path(&target.path)
+                                            && matches!(target.kind.as_str(), "file" | "directory")
+                                    })
+                            })
                             && operation
                                 .terminal
                                 .as_ref()
@@ -2338,7 +2318,7 @@ mod tests {
                     "details": "读取 README。"
                 }],
                 "mutationManifest": [],
-                "status": "completed",
+                "status": "confirmed",
                 "decisionId": "decision:plan",
                 "sequence": 2,
                 "createdAt": "2026-08-25T00:00:01.000Z",
@@ -2347,12 +2327,10 @@ mod tests {
             "activePlanRef": null,
             "pendingPlan": null,
             "todoList": {
-                "sourcePlanId": "plan:test",
-                "sourcePlanRevision": 1,
+                "runId": "run:test",
+                "revision": 1,
                 "items": [{
-                    "todoId": "todo:read",
-                    "sourceStepId": "step:read",
-                    "label": "读取入口",
+                    "text": "读取入口",
                     "status": "completed"
                 }],
                 "sequence": 3,
@@ -2375,9 +2353,6 @@ mod tests {
                 "purpose": "agent",
                 "runId": "run:test",
                 "responseConstraint": "normal",
-                "stableCoreHash": "context-hash-v1:0000000000000001",
-                "baseToolSchemaHash": "context-hash-v1:0000000000000002",
-                "selectedPluginSnapshotHash": "context-hash-v1:0000000000000003",
                 "dynamicInstructionBytes": 128,
                 "messages": [{
                     "messageIndex": 0,
@@ -2524,6 +2499,36 @@ mod tests {
             projection.activities[0].call_id.as_deref(),
             Some("call:read")
         );
+    }
+
+    #[test]
+    fn shell_plan_projection_uses_business_paths_without_model_authority() {
+        for shell in ["bash", "powershell"] {
+            let mut value = projection_value();
+            value["plans"][0]["mutationManifest"] = json!([{
+                "workspaceId": "workspace:test", "operation": shell,
+                "writablePaths": [{"path":"build", "kind":"directory"}]
+            }]);
+            let projection: SessionProjection = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(projection.validate(), Ok(()));
+            for paths in [
+                Value::Null,
+                json!([]),
+                json!([{"path":"../outside", "kind":"file"}]),
+            ] {
+                let mut invalid = value.clone();
+                invalid["plans"][0]["mutationManifest"][0]["writablePaths"] = paths;
+                assert!(serde_json::from_value::<SessionProjection>(invalid)
+                    .unwrap()
+                    .validate()
+                    .is_err());
+            }
+            for (field, authority) in [("workspaceMode", "write"), ("executionScope", "host")] {
+                let mut invalid = value.clone();
+                invalid["plans"][0]["mutationManifest"][0][field] = json!(authority);
+                assert!(serde_json::from_value::<SessionProjection>(invalid).is_err());
+            }
+        }
     }
 
     #[test]
@@ -2831,12 +2836,12 @@ impl FileChangeContent {
             if self.before.is_some() {
                 self.path.as_str()
             } else {
-                "/dev/null (不存在)"
+                "/dev/null"
             },
             if self.after.is_some() {
                 self.path.as_str()
             } else {
-                "/dev/null (不存在)"
+                "/dev/null"
             },
             if old_end == start { 0 } else { start + 1 },
             old_end - start,

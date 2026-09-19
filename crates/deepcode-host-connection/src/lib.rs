@@ -1,5 +1,8 @@
-//! Local Host transport discovery. This owns no Session or Kernel business state.
+//! Local Host transport discovery and user directories. No Session or Kernel business state.
+mod user_directories;
+pub use user_directories::UserDirectories;
 mod client_lease;
+pub mod loopback_http;
 pub mod process;
 pub mod shell_lifecycle;
 pub use client_lease::{HostClientLease, HOST_LIFETIME_ENV};
@@ -37,7 +40,7 @@ pub struct HostStartupStatusV1 {
     pub updated_at: String,
 }
 
-const CONNECTION_FILE: &str = "runtime/agent-runtime/host-connection.json";
+const CONNECTION_FILE: &str = "agent-runtime/host-connection.json";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -203,7 +206,7 @@ pub struct HostStartGuard {
 
 impl HostStartGuard {
     pub fn acquire(root: &Path) -> io::Result<Self> {
-        let path = root.join("runtime/agent-runtime/host-start.lock");
+        let path = root.join("agent-runtime/host-start.lock");
         std::fs::create_dir_all(path.parent().expect("startup parent"))?;
         let file = OpenOptions::new()
             .create(true)
@@ -230,33 +233,20 @@ impl HostStartGuard {
     }
 }
 
-pub fn config_root(distribution_root: &Path) -> io::Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from);
-    let requested = if let Some(path) = std::env::var_os("DEEPCODE_CONFIG_DIR") {
-        PathBuf::from(path)
-    } else if std::env::var("DEEPCODE_PORTABLE").is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    }) {
-        distribution_root.join("config/user/local")
-    } else if cfg!(windows) {
-        std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .map(|root| root.join("DeepCode"))
-            .or_else(|| home.map(|root| root.join("AppData/Roaming/DeepCode")))
-            .unwrap_or_else(|| distribution_root.join(".deepcode-user"))
-    } else if let Some(root) = std::env::var_os("XDG_CONFIG_HOME") {
-        PathBuf::from(root).join("deepcode")
-    } else {
-        home.map(|root| root.join(".config/deepcode"))
-            .unwrap_or_else(|| distribution_root.join(".deepcode-user"))
-    };
-    std::fs::create_dir_all(&requested)?;
-    requested.canonicalize()
+/// Packaged resources are independent of the writable user data directory.
+pub fn runtime_root(executable_dir: &Path) -> PathBuf {
+    std::env::var_os("DEEPCODE_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "macos") && executable_dir.ends_with("Contents/MacOS") {
+                executable_dir
+                    .parent()
+                    .expect("bundle Contents")
+                    .join("Resources")
+            } else {
+                executable_dir.to_path_buf()
+            }
+        })
 }
 
 #[cfg(unix)]
@@ -282,6 +272,7 @@ fn lock_file(file: &File) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use deepcode_kernel_abi::{HOST_INSTANCE_ID_PREFIX, HOST_SHELL_TOKEN_PREFIX};
     use std::net::TcpListener;
 
@@ -368,7 +359,7 @@ mod tests {
         let another = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(root.join("runtime/agent-runtime/host-start.lock"))
+            .open(root.join("agent-runtime/host-start.lock"))
             .unwrap();
         assert_eq!(
             lock_file(&another).unwrap_err().kind(),

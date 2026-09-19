@@ -1,4 +1,3 @@
-import React from 'react';
 
 /** Built-in UI glyphs: one grid, optical weight and currentColor across every surface.
  * Change glyphs or semantic role mappings here; consumers never define SVG paths.

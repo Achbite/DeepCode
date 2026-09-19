@@ -97,6 +97,7 @@ impl PluginCatalogEntry {
 #[derive(Debug, Clone)]
 enum PluginContribution {
     Skill,
+    Host,
     Mcp { plugin_uri: String },
 }
 
@@ -154,6 +155,13 @@ impl ResolvedPluginSelection {
         }
     }
 
+    pub(crate) fn computer_use_instance(&self) -> Option<String> {
+        self.plugins
+            .iter()
+            .find(|plugin| matches!(plugin.contribution, PluginContribution::Host))
+            .map(|plugin| plugin.plugin_instance_ref.clone())
+    }
+
     pub(crate) fn mcp_plugin_instances(&self) -> &BTreeMap<String, String> {
         &self.mcp_plugin_instances
     }
@@ -178,6 +186,11 @@ pub(crate) fn plugin_catalog_projection(settings: &Value) -> Result<Value, Strin
                 {
                     "skill"
                 }
+                PluginCatalogEntry::Loaded(source)
+                    if matches!(source.contribution, PluginContribution::Host) =>
+                {
+                    "host"
+                }
                 _ if source.public().uri.ends_with("@cli")
                     || source.public().uri.ends_with("@first-party") =>
                 {
@@ -187,7 +200,7 @@ pub(crate) fn plugin_catalog_projection(settings: &Value) -> Result<Value, Strin
             };
             let mut item =
                 serde_json::to_value(source.into_public()).expect("catalog item serializes");
-            item["source"] = json!("mounted");
+            item["source"] = json!(if kind == "host" { "builtin" } else { "mounted" });
             item["category"] = json!("functional");
             item["discovery"] = json!("default");
             item["contributionKind"] = json!(kind);
@@ -210,6 +223,35 @@ pub(crate) fn plugin_catalog_projection(settings: &Value) -> Result<Value, Strin
             "source":"builtin","category":"reference","contributionKind":"skill","discovery":"searchOnly","activationMediaTypes":[],"enabled":true,"available":true,"reference":{"toolName":"doc.read","name":name}}));
     }
     Ok(json!({"revision":revision,"plugins":plugins}))
+}
+
+pub(crate) fn search_plugins(settings: &Value, query: &str, limit: usize) -> Result<Value, String> {
+    let (revision, sources, _) = plugin_catalog(settings)?;
+    let words = query.to_lowercase();
+    let mut matches = Vec::new();
+    for source in sources.values() {
+        let item = source.public();
+        let capabilities = match source {
+            PluginCatalogEntry::Loaded(source) => source.capability_summary.as_str(),
+            _ => "",
+        };
+        let searchable = format!(
+            "{} {} {} {capabilities}",
+            item.uri, item.display_name, item.short_description
+        )
+        .to_lowercase();
+        if words
+            .split_whitespace()
+            .all(|word| searchable.contains(word))
+        {
+            matches.push(json!({"uri":item.uri,"displayName":item.display_name,"shortDescription":item.short_description,
+                "enabled":item.enabled,"available":item.available,"error":item.error}));
+        }
+    }
+    let total = matches.len();
+    Ok(
+        json!({"revision":revision,"plugins":matches.into_iter().take(limit).collect::<Vec<_>>(),"total":total}),
+    )
 }
 
 /// Settings inspects text Skills through the same loader used for run preparation.
@@ -305,6 +347,12 @@ pub(crate) fn resolve_plugin_selection(
                 });
             }
         };
+        if !source.public.enabled || !source.public.available {
+            return Err(format!(
+                "plugin_selection_disabled: 插件未启用：{}",
+                source.public.uri
+            ));
+        }
         source.plugin_instance_ref = crate::utils::new_runtime_ref("plugin-instance")?;
         if let PluginContribution::Mcp { plugin_uri } = &source.contribution {
             mcp_plugin_instances.insert(plugin_uri.clone(), source.plugin_instance_ref.clone());
@@ -376,6 +424,37 @@ fn plugin_catalog(
     String,
 > {
     let mut sources = BTreeMap::new();
+    let uri = "plugin://computer-use@builtin";
+    let disabled: Vec<String> =
+        serde_json::from_str(settings["plugins.disabled"].as_str().unwrap_or("[]"))
+            .map_err(|error| format!("plugin_config_invalid: {error}"))?;
+    let disabled = disabled.iter().any(|value| value == uri);
+    let guide = include_str!("../../../plugins/computer-use/README.md");
+    insert_plugin_source(
+        &mut sources,
+        PluginCatalogEntry::Loaded(PluginSource {
+            public: PublicPluginCatalogItem {
+                uri: uri.into(),
+                display_name: "Computer Use".into(),
+                short_description: "控制内置浏览器并检验截图；经单独授权控制电脑与外部应用。"
+                    .into(),
+                icon_ref: None,
+                management: Some(json!({"key":"plugins.disabled","id":uri})),
+                activation_media_types: vec![],
+                enabled: !disabled,
+                available: !disabled,
+                error: None,
+            },
+            plugin_artifact_ref: crate::utils::new_runtime_ref("plugin-artifact")?,
+            plugin_instance_ref: String::new(),
+            capability_refs: vec!["host:computer-use".into()],
+            capability_summary: guide.into(),
+            tool_prompt_provider: None,
+            contribution: PluginContribution::Host,
+            implementation: json!({"host":"native","plugin":"computer-use"}),
+            content: Arc::from(guide.as_bytes()),
+        }),
+    )?;
     for source in skill_catalog_entries(settings)? {
         insert_plugin_source(&mut sources, source)?;
     }
@@ -717,6 +796,31 @@ const fn enabled_by_default() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn computer_plugin_has_selected_identity_and_honors_disabled_setting() {
+        let mut selections = vec![PluginSelectionInput {
+            selection_id: "selection:computer".into(),
+            uri: "plugin://computer-use@builtin".into(),
+            label: "Computer Use".into(),
+        }];
+        let selected = resolve_plugin_selection(&json!({}), &mut selections, false).unwrap();
+        assert!(selected.computer_use_instance().is_some());
+        assert!(selected
+            .mcp_sources
+            .iter()
+            .all(|source| source.descriptor.uri != "plugin://computer-use@builtin"));
+        assert!(resolve_plugin_selection(
+            &json!({"plugins.disabled":"[\"plugin://computer-use@builtin\"]"}),
+            &mut selections,
+            false
+        )
+        .is_err());
+        assert!(resolve_plugin_selection(&json!({}), &mut vec![], false)
+            .unwrap()
+            .computer_use_instance()
+            .is_none());
+    }
 
     #[test]
     fn empty_selection_does_not_load_the_plugin_catalog() {

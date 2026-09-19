@@ -1,6 +1,8 @@
 use deepcode_kernel_abi::{KernelError, KernelResult};
 use deepcode_kernel_tools::file_content::read_text_file_for_llm;
-use deepcode_kernel_tools::kernel_internal::{KernelCanonicalInvocation, KernelDeleteTarget, KernelTextEdit, KernelToolKind};
+use deepcode_kernel_tools::kernel_internal::{
+    KernelCanonicalInvocation, KernelDeleteTarget, KernelTextEdit, KernelToolKind,
+};
 use deepcode_kernel_tools::KernelToolRegistry;
 use deepcode_kernel_tools::ToolAvailability;
 use serde::{Deserialize, Serialize};
@@ -24,6 +26,7 @@ pub struct KernelExecutorConfig {
     pub cloud_web_search: Option<CloudWebSearchConfig>,
     pub shell_program: Option<crate::shell_environment::ShellProgram>,
     pub execution_path: Option<String>,
+    pub temporary_root: Option<PathBuf>,
     pub wsl: Option<crate::wsl_execution::WslExecution>,
 }
 
@@ -218,10 +221,6 @@ impl KernelExecutorRegistry {
         }
         executor.invoke(invocation, context)
     }
-
-    pub fn tool_ids(&self) -> impl Iterator<Item = &'static str> + '_ {
-        self.executors.keys().copied()
-    }
 }
 
 pub fn builtin_executors(
@@ -229,7 +228,7 @@ pub fn builtin_executors(
     config: KernelExecutorConfig,
     secret_provider: Arc<dyn SecretProvider>,
 ) -> Vec<(&'static str, Box<dyn KernelToolExecutor>)> {
-    let executors = registry
+    registry
         .executor_bindings()
         .map(|(tool_id, binding)| {
             if let Some(wsl) = config
@@ -251,8 +250,7 @@ pub fn builtin_executors(
                 executor_for_binding(binding, config.clone(), Arc::clone(&secret_provider)),
             )
         })
-        .collect::<Vec<_>>();
-    executors
+        .collect()
 }
 
 pub fn web_search_availability(config: &KernelExecutorConfig) -> ToolAvailability {
@@ -296,6 +294,7 @@ fn executor_for_binding(
             Box::new(process::ConfiguredShellExecutor {
                 program: config.shell_program,
                 execution_path: config.execution_path,
+                temporary_root: config.temporary_root,
             })
         }
     }
@@ -340,6 +339,41 @@ fn known_failure(
     }
 }
 
+// Both operations have already run. Keep the first failure as primary while
+// retaining a later cleanup/reader failure in the same returned diagnostic.
+pub(crate) fn combine_shell_results<T, U>(
+    primary: KernelResult<T>,
+    cleanup: KernelResult<U>,
+) -> KernelResult<(T, U)> {
+    match (primary, cleanup) {
+        (Ok(value), Ok(cleaned)) => Ok((value, cleaned)),
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+        (Err(mut error), Err(cleanup)) => {
+            let cleanup = deepcode_kernel_abi::KernelErrorEnvelope::from(&cleanup);
+            let suffix = format!("; cleanup failed [{}]: {}", cleanup.code, cleanup.message);
+            match &mut error {
+                KernelError::InvalidCommand(message)
+                | KernelError::WorkspaceAccessDenied(message)
+                | KernelError::WorkspaceRootUnreadable(message)
+                | KernelError::AttachmentAccessDenied(message)
+                | KernelError::PendingPermissionUnavailable(message)
+                | KernelError::PermissionDenied(message)
+                | KernelError::Structured { message, .. }
+                | KernelError::Other(message) => message.push_str(&suffix),
+                KernelError::MissingWorkspaceBinding => {
+                    error = KernelError::Structured {
+                        code: "workspace_binding_required",
+                        stage: "execution",
+                        message: format!("{error}{suffix}"),
+                        details: Value::Null,
+                    };
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
 #[derive(Debug)]
 struct TextEditRange {
     start: usize,
@@ -354,7 +388,10 @@ struct AppliedTextEdits {
     preview: Value,
 }
 
-fn apply_exact_text_edits(original: &str, edits: &[KernelTextEdit]) -> KernelResult<AppliedTextEdits> {
+fn apply_exact_text_edits(
+    original: &str,
+    edits: &[KernelTextEdit],
+) -> KernelResult<AppliedTextEdits> {
     let mut ranges = Vec::with_capacity(edits.len());
     for (edit_index, edit) in edits.iter().enumerate() {
         let (start, end) = unique_match_range(original, &edit.old_text, edit_index)?;

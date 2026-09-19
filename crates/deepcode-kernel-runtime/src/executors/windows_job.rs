@@ -6,7 +6,7 @@ use windows_sys::Win32::{
     System::{
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         },
         Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE},
@@ -16,6 +16,13 @@ use windows_sys::Win32::{
 pub(crate) struct ProcessJob(HANDLE);
 
 impl ProcessJob {
+    pub fn terminate(&self) -> KernelResult<()> {
+        if unsafe { TerminateJobObject(self.0, 1) } == 0 {
+            return Err(last_error("terminate invocation process job"));
+        }
+        Ok(())
+    }
+
     pub fn attach(pid: u32) -> KernelResult<Self> {
         unsafe {
             let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
