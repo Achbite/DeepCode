@@ -1595,6 +1595,7 @@ mod tests {
                 workspace_id: None,
                 private_resolved_targets: vec![],
                 workspace_write_targets: None,
+                file_access: Default::default(),
                 cancellation: Default::default(),
                 progress: Default::default(),
             };
@@ -1653,6 +1654,7 @@ for line in sys.stdin:
             workspace_id: None,
             private_resolved_targets: vec![],
             workspace_write_targets: None,
+            file_access: Default::default(),
             cancellation: KernelCancellationToken::default(),
             progress: Default::default(),
         };
@@ -1733,6 +1735,7 @@ for line in sys.stdin:
             workspace_id: None,
             private_resolved_targets: vec![],
             workspace_write_targets: None,
+            file_access: Default::default(),
             cancellation: KernelCancellationToken::default(),
             progress: Default::default(),
         };
@@ -1813,6 +1816,7 @@ for line in sys.stdin:
             workspace_id: None,
             private_resolved_targets: Vec::new(),
             workspace_write_targets: None,
+            file_access: Default::default(),
             cancellation,
             progress: Default::default(),
         };

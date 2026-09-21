@@ -1,4 +1,5 @@
 use crate::command_denylist::CommandDenylist;
+mod file_permissions;
 use crate::local_agent_mcp::McpRuntime;
 use crate::local_agent_store::{LocalAgentJournal, LocalAgentStoreError};
 use crate::local_agent_tool_catalog::{
@@ -10,11 +11,13 @@ use deepcode_kernel_runtime::executors::{
     KernelToolExecutionContext, KernelToolExecutionOutcome, KernelToolExecutionResult,
     SecretProvider,
 };
+use deepcode_kernel_runtime::file_access::FileAccessScope;
 use deepcode_kernel_runtime::workspace_boundary::WorkspaceBoundary;
 use deepcode_kernel_tools::kernel_internal::{
     KernelCanonicalInvocation, KernelDeleteTarget, KernelExecutionScope, KernelWorkspaceMode,
 };
 use deepcode_kernel_tools::{ToolAvailability, ToolInputIssue};
+use file_permissions::RequestedFiles;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -143,6 +146,20 @@ pub(crate) enum PermissionMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellApprovalMode {
+    Ask,
+    Review,
+    Allow,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ShellCommandRule {
+    decision: String,
+    context: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceMutationMode {
     Plan,
     Allow,
@@ -163,6 +180,10 @@ enum PreparedEffectScope {
 #[derive(Debug, Clone)]
 pub(crate) struct LocalAgentPermissionPolicy {
     workspace_mutation: WorkspaceMutationMode,
+    shell: ShellApprovalMode,
+    shell_full_access: bool,
+    command_rules: Vec<ShellCommandRule>,
+    settings: Value,
     network: PermissionMode,
     external: PermissionMode,
     command_denylist: CommandDenylist,
@@ -170,7 +191,88 @@ pub(crate) struct LocalAgentPermissionPolicy {
 
 impl LocalAgentPermissionPolicy {
     pub(crate) fn from_settings(settings: &Value) -> Result<Self, LocalAgentKernelError> {
+        let shell = match settings.get("agent.permissions.shell") {
+            None => ShellApprovalMode::Ask,
+            Some(value) => match value.as_str() {
+                Some("ask") => ShellApprovalMode::Ask,
+                Some("review") => ShellApprovalMode::Review,
+                Some("allow") => ShellApprovalMode::Allow,
+                _ => {
+                    return Err(LocalAgentKernelError::new(
+                        "agent_permission_setting_invalid",
+                        "Shell 审批必须是 ask、review 或 allow。",
+                    ))
+                }
+            },
+        };
+        let shell_full_access = match settings.get("agent.permissions.shellAccess") {
+            None => false,
+            Some(value) => match value.as_str() {
+                Some("workspace") => false,
+                Some("full") => true,
+                _ => {
+                    return Err(LocalAgentKernelError::new(
+                        "agent_permission_setting_invalid",
+                        "Shell 范围必须是 workspace 或 full。",
+                    ))
+                }
+            },
+        };
+        let encoded = settings
+            .get("agent.permissions.commandRules")
+            .map(|value| {
+                value.as_str().ok_or_else(|| {
+                    LocalAgentKernelError::new(
+                        "agent_permission_setting_invalid",
+                        "命令规则必须是 JSON 字符串。",
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or("[]");
+        if let Some(roots) = settings.get("agent.permissions.runtimeReadRoots") {
+            let valid = roots.as_array().is_some_and(|roots| {
+                roots.iter().all(|root| {
+                    root.as_str()
+                        .is_some_and(|path| Path::new(path).is_absolute())
+                })
+            });
+            if !valid {
+                return Err(LocalAgentKernelError::new(
+                    "runtime_read_roots_invalid",
+                    "运行依赖目录必须是绝对路径数组。",
+                ));
+            }
+        }
+        let command_rules: Vec<ShellCommandRule> =
+            serde_json::from_str(encoded).map_err(|error| {
+                LocalAgentKernelError::new(
+                    "agent_permission_setting_invalid",
+                    format!("命令规则无效：{error}"),
+                )
+            })?;
+        if command_rules.len() > 256
+            || command_rules.iter().any(|rule| {
+                rule.context["command"]
+                    .as_str()
+                    .is_none_or(|command| command.trim().is_empty() || command.len() > 16384)
+                    || rule.context["workspaceId"]
+                        .as_str()
+                        .is_none_or(str::is_empty)
+                    || !rule.context["environment"].is_object()
+                    || !matches!(rule.decision.as_str(), "allow" | "ask" | "deny")
+            })
+        {
+            return Err(LocalAgentKernelError::new(
+                "agent_permission_setting_invalid",
+                "命令规则的命令、环境或决定无效。",
+            ));
+        }
         Ok(Self {
+            shell,
+            shell_full_access,
+            command_rules,
+            settings: settings.clone(),
             workspace_mutation: workspace_mutation_mode(settings)?,
             network: permission_mode(
                 settings,
@@ -663,10 +765,17 @@ impl LocalAgentKernel {
         match admission {
             Admission::ApprovalRequired => {
                 let mut preview = prepared.preview(&request.tool_name);
-                if self.host_requires_call_approval(&request, &prepared)? {
-                    let object = preview.as_object_mut().expect("prepared preview");
-                    object.remove("authorizationScope");
-                    object.remove("authorizationContext");
+                if is_shell_tool(&prepared.operation)
+                    || prepared.binding.container_adapter().is_some()
+                {
+                    preview["approvalReviewer"] = json!(if prepared.permissions.shell
+                        == ShellApprovalMode::Review
+                        && prepared.command_rule() != Some("ask")
+                    {
+                        "agent"
+                    } else {
+                        "user"
+                    });
                 }
                 Ok(json!({
                 "schemaVersion": KERNEL_REPLY_VERSION,
@@ -715,7 +824,9 @@ impl LocalAgentKernel {
 
                 let start_execution = control.start_execution();
                 let result = start_execution.then(|| {
-                    if !is_shell_tool(&prepared.operation) {
+                    if !is_shell_tool(&prepared.operation)
+                        && !matches!(&prepared.input, PreparedToolInput::Container { input, .. } if input.action != "inspect")
+                    {
                         progress.started();
                     }
                     self.execute_prepared(
@@ -982,6 +1093,50 @@ impl LocalAgentKernel {
             CatalogEffectScope::External => PreparedEffectScope::External,
         };
         let mut tool_input = request.input.clone();
+        let network_request = if is_shell_tool(&request.tool_name) {
+            tool_input
+                .as_object_mut()
+                .and_then(|input| input.remove("requestNetworkPermission"))
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|s| !s.trim().is_empty() && s.len() <= 1024)
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            LocalAgentKernelError::input(
+                                "$.requestNetworkPermission",
+                                "reason",
+                                "Provide a short reason for network access.",
+                                None,
+                            )
+                        })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let file_requests = if is_shell_tool(&request.tool_name)
+            || matches!(
+                request.tool_name.as_str(),
+                "fs.read" | "fs.write" | "fs.edit" | "fs.delete"
+            ) {
+            tool_input
+                .as_object_mut()
+                .and_then(|input| input.remove("requestFileAccess"))
+                .map(serde_json::from_value::<RequestedFiles>)
+                .transpose()
+                .map_err(|error| {
+                    LocalAgentKernelError::input(
+                        "$.requestFileAccess",
+                        "fileAccess",
+                        &error.to_string(),
+                        None,
+                    )
+                })?
+                .unwrap_or_default()
+        } else {
+            RequestedFiles::default()
+        };
         let workspace_id = match scope {
             PreparedEffectScope::WorkspaceRead
             | PreparedEffectScope::WorkspaceMutation
@@ -1074,15 +1229,25 @@ impl LocalAgentKernel {
                     ));
                 }
                 let boundary = WorkspaceBoundary::new(canonical_root.clone());
-                let resolve_target = |target: &str| match scope {
-                    PreparedEffectScope::WorkspaceRead | PreparedEffectScope::Process => {
-                        boundary.resolve_read(target)
-                    }
-                    PreparedEffectScope::WorkspaceMutation => boundary.resolve_mutation(target),
-                    PreparedEffectScope::LocalRead
-                    | PreparedEffectScope::Network
-                    | PreparedEffectScope::External => {
-                        unreachable!("workspace target scope")
+                let resolve_target = |target: &str| {
+                    if std::path::Path::new(target).is_absolute() {
+                        deepcode_kernel_runtime::file_access::resolve_path(std::path::Path::new(
+                            target,
+                        ))
+                    } else {
+                        match scope {
+                            PreparedEffectScope::WorkspaceRead | PreparedEffectScope::Process => {
+                                boundary.resolve_read(target)
+                            }
+                            PreparedEffectScope::WorkspaceMutation => {
+                                boundary.resolve_mutation(target)
+                            }
+                            PreparedEffectScope::LocalRead
+                            | PreparedEffectScope::Network
+                            | PreparedEffectScope::External => {
+                                unreachable!("workspace target scope")
+                            }
+                        }
                     }
                 };
                 let private = logical_targets
@@ -1144,7 +1309,14 @@ impl LocalAgentKernel {
             ),
             _ => (None, None),
         };
+        let mut effective_settings = generation.permissions.settings.clone();
+        let overrides = self.journal.permission_overrides(&request.session_id)?;
+        effective_settings
+            .as_object_mut()
+            .expect("permission settings")
+            .extend(overrides.as_object().expect("permission overrides").clone());
         let mut prepared = PreparedEffect {
+            permissions: LocalAgentPermissionPolicy::from_settings(&effective_settings)?,
             generation,
             binding,
             scope,
@@ -1162,8 +1334,50 @@ impl LocalAgentKernel {
             delete_target_kind,
             process_workspace_mode,
             process_execution_scope,
+            file_requests,
+            file_access: FileAccessScope::default(),
+            file_authority_required: false,
+            git_write_requested: false,
+            network_request: None,
+            network_authority: None,
         };
+        prepared.network_request = network_request;
         self.prepare_process_permissions(request, &mut prepared)?;
+        self.prepare_file_permissions(request, &mut prepared)?;
+        if let PreparedToolInput::Container { input, target } = &mut prepared.input {
+            *target = prepared
+                .binding
+                .container_adapter()
+                .expect("container binding")
+                .prepare(
+                    input,
+                    prepared
+                        .workspace_root
+                        .as_deref()
+                        .expect("container workspace"),
+                    prepared.file_access.home.as_deref().and_then(Path::parent),
+                )
+                .map_err(|message| {
+                    LocalAgentKernelError::input("$.container", "containerTarget", &message, None)
+                })?;
+            prepared.canonical_invocation["arguments"] = prepared.input.arguments();
+        }
+
+        if is_shell_tool(&prepared.operation) && !prepared.is_host_process() {
+            for scope in ["runNetwork", "sessionNetwork"] {
+                if let Some(authority) = self.execution_authority(
+                    request,
+                    &prepared,
+                    scope,
+                    &prepared.file_environment(),
+                )? {
+                    prepared.network_authority = Some(authority);
+                    break;
+                }
+            }
+            prepared.file_access.network_access =
+                prepared.network_authority.is_some() || prepared.network_request.is_some();
+        }
         Ok(prepared)
     }
 
@@ -1187,34 +1401,24 @@ impl LocalAgentKernel {
                 "Input snapshots only support sandboxed reads. Use the session working directory for editable copies or a Host permission request.", None,
             ));
         }
-        let (plan_authority, has_workspace_plan) =
-            self.workspace_plan_authority(request, prepared)?;
-        let unrestricted_workspace = !has_workspace_plan
-            && prepared.generation.permissions.workspace_mutation == WorkspaceMutationMode::Allow;
+        let (plan_authority, _) = self.workspace_plan_authority(request, prepared)?;
         // Select capabilities from committed authorization, never from script text.
         let mode = if !access.read_only()
             && (host_requested
+                || prepared.permissions.shell_full_access
                 || matches!(access, WorkspaceAccess::SessionWorkdir(_))
-                || plan_authority.is_some()
-                || unrestricted_workspace)
+                || plan_authority.is_some())
         {
             KernelWorkspaceMode::Write
         } else {
             KernelWorkspaceMode::Read
         };
-        let scope = if host_requested
-            || (!access.read_only()
-                && unrestricted_workspace
-                && prepared.generation.permissions.external == PermissionMode::Allow
-                && self
-                    .journal
-                    .active_plan_authorities(&request.session_id)?
-                    .is_none())
-        {
-            KernelExecutionScope::Host
-        } else {
-            KernelExecutionScope::Workspace
-        };
+        let scope =
+            if host_requested || (!access.read_only() && prepared.permissions.shell_full_access) {
+                KernelExecutionScope::Host
+            } else {
+                KernelExecutionScope::Workspace
+            };
         let PreparedToolInput::Builtin(invocation) = &mut prepared.input else {
             return Err(LocalAgentKernelError::new(
                 "process_binding_invalid",
@@ -1262,7 +1466,7 @@ impl LocalAgentKernel {
                 "当前 run 已 settled，所有 authority 均已失效。",
             ));
         }
-        let rules = &prepared.generation.permissions.command_denylist;
+        let rules = &prepared.permissions.command_denylist;
         let denied = match &prepared.input {
             PreparedToolInput::Builtin(
                 KernelCanonicalInvocation::ProcessShell {
@@ -1276,6 +1480,10 @@ impl LocalAgentKernel {
                     .as_ref()
                     .and_then(|input| rules.matching_rule(&input.stdin))
             }),
+            PreparedToolInput::Container { input, .. } => input
+                .command
+                .as_deref()
+                .and_then(|command| rules.matching_rule(command)),
             _ if prepared.binding.is_browser_service() && prepared.is_host_process() => {
                 let arguments = &prepared.canonical_invocation["arguments"];
                 arguments["command"].as_str().and_then(|command| {
@@ -1294,24 +1502,87 @@ impl LocalAgentKernel {
                 authority: json!({"decision":"deny", "source":"userSetting",
                     "authorityId":crate::command_denylist::SETTING, "matchedRule":rule}),
                 error: json!({"code":"command_denied_by_rule",
-                    "message":format!("Command was not executed: blocked by command rule {rule:?}."), "rule":rule}),
+                    "message":format!("Command was not executed: blocked by command rule {rule:?}." )}),
             });
         }
+        if let PreparedToolInput::Container { input, target } = &prepared.input {
+            if input.action == "inspect" {
+                return Ok(Admission::Allowed(
+                    json!({"decision":"allow","source":"containerInspection"}),
+                ));
+            }
+            if let Some(decision) = self.admit_call_authority(request, prepared)? {
+                return Ok(decision);
+            }
+            if prepared
+                .binding
+                .container_adapter()
+                .expect("container binding")
+                .owns(target)
+            {
+                return Ok(Admission::Allowed(
+                    json!({"decision":"allow","source":"containerCreation","containerId":target["id"]}),
+                ));
+            }
+            if input.action == "exec" {
+                for scope in ["runContainer", "sessionContainer"] {
+                    if let Some(authority) =
+                        self.execution_authority(request, prepared, scope, target)?
+                    {
+                        return Ok(Admission::Allowed(authority));
+                    }
+                }
+            }
+            if prepared.permissions.shell == ShellApprovalMode::Allow {
+                return Ok(Admission::Allowed(
+                    json!({"decision":"allow","source":"userSetting","authorityId":"agent.permissions.shell"}),
+                ));
+            }
+            return Ok(Admission::ApprovalRequired);
+        }
+        // Project scope is independent of a concrete execution approval.
+        let workspace_authority = if !is_shell_tool(&prepared.operation)
+            && (prepared.scope == PreparedEffectScope::WorkspaceMutation
+                || (prepared.scope == PreparedEffectScope::Process
+                    && prepared.process_workspace_mode.as_deref() == Some("write")))
+        {
+            match self.admit_workspace_mutation(request, prepared)? {
+                Admission::Allowed(authority) => Some(authority),
+                other => return Ok(other),
+            }
+        } else {
+            None
+        };
+        if prepared.file_authority_required && !prepared.is_host_process() {
+            match self.admit_call_authority(request, prepared)? {
+                Some(Admission::Allowed(_)) => {}
+                Some(other) => return Ok(other),
+                None => return Ok(Admission::ApprovalRequired),
+            }
+        }
         if prepared.is_host_process()
-            && prepared.generation.permissions.external == PermissionMode::Deny
+            && !is_shell_tool(&prepared.operation)
+            && prepared.permissions.external == PermissionMode::Deny
         {
             return self.admit_non_workspace(request, prepared, PreparedEffectScope::External);
         }
-        if let Some(decision) = self.admit_call_authority(request)? {
+        if is_shell_tool(&prepared.operation) {
+            return self.admit_shell(request, prepared);
+        }
+        if matches!(
+            prepared.scope,
+            PreparedEffectScope::Network | PreparedEffectScope::External
+        ) && prepared.permissions.mode(prepared.scope) == Some(PermissionMode::Deny)
+        {
+            return self.admit_non_workspace(request, prepared, prepared.scope);
+        }
+        if let Some(decision) = self.admit_call_authority(request, prepared)? {
             return Ok(decision);
         }
         if prepared.binding.is_internal_preview() {
             return Ok(Admission::Allowed(
                 json!({"decision":"allow","source":"internalPreview"}),
             ));
-        }
-        if self.host_requires_call_approval(request, prepared)? {
-            return Ok(Admission::ApprovalRequired);
         }
         match prepared.scope {
             PreparedEffectScope::LocalRead => Ok(Admission::Allowed(
@@ -1330,11 +1601,7 @@ impl LocalAgentKernel {
             }
             PreparedEffectScope::Process => {
                 if prepared.process_workspace_mode.as_deref() == Some("write") {
-                    let workspace_authority =
-                        match self.admit_workspace_mutation(request, prepared)? {
-                            Admission::Allowed(authority) => authority,
-                            other => return Ok(other),
-                        };
+                    let workspace_authority = workspace_authority.expect("workspace admission");
                     if prepared.process_execution_scope.as_deref() != Some("host") {
                         return Ok(Admission::Allowed(workspace_authority));
                     }
@@ -1356,31 +1623,130 @@ impl LocalAgentKernel {
                     "workspaceId": prepared.workspace_id,
                 })))
             }
-            PreparedEffectScope::WorkspaceMutation => {
-                self.admit_workspace_mutation(request, prepared)
-            }
+            PreparedEffectScope::WorkspaceMutation => Ok(Admission::Allowed(
+                workspace_authority.expect("workspace admission"),
+            )),
             PreparedEffectScope::Network | PreparedEffectScope::External => {
                 self.admit_non_workspace(request, prepared, prepared.scope)
             }
         }
     }
 
-    fn host_requires_call_approval(
+    fn execution_authority(
         &self,
         request: &LocalToolExecutionRequest,
         prepared: &PreparedEffect,
-    ) -> Result<bool, LocalAgentKernelError> {
-        Ok(prepared.is_host_process()
-            && (prepared.generation.permissions.workspace_mutation == WorkspaceMutationMode::Plan
-                || self
-                    .journal
-                    .active_plan_authorities(&request.session_id)?
-                    .is_some()))
+        scope: &str,
+        context: &Value,
+    ) -> Result<Option<Value>, LocalAgentKernelError> {
+        Ok(self
+            .journal
+            .execution_authority(&request.session_id, &request.run_id, scope, context)?
+            .filter(|authority| {
+                authority["source"] != "agent"
+                    || prepared.permissions.shell == ShellApprovalMode::Review
+            }))
+    }
+
+    fn admit_shell(
+        &self,
+        request: &LocalToolExecutionRequest,
+        prepared: &PreparedEffect,
+    ) -> Result<Admission, LocalAgentKernelError> {
+        if !prepared.is_host_process()
+            && prepared.file_access.network_access
+            && prepared.permissions.network == PermissionMode::Deny
+        {
+            return Ok(Admission::denied(
+                "network_denied",
+                "当前权限设置禁止网络访问。",
+            ));
+        }
+        let rule = prepared.command_rule();
+        if rule == Some("deny") {
+            return Ok(Admission::denied(
+                "command_rule_denied",
+                "用户命令规则阻止了此操作。",
+            ));
+        }
+        let workspace = if prepared.process_workspace_mode.as_deref() == Some("write") {
+            match self.admit_workspace_mutation(request, prepared)? {
+                Admission::Allowed(authority) => authority,
+                // A concrete Host request can be authorized before a project Plan exists.
+                // It gains no workspace authority, and cannot extend an existing Plan.
+                _ if prepared.is_host_process()
+                    && !self.workspace_plan_authority(request, prepared)?.1 =>
+                {
+                    Value::Null
+                }
+                denied => return Ok(denied),
+            }
+        } else {
+            json!({"decision":"allow","source":"workspaceBinding","workspaceId":prepared.workspace_id})
+        };
+        if let Some(decision) = self.admit_call_authority(request, prepared)? {
+            return Ok(match decision {
+                Admission::Allowed(authority) => Admission::Allowed(
+                    json!({"decision":"allow","source":"composite","workspaceAuthority":workspace,"externalAuthority":authority}),
+                ),
+                other => other,
+            });
+        }
+        if rule == Some("ask") {
+            return Ok(Admission::ApprovalRequired);
+        }
+        let context = prepared
+            .command_authorization_context()
+            .expect("shell context");
+        for scope in [
+            "runCommand",
+            "sessionCommand",
+            "runHostShell",
+            "sessionHostShell",
+        ] {
+            if matches!(scope, "runHostShell" | "sessionHostShell") && !prepared.is_host_process() {
+                continue;
+            }
+            let binding = if matches!(scope, "runHostShell" | "sessionHostShell") {
+                prepared
+                    .host_shell_authorization_context()
+                    .expect("host context")
+            } else {
+                context.clone()
+            };
+            if let Some(authority) = self.execution_authority(request, prepared, scope, &binding)? {
+                return Ok(Admission::Allowed(
+                    json!({"decision":"allow","source":"composite","workspaceAuthority":workspace,"externalAuthority":authority}),
+                ));
+            }
+        }
+        if !prepared.is_host_process() {
+            if prepared.network_request.is_some() && prepared.network_authority.is_none() {
+                return Ok(Admission::ApprovalRequired);
+            }
+            return Ok(Admission::Allowed(match &prepared.network_authority {
+                Some(network) => {
+                    json!({"decision":"allow","source":"composite","workspaceAuthority":workspace,"networkAuthority":network})
+                }
+                None => workspace,
+            }));
+        }
+        if rule == Some("allow")
+            || (prepared.permissions.shell_full_access
+                && prepared.permissions.shell == ShellApprovalMode::Allow)
+        {
+            return Ok(Admission::Allowed(
+                json!({"decision":"allow","source":"composite","workspaceAuthority":workspace,
+                "externalAuthority":{"decision":"allow","source":"userSetting","authorityId":if rule == Some("allow") { "user-setting:agent.permissions.commandRules" } else { "user-setting:agent.permissions.shell" }}}),
+            ));
+        }
+        Ok(Admission::ApprovalRequired)
     }
 
     fn admit_call_authority(
         &self,
         request: &LocalToolExecutionRequest,
+        prepared: &PreparedEffect,
     ) -> Result<Option<Admission>, LocalAgentKernelError> {
         if let Some(authority) = request.non_workspace_authority.as_ref() {
             validate_id("authorityId", &authority.authority_id)?;
@@ -1398,22 +1764,56 @@ impl LocalAgentKernel {
                     "调用审批 authority 与当前 journal fact 不一致。",
                 ));
             }
+            if self.journal.authority_revoked(
+                &request.session_id,
+                &request.run_id,
+                &authority.authority_id,
+            )? {
+                return Ok(None);
+            }
+            let source = self
+                .journal
+                .approval_source(&request.session_id, &authority.authority_id)?;
+            if !self.journal.approval_matches_request(
+                &request.session_id,
+                &request.run_id,
+                &request.call_id,
+                &authority.authority_id,
+                &request.tool_name,
+                &request.input,
+                prepared.authorization_context().as_ref(),
+            )? {
+                return Ok(None);
+            }
+            if source == "agent"
+                && (!(is_shell_tool(&prepared.operation)
+                    || prepared.binding.container_adapter().is_some())
+                    || prepared.permissions.shell != ShellApprovalMode::Review
+                    || prepared.command_rule().is_some_and(|rule| rule != "allow")
+                    || !self.journal.approval_has_review(
+                        &request.session_id,
+                        &authority.authority_id,
+                        &authority.decision,
+                    )?)
+            {
+                return Ok(None);
+            }
             if authority.decision == "allow" {
                 return Ok(Some(Admission::Allowed(json!({
                     "decision": "allow",
-                    "source": "user",
+                    "source": source,
                     "authorityId": authority.authority_id,
                 }))));
             }
             return Ok(Some(Admission::Denied {
                 authority: json!({
                     "decision": "deny",
-                    "source": "user",
+                    "source": source,
                     "authorityId": authority.authority_id,
                 }),
                 error: json!({
                     "code": "tool_effect_denied",
-                    "message": "用户拒绝了本次操作。",
+                    "message": if source == "agent" { "受委托的审查代理拒绝了本次操作。" } else { "用户拒绝了本次操作。" },
                 }),
             }));
         }
@@ -1427,15 +1827,9 @@ impl LocalAgentKernel {
         scope: PreparedEffectScope,
     ) -> Result<Admission, LocalAgentKernelError> {
         let mode = prepared
-            .generation
             .permissions
             .mode(scope)
             .expect("non-workspace policy");
-        let mode = if prepared.binding.is_computer_control() && mode != PermissionMode::Deny {
-            PermissionMode::Ask
-        } else {
-            mode
-        };
         match mode {
             PermissionMode::Allow => Ok(Admission::Allowed(json!({
                 "decision": "allow",
@@ -1443,16 +1837,16 @@ impl LocalAgentKernel {
                 "authorityId": permission_setting_id(scope),
             }))),
             PermissionMode::Ask => {
-                if let Some(context) = prepared.host_shell_authorization_context() {
-                    if let Some(authority_id) = self.journal.run_host_shell_authority(
-                        &request.session_id,
-                        &request.run_id,
-                        &context,
-                    )? {
-                        return Ok(Admission::Allowed(json!({
-                            "decision": "allow", "source": "user", "authorityId": authority_id,
-                            "authorizationScope": "runHostShell",
-                        })));
+                if scope == PreparedEffectScope::Network {
+                    for grant_scope in ["runNetwork", "sessionNetwork"] {
+                        if let Some(authority) = self.journal.execution_authority(
+                            &request.session_id,
+                            &request.run_id,
+                            grant_scope,
+                            &json!({"kind":"networkTools"}),
+                        )? {
+                            return Ok(Admission::Allowed(authority));
+                        }
                     }
                 }
                 if prepared.binding.is_browser_page() {
@@ -1487,6 +1881,11 @@ impl LocalAgentKernel {
         request: &LocalToolExecutionRequest,
         prepared: &PreparedEffect,
     ) -> Result<Admission, LocalAgentKernelError> {
+        if prepared.external_file_target() {
+            return Ok(Admission::Allowed(
+                json!({"decision":"allow","source":"fileResource"}),
+            ));
+        }
         if let Some(WorkspaceAccess::SessionWorkdir(owner)) = &prepared.workspace_access {
             return Ok(Admission::Allowed(json!({
                 "decision": "allow", "source": "sessionWorkdir",
@@ -1498,7 +1897,7 @@ impl LocalAgentKernel {
             return Ok(Admission::Allowed(authority));
         }
         if !has_confirmed_plan
-            && prepared.generation.permissions.workspace_mutation == WorkspaceMutationMode::Allow
+            && prepared.permissions.workspace_mutation == WorkspaceMutationMode::Allow
         {
             return Ok(Admission::Allowed(json!({
                 "decision": "allow",
@@ -1507,7 +1906,11 @@ impl LocalAgentKernel {
                 "workspaceId": prepared.workspace_id,
             })));
         }
-        Ok(Admission::ApprovalRequired)
+        Ok(Admission::Denied {
+            authority: json!({"decision":"deny","source":"planScope"}),
+            error: json!({"code":"plan_scope_required",
+                "message":"操作未执行：目标未被已确认的 Plan 覆盖。请先发布或调整 Plan，说明必要性和新增目标；执行审批不能替代计划确认。"}),
+        })
     }
 
     fn workspace_plan_authority(
@@ -1574,16 +1977,21 @@ impl LocalAgentKernel {
         cancellation: KernelCancellationToken,
         progress: deepcode_kernel_runtime::executors::KernelProgressSink,
     ) -> Result<KernelToolExecutionResult, String> {
+        let workspace_authority = if authority["source"] == "composite" {
+            &authority["workspaceAuthority"]
+        } else {
+            authority
+        };
         let workspace_write_targets = if is_shell_tool(&prepared.operation)
             && prepared.process_execution_scope.as_deref() == Some("workspace")
-            && authority["source"] == "plan"
+            && workspace_authority["source"] == "plan"
         {
             let root = prepared
                 .workspace_root
                 .as_deref()
                 .ok_or("workspace root missing")?;
             let boundary = WorkspaceBoundary::new(root);
-            let paths = authority["writablePaths"]
+            let paths = workspace_authority["writablePaths"]
                 .as_array()
                 .ok_or("Plan writablePaths missing")?;
             if paths.is_empty() {
@@ -1596,12 +2004,11 @@ impl LocalAgentKernel {
                         let path = target["path"]
                             .as_str()
                             .ok_or("Plan writable path missing")?;
-                        Ok(deepcode_kernel_runtime::executors::WorkspaceWriteTarget {
-                            path: boundary
-                                .resolve_mutation(path)
-                                .map_err(|error| error.to_string())?,
-                            directory: target["kind"] == "directory",
-                        })
+                        let resolved = boundary.resolve_mutation(path).map_err(|error| error.to_string())?;
+                        if target["kind"] != "directory" || resolved == std::fs::canonicalize(root).map_err(|e| e.to_string())? {
+                            return Err("Shell writablePaths must name test/output directories, not project files or the workspace root".into());
+                        }
+                        Ok(deepcode_kernel_runtime::executors::WorkspaceWriteTarget { path: resolved, directory: true })
                     })
                     .collect::<Result<Vec<_>, String>>()?,
             )
@@ -1623,6 +2030,7 @@ impl LocalAgentKernel {
                     workspace_id: prepared.workspace_id.clone(),
                     private_resolved_targets: prepared.private_resolved_targets.clone(),
                     workspace_write_targets,
+                    file_access: prepared.execution_file_access(),
                     cancellation,
                     progress,
                 },
@@ -1776,6 +2184,7 @@ impl Admission {
 
 #[derive(Clone)]
 struct PreparedEffect {
+    permissions: LocalAgentPermissionPolicy,
     generation: Arc<KernelGeneration>,
     binding: PreparedCatalogBinding,
     scope: PreparedEffectScope,
@@ -1790,6 +2199,12 @@ struct PreparedEffect {
     delete_target_kind: Option<String>,
     process_workspace_mode: Option<String>,
     process_execution_scope: Option<String>,
+    file_requests: RequestedFiles,
+    file_access: FileAccessScope,
+    file_authority_required: bool,
+    git_write_requested: bool,
+    network_request: Option<String>,
+    network_authority: Option<Value>,
 }
 
 impl PreparedEffect {
@@ -1854,11 +2269,104 @@ impl PreparedEffect {
                 )
             ));
         }
-        if let Some(context) = self.host_shell_authorization_context() {
-            preview["authorizationScope"] = json!("runHostShell");
+        if let Some(context) = self.command_authorization_context() {
+            preview["authorizationScope"] = json!(if self.is_host_process() {
+                "runHostShell"
+            } else {
+                "runCommand"
+            });
+            preview["authorizationScopes"] = if self.command_rule() == Some("ask") {
+                json!([])
+            } else if self.is_host_process() {
+                json!([
+                    "runCommand",
+                    "sessionCommand",
+                    "runHostShell",
+                    "sessionHostShell"
+                ])
+            } else {
+                json!(["runCommand", "sessionCommand"])
+            };
             preview["authorizationContext"] = context;
         }
+        if self.scope == PreparedEffectScope::Network
+            || self.network_request.is_some() && !self.is_host_process()
+        {
+            preview["authorizationScope"] = json!("runNetwork");
+            preview["authorizationScopes"] = json!(["runNetwork", "sessionNetwork"]);
+            preview["authorizationContext"] =
+                self.authorization_context().expect("network context");
+            if let Some(reason) = &self.network_request {
+                preview["summary"] = json!(format!(
+                    "{}\nNetwork: {reason}",
+                    preview["summary"].as_str().unwrap_or_default()
+                ));
+            }
+        }
+        if self.command_rule() == Some("ask") {
+            preview["authorizationScopes"] = json!([]);
+        }
+        if let PreparedToolInput::Container { input, target } = &self.input {
+            preview["summary"] = json!(format!(
+                "{}\n{}",
+                serde_json::to_string_pretty(input).expect("container input"),
+                serde_json::to_string_pretty(target).expect("container target")
+            ));
+            preview["authorizationContext"] = json!({"container":target});
+            if input.action == "exec" {
+                preview["authorizationScope"] = json!("runContainer");
+                preview["authorizationScopes"] = json!(["runContainer", "sessionContainer"]);
+            }
+        }
+        if !self.file_requests.is_empty() {
+            preview["authorizationScope"] = json!("runFiles");
+            preview["fileAccess"] = self.file_requests.display();
+            if let Some(reason) = &self.file_requests.reason {
+                preview["summary"] = json!(format!(
+                    "{}\n{reason}",
+                    preview["summary"].as_str().unwrap_or_default()
+                ));
+            }
+            preview["authorizationContext"] = self
+                .authorization_context()
+                .expect("file authorization context");
+            preview["authorizationScopes"] = if self.git_write_requested || self.is_host_process() {
+                json!([])
+            } else {
+                json!(["runFiles", "sessionFiles"])
+            };
+        }
         preview
+    }
+
+    fn command_authorization_context(&self) -> Option<Value> {
+        if !is_shell_tool(&self.operation) {
+            return None;
+        }
+        let args = &self.canonical_invocation["arguments"];
+        Some(json!({
+            "workspaceId":self.workspace_id, "workspaceRoot":self.workspace_root,
+            "environment": {"shell":self.generation.executor_config.shell_program,
+                "wsl":self.generation.executor_config.wsl, "executionPath":self.generation.executor_config.execution_path,
+                "executionScope":self.process_execution_scope,
+                "networkAccess":self.is_host_process() || self.file_access.network_access},
+            "toolName":self.operation, "command":args["command"], "cwd":self.workspace_root,
+            "terminal":args["terminal"], "workspaceMode":self.process_workspace_mode,
+        }))
+    }
+
+    fn command_rule(&self) -> Option<&str> {
+        let context = self.command_authorization_context()?;
+        self.permissions
+            .command_rules
+            .iter()
+            .filter(|rule| rule.context == context)
+            .max_by_key(|rule| match rule.decision.as_str() {
+                "deny" => 3,
+                "ask" => 2,
+                _ => 1,
+            })
+            .map(|rule| rule.decision.as_str())
     }
 
     fn host_shell_authorization_context(&self) -> Option<Value> {
@@ -1867,13 +2375,11 @@ impl PreparedEffect {
         {
             return None;
         }
-        Some(json!({
-            "workspaceId": self.workspace_id,
-            "workspaceRoot": self.workspace_root,
-            "shell": self.generation.executor_config.shell_program,
-            "wsl": self.generation.executor_config.wsl,
-            "executionPath": self.generation.executor_config.execution_path,
-        }))
+        let mut context = self.command_authorization_context()?;
+        for key in ["command", "cwd", "terminal", "workspaceMode", "toolName"] {
+            context.as_object_mut().expect("shell context").remove(key);
+        }
+        Some(context)
     }
 }
 
@@ -2589,6 +3095,7 @@ mod attempt_control_tests {
             "type":"run.started", "sessionId":"session:reject", "runId":"run:reject",
             "payload":{"inputMessageId":"message:reject", "workspaceBindings":bindings,
                 "runtimeSnapshot":{
+                    "permissions":crate::settings_api::permission_settings(&json!({})),
                     "runRuntimeSnapshotRef":"runtime:test", "extensionGenerationRef":"extension:test",
                     "kernelCatalogSnapshotRef":catalog["kernelCatalogSnapshotRef"],
                     "provider":{"providerRuntimeRef":"provider:test", "profileId":"profile:test", "contextWindowTokens":4096, "maxOutputTokens":512, "apiSurface":"chatCompletions", "hostedWebSearch":"none"},
@@ -2633,10 +3140,12 @@ mod attempt_control_tests {
                 }))
                 .unwrap(),
             });
+            effect.permissions = effect.generation.permissions.clone();
             assert!(matches!(kernel.admit(&request, &effect).unwrap(),
                 Admission::Denied { authority, error }
                 if authority["matchedRule"] == "rm -rf /"
-                    && error["code"] == "command_denied_by_rule"));
+                    && error["code"] == "command_denied_by_rule"
+                    && error.as_object().unwrap().len() == 2));
         }
         effect.generation = Arc::new(KernelGeneration {
             catalog: effect.generation.catalog.clone(),
@@ -2648,6 +3157,7 @@ mod attempt_control_tests {
             }))
             .unwrap(),
         });
+        effect.permissions = effect.generation.permissions.clone();
         assert!(matches!(
             kernel.admit(&request, &effect).unwrap(),
             Admission::Allowed(_)
@@ -2722,6 +3232,275 @@ mod attempt_control_tests {
     }
 
     #[test]
+    fn shell_approval_binds_actual_request_and_revocation_precedes_reuse() {
+        struct Workspace;
+        impl WorkspaceResolverPort for Workspace {
+            fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
+                Ok(ResolvedWorkspace {
+                    root: std::env::current_dir().unwrap().to_string_lossy().into(),
+                    access: WorkspaceAccess::SessionWorkdir("session:reject".into()),
+                })
+            }
+        }
+        let (kernel, mut request, _) = kernel_with_request(
+            Arc::new(Workspace),
+            "bash",
+            json!({"workspaceId":"workspace:test","command":"printf approved","requestHostPermission":"Use the selected environment"}),
+        );
+        let effect = kernel.prepare_tool(&request).unwrap();
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        request.non_workspace_authority = Some(NonWorkspaceAuthority {
+            authority_id: "authority:invented".into(),
+            decision: "allow".into(),
+        });
+        assert!(
+            matches!(kernel.admit(&request, &effect), Err(error) if error.code == "non_workspace_authority_invalid")
+        );
+        request.non_workspace_authority = None;
+        kernel.journal.append(&json!({"type":"tool.requested","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+            "payload":{"providerCallId":"provider:grant","attemptId":request.attempt_id,"toolName":"bash","input":request.input}})).unwrap();
+        kernel.journal.append(&json!({"type":"approval.requested","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+            "payload":{"approvalId":"approval:grant","preview":effect.preview("bash")}})).unwrap();
+        kernel.journal.append(&json!({"type":"approval.resolved","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+            "payload":{"approvalId":"approval:grant","commandId":"command:grant","decision":"allow","source":"user","authorityId":"authority:grant","authorizationScope":"runCommand"}})).unwrap();
+        request.non_workspace_authority = Some(NonWorkspaceAuthority {
+            authority_id: "authority:grant".into(),
+            decision: "allow".into(),
+        });
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::Allowed(_)
+        ));
+        let mut changed = request.clone();
+        changed.input["command"] = json!("printf changed");
+        let changed_effect = kernel.prepare_tool(&changed).unwrap();
+        assert!(
+            matches!(
+                kernel.admit(&changed, &changed_effect).unwrap(),
+                Admission::ApprovalRequired
+            ),
+            "An approval never follows changed input, even with the same call ID"
+        );
+        changed = request.clone();
+        changed.call_id = "call:repeat".into();
+        changed.non_workspace_authority = None;
+        assert!(
+            matches!(
+                kernel.admit(&changed, &effect).unwrap(),
+                Admission::Allowed(_)
+            ),
+            "An explicit command grant can cover a later identical command in this run"
+        );
+        kernel.journal.append(&json!({"type":"approval.revoked","sessionId":request.session_id,"runId":request.run_id,
+            "payload":{"commandId":"command:revoke","authorityId":"authority:grant"}})).unwrap();
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        assert!(matches!(
+            kernel.admit(&changed, &effect).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        kernel.journal.append(&json!({"type":"approval.requested","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+            "payload":{"approvalId":"approval:renewed","preview":effect.preview("bash")}})).unwrap();
+        kernel.journal.append(&json!({"type":"approval.resolved","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+            "payload":{"approvalId":"approval:renewed","commandId":"command:renewed","decision":"allow","source":"user","authorityId":"authority:renewed","authorizationScope":"runCommand"}})).unwrap();
+        request
+            .non_workspace_authority
+            .as_mut()
+            .unwrap()
+            .authority_id = "authority:renewed".into();
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::Allowed(_)
+        ));
+        kernel
+            .journal
+            .append(
+                &json!({"type":"session.permissions.updated","sessionId":request.session_id,
+            "payload":{"commandId":"command:policy","patches":{"agent.permissions.shell":"ask"}}}),
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                kernel.admit(&request, &effect).unwrap(),
+                Admission::ApprovalRequired
+            ),
+            "A policy change invalidates an unconsumed call approval"
+        );
+        assert!(
+            matches!(
+                kernel.admit(&changed, &effect).unwrap(),
+                Admission::ApprovalRequired
+            ),
+            "The Kernel also stops reusing the grant without depending on a projection"
+        );
+    }
+
+    #[test]
+    fn model_approval_requires_explicit_current_delegation_and_a_review_fact() {
+        struct Workspace;
+        impl WorkspaceResolverPort for Workspace {
+            fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
+                Ok(ResolvedWorkspace {
+                    root: std::env::current_dir().unwrap().to_string_lossy().into(),
+                    access: WorkspaceAccess::SessionWorkdir("session:reject".into()),
+                })
+            }
+        }
+        let (kernel, mut request, _) = kernel_with_request(
+            Arc::new(Workspace),
+            "bash",
+            json!({"workspaceId":"workspace:test","command":"printf review","requestHostPermission":"Use the selected environment"}),
+        );
+        let mut effect = kernel.prepare_tool(&request).unwrap();
+        kernel.journal.append(&json!({"type":"tool.requested","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+            "payload":{"providerCallId":"provider:review","attemptId":request.attempt_id,"toolName":"bash","input":request.input}})).unwrap();
+        kernel.journal.append(&json!({"type":"approval.requested","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+            "payload":{"approvalId":"approval:review","preview":effect.preview("bash")}})).unwrap();
+        kernel.journal.append(&json!({"type":"approval.resolved","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+            "payload":{"approvalId":"approval:review","commandId":"decision:review","decision":"allow","source":"agent","authorityId":"authority:review","authorizationScope":"runHostShell"}})).unwrap();
+        request.non_workspace_authority = Some(NonWorkspaceAuthority {
+            authority_id: "authority:review".into(),
+            decision: "allow".into(),
+        });
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::ApprovalRequired
+        ));
+        effect.permissions = LocalAgentPermissionPolicy::from_settings(
+            &json!({"agent.permissions.shell":"review","agent.permissions.shellAccess":"full"}),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                kernel.admit(&request, &effect).unwrap(),
+                Admission::ApprovalRequired
+            ),
+            "Delegation does not turn an unreviewed claim into authorization"
+        );
+        request.non_workspace_authority = None;
+        request.call_id = "call:later".into();
+        assert!(
+            matches!(
+                kernel.admit(&request, &effect).unwrap(),
+                Admission::ApprovalRequired
+            ),
+            "The Agent cannot mint a reusable Host grant"
+        );
+        request.call_id = "call:reject".into();
+        kernel.journal.append(&json!({"type":"session.permissions.updated","sessionId":request.session_id,
+            "payload":{"commandId":"command:delegate","patches":{"agent.permissions.shell":"review","agent.permissions.shellAccess":"full"}}})).unwrap();
+        let reply = kernel.execute(request.clone()).unwrap();
+        assert_eq!(reply["status"], "approvalRequired");
+        assert_eq!(reply["preview"]["approvalReviewer"], "agent");
+        kernel.journal.append(&json!({"type":"approval.requested","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+            "payload":{"approvalId":"approval:valid-review","preview":reply["preview"]}})).unwrap();
+        kernel.journal.append(&json!({"type":"provider.turn.settled","sessionId":request.session_id,"runId":request.run_id,
+            "payload":{"providerRequestId":"provider:valid-review","purpose":"approvalReview","providerRuntimeRef":"runtime:review","outcome":"completed","orderedCallIds":[]}})).unwrap();
+        kernel.journal.append(&json!({"type":"approval.reviewed","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+            "payload":{"approvalId":"approval:valid-review","providerRequestId":"provider:valid-review","decision":"allow","reason":"The command fits the user delegation."}})).unwrap();
+        kernel.journal.append(&json!({"type":"approval.resolved","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+            "payload":{"approvalId":"approval:valid-review","commandId":"decision:valid-review","decision":"allow","source":"agent","authorityId":"authority:valid-review"}})).unwrap();
+        request.non_workspace_authority = Some(NonWorkspaceAuthority {
+            authority_id: "authority:valid-review".into(),
+            decision: "allow".into(),
+        });
+        effect = kernel.prepare_tool(&request).unwrap();
+        assert!(
+            matches!(
+                kernel.admit(&request, &effect).unwrap(),
+                Admission::Allowed(_)
+            ),
+            "The complete delegated review chain authorizes this exact call"
+        );
+        kernel.journal.append(&json!({"type":"session.permissions.updated","sessionId":request.session_id,
+            "payload":{"commandId":"command:stop-delegation","patches":{"agent.permissions.shell":"ask"}}})).unwrap();
+        effect = kernel.prepare_tool(&request).unwrap();
+        assert!(
+            matches!(
+                kernel.admit(&request, &effect).unwrap(),
+                Admission::ApprovalRequired
+            ),
+            "Turning off delegation stops an unconsumed review approval"
+        );
+    }
+
+    #[test]
+    fn file_requests_cannot_replace_bound_project_write_authority() {
+        struct Projects(PathBuf);
+        impl WorkspaceResolverPort for Projects {
+            fn resolve(&self, id: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
+                Ok(ResolvedWorkspace {
+                    root: self
+                        .0
+                        .join(if id == "workspace:test" {
+                            "first"
+                        } else {
+                            "second"
+                        })
+                        .to_string_lossy()
+                        .into(),
+                    access: WorkspaceAccess::Project,
+                })
+            }
+        }
+        impl Drop for Projects {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root =
+            std::env::temp_dir().join(random_id("bound-projects").unwrap().replace(':', "-"));
+        std::fs::create_dir_all(root.join("first")).unwrap();
+        std::fs::create_dir_all(root.join("second")).unwrap();
+        let projects = Arc::new(Projects(root));
+        let (kernel, mut request, _) = kernel_with_request(
+            projects.clone(),
+            "fs.write",
+            json!({"workspaceId":"workspace:test", "path":projects.0.join("second/result.txt"), "content":"outside current Plan"}),
+        );
+        request.workspace_bindings.push("workspace:second".into());
+        let error = kernel
+            .prepare_tool(&request)
+            .err()
+            .expect("wrong workspace must be rejected");
+        assert!(error.message.contains("another bound project"));
+        assert!(!projects.0.join("second/result.txt").exists());
+        let (kernel, request, _) = kernel_with_request(
+            projects.clone(),
+            "bash",
+            json!({"workspaceId":"workspace:test", "command":"printf unauthorized > result.txt",
+                "requestFileAccess":{"write":[projects.0.join("first")]}}),
+        );
+        let error = kernel
+            .prepare_tool(&request)
+            .err()
+            .expect("file grant must not replace Plan authority");
+        assert!(error.message.contains("Plan writablePaths"));
+        assert!(!projects.0.join("first/result.txt").exists());
+        std::fs::create_dir(projects.0.join("first/.git")).unwrap();
+        let (kernel, request, _) = kernel_with_request(
+            projects.clone(),
+            "fs.delete",
+            json!({"workspaceId":"workspace:test", "path":projects.0.join("first"), "targetKind":"directoryTree"}),
+        );
+        let effect = kernel.prepare_tool(&request).unwrap();
+        assert!(
+            effect.git_write_requested,
+            "Deleting the parent tree includes protected metadata"
+        );
+        assert!(effect.file_authority_required);
+        assert_eq!(
+            effect.preview("fs.delete")["authorizationScopes"],
+            json!([])
+        );
+    }
+
+    #[test]
     fn shell_uses_existing_workspace_authority_without_asking_for_write_access() {
         struct Workspace(WorkspaceAccess);
         impl WorkspaceResolverPort for Workspace {
@@ -2758,7 +3537,7 @@ mod attempt_control_tests {
     }
 
     #[test]
-    fn uncovered_plan_effects_wait_for_a_call_decision_without_expanding_the_plan() {
+    fn uncovered_project_effects_require_plan_scope_even_with_a_call_approval() {
         struct Workspace;
         impl WorkspaceResolverPort for Workspace {
             fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
@@ -2776,7 +3555,8 @@ mod attempt_control_tests {
         let mut effect = kernel.prepare_tool(&request).unwrap();
         assert!(matches!(
             kernel.admit(&request, &effect).unwrap(),
-            Admission::ApprovalRequired
+            Admission::Denied { error, .. } if error["code"] == "plan_scope_required"
+                && error.as_object().unwrap().len() == 2
         ));
         effect.generation = Arc::new(KernelGeneration {
             catalog: effect.generation.catalog.clone(),
@@ -2786,6 +3566,7 @@ mod attempt_control_tests {
             }))
             .unwrap(),
         });
+        effect.permissions = effect.generation.permissions.clone();
         assert!(matches!(
             kernel.admit(&request, &effect).unwrap(),
             Admission::Allowed(_)
@@ -2800,7 +3581,7 @@ mod attempt_control_tests {
             "payload":{"planId":"plan:files", "revision":1, "commandId":"command:plan", "decisionId":"decision:plan", "authorities":[authority]}})).unwrap();
         assert!(matches!(
             kernel.admit(&request, &effect).unwrap(),
-            Admission::ApprovalRequired
+            Admission::Denied { error, .. } if error["code"] == "plan_scope_required"
         ));
         assert!(kernel.records.read(&request.call_id).unwrap().is_none());
         for decision in ["deny", "allow"] {
@@ -2817,34 +3598,124 @@ mod attempt_control_tests {
                 }))
                 .unwrap(),
             );
-            match kernel.admit(&request, &effect).unwrap() {
-                Admission::Denied { error, .. } if decision == "deny" => {
-                    assert_eq!(error["code"], "tool_effect_denied")
-                }
-                Admission::Allowed(authority) if decision == "allow" => {
-                    assert_eq!(authority["source"], "user")
-                }
-                _ => panic!("the committed call decision was not honored"),
-            }
+            assert!(matches!(kernel.admit(&request, &effect).unwrap(),
+                Admission::Denied { error, .. } if error["code"] == "plan_scope_required"));
         }
         request.call_id = "call:next-write".into();
         request.non_workspace_authority = None;
         assert!(matches!(
             kernel.admit(&request, &effect).unwrap(),
-            Admission::ApprovalRequired
+            Admission::Denied { error, .. } if error["code"] == "plan_scope_required"
         ));
         assert_eq!(
             kernel
                 .journal
                 .active_plan_authorities(&request.session_id)
                 .unwrap(),
-            Some(vec![authority])
+            Some(vec![authority.clone()])
         );
+        request.input["path"] = json!("planned.txt");
+        request.plan_authorities = vec![authority];
+        let covered = kernel.prepare_tool(&request).unwrap();
+        assert!(matches!(
+            kernel.admit(&request, &covered).unwrap(),
+            Admission::Allowed(_)
+        ));
         effect.workspace_id = Some("workspace:other-project".into());
         assert!(matches!(
             kernel.admit(&request, &effect).unwrap(),
             Admission::Allowed(_)
         ));
+    }
+
+    #[test]
+    fn file_edit_permission_does_not_grant_shell_project_writes() {
+        struct Project;
+        impl WorkspaceResolverPort for Project {
+            fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
+                Ok(ResolvedWorkspace {
+                    root: std::env::current_dir().unwrap().to_string_lossy().into(),
+                    access: WorkspaceAccess::Project,
+                })
+            }
+        }
+        let (kernel, request, _) = kernel_with_request(
+            Arc::new(Project),
+            "bash",
+            json!({"workspaceId":"workspace:test","command":"printf x > source.cpp"}),
+        );
+        kernel.journal.append(&json!({"type":"session.permissions.updated","sessionId":request.session_id,
+            "payload":{"commandId":"command:files-allowed","patches":{"agent.permissions.workspaceMutation":"allow"}}})).unwrap();
+        let effect = kernel.prepare_tool(&request).unwrap();
+        assert_eq!(effect.process_workspace_mode.as_deref(), Some("read"));
+        assert_eq!(effect.process_execution_scope.as_deref(), Some("workspace"));
+        assert!(matches!(
+            kernel.admit(&request, &effect).unwrap(),
+            Admission::Allowed(_)
+        ));
+        let mut metadata_request = request.clone();
+        metadata_request.input["requestFileAccess"] = json!({"write":[std::env::current_dir().unwrap().join("source.cpp")],"reason":"edit source"});
+        assert!(
+            kernel.prepare_tool(&metadata_request).is_err(),
+            "Shell cannot turn file-resource approval into a project edit grant"
+        );
+    }
+
+    #[test]
+    fn network_grants_reuse_the_environment_and_expire_at_the_requested_boundary() {
+        struct Project;
+        impl WorkspaceResolverPort for Project {
+            fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
+                Ok(ResolvedWorkspace {
+                    root: std::env::current_dir().unwrap().to_string_lossy().into(),
+                    access: WorkspaceAccess::Project,
+                })
+            }
+        }
+        for (scope, across_tasks) in [("runNetwork", false), ("sessionNetwork", true)] {
+            let (kernel, mut request, _) = kernel_with_request(
+                Arc::new(Project),
+                "bash",
+                json!({"workspaceId":"workspace:test","command":"curl https://example.test","requestNetworkPermission":"Fetch test dependencies"}),
+            );
+            let effect = kernel.prepare_tool(&request).unwrap();
+            assert!(matches!(
+                kernel.admit(&request, &effect).unwrap(),
+                Admission::ApprovalRequired
+            ));
+            assert_eq!(effect.process_workspace_mode.as_deref(), Some("read"));
+            let preview = effect.preview("bash");
+            kernel.journal.append(&json!({"type":"tool.requested","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+                "payload":{"providerCallId":"provider:network","attemptId":request.attempt_id,"toolName":"bash","input":request.input}})).unwrap();
+            kernel.journal.append(&json!({"type":"approval.requested","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+                "payload":{"approvalId":"approval:network","preview":preview}})).unwrap();
+            kernel.journal.append(&json!({"type":"approval.resolved","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+                "payload":{"approvalId":"approval:network","commandId":"command:network","authorityId":"authority:network","decision":"allow","source":"user","authorizationScope":scope}})).unwrap();
+            request.input =
+                json!({"workspaceId":"workspace:test","command":"wget https://another.test"});
+            request.call_id = "call:second-network".into();
+            let second = kernel.prepare_tool(&request).unwrap();
+            assert!(second.file_access.network_access);
+            assert_eq!(second.process_workspace_mode.as_deref(), Some("read"));
+            assert!(matches!(
+                kernel.admit(&request, &second).unwrap(),
+                Admission::Allowed(_)
+            ));
+            request.run_id = "run:next".into();
+            assert_eq!(
+                kernel
+                    .execution_authority(&request, &second, scope, &second.file_environment())
+                    .unwrap()
+                    .is_some(),
+                across_tasks
+            );
+            kernel.journal.append(&json!({"type":"approval.revoked","sessionId":request.session_id,"runId":"run:reject",
+                "payload":{"commandId":"command:revoke-network","authorityId":"authority:network"}})).unwrap();
+            assert!(kernel
+                .execution_authority(&request, &second, scope, &second.file_environment())
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[test]
@@ -2880,6 +3751,7 @@ mod attempt_control_tests {
             }))
             .unwrap(),
         });
+        effect.permissions = effect.generation.permissions.clone();
         kernel
             .prepare_process_permissions(&request, &mut effect)
             .unwrap();
@@ -2896,6 +3768,7 @@ mod attempt_control_tests {
             }))
             .unwrap(),
         });
+        effect.permissions = effect.generation.permissions.clone();
         kernel
             .prepare_process_permissions(&request, &mut effect)
             .unwrap();
@@ -2908,8 +3781,13 @@ mod attempt_control_tests {
         request.plan_authorities.clear();
         assert!(matches!(
             kernel.admit(&request, &effect).unwrap(),
-            Admission::ApprovalRequired
+            Admission::Denied { error, .. } if error["code"] == "plan_scope_required"
         ));
+        request.plan_authorities = kernel
+            .journal
+            .active_plan_authorities(&request.session_id)
+            .unwrap()
+            .unwrap();
         request.input["requestHostPermission"] =
             json!("Access a resource outside the Plan sandbox");
         let reply = kernel.execute(request.clone()).unwrap();
@@ -2918,9 +3796,14 @@ mod attempt_control_tests {
             .as_str()
             .unwrap()
             .contains("outside the Plan sandbox"));
-        assert!(
-            reply["preview"].get("authorizationScope").is_none(),
-            "Plan-bound Host approval is call-only"
+        assert_eq!(
+            reply["preview"]["authorizationScopes"],
+            json!([
+                "runCommand",
+                "sessionCommand",
+                "runHostShell",
+                "sessionHostShell"
+            ])
         );
         let mut host_effect = kernel.prepare_tool(&request).unwrap();
         host_effect.generation = Arc::new(KernelGeneration {
@@ -2931,8 +3814,14 @@ mod attempt_control_tests {
             )
             .unwrap(),
         });
-        assert!(matches!(kernel.admit(&request, &host_effect).unwrap(),
-            Admission::Denied { error, .. } if error["code"] == "tool_effect_denied_by_setting"));
+        host_effect.permissions = host_effect.generation.permissions.clone();
+        assert!(
+            matches!(
+                kernel.admit(&request, &host_effect).unwrap(),
+                Admission::ApprovalRequired
+            ),
+            "Shell has its own policy, independent of other external tools"
+        );
     }
 
     #[test]
@@ -2960,6 +3849,7 @@ mod attempt_control_tests {
             }))
             .unwrap(),
         });
+        effect.permissions = effect.generation.permissions.clone();
         let preview = effect.preview("bash");
         assert_eq!(preview["authorizationScope"], "runHostShell");
         let commit = |call: &str, scope: bool| {
@@ -3009,29 +3899,38 @@ mod attempt_control_tests {
             executor_config: config,
             permissions: effect.generation.permissions.clone(),
         });
+        other.permissions = other.generation.permissions.clone();
         assert!(matches!(
             kernel.admit(&request, &other).unwrap(),
             Admission::ApprovalRequired
         ));
         other = effect.clone();
+        let plan = json!({"authorityId":"authority:files-only", "planId":"plan:files-only", "revision":1,
+            "decisionId":"decision:files-only", "sessionId":request.session_id, "runId":request.run_id,
+            "workspaceId":"workspace:test", "coveredOperations":[{"workspaceId":"workspace:test", "operation":"fs.write", "target":"planned.txt"}]});
+        kernel.journal.append(&json!({"type":"plan.published", "sessionId":request.session_id,"runId":request.run_id,"callId":"call:files-plan",
+            "payload":{"providerCallId":"provider:files-plan", "planId":"plan:files-only", "revision":1, "title":"Write a file", "summary":"No Shell effects", "steps":[{"stepId":"write", "title":"Write", "details":"Write planned.txt", "verification":["Read it"]}], "mutationManifest":plan["coveredOperations"]}})).unwrap();
+        kernel.journal.append(&json!({"type":"plan.confirmed", "sessionId":request.session_id,"runId":request.run_id,"callId":"call:files-plan",
+            "payload":{"planId":"plan:files-only", "revision":1, "commandId":"command:files-plan", "decisionId":"decision:files-only", "authorities":[plan]}})).unwrap();
         other.generation = Arc::new(KernelGeneration {
             catalog: effect.generation.catalog.clone(),
             executor_config: effect.generation.executor_config.clone(),
             permissions: LocalAgentPermissionPolicy::from_settings(&json!({})).unwrap(),
         });
+        other.permissions = other.generation.permissions.clone();
         assert!(
             matches!(
                 kernel.admit(&request, &other).unwrap(),
-                Admission::ApprovalRequired
+                Admission::Denied { error, .. } if error["code"] == "plan_scope_required"
             ),
-            "run Host grant never substitutes for missing Plan permission"
+            "run Host grant never extends an existing Plan to an unapproved Shell operation"
         );
         other.process_workspace_mode = Some("write".into());
         other.process_execution_scope = Some("workspace".into());
         assert!(
             matches!(
                 kernel.admit(&request, &other).unwrap(),
-                Admission::ApprovalRequired
+                Admission::Denied { error, .. } if error["code"] == "plan_scope_required"
             ),
             "Host grant does not authorize workspace sandbox write targets"
         );
@@ -3057,7 +3956,7 @@ mod attempt_control_tests {
     }
 
     #[test]
-    fn internal_preview_is_allowed_but_computer_control_always_requires_explicit_approval() {
+    fn internal_preview_is_allowed_and_external_control_respects_user_policy() {
         use std::io::{BufRead, BufReader, Write};
         use std::net::{TcpListener, TcpStream};
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -3159,7 +4058,7 @@ mod attempt_control_tests {
         assert_eq!(activation["input"], request.input);
         let context: KernelToolExecutionContext = serde_json::from_value(json!({
             "output_directory": "/unused-capture-archive", "workspace_root":null, "workspace_id":null,
-            "private_resolved_targets":[], "workspace_write_targets":null,
+            "private_resolved_targets":[], "workspace_write_targets":null, "file_access":{"read":[],"write":[],"readOnly":[],"home":null},
         })).unwrap();
         let before = received.lock().unwrap().len();
         crate::browser_tools::execute(
@@ -3302,9 +4201,10 @@ mod attempt_control_tests {
                 )
                 .unwrap(),
             });
+            configured.permissions = configured.generation.permissions.clone();
             assert!(matches!(
                 (kernel.admit(&request, &configured).unwrap(), expects_denial),
-                (Admission::ApprovalRequired, false) | (Admission::Denied { .. }, true)
+                (Admission::Allowed(_), false) | (Admission::Denied { .. }, true)
             ));
         }
         kernel.journal.append(&json!({"type":"tool.requested","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
@@ -3535,6 +4435,7 @@ mod attempt_control_tests {
             )
             .unwrap();
         let mut effect = PreparedEffect {
+            permissions: LocalAgentPermissionPolicy::from_settings(&json!({})).unwrap(),
             generation: Arc::clone(&generation),
             binding,
             scope: PreparedEffectScope::Process,
@@ -3549,6 +4450,12 @@ mod attempt_control_tests {
             delete_target_kind: None,
             process_workspace_mode: Some("write".into()),
             process_execution_scope: Some("host".into()),
+            file_requests: RequestedFiles::default(),
+            file_access: FileAccessScope::default(),
+            file_authority_required: false,
+            git_write_requested: false,
+            network_request: None,
+            network_authority: None,
         };
         let authority = json!({"coveredOperations":[{"workspaceId":"workspace:scope", "operation":"bash", "command":"make build", "writablePaths":[{"path":"build", "kind":"directory"}]}]});
         assert!(authority_covers(&authority, &effect));

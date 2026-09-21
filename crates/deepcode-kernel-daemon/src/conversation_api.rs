@@ -61,7 +61,9 @@ where
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ReadConversationResourceRequest {
-    workspace_id: String,
+    workspace_id: Option<String>,
+    file_grant: Option<crate::conversation_resources::FileGrantReference>,
+    change: Option<crate::conversation_resources::ChangeReference>,
     logical_path: String,
     start_byte: Option<u64>,
     start_line: Option<u64>,
@@ -176,49 +178,25 @@ pub(crate) async fn conversation_resource_read(
     Path(session_id): Path<String>,
     Json(body): Json<ReadConversationResourceRequest>,
 ) -> Response {
-    if !valid_id(&session_id) || !valid_id(&body.workspace_id) {
-        return ApiResponse::error("conversation_resource_identity_invalid", "资源身份无效。")
-            .into_response();
-    }
-    let projection = match request_service(
-        state.session_service.clone(),
-        "snapshot",
-        json!({ "sessionId": session_id }),
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(error) => return session_service_error(error).into_response(),
+    let resource = crate::conversation_resources::ResourceReference {
+        workspace_id: body.workspace_id.clone(),
+        file_grant: body.file_grant.clone(),
+        change: body.change.clone(),
+        logical_path: body.logical_path.clone(),
     };
-    if !projection_references_workspace(&projection, &body.workspace_id) {
-        return ApiResponse::error(
-            "conversation_resource_workspace_not_bound",
-            "资源不属于当前 Session 的有效目录集合。",
-        )
-        .into_response();
-    }
-    let root = {
-        let gui = state.gui.lock().expect("gui state lock");
-        if let Some(error) = gui.conversation_catalog_error.as_deref() {
-            return ApiResponse::error("conversation_catalog_unavailable", error).into_response();
-        }
-        if gui.conversation_catalog.session(&session_id).is_none() {
-            return ApiResponse::error("conversation_session_not_found", "对话不存在。")
-                .into_response();
-        }
-        let Some(workspace) = gui.conversation_catalog.workspace(&body.workspace_id) else {
-            return ApiResponse::error("conversation_workspace_not_found", "工作目录不存在。")
-                .into_response();
+    let projection =
+        match crate::conversation_resources::resource_projection(&state, &session_id).await {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
         };
-        workspace.canonical_root.clone()
-    };
-
-    let target = match crate::host_inspection::resolve_workspace_read_path(
-        StdPath::new(&root),
-        &body.logical_path,
+    let target = match crate::conversation_resources::resolve_resource(
+        &state,
+        &session_id,
+        &projection,
+        &resource,
     ) {
         Ok(path) => path,
-        Err(error) => return ApiResponse::error(error.code, &error.message).into_response(),
+        Err(error) => return error.into_response(),
     };
     if matches!(body.format, Some(ResourceReadFormat::Path)) {
         let kind = if target.is_dir() {
@@ -278,6 +256,9 @@ pub(crate) async fn conversation_resource_read(
     ) {
         Ok(mut read) => {
             read["workspaceId"] = json!(body.workspace_id);
+            if let Some(grant) = body.file_grant {
+                read["fileGrant"] = json!(grant);
+            }
             read["logicalPath"] = json!(body.logical_path);
             ApiResponse::ok(read)
         }
@@ -1701,7 +1682,7 @@ pub(crate) async fn conversation_context_composition_get(
     }
 }
 
-async fn request_service(
+pub(crate) async fn request_service(
     service: SessionServiceProcess,
     operation: &'static str,
     data: Value,
@@ -1716,7 +1697,7 @@ async fn request_service(
         })?
 }
 
-fn session_service_error(error: SessionServiceError) -> Json<ApiResponse> {
+pub(crate) fn session_service_error(error: SessionServiceError) -> Json<ApiResponse> {
     ApiResponse::error(error.code, error.message)
 }
 
@@ -2032,7 +2013,7 @@ fn binding_snapshot(
         .collect()
 }
 
-fn projection_references_workspace(projection: &Value, workspace_id: &str) -> bool {
+pub(crate) fn projection_references_workspace(projection: &Value, workspace_id: &str) -> bool {
     let bindings_contain = |value: Option<&Value>| {
         value.and_then(Value::as_array).is_some_and(|bindings| {
             bindings.iter().any(|binding| {
@@ -2361,7 +2342,7 @@ fn selected_profile_id(
     Ok(selected.to_string())
 }
 
-fn valid_id(value: &str) -> bool {
+pub(crate) fn valid_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
 }
 

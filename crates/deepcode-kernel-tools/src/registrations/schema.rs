@@ -2,7 +2,7 @@ use crate::invocation_types::KernelToolKind;
 use serde_json::Value;
 
 pub(super) fn provider_schema_for_tool(tool: KernelToolKind) -> Value {
-    match tool {
+    let mut schema = match tool {
         KernelToolKind::FsRead => serde_json::json!({
             "type": "object",
             "required": ["path"],
@@ -10,7 +10,7 @@ pub(super) fn provider_schema_for_tool(tool: KernelToolKind) -> Value {
                 "path": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Workspace-relative UTF-8 text file path."
+                    "description": "UTF-8 text file path, relative to the workspace or absolute. External files require permission."
                 },
                 "startByte": { "type": "integer", "minimum": 0, "maximum": 9007199254740991u64, "description": "Resume at nextByte from the previous read, including within long lines. Takes precedence over startLine." },
                 "startLine": {
@@ -41,7 +41,7 @@ pub(super) fn provider_schema_for_tool(tool: KernelToolKind) -> Value {
                 "path": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Workspace-relative file path. Missing parent directories are created automatically."
+                    "description": "File path, relative to the workspace or absolute. External files require permission. Missing parents are created."
                 },
                 "content": { "type": "string" },
                 "executable": {
@@ -100,13 +100,27 @@ pub(super) fn provider_schema_for_tool(tool: KernelToolKind) -> Value {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 16384,
-                    "description": "Bash script. Each call starts at the bound workspace root; use cd for a subdirectory. Preserve the exit status of the operation being checked."
+                    "description": "Bash script. Each call starts at the selected workspace root. In the sandbox, HOME is the session home directory; TMPDIR is removed after this call. Use an explicit template for temporary files, e.g. mktemp -d \"$TMPDIR/build.XXXXXX\". Store persistent output in the session workspace. Preserve the target command exit status."
+                },
+                "requestNetworkPermission": {
+                    "type": "string", "minLength": 1, "maxLength": 1024,
+                    "description": "Reason to enable network in this sandbox. File permissions stay unchanged. Omit after the environment has an active network grant."
                 },
                 "requestHostPermission": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 1024,
-                    "description": "Optional reason to request execution outside the sandbox; Kernel approval is required. Omit for ordinary sandboxed commands, including reads of accessible paths outside the workspace."
+                    "description": "Request Host execution with this reason. Use requestFileAccess for additional files while keeping the sandbox."
+                },
+                "requestFileAccess": {
+                    "type": "object",
+                    "description": "Request extra absolute paths outside the project. Project edits/deletions use file tools; test/output directory writes use Plan writablePaths.",
+                    "properties": {
+                        "reason": { "type": "string", "minLength": 1, "maxLength": 1024, "description": "Explain why this external access is needed. Project scope changes use Plan instead." },
+                        "read": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+                        "write": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+                    },
+                    "additionalProperties": false
                 },
                 "timeout": {
                     "type": "integer",
@@ -162,5 +176,18 @@ pub(super) fn provider_schema_for_tool(tool: KernelToolKind) -> Value {
             },
             "additionalProperties": false
         }),
+    };
+    if matches!(
+        tool,
+        KernelToolKind::FsRead
+            | KernelToolKind::FsWrite
+            | KernelToolKind::FsEdit
+            | KernelToolKind::FsDelete
+    ) {
+        schema["properties"]["requestFileAccess"] =
+            provider_schema_for_tool(KernelToolKind::ProcessShell)["properties"]
+                ["requestFileAccess"]
+                .clone();
     }
+    schema
 }

@@ -393,6 +393,9 @@ impl KernelCanonicalInvocation {
 
 fn validate_path(value: &str, allow_dot: bool) -> Result<(), ToolValidationError> {
     validate_text("path", value, false)?;
+    if std::path::Path::new(value).is_absolute() {
+        return Ok(());
+    }
     if value.contains('\\')
         || value.starts_with('/')
         || value.as_bytes().get(1) == Some(&b':')

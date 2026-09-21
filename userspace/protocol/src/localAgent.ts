@@ -1,3 +1,5 @@
+import type { UserSettings } from './userSettings.js';
+import type { ShellAuthorizationScope } from './permissions.js';
 import type { LlmReasoningEffort, LlmThinkingMode } from './llm.js';
 
 export const LOCAL_AGENT_PROTOCOL_VERSION = 'deepcode.local-agent' as const;
@@ -40,7 +42,7 @@ export interface ProviderAttemptFact {
   providerRequestId: string;
   providerAttemptId: string;
   attempt: number;
-  purpose: 'agent' | 'contextCompaction';
+  purpose: 'agent' | 'contextCompaction' | 'approvalReview';
   phase: 'started' | 'completed' | 'failed' | 'retryWaiting';
   error?: LocalAgentError;
   retryAt?: string;
@@ -233,6 +235,8 @@ export type PlanResponse =
 export type MessageFeedback = 'up' | 'down';
 
 export type ConversationCommand =
+  | { schemaVersion: typeof CONVERSATION_COMMAND_VERSION; type: 'session.permissions.set'; commandId: string; sessionId: string; patches: UserSettings }
+  | { schemaVersion: typeof CONVERSATION_COMMAND_VERSION; type: 'approval.revoke'; commandId: string; sessionId: string; runId: string; authorityId: string }
   | {
       schemaVersion: typeof CONVERSATION_COMMAND_VERSION;
       type: 'session.model-settings.set';
@@ -326,7 +330,7 @@ export type ConversationCommand =
       callId: string;
       approvalId: string;
       decision: 'allow' | 'deny';
-      authorizationScope?: 'runHostShell';
+      authorizationScope?: ShellAuthorizationScope;
     }
   | {
       schemaVersion: typeof CONVERSATION_COMMAND_VERSION;
@@ -399,7 +403,7 @@ export interface ProviderToolCallInput {
 
 export type ProviderTurnSettlement = {
   providerRequestId: string;
-  purpose: 'agent' | 'contextCompaction';
+  purpose: 'agent' | 'contextCompaction' | 'approvalReview';
   providerRuntimeRef: string;
 } & (
   | {
@@ -554,7 +558,7 @@ export type ProviderResponseConstraint = 'normal' | 'answerOnly';
 export interface ContextCompositionReceipt {
   kernelCatalogSnapshotRef?: string;
   providerRequestId: string;
-  purpose: 'agent' | 'contextCompaction';
+  purpose: 'agent' | 'contextCompaction' | 'approvalReview';
   responseConstraint: ProviderResponseConstraint;
   dynamicInstructionBytes: number;
   messages: ContextCompositionMessage[];
@@ -565,7 +569,7 @@ export interface ContextCompositionReceipt {
 
 interface ContextCompositionProjectionBase {
   providerRequestId: string;
-  purpose: 'agent' | 'contextCompaction';
+  purpose: 'agent' | 'contextCompaction' | 'approvalReview';
   responseConstraint: ProviderResponseConstraint;
   runId: string;
   sequence: number;
@@ -616,17 +620,33 @@ export interface ContextCompactedPayload {
   summary: string;
 }
 
+export interface ShellAuthorizationProjection {
+  authorityId: string;
+  runId: string;
+  scope: ShellAuthorizationScope;
+  summary: string;
+  context: JsonObject;
+}
+
 export interface EffectPreview {
+  approvalReviewer?: 'user' | 'agent';
+  authorizationScopes?: ShellAuthorizationScope[];
+  fileAccess?: { read: string[]; write: string[] };
+  review?: { decision: 'allow' | 'deny' | 'ask'; reason: string };
+
   summary: string;
   effects: EffectKind[];
   logicalTargets: string[];
   /** An explicit browser grant applies to subsequent page operations in this Session. */
-  authorizationScope?: 'sessionBrowser' | 'runHostShell';
+  authorizationScope?: 'sessionBrowser' | ShellAuthorizationScope;
   /** Kernel-owned binding for a reusable Host Shell grant. */
   authorizationContext?: JsonObject;
 }
 
 export type SessionEvent =
+  | (SessionEventBase & { type: 'session.permissions.updated'; payload: { commandId: string; patches: UserSettings } })
+  | (SessionEventBase & { type: 'approval.revoked'; runId: string; payload: { commandId: string; authorityId: string } })
+  | (SessionEventBase & { type: 'approval.reviewed'; runId: string; callId: string; payload: { approvalId: string; providerRequestId: string; decision: 'allow' | 'deny' | 'ask'; reason: string } })
   | (SessionEventBase & { type: 'provider.attempt.updated'; runId: string; payload: ProviderAttemptFact })
   | (SessionEventBase & { type: 'run.failure.recorded'; runId: string; payload: RunFailureSnapshot })
   | (SessionEventBase & {
@@ -756,6 +776,7 @@ export type SessionEvent =
         revision: number;
         commandId: string;
         decisionId: string;
+        source?: 'user' | 'agent';
         authorities: PlanAuthority[];
       };
     })
@@ -828,7 +849,9 @@ export type SessionEvent =
         commandId: string;
         decision: 'allow' | 'deny';
         authorityId: string;
-        authorizationScope?: 'runHostShell';
+        source?: 'user' | 'agent';
+        reason?: string;
+        authorizationScope?: ShellAuthorizationScope;
       };
     })
   | (SessionEventBase & {
@@ -1057,7 +1080,7 @@ export interface PlanPreviewProjection {
 }
 
 export interface ProviderActivityProjection {
-  purpose: 'agent' | 'contextCompaction';
+  purpose: 'agent' | 'contextCompaction' | 'approvalReview';
   phase: 'waitingResponse' | 'reasoning' | 'awaitingOutput' | 'generatingOutput';
   startedAt: string;
   lastContentAt?: string;
@@ -1075,6 +1098,7 @@ export interface PlanProjection extends ExecutionPlan {
   runId: string;
   callId: string;
   status: PlanProjectionStatus;
+  confirmationSource?: 'user' | 'agent';
   decisionId?: string;
   sequence: number;
   createdAt: string;
@@ -1161,6 +1185,8 @@ export interface ActivityResourceProjection {
 export interface ToolActivityProjection {
   recordId?: string;
   error?: LocalAgentError;
+  /** Detail decoding failed; the execution status and original record are unchanged. */
+  projectionError?: LocalAgentError;
   operation: string;
   resources: ActivityResourceProjection[];
   shell?: ShellActivityProjection;
@@ -1208,7 +1234,8 @@ export interface ShellExecutionEnvironmentProjection {
   terminal: boolean;
   /** Diagnostic recorded by the producer, preserved verbatim when reading history. */
   pathSource: string;
-  writeScope: 'kernelTemporaryOnly' | 'workspaceAndKernelTemporary' | 'hostUser';
+  /** Recorded diagnostic, not an authorization for a later invocation. */
+  writeScope: string;
   homeWritable: boolean;
   networkAccess: boolean;
 }
@@ -1254,6 +1281,9 @@ export interface QueuedInputProjection {
 }
 
 export interface SessionProjection {
+  permissionOverrides: UserSettings;
+  effectivePermissions: UserSettings | null;
+  shellAuthorizations: ShellAuthorizationProjection[];
   providerAttempts?: Array<ProviderAttemptFact & { runId: string; updatedAt: string }>;
   failureSnapshot?: RunFailureSnapshot;
   modelSettings: SessionModelSettings | null;
@@ -1378,7 +1408,7 @@ export interface ProviderRequest {
   runId: string;
   providerRuntimeRef: string;
   profileId: string;
-  purpose: 'agent' | 'contextCompaction';
+  purpose: 'agent' | 'contextCompaction' | 'approvalReview';
   responseConstraint: ProviderResponseConstraint;
   maxOutputTokens: number;
   workspaceBindings: readonly WorkspaceBindingDisplay[];
@@ -1514,6 +1544,7 @@ export interface ProviderToolAlias {
 }
 
 export interface RunRuntimeSnapshot {
+  permissions: UserSettings;
   environment: JsonObject;
   runRuntimeSnapshotRef: string;
   extensionGenerationRef: string;
@@ -1644,7 +1675,7 @@ export type WorkspaceAuthorityDecision =
     };
 
 export type NonWorkspaceAuthorityDecision =
-  | { decision: 'allow'; source: 'user' | 'userSetting'; authorityId: string; authorizationScope?: 'sessionBrowser' | 'runHostShell' }
+  | { decision: 'allow'; source: 'user' | 'agent' | 'userSetting'; authorityId: string; authorizationScope?: 'sessionBrowser' | ShellAuthorizationScope }
   | { decision: 'deny'; source: 'user'; authorityId: string }
   | { decision: 'deny'; source: 'kernel' | 'userSetting'; reason: string };
 

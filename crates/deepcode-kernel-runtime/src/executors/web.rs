@@ -631,6 +631,7 @@ mod tests {
             workspace_id: None,
             private_resolved_targets: vec![],
             workspace_write_targets: None,
+            file_access: Default::default(),
             cancellation: KernelCancellationToken::default(),
             progress: Default::default(),
         }
@@ -754,6 +755,7 @@ mod tests {
                 workspace_id: None,
                 private_resolved_targets: vec![],
                 workspace_write_targets: None,
+                file_access: Default::default(),
                 cancellation: KernelCancellationToken::default(),
                 progress: Default::default(),
             },

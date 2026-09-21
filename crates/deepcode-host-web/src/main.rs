@@ -401,10 +401,13 @@ async fn proxy_api(
     {
         request = request.header(reqwest::header::CONTENT_TYPE, content_type);
     }
-    let request = request.timeout(Duration::from_secs(60));
-    match request.send().await {
-        Ok(response) => proxy_response(response).await,
-        Err(error) => proxy_request_error("kernel_daemon_proxy_failed", &error),
+    // Bound connection/headers separately: an SSE subscription lives until its owner closes it.
+    match tokio::time::timeout(Duration::from_secs(60), request.send()).await {
+        Ok(Ok(response)) => proxy_response(response).await,
+        Ok(Err(error)) => proxy_request_error("kernel_daemon_proxy_failed", &error),
+        Err(error) => {
+            ApiResponse::error("kernel_daemon_proxy_timeout", error.to_string()).into_response()
+        }
     }
 }
 
@@ -441,6 +444,9 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
     match (method, segments.as_slice()) {
+        ("GET", ["api", "conversation", "sessions", _, "resources", "roots"])
+        | ("POST", ["api", "conversation", "sessions", _, "resources", "list" | "watch"]) => true,
+
         ("GET", ["api", "health"])
         | ("GET", ["api", "workspaces", "current"])
         | ("GET", ["api", "workspaces", "default-path"])
@@ -686,8 +692,8 @@ async fn proxy_response(response: reqwest::Response) -> Response {
                 ApiResponse::error("proxy_response_build_failed", error.to_string()).into_response()
             });
     }
-    match response.bytes().await {
-        Ok(bytes) => {
+    match tokio::time::timeout(Duration::from_secs(60), response.bytes()).await {
+        Ok(Ok(bytes)) => {
             let mut builder = Response::builder().status(status);
             if let Some(content_type) = content_type {
                 builder = builder.header(header::CONTENT_TYPE, content_type);
@@ -696,6 +702,9 @@ async fn proxy_response(response: reqwest::Response) -> Response {
                 ApiResponse::error("proxy_response_build_failed", error.to_string()).into_response()
             })
         }
-        Err(error) => proxy_request_error("proxy_response_read_failed", &error),
+        Ok(Err(error)) => proxy_request_error("proxy_response_read_failed", &error),
+        Err(error) => {
+            ApiResponse::error("proxy_response_read_timeout", error.to_string()).into_response()
+        }
     }
 }

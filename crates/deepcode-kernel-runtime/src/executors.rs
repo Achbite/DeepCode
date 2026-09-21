@@ -27,6 +27,7 @@ pub struct KernelExecutorConfig {
     pub shell_program: Option<crate::shell_environment::ShellProgram>,
     pub execution_path: Option<String>,
     pub temporary_root: Option<PathBuf>,
+    pub file_read_roots: Vec<PathBuf>,
     pub wsl: Option<crate::wsl_execution::WslExecution>,
 }
 
@@ -146,6 +147,7 @@ pub struct KernelToolExecutionContext {
     pub private_resolved_targets: Vec<String>,
     /// None is an explicit unrestricted workspace-write grant; Some limits writes to Plan paths.
     pub workspace_write_targets: Option<Vec<WorkspaceWriteTarget>>,
+    pub file_access: crate::file_access::FileAccessScope,
     #[serde(skip)]
     pub cancellation: KernelCancellationToken,
     #[serde(skip)]
@@ -306,6 +308,7 @@ pub use file_changes::{capture_side as capture_file_change_side, change_fact as 
 #[path = "executors/fs.rs"]
 mod filesystem;
 mod process;
+pub use process::execute_cli_command;
 pub(crate) mod web;
 
 use filesystem::*;
@@ -657,9 +660,19 @@ fn prepared_workspace_target(context: &KernelToolExecutionContext) -> KernelResu
     }
     let root = workspace_root(context)?;
     let target = PathBuf::from(&context.private_resolved_targets[0]);
-    if !target.is_absolute() || !target.starts_with(&root) {
+    if !target.is_absolute()
+        || (!target.starts_with(&root)
+            && !context
+                .file_access
+                .read
+                .iter()
+                .any(|path| path == &target || (path.is_dir() && target.starts_with(path)))
+            && !context.file_access.write.iter().any(|grant| {
+                grant.path == target || (grant.directory && target.starts_with(&grant.path))
+            }))
+    {
         return Err(KernelError::PermissionDenied(
-            "PreparedEffect target is outside the canonical workspace root".to_string(),
+            "PreparedEffect target is outside the authorized file scope".to_string(),
         ));
     }
     Ok(target)
@@ -676,6 +689,9 @@ fn required_string(value: &Value, key: &str) -> KernelResult<String> {
 }
 
 fn normalize_relative_path(path: &str) -> String {
+    if Path::new(path).is_absolute() {
+        return path.to_owned();
+    }
     let normalized = path
         .replace('\\', "/")
         .trim_start_matches("./")

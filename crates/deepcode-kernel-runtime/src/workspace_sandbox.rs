@@ -1,6 +1,8 @@
 //! Platform implementations of the existing workspace Shell policy.
 #[cfg(any(target_os = "linux", windows))]
-use deepcode_kernel_abi::{KernelError, KernelResult};
+use deepcode_kernel_abi::KernelError;
+#[cfg(target_os = "linux")]
+use deepcode_kernel_abi::KernelResult;
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "macos")]
 use std::path::Path;
@@ -38,7 +40,7 @@ pub fn probe() -> SandboxStatus {
     }
     #[cfg(windows)]
     {
-        windows::probe()
+        SandboxStatus::observed("windows-restricted-token", Err("This backend restricts writes but does not provide strict file read isolation. Use WSL or explicitly authorize Host execution.".into()))
     }
     #[cfg(target_os = "macos")]
     {
@@ -76,7 +78,7 @@ pub(crate) fn unavailable(tool: &str, message: impl Into<String>) -> KernelError
 
 /// Directory grants may create the authorized output directory. File grants do
 /// not implicitly authorize creating or renaming entries in their parent.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(target_os = "linux")]
 pub(crate) fn writable_paths(
     root: &Path,
     mode: &str,
@@ -94,7 +96,7 @@ pub(crate) fn writable_paths(
         } else if !target.path.is_file() {
             return Err(KernelError::Structured {
                 code: "workspace_shell_write_target_unavailable", stage: "execution",
-                message: "A file-level Shell grant requires an existing file. Use fs.edit to create the file, or request its output directory for a generator/build command.".into(),
+                message: "A file-level Shell grant requires an existing file. Use fs.write to create the file, or request its output directory for a generator/build command.".into(),
                 details: serde_json::json!({"path": target.path}),
             });
         }

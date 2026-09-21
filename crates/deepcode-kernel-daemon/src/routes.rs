@@ -165,6 +165,18 @@ pub(crate) fn build_app(state: AppState) -> Router {
             post(conversation_change_read),
         )
         .route(
+            "/api/conversation/sessions/:session_id/resources/roots",
+            get(conversation_resource_roots),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/resources/list",
+            post(conversation_resource_list),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/resources/watch",
+            post(conversation_resources_watch),
+        )
+        .route(
             "/api/conversation/sessions/:session_id/resources/read",
             post(conversation_resource_read),
         )

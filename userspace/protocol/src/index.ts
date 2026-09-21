@@ -7,3 +7,5 @@ export * from './modelServices.js';
 export * from './localAgent.js';
 
 export { isErrorDiagnostics, isLocalAgentErrorValue } from './errorDiagnostics.js';
+
+export * from './permissions.js';

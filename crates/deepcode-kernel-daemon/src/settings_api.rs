@@ -253,6 +253,10 @@ pub(crate) fn default_user_settings() -> Value {
         "agent.projectEnvironments": "{}",
         "agent.permissions.workspaceMutation": "plan",
         "agent.permissions.engineeringDecisions": "ask",
+        "agent.permissions.shell": "ask",
+        "agent.permissions.shellAccess": "workspace",
+        "agent.permissions.commandRules": "[]",
+        "agent.permissions.runtimeReadRoots": [],
         "agent.permissions.networkRead": "allow",
         "agent.permissions.external": "ask",
         "agent.permissions.commandDenylist": crate::command_denylist::DEFAULT_COMMANDS,
@@ -276,6 +280,8 @@ pub(crate) fn default_user_settings() -> Value {
 
 pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), String> {
     crate::command_denylist::CommandDenylist::from_settings(settings)?;
+    crate::local_agent_kernel::LocalAgentPermissionPolicy::from_settings(settings)
+        .map_err(|error| error.message)?;
     if settings
         .get("agent.documents.pythonPath")
         .is_some_and(|value| !value.is_string())
@@ -296,6 +302,10 @@ pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), St
                     | "agent.permissions.networkRead"
                     | "agent.permissions.external"
                     | "agent.permissions.commandDenylist"
+                    | "agent.permissions.shell"
+                    | "agent.permissions.shellAccess"
+                    | "agent.permissions.commandRules"
+                    | "agent.permissions.runtimeReadRoots"
             ) {
                 return Err(format!("{key} 不是当前 Agent Runtime 权限设置。"));
             }
@@ -344,4 +354,18 @@ pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), St
         }
     }
     Ok(())
+}
+
+/// The persisted run receives the same permission defaults as Kernel admission.
+pub(crate) fn permission_settings(settings: &Value) -> Value {
+    let defaults = default_user_settings();
+    Value::Object(
+        defaults
+            .as_object()
+            .expect("settings defaults")
+            .iter()
+            .filter(|(key, _)| key.starts_with("agent.permissions."))
+            .map(|(key, default)| (key.clone(), settings.get(key).unwrap_or(default).clone()))
+            .collect(),
+    )
 }

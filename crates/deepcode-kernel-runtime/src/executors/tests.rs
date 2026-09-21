@@ -175,6 +175,7 @@ fn context_with_target(root: &Path, relative_path: &str) -> KernelToolExecutionC
         workspace_root: Some(canonical_root.to_string_lossy().to_string()),
         workspace_id: Some("workspace:test".to_string()),
         workspace_write_targets: None,
+        file_access: crate::file_access::FileAccessScope::workspace(&canonical_root).unwrap(),
         private_resolved_targets: vec![canonical_root
             .join(relative_path)
             .to_string_lossy()
@@ -431,9 +432,9 @@ fn bash_executes_in_the_bound_workspace_and_reports_environment() {
     );
     assert_eq!(
         result.output["environment"]["writeScope"],
-        "workspaceAndKernelTemporary"
+        "authorizedResources"
     );
-    assert_eq!(result.output["environment"]["homeWritable"], false);
+    assert_eq!(result.output["environment"]["homeWritable"], true);
     assert_eq!(result.output["environment"]["networkAccess"], false);
     assert_eq!(
         fs::read_to_string(workspace.0.join("build/generated.txt")).unwrap(),
@@ -466,7 +467,7 @@ fn bash_cleans_its_owned_temporary_directory() {
     assert_eq!(result.output["workspaceMode"], "read");
     assert_eq!(
         result.output["environment"]["writeScope"],
-        "kernelTemporaryOnly"
+        "authorizedResources"
     );
     assert_eq!(result.output["environment"]["networkAccess"], false);
     let temporary = result.output["stdout"]

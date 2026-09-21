@@ -1,3 +1,5 @@
+import { PERMISSION_DEFAULTS } from './permissions.js';
+
 export type UserSettingValue = string | number | boolean | null | string[];
 export type UserSettings = Record<string, UserSettingValue>;
 export type SettingsSurface = 'gui' | 'cli' | 'tui';
@@ -38,11 +40,7 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'agent.windows.gitBashPath': '',
   'agent.environmentRevision': 0,
   'agent.projectEnvironments': '{}',
-  'agent.permissions.workspaceMutation': 'plan',
-  'agent.permissions.engineeringDecisions': 'ask',
-  'agent.permissions.networkRead': 'allow',
-  'agent.permissions.external': 'ask',
-  'agent.permissions.commandDenylist': ['rm -rf /'],
+  ...PERMISSION_DEFAULTS,
   'agent.web.search.endpointTemplate': '',
   'agent.web.search.authHeaderName': 'Authorization',
   'agent.web.search.authSecretRef': '',

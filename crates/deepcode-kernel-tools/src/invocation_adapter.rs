@@ -83,7 +83,7 @@ fn normalize_invocation(
         KernelCanonicalInvocation::FsRead { path, .. }
         | KernelCanonicalInvocation::FsWrite { path, .. }
         | KernelCanonicalInvocation::FsEdit { path, .. } => {
-            *path = normalize_workspace_path(path, false)?;
+            *path = normalize_file_path(path)?;
         }
         KernelCanonicalInvocation::FsDelete(target) => {
             let path = match target {
@@ -91,12 +91,19 @@ fn normalize_invocation(
                     path
                 }
             };
-            *path = normalize_workspace_path(path, false)?;
+            *path = normalize_file_path(path)?;
         }
         _ => {}
     }
     invocation.validate()?;
     Ok(())
+}
+
+fn normalize_file_path(value: &str) -> Result<String, InvocationNormalizationError> {
+    if std::path::Path::new(value).is_absolute() && !value.contains('\0') {
+        return Ok(value.to_owned());
+    }
+    normalize_workspace_path(value, false)
 }
 
 pub fn normalize_workspace_path(

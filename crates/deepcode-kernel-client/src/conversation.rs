@@ -160,6 +160,9 @@ pub struct SessionProjection {
     pub revision: u64,
     pub display: SessionDisplayProjection,
     pub model_settings: Option<SessionModelSettings>,
+    pub permission_overrides: Value,
+    pub effective_permissions: Option<Value>,
+    pub shell_authorizations: Vec<ShellAuthorizationProjection>,
     pub workspace_bindings: Vec<WorkspaceBindingDisplay>,
     pub session_directory_indexes: Vec<WorkspaceBindingDisplay>,
     pub timeline: Vec<SessionTimelineItem>,
@@ -231,7 +234,10 @@ impl SessionProjection {
         }
         if self.provider_attempts.iter().any(|attempt| {
             !(1..=5).contains(&attempt.attempt)
-                || !matches!(attempt.purpose.as_str(), "agent" | "contextCompaction")
+                || !matches!(
+                    attempt.purpose.as_str(),
+                    "agent" | "contextCompaction" | "approvalReview"
+                )
                 || !matches!(
                     attempt.phase.as_str(),
                     "started" | "completed" | "failed" | "retryWaiting"
@@ -310,12 +316,13 @@ impl SessionProjection {
                             .any(|title| title.encode_utf16().count() > 256)
                 })
                 || draft.activity.as_ref().is_some_and(|activity| {
-                    !matches!(activity.purpose.as_str(), "agent" | "contextCompaction")
-                        || !matches!(
-                            activity.phase.as_str(),
-                            "waitingResponse" | "reasoning" | "awaitingOutput" | "generatingOutput"
-                        )
-                        || activity.started_at.is_empty()
+                    !matches!(
+                        activity.purpose.as_str(),
+                        "agent" | "contextCompaction" | "approvalReview"
+                    ) || !matches!(
+                        activity.phase.as_str(),
+                        "waitingResponse" | "reasoning" | "awaitingOutput" | "generatingOutput"
+                    ) || activity.started_at.is_empty()
                         || activity
                             .last_content_at
                             .as_deref()
@@ -425,7 +432,12 @@ impl SessionProjection {
                     .preview
                     .authorization_scope
                     .as_deref()
-                    .is_some_and(|scope| !matches!(scope, "sessionBrowser" | "runHostShell"))
+                    .is_some_and(|scope| {
+                        scope != "sessionBrowser"
+                            && !AUTHORIZATION_OPTIONS
+                                .iter()
+                                .any(|(candidate, _)| *candidate == scope)
+                    })
         }) {
             return Err("shared Session projection has an invalid approval".to_string());
         }
@@ -501,7 +513,10 @@ impl SessionProjection {
         if self.context_compositions.iter().any(|receipt| {
             receipt.provider_request_id.is_empty()
                 || receipt.run_id.is_empty()
-                || !matches!(receipt.purpose.as_str(), "agent" | "contextCompaction")
+                || !matches!(
+                    receipt.purpose.as_str(),
+                    "agent" | "contextCompaction" | "approvalReview"
+                )
                 || receipt.sequence == 0
                 || receipt.sequence > self.revision
                 || receipt.created_at.is_empty()
@@ -647,6 +662,10 @@ impl SessionProjection {
                             .error
                             .as_ref()
                             .is_some_and(|error| error.code.is_empty() || error.message.is_empty())
+                        || tool
+                            .projection_error
+                            .as_ref()
+                            .is_some_and(|error| error.code.is_empty() || error.message.is_empty())
                         || tool.shell.as_ref().is_some_and(|shell| {
                             !matches!(tool.operation.as_str(), "bash" | "powershell")
                                 || shell.command.trim().is_empty()
@@ -662,7 +681,7 @@ impl SessionProjection {
                                 })
                         })
                         || matches!(tool.operation.as_str(), "bash" | "powershell")
-                            && (tool.shell.is_none()
+                            && (tool.shell.is_none() && tool.projection_error.is_none()
                                 || tool.shell.as_ref().is_some_and(|shell| {
                                     match activity.status.as_str() {
                                         "completed" => shell.result.is_none(),
@@ -1397,6 +1416,20 @@ pub struct EffectPreview {
     pub logical_targets: Vec<String>,
     pub authorization_scope: Option<String>,
     pub authorization_context: Option<Value>,
+    pub authorization_scopes: Option<Vec<String>>,
+    pub file_access: Option<Value>,
+    pub approval_reviewer: Option<String>,
+    pub review: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShellAuthorizationProjection {
+    pub authority_id: String,
+    pub run_id: String,
+    pub scope: String,
+    pub summary: String,
+    pub context: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1457,6 +1490,7 @@ pub struct PlanProjection {
     pub mutation_manifest: Vec<PlanOperation>,
     pub status: String,
     pub decision_id: Option<String>,
+    pub confirmation_source: Option<String>,
     pub sequence: u64,
     pub created_at: String,
     pub updated_at: String,
@@ -1482,6 +1516,7 @@ pub struct PendingPlanProjection {
     pub mutation_manifest: Vec<PlanOperation>,
     pub status: String,
     pub decision_id: Option<String>,
+    pub confirmation_source: Option<String>,
     pub response_mode: String,
     pub sequence: u64,
     pub created_at: String,
@@ -1687,6 +1722,7 @@ pub struct ToolOutputProjection {
 pub struct ToolInputRejectionProjection {
     pub code: String,
     pub message: String,
+    pub diagnostics: Option<ErrorDiagnostics>,
     pub issues: Vec<ToolInputIssueProjection>,
 }
 
@@ -1713,6 +1749,7 @@ pub struct ToolActivityProjection {
     pub record_id: Option<String>,
     pub operation: String,
     pub error: Option<ConversationError>,
+    pub projection_error: Option<ConversationError>,
     pub resources: Vec<ActivityResourceProjection>,
     pub shell: Option<ShellActivityProjection>,
     #[serde(default)]
@@ -1969,6 +2006,27 @@ pub fn interaction_response_command(
     })
 }
 
+/// Shells display only scopes offered by the shared Kernel preview.
+pub const AUTHORIZATION_OPTIONS: &[(&str, &str)] = &[
+    ("runCommand", "allow-run"),
+    ("sessionCommand", "allow-session"),
+    ("runHostShell", "allow-host-run"),
+    ("sessionHostShell", "allow-host-session"),
+    ("runNetwork", "allow-network-run"),
+    ("sessionNetwork", "allow-network-session"),
+    ("runContainer", "allow-container-run"),
+    ("sessionContainer", "allow-container-session"),
+    ("runFiles", "allow-files-run"),
+    ("sessionFiles", "allow-files-session"),
+];
+
+pub fn approval_scope_for_input(decision: &str) -> Option<&'static str> {
+    AUTHORIZATION_OPTIONS
+        .iter()
+        .find(|(_, input)| *input == decision)
+        .map(|(scope, _)| *scope)
+}
+
 pub fn approval_response_command(
     session_id: &str,
     command_id: &str,
@@ -1983,10 +2041,10 @@ pub fn approval_response_command(
         "runId": approval.run_id,
         "callId": approval.call_id,
         "approvalId": approval.approval_id,
-        "decision": if decision == "allow-run" { "allow" } else { decision },
+        "decision": if approval_scope_for_input(decision).is_some() { "allow" } else { decision },
     });
-    if decision == "allow-run" {
-        command["authorizationScope"] = json!("runHostShell");
+    if let Some(scope) = approval_scope_for_input(decision) {
+        command["authorizationScope"] = json!(scope);
     }
     command
 }
@@ -2239,17 +2297,7 @@ fn valid_shell_execution_environment(environment: &ShellExecutionEnvironmentProj
         && matches!(environment.execution_scope.as_str(), "workspace" | "host")
         && environment.interactive == environment.terminal
         && !environment.path_source.trim().is_empty()
-        && if environment.execution_scope == "host" {
-            environment.write_scope == "hostUser"
-                && environment.home_writable
-                && environment.network_access
-        } else {
-            matches!(
-                environment.write_scope.as_str(),
-                "kernelTemporaryOnly" | "workspaceAndKernelTemporary"
-            ) && !environment.home_writable
-                && !environment.network_access
-        }
+        && !environment.write_scope.trim().is_empty()
 }
 
 fn is_normalized_logical_path(value: &str) -> bool {
@@ -2268,7 +2316,7 @@ mod tests {
 
     fn projection_value() -> Value {
         let mut value = json!({
-            "schemaVersion": SESSION_PROJECTION_VERSION,
+            "schemaVersion": SESSION_PROJECTION_VERSION, "permissionOverrides":{}, "effectivePermissions":null, "shellAuthorizations":[],
             "sessionId": "session:test",
             "revision": 8,
             "display": { "creationTitle": "测试" },
@@ -2678,6 +2726,33 @@ mod tests {
     #[test]
     fn validates_canonical_shell_command_and_result_projection() {
         let mut value = projection_value();
+        let mut unreadable = value.clone();
+        unreadable["activities"][0]["tool"] = json!({
+            "operation": "bash", "resources": [], "recordId": "record:original",
+            "projectionError": {"code":"bash_projection_environment_invalid", "message":"Tool details are unavailable."}
+        });
+        let readable: SessionProjection = serde_json::from_value(unreadable.clone()).unwrap();
+        assert_eq!(readable.validate(), Ok(()));
+        assert_eq!(readable.activities[0].status, "completed");
+        assert_eq!(
+            readable.activities[0]
+                .tool
+                .as_ref()
+                .unwrap()
+                .projection_error
+                .as_ref()
+                .unwrap()
+                .code,
+            "bash_projection_environment_invalid"
+        );
+        unreadable["activities"][0]["tool"]
+            .as_object_mut()
+            .unwrap()
+            .remove("projectionError");
+        assert!(serde_json::from_value::<SessionProjection>(unreadable)
+            .unwrap()
+            .validate()
+            .is_err());
         value["activities"][0]["label"] = json!("bash");
         value["activities"][0]["tool"] = json!({
             "operation": "bash",
@@ -2707,8 +2782,8 @@ mod tests {
                         "executionScope": "workspace",
                         "terminal": false,
                         "pathSource": "hostPlusStandardDeveloperPaths",
-                        "writeScope": "workspaceAndKernelTemporary",
-                        "homeWritable": false,
+                        "writeScope": "authorizedResources",
+                        "homeWritable": true,
                         "networkAccess": false
                     }
                 }
@@ -2726,11 +2801,41 @@ mod tests {
             Some("make build")
         );
 
-        value["activities"][0]["tool"]["shell"]["result"]["environment"]["writeScope"] =
-            json!("kernelTemporaryOnly");
+        for scope in [
+            "workspaceAndKernelTemporary",
+            "kernelTemporaryOnly",
+            "recordedScope",
+        ] {
+            let mut recorded = value.clone();
+            let environment =
+                &mut recorded["activities"][0]["tool"]["shell"]["result"]["environment"];
+            environment["writeScope"] = json!(scope);
+            environment["homeWritable"] = json!(false);
+            let projection: SessionProjection = serde_json::from_value(recorded).unwrap();
+            assert_eq!(projection.validate(), Ok(()));
+            let environment = &projection.activities[0]
+                .tool
+                .as_ref()
+                .unwrap()
+                .shell
+                .as_ref()
+                .unwrap()
+                .result
+                .as_ref()
+                .unwrap()
+                .environment;
+            assert_eq!(environment.write_scope, scope);
+            assert!(!environment.home_writable);
+        }
+
+        value["activities"][0]["tool"]["shell"]["result"]["environment"]["executionScope"] =
+            json!("host");
         let read_projection: SessionProjection =
             serde_json::from_value(value.clone()).expect("read shell projection decodes");
-        assert_eq!(read_projection.validate(), Ok(()));
+        assert!(
+            read_projection.validate().is_err(),
+            "Recorded environment must match the invocation execution scope"
+        );
 
         value["activities"][0]["tool"]["shell"]["executionScope"] = json!("host");
         value["activities"][0]["tool"]["shell"]["result"]["environment"]["executionScope"] =
@@ -2745,8 +2850,7 @@ mod tests {
             serde_json::from_value(value.clone()).expect("host shell projection decodes");
         assert_eq!(host_projection.validate(), Ok(()));
 
-        value["activities"][0]["tool"]["shell"]["result"]["environment"]["writeScope"] =
-            json!("unexpectedScope");
+        value["activities"][0]["tool"]["shell"]["result"]["environment"]["writeScope"] = json!("");
         let invalid_projection: SessionProjection =
             serde_json::from_value(value).expect("invalid shell projection still decodes");
         assert!(invalid_projection.validate().is_err());

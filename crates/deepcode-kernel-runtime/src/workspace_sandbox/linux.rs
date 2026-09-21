@@ -76,6 +76,7 @@ pub(crate) fn command(
     mode: &str,
     targets: Option<&[crate::executors::WorkspaceWriteTarget]>,
     temp: &Path,
+    files: &crate::file_access::FileAccessScope,
 ) -> KernelResult<(PathBuf, Vec<OsString>)> {
     let helper = executable().ok_or_else(|| unavailable(&shell.tool, "Install bubblewrap in the selected Linux/WSL2 environment and refresh its environment snapshot."))?;
     let filter = temp.join("network-filter.bpf");
@@ -86,7 +87,16 @@ pub(crate) fn command(
         (0x15, 2, 0, libc::SYS_socket as u32),
         (0x15, 1, 0, libc::SYS_connect as u32),
         (0x06, 0, 0, 0x7fff0000), // SECCOMP_RET_ALLOW
-        (0x06, 0, 0, 0x00050000 | libc::EPERM as u32),
+        (
+            0x06,
+            0,
+            0,
+            if files.network_access {
+                0x7fff0000
+            } else {
+                0x00050000 | libc::EPERM as u32
+            },
+        ),
     ];
     let mut bytes = Vec::new();
     for (code, jt, jf, value) in instructions {
@@ -108,14 +118,56 @@ pub(crate) fn command(
     .collect();
     command.push(filter.into_os_string());
     command.push(helper.into_os_string());
-    command.extend(BASE_ARGS.into_iter().map(OsString::from));
+    command.extend(
+        BASE_ARGS[..6]
+            .iter()
+            .filter(|arg| !files.network_access || **arg != "--unshare-net")
+            .map(OsString::from),
+    );
+    let mut readable = files.read.clone();
+    readable.sort();
+    readable.dedup();
+    for path in readable {
+        command.extend([
+            OsString::from("--ro-bind"),
+            path.clone().into(),
+            path.into(),
+        ]);
+    }
+    command.extend(
+        ["--dev", "/dev", "--proc", "/proc"]
+            .into_iter()
+            .map(OsString::from),
+    );
     command.push("--bind".into());
     command.push(temp.into());
     command.push(temp.into());
-    for target in writable_paths(root, mode, targets)? {
+    let mut writable = writable_paths(root, mode, targets)?;
+    writable.extend(writable_paths(root, "write", Some(&files.write))?);
+    writable.sort();
+    writable.dedup();
+    for target in writable {
         command.push("--bind".into());
         command.push(target.clone().into());
         command.push(target.into());
+    }
+    for path in &files.read_only {
+        command.extend([
+            OsString::from("--ro-bind"),
+            path.clone().into(),
+            path.into(),
+        ]);
+    }
+    for target in files
+        .write
+        .iter()
+        .filter(|target| files.protects(&target.path))
+    {
+        command.extend([
+            OsString::from("--bind"),
+            target.path.clone().into(),
+            target.path.clone().into(),
+        ]);
     }
     command.extend(["--seccomp", "3", "--"].into_iter().map(OsString::from));
     command.push(shell.executable.as_os_str().into());
