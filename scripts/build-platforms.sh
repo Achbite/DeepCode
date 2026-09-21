@@ -62,10 +62,10 @@ case "${1:-}" in
   --native)
     configure_cache
     case "$2" in
-      native-gui) cargo build --locked --release --manifest-path "$GUI_MANIFEST" ;;
-      daemon) cargo build --locked --release -p deepcode-kernel-daemon -p deepcode-first-party-tools ;;
-      cli) cargo build --locked --release -p deepcode-cli ;;
-      tui) cargo build --locked --release -p deepcode-tui ;;
+      native-gui) cargo build --release --manifest-path "$GUI_MANIFEST" ;;
+      daemon) cargo build --release -p deepcode-kernel-daemon -p deepcode-first-party-tools ;;
+      cli) cargo build --release -p deepcode-cli ;;
+      tui) cargo build --release -p deepcode-tui ;;
       *) printf 'Unknown native stage: %s\n' "$2" >&2; exit 2 ;;
     esac
     ;;
@@ -86,15 +86,15 @@ case "${1:-}" in
     else
       case "$(uname -m)" in x86_64) platform_dir=linux-x64 ;; aarch64) platform_dir=linux-arm64 ;; *) printf 'Unsupported Linux architecture.\n' >&2; exit 1 ;; esac
     fi
-    cargo build --locked --release "${target_args[@]}" -p deepcode-kernel-daemon -p deepcode-first-party-tools -p deepcode-host-web -p deepcode-cli -p deepcode-tui
+    cargo build --release "${target_args[@]}" -p deepcode-kernel-daemon -p deepcode-first-party-tools -p deepcode-host-web -p deepcode-cli -p deepcode-tui
     if [ "$platform" = windows ]; then
       messages="$(dirname "$shared")/windows-native.jsonl"
-      cargo build --locked --release "${target_args[@]}" --manifest-path "$GUI_MANIFEST" --message-format=json-render-diagnostics > "$messages"
+      cargo build --release "${target_args[@]}" --manifest-path "$GUI_MANIFEST" --message-format=json-render-diagnostics > "$messages"
       # Read this Cargo invocation's dependency output, not a glob over cached builds.
       loader="$(python3 -c 'import json,sys; from pathlib import Path; messages=map(json.loads,open(sys.argv[1])); output=next(m["out_dir"] for m in messages if m.get("reason")=="build-script-executed" and m["package_id"].split("#")[-1].startswith("webview2-com-sys@")); print(Path(output)/"x64/WebView2Loader.dll")' "$messages")"
       loader_args=(--webview-loader "$loader")
     else
-      cargo build --locked --release --manifest-path "$GUI_MANIFEST"
+      cargo build --release --manifest-path "$GUI_MANIFEST"
     fi
     stage="$(mktemp -d "$(dirname "$shared")/$platform_dir.XXXXXX")"
     python3 scripts/package-runtime.py assemble --root "$ROOT_DIR" --platform "$platform_dir" --stage "$stage" --shared "$shared" --native "$native" --node "$node" --node-license "$node_license" "${loader_args[@]}"

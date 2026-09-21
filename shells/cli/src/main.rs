@@ -739,6 +739,13 @@ async fn submit_input_and_wait(
         plugin_binding,
     )?;
     submit_checked(client, &before.session_id, &command).await?;
+    if matches!(
+        command["type"].as_str(),
+        Some("session.permissions.set" | "approval.revoke")
+    ) {
+        println!("权限设置已更新。");
+        return Ok(Outcome::Done);
+    }
     wait_for_projection(client, before, plain).await
 }
 
@@ -1044,9 +1051,13 @@ async fn run_chat(
                 || text == "/focus"
                 || text.starts_with("/focus ")
                 || text == "/reply"
-                || text.starts_with("/reply ") =>
+                || text.starts_with("/reply ")
+                || text.starts_with("/permissions ")
+                || text.starts_with("/revoke ") =>
             {
-                let consumes_plugins = text != "/reply" && !text.starts_with("/reply ");
+                let consumes_plugins = !text.starts_with("/reply")
+                    && !text.starts_with("/permissions ")
+                    && !text.starts_with("/revoke ");
                 let plugin_binding = if selected_plugins.is_empty() || !consumes_plugins {
                     None
                 } else {
@@ -1223,6 +1234,7 @@ fn print_help() {
 
 使用 -C/--workspace 为新对话指定工作目录；已有对话通过 attach-directory/detach-directory 管理目录。
 chat 普通文本随时发送，运行中按序排队；/reply 1 确认计划，/reply <说明> 修改计划或回答问题，/reply 1/2 允许/拒绝操作；cancel-plan 取消计划。
+权限请求提供时，/reply 3 本轮允许相同命令，/reply 4 本轮允许 Host Shell。/permissions <JSON> 修改当前任务权限；/revoke <authority-id> 撤销本轮授权。
 文件与目录引用只在 ask 中显式选择；--file 与 --directory 均可重复。图片以视觉内容发送给支持图片的模型，其他文件保留只读引用。
 ask/chat 支持重复使用 --plugin 指定插件；Agent 也可按任务发现并加载已启用插件。PDF 文件需要已配置且支持 PDF 的 Skill。chat 使用 @ 选择下一次请求的插件，/focus <task> 开始任务。"#,
     );

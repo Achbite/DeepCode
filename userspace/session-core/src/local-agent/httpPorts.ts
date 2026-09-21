@@ -1,3 +1,4 @@
+import { isManagedProcessSnapshot, type ManagedProcessSnapshot, type ProcessReadRequest } from '@deepcode/protocol';
 import { isLocalAgentErrorValue } from '@deepcode/protocol';
 import type {
   JsonObject,
@@ -179,6 +180,17 @@ export class HttpCommandJournal extends LocalAgentHttpPort implements CommandJou
 }
 
 export class HttpKernelPort extends LocalAgentHttpPort implements KernelPort {
+  async readProcesses(request: ProcessReadRequest, signal?: AbortSignal): Promise<ManagedProcessSnapshot[]> {
+    const value: unknown = await this.json('/api/local-agent/kernel/processes', {
+      method: 'POST', body: JSON.stringify(request), signal,
+    });
+    if (!isRecord(value) || !Array.isArray(value.jobs) || !value.jobs.every(isManagedProcessSnapshot)
+      || value.jobs.some(job => job.sessionId !== request.sessionId || job.runId !== request.runId)) {
+      throw new Error('managed_process_snapshot_invalid');
+    }
+    return value.jobs;
+  }
+
   async execute(request: ToolExecutionRequest, onProgress?: (progress: ToolExecutionProgress) => Promise<void>): Promise<ToolExecutionReply> {
     const controller = new AbortController();
     const response = await this.postStream('/api/local-agent/kernel/execute', request, controller.signal);
@@ -423,6 +435,7 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
           provider,
           webSearch,
           environment: value.environment as JsonObject,
+          permissions: pluginConfig.permissions,
           instructions: [...runtimeInstructions([
             ...this.#stableCoreInstructions,
             environmentInstruction(value.environment),

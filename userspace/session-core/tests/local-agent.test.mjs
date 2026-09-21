@@ -1868,8 +1868,8 @@ test('read-only bash result projects its real write scope and continues the Loop
           executionScope: 'workspace',
           terminal: false,
           pathSource: 'hostPlusStandardDeveloperPaths',
-          writeScope: 'kernelTemporaryOnly',
-          homeWritable: false,
+          writeScope: 'authorizedResources',
+          homeWritable: true,
           networkAccess: false,
         },
       });
@@ -1908,7 +1908,9 @@ test('read-only bash result projects its real write scope and continues the Loop
       assert.equal(toolResult?.output?.executionScope, 'workspace');
       assert.equal(toolResult?.output?.terminal, false);
       assert.equal(toolResult?.output?.workspaceId, undefined);
-      assert.equal(toolResult?.output?.environment?.writeScope, 'kernelTemporaryOnly');
+      assert.equal(toolResult?.output?.environment?.writeScope, 'authorizedResources');
+      assert.equal(toolResult?.output?.environment?.homeWritable, true);
+      assert.equal(toolResult?.output?.environment?.networkAccess, false);
       yield providerEvent(request.requestId, 'assistant.message', {
         messageId: 'provider-message:bash-read-answer',
         content: 'Read-only shell continuation completed.',
@@ -1944,7 +1946,9 @@ test('read-only bash result projects its real write scope and continues the Loop
     activity.callId === kernelRequests[0].callId
   ));
   assert.equal(shellActivity?.status, 'completed');
-  assert.equal(shellActivity?.tool?.shell?.result?.environment.writeScope, 'kernelTemporaryOnly');
+  assert.equal(shellActivity?.tool?.shell?.result?.environment.writeScope, 'authorizedResources');
+  assert.equal(shellActivity?.tool?.shell?.result?.environment.homeWritable, true);
+  assert.equal(shellActivity?.tool?.shell?.result?.environment.networkAccess, false);
   const events = await readEvents(journal, sessionId);
   const requested = singleEvent(events, 'tool.requested');
   const completed = singleEvent(events, 'tool.completed');
@@ -1953,6 +1957,67 @@ test('read-only bash result projects its real write scope and continues the Loop
   assertEventOrder(requested, completed, providerCompletions[1]);
 
   await actor.dispose();
+
+  for (const writeScope of ['workspaceAndKernelTemporary', 'kernelTemporaryOnly', 'recordedScope']) {
+    const history = structuredClone(events);
+    const environment = history.find((event) => event.type === 'tool.completed').payload.record.output.environment;
+    Object.assign(environment, { writeScope, homeWritable: false, networkAccess: false });
+    const beforeRead = structuredClone(history);
+    const service = new SessionService({ async *read() { yield* history; } }, {
+      async create() { throw new Error('Reading history must not prepare or execute a run'); },
+    });
+    const restored = await service.snapshot(sessionId);
+    const result = restored.activities.find((activity) => activity.callId === kernelRequests[0].callId).tool.shell.result;
+    assert.deepEqual(result.environment, environment);
+    assert.deepEqual(history, beforeRead);
+    assert.deepEqual(restored.shellAuthorizations, []);
+    environment.homeWritable = 'false';
+    const invalidHistory = structuredClone(history);
+    const readable = await service.snapshot(sessionId);
+    const invalidTool = readable.activities.find((activity) => activity.callId === kernelRequests[0].callId);
+    assert.equal(invalidTool.status, 'completed');
+    assert.equal(invalidTool.tool.shell, undefined);
+    assert.equal(invalidTool.tool.projectionError.code, 'bash_projection_environment_invalid');
+    assert.deepEqual(readable.messages, restored.messages);
+    assert.deepEqual(readable.run, restored.run);
+    assert.deepEqual(history, invalidHistory);
+  }
+  for (const [detail, expectedCode] of [
+    [{ fileChanges: [{ workspaceId: workspaceBinding.workspaceId, path: 'output.txt', kind: 'create',
+      before: { exists: false }, after: { exists: true, contentRef: 'content:one', sizeBytes: '12' } }] }, 'kernel_file_changes_invalid'],
+    [{ artifacts: [{ artifactId: 'artifact:bad', label: 'Output', contentType: 'text/plain', contentMode: 'fixed' }] }, 'tool_artifact_resource_invalid'],
+  ]) {
+    const history = structuredClone(events);
+    Object.assign(history.find((event) => event.type === 'tool.completed').payload.record.output, detail);
+    const original = structuredClone(history);
+    const service = new SessionService({ async *read() { yield* history; } }, {
+      async create() { throw new Error('History must not start a run'); },
+    });
+    const readable = await service.snapshot(sessionId);
+    const tool = readable.activities.find((activity) => activity.callId === kernelRequests[0].callId).tool;
+    assert.equal(tool.projectionError.code, expectedCode);
+    assert.equal(tool.shell.result.exitCode, 0);
+    assert.equal(readable.run.status, 'completed');
+    assert.deepEqual(readable.messages, projection.messages);
+    assert.deepEqual(history, original);
+  }
+  for (const extra of [{ operation: 'fs.delete', targets: ['logs'], workspaceId: workspaceBinding.workspaceId }, { rule: 'example' }]) {
+    const history = structuredClone(events);
+    const record = history.find((event) => event.type === 'tool.completed').payload.record;
+    record.outcome = 'denied';
+    record.error = { code: 'operation_denied', message: 'Original refusal.', ...extra };
+    const original = structuredClone(history);
+    const readable = projectSession(loopSnapshot(sessionId, history).state);
+    const activity = readable.activities.find((item) => item.callId === record.callId);
+    assert.equal(activity.status, 'denied');
+    assert.deepEqual(activity.tool.error, { code: 'operation_denied', message: 'Original refusal.' });
+    assert.equal(activity.tool.projectionError, undefined);
+    assert.equal(readable.run.status, 'completed');
+    assert.deepEqual(history, original);
+  }
+  assert.equal(kernelRequests.length, 1);
+  assert.equal(providerRequests.length, 2);
+  assert.equal(preparation.prepared.length, 1);
 });
 
 for (const toolName of ['bash', 'powershell']) {
@@ -2690,7 +2755,7 @@ test('confirmed Host Bash preserves failed execution and reports later Todo prog
   const sessionId = 'session:confirmed-bash-retry';
   await createSession(journal, sessionId, [workspaceBinding]);
 
-  const command = "printf ready > marker.txt";
+  const command = "printf ready > build/marker.txt";
   const terminal = { stdin: 'ready\n' };
   const preparedTool = {
     toolBindingRef: 'tool-binding:bash:g1',
@@ -2751,7 +2816,7 @@ test('confirmed Host Bash preserves failed execution and reports later Todo prog
         workspaceId: workspaceBinding.workspaceId,
         operation: 'bash',
         command,
-        writablePaths: [{ path: 'marker.txt', kind: 'file' }],
+        writablePaths: [{ path: 'build', kind: 'directory' }],
         terminal,
       }]);
       const reply = kernelRequests.length === 1
@@ -2799,13 +2864,13 @@ test('confirmed Host Bash preserves failed execution and reports later Todo prog
             steps: [{
               stepId: 'run-bash',
               title: 'Run Bash mutation',
-              details: 'Create marker.txt from the bound workspace root.',
+              details: 'Create build/marker.txt from the bound workspace root.',
             }],
             mutationManifest: [{
               workspace: 'primary',
               operation: 'bash',
               command,
-              writablePaths: [{ path: 'marker.txt', kind: 'file' }],
+              writablePaths: [{ path: 'build', kind: 'directory' }],
               terminal,
             }],
           },
@@ -3326,16 +3391,14 @@ test('built-in runtime and control prompts stay concise and policy-scoped', () =
   };
   const planAsk = runtimeInstructions(stableCore, {
     ...baseConfig,
-    workspaceMutation: 'plan',
-    engineeringDecisions: 'ask',
+    permissions: { 'agent.permissions.workspaceMutation': 'plan', 'agent.permissions.engineeringDecisions': 'ask' },
   }, {
     interactionRequest: 'ask_user_wire',
     planPublish: 'publish_plan_wire',
   });
   const allowDelegate = runtimeInstructions(stableCore, {
     ...baseConfig,
-    workspaceMutation: 'allow',
-    engineeringDecisions: 'delegate',
+    permissions: { 'agent.permissions.workspaceMutation': 'allow', 'agent.permissions.engineeringDecisions': 'delegate' },
   });
 
   const planInstruction = planAsk.find((instruction) => (
@@ -3343,14 +3406,16 @@ test('built-in runtime and control prompts stay concise and policy-scoped', () =
   ))?.text ?? '';
   assert.ok(planInstruction.includes('publish_plan_wire'));
   assert.ok(planInstruction.includes('ask_user_wire'));
-  assert.ok(planInstruction.includes('Its declared scope authorizes project changes'));
-  assert.ok(planInstruction.includes('session working directories hold editable drafts and previews; changes there do not require a Plan'));
-  assert.ok(planInstruction.includes('Reading and inspecting a project do not require a Plan'));
+  assert.ok(planInstruction.includes('wait for confirmation of the declared scope'));
+  assert.ok(planInstruction.includes('Session working directories hold editable drafts and previews; changes there need no Plan'));
+  assert.ok(planInstruction.includes('Project reads need no Plan'));
   const allowInstruction = allowDelegate.find((instruction) => (
     instruction.id === 'deepcode.workspace-autonomy'
   ))?.text ?? '';
   assert.ok(allowInstruction.includes('interaction_request'));
   assert.equal(allowInstruction.includes('plan_publish'), false);
+  assert.ok(allowInstruction.includes('Plan decisions are delegated'));
+  assert.ok(allowInstruction.includes('Execution permissions still apply'));
   const pluginInstruction = planAsk.find((instruction) => (
     instruction.id === 'plugin.fixture.skill'
   ))?.text ?? '';
@@ -3362,6 +3427,7 @@ test('built-in runtime and control prompts stay concise and policy-scoped', () =
   const progress = controls.find((tool) => tool.name === 'todo.update');
   assert.ok(controls.some((tool) => tool.name === 'interaction.request'));
   assert.match(publish.description, /not an exact script lock/u);
+  assert.match(publish.description, /confirmation follows the current Plan setting/u);
   assert.match(progress.description, /complete ordered task list/u);
   assert.deepEqual(progress.inputSchema.required, ['items']);
   const bashScope = publish.inputSchema.properties.mutationManifest.items.oneOf.find((branch) => branch.properties.operation.enum?.includes('bash'));
@@ -4400,9 +4466,12 @@ test(`workspace ${shell} Plan declares paths without locking its command text`, 
   const definition = sessionControlToolDefinitions().find((tool) => tool.inputSchema.properties?.mutationManifest);
   const input = { title: 'Build project', summary: 'Build in the allowed directory.',
     steps: [{ stepId: 'build', title: 'Build', details: 'Compile the project.' }],
-    mutationManifest: [{ workspaceId: 'workspace:test', operation: shell, command: 'make build', writablePaths: [{ path: 'build', kind: 'directory' }, { path: 'src/main.cpp', kind: 'file' }] }] };
+    mutationManifest: [{ workspaceId: 'workspace:test', operation: shell, command: 'make build', writablePaths: [{ path: 'build', kind: 'directory' }] }] };
   const decoded = decodeSessionControlCall('call:plan-paths', definition.name, input);
   assert.deepEqual(decoded.draft.mutationManifest, input.mutationManifest);
+  const projectFile = structuredClone(input);
+  projectFile.mutationManifest[0].writablePaths = [{ path: 'src/main.cpp', kind: 'file' }];
+  assert.throws(() => decodeSessionControlCall('call:project-file', definition.name, projectFile), /kind=directory/);
   const absentPaths = structuredClone(input);
   delete absentPaths.mutationManifest[0].writablePaths;
   assert.throws(() => decodeSessionControlCall('call:missing-paths', definition.name, absentPaths), /writablePaths/);
@@ -4821,6 +4890,7 @@ test('a Kernel input rejection can request confirmation and resume the same run'
     possibleEffects: ['workspaceMutation'], availability: 'callable', origin: 'coreBuiltin' };
   let calls = 0, turns = 0;
   const originalError = { code: 'input_resource_read_only', message: 'Input snapshot is read-only. Choose a writable destination.',
+    diagnostics: { source: 'kernel', phase: 'prepare', category: 'input', retryable: false, causes: [] },
     issues: [{ path: '$.workspaceId', rule: 'readOnlyInput', message: 'Input snapshot is read-only.' }] };
   const kernel = emptyKernel({ async execute(request) {
     calls++;
@@ -4914,4 +4984,21 @@ test('Todo can start before tools without a Plan, preserve a failed record and e
   assert.equal(failure.payload.record.error.code, 'file_missing');
   assertEventOrder(updates[0], singleEvent(events, 'tool.requested'), failure, updates[1], singleEvent(events, 'run.finishing'));
   assert.equal(preparation.released.length, 1);
+});
+
+
+test('tool results keep the workspace handle of the request that produced the call', async () => {
+  const { encodeProviderMessage } = await import('../dist/local-agent/providerToolCodec.js');
+  const old = { workspaceHandleById: new Map([['workspace:one', 'primary']]) };
+  const current = { workspaceHandleById: new Map([['workspace:one', 'workspace2']]) };
+  const message = { role: 'tool', toolCallId: 'call:old', content: JSON.stringify({ outcome: 'failed',
+    output: { workspaceId: 'workspace:one', path: 'src/main.cpp', paths: { workspace: '/project', home: '/session/home' } },
+    error: { code: 'plan_scope_required', workspaceId: 'workspace:one', targets: ['src/main.cpp'] },
+  }) };
+  const content = JSON.parse(encodeProviderMessage(message, current, new Map([['call:old', old]])).content);
+  assert.equal(content.output.workspace, 'primary');
+  assert.equal(content.error.workspace, 'primary');
+  assert.equal(content.output.workspaceId, undefined);
+  assert.deepEqual(content.output.paths, { workspace: '/project', home: '/session/home' });
+  assert.equal(JSON.parse(message.content).output.workspaceId, 'workspace:one');
 });

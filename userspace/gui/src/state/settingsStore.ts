@@ -158,6 +158,12 @@ const SETTING_DEFINITION_SCHEMAS: SettingDefinitionSchema[] = [
     options: ['ask', 'delegate'],
   },
   {
+    key: 'agent.permissions.shell', group: 'agent', control: 'select', options: ['ask', 'review', 'allow'],
+  },
+  {
+    key: 'agent.permissions.shellAccess', group: 'agent', control: 'select', options: ['workspace', 'full'],
+  },
+  {
     key: 'agent.permissions.networkRead',
     group: 'agent',
     control: 'select',

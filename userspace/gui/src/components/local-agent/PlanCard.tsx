@@ -5,7 +5,7 @@ import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import { MarkdownContent, MarkdownInline } from './BufferedMarkdown';
 import { PlanDocument } from './PlanDocument';
 import { useConversationRowState } from './ConversationVirtualRow';
-import { planScopeAddition } from './planReview';
+import { planOperationDetail, planScopeAddition } from './planReview';
 
 interface PlanCardProps {
   plan: PlanProjection;
@@ -39,10 +39,20 @@ const PlanCard: React.FC<PlanCardProps> = ({
     }
   }, [plan.status]);
 
-  const status = t(language, `agent.plan.status.${plan.status}`);
+  const status = t(language, plan.status === 'confirmed' && plan.confirmationSource === 'agent' ? 'agent.plan.confirmedByAgent' : `agent.plan.status.${plan.status}`);
   const addition = planScopeAddition(previousPlan, plan);
-  const scopeLabel = language === 'zh-CN' ? '补充执行范围' : 'Additional execution scope';
   const stepCount = t(language, 'agent.plan.stepCount', { count: plan.steps.length });
+
+  if (addition) return <article ref={cardRef} className="local-agent__tool-entry">
+    <button type="button" className="local-agent__tool-entry-heading" aria-expanded={expanded}
+      onClick={() => toggle(!expanded)}>
+      <DeepCodeShellIcon name="compose" />
+      <strong>{language === 'zh-CN' ? '计划范围调整' : 'Plan scope adjustment'}</strong>
+      <span>{status}</span>
+      <span className="local-agent__tool-entry-chevron" aria-hidden="true"><DeepCodeShellIcon name="chevronRight" /></span>
+    </button>
+    {expanded && <PlanCardContent plan={plan} previousPlan={previousPlan} workspaceBindings={workspaceBindings} language={language} />}
+  </article>;
 
   return (
     <article ref={cardRef} className={`local-agent__plan-card local-agent__plan-card--${plan.status}`}>
@@ -57,7 +67,7 @@ const PlanCard: React.FC<PlanCardProps> = ({
           >
             <DeepCodeShellIcon name="activity" />
             <span>
-              {addition ? scopeLabel : t(language, 'agent.plan.documentLabel')}
+              {t(language, 'agent.plan.documentLabel')}
               {' · '}
               {t(language, 'agent.plan.revision', { revision: plan.revision })}
               {active ? ` · ${t(language, 'agent.plan.active')}` : ''}
@@ -76,10 +86,8 @@ const PlanCard: React.FC<PlanCardProps> = ({
           onClick={() => toggle(true)}
         >
           <DeepCodeShellIcon name="activity" />
-          <strong><MarkdownInline>{addition ? `${scopeLabel} · ${plan.title}` : plan.title}</MarkdownInline></strong>
-          <span className="local-agent__plan-card-status">{status} · {addition
-            ? (language === 'zh-CN' ? `${addition.operations.length} 项新增范围` : `${addition.operations.length} scope additions`)
-            : stepCount}</span>
+          <strong><MarkdownInline>{plan.title}</MarkdownInline></strong>
+          <span className="local-agent__plan-card-status">{status} · {stepCount}</span>
           <span className="local-agent__plan-card-chevron" aria-hidden="true">
             <DeepCodeShellIcon name="chevronRight" />
           </span>
@@ -126,19 +134,6 @@ export function PlanCardContent({ plan, previousPlan, workspaceBindings = [], la
   </>;
 }
 
-function planOperationDetail(operation: PlanOperation, language: UiLanguage = 'zh-CN'): string {
-  const chinese = language === 'zh-CN';
-  if ('writablePaths' in operation) {
-    const paths = operation.writablePaths.map((target) => target.path + (target.kind === 'directory' ? '/' : '')).join(', ');
-    return `${t(language, 'agent.tool.shell.command')} · ${t(language, 'agent.tool.shell.writeScope')}: ${paths}${operation.command ? `\n${operation.command}` : ''}${operation.terminal ? ` · ${t(language, 'agent.plan.interactiveTerminal')}` : ''}`;
-  }
-  const label = operation.operation === 'fs.delete' ? (chinese ? '删除' : 'Delete')
-    : operation.operation === 'fs.write' ? (chinese ? '写入' : 'Write') : (chinese ? '编辑' : 'Edit');
-  const directory = operation.targetKind === 'directoryTree'
-    ? operation.operation === 'fs.delete' ? (chinese ? '（删除目录树）' : ' (delete directory tree)')
-      : (chinese ? '（目录内文件，含新建）' : ' (descendant files, including new files)') : '';
-  return `${label} · ${operation.target}${directory}`;
-}
 
 function PlanRevisionDetails({ previous, current, language, workspaceBindings }: {
   previous: PlanProjection; current: PlanProjection; language: UiLanguage; workspaceBindings: readonly WorkspaceBindingDisplay[];

@@ -48,7 +48,7 @@ class ProviderHandler(fixture.MockProviderHandler):
                     ("read-default", names["read"], {"path": "probe.txt"}),
                     ("unknown-tool", "undeclared_tool", {"path": "probe.txt"}),
                     ("missing-file", names["read"], {"path": "does-not-exist.txt"}),
-                    ("bad-timeout", names["bash"], {"command": "pwd", "timeout": 601}),
+                    ("bad-timeout", names["bash"], {"command": "pwd", "timeout": 0}),
                     ("bad-field", names["edit"], {"path": "probe.txt", "workspaceMode": "write", "edits": [{"oldText": "alpha", "newText": "ALPHA"}]}),
                     ("bad-workspace", names["read"], {"path": "probe.txt", "workspace": "workspace99"}),
                     ("shell-format", names["bash"], {"command": SCRIPT, "requestHostPermission": "Verify the explicitly approved Host Shell and temporary files."}),
@@ -62,7 +62,7 @@ class ProviderHandler(fixture.MockProviderHandler):
                 missing = results["missing-file"]
                 require(missing["outcome"] == "failed" and missing["error"]["code"] == "fs_read_metadata_failed"
                         and "does-not-exist.txt" in missing["error"]["message"], "文件不存在的原始错误丢失")
-                for call_id, path, rule in [("bad-timeout", "$.timeout", "maximum"), ("bad-field", "$.workspaceMode", "additionalProperties")]:
+                for call_id, path, rule in [("bad-timeout", "$.timeout", "minimum"), ("bad-field", "$.workspaceMode", "additionalProperties")]:
                     rejected = results[call_id]
                     require(rejected["status"] == "inputRejected" and rejected["executed"] is False, "非法输入被执行")
                     require(any(issue["path"] == path and issue["rule"] == rule for issue in rejected["error"]["issues"]), "字段诊断没有到达 Provider")
@@ -70,7 +70,7 @@ class ProviderHandler(fixture.MockProviderHandler):
                 require(results["shell-format"]["outcome"] == "completed", "合法多行命令未执行")
                 blocked = results["blocked-command"]
                 require(blocked["outcome"] == "denied" and blocked["error"]["code"] == "command_denied_by_rule"
-                        and blocked["error"]["rule"] == "printf denylist-probe", "全部允许模式未在执行前阻止自定义黑名单命令")
+                        and 'printf denylist-probe' in blocked["error"]["message"], "全部允许模式未在执行前阻止自定义黑名单命令")
                 shell_output = results["shell-format"]["output"]
                 require(shell_output["executionScope"] == "host", "Kernel 未在用户批准后选择真实 Host 执行")
                 require(shell_output["stdout"].startswith("hello world\nliteral $value\n"), "多行脚本原始输出不符")
@@ -99,8 +99,8 @@ class ProviderHandler(fixture.MockProviderHandler):
                 require(results["directory-create"]["outcome"] == "completed", "目录授权未覆盖后代新文件")
                 require((self.provider_state.workspace / "src/nested/new.txt").read_text() == "created within approved directory\n", "目录内文件内容不符")
                 denied = results["outside-scope"]
-                require(denied["outcome"] == "denied" and denied["error"]["code"] == "tool_effect_denied", "范围外写入未保留用户拒绝")
-                require(bool(denied["error"]["message"]), "用户拒绝的原始说明丢失")
+                require(denied["outcome"] == "denied" and denied["error"]["code"] == "plan_scope_required", "范围外写入未返回 Plan 范围拒绝")
+                require(bool(denied["error"]["message"]), "范围拒绝的原始说明丢失")
                 require(not (self.provider_state.workspace / "extra/new.txt").exists(), "未确认的范围已执行")
                 failed = results["edit-mismatch"]
                 require(failed["outcome"] == "failed" and failed["error"]["code"] == "patch_match_not_found", "编辑原始错误码丢失")
@@ -270,16 +270,9 @@ def main() -> None:
             first_plan = waiting["pendingPlan"]
             fixture.cli(daemon, session_id, "/reply 确认", expected=5)
             state.assert_healthy()
-            outside_waiting = fixture.projection(daemon, session_id)
-            outside_approval = require_unexecuted_approval(daemon, outside_waiting)
-            require("extra/new.txt" in outside_approval["preview"]["logicalTargets"], "范围外审批未显示实际目标")
-            require(outside_waiting["pendingPlan"] is None and outside_waiting["plans"][-1]["revision"] == 1
-                    and outside_waiting["plans"][-1]["mutationManifest"] == first_plan["mutationManifest"],
-                    "调用审批自动扩大了已确认 Plan")
-            require(not (workspace / "extra/new.txt").exists(), "范围外调用在批准前已写入")
-            fixture.cli(daemon, session_id, "/reply 2", expected=5)
-            state.assert_healthy()
             extension = fixture.projection(daemon, session_id)
+            require(extension["pendingApproval"] is None and extension["run"]["waitingReason"] == "plan",
+                    "范围外写入应由 Agent 调整 Plan，不应变为命令审批")
             require(extension["pendingPlan"]["planId"] == first_plan["planId"] and extension["pendingPlan"]["revision"] == 2, "范围补充没有沿用当前 Plan")
             require(extension["pendingPlan"]["steps"] == first_plan["steps"], "只补范围重写了阶段或验收")
             require(extension["pendingPlan"]["summary"].startswith(first_plan["summary"] + "\n\n"), "只补范围丢失原目标摘要")
@@ -337,8 +330,8 @@ def main() -> None:
                 require(requested == terminal, "工具调用缺少持久化终态")
                 require(sum(kind == "run.runtime.released" for kind, _, _ in rows) == 3, "三个 run 未全部释放 runtime")
                 approvals = [json.loads(payload) for kind, _, payload in rows if kind == "approval.resolved"]
-                require([item["decision"] for item in approvals] == ["allow", "deny", "allow", "allow"],
-                        "应逐次批准三条 Host 命令并拒绝一次范围外写入")
+                require([item["decision"] for item in approvals] == ["allow", "allow", "allow"],
+                        "应逐次批准三条 Host 命令，Plan 范围拒绝不应生成工具审批")
                 native_run = native_projection["run"]["runId"]
                 native_events = [json.loads(row[0]) for row in connection.execute(
                     "SELECT payload_json FROM session_events WHERE session_id=? AND run_id=? AND event_type='provider.turn.settled' ORDER BY sequence", (native_session_id, native_run))]
@@ -356,9 +349,12 @@ def main() -> None:
                 require(not any(kind == "tool.started" and call_id == blocked["callId"] for kind, call_id, _ in rows),
                         "黑名单命令不应进入执行边界")
                 require(any(record.get("error", {}).get("code") == "patch_match_not_found" for record in records), "原始编辑失败未落库")
+                outside = next(record for record in records if record.get("error", {}).get("code") == "plan_scope_required")
+                require(not any(kind == "tool.started" and call_id == outside["callId"] for kind, call_id, _ in rows),
+                        "范围外编辑不应进入执行边界")
             require(len(state.requests) == 11, "Provider 调用次数不符")
             require(len(state.responses_requests) == 4, "Responses 续跑调用次数不符")
-            print("[cli-e2e] PASS: unknown tools rejected in aggregate/Responses, missing-file errors preserved, explicit call approval before Host execution, configured command rule denied before spawn, Kernel TMPDIR write and cleanup, directory scope, user-denied outside write without implicit Plan expansion, confirmed scope extension preserving phases, edit preview and shell exit status; 13 phases/129 initial targets, pasted text, native commentary/rejection/tool/final continuation, paired history and 3 runtime releases (fixture Provider; no GUI)")
+            print("[cli-e2e] PASS: unknown tools rejected in aggregate/Responses, missing-file errors preserved, explicit call approval before Host execution, configured command rule denied before spawn, Kernel TMPDIR write and cleanup, directory scope, Kernel Plan-scope denial before execution, confirmed scope extension preserving phases, edit preview and shell exit status; 13 phases/129 initial targets, pasted text, native commentary/rejection/tool/final continuation, paired history and 3 runtime releases (fixture Provider; no GUI)")
         except BaseException:
             state.assert_healthy()
             print(daemon.log_tail())

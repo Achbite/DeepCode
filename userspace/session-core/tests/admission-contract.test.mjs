@@ -46,6 +46,20 @@ test('Session admission rejects late queued input and an unfinished Provider wit
   assert.deepEqual(current, before, 'a rejected batch cannot mutate the state used by the write owner');
 });
 
+test('a session file grant can be revoked across runs only by its original authority and run', async () => {
+  const { current } = await snapshot(started);
+  const grant = { authorityId: 'authority:session-files', runId: 'run:previous', scope: 'sessionFiles',
+    summary: 'Read reference files', context: { fileAccess: { read: ['/references'], write: [] } } };
+  current.state.shellAuthorizations = [grant];
+  const revoke = event('approval.revoked', { commandId: 'command:revoke', authorityId: grant.authorityId }, { runId: grant.runId });
+  assert.doesNotThrow(() => admitSessionEvents(current, [revoke]));
+  assert.throws(() => admitSessionEvents(current, [{ ...revoke, runId }]), /approval_grant_missing/);
+  assert.throws(() => admitSessionEvents(current, [{ ...revoke, payload: { ...revoke.payload, authorityId: 'authority:unknown' } }]), /approval_grant_missing/);
+  assert.throws(() => admitSessionEvents(current, [revoke, revoke]), /approval_grant_missing/);
+  current.state.shellAuthorizations = [{ ...grant, scope: 'runFiles' }];
+  assert.throws(() => admitSessionEvents(current, [revoke]), /session_event_run_not_active/);
+});
+
 const plan = event('plan.published', {
   providerCallId: 'provider:plan', planId: 'plan:one', revision: 1, title: 'Inspect', summary: 'Inspect the source.',
   steps: [{ stepId: 'step:one', title: 'Inspect', details: 'Read the source.' }], mutationManifest: [],

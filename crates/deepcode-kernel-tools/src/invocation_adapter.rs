@@ -1,6 +1,6 @@
 use crate::invocation_types::{
-    default_timeout, KernelCanonicalInvocation, KernelDeleteTarget, KernelExecutionScope,
-    KernelTerminalInput, KernelToolKind, KernelWorkspaceMode,
+    KernelCanonicalInvocation, KernelDeleteTarget, KernelExecutionScope, KernelTerminalInput,
+    KernelToolKind, KernelWorkspaceMode,
 };
 use crate::types::{ToolInputIssue, ToolValidationError};
 use serde::{de::value::MapDeserializer, Deserialize};
@@ -70,8 +70,7 @@ pub fn canonicalize_invocation(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ShellInput {
     command: String,
-    #[serde(default = "default_timeout")]
-    timeout: u32,
+    timeout: Option<u32>,
     terminal: Option<KernelTerminalInput>,
     request_host_permission: Option<String>,
 }
@@ -83,7 +82,7 @@ fn normalize_invocation(
         KernelCanonicalInvocation::FsRead { path, .. }
         | KernelCanonicalInvocation::FsWrite { path, .. }
         | KernelCanonicalInvocation::FsEdit { path, .. } => {
-            *path = normalize_workspace_path(path, false)?;
+            *path = normalize_file_path(path)?;
         }
         KernelCanonicalInvocation::FsDelete(target) => {
             let path = match target {
@@ -91,12 +90,19 @@ fn normalize_invocation(
                     path
                 }
             };
-            *path = normalize_workspace_path(path, false)?;
+            *path = normalize_file_path(path)?;
         }
         _ => {}
     }
     invocation.validate()?;
     Ok(())
+}
+
+fn normalize_file_path(value: &str) -> Result<String, InvocationNormalizationError> {
+    if std::path::Path::new(value).is_absolute() && !value.contains('\0') {
+        return Ok(value.to_owned());
+    }
+    normalize_workspace_path(value, false)
 }
 
 pub fn normalize_workspace_path(

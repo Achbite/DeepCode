@@ -131,10 +131,17 @@ impl LocalAgentRuntime {
             .get(&key)
             .and_then(|views| views.last())
             .cloned();
-        let settings = previous
+        let mut settings = previous
             .as_ref()
             .map(|prepared| &prepared.runtime_settings)
-            .unwrap_or(&gui.user_settings);
+            .unwrap_or(&gui.user_settings)
+            .clone();
+        let overrides = self
+            .journal
+            .permission_overrides(&request.session_id)
+            .map_err(|error| RunPreparationError::new(error.code, error.message))?;
+        merge_object(&mut settings, &overrides);
+        let settings = &settings;
         if request.restore_environment {
             return prepared_runs
                 .get(&key)
@@ -337,6 +344,7 @@ impl LocalAgentRuntime {
             &provider_binding.profile(),
             &provider_runtime.profile_id,
         );
+        executor_config.file_read_roots = plugin_selection.file_read_roots();
         let permissions = LocalAgentPermissionPolicy::from_settings(settings)
             .map_err(RunPreparationError::from)?;
         let web_search = prepare_web_search_binding(
@@ -357,6 +365,8 @@ impl LocalAgentRuntime {
                 crate::local_agent_product_tools::ProductTools::new(Arc::new(session_service))
                     .with_plugin_settings(settings.clone())
                     .with_computer_use(plugin_selection.computer_use_instance())
+                    .with_containers(plugin_selection.container_instance())
+                    .with_processes(plugin_selection.process_instance())
                     .with_browser_binding(environment.get("hostBinding").cloned().map(
                         |mut binding| {
                             binding["sessionId"] = json!(request.session_id);
@@ -931,6 +941,34 @@ pub(crate) async fn local_agent_tool_cancel(
     }
 }
 
+pub(crate) async fn local_agent_processes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::managed_processes::ReadRequest>,
+) -> Json<ApiResponse> {
+    if let Err(response) = require_session_service(&state, &headers) {
+        return response;
+    }
+    let jobs = state.local_agent.kernel.jobs.clone();
+    match tokio::task::spawn_blocking(move || {
+        if body.cancel {
+            jobs.cancel_run(&body.session_id, &body.run_id)?;
+        }
+        jobs.snapshots(
+            &body.session_id,
+            &body.run_id,
+            &body.revisions,
+            body.wait_ms,
+        )
+    })
+    .await
+    {
+        Ok(Ok(jobs)) => ApiResponse::ok(json!({"jobs":jobs})),
+        Ok(Err(error)) => ApiResponse::error("managed_process_failed", error),
+        Err(error) => ApiResponse::error("managed_process_join_failed", error.to_string()),
+    }
+}
+
 pub(crate) async fn local_agent_tool_record(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1198,7 +1236,7 @@ fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), St
                 return Err("普通 Agent 请求必须使用固定的完整输出预算。".to_string());
             }
         }
-        "contextCompaction" => {
+        "contextCompaction" | "approvalReview" => {
             if body.response_constraint != "answerOnly"
                 || !body.tools.is_empty()
                 || !body.hosted_tools.is_empty()
@@ -1458,7 +1496,7 @@ fn validate_provider_search_binding(
         "providerHosted" => {
             let request_matches_purpose = match purpose {
                 "agent" => hosted_search_requested,
-                "contextCompaction" => hosted_tools.is_empty(),
+                "contextCompaction" | "approvalReview" => hosted_tools.is_empty(),
                 _ => false,
             };
             if runtime.api_surface != "responses"

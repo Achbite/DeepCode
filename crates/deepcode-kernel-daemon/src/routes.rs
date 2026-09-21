@@ -82,6 +82,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
             post(local_agent_run_runtime_release),
         )
         .route(
+            "/api/local-agent/kernel/processes",
+            post(local_agent_processes),
+        )
+        .route(
             "/api/local-agent/kernel/execute",
             post(local_agent_tool_execute),
         )
@@ -163,6 +167,18 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/api/conversation/sessions/:session_id/changes/read",
             post(conversation_change_read),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/resources/roots",
+            get(conversation_resource_roots),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/resources/list",
+            post(conversation_resource_list),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/resources/watch",
+            post(conversation_resources_watch),
         )
         .route(
             "/api/conversation/sessions/:session_id/resources/read",

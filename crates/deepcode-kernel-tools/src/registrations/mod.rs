@@ -109,19 +109,19 @@ fn tool_guidance(tool: KernelToolKind) -> (&'static str, &'static [&'static str]
             ],
         ),
         KernelToolKind::ProcessPowerShell => (
-            "Run a PowerShell script in the selected Windows environment. Kernel applies available filesystem permissions: project files are read-only until writes are authorized; session drafts are writable. The result preserves the actual exit status and output.",
+            "Run a PowerShell script in the selected Windows environment. Kernel applies available filesystem permissions: project files are read-only; approved test/output directories and session drafts are writable. The result preserves the actual exit status and output.",
             &[
                 "Each call starts in the bound workspace root with no profile and UTF-8 output. Use PowerShell syntax; Windows PowerShell 5.1 does not support && or ||. Preserve $LASTEXITCODE for native commands.",
                 "Use the project's required build/test entrypoints. Report the actual command error; missing commands, denied access and connection failures do not prove that tools or services are absent.",
-                "When proposing a Plan, declare intended file and directory writes in writablePaths. Kernel owns temporary resources for each call; keep files needed by later calls in workspace paths."
+                "Use file tools to edit or delete project files. Declare test/output directories in Plan writablePaths. Kernel owns temporary resources for each call; keep files needed by later calls in workspace paths."
             ],
         ),
         KernelToolKind::ProcessShell => (
-            "Run a Bash script from the bound workspace root. Kernel applies the available filesystem permissions: project files are read-only until writes are authorized; session drafts are writable. Commands can fail at the sandbox boundary; the result preserves their exit status and output. Optional terminal input uses a one-call PTY; otherwise stdin is closed.",
+            "Run a Bash script from the bound workspace root. Kernel applies the available filesystem permissions: project files are read-only; approved test/output directories and session drafts are writable. Commands can fail at the sandbox boundary; the result preserves their exit status and output. Optional terminal input uses a one-call PTY; otherwise stdin is closed.",
             &[
                 "Use cd for subdirectories and the project's required build/test entrypoints. Preserve the exit status being checked, including pipeline failures. Use fs.read for known UTF-8 workspace files.",
                 "Report the actual command error; missing commands, denied access and connection failures do not prove that tools or services are absent.",
-                "When proposing a Plan, declare intended file and directory writes in writablePaths. Kernel owns temporary resources for each call; keep files needed by later calls in workspace paths.",
+                "Use file tools to edit or delete project files. Declare test/output directories in Plan writablePaths. Kernel owns temporary resources for each call; keep files needed by later calls in workspace paths.",
                 "Output is limited to the last 2000 lines or 50 KiB. When truncated, inspect bounded sections of the returned fullOutput log paths instead of repeating the command."
             ],
         ),

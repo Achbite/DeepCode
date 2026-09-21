@@ -1,0 +1,245 @@
+import { InMemoryCommandJournal } from './support/memoryJournal.mjs';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { DEFAULT_USER_SETTINGS, permissionSettings, validatePermissionPatches } from '../../protocol/dist/index.js';
+import { emptySessionState, loopSnapshot, projectSession, reduceSession } from '../dist/index.js';
+import { prepareApprovalReview } from '../dist/local-agent/approvalReview.js';
+import {
+  actorWith, createSession, fakeRunPreparation, emptyKernel,
+  workspaceBinding, providerEvent, messageCommand, waitForProjection, completedExecutionReply, readEvents, runtimeSnapshot,
+} from './local-agent-fixtures.mjs';
+
+const shell = { toolBindingRef: 'binding:shell', name: 'bash', description: 'Run a command', origin: 'coreBuiltin',
+  availability: 'callable', possibleEffects: ['process'], inputSchema: { type: 'object', required: ['command'], properties: { command: { type: 'string' } } } };
+const context = { workspaceId: workspaceBinding.workspaceId, workspaceRoot: '/workspace', command: 'make check',
+  cwd: '/workspace', environment: { shell: '/bin/bash', executionScope: 'host' }, terminal: null, workspaceMode: 'write', toolName: 'bash' };
+
+test('runtime read roots use shared defaults and validate their setting shape', () => {
+  assert.deepEqual(DEFAULT_USER_SETTINGS['agent.permissions.runtimeReadRoots'], []);
+  assert.deepEqual(permissionSettings({})['agent.permissions.runtimeReadRoots'], []);
+  assert.deepEqual(permissionSettings({ 'agent.permissions.runtimeReadRoots': ['/opt/toolchain'] })['agent.permissions.runtimeReadRoots'], ['/opt/toolchain']);
+  assert.throws(() => validatePermissionPatches({ 'agent.permissions.runtimeReadRoots': '/opt/toolchain' }), /runtime_read_roots_invalid/);
+  assert.throws(() => validatePermissionPatches({ 'agent.permissions.runtimeReadRoots': [42] }), /runtime_read_roots_invalid/);
+  assert.throws(() => validatePermissionPatches({ 'agent.permissions.commandDenylist': [''] }), /command_denylist_invalid/);
+});
+
+test('approval review reuses compacted context and retains the current input and later guidance', () => {
+  const sessionId = 'session:review-context', runId = 'run:review-context';
+  const runtime = runtimeSnapshot(runId);
+  const events = [
+    { type: 'message.committed', payload: { messageId: 'message:old', role: 'user', content: 'Obsolete task details.' } },
+    { type: 'message.committed', payload: { messageId: 'message:current', role: 'user', content: 'Run make check.' } },
+    { type: 'run.started', runId, payload: { inputMessageId: 'message:current', workspaceBindings: [workspaceBinding], runtimeSnapshot: runtime } },
+    { type: 'context.compacted', runId, payload: { compactionId: 'compaction:review', providerRequestId: 'provider:compaction', trigger: 'pressure', coveredThroughSequence: 3, summary: 'Keep project changes within the approved scope.' } },
+    { type: 'message.committed', runId, payload: { messageId: 'message:guidance', role: 'user', content: 'Use the existing build directory.' } },
+  ].map((event, index) => ({ schemaVersion: 'deepcode.session-event.v5', eventId: `event:${index + 1}`, sessionId,
+    sequence: index + 1, occurredAt: '2026-09-20T00:00:00.000Z', ...event }));
+  const snapshot = { events, state: { ...emptySessionState(sessionId), workspaceBindings: [workspaceBinding] } };
+  const approval = { approvalId: 'approval:review-context', runId, callId: 'call:build',
+    preview: { summary: 'Run make check', effects: ['process'], logicalTargets: ['.'], authorizationContext: context } };
+  const { request } = prepareApprovalReview(snapshot, runtime, approval, 'provider:review-context');
+  const input = JSON.parse(request.messages[1].content);
+  assert.deepEqual(input.taskContext, [
+    { role: 'system', content: 'Keep project changes within the approved scope.' },
+    { role: 'user', content: 'Run make check.' },
+    { role: 'user', content: 'Use the existing build directory.' },
+  ]);
+  assert.deepEqual(request.tools, []);
+  assert.deepEqual(input.preview, approval.preview);
+});
+
+test('file resources preserve external targets without assigning a workspace logical path', () => {
+  const sessionId = 'session:file-resources', runId = 'run:file-resources', callId = 'call:read';
+  const base = { schemaVersion: 'deepcode.session-event.v5', sessionId, runId, callId, occurredAt: '2026-09-20T00:00:00.000Z' };
+  const requested = reduceSession(emptySessionState(sessionId), { ...base, type: 'tool.requested', eventId: 'event:request', sequence: 1,
+    payload: { providerCallId: 'provider:read', toolName: 'fs.read', input: { path: '/references/notes.txt' } } });
+  const reply = completedExecutionReply({ sessionId, runId, callId, input: { workspaceId: workspaceBinding.workspaceId, path: '/references/notes.txt' }, toolName: 'fs.read' }, {});
+  reply.record.preparedEffect.logicalTargets = ['src/index.ts', '.', '/references/notes.txt', 'C:\\references\\notes.txt', 'https://example.com/notes'];
+  const completed = reduceSession(requested, { ...base, type: 'tool.completed', eventId: 'event:completed', sequence: 2, payload: { record: reply.record } });
+  assert.deepEqual(projectSession(completed).activities[0].tool.resources, [
+    { kind: 'workspacePath', label: 'src/index.ts', workspaceId: workspaceBinding.workspaceId, logicalPath: 'src/index.ts' },
+    { kind: 'workspacePath', label: '.', workspaceId: workspaceBinding.workspaceId, logicalPath: '.' },
+    { kind: 'logicalTarget', label: '/references/notes.txt' },
+    { kind: 'logicalTarget', label: 'C:\\references\\notes.txt' },
+    { kind: 'url', label: 'https://example.com/notes', uri: 'https://example.com/notes' },
+  ]);
+});
+
+for (const scope of ['sessionFiles', 'sessionHostShell', 'sessionNetwork', 'sessionContainer']) test(`${scope} grants and revocations survive message edits and journal recovery`, async t => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:file-grant-history';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const requests = [];
+  const preparation = fakeRunPreparation({ tools: [shell], permissions: { 'agent.permissions.shell': 'ask' } });
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    requests.push(structuredClone(request));
+    if (requests.length === 1) yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:read', name: 'bash', input: { workspace: 'primary', command: 'cat /references/notes.txt' } });
+    else yield providerEvent(request.requestId, 'assistant.message', { messageId: `message:done:${requests.length}`, content: 'Finished.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel({ async execute(request) {
+    if (request.nonWorkspaceAuthority) return shellReply(request);
+    return { schemaVersion: 'deepcode.kernel-reply', type: 'tool.execution', requestId: request.requestId, callId: request.callId,
+      status: 'approvalRequired', preview: { summary: 'Read reference files', effects: ['process'], logicalTargets: ['/references/notes.txt'],
+        authorizationScope: scope, authorizationScopes: [scope], approvalReviewer: 'user',
+        authorizationContext: { ...context, command: request.input.command, fileAccess: { read: ['/references/notes.txt'], write: [] } } } };
+  } }), preparation.port, 'file-grant-history');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:start', 'Read the original reference file.'));
+  const { pendingApproval: approval } = await waitForProjection(actor, state => state.run?.status === 'waiting');
+  await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'approval.respond', sessionId, commandId: 'command:approve',
+    runId: approval.runId, callId: approval.callId, approvalId: approval.approvalId, decision: 'allow', authorizationScope: scope });
+  const original = await waitForProjection(actor, state => state.run?.status === 'completed');
+  const [grant] = original.shellAuthorizations;
+  assert.equal(grant.scope, scope);
+  const saved = await readEvents(journal, sessionId);
+  await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'message.edit', sessionId, commandId: 'command:edit',
+    messageId: original.messages[0].messageId, expectedRevision: original.revision, text: 'Use the revised reference question.' });
+  const edited = await waitForProjection(actor, state => state.run?.status === 'completed' && state.run.runId !== original.run.runId);
+  assert.deepEqual(edited.shellAuthorizations, [grant]);
+  assert.equal(edited.activities.some(activity => activity.kind === 'run' && activity.runId === original.run.runId), false);
+  assert.equal(JSON.stringify(requests.at(-1).messages).includes('Read the original reference file.'), false);
+  assert.equal(requests.at(-1).messages.some(message => message.role === 'tool' || message.toolCalls?.length), false);
+  assert.deepEqual((await readEvents(journal, sessionId)).slice(0, saved.length), saved);
+  const revoke = await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'approval.revoke', sessionId,
+    commandId: 'command:revoke', runId: grant.runId, authorityId: grant.authorityId });
+  assert.equal(revoke.status, 'accepted');
+  const revoked = await actor.snapshot();
+  assert.deepEqual(revoked.shellAuthorizations, []);
+  await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'message.edit', sessionId, commandId: 'command:edit-again',
+    messageId: revoked.messages[0].messageId, expectedRevision: revoked.revision, text: 'Keep the permission revoked.' });
+  const revisedAgain = await waitForProjection(actor, state => state.run?.status === 'completed' && state.run.runId !== edited.run.runId);
+  assert.deepEqual(revisedAgain.shellAuthorizations, []);
+  assert.deepEqual(projectSession(loopSnapshot(sessionId, await readEvents(journal, sessionId)).state), revisedAgain);
+});
+
+for (const mode of ['ask', 'review', 'allow']) test(`Shell ${mode} has a distinct review lifecycle`, async t => {
+  const journal = new InMemoryCommandJournal(), sessionId = `session:permissions-${mode}`;
+  await createSession(journal, sessionId, [workspaceBinding]);
+  let agentTurns = 0, reviews = 0, executions = 0;
+  const preparation = fakeRunPreparation({ tools: [shell], permissions: { 'agent.permissions.shell': mode, 'agent.permissions.shellAccess': 'full' } });
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    if (request.purpose === 'approvalReview') {
+      reviews++;
+      assert.deepEqual(request.tools, []); assert.deepEqual(request.hostedTools, []);
+      assert.equal(request.responseConstraint, 'answerOnly');
+      assert.match(request.messages[1].content, /make check/);
+      yield providerEvent(request.requestId, 'assistant.message', { content: '{"decision":"allow","reason":"The user requested this test in the delegated environment."}' });
+    } else if (++agentTurns === 1) yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:build', name: 'bash', input: { workspace: 'primary', command: 'make check' } });
+    else yield providerEvent(request.requestId, 'assistant.message', { messageId: 'message:done', content: 'Finished.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel({ async execute(request) {
+    if (mode !== 'allow' && !request.nonWorkspaceAuthority) return { schemaVersion: 'deepcode.kernel-reply', type: 'tool.execution', requestId: request.requestId,
+      callId: request.callId, status: 'approvalRequired', preview: { summary: 'Run make check', effects: ['process'], logicalTargets: ['.'],
+        authorizationScope: 'runCommand', authorizationScopes: ['runCommand', 'runHostShell'], authorizationContext: context,
+        approvalReviewer: mode === 'review' ? 'agent' : 'user' } };
+    executions++; return shellReply(request);
+  } }), preparation.port, `permission-${mode}`);
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:start', 'Run make check.'));
+  if (mode === 'ask') {
+    const pending = await waitForProjection(actor, state => state.run?.status === 'waiting');
+    assert.equal(reviews, 0); assert.equal(executions, 0);
+    const approval = pending.pendingApproval;
+    await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'approval.respond', sessionId, commandId: 'command:approve', runId: approval.runId,
+      callId: approval.callId, approvalId: approval.approvalId, decision: 'allow', authorizationScope: 'runCommand' });
+  }
+  const completed = await waitForProjection(actor, state => state.run?.status === 'completed');
+  assert.equal(executions, 1); assert.equal(reviews, mode === 'review' ? 1 : 0);
+  assert.deepEqual(completed.shellAuthorizations, []);
+  const events = await readEvents(journal, sessionId);
+  const resolved = events.find(event => event.type === 'approval.resolved');
+  if (mode === 'review') { assert.equal(resolved.payload.source, 'agent'); assert.equal(resolved.payload.authorizationScope, 'runCommand'); }
+  else if (mode === 'allow') assert.equal(resolved, undefined);
+});
+
+test('delegated Plan confirmation records Agent authority without waiting for a user', async t => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:delegated-plan';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  let turns = 0;
+  const prep = fakeRunPreparation({ permissions: { 'agent.permissions.workspaceMutation': 'allow' } });
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    if (++turns === 1) yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:plan', name: 'plan_publish', input: {
+      title: 'Inspect the project', summary: 'Confirm the task scope', steps: [{ stepId: 'inspect', title: 'Inspect', details: 'Read files', verification: ['Report findings'] }], mutationManifest: [],
+    } });
+    else yield providerEvent(request.requestId, 'assistant.message', { messageId: 'message:done', content: 'Done.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel(), prep.port, 'delegated');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:start', 'Inspect the project.'));
+  const done = await waitForProjection(actor, state => state.run?.status === 'completed');
+  assert.equal(done.plans[0].confirmationSource, 'agent');
+  const events = await readEvents(journal, sessionId);
+  assert.equal(events.find(event => event.type === 'plan.confirmed').payload.source, 'agent');
+  assert.equal(events.some(event => event.type === 'run.waiting' && event.payload.reason === 'plan'), false);
+});
+
+for (const result of ['not JSON', '{"decision":"ask","reason":"Script contents are unknown."}']) test(`unresolved review retains a user decision: ${result}`, async t => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:review-uncertain';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  let executions = 0;
+  const prep = fakeRunPreparation({ tools: [shell], permissions: { 'agent.permissions.shell': 'review', 'agent.permissions.shellAccess': 'full' } });
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    if (request.purpose === 'approvalReview') yield providerEvent(request.requestId, 'assistant.message', { content: result });
+    else yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:script', name: 'bash', input: { workspace: 'primary', command: 'make check' } });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel({ async execute(request) {
+    if (request.nonWorkspaceAuthority) { executions++; return shellReply(request); }
+    return { schemaVersion: 'deepcode.kernel-reply', type: 'tool.execution', requestId: request.requestId, callId: request.callId,
+      status: 'approvalRequired', preview: { summary: 'Script request', effects: ['process'], logicalTargets: ['.'], approvalReviewer: 'agent', authorizationContext: context } };
+  } }), prep.port, 'uncertain');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:start', 'Run the script.'));
+  const waiting = await waitForProjection(actor, state => state.run?.status === 'waiting');
+  assert.equal(waiting.pendingApproval.preview.review.decision, 'ask');
+  assert.ok(waiting.pendingApproval.preview.review.reason); assert.equal(executions, 0);
+  assert.equal((await readEvents(journal, sessionId)).some(event => event.type === 'approval.resolved'), false);
+});
+
+function shellReply(request) {
+  const reply = completedExecutionReply(request, { workspaceId: workspaceBinding.workspaceId, command: request.input.command,
+    cwd: '.', workspaceMode: 'write', executionScope: 'host', terminal: false, stdout: 'Passed', stderr: '', exitCode: 0,
+    success: true, timedOut: false, truncated: false, capturedBytes: 6, durationMs: 1,
+    environment: { shell: '/bin/bash', interactive: false, executionScope: 'host', terminal: false,
+      pathSource: 'preparedRunEnvironment', writeScope: 'hostUser', homeWritable: true, networkAccess: true } });
+  reply.record.preparedEffect.logicalTargets = ['.'];
+  Object.assign(reply.record.preparedEffect.canonicalInvocation.arguments, { workspaceMode: 'write', executionScope: 'host' });
+  reply.record.preparedEffect.processWorkspaceMode = 'write'; reply.record.preparedEffect.processExecutionScope = 'host';
+  return reply;
+}
+
+for (const nextMode of ['ask', 'allow']) test(`changing Shell to ${nextMode} during review applies before execution`, async t => {
+  const journal = new InMemoryCommandJournal(), sessionId = `session:change-${nextMode}`;
+  await createSession(journal, sessionId, [workspaceBinding]);
+  let startReview, releaseReview;
+  const started = new Promise(resolve => { startReview = resolve; });
+  const released = new Promise(resolve => { releaseReview = resolve; });
+  let turns = 0, reviews = 0, executions = 0;
+  const preparation = fakeRunPreparation({ tools: [shell], permissions: { 'agent.permissions.shell': 'review', 'agent.permissions.shellAccess': 'full' } });
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    if (request.purpose === 'approvalReview') {
+      reviews++; startReview(); await released;
+      yield providerEvent(request.requestId, 'assistant.message', { content: '{"decision":"allow","reason":"The requested command fits the delegated scope."}' });
+    } else if (++turns === 1) yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:change', name: 'bash', input: { workspace: 'primary', command: 'make check' } });
+    else yield providerEvent(request.requestId, 'assistant.message', { messageId: 'message:done', content: 'Done.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel({ async execute(request) {
+    const changes = (await readEvents(journal, sessionId)).filter(event => event.type === 'session.permissions.updated');
+    const mode = changes.at(-1)?.payload.patches['agent.permissions.shell'] ?? 'review';
+    if (mode === 'allow' || request.nonWorkspaceAuthority) { executions++; return shellReply(request); }
+    return { schemaVersion: 'deepcode.kernel-reply', type: 'tool.execution', requestId: request.requestId, callId: request.callId,
+      status: 'approvalRequired', preview: { summary: 'Run make check', effects: ['process'], logicalTargets: ['.'],
+        approvalReviewer: mode === 'review' ? 'agent' : 'user', authorizationContext: context } };
+  } }), preparation.port, 'change');
+  t.after(() => { releaseReview(); actor.dispose(); });
+  await actor.submit(messageCommand(sessionId, 'command:start', 'Run make check.'));
+  await started;
+  await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'session.permissions.set', sessionId,
+    commandId: 'command:change', patches: { 'agent.permissions.shell': nextMode } });
+  releaseReview();
+  const state = await waitForProjection(actor, state => state.run?.status === (nextMode === 'ask' ? 'waiting' : 'completed'));
+  assert.equal(reviews, 1); assert.equal(executions, nextMode === 'ask' ? 0 : 1);
+  assert.equal((await readEvents(journal, sessionId)).some(event => event.type === 'approval.resolved' && event.payload.source === 'agent'), false);
+  if (nextMode === 'ask') {
+    assert.equal(state.pendingApproval.preview.approvalReviewer, 'user');
+    assert.equal(state.activities.filter(activity => activity.kind === 'approval' && activity.status === 'waiting').length, 1);
+  }
+});

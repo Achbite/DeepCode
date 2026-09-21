@@ -157,8 +157,8 @@ pub enum KernelCanonicalInvocation {
         workspace_mode: KernelWorkspaceMode,
         #[serde(default)]
         execution_scope: KernelExecutionScope,
-        #[serde(default = "default_timeout")]
-        timeout: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout: Option<u32>,
         terminal: Option<KernelTerminalInput>,
     },
     #[serde(rename = "powershell")]
@@ -170,8 +170,8 @@ pub enum KernelCanonicalInvocation {
         workspace_mode: KernelWorkspaceMode,
         #[serde(default)]
         execution_scope: KernelExecutionScope,
-        #[serde(default = "default_timeout")]
-        timeout: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout: Option<u32>,
         terminal: Option<KernelTerminalInput>,
     },
     #[serde(rename = "web.search")]
@@ -196,9 +196,6 @@ fn default_max_lines() -> u32 {
 }
 fn default_read_bytes() -> u32 {
     262_144
-}
-pub(crate) fn default_timeout() -> u32 {
-    120
 }
 fn default_search_limit() -> u32 {
     5
@@ -292,7 +289,9 @@ impl KernelCanonicalInvocation {
                         return Err(field_too_large("requestHostPermission", 1024));
                     }
                 }
-                validate_u32("timeout", *timeout, 1, 600)?;
+                if let Some(timeout) = timeout {
+                    validate_u32("timeout", *timeout, 1, u32::MAX)?;
+                }
                 if let Some(terminal) = terminal {
                     if terminal.stdin.len() > MAX_TERMINAL_STDIN_BYTES {
                         return Err(field_too_large("terminal.stdin", MAX_TERMINAL_STDIN_BYTES));
@@ -375,8 +374,10 @@ impl KernelCanonicalInvocation {
                     "command": command,
                     "workspaceMode": workspace_mode,
                     "executionScope": execution_scope,
-                    "timeout": timeout,
                 });
+                if let Some(timeout) = timeout {
+                    value["timeout"] = json!(timeout);
+                }
                 if let Some(terminal) = terminal {
                     value["terminal"] = json!(terminal);
                 }
@@ -393,6 +394,9 @@ impl KernelCanonicalInvocation {
 
 fn validate_path(value: &str, allow_dot: bool) -> Result<(), ToolValidationError> {
     validate_text("path", value, false)?;
+    if std::path::Path::new(value).is_absolute() {
+        return Ok(());
+    }
     if value.contains('\\')
         || value.starts_with('/')
         || value.as_bytes().get(1) == Some(&b':')

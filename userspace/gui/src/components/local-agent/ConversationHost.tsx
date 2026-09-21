@@ -1,14 +1,14 @@
+import * as resources from '../../services/conversationResources';
 import { useEffect, useState } from 'react';
-import { readConversation, readConversationResource, readConversationImage, readConversationDocument, readFileChange, resolveConversationResource, readConversationArtifact } from '../../services/localAgentApi';
+import { readConversation, readConversationImage, readFileChange, resolveConversationResource, readConversationArtifact } from '../../services/localAgentApi';
 import { openExternalUrl } from '../../services/runtimeAdapter';
 import type { SourcePosition } from './resourceLinks';
 
 /** Web conversation content receives host operations here; it owns no native shell API. */
 export interface ConversationHost {
+  resources: typeof resources;
   copyText(text: string): Promise<void>;
   openExternalLink(url: string): Promise<void>;
-  readResource: typeof readConversationResource;
-  readDocument: typeof readConversationDocument;
   readLocalFile?(path: string): Promise<Blob>;
   readArtifact: typeof readConversationArtifact;
   readChange: typeof readFileChange;
@@ -20,16 +20,15 @@ export interface ConversationHost {
 }
 
 const defaultHost: ConversationHost = {
+  resources,
   copyText: async (text) => navigator.clipboard.writeText(text),
   openExternalLink: openExternalUrl,
-  readResource: readConversationResource,
   readLocalFile: async (path) => {
     const invoke = window.__TAURI__?.core?.invoke;
     if (!invoke) throw new Error('Local file reading requires the desktop Host.');
     const bytes = await invoke<ArrayBuffer>('deepcode_read_local_file', { path });
     return new Blob([bytes]);
   },
-  readDocument: readConversationDocument,
   readArtifact: readConversationArtifact,
   resolveResource: resolveConversationResource,
   openFile: async (path, position) => {

@@ -6,9 +6,9 @@ import ModalDialog from '../../shared/ModalDialog';
 import { useSettingsHelp } from '../SettingsHelp';
 import { useSettingsSearchEntries, useSettingsSearchTarget } from '../settingsSearch';
 
-const SETTING_KEY = 'agent.permissions.commandDenylist';
-
-export default function CommandDenylistSettings({ language }: { language: UiLanguage }) {
+export default function CommandDenylistSettings({ language, setting = 'commandDenylist' }: { language: UiLanguage; setting?: 'commandDenylist' | 'runtimeReadRoots' }) {
+  const SETTING_KEY = `agent.permissions.${setting}`;
+  const messages = `settings.${setting}`;
   const value = useSettingsStore((state) => state.effectiveSettings[SETTING_KEY]);
   const loading = useSettingsStore((state) => state.loading);
   const patch = useSettingsStore((state) => state.patchUserSetting);
@@ -16,14 +16,14 @@ export default function CommandDenylistSettings({ language }: { language: UiLang
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const id = useId();
-  const title = t(language, 'settings.commandDenylist.title');
-  const description = t(language, 'settings.commandDenylist.description');
+  const title = t(language, `${messages}.title`);
+  const description = t(language, `${messages}.description`);
   const target = useSettingsSearchTarget(SETTING_KEY);
   const { helpId, helpEvents, help } = useSettingsHelp(description);
-  useSettingsSearchEntries('command-denylist', [{ id: SETTING_KEY, category: 'permissions', title, keywords: description }]);
+  useSettingsSearchEntries(SETTING_KEY, [{ id: SETTING_KEY, category: 'permissions', title, keywords: description }]);
   const valid = Array.isArray(value) && value.every((command) => typeof command === 'string' && command.trim().length > 0 && !/[\r\n]/u.test(command));
   const savedText = valid ? value.join('\n') : null;
-  const configurationError = valid ? null : t(language, 'settings.commandDenylist.invalid');
+  const configurationError = valid ? null : t(language, `${messages}.invalid`);
   useInterfaceReloadGuard(draft !== null && draft !== savedText, title, saving);
 
   const close = () => { setDraft(null); setError(null); };
@@ -49,7 +49,7 @@ export default function CommandDenylistSettings({ language }: { language: UiLang
       <div className="settings-field__main"><span className="settings-field__label">{title}</span></div>
       <div className="settings-field__control">
         <button type="button" className="settings-button" disabled={loading || savedText === null}
-          onClick={() => { setError(null); setDraft(savedText); }}>{t(language, 'settings.commandDenylist.edit')}</button>
+          onClick={() => { setError(null); setDraft(savedText); }}>{t(language, `${messages}.edit`)}</button>
         {configurationError && <p className="settings-error" role="alert">{configurationError}</p>}
       </div>
     </div>

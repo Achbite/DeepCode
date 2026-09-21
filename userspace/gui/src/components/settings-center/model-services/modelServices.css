@@ -5,7 +5,6 @@
 .model-services button { border: 1px solid var(--line); border-radius: 7px; background: var(--dc-surface-subtle); padding: 7px 12px; cursor: pointer; }
 .model-services button:hover { background: var(--bg-hover, var(--dc-surface-raised)); }
 .model-services button:disabled { opacity: .45; cursor: default; }
-.model-services button:focus-visible, .model-services input:focus-visible, .model-services select:focus-visible, .model-services summary:focus-visible { outline: 2px solid var(--dc-focus-ring, var(--dc-border-strong)); outline-offset: 3px; }
 .model-services .model-primary { background: var(--dc-control-background); color: var(--dc-control-foreground); border-color: var(--dc-control-border); font-weight: 600; }
 .model-services .model-primary:hover:not(:disabled) { background: var(--dc-surface-hover); }
 .model-heading, .model-actions, .model-filters, .model-chart-heading { display: flex; align-items: center; gap: 10px; }

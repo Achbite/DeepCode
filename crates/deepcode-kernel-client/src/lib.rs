@@ -18,12 +18,12 @@ use conversation::invalid_filesystem_references;
 
 pub use bootstrap::{DaemonStatus, KernelBootstrap, KernelBootstrapGuard, KernelBootstrapOptions};
 pub use conversation::{
-    approval_response_command, cancel_command, directory_index_attach_command,
-    directory_index_detach_command, focus_command, interaction_response_command,
-    is_terminal_run_status, message_command, message_command_with_profile,
-    message_command_with_profile_and_plugins, plan_cancel_command, plan_confirm_command,
-    plan_revision_command, ActivityProjection, ApprovalProjection, ArtifactProjection,
-    AssistantDraftBlockProjection, AssistantDraftProjection,
+    approval_response_command, approval_scope_for_input, cancel_command,
+    directory_index_attach_command, directory_index_detach_command, focus_command,
+    interaction_response_command, is_terminal_run_status, message_command,
+    message_command_with_profile, message_command_with_profile_and_plugins, plan_cancel_command,
+    plan_confirm_command, plan_revision_command, ActivityProjection, ApprovalProjection,
+    ArtifactProjection, AssistantDraftBlockProjection, AssistantDraftProjection,
     AttachConversationDirectoryIndexRequest, CommandReply, ContextCompositionItem,
     ContextCompositionMessage, ContextCompositionMessageBlock,
     ContextCompositionPartitionProjection, ContextCompositionProjection, ContextCompositionTool,
@@ -36,7 +36,7 @@ pub use conversation::{
     QueuedInputProjection, ResolveConversationFilesystemReferencesRequest, RunProjection,
     SessionDisplayProjection, SessionProjection, SessionTimelineItem, TodoItem, TodoListProjection,
     TokenUsageProjection, TokenUsageRoundProjection, ToolOutputProjection, WorkspaceBindingDisplay,
-    CONVERSATION_COMMAND_VERSION, SESSION_PROJECTION_VERSION,
+    AUTHORIZATION_OPTIONS, CONVERSATION_COMMAND_VERSION, SESSION_PROJECTION_VERSION,
 };
 
 #[derive(Debug, Error)]

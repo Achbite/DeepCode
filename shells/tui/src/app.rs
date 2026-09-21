@@ -283,7 +283,9 @@ impl TuiApp {
                 if value == "/focus"
                     || value.starts_with("/focus ")
                     || value == "/reply"
-                    || value.starts_with("/reply ") =>
+                    || value.starts_with("/reply ")
+                    || value.starts_with("/permissions ")
+                    || value.starts_with("/revoke ") =>
             {
                 self.submit_contextual_input(value).await
             }
@@ -325,6 +327,8 @@ impl TuiApp {
             .await
             && text != "/reply"
             && !text.starts_with("/reply ")
+            && !text.starts_with("/permissions ")
+            && !text.starts_with("/revoke ")
         {
             self.clear_plugin_selections();
         }
@@ -336,7 +340,10 @@ impl TuiApp {
         text: &str,
     ) -> Result<serde_json::Value, String> {
         // TUI selections apply to the next message and remain selected during a reply.
-        let is_reply = text == "/reply" || text.starts_with("/reply ");
+        let is_reply = text == "/reply"
+            || text.starts_with("/reply ")
+            || text.starts_with("/permissions ")
+            || text.starts_with("/revoke ");
         crate::conversation_input::contextual_input_command(
             self.host.language,
             projection,

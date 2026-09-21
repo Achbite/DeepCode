@@ -101,9 +101,9 @@ const PLAN_OPERATION_SCHEMA: JsonObject = {
         command: { type: 'string', minLength: 1, maxLength: 16_384 },
         writablePaths: {
           type: 'array', minItems: 1,
-          description: 'Declared files and directories this operation may modify, including build/output directories. A directory includes its descendants. Kernel applies the configured Shell permissions; command text is not an authorization lock.',
+          description: 'Approved test/output directories, including their contents. Project files stay read-only outside these directories. Command is an example, not an authorization lock.',
           items: { type: 'object', additionalProperties: false, required: ['path', 'kind'], properties: {
-            path: { type: 'string', minLength: 1 }, kind: { type: 'string', enum: ['file', 'directory'] },
+            path: { type: 'string', minLength: 1 }, kind: { type: 'string', enum: ['directory'] },
           } },
         },
         terminal: {
@@ -131,7 +131,7 @@ const PLAN_SCHEMA: JsonObject = {
   required: ['summary', 'mutationManifest'],
   anyOf: [{ required: ['title', 'steps'] }, { required: ['mode'] }],
   properties: {
-    mode: { type: 'string', enum: ['extendScope'], description: 'Only to add scope to the current confirmed Plan: submit summary (reason) and mutationManifest (additions), omitting title and steps. Existing phases and verification are preserved; user confirmation is still required.' },
+    mode: { type: 'string', enum: ['extendScope'], description: 'Add scope to the current confirmed Plan using summary (reason) and mutationManifest (additions); omit title and steps. Existing phases and verification are preserved.' },
     title: PLAN_TITLE_SCHEMA,
     summary: { type: 'string', minLength: 1, description: 'Markdown prose. Use actual paragraph breaks, not literal backslash-n text.' },
     steps: {
@@ -207,7 +207,7 @@ export function sessionControlToolDefinitions(): readonly ProviderToolDefinition
     },
     {
       name: SESSION_CONTROL_PLAN_PUBLISH,
-      description: 'Propose a Plan for user confirmation. Keep steps to a few meaningful outcome phases, merging similar work instead of listing files, commands or implementation recipes; choose the count to fit the task. New tasks need not repeat completed history. For scope additions only, use mode=extendScope with summary explaining why and mutationManifest containing additions; Session preserves the approved phases and verification; Todo stays independent. If the task needs a rewritten Plan, omit mode, retain existing stepIds and submit title, summary, steps and the full effective manifest. Scope expansion and Plan rewrites take effect only after user confirmation. fs.edit/fs.write/document.render/browser.capture share file or explicit directoryTree scope; deletion is separate. When creating a module, propose its specific directoryTree scope upfront so new implementation files within that approved directory need no extra confirmation; list unrelated root files separately. Bash command is an optional example, not an exact script lock. Routine fixes within confirmed scope need no reconfirmation. Titles use inline Markdown; other text uses Markdown.',
+      description: 'Publish or revise a Plan; confirmation follows the current Plan setting. Keep steps to meaningful outcome phases, merging similar work. Use extendScope for additions; for a full revision, retain existing stepIds and submit the complete Plan and manifest. Routine fixes within confirmed scope need no new Plan. Bash command is an optional example, not an exact script lock; writablePaths defines its write scope. Todo remains independent.',
       inputSchema: structuredClone(PLAN_SCHEMA) as JsonObject,
     },
     {
@@ -402,14 +402,15 @@ function decodePlanOperation(value: unknown, index: number): PlanOperation {
     }
     const terminal = value.terminal === undefined ? undefined : decodeTerminalInput(value.terminal);
     if (!Array.isArray(value.writablePaths) || !value.writablePaths.length) {
-      throw new SessionControlError('session_control_plan_shell_invalid', 'writablePaths 必须包含至少一个可写文件或目录。');
+      throw new SessionControlError('session_control_plan_shell_invalid', 'writablePaths 必须包含至少一个测试或输出目录。');
     }
     const writablePaths = value.writablePaths.map((entry) => {
-      if (!isRecord(entry) || entry.kind !== 'file' && entry.kind !== 'directory') {
-        throw new SessionControlError('session_control_plan_shell_invalid', 'writablePaths 项必须包含 path 和 kind=file|directory。');
+      if (!isRecord(entry) || entry.kind !== 'directory') {
+        throw new SessionControlError('session_control_plan_shell_invalid', 'writablePaths 项必须包含 path 和 kind=directory；项目文件编辑使用文件工具。');
       }
       assertExactKeys(entry, ['path', 'kind'], [], 'writablePaths');
-      return { path: normalizedTarget(entry.path), kind: entry.kind as 'file' | 'directory' };
+      const path = normalizedTarget(entry.path);
+      return { path, kind: 'directory' as const };
     });
     return {
       workspaceId, operation, writablePaths,

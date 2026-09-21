@@ -98,6 +98,8 @@ impl PluginCatalogEntry {
 enum PluginContribution {
     Skill,
     Host,
+    Container,
+    Process,
     Mcp { plugin_uri: String },
 }
 
@@ -131,6 +133,19 @@ pub(crate) struct ResolvedPluginSelection {
 }
 
 impl ResolvedPluginSelection {
+    pub(crate) fn file_read_roots(&self) -> Vec<PathBuf> {
+        self.plugins
+            .iter()
+            .filter_map(|plugin| {
+                plugin
+                    .implementation
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .and_then(|path| Path::new(path).parent())
+                    .map(Path::to_path_buf)
+            })
+            .collect()
+    }
     pub(crate) fn same_inputs(&self, other: &Self) -> bool {
         self.plugins.len() == other.plugins.len()
             && self
@@ -162,6 +177,20 @@ impl ResolvedPluginSelection {
             .map(|plugin| plugin.plugin_instance_ref.clone())
     }
 
+    pub(crate) fn process_instance(&self) -> Option<String> {
+        self.plugins
+            .iter()
+            .find(|plugin| matches!(plugin.contribution, PluginContribution::Process))
+            .map(|plugin| plugin.plugin_instance_ref.clone())
+    }
+
+    pub(crate) fn container_instance(&self) -> Option<String> {
+        self.plugins
+            .iter()
+            .find(|plugin| matches!(plugin.contribution, PluginContribution::Container))
+            .map(|plugin| plugin.plugin_instance_ref.clone())
+    }
+
     pub(crate) fn mcp_plugin_instances(&self) -> &BTreeMap<String, String> {
         &self.mcp_plugin_instances
     }
@@ -187,7 +216,10 @@ pub(crate) fn plugin_catalog_projection(settings: &Value) -> Result<Value, Strin
                     "skill"
                 }
                 PluginCatalogEntry::Loaded(source)
-                    if matches!(source.contribution, PluginContribution::Host) =>
+                    if matches!(
+                        source.contribution,
+                        PluginContribution::Host | PluginContribution::Container
+                    ) =>
                 {
                     "host"
                 }
@@ -372,23 +404,8 @@ pub(crate) fn local_agent_plugin_config(
     settings: &Value,
     selection: &ResolvedPluginSelection,
 ) -> Result<Value, String> {
-    let workspace_mutation = settings
-        .get("agent.permissions.workspaceMutation")
-        .and_then(Value::as_str)
-        .unwrap_or("plan");
-    if !matches!(workspace_mutation, "plan" | "allow") {
-        return Err("agent.permissions.workspaceMutation 必须是 plan 或 allow。".to_string());
-    }
-    let engineering_decisions = settings
-        .get("agent.permissions.engineeringDecisions")
-        .and_then(Value::as_str)
-        .unwrap_or("ask");
-    if !matches!(engineering_decisions, "ask" | "delegate") {
-        return Err("agent.permissions.engineeringDecisions 必须是 ask 或 delegate。".to_string());
-    }
     Ok(json!({
-        "workspaceMutation": workspace_mutation,
-        "engineeringDecisions": engineering_decisions,
+        "permissions": crate::settings_api::permission_settings(settings),
         "selectedPlugins": selection.plugins.iter().map(|plugin| json!({
             "uri": plugin.public.uri,
             "displayName": plugin.public.display_name,
@@ -425,10 +442,10 @@ fn plugin_catalog(
 > {
     let mut sources = BTreeMap::new();
     let uri = "plugin://computer-use@builtin";
-    let disabled: Vec<String> =
+    let disabled_plugins: Vec<String> =
         serde_json::from_str(settings["plugins.disabled"].as_str().unwrap_or("[]"))
             .map_err(|error| format!("plugin_config_invalid: {error}"))?;
-    let disabled = disabled.iter().any(|value| value == uri);
+    let disabled = disabled_plugins.iter().any(|value| value == uri);
     let guide = include_str!("../../../plugins/computer-use/README.md");
     insert_plugin_source(
         &mut sources,
@@ -452,6 +469,58 @@ fn plugin_catalog(
             tool_prompt_provider: None,
             contribution: PluginContribution::Host,
             implementation: json!({"host":"native","plugin":"computer-use"}),
+            content: Arc::from(guide.as_bytes()),
+        }),
+    )?;
+    let uri = "plugin://containers@builtin";
+    let guide = include_str!("../../../plugins/containers/README.md");
+    insert_plugin_source(
+        &mut sources,
+        PluginCatalogEntry::Loaded(PluginSource {
+            public: PublicPluginCatalogItem {
+                uri: uri.into(),
+                display_name: "Containers".into(),
+                short_description: "在已授权容器中运行命令，创建独立测试容器。".into(),
+                icon_ref: None,
+                management: Some(json!({"key":"plugins.disabled","id":uri})),
+                activation_media_types: vec![],
+                enabled: !disabled_plugins.iter().any(|id| id == uri),
+                available: !disabled_plugins.iter().any(|id| id == uri),
+                error: None,
+            },
+            plugin_artifact_ref: crate::utils::new_runtime_ref("plugin-artifact")?,
+            plugin_instance_ref: String::new(),
+            capability_refs: vec!["host:containers".into()],
+            capability_summary: "Run commands in an approved Docker container or create an independent temporary test container; Kernel owns approval and cleanup.".into(),
+            tool_prompt_provider: None,
+            contribution: PluginContribution::Container,
+            implementation: json!({"host":"native","plugin":"containers"}),
+            content: Arc::from(guide.as_bytes()),
+        }),
+    )?;
+    let uri = "plugin://processes@builtin";
+    let guide = include_str!("../../../plugins/processes/README.md");
+    insert_plugin_source(
+        &mut sources,
+        PluginCatalogEntry::Loaded(PluginSource {
+            public: PublicPluginCatalogItem {
+                uri: uri.into(),
+                display_name: "Processes".into(),
+                short_description: "托管长时间命令、等待结果或并行处理独立工作。".into(),
+                icon_ref: None,
+                management: Some(json!({"key":"plugins.disabled","id":uri})),
+                activation_media_types: vec![],
+                enabled: !disabled_plugins.iter().any(|id| id == uri),
+                available: !disabled_plugins.iter().any(|id| id == uri),
+                error: None,
+            },
+            plugin_artifact_ref: crate::utils::new_runtime_ref("plugin-artifact")?,
+            plugin_instance_ref: String::new(),
+            capability_refs: vec!["host:processes".into()],
+            capability_summary: "Start run-owned commands, wait for results, or cancel them. Status is delivered automatically; do independent work or wait before dependent actions.".into(),
+            tool_prompt_provider: None,
+            contribution: PluginContribution::Process,
+            implementation: json!({"host":"native","plugin":"processes"}),
             content: Arc::from(guide.as_bytes()),
         }),
     )?;

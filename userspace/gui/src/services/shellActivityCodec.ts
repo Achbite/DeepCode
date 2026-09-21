@@ -43,16 +43,10 @@ export function isShellExecutionEnvironment(value: unknown): boolean {
     && (value.executionScope === 'workspace' || value.executionScope === 'host')
     && typeof value.pathSource === 'string'
     && value.pathSource.trim().length > 0
-    && (value.executionScope === 'host'
-      ? value.writeScope === 'hostUser'
-        && value.homeWritable === true
-        && value.networkAccess === true
-      : (
-          value.writeScope === 'kernelTemporaryOnly'
-          || value.writeScope === 'workspaceAndKernelTemporary'
-        )
-        && value.homeWritable === false
-        && value.networkAccess === false);
+    && typeof value.writeScope === 'string'
+    && value.writeScope.trim().length > 0
+    && typeof value.homeWritable === 'boolean'
+    && typeof value.networkAccess === 'boolean';
 }
 
 function isNaturalNumber(value: unknown): value is number {

@@ -29,8 +29,7 @@ const BASH_OUTPUT_LIMIT_LINES: usize = 2000;
 const BASH_TERMINAL_COLS: u16 = 120;
 const BASH_TERMINAL_ROWS: u16 = 30;
 const AGENT_SHELL_PATH_SOURCE: &str = "preparedRunEnvironment";
-const AGENT_SHELL_READ_MODE_WRITE_SCOPE: &str = "kernelTemporaryOnly";
-const AGENT_SHELL_WRITE_MODE_WRITE_SCOPE: &str = "workspaceAndKernelTemporary";
+const AGENT_SHELL_RESOURCE_WRITE_SCOPE: &str = "authorizedResources";
 const AGENT_SHELL_HOST_WRITE_SCOPE: &str = "hostUser";
 static NEXT_PROCESS_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
 const AGENT_SHELL_ENV_ALLOWLIST: &[&str] = &[
@@ -150,7 +149,7 @@ fn invoke_shell_in_temp(
                 command,
                 workspace_mode.as_str().to_owned(),
                 execution_scope.as_str().to_owned(),
-                u64::from(timeout),
+                timeout.map(u64::from),
                 terminal.map(|value| value.stdin),
             ),
             _ => {
@@ -159,7 +158,7 @@ fn invoke_shell_in_temp(
                 ))
             }
         };
-    let write_scope = shell_write_scope(&execution_scope, &workspace_mode);
+    let write_scope = shell_write_scope(&execution_scope);
     let workspace_id = workspace_id(&context)?.to_string();
     let workspace_root = canonical_process_workspace_root(&context)?;
     let cwd = prepared_process_cwd(&context, &workspace_root)?;
@@ -210,8 +209,7 @@ fn invoke_shell_in_temp(
 
     let terminal = terminal_stdin.is_some();
     let arguments = prepare_script_arguments(&shell, &command_text, temporary)?;
-    #[allow(unused_mut)]
-    let mut prepared_command = prepare_shell_command(
+    let prepared_command = prepare_shell_command(
         &arguments,
         &shell,
         &workspace_root,
@@ -221,8 +219,9 @@ fn invoke_shell_in_temp(
         temporary,
         process_scope_id,
         terminal_stdin.as_deref(),
+        &context.file_access,
     )?;
-    let result = (|| {
+    (|| {
         let mut process = Command::new(&prepared_command.program);
         process.args(&prepared_command.arguments);
         #[cfg(unix)]
@@ -242,144 +241,36 @@ fn invoke_shell_in_temp(
             .env("TMPDIR", temporary)
             .env("TMP", temporary)
             .env("TEMP", temporary);
-        process
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let started = Instant::now();
-        let archive = ShellOutputArchive::create(&context)?;
-        let stdout_file = archive.open("stdout")?;
-        let stderr_file = archive.open("stderr")?;
-        let mut child = process.spawn().map_err(|error| {
-            KernelError::Other(format!("spawn {tool_name} in {}: {error}", cwd.display()))
-        })?;
-        context.progress.started();
-        #[cfg(windows)]
-        let process_job = match windows_job::ProcessJob::attach(child.id()) {
-            Ok(job) => job,
-            Err(error) => {
-                return combine_shell_results(Err(error), terminate_child(&mut child))
-                    .map(|(result, _)| result);
-            }
-        };
-        #[cfg(unix)]
-        let child_id = child.id();
-        #[cfg(target_os = "macos")]
-        let mut process_scope_guard = (execution_scope == "workspace")
-            .then(|| ProcessScopeGuard::new(child_id, process_scope_id.to_owned()));
-        #[allow(unused_mut)]
-        let mut stop_process = |child: &mut Child| {
-            let reaped = terminate_child(child).map(|_| ());
-            #[cfg(windows)]
-            let descendants = process_job.terminate();
-            #[cfg(all(unix, not(target_os = "macos")))]
-            let descendants = terminate_remaining_process_group(child_id);
-            #[cfg(target_os = "macos")]
-            let descendants = match process_scope_guard.as_mut() {
-                Some(guard) => guard.terminate(),
-                None => terminate_remaining_process_group(child_id),
-            };
-            #[cfg(not(any(unix, windows)))]
-            let descendants = Ok(());
-            combine_shell_results(reaped, descendants).map(|_| ())
-        };
-        let pipes =
-            (|| {
-                let stdout = child.stdout.take().ok_or_else(|| {
-                    KernelError::Other("bash stdout pipe is unavailable".to_string())
-                })?;
-                let stderr = child.stderr.take().ok_or_else(|| {
-                    KernelError::Other("bash stderr pipe is unavailable".to_string())
-                })?;
-                set_pipe_nonblocking(&stdout, "stdout")?;
-                set_pipe_nonblocking(&stderr, "stderr")?;
-                Ok((stdout, stderr))
-            })();
-        let (stdout, stderr) = match pipes {
-            Ok(pipes) => pipes,
-            Err(error) => {
-                return combine_shell_results(Err(error), stop_process(&mut child))
-                    .map(|(result, ())| result)
-            }
-        };
-        let stop_capture = Arc::new(AtomicBool::new(false));
-        let stdout_reader = spawn_output_reader(
-            stdout,
-            stdout_file,
-            BASH_OUTPUT_LIMIT_BYTES,
-            Arc::clone(&stop_capture),
-            context.progress.clone(),
-            "stdout",
-            false,
-        );
-        let stderr_reader = spawn_output_reader(
-            stderr,
-            stderr_file,
-            BASH_OUTPUT_LIMIT_BYTES,
-            Arc::clone(&stop_capture),
-            context.progress.clone(),
-            "stderr",
-            false,
-        );
-
-        let wait_result = wait_for_bounded_child(
-            &mut child,
-            Duration::from_secs(timeout_seconds),
-            &context.cancellation,
-        );
-        let wait_result = wait_result.and_then(|(status, timed_out, cancelled)| {
-            if cancelled {
-                Err(KernelError::Structured {
-                    code: "tool_execution_cancelled",
-                    stage: "execution",
-                    message: format!("{tool_name} was cancelled"),
-                    details: serde_json::json!({
-                        "toolId": tool_name,
-                        "workspaceMode": workspace_mode,
-                        "executionScope": execution_scope,
-                    }),
-                })
-            } else {
-                Ok((status, timed_out))
-            }
-        });
-        let process_cleanup = stop_process(&mut child);
-        stop_capture.store(true, AtomicOrdering::Release);
-        if let Err(cleanup) = process_cleanup {
-            return shell_cleanup_failure(wait_result, cleanup);
+        if execution_scope == "workspace" {
+            let home = context.file_access.home.as_deref().unwrap_or(temporary);
+            fs::create_dir_all(home)
+                .map_err(|error| KernelError::Other(format!("Create Agent home: {error}")))?;
+            process
+                .env("HOME", home)
+                .env("XDG_CONFIG_HOME", home.join("config"))
+                .env("XDG_CACHE_HOME", home.join("cache"))
+                .env("GIT_OPTIONAL_LOCKS", "0");
         }
-
-        let stdout_result = join_output_reader(stdout_reader, "stdout");
-        let stderr_result = join_output_reader(stderr_reader, "stderr");
-
-        let (mut stdout, mut stderr) = match combine_shell_results(stdout_result, stderr_result) {
-            Ok(streams) => streams,
-            Err(error) => return shell_cleanup_failure(wait_result, error),
-        };
-        let (status, timed_out) = wait_result?;
-        bound_combined_output(&mut stdout, &mut stderr, BASH_OUTPUT_LIMIT_BYTES);
-        bound_output_lines(&mut stdout, &mut stderr);
-        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let captured_bytes = stdout.bytes.len().saturating_add(stderr.bytes.len());
-        let truncated = stdout.truncated || stderr.truncated;
-        let exit_code = status.code();
-        let success = !timed_out && status.success();
-
-        let mut output = serde_json::json!({
+        let mut result = execute_cli_command(
+            invocation.id,
+            process,
+            timeout_seconds,
+            tool_name,
+            &context,
+            (execution_scope == "workspace").then_some(process_scope_id),
+        )?;
+        let metadata = serde_json::json!({
             "workspaceId": workspace_id,
             "command": command_text,
             "cwd": ".",
+            "paths": {
+                "workspace": workspace_root,
+                "home": if execution_scope == "workspace" { context.file_access.home.clone().or_else(|| Some(temporary.to_path_buf())) } else { std::env::var_os("HOME").map(PathBuf::from) },
+                "scratch": temporary,
+            },
             "workspaceMode": workspace_mode,
             "executionScope": execution_scope,
             "terminal": terminal,
-            "stdout": String::from_utf8_lossy(&stdout.bytes),
-            "stderr": String::from_utf8_lossy(&stderr.bytes),
-            "exitCode": exit_code,
-            "success": success,
-            "timedOut": timed_out,
-            "truncated": truncated,
-            "capturedBytes": captured_bytes,
-            "durationMs": duration_ms,
             "environment": {
                 "executionTarget": { "kind": "native" },
                 "os": std::env::consts::OS,
@@ -390,41 +281,17 @@ fn invoke_shell_in_temp(
                 "terminal": terminal,
                 "pathSource": AGENT_SHELL_PATH_SOURCE,
                 "writeScope": write_scope,
-                "homeWritable": execution_scope == "host",
-                "networkAccess": execution_scope == "host"
+                "homeWritable": true,
+                "networkAccess": execution_scope == "host" || context.file_access.network_access
             }
         });
-        archive.finish(&mut output)?;
-        if success {
-            Ok(ok(invocation.id, output))
-        } else if timed_out {
-            Ok(known_failure(
-                invocation.id,
-                output,
-                if tool_name == "powershell" {
-                    "powershell_timed_out"
-                } else {
-                    "bash_timed_out"
-                },
-                format!("{tool_name} command exceeded the {timeout_seconds}-second timeout."),
-            ))
-        } else {
-            Ok(known_failure(
-                invocation.id,
-                output,
-                if tool_name == "powershell" {
-                    "powershell_exit_nonzero"
-                } else {
-                    "bash_exit_nonzero"
-                },
-                match exit_code {
-                    Some(code) => format!("{tool_name} command exited with status {code}."),
-                    None => "Bash command terminated without an exit status.".to_string(),
-                },
-            ))
-        }
-    })();
-    finish_shell_execution(result, prepared_command.finish())
+        result
+            .output
+            .as_object_mut()
+            .expect("process output")
+            .extend(metadata.as_object().expect("process metadata").clone());
+        Ok(result)
+    })()
 }
 
 fn finish_shell_execution(
@@ -452,15 +319,15 @@ fn finish_shell_execution(
 }
 
 fn shell_cleanup_failure<S: std::fmt::Debug>(
-    wait: KernelResult<(S, bool)>,
+    wait: KernelResult<(S, bool, bool)>,
     cleanup: KernelError,
 ) -> KernelResult<KernelToolExecutionResult> {
     match wait {
         Err(primary) => combine_shell_results(Err(primary), Err::<(), _>(cleanup)).map(|(value, ())| value),
-        Ok((status, timed_out)) => Err(KernelError::Structured {
+        Ok((status, timed_out, cancelled)) => Err(KernelError::Structured {
             code: "shell_cleanup_failed",
             stage: "execution",
-            message: format!("Shell exit status {status:?} (timedOut={timed_out}); resource cleanup failed: {cleanup}"),
+            message: format!("Shell exit status {status:?} (timedOut={timed_out}, cancelled={cancelled}); resource cleanup failed: {cleanup}"),
             details: serde_json::json!({ "exitStatus": format!("{status:?}"), "timedOut": timed_out }),
         }),
     }
@@ -473,7 +340,7 @@ fn invoke_terminal_shell(
     workspace_mode: String,
     execution_scope: String,
     terminal_stdin: String,
-    timeout_seconds: u64,
+    timeout_seconds: Option<u64>,
     workspace_id: String,
     workspace_root: PathBuf,
     cwd: PathBuf,
@@ -485,7 +352,7 @@ fn invoke_terminal_shell(
 ) -> KernelResult<KernelToolExecutionResult> {
     let tool_name = shell.tool.clone();
     let bash_program = shell.executable.clone();
-    let write_scope = shell_write_scope(&execution_scope, &workspace_mode);
+    let write_scope = shell_write_scope(&execution_scope);
 
     let pty = native_pty_system()
         .openpty(PtySize {
@@ -496,8 +363,7 @@ fn invoke_terminal_shell(
         })
         .map_err(|error| KernelError::Other(format!("open bash pty: {error}")))?;
     let arguments = prepare_script_arguments(&shell, &command_text, temporary)?;
-    #[allow(unused_mut)]
-    let mut prepared_command = prepare_shell_command(
+    let prepared_command = prepare_shell_command(
         &arguments,
         &shell,
         &workspace_root,
@@ -507,8 +373,9 @@ fn invoke_terminal_shell(
         temporary,
         process_scope_id,
         Some(&terminal_stdin),
+        &context.file_access,
     )?;
-    let result = (|| {
+    (|| {
         let mut command = CommandBuilder::new(&prepared_command.program);
         command.args(&prepared_command.arguments);
         apply_agent_terminal_environment(
@@ -523,6 +390,15 @@ fn invoke_terminal_shell(
         command.env("TMPDIR", temporary);
         command.env("TMP", temporary);
         command.env("TEMP", temporary);
+        if execution_scope == "workspace" {
+            let home = context.file_access.home.as_deref().unwrap_or(temporary);
+            fs::create_dir_all(home)
+                .map_err(|error| KernelError::Other(format!("Create Agent home: {error}")))?;
+            command.env("HOME", home);
+            command.env("XDG_CONFIG_HOME", home.join("config"));
+            command.env("XDG_CACHE_HOME", home.join("cache"));
+            command.env("GIT_OPTIONAL_LOCKS", "0");
+        }
 
         let archive = ShellOutputArchive::create(&context)?;
         let stdout_file = archive.open("stdout")?;
@@ -598,26 +474,9 @@ fn invoke_terminal_shell(
         let wait_result = write_result.and_then(|()| {
             wait_for_bounded_pty_child(
                 &mut child,
-                Duration::from_secs(timeout_seconds),
+                timeout_seconds.map(Duration::from_secs),
                 &context.cancellation,
             )
-        });
-        let wait_result = wait_result.and_then(|(status, timed_out, cancelled)| {
-            if cancelled {
-                Err(KernelError::Structured {
-                    code: "tool_execution_cancelled",
-                    stage: "execution",
-                    message: format!("{tool_name} was cancelled"),
-                    details: serde_json::json!({
-                        "toolId": tool_name,
-                        "workspaceMode": workspace_mode,
-                        "executionScope": execution_scope,
-                        "terminal": true,
-                    }),
-                })
-            } else {
-                Ok((status, timed_out))
-            }
         });
         let process_cleanup = child.terminate_and_wait().map(|_| ());
         #[cfg(windows)]
@@ -644,17 +503,22 @@ fn invoke_terminal_shell(
             Ok(stdout) => stdout,
             Err(error) => return shell_cleanup_failure(wait_result, error),
         };
-        let (status, timed_out) = wait_result?;
+        let (status, timed_out, cancelled) = wait_result?;
         stdout.truncated |= retain_tail_lines(&mut stdout.bytes, BASH_OUTPUT_LIMIT_LINES);
         trim_utf8_prefix(&mut stdout.bytes);
 
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let exit_code = i32::try_from(status.exit_code()).ok();
-        let success = !timed_out && status.success();
+        let success = !timed_out && !cancelled && status.success();
         let mut output = serde_json::json!({
             "workspaceId": workspace_id,
             "command": command_text,
             "cwd": ".",
+            "paths": {
+                "workspace": workspace_root,
+                "home": if execution_scope == "workspace" { context.file_access.home.clone().or_else(|| Some(temporary.to_path_buf())) } else { std::env::var_os("HOME").map(PathBuf::from) },
+                "scratch": temporary,
+            },
             "workspaceMode": workspace_mode,
             "executionScope": execution_scope,
             "terminal": true,
@@ -673,12 +537,19 @@ fn invoke_terminal_shell(
                 "terminal": true,
                 "pathSource": AGENT_SHELL_PATH_SOURCE,
                 "writeScope": write_scope,
-                "homeWritable": execution_scope == "host",
-                "networkAccess": execution_scope == "host"
+                "homeWritable": true,
+                "networkAccess": execution_scope == "host" || context.file_access.network_access
             }
         });
         archive.finish(&mut output)?;
-        if success {
+        if cancelled {
+            Ok(known_failure(
+                invocation_id,
+                output,
+                "tool_execution_cancelled",
+                format!("{tool_name} was cancelled"),
+            ))
+        } else if success {
             Ok(ok(invocation_id, output))
         } else if timed_out {
             Ok(known_failure(
@@ -689,7 +560,10 @@ fn invoke_terminal_shell(
                 } else {
                     "bash_timed_out"
                 },
-                format!("{tool_name} command exceeded the {timeout_seconds}-second timeout."),
+                format!(
+                    "{tool_name} command exceeded its {}-second timeout.",
+                    timeout_seconds.expect("timed out with a deadline")
+                ),
             ))
         } else {
             Ok(known_failure(
@@ -706,8 +580,7 @@ fn invoke_terminal_shell(
                 },
             ))
         }
-    })();
-    finish_shell_execution(result, prepared_command.finish())
+    })()
 }
 
 fn apply_agent_shell_environment(
@@ -760,13 +633,11 @@ fn apply_agent_terminal_environment(
     command.env("CLICOLOR", "0");
 }
 
-fn shell_write_scope(execution_scope: &str, workspace_mode: &str) -> &'static str {
+fn shell_write_scope(execution_scope: &str) -> &'static str {
     if execution_scope == "host" {
         AGENT_SHELL_HOST_WRITE_SCOPE
-    } else if workspace_mode == "write" {
-        AGENT_SHELL_WRITE_MODE_WRITE_SCOPE
     } else {
-        AGENT_SHELL_READ_MODE_WRITE_SCOPE
+        AGENT_SHELL_RESOURCE_WRITE_SCOPE
     }
 }
 
@@ -987,18 +858,6 @@ fn canonical_process_workspace_root(context: &KernelToolExecutionContext) -> Ker
 struct PreparedShellCommand {
     program: PathBuf,
     arguments: Vec<OsString>,
-    #[cfg(windows)]
-    _grants: Option<crate::workspace_sandbox::windows::WorkspaceGrants>,
-}
-
-impl PreparedShellCommand {
-    fn finish(&mut self) -> KernelResult<()> {
-        #[cfg(windows)]
-        if let Some(grants) = self._grants.as_mut() {
-            return grants.startup_result();
-        }
-        Ok(())
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1012,25 +871,18 @@ fn prepare_shell_command(
     temp: &Path,
     scope: &str,
     terminal_stdin: Option<&str>,
+    files: &crate::file_access::FileAccessScope,
 ) -> KernelResult<PreparedShellCommand> {
     if execution_scope == "host" {
         return Ok(PreparedShellCommand {
             program: shell.executable.clone(),
             arguments: args.iter().map(OsString::from).collect(),
-            #[cfg(windows)]
-            _grants: None,
         });
     }
     #[cfg(target_os = "macos")]
     {
         let _ = terminal_stdin;
-        let user_temporary = macos_user_temporary_directory()?;
-        macos_sandbox_path(&user_temporary, "OS user temporary directory")?;
         let mut arguments = vec![
-            OsString::from("-D"),
-            format!("WORKSPACE_ROOT={}", workspace_root.display()).into(),
-            OsString::from("-D"),
-            format!("USER_TEMP_DIR={}", user_temporary.display()).into(),
             OsString::from("-p"),
             macos_workspace_profile(
                 workspace_root,
@@ -1038,6 +890,7 @@ fn prepare_shell_command(
                 scope,
                 workspace_mode,
                 writable_targets,
+                files,
             )?
             .into(),
             shell.executable.as_os_str().into(),
@@ -1058,26 +911,24 @@ fn prepare_shell_command(
             workspace_mode,
             writable_targets,
             temp,
+            files,
         )?;
         Ok(PreparedShellCommand { program, arguments })
     }
     #[cfg(windows)]
     {
-        let grants = crate::workspace_sandbox::windows::WorkspaceGrants::prepare(
-            shell,
+        let _ = (
+            files,
             args,
-            workspace_root,
-            workspace_mode,
             writable_targets,
             temp,
             scope,
             terminal_stdin,
-        )?;
-        Ok(PreparedShellCommand {
-            program: grants.program.clone(),
-            arguments: grants.arguments.clone(),
-            _grants: Some(grants),
-        })
+            workspace_root,
+            workspace_mode,
+        );
+        return Err(crate::workspace_sandbox::unavailable(&shell.tool,
+            "Strict file read isolation is not available in this Windows backend. Select a supported execution environment, or explicitly request Host permission."));
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
@@ -1102,6 +953,7 @@ fn macos_workspace_profile(
     process_scope_id: &str,
     workspace_mode: &str,
     writable_targets: Option<&[WorkspaceWriteTarget]>,
+    files: &crate::file_access::FileAccessScope,
 ) -> KernelResult<String> {
     let escaped_workspace = macos_sandbox_path(workspace_root, "workspace")?;
     let escaped_temporary = macos_sandbox_path(temporary_root, "temporary directory")?;
@@ -1138,44 +990,75 @@ fn macos_workspace_profile(
             ))
         }
     };
-    let base = include_str!("macos_workspace.sbpl");
-    Ok(format!(
-        "{base}{workspace_write_rule}\n(allow file-write* (subpath \"{escaped_temporary}\"))\n(deny mach-lookup (global-name \"{process_scope_id}\"))"
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn macos_user_temporary_directory() -> KernelResult<PathBuf> {
-    // macOS mktemp uses confstr, even when an invocation supplies a private TMPDIR.
-    let length = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, std::ptr::null_mut(), 0) };
-    if length == 0 {
-        return Err(KernelError::Other(format!(
-            "read OS user temporary directory: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let mut buffer = vec![0_u8; length];
-    let written = unsafe {
-        libc::confstr(
-            libc::_CS_DARWIN_USER_TEMP_DIR,
-            buffer.as_mut_ptr().cast(),
-            length,
-        )
-    };
-    if written == 0 || written > buffer.len() {
-        return Err(KernelError::Other(
-            "OS user temporary directory is unavailable or changed while reading".into(),
+    let mut rules = String::new();
+    // Traversal may inspect ancestors, but grants no reads of their other children.
+    let ancestors: std::collections::BTreeSet<_> = files
+        .read
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(files.write.iter().map(|target| target.path.as_path()))
+        .chain(std::iter::once(temporary_root))
+        .flat_map(|path| path.ancestors().skip(1))
+        .collect();
+    for path in ancestors {
+        let escaped = macos_sandbox_path(path, "resource ancestor")?;
+        rules.push_str(&format!(
+            "\n(allow file-read-metadata (literal \"{escaped}\"))"
         ));
     }
-    let path = CStr::from_bytes_with_nul(&buffer[..written])
-        .map_err(|error| KernelError::Other(format!("read OS temporary path: {error}")))?
-        .to_str()
-        .map_err(|error| KernelError::Other(format!("decode OS temporary path: {error}")))?;
-    fs::canonicalize(path).map_err(|error| {
-        KernelError::Other(format!(
-            "resolve OS user temporary directory {path}: {error}"
-        ))
-    })
+    for path in &files.read {
+        let escaped = macos_sandbox_path(path, "read path")?;
+        let matcher = if path.is_dir() { "subpath" } else { "literal" };
+        rules.push_str(&format!("\n(allow file-read* ({matcher} \"{escaped}\"))"));
+    }
+    for target in &files.write {
+        let escaped = macos_sandbox_path(&target.path, "write path")?;
+        let matcher = if target.directory {
+            "subpath"
+        } else {
+            "literal"
+        };
+        rules.push_str(&format!(
+            "\n(allow file-read* file-write* ({matcher} \"{escaped}\"))"
+        ));
+    }
+    for path in &files.read_only {
+        let escaped = macos_sandbox_path(path, "read-only path")?;
+        let matcher = if path.is_dir() { "subpath" } else { "literal" };
+        let mut exceptions = String::new();
+        for grant in files
+            .write
+            .iter()
+            .filter(|grant| grant.path.starts_with(path))
+        {
+            let target = macos_sandbox_path(&grant.path, "approved write path")?;
+            let kind = if grant.directory {
+                "subpath"
+            } else {
+                "literal"
+            };
+            exceptions.push_str(&format!(" ({kind} \"{target}\")"));
+        }
+        let filter = if exceptions.is_empty() {
+            format!("({matcher} \"{escaped}\")")
+        } else {
+            format!(
+                "(require-all ({matcher} \"{escaped}\") (require-not (require-any{exceptions})))"
+            )
+        };
+        rules.push_str(&format!("\n(deny file-write* {filter})"));
+    }
+    let base = include_str!("macos_workspace.sbpl").replace(
+        "(deny network*)",
+        if files.network_access {
+            ""
+        } else {
+            "(deny network*)"
+        },
+    );
+    Ok(format!(
+        "{base}{workspace_write_rule}{rules}\n(allow file-read* file-write* (subpath \"{escaped_temporary}\"))\n(deny mach-lookup (global-name \"{process_scope_id}\"))"
+    ))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1268,24 +1151,44 @@ mod plan_scope_tests {
                 directory: true,
             },
         ];
-        let policy =
-            macos_workspace_profile(root, temporary, "scope-test", "write", Some(&targets))
-                .unwrap();
+        let policy = macos_workspace_profile(
+            root,
+            temporary,
+            "scope-test",
+            "write",
+            Some(&targets),
+            &crate::file_access::FileAccessScope::default(),
+        )
+        .unwrap();
         assert!(
             policy.contains("(allow file-write* (literal \"/fixture/workspace/src/main.cpp\"))")
         );
         assert!(policy.contains("(allow file-write* (subpath \"/fixture/workspace/build\"))"));
         assert!(!policy.contains("(allow file-write* (subpath \"/fixture/workspace\"))"));
-        let read =
-            macos_workspace_profile(root, temporary, "scope-test", "read", Some(&targets)).unwrap();
+        let read = macos_workspace_profile(
+            root,
+            temporary,
+            "scope-test",
+            "read",
+            Some(&targets),
+            &crate::file_access::FileAccessScope::default(),
+        )
+        .unwrap();
         assert!(
             !read.contains("/fixture/workspace"),
             "read mode cannot gain Plan write authority"
         );
-        assert!(read.contains("(allow file-write* (subpath \"/fixture/private-temp\"))"));
+        assert!(read.contains("(allow file-read* file-write* (subpath \"/fixture/private-temp\"))"));
         assert!(read.contains("(deny network*)"));
-        assert!(read.contains("(subpath (param \"USER_TEMP_DIR\"))"));
-        assert!(read.contains("(require-not (subpath (param \"WORKSPACE_ROOT\")))"));
+        assert!(read.contains("(deny file-read*)"));
+        assert!(read.contains("(allow file-read-data (literal \"/\"))"));
+        assert!(!read.contains("(allow file-read* (subpath \"/\"))"));
+        assert!(!read.contains("(allow file-read-metadata)"));
+        assert!(read.contains("(allow file-read-metadata (literal \"/fixture\"))"));
+        assert!(
+            !read.contains("USER_TEMP_DIR"),
+            "shared host temp is not an Agent resource"
+        );
     }
 }
 
@@ -1543,10 +1446,10 @@ fn join_output_reader(
 
 pub(super) fn wait_for_bounded_child(
     child: &mut Child,
-    timeout: Duration,
+    timeout: Option<Duration>,
     cancellation: &KernelCancellationToken,
 ) -> KernelResult<(ExitStatus, bool, bool)> {
-    let deadline = Instant::now() + timeout;
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
     loop {
         if let Some(status) = child
             .try_wait()
@@ -1557,7 +1460,7 @@ pub(super) fn wait_for_bounded_child(
         if cancellation.is_cancelled() {
             return terminate_child(child).map(|status| (status, false, true));
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return terminate_child(child).map(|status| (status, true, false));
         }
         thread::sleep(PROCESS_POLL_INTERVAL);
@@ -1566,10 +1469,10 @@ pub(super) fn wait_for_bounded_child(
 
 fn wait_for_bounded_pty_child(
     child: &mut PtyChildGuard,
-    timeout: Duration,
+    timeout: Option<Duration>,
     cancellation: &KernelCancellationToken,
 ) -> KernelResult<(portable_pty::ExitStatus, bool, bool)> {
-    let deadline = Instant::now() + timeout;
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
     loop {
         if let Some(status) = child
             .child
@@ -1583,7 +1486,7 @@ fn wait_for_bounded_pty_child(
                 .terminate_and_wait()
                 .map(|status| (status, false, true));
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return child
                 .terminate_and_wait()
                 .map(|status| (status, true, false));
@@ -1897,4 +1800,176 @@ unsafe extern "C" {
         filter_type: u32,
         ...
     ) -> i32;
+}
+
+/// Execute an already prepared CLI command. Kernel admission belongs to its caller.
+/// Plugins share the Shell runner's output, timeout and cancellation lifecycle.
+pub fn execute_cli_command(
+    invocation_id: String,
+    mut process: Command,
+    timeout_seconds: Option<u64>,
+    tool_name: &str,
+    context: &KernelToolExecutionContext,
+    process_scope_id: Option<&str>,
+) -> KernelResult<KernelToolExecutionResult> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = process_scope_id;
+    #[cfg(unix)]
+    process.process_group(0);
+    process
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let started = Instant::now();
+    let archive = ShellOutputArchive::create(&context)?;
+    let stdout_file = archive.open("stdout")?;
+    let stderr_file = archive.open("stderr")?;
+    let mut child = process.spawn().map_err(|error| {
+        KernelError::Other(format!(
+            "spawn {tool_name} in {}: {error}",
+            process.get_program().to_string_lossy()
+        ))
+    })?;
+    context.progress.started();
+    #[cfg(windows)]
+    let process_job = match windows_job::ProcessJob::attach(child.id()) {
+        Ok(job) => job,
+        Err(error) => {
+            return combine_shell_results(Err(error), terminate_child(&mut child))
+                .map(|(result, _)| result);
+        }
+    };
+    #[cfg(unix)]
+    let child_id = child.id();
+    #[cfg(target_os = "macos")]
+    let mut process_scope_guard =
+        process_scope_id.map(|scope| ProcessScopeGuard::new(child_id, scope.to_owned()));
+    #[allow(unused_mut)]
+    let mut stop_process = |child: &mut Child| {
+        let reaped = terminate_child(child).map(|_| ());
+        #[cfg(windows)]
+        let descendants = process_job.terminate();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let descendants = terminate_remaining_process_group(child_id);
+        #[cfg(target_os = "macos")]
+        let descendants = match process_scope_guard.as_mut() {
+            Some(guard) => guard.terminate(),
+            None => terminate_remaining_process_group(child_id),
+        };
+        #[cfg(not(any(unix, windows)))]
+        let descendants = Ok(());
+        combine_shell_results(reaped, descendants).map(|_| ())
+    };
+    let pipes = (|| {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| KernelError::Other("bash stdout pipe is unavailable".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| KernelError::Other("bash stderr pipe is unavailable".to_string()))?;
+        set_pipe_nonblocking(&stdout, "stdout")?;
+        set_pipe_nonblocking(&stderr, "stderr")?;
+        Ok((stdout, stderr))
+    })();
+    let (stdout, stderr) = match pipes {
+        Ok(pipes) => pipes,
+        Err(error) => {
+            return combine_shell_results(Err(error), stop_process(&mut child))
+                .map(|(result, ())| result)
+        }
+    };
+    let stop_capture = Arc::new(AtomicBool::new(false));
+    let stdout_reader = spawn_output_reader(
+        stdout,
+        stdout_file,
+        BASH_OUTPUT_LIMIT_BYTES,
+        Arc::clone(&stop_capture),
+        context.progress.clone(),
+        "stdout",
+        false,
+    );
+    let stderr_reader = spawn_output_reader(
+        stderr,
+        stderr_file,
+        BASH_OUTPUT_LIMIT_BYTES,
+        Arc::clone(&stop_capture),
+        context.progress.clone(),
+        "stderr",
+        false,
+    );
+
+    let wait_result = wait_for_bounded_child(
+        &mut child,
+        timeout_seconds.map(Duration::from_secs),
+        &context.cancellation,
+    );
+    let process_cleanup = stop_process(&mut child);
+    stop_capture.store(true, AtomicOrdering::Release);
+    if let Err(cleanup) = process_cleanup {
+        return shell_cleanup_failure(wait_result, cleanup);
+    }
+
+    let stdout_result = join_output_reader(stdout_reader, "stdout");
+    let stderr_result = join_output_reader(stderr_reader, "stderr");
+
+    let (mut stdout, mut stderr) = match combine_shell_results(stdout_result, stderr_result) {
+        Ok(streams) => streams,
+        Err(error) => return shell_cleanup_failure(wait_result, error),
+    };
+    let (status, timed_out, cancelled) = wait_result?;
+    bound_combined_output(&mut stdout, &mut stderr, BASH_OUTPUT_LIMIT_BYTES);
+    bound_output_lines(&mut stdout, &mut stderr);
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let captured_bytes = stdout.bytes.len().saturating_add(stderr.bytes.len());
+    let truncated = stdout.truncated || stderr.truncated;
+    let exit_code = status.code();
+    let success = !timed_out && !cancelled && status.success();
+
+    let mut output = serde_json::json!({
+        "stdout": String::from_utf8_lossy(&stdout.bytes),
+        "stderr": String::from_utf8_lossy(&stderr.bytes),
+        "exitCode": exit_code, "success": success, "timedOut": timed_out,
+        "truncated": truncated, "capturedBytes": captured_bytes, "durationMs": duration_ms,
+    });
+    archive.finish(&mut output)?;
+    if cancelled {
+        Ok(known_failure(
+            invocation_id,
+            output,
+            "tool_execution_cancelled",
+            format!("{tool_name} was cancelled"),
+        ))
+    } else if success {
+        Ok(ok(invocation_id, output))
+    } else if timed_out {
+        Ok(known_failure(
+            invocation_id,
+            output,
+            match tool_name {
+                "powershell" => "powershell_timed_out",
+                "bash" => "bash_timed_out",
+                _ => "process_timed_out",
+            },
+            format!(
+                "{tool_name} command exceeded its {}-second timeout.",
+                timeout_seconds.expect("timed out with a deadline")
+            ),
+        ))
+    } else {
+        Ok(known_failure(
+            invocation_id,
+            output,
+            match tool_name {
+                "powershell" => "powershell_exit_nonzero",
+                "bash" => "bash_exit_nonzero",
+                _ => "process_exit_nonzero",
+            },
+            match exit_code {
+                Some(code) => format!("{tool_name} command exited with status {code}."),
+                None => "Bash command terminated without an exit status.".to_string(),
+            },
+        ))
+    }
 }

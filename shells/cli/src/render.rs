@@ -326,7 +326,7 @@ impl CliRenderState {
         }
         if let Some(approval) = projection.pending_approval.as_ref() {
             render_approval(out, approval)?;
-            writeln!(out, "继续：输入 /reply 1 允许或 /reply 2 拒绝。")?;
+            writeln!(out, "继续：使用上面的 /reply 选项。")?;
         }
         out.flush()
     }
@@ -541,8 +541,21 @@ pub(crate) fn render_tool_activity(
         }
     }
     if let Some(tool) = activity.tool.as_ref() {
-        if let Some(error) = &tool.error {
+        for error in tool.error.iter().chain(&tool.projection_error) {
             writeln!(out, "  {}: {}", error.code, error.message)?;
+        }
+        if let Some(process) = &tool.process {
+            writeln!(out, "  $ {}", process.command)?;
+            if activity.status != "active" {
+                render_live_tool_output(out, &process.output, None)?;
+            }
+            if let Some(result) = &process.result {
+                writeln!(
+                    out,
+                    "  exit={:?} · {} ms · timedOut={}",
+                    result.exit_code, result.duration_ms, result.timed_out
+                )?;
+            }
         }
         if let Some(shell) = tool.shell.as_ref() {
             writeln!(out, "  $ {}", shell.command)?;
@@ -748,6 +761,35 @@ pub(crate) fn render_approval(
     if approval.preview.authorization_scope.as_deref() == Some("sessionBrowser") {
         writeln!(out, "允许后，当前对话内的浏览器页面操作无需重复确认。")?;
     }
+    if let Some(review) = approval.preview.review.as_ref() {
+        if let Some(reason) = review.get("reason").and_then(serde_json::Value::as_str) {
+            writeln!(out, "审查结果：{reason}")?;
+        }
+    }
+    writeln!(out, "/reply 1 允许一次 · /reply 2 拒绝")?;
+    for (scope, input) in deepcode_kernel_client::AUTHORIZATION_OPTIONS {
+        if approval
+            .preview
+            .authorization_scopes
+            .as_ref()
+            .is_some_and(|scopes| scopes.iter().any(|value| value == scope))
+        {
+            writeln!(
+                out,
+                "/reply {input} {}",
+                crate::i18n::Language::ZhCn.text(&format!("agent.permission.scope.{scope}"))
+            )?;
+        }
+    }
+    if let Some(files) = &approval.preview.file_access {
+        for access in ["read", "write"] {
+            if let Some(paths) = files[access].as_array() {
+                for path in paths {
+                    writeln!(out, "  {}: {}", access, path.as_str().unwrap_or(""))?;
+                }
+            }
+        }
+    }
     for target in &approval.preview.logical_targets {
         writeln!(out, "  - {target}")?;
     }
@@ -850,7 +892,7 @@ mod tests {
 
     fn projection() -> SessionProjection {
         serde_json::from_value(json!({
-            "schemaVersion": deepcode_kernel_client::SESSION_PROJECTION_VERSION,
+            "schemaVersion": deepcode_kernel_client::SESSION_PROJECTION_VERSION, "permissionOverrides":{}, "effectivePermissions":null, "shellAuthorizations":[],
             "sessionId": "session:test", "revision": 1,
             "display": {"creationTitle":"CLI display"},
             "workspaceBindings": [], "sessionDirectoryIndexes": [],
@@ -943,12 +985,14 @@ mod tests {
         state.render(&mut out, &p).unwrap();
         let activity = serde_json::from_value(json!({"activityId":"tool:error", "kind":"tool", "status":"failed",
             "label":"fs.read", "runId":"run:test", "callId":"call:error", "sequence":2,
-            "tool":{"operation":"fs.read", "resources":[], "error":{"code":"fs_read_failed", "message":"original failure"}}})).unwrap();
+            "tool":{"operation":"fs.read", "resources":[], "error":{"code":"fs_read_failed", "message":"original failure"},
+                "projectionError":{"code":"tool_error_diagnostics_invalid", "message":"Original record retained."}}})).unwrap();
         render_tool_activity(&mut out, &p, &activity).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text.matches("已排队: 补充🙂").count(), 1);
         assert_eq!(text.matches("未执行: 补充🙂").count(), 1);
         assert!(text.contains("fs_read_failed: original failure"));
+        assert!(text.contains("tool_error_diagnostics_invalid: Original record retained."));
     }
 
     #[test]
@@ -1034,7 +1078,7 @@ mod tests {
                     "timedOut":false, "truncated":false, "capturedBytes":13, "durationMs":100,
                     "environment":{"shell":"/bin/bash", "interactive":false, "executionScope":"workspace",
                         "terminal":false, "pathSource":"hostPlusStandardDeveloperPaths",
-                        "writeScope":"workspaceAndKernelTemporary", "homeWritable":false, "networkAccess":false}}}
+                        "writeScope":"authorizedResources", "homeWritable":true, "networkAccess":false}}}
         })).unwrap());
         state.render(&mut out, &p).unwrap();
         state.render(&mut out, &p).unwrap();

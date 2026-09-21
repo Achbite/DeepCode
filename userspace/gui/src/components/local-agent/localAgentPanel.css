@@ -503,10 +503,6 @@
   color: var(--dc-accent);
 }
 
-.local-agent .local-agent__message-actions button:focus-visible {
-  outline-offset: 1px;
-}
-
 .local-agent__message-actions svg {
   width: 15px;
   height: 15px;
@@ -794,6 +790,9 @@
 .local-agent__tool-entry-details {
   display: grid;
   min-width: 0;
+  max-height: min(420px, 50vh);
+  overflow: auto;
+  overscroll-behavior-y: contain;
   gap: 7px;
   margin: 1px 4px 5px 6px;
   padding: 5px 7px 7px 10px;
@@ -893,10 +892,7 @@
 }
 
 .local-agent__shell-result pre {
-  max-height: 220px;
   margin: 0;
-  overflow: auto;
-  overscroll-behavior-y: auto;
   padding: 7px 8px;
   border: 1px solid var(--dc-border);
   border-radius: 6px;
@@ -904,6 +900,7 @@
   color: var(--dc-foreground);
   font: var(--dc-font-micro)/1.5 var(--dc-font-mono);
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .local-agent__terminal-error {
@@ -1256,12 +1253,6 @@
   overscroll-behavior: contain;
 }
 
-:root[data-product='deepcode-gui'] .local-agent__interaction-document-scroll:focus-visible {
-  outline: 2px solid var(--dc-focus-ring);
-  outline-offset: -3px;
-  border-radius: 16px 16px 4px 4px;
-}
-
 .local-agent__interaction-option-description {
   position: absolute;
   width: 1px;
@@ -1418,7 +1409,7 @@
   :is(.local-agent__plan-card, .local-agent__interaction-panel, .local-agent__decision)
   :is(button, summary):focus-visible {
   background: var(--dc-surface-hover);
-  box-shadow: inset 0 0 0 1px var(--dc-border-strong);
+  box-shadow: none;
 }
 
 .local-agent .local-agent__interaction-secondary {
@@ -1448,8 +1439,8 @@
 .local-agent__decision-controls { display: flex; flex-direction: column; gap: 12px; padding-top: 12px; }
 .local-agent__decision-scope { align-self: flex-start; max-width: 100%; }
 .local-agent__decision-actions { width: 100%; flex-wrap: wrap; }
-.local-agent__decision-actions--run .local-agent__decision-run { margin-inline-end: auto; }
-.local-agent .local-agent__decision-actions--run :is(.local-agent__decision-run, .local-agent__decision-allow) {
+.local-agent__decision-session { margin-inline-end: auto; }
+.local-agent .local-agent__decision-actions :is(.local-agent__decision-session, .local-agent__decision-allow) {
   min-width: 110px; justify-content: center;
 }
 
@@ -1464,7 +1455,7 @@
 :root[data-product='deepcode-gui'] .local-agent .local-agent__decision-actions .local-agent__decision-allow:focus-visible {
   background: var(--dc-foreground-strong);
   color: var(--dc-surface);
-  box-shadow: 0 0 0 2px var(--dc-surface), 0 0 0 3px var(--dc-muted);
+  box-shadow: none;
 }
 
 .local-agent button,
@@ -1520,35 +1511,12 @@
   border-radius: 18px;
   background: var(--dc-surface-raised);
   box-shadow: var(--dc-shadow-panel);
-  transform-origin: center bottom;
-  transition: transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease;
 }
 
-.local-agent__composer:focus-within {
-  outline: none;
-  box-shadow: var(--dc-shadow-panel);
-  transform: translateY(-1px);
-}
-
-.local-agent__composer--approval:focus-within {
-  transform: none;
-}
-
-.local-agent__composer--approval,
-.local-agent__composer--approval:focus-within {
+.local-agent__composer--approval {
   border-color: var(--dc-border);
   border-radius: 22px;
   box-shadow: none;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .local-agent__composer {
-    transition: none;
-  }
-
-  .local-agent__composer:focus-within {
-    transform: none;
-  }
 }
 
 .local-agent__composer textarea {
@@ -1985,52 +1953,27 @@
   color: var(--dc-muted);
 }
 
-.local-agent__permission-menu {
-  position: absolute;
-  bottom: 36px;
-  left: 0;
-  z-index: 5;
-  display: grid;
-  width: 220px;
-  gap: 9px;
-  padding: 11px;
-  border: 1px solid var(--dc-border);
-  border-radius: 12px;
-  background: var(--dc-surface-raised);
-  box-shadow: var(--dc-shadow-panel);
-}
-
-.local-agent__permission-menu label {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 86px;
-  align-items: center;
-  gap: 8px;
-  color: var(--dc-muted);
-  font-size: var(--dc-font-caption);
-}
-
-.local-agent__permission-invariant {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  color: var(--dc-muted);
-  font-size: var(--dc-font-caption);
-}
-
-.local-agent__permission-invariant strong {
-  color: var(--dc-foreground);
-  font-size: var(--dc-font-micro);
-  font-weight: var(--dc-weight-medium);
-}
-
-.local-agent__permission-menu select {
-  height: 29px;
-  border: 1px solid var(--dc-border);
-  border-radius: 8px;
-  background: var(--dc-surface);
-  color: var(--dc-foreground);
-}
+.local-agent__permission-menu { position: fixed; z-index: 1000; width: min(380px, calc(100vw - 24px)); box-sizing: border-box; padding: 9px; overflow-y: auto; overscroll-behavior: contain; border: 1px solid var(--dc-border); border-radius: 14px; background: var(--dc-surface-raised); color: var(--dc-foreground); box-shadow: var(--dc-shadow-panel); }
+.local-agent__permission-menu button { cursor: pointer; color: inherit; font: inherit; border: 0; background: transparent; border-radius: 7px; }
+.local-agent__permission-menu button:is(:hover, :focus-visible) { background: var(--dc-surface-hover); }
+.local-agent__permission-heading { display: flex; align-items: center; gap: 8px; padding: 7px 8px 12px; font-size: var(--dc-font-caption); }
+.local-agent__permission-heading button { display: grid; place-items: center; width: 28px; height: 28px; }
+.local-agent__permission-heading button:last-child { margin-left: auto; }
+.local-agent__permission-row, .local-agent__permission-invariant { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; padding: 12px 10px; font-size: var(--dc-font-caption); text-align: left; line-height: 1.5; }
+.local-agent__permission-row > span:last-child { display: flex; align-items: center; gap: 8px; text-align: right; }
+.local-agent__permission-row svg { flex: none; width: 13px; }
+.local-agent__permission-invariant { color: var(--dc-muted); border-bottom: 1px solid var(--dc-border); }
+.local-agent__permission-invariant strong { font-size: inherit; font-weight: var(--dc-weight-medium); }
+.local-agent__permission-option { display: flex; align-items: flex-start; gap: 11px; width: 100%; padding: 13px 12px; text-align: left; }
+.local-agent__permission-option[aria-checked=true] { background: var(--dc-surface-hover); }
+.local-agent__permission-option small { display: block; margin-top: 5px; color: var(--dc-muted); font-size: var(--dc-font-caption); line-height: 1.6; }
+.local-agent__permission-radio { width: 16px; height: 16px; flex: none; margin-top: 2px; border: 1px solid var(--dc-border-strong); border-radius: 50%; box-sizing: border-box; }
+.local-agent__permission-option[aria-checked=true] .local-agent__permission-radio { border: 5px solid var(--dc-muted); }
+.local-agent__permission-grants { display: grid; gap: 12px; margin: 4px 10px; font-size: var(--dc-font-caption); }
+.local-agent__permission-grants > div { display: flex; align-items: flex-start; gap: 12px; }
+.local-agent__permission-grants span { min-width: 0; flex: 1; overflow-wrap: anywhere; white-space: pre-wrap; }
+.local-agent__permission-grants button { flex: none; }
+.local-agent__permission-grants b, .local-agent__permission-grants > div > span > span { display: block; margin-bottom: 4px; }
 
 .local-agent--workbench .local-agent__transcript {
   width: min(820px, calc(100% - 48px));
@@ -2117,12 +2060,6 @@
   border-color: var(--dc-border);
   border-radius: 22px;
   box-shadow: none;
-}
-
-.local-agent__composer--plan:focus-within,
-.local-agent__composer--interaction:focus-within {
-  box-shadow: none;
-  transform: none;
 }
 
 .local-agent__composer > .local-agent__interaction-panel,
@@ -2328,3 +2265,9 @@
 .local-agent__annotation-edit strong, .local-agent__annotation-edit small { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: var(--dc-font-caption); line-height: 1.4; }
 .local-agent__annotation-edit small { color: var(--dc-muted); }
 .local-agent__browser-annotation > button:last-child { flex: none; min-height: 20px; padding: 2px; border: 0; color: var(--dc-muted); background: transparent; }
+
+.local-agent__permission-save-rule { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+
+.local-agent__file-access { margin: 0; min-width: 0; }
+.local-agent__file-access dd { margin: 0.3rem 0 0.65rem; }
+.local-agent__file-access code, .local-agent__permission-grants code { display: block; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }

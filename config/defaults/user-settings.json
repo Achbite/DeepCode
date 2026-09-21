@@ -6,7 +6,9 @@
   "agent.permissions.engineeringDecisions": "ask",
   "agent.permissions.networkRead": "allow",
   "agent.permissions.external": "ask",
-  "agent.permissions.commandDenylist": ["rm -rf /"],
+  "agent.permissions.commandDenylist": [
+    "rm -rf /"
+  ],
   "agent.web.search.endpointTemplate": "",
   "agent.web.search.authHeaderName": "Authorization",
   "agent.web.search.authSecretRef": "",
@@ -19,5 +21,9 @@
   "agent.environmentRevision": 0,
   "agent.projectEnvironments": "{}",
   "plugins.sources": "[]",
-  "plugins.disabled": "[]"
+  "plugins.disabled": "[]",
+  "agent.permissions.shell": "ask",
+  "agent.permissions.shellAccess": "workspace",
+  "agent.permissions.runtimeReadRoots": [],
+  "agent.permissions.commandRules": "[]"
 }

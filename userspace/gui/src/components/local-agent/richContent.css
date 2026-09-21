@@ -89,7 +89,7 @@ details:not([open]) > summary > .conversation-disclosure-chevron, .conversation-
 .local-agent__tool-entry-icon { width: 16px; height: 16px; flex: 0 0 16px; color: var(--dc-muted); }
 .local-agent__tool-entry-icon svg { width: 100%; height: 100%; }
 .local-agent__tool-entry-details dd { min-width: 0; }
-.local-agent__tool-entry-details code { display: block; max-height: 280px; overflow: auto; overscroll-behavior-y: auto; }
+.local-agent__tool-entry-details code { display: block; }
 .conversation-plan-preview { margin: 8px 0; }
 
 .conversation-changes { position: relative; margin: 16px 0; border: 1px solid var(--dc-border); border-radius: 14px; background: var(--dc-surface); min-width: 0; }
@@ -111,29 +111,7 @@ details:not([open]) > summary > .conversation-disclosure-chevron, .conversation-
 .conversation-changes--compact .conversation-change-list { display: none; position: absolute; left: 0; top: 100%; z-index: 12; width: min(440px, 65vw); max-height: 240px; overflow: auto; background: var(--dc-surface); border: 1px solid var(--dc-border); border-radius: 10px; box-shadow: 0 6px 20px color-mix(in srgb, var(--dc-shadow-color) 13.33%, transparent); }
 .conversation-changes--compact:hover .conversation-change-list, .conversation-changes--compact:focus-within .conversation-change-list, .conversation-changes--compact.is-expanded .conversation-change-list { display: block; }
 .local-agent__tool-entry-details .conversation-changes--compact .conversation-change-list { position: static; max-width: 100%; }
-.conversation-diff-overlay {
-  position: fixed;
-  z-index: 1000;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  padding: 24px;
-  background: color-mix(in srgb, var(--dc-background) 54%, transparent);
-  backdrop-filter: blur(3px);
-}
-.conversation-diff-dialog { display: flex; flex-direction: column; width: min(1040px, calc(100vw - 48px)); height: min(740px, 82vh); min-height: 200px; overflow: hidden; background: var(--dc-surface); color: var(--dc-foreground); border: 1px solid var(--dc-border); border-radius: 14px; box-shadow: 0 16px 56px color-mix(in srgb, var(--dc-shadow-color) 20.00%, transparent); }
-.conversation-diff-header { display: flex; align-items: center; gap: 12px; min-height: 54px; padding: 10px 14px; border-bottom: 1px solid var(--dc-border); flex: none; box-sizing: border-box; }
-.conversation-diff-header > svg { width: 17px; height: 17px; flex: none; color: var(--dc-muted); }
-.conversation-diff-title { flex: 1; min-width: 0; }
-.conversation-diff-path { display: flex; min-width: 0; font-size: calc(13px * var(--dc-ui-font-scale, 1)); line-height: 1.5; white-space: nowrap; }
-.conversation-diff-path > span { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--dc-muted); }
-.conversation-diff-path > strong { flex: 0 0 auto; max-width: 100%; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
-.conversation-diff-header small { display: block; font-size: calc(11px * var(--dc-ui-font-scale, 1)); color: var(--dc-muted); margin-top: 3px; }
-.conversation-diff-close { box-sizing: border-box; display: grid; place-items: center; width: 30px; height: 30px; flex: 0 0 30px; padding: 6px; border: 0; border-radius: 7px; color: var(--dc-muted); background: transparent; cursor: pointer; }
-.conversation-diff-close:hover { background: var(--dc-surface-hover); }
-.conversation-diff-close svg { width: 18px; height: 18px; }
 .conversation-diff-editor { flex: 1; min-height: 0; }
-.conversation-diff-dialog > [role='alert'] { padding: 8px 16px; overflow: auto; }
 
 /* A fixed composer slot owns the live capsule; transcript growth cannot move it. */
 .conversation-change-dock { display: flex; align-items: center; justify-content: center; height: 40px; flex: none; position: relative; z-index: 5; width: min(760px, 100%); margin-inline: auto; }
