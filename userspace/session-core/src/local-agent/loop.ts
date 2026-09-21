@@ -1,3 +1,7 @@
+import { isShellAuthorizationScope } from '@deepcode/protocol';
+import { permissionSettings } from '@deepcode/protocol';
+import { permissionInstructionText } from './skillPlugins.js';
+import { prepareApprovalReview, decodeApprovalReview } from './approvalReview.js';
 import { withProviderAttempts } from './providerAttempts.js';
 import type {
   AssistantDraftBlockProjection,
@@ -53,7 +57,7 @@ import { recoverSession, type SessionState } from './reducer.js';
 import { activeConversationEvents } from './conversationHistory.js';
 import { providerTextStreamId } from './streamIdentity.js';
 import { PlanPreviewBuffer } from './planPreview.js';
-import { publishPlan } from './planStage.js';
+import { publishPlan, confirmationFacts } from './planStage.js';
 import { todoUpdateFact } from './todoState.js';
 import {
   decodeSessionControlCall,
@@ -98,6 +102,7 @@ export type LoopResult =
 
 export interface AgentLoopDeps {
   composition: AgentComposition;
+  readSnapshot(): Promise<LoopSnapshot>;
   commit(event: NewSessionEvent | readonly NewSessionEvent[] | ((current: LoopSnapshot) => readonly NewSessionEvent[])): Promise<LoopSnapshot>;
   takeQueuedInputs(runId: string): Promise<LoopSnapshot>;
   updateAssistantDraft(draft: AssistantDraftProjection | null): void;
@@ -118,7 +123,7 @@ type ProviderTurnCommon = {
 
 interface ProviderTurnCompletion {
   providerRequestId: string;
-  purpose: 'agent' | 'contextCompaction';
+  purpose: 'agent' | 'contextCompaction' | 'approvalReview';
   providerRuntimeRef: string;
   orderedCallIds: string[];
   reasoningContent?: string;
@@ -299,8 +304,9 @@ export async function runAgentLoop(
 
     if (command.type === 'cancel') return await cancelRun(snapshot, command, deps, commit);
 
-    while (true) {
+    nextTurn: while (true) {
       throwIfAborted(signal);
+      snapshot = await deps.readSnapshot();
       const pendingCompaction = pendingContextCompaction(snapshot.events, runId);
       if (pendingCompaction) {
         await performContextCompaction(snapshot, pendingCompaction, runId, deps, signal, commit);
@@ -308,11 +314,9 @@ export async function runAgentLoop(
       }
       const pending = pendingToolRequests(snapshot.events, runId);
       for (const requestEvent of pending) {
+        snapshot = await deps.readSnapshot();
         const runtime = runtimeForToolRequest(snapshot, requestEvent);
         const approval = latestApproval(snapshot.events, runId, requestEvent.callId);
-        if (approval.requested && !approval.resolved) {
-          return { status: 'waiting', runId, reason: 'approval', callId: requestEvent.callId };
-        }
         const existing = await deps.composition.kernel.readRecord(requestEvent.callId);
         if (existing) {
           await commitToolRecord(
@@ -365,25 +369,45 @@ export async function runAgentLoop(
           continue;
         }
         if (reply.status === 'approvalRequired') {
-          if (approval.resolved) {
-            throw new LoopFailure('kernel_approval_not_honored', 'Kernel 未接受已持久化的用户决策。');
+          const approvalId = deps.nextId('approval');
+          await commit({ type: 'approval.requested', sessionId: snapshot.state.sessionId, runId,
+            callId: requestEvent.callId, payload: { approvalId, preview: reply.preview } });
+          if (reply.preview.approvalReviewer === 'agent'
+            && runRuntimeSnapshot(snapshot, runId).permissions['agent.permissions.shell'] === 'review') {
+            const scope = reply.preview.authorizationScope;
+            const reviewScope = isShellAuthorizationScope(scope) && reply.preview.authorizationScopes?.includes(scope) ? scope : undefined;
+            const baseline = JSON.stringify(snapshot.state.permissionOverrides);
+            const review = prepareApprovalReview(snapshot, runRuntimeSnapshot(snapshot, runId), snapshot.state.pendingApproval!, deps.nextId('provider-request'));
+            await commit({ type: 'context.composed', sessionId: snapshot.state.sessionId, runId, payload: review.receipt });
+            let verdict: ReturnType<typeof decodeApprovalReview>;
+            try {
+              const result = await consumeTextProvider(review.request, deps, signal);
+              await commit([providerTurnSettledEvent(snapshot.state.sessionId, runId, result.completion),
+                ...(result.contextUsage ? [{ type: 'context.updated' as const, sessionId: snapshot.state.sessionId, runId, payload: result.contextUsage }] : [])]);
+              verdict = decodeApprovalReview(result.summary);
+            } catch (error) {
+              if (signal.aborted) throw error;
+              const fact = errorFact(error);
+              if (!snapshot.state.providerTurns[review.request.requestId]) await commit({ type: 'provider.turn.settled',
+                sessionId: snapshot.state.sessionId, runId, payload: { providerRequestId: review.request.requestId,
+                  purpose: 'approvalReview', providerRuntimeRef: review.request.providerRuntimeRef, outcome: 'failed', error: fact } });
+              verdict = { decision: 'ask', reason: `自动审查未完成：${fact.code}：${fact.message}` };
+            }
+            await commit(current => {
+              const changed = JSON.stringify(current.state.permissionOverrides) !== baseline;
+              const decision = changed ? { decision: 'ask' as const, reason: '审查期间权限设置已更改，正在重新检查。' } : verdict;
+              const events: NewSessionEvent[] = [{ type: 'approval.reviewed', sessionId: current.state.sessionId, runId,
+                callId: requestEvent.callId, payload: { approvalId, providerRequestId: review.request.requestId, ...decision } }];
+              if (decision.decision !== 'ask') events.push({ type: 'approval.resolved', sessionId: current.state.sessionId, runId,
+                callId: requestEvent.callId, payload: { approvalId, commandId: deps.nextId('agent-decision'),
+                  authorityId: deps.nextId('authority'), decision: decision.decision, source: 'agent', reason: decision.reason,
+                  ...(decision.decision === 'allow' && reviewScope ? { authorizationScope: reviewScope } : {}) } });
+              return events;
+            });
+            if (JSON.stringify(snapshot.state.permissionOverrides) !== baseline || !snapshot.state.pendingApproval) continue nextTurn;
           }
-          const approvalId = reply.approvalId || deps.nextId('approval');
-          await commit([
-            {
-              type: 'approval.requested',
-              sessionId: snapshot.state.sessionId,
-              runId,
-              callId: requestEvent.callId,
-              payload: { approvalId, preview: reply.preview },
-            },
-            {
-              type: 'run.waiting',
-              sessionId: snapshot.state.sessionId,
-              runId,
-              payload: { reason: 'approval', detail: reply.preview.summary },
-            },
-          ]);
+          await commit({ type: 'run.waiting', sessionId: snapshot.state.sessionId, runId,
+            payload: { reason: 'approval', detail: reply.preview.summary } });
           return { status: 'waiting', runId, reason: 'approval', callId: requestEvent.callId };
         }
         await commitToolRecord(
@@ -555,15 +579,13 @@ export async function runAgentLoop(
             ...orderedProviderCallFacts(turn.completion, [...providerCallFacts, fact]),
             providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
             ...completionDerivedFacts,
-            ...(fact.type === 'plan.published' ? [{
-              type: 'run.waiting' as const,
-              sessionId: snapshot.state.sessionId,
-              runId,
-              payload: { reason: 'plan' as const, detail: fact.payload.title },
-            }] : []),
           ]);
           if (fact.type !== 'plan.published') break;
-          return { status: 'waiting', runId, reason: 'plan', planId: fact.payload.planId };
+          await commit(current => runRuntimeSnapshot(current, runId).permissions['agent.permissions.workspaceMutation'] === 'allow'
+            ? confirmationFacts(current.state, current.state.pendingPlan!, deps.nextId('agent-decision'), 'agent', deps.nextId)
+            : [{ type: 'run.waiting', sessionId: current.state.sessionId, runId, payload: { reason: 'plan', detail: fact.payload.title } }]);
+          if (snapshot.state.pendingPlan) return { status: 'waiting', runId, reason: 'plan', planId: fact.payload.planId };
+          break;
         }
         case 'answer': {
           const messageId = turn.messageId ?? deps.nextId('message');
@@ -751,7 +773,7 @@ async function performContextCompaction(
     runId,
     payload: prepared.receipt,
   });
-  const compacted = await consumeCompactionProvider(prepared.request, deps, signal);
+  const compacted = await consumeTextProvider(prepared.request, deps, signal);
   const facts: NewSessionEvent[] = [providerTurnSettledEvent(
     snapshot.state.sessionId,
     runId,
@@ -780,13 +802,13 @@ async function performContextCompaction(
   await commit(facts);
 }
 
-async function consumeCompactionProvider(request: ProviderRequest, deps: AgentLoopDeps, signal: AbortSignal) {
+async function consumeTextProvider(request: ProviderRequest, deps: AgentLoopDeps, signal: AbortSignal) {
   return withProviderAttempts(request, deps, signal, (attempt, onCompleted) => (
-    consumeCompactionAttempt(attempt, deps, signal, onCompleted)
+    consumeTextAttempt(attempt, deps, signal, onCompleted)
   ));
 }
 
-async function consumeCompactionAttempt(
+async function consumeTextAttempt(
   request: ProviderRequest,
   deps: AgentLoopDeps,
   signal: AbortSignal,
@@ -810,7 +832,7 @@ async function consumeCompactionAttempt(
     if (completed) {
       throw new LoopFailure(
         'provider_event_after_completion',
-        'Provider 在 completed 之后继续发送压缩事件。',
+        'Provider 在 completed 之后继续发送文本事件。',
       );
     }
     activity.observe(event);
@@ -827,19 +849,19 @@ async function consumeCompactionAttempt(
         ) {
           throw new LoopFailure(
             'provider_output_item_order_invalid',
-            '上下文压缩 output item 没有按原生 output_index 递增返回。',
+            '文本决策请求 output item 没有按原生 output_index 递增返回。',
           );
         }
         if (event.data.item.type === 'function_call') {
           throw new LoopFailure(
             'context_compaction_tool_call_invalid',
-            '上下文压缩请求不能调用工具或 Session control。',
+            '文本决策请求请求不能调用工具或 Session control。',
           );
         }
         if (event.data.item.type === 'web_search_call') {
           throw new LoopFailure(
             'context_compaction_hosted_tool_invalid',
-            '上下文压缩请求不能调用 Provider hosted search。',
+            '文本决策请求请求不能调用 Provider hosted search。',
           );
         }
         orderedOutputItems.push({
@@ -851,7 +873,7 @@ async function consumeCompactionAttempt(
         if (completeMessage !== undefined) {
           throw new LoopFailure(
             'provider_message_duplicate',
-            '上下文压缩返回了多个最终消息。',
+            '文本决策请求返回了多个最终消息。',
           );
         }
         completeMessage = event.data;
@@ -859,12 +881,12 @@ async function consumeCompactionAttempt(
       case 'tool.call':
         throw new LoopFailure(
           'context_compaction_tool_call_invalid',
-          '上下文压缩请求不能调用工具或 Session control。',
+          '文本决策请求请求不能调用工具或 Session control。',
         );
       case 'hosted.web-search.completed':
         throw new LoopFailure(
           'context_compaction_hosted_tool_invalid',
-          '上下文压缩请求不能调用 Provider hosted search。',
+          '文本决策请求请求不能调用 Provider hosted search。',
         );
       case 'completed':
         completed = true;
@@ -876,16 +898,16 @@ async function consumeCompactionAttempt(
     }
   }
   if (!completed) {
-    throw new LoopFailure('provider_stream_incomplete', '上下文压缩 Provider 流未产生完成事件。');
+    throw new LoopFailure('provider_stream_incomplete', '文本决策请求 Provider 流未产生完成事件。');
   }
   if (orderedOutputItems.length > 0 && completeMessage !== undefined) {
     throw new LoopFailure(
       'provider_output_contract_mixed',
-      '上下文压缩同一 turn 混用了有序 output item 与聚合完成事件。',
+      '文本决策请求同一 turn 混用了有序 output item 与聚合完成事件。',
     );
   }
   if (completeMessage !== undefined && deltas && completeMessage.content !== deltas) {
-    throw new LoopFailure('provider_message_mismatch', '上下文压缩最终消息与流式文本不一致。');
+    throw new LoopFailure('provider_message_mismatch', '文本决策请求最终消息与流式文本不一致。');
   }
   const orderedMessages = orderedOutputItems.flatMap((output) => (
     output.item.type === 'message'
@@ -895,25 +917,25 @@ async function consumeCompactionAttempt(
   if (orderedMessages.length > 1) {
     throw new LoopFailure(
       'context_compaction_message_count_invalid',
-      '上下文压缩必须只产生一个最终消息。',
+      '文本决策请求必须只产生一个最终消息。',
     );
   }
   const orderedSummary = orderedMessages[0];
   if (orderedSummary !== undefined && deltas && orderedSummary !== deltas) {
     throw new LoopFailure(
       'provider_output_text_mismatch',
-      '上下文压缩有序 message item 与流式文本不一致。',
+      '文本决策请求有序 message item 与流式文本不一致。',
     );
   }
   const summary = (orderedSummary ?? completeMessage?.content ?? deltas).trim();
   if (!summary) {
-    throw new LoopFailure('context_compaction_empty', '上下文压缩没有产生摘要。');
+    throw new LoopFailure('context_compaction_empty', '文本决策请求没有产生结果。');
   }
   return {
     summary,
     completion: {
       providerRequestId: request.requestId,
-      purpose: 'contextCompaction',
+      purpose: request.purpose,
       providerRuntimeRef: request.providerRuntimeRef,
       orderedCallIds: [],
       ...(completeMessage?.reasoningContent !== undefined
@@ -2089,6 +2111,7 @@ function latestApproval(
   for (const event of events) {
     if (event.type === 'approval.requested' && event.runId === runId && event.callId === callId) {
       result.requested = event;
+      delete result.resolved;
     }
     if (event.type === 'approval.resolved' && event.runId === runId && event.callId === callId) {
       result.resolved = event;
@@ -2175,7 +2198,12 @@ export function uncompletedProviderComposition(
 function runRuntimeSnapshot(snapshot: LoopSnapshot, runId: string): RunRuntimeSnapshot {
   const runtime = snapshot.state.runRuntimeSnapshots[runId];
   if (!runtime) throw new LoopFailure('run_runtime_snapshot_missing', '当前 run 缺少运行时快照。');
-  return { ...runtime, ...snapshot.state.runToolViews[runId] };
+  const view = { ...runtime, ...snapshot.state.runToolViews[runId] };
+  const permissions = permissionSettings({ ...runtime.permissions, ...snapshot.state.permissionOverrides });
+  return { ...view, permissions, instructions: view.instructions.map(instruction => instruction.id === 'deepcode.workspace-autonomy'
+    ? { ...instruction, text: permissionInstructionText(permissions,
+      view.providerToolAliases.find(alias => alias.canonicalName === SESSION_CONTROL_INTERACTION_REQUEST)?.wireName,
+      view.providerToolAliases.find(alias => alias.canonicalName === SESSION_CONTROL_PLAN_PUBLISH)?.wireName) } : instruction) };
 }
 
 function runtimeForToolRequest(snapshot: LoopSnapshot, request: Extract<SessionEvent, { type: 'tool.requested' }>): RunRuntimeSnapshot {

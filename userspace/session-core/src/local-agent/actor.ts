@@ -1,3 +1,5 @@
+import { validatePermissionPatches } from '@deepcode/protocol';
+import { confirmationFacts } from './planStage.js';
 import { admitSessionEvents } from './admission.js';
 import { failureSnapshotEvent } from './failureSnapshot.js';
 import { errorFact } from './loopFailure.js';
@@ -164,6 +166,10 @@ export class SessionActor {
     }
 
     switch (command.type) {
+      case 'session.permissions.set':
+        return await this.handlePermissions(command);
+      case 'approval.revoke':
+        return await this.handleRevoke(command);
       case 'session.model-settings.set':
         return await this.handleModelSettings(command);
       case 'session.directory-index.attach':
@@ -187,6 +193,38 @@ export class SessionActor {
       case 'plan.respond':
         return await this.handlePlan(command);
     }
+  }
+
+  private async handlePermissions(command: Extract<ConversationCommand, { type: 'session.permissions.set' }>): Promise<CommandReply> {
+    try { validatePermissionPatches(command.patches); }
+    catch { return this.recordRejection(command, 'permission_settings_invalid', '权限设置无效。'); }
+    const snapshot = await this.loadSnapshot();
+    const events: NewSessionEvent[] = [{ type: 'session.permissions.updated', sessionId: this.sessionId,
+      payload: { commandId: command.commandId, patches: command.patches } }];
+    // A change to Shell policy invalidates outstanding reusable grants, visibly.
+    if (Object.keys(command.patches).some(key => ['agent.permissions.shell', 'agent.permissions.shellAccess', 'agent.permissions.commandRules', 'agent.permissions.commandDenylist', 'agent.permissions.networkRead'].includes(key))) {
+      events.push(...snapshot.state.shellAuthorizations.map(grant => ({ type: 'approval.revoked' as const,
+        sessionId: this.sessionId, runId: grant.runId, payload: { commandId: command.commandId, authorityId: grant.authorityId } })));
+    }
+    if (snapshot.state.pendingPlan && command.patches['agent.permissions.workspaceMutation'] === 'allow') {
+      events.push(...confirmationFacts(snapshot.state, snapshot.state.pendingPlan, command.commandId, 'agent', this.#nextId));
+    }
+    const reply = await this.commitCommand(command, events, acceptedReply(command));
+    if (!this.#active && snapshot.state.run?.status === 'waiting'
+      && (snapshot.state.run.waitingReason === 'approval'
+        || (snapshot.state.pendingPlan && command.patches['agent.permissions.workspaceMutation'] === 'allow'))) {
+      this.startLoop({ type: 'resume', runId: snapshot.state.run.runId });
+    }
+    return reply;
+  }
+
+  private async handleRevoke(command: Extract<ConversationCommand, { type: 'approval.revoke' }>): Promise<CommandReply> {
+    const snapshot = await this.loadSnapshot();
+    if (!snapshot.state.shellAuthorizations.some(grant => grant.runId === command.runId && grant.authorityId === command.authorityId)) {
+      return this.recordRejection(command, 'approval_grant_missing', '该授权已经结束或撤销。');
+    }
+    return this.commitCommand(command, [{ type: 'approval.revoked', sessionId: this.sessionId, runId: command.runId,
+      payload: { commandId: command.commandId, authorityId: command.authorityId } }], acceptedReply(command));
   }
 
   private async handleModelSettings(
@@ -658,7 +696,7 @@ export class SessionActor {
         '该 effect 裁决已经关闭或不属于当前运行。',
       );
     }
-    if (command.authorizationScope && (command.decision !== 'allow' || approval.preview.authorizationScope !== command.authorizationScope)) {
+    if (command.authorizationScope && (command.decision !== 'allow' || !(approval.preview.authorizationScopes ?? [approval.preview.authorizationScope]).includes(command.authorizationScope))) {
       return await this.recordRejection(command, 'approval_scope_invalid', '当前操作未提供该授权范围。');
     }
     const reply = await this.commitCommand(
@@ -672,6 +710,7 @@ export class SessionActor {
           approvalId: command.approvalId,
           commandId: command.commandId,
           decision: command.decision,
+          source: 'user',
           authorityId: this.#nextId('authority'),
           ...(command.authorizationScope ? { authorizationScope: command.authorizationScope } : {}),
         },
@@ -712,45 +751,7 @@ export class SessionActor {
 
     const events: NewSessionEvent[] = [];
     if (command.response.kind === 'confirm') {
-      const decisionId = this.#nextId('plan-decision');
-      const superseded = planToSupersede(snapshot.state, plan.planId, plan.revision);
-      if (superseded) {
-        events.push({
-          type: 'plan.superseded',
-          sessionId: this.sessionId,
-          runId: command.runId,
-          payload: {
-            planId: superseded.planId,
-            revision: superseded.revision,
-            supersededByPlanId: plan.planId,
-            supersededByRevision: plan.revision,
-          },
-        });
-      }
-      const authorities = planAuthoritiesForConfirmation(
-        plan,
-        this.sessionId,
-        decisionId,
-        this.#nextId,
-      );
-      events.push({
-        type: 'plan.confirmed',
-        sessionId: this.sessionId,
-        runId: command.runId,
-        callId: plan.callId,
-        payload: {
-          planId: plan.planId,
-          revision: plan.revision,
-          commandId: command.commandId,
-          decisionId,
-          authorities,
-        },
-      });
-      // Confirmation may initialize this run's list, but never rewrites an existing Todo.
-      if (snapshot.state.todoList?.runId !== command.runId) {
-        events.push(todoUpdateFact(this.sessionId, command.runId, snapshot.state.todoList,
-          plan.steps.map(step => ({ text: step.title, status: 'pending' }))));
-      }
+      events.push(...confirmationFacts(snapshot.state, plan, command.commandId, 'user', this.#nextId));
     } else if (command.response.kind === 'requestRevision') {
       const messageId = this.#nextId('message');
       events.push({
@@ -866,6 +867,7 @@ export class SessionActor {
       command,
       {
         composition: this.#composition,
+        readSnapshot: () => this.withWrite(() => this.loadSnapshot()),
         commit: (events) => this.withWrite(async () => {
           const current = await this.loadSnapshot();
           const batch = typeof events === 'function' ? events(current) : Array.isArray(events) ? events : [events];
@@ -1215,48 +1217,6 @@ export class SessionActor {
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
-}
-
-function planAuthoritiesForConfirmation(
-  plan: NonNullable<SessionProjection['pendingPlan']>,
-  sessionId: string,
-  decisionId: string,
-  nextId: (kind: string) => string,
-): PlanAuthority[] {
-  const workspaceIds = [...new Set(plan.mutationManifest.map((operation) => operation.workspaceId))];
-  return workspaceIds.map((workspaceId) => ({
-    authorityId: nextId('plan-authority'),
-    planId: plan.planId,
-    revision: plan.revision,
-    decisionId,
-    sessionId,
-    runId: plan.runId,
-    workspaceId,
-    coveredOperations: plan.mutationManifest
-      .filter((operation) => operation.workspaceId === workspaceId)
-      .map((operation) => ({ ...operation })),
-  }));
-}
-
-function planToSupersede(
-  state: LoopSnapshot['state'],
-  nextPlanId: string,
-  nextRevision: number,
-): { planId: string; revision: number } | null {
-  if (state.activePlanRef && (
-    state.activePlanRef.planId !== nextPlanId
-    || state.activePlanRef.revision !== nextRevision
-  )) return { ...state.activePlanRef };
-  const previousRevision = state.plans
-    .filter((candidate) => (
-      candidate.planId === nextPlanId
-      && candidate.revision < nextRevision
-      && (candidate.status === 'confirmed' || candidate.status === 'revisionRequested')
-    ))
-    .sort((left, right) => right.revision - left.revision)[0];
-  return previousRevision
-    ? { planId: previousRevision.planId, revision: previousRevision.revision }
-    : null;
 }
 
 function validInteractionResponse(interaction: InteractionProjection, response: string): boolean {

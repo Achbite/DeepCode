@@ -1,5 +1,6 @@
+import { todoUpdateFact } from './todoState.js';
 import type {
-  NewSessionEvent,
+  NewSessionEvent, PlanAuthority, SessionProjection,
 } from '@deepcode/protocol';
 import { SESSION_CONTROL_PLAN_PUBLISH } from '@deepcode/protocol';
 import { canonicalJsonValue } from './providerToolCodec.js';
@@ -74,4 +75,61 @@ export function publishPlan(
       ...structuredClone(draft), planId, revision: (previous?.revision ?? 0) + 1, providerCallId,
     },
   };
+}
+
+export function confirmationFacts(state: SessionState, plan: NonNullable<SessionProjection['pendingPlan']>,
+  commandId: string, source: 'user' | 'agent', nextId: (kind: string) => string): NewSessionEvent[] {
+  const decisionId = nextId('plan-decision');
+  const previous = planToSupersede(state, plan.planId, plan.revision);
+  const events: NewSessionEvent[] = [];
+  if (previous) events.push({ type: 'plan.superseded', sessionId: state.sessionId, runId: plan.runId,
+    payload: { ...previous, supersededByPlanId: plan.planId, supersededByRevision: plan.revision } });
+  events.push({ type: 'plan.confirmed', sessionId: state.sessionId, runId: plan.runId, callId: plan.callId,
+    payload: { planId: plan.planId, revision: plan.revision, commandId, source, decisionId,
+      authorities: planAuthoritiesForConfirmation(plan, state.sessionId, decisionId, nextId) } });
+  if (state.todoList?.runId !== plan.runId) events.push(todoUpdateFact(state.sessionId, plan.runId, state.todoList,
+    plan.steps.map(step => ({ text: step.title, status: 'pending' }))));
+  return events;
+}
+
+export function planAuthoritiesForConfirmation(
+  plan: NonNullable<SessionProjection['pendingPlan']>,
+  sessionId: string,
+  decisionId: string,
+  nextId: (kind: string) => string,
+): PlanAuthority[] {
+  const workspaceIds = [...new Set(plan.mutationManifest.map((operation) => operation.workspaceId))];
+  return workspaceIds.map((workspaceId) => ({
+    authorityId: nextId('plan-authority'),
+    planId: plan.planId,
+    revision: plan.revision,
+    decisionId,
+    sessionId,
+    runId: plan.runId,
+    workspaceId,
+    coveredOperations: plan.mutationManifest
+      .filter((operation) => operation.workspaceId === workspaceId)
+      .map((operation) => ({ ...operation })),
+  }));
+}
+
+export function planToSupersede(
+  state: SessionState,
+  nextPlanId: string,
+  nextRevision: number,
+): { planId: string; revision: number } | null {
+  if (state.activePlanRef && (
+    state.activePlanRef.planId !== nextPlanId
+    || state.activePlanRef.revision !== nextRevision
+  )) return { ...state.activePlanRef };
+  const previousRevision = state.plans
+    .filter((candidate) => (
+      candidate.planId === nextPlanId
+      && candidate.revision < nextRevision
+      && (candidate.status === 'confirmed' || candidate.status === 'revisionRequested')
+    ))
+    .sort((left, right) => right.revision - left.revision)[0];
+  return previousRevision
+    ? { planId: previousRevision.planId, revision: previousRevision.revision }
+    : null;
 }

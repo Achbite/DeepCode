@@ -267,6 +267,17 @@ export function encodeProviderMessage(
   journalCodecsByCallId: ReadonlyMap<string, ProviderMessageToolCodec> = new Map(),
 ): ModelMessage {
   const encoded = cloneModelMessage(message);
+  if (encoded.role === 'tool' && encoded.toolCallId) {
+    const callCodec = journalCodecsByCallId.get(encoded.toolCallId) ?? codec;
+    // These are structured Session results, not model-authored JSON to repair.
+    const result: unknown = JSON.parse(encoded.content);
+    if (isRecord(result)) {
+      for (const key of ['output', 'error']) {
+        if (isRecord(result[key])) result[key] = encodeWorkspaceIdentity(callCodec, result[key] as JsonObject);
+      }
+      encoded.content = JSON.stringify(result);
+    }
+  }
   if (!encoded.toolCalls) return encoded;
   encoded.toolCalls = encoded.toolCalls.map((call) => {
     const callCodec: ProviderMessageToolCodec = journalCodecsByCallId.get(call.callId) ?? codec;
@@ -328,6 +339,8 @@ export function providerMessageCodecsByCallId(
       currentRequests.set(event.runId, codec);
       continue;
     }
+    // Session grants can outlive edited-away calls; tool.requested owns their codec.
+    if (event.type === 'approval.requested' || event.type === 'approval.resolved') continue;
     const completion = event.type === 'provider.turn.settled' && event.payload.outcome === 'completed' ? event.payload : undefined;
     const inputs = completion?.toolCallInputs ?? [];
     const callIds = completion ? inputs.map((call) => call.callId)

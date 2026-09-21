@@ -1,9 +1,11 @@
+import { isShellAuthorizationScope } from '@deepcode/protocol';
 import { stableCoreInstructions } from './local-agent/coreInstructions.js';
 import type { ConversationCommand } from '@deepcode/protocol';
 import { responseFrames } from './responseFrames.js';
 import {
   CONVERSATION_COMMAND_VERSION,
   LOCAL_AGENT_PROTOCOL_VERSION,
+  validatePermissionPatches,
 } from '@deepcode/protocol';
 import {
   HttpCommandJournal,
@@ -139,6 +141,14 @@ function decodeCommand(value: unknown): ConversationCommand {
     || !validId(value.sessionId)
   ) throw new Error('conversation_command_invalid');
   switch (value.type) {
+    case 'session.permissions.set':
+      if (!hasExactKeys(value, ['schemaVersion', 'type', 'commandId', 'sessionId', 'patches'])) throw new Error('conversation_command_invalid');
+      validatePermissionPatches(value.patches);
+      return value as unknown as ConversationCommand;
+    case 'approval.revoke':
+      if (!hasExactKeys(value, ['schemaVersion', 'type', 'commandId', 'sessionId', 'runId', 'authorityId'])
+        || !validId(value.runId) || !validId(value.authorityId)) throw new Error('conversation_command_invalid');
+      return value as unknown as ConversationCommand;
     case 'session.model-settings.set':
       if (!hasExactKeys(value, ['schemaVersion', 'type', 'commandId', 'sessionId', 'settings'])
         || !isRecord(value.settings)
@@ -250,7 +260,7 @@ function decodeCommand(value: unknown): ConversationCommand {
         || !validId(value.approvalId)
         || value.decision !== 'allow' && value.decision !== 'deny'
         || value.authorizationScope !== undefined
-          && (value.authorizationScope !== 'runHostShell' || value.decision !== 'allow')
+          && (!isShellAuthorizationScope(value.authorizationScope) || value.decision !== 'allow')
       ) throw new Error('conversation_command_invalid');
       return value as unknown as ConversationCommand;
     case 'plan.respond':

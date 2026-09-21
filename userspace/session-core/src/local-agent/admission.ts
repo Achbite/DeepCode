@@ -1,3 +1,5 @@
+import { isSessionAuthorizationScope } from '@deepcode/protocol';
+import { permissionSettings } from '@deepcode/protocol';
 import { SESSION_EVENT_VERSION } from '@deepcode/protocol';
 import type { CommandReply, ConversationCommand, NewSessionEvent, SessionEvent } from '@deepcode/protocol';
 import { loopSnapshot, pendingToolRequests, type LoopSnapshot } from './loop.js';
@@ -50,7 +52,11 @@ function admitEvent(snapshot: LoopSnapshot, event: NewSessionEvent): void {
   const pendingProvider = state.contextCompositions.some((receipt) => receipt.runId === runId
     && !state.providerTurns[receipt.providerRequestId]);
   const userInput = event.type === 'input.accepted' || event.type === 'message.committed' && event.payload.role !== 'assistant';
-  if (runId && event.type !== 'run.started' && !userInput
+  const revokedGrant = event.type === 'approval.revoked'
+    ? state.shellAuthorizations.find((grant) => grant.authorityId === event.payload.authorityId && grant.runId === event.runId)
+    : undefined;
+  if (event.type === 'approval.revoked' && !revokedGrant) throw new Error('approval_grant_missing');
+  if (runId && event.type !== 'run.started' && !userInput && !(revokedGrant && isSessionAuthorizationScope(revokedGrant.scope))
     && (state.run?.runId !== runId || state.tokenUsageHistory[runId]?.outcome)) {
     throw new Error('session_event_run_not_active');
   }
@@ -103,6 +109,21 @@ function admitEvent(snapshot: LoopSnapshot, event: NewSessionEvent): void {
       }
       break;
     }
+    case 'plan.confirmed':
+      if (event.payload.source === 'agent' && permissionSettings({ ...state.runRuntimeSnapshots[event.runId]?.permissions,
+        ...state.permissionOverrides })['agent.permissions.workspaceMutation'] !== 'allow') throw new Error('plan_delegation_missing');
+      break;
+    case 'approval.resolved':
+      if (event.payload.source === 'agent') {
+        const permissions = permissionSettings({ ...state.runRuntimeSnapshots[event.runId]?.permissions, ...state.permissionOverrides });
+        if (permissions['agent.permissions.shell'] !== 'review'
+          || state.pendingApproval?.preview.approvalReviewer !== 'agent'
+          || state.pendingApproval?.preview.review?.decision !== event.payload.decision
+          || (event.payload.authorizationScope && (event.payload.decision !== 'allow'
+            || event.payload.authorizationScope !== state.pendingApproval?.preview.authorizationScope
+            || !state.pendingApproval.preview.authorizationScopes?.includes(event.payload.authorizationScope)))) throw new Error('approval_delegation_missing');
+      }
+      break;
     case 'plan.superseded':
       if (event.payload.planId === event.payload.supersededByPlanId
         && event.payload.revision === event.payload.supersededByRevision) throw new Error('plan_supersede_invalid');
@@ -136,6 +157,7 @@ function admitEvent(snapshot: LoopSnapshot, event: NewSessionEvent): void {
       if (pendingProvider) throw new Error('provider_turn_still_active');
       const compaction = events.some((item) => item.type === 'context.compaction.requested'
         && item.runId === runId && item.payload.providerRequestId === event.payload.providerRequestId);
+      if (event.payload.purpose === 'approvalReview' && (!state.pendingApproval || event.payload.tools.length)) throw new Error('approval_review_context_invalid');
       if ((event.payload.purpose === 'contextCompaction') !== compaction) throw new Error('context_composition_purpose_mismatch');
       const runtime = state.runRuntimeSnapshots[event.runId];
       const view = state.runToolViews[event.runId] ?? runtime;

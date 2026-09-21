@@ -1092,12 +1092,12 @@ function messageContentForModel(
 function toolResultForModel(record: ToolExecutionRecord): Record<string, unknown> {
   if (record.outcome === 'completed') {
     const output = structuredClone(record.output);
-    if (isRecord(output)) { delete output.workspaceId; delete output.fileChanges; }
+    if (isRecord(output)) { delete output.fileChanges; }
     return { recordId: record.recordId, outcome: record.outcome, output };
   }
   if (record.outcome === 'failed') {
     const output = record.output === undefined ? undefined : structuredClone(record.output);
-    if (isRecord(output)) { delete output.workspaceId; delete output.fileChanges; }
+    if (isRecord(output)) { delete output.fileChanges; }
     return {
       recordId: record.recordId,
       outcome: record.outcome,

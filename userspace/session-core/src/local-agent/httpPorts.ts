@@ -423,6 +423,7 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
           provider,
           webSearch,
           environment: value.environment as JsonObject,
+          permissions: pluginConfig.permissions,
           instructions: [...runtimeInstructions([
             ...this.#stableCoreInstructions,
             environmentInstruction(value.environment),

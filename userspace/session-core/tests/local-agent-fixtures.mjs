@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { PERMISSION_DEFAULTS } from '../../protocol/dist/index.js';
 import { SessionActor, sessionControlToolDefinitions } from '../dist/index.js';
 
 export const workspaceBinding = {
@@ -41,6 +42,7 @@ export function fakeRunPreparation(options = {}) {
         prepared.push(structuredClone(request));
         const snapshot = runtimeSnapshot(request.runId, {
           environment: options.environment,
+          permissions: options.permissions,
           profileId: request.profileId ?? options.profileId ?? 'profile:default',
           contextWindowTokens: options.contextWindowTokens,
           maxOutputTokens: options.maxOutputTokens,
@@ -99,6 +101,7 @@ export function runtimeSnapshot(runId, options = {}) {
     }));
   return {
     runRuntimeSnapshotRef: `runtime-snapshot:${runId}`,
+    permissions: { ...PERMISSION_DEFAULTS, ...options.permissions },
     extensionGenerationRef: 'extension-generation:g1',
     kernelCatalogSnapshotRef: `kernel-catalog:${runId}`,
     provider,

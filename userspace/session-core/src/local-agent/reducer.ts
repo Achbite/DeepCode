@@ -1,3 +1,4 @@
+import { isSessionAuthorizationScope } from '@deepcode/protocol';
 import { advanceTodoList } from './todoState.js';
 import { providerTextStreamId } from './streamIdentity.js';
 import { activeConversationEvents } from './conversationHistory.js';
@@ -23,12 +24,14 @@ import {
   SESSION_CONTROL_INTERACTION_REQUEST,
   SESSION_CONTROL_PLAN_PUBLISH,
   SESSION_CONTROL_PLUGIN_ACTIVATE,
-  SESSION_PROJECTION_VERSION,
+  SESSION_PROJECTION_VERSION, permissionSettings, validatePermissionPatches, isLocalAgentErrorValue,
 } from '@deepcode/protocol';
 
 export interface SessionState {
   providerAttempts: Record<string, NonNullable<SessionProjection['providerAttempts']>[number]>;
   failureSnapshots: Record<string, NonNullable<SessionProjection['failureSnapshot']>>;
+  permissionOverrides: SessionProjection['permissionOverrides'];
+  shellAuthorizations: SessionProjection['shellAuthorizations'];
   modelSettings: SessionProjection['modelSettings'];
   sessionId: string;
   revision: number;
@@ -69,7 +72,7 @@ export interface SessionState {
 export interface ProviderTurnState {
   runId: string;
   providerRequestId: string;
-  purpose: 'agent' | 'contextCompaction';
+  purpose: 'agent' | 'contextCompaction' | 'approvalReview';
   providerRuntimeRef: string;
   outcome: 'completed' | 'failed' | 'indeterminate';
   orderedCallIds?: string[];
@@ -92,6 +95,7 @@ export interface ProviderCallFactState {
 export function emptySessionState(sessionId: string): SessionState {
   return {
     providerAttempts: {}, failureSnapshots: {},
+    permissionOverrides: {}, shellAuthorizations: [],
     modelSettings: null,
     sessionId,
     revision: 0,
@@ -187,6 +191,19 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
     case 'input.accepted':
       next.acceptedInputs = { ...next.acceptedInputs };
       next.acceptedInputs[event.payload.commandId] = { messageId: event.payload.messageId };
+      break;
+    case 'session.permissions.updated':
+      validatePermissionPatches(event.payload.patches);
+      next.permissionOverrides = { ...next.permissionOverrides, ...event.payload.patches };
+      if (next.run?.status === 'waiting' && next.run.waitingReason === 'approval') resumeRun(next, next.run.runId);
+      break;
+    case 'approval.revoked':
+      next.shellAuthorizations = next.shellAuthorizations.filter(grant => grant.authorityId !== event.payload.authorityId);
+      break;
+    case 'approval.reviewed':
+      if (!next.pendingApproval || next.pendingApproval.approvalId !== event.payload.approvalId) throw new Error('approval_review_request_missing');
+      next.pendingApproval = { ...next.pendingApproval, preview: { ...next.pendingApproval.preview,
+        review: { decision: event.payload.decision, reason: event.payload.reason } } };
       break;
     case 'session.model-settings.updated':
       next.modelSettings = { ...event.payload.settings };
@@ -435,6 +452,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       updatePlan(next, event.payload.planId, event.payload.revision, (plan) => ({
         ...plan,
         status: 'confirmed',
+        confirmationSource: event.payload.source ?? 'user',
         decisionId: event.payload.decisionId,
         sequence: event.sequence,
         updatedAt: event.occurredAt,
@@ -556,6 +574,10 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     }
     case 'approval.requested':
+      if (next.pendingApproval) {
+        // A fresh Kernel preview replaces the pending decision after policy changes.
+        settleActivity(next, approvalActivityId(next.pendingApproval.approvalId), 'cancelled');
+      }
       next.activities = { ...next.activities };
       next.pendingApproval = {
         approvalId: event.payload.approvalId,
@@ -587,9 +609,16 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         || next.pendingApproval.callId !== event.callId
         || next.pendingApproval.runId !== event.runId
       ) throw new Error('approval_request_missing');
+      if (event.payload.decision === 'allow' && event.payload.authorizationScope && next.pendingApproval.preview.authorizationContext) {
+        next.shellAuthorizations = [...next.shellAuthorizations, { authorityId: event.payload.authorityId,
+          runId: event.runId, scope: event.payload.authorizationScope, summary: next.pendingApproval.preview.summary,
+          context: structuredClone(next.pendingApproval.preview.authorizationContext) }];
+      }
       next.pendingApproval = null;
       settleActivity(next, approvalActivityId(event.payload.approvalId), event.payload.decision === 'allow' ? 'completed' : 'denied');
-      resumeRun(next, event.runId);
+      // Conversation grants also replay after an edit removes their original run.
+      if (event.payload.decision !== 'allow' || !(event.payload.authorizationScope && isSessionAuthorizationScope(event.payload.authorizationScope))
+        || next.run?.runId === event.runId) resumeRun(next, event.runId);
       break;
     case 'tool.input-rejected':
       settleActivity(next, toolActivityId(event.callId), 'rejected');
@@ -598,21 +627,28 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         inputRejection: structuredClone(event.payload.rejection.error),
       };
       break;
-    case 'tool.completed':
+    case 'tool.completed': {
+      if (next.pendingApproval?.callId === event.callId) {
+        settleActivity(next, approvalActivityId(next.pendingApproval.approvalId), 'completed');
+        next.pendingApproval = null;
+        resumeRun(next, event.runId);
+      }
       settleActivity(
         next,
         toolActivityId(event.callId),
         event.payload.record.outcome,
       );
+      const { tool, artifacts } = projectToolRecord(event.payload.record);
       next.activities[toolActivityId(event.callId)] = {
         ...next.activities[toolActivityId(event.callId)],
-        tool: projectToolActivity(event.payload.record),
+        tool,
       };
       next.artifacts = { ...next.artifacts };
-      for (const artifact of artifactsFromRecord(event.payload.record)) {
+      for (const artifact of artifacts) {
         next.artifacts[artifact.artifactId] = artifact;
       }
       break;
+    }
     case 'tool.interrupted':
       if (!next.runRuntimeReleases[event.runId]
         || !['requested', 'active'].includes(next.activities[toolActivityId(event.callId)]?.status ?? '')) {
@@ -1002,6 +1038,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       break;
     }
     case 'run.settled':
+      next.shellAuthorizations = next.shellAuthorizations.filter(grant => grant.runId !== event.runId || isSessionAuthorizationScope(grant.scope));
       next.tokenUsageHistory = { ...next.tokenUsageHistory };
       next.pendingRunSettlements = { ...next.pendingRunSettlements };
       // Session admission enforces tool closure for new settlements. Replaying
@@ -1079,6 +1116,9 @@ export function projectSession(
     ...(Object.keys(state.providerAttempts).length ? { providerAttempts: Object.values(state.providerAttempts)
       .filter((attempt) => attempt.runId === state.run?.runId).map((attempt) => structuredClone(attempt)) } : {}),
     ...(state.run && state.failureSnapshots[state.run.runId] ? { failureSnapshot: structuredClone(state.failureSnapshots[state.run.runId]) } : {}),
+    permissionOverrides: structuredClone(state.permissionOverrides),
+    effectivePermissions: state.run ? permissionSettings({ ...state.runRuntimeSnapshots[state.run.runId]?.permissions, ...state.permissionOverrides }) : null,
+    shellAuthorizations: structuredClone(state.shellAuthorizations),
     schemaVersion: SESSION_PROJECTION_VERSION,
     ...(rounds.size ? { fileChangeRounds: [...rounds].map(([runId, recordIds]) => ({ runId, recordIds })) } : {}),
     sessionId: state.sessionId,
@@ -1827,13 +1867,37 @@ function settleActivity(
   state.activities = { ...state.activities, [activityId]: { ...activity, status } };
 }
 
-function projectToolActivity(record: ToolExecutionRecord): NonNullable<ActivityProjection['tool']> {
+class ToolDetailProjectionError extends Error {}
+
+function projectToolRecord(record: ToolExecutionRecord): {
+  tool: NonNullable<ActivityProjection['tool']>; artifacts: ArtifactProjection[];
+} {
   const { preparedEffect } = record;
-  return {
+  const tool: NonNullable<ActivityProjection['tool']> = {
     recordId: record.recordId,
     operation: preparedEffect.operation,
-    resources: preparedEffect.logicalTargets.map((target) => {
-      if (preparedEffect.workspaceId) {
+    resources: [],
+  };
+  let artifacts: ArtifactProjection[] = [];
+  try {
+    if ('error' in record && record.error) {
+      const { code, message, diagnostics } = record.error;
+      const error = { code, message };
+      if (!isLocalAgentErrorValue(error)) throw new ToolDetailProjectionError('tool_error_projection_invalid');
+      tool.error = error;
+      if (diagnostics !== undefined) {
+        if (!isLocalAgentErrorValue({ ...error, diagnostics })) throw new ToolDetailProjectionError('tool_error_diagnostics_invalid');
+        tool.error.diagnostics = structuredClone(diagnostics);
+      }
+    }
+    if (!Array.isArray(preparedEffect.logicalTargets)) throw new ToolDetailProjectionError('tool_resource_projection_invalid');
+    tool.resources = preparedEffect.logicalTargets.map((target) => {
+      if (typeof target !== 'string' || !target.trim() || target.includes('\0')) {
+        throw new ToolDetailProjectionError('tool_resource_projection_invalid');
+      }
+      const relativePath = target === '.' || Boolean(target) && !target.includes('\\') && !target.includes('\0')
+        && !/^[a-z]:/iu.test(target) && target.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
+      if (preparedEffect.workspaceId && relativePath) {
         return {
           kind: 'workspacePath' as const,
           label: target,
@@ -1845,11 +1909,15 @@ function projectToolActivity(record: ToolExecutionRecord): NonNullable<ActivityP
         return { kind: 'url' as const, label: target, uri: target };
       }
       return { kind: 'logicalTarget' as const, label: target };
-    }),
-    ...(['bash', 'powershell'].includes(record.toolName) ? { shell: projectShellActivity(record) } : {}),
-    ...('error' in record && record.error ? { error: structuredClone(record.error) } : {}),
-    ...projectFileChanges(record),
-  };
+    });
+    if (['bash', 'powershell'].includes(record.toolName)) tool.shell = projectShellActivity(record);
+    Object.assign(tool, projectFileChanges(record));
+    artifacts = artifactsFromRecord(record);
+  } catch (error) {
+    if (!(error instanceof ToolDetailProjectionError)) throw error;
+    tool.projectionError = { code: error.message, message: '工具详情无法显示；原始执行记录已保留。' };
+  }
+  return { tool, artifacts };
 }
 
 function projectShellActivity(
@@ -1857,7 +1925,7 @@ function projectShellActivity(
 ): NonNullable<NonNullable<ActivityProjection['tool']>['shell']> {
   const canonicalArguments = record.preparedEffect.canonicalInvocation.arguments;
   if (!isRecord(canonicalArguments)) {
-    throw new Error('bash_projection_input_invalid');
+    throw new ToolDetailProjectionError('bash_projection_input_invalid');
   }
   const command = canonicalArguments.command;
   const cwd = '.';
@@ -1871,7 +1939,7 @@ function projectShellActivity(
     || !matchesProcessExecutionScope(executionScope)
     || terminal && !isCanonicalTerminalInput(canonicalArguments.terminal)
   ) {
-    throw new Error('bash_projection_input_invalid');
+    throw new ToolDetailProjectionError('bash_projection_input_invalid');
   }
   const output = record.outcome === 'completed'
     ? record.output
@@ -1890,7 +1958,7 @@ function projectShellActivity(
       && Object.keys(output).every((key) => key === 'stage' || key === 'details')
   )) return { command, cwd, executionScope, terminal };
   if (output === undefined && record.outcome !== 'completed') return { command, cwd, executionScope, terminal };
-  if (!isRecord(output)) throw new Error('bash_projection_output_invalid');
+  if (!isRecord(output)) throw new ToolDetailProjectionError('bash_projection_output_invalid');
   const {
     command: outputCommand,
     cwd: outputCwd,
@@ -1918,16 +1986,16 @@ function projectShellActivity(
     || typeof stderr !== 'string'
     || !(exitCode === null || typeof exitCode === 'number' && Number.isSafeInteger(exitCode))
     || typeof success !== 'boolean'
+    || success && (timedOut || exitCode !== 0)
     || typeof timedOut !== 'boolean'
     || typeof truncated !== 'boolean'
     || !isNaturalSafeInteger(capturedBytes)
     || !isNaturalSafeInteger(durationMs)
   ) {
-    throw new Error('bash_projection_output_invalid');
+    throw new ToolDetailProjectionError('bash_projection_output_invalid');
   }
   const environment = projectShellEnvironment(
     output.environment,
-    workspaceMode,
     executionScope,
     terminal,
   );
@@ -1952,11 +2020,10 @@ function projectShellActivity(
 
 function projectShellEnvironment(
   value: unknown,
-  workspaceMode: 'read' | 'write',
   executionScope: 'workspace' | 'host',
   terminal: boolean,
 ): ShellExecutionEnvironmentProjection {
-  if (!isRecord(value)) throw new Error('bash_projection_environment_invalid');
+  if (!isRecord(value)) throw new ToolDetailProjectionError('bash_projection_environment_invalid');
   const {
     shell,
     interactive,
@@ -1967,13 +2034,8 @@ function projectShellEnvironment(
     homeWritable,
     networkAccess,
   } = value;
-  const expectedWriteScope: ShellExecutionEnvironmentProjection['writeScope'] = (
-    executionScope === 'host'
-      ? 'hostUser'
-      : workspaceMode === 'read'
-        ? 'kernelTemporaryOnly'
-        : 'workspaceAndKernelTemporary'
-  );
+  // History describes the environment at execution time. Current sandbox
+  // policy applies to new calls, not to these recorded diagnostics.
   if (
     typeof shell !== 'string'
     || !shell.trim()
@@ -1982,11 +2044,12 @@ function projectShellEnvironment(
     || outputTerminal !== terminal
     || typeof pathSource !== 'string'
     || !pathSource.trim()
-    || writeScope !== expectedWriteScope
-    || homeWritable !== (executionScope === 'host')
-    || networkAccess !== (executionScope === 'host')
+    || typeof writeScope !== 'string'
+    || !writeScope.trim()
+    || typeof homeWritable !== 'boolean'
+    || typeof networkAccess !== 'boolean'
   ) {
-    throw new Error('bash_projection_environment_invalid');
+    throw new ToolDetailProjectionError('bash_projection_environment_invalid');
   }
   return {
     shell,
@@ -1994,7 +2057,7 @@ function projectShellEnvironment(
     executionScope,
     terminal,
     pathSource,
-    writeScope: expectedWriteScope,
+    writeScope,
     homeWritable,
     networkAccess,
   };
@@ -2018,19 +2081,20 @@ function isCanonicalTerminalInput(value: unknown): value is { stdin: string } {
 function artifactsFromRecord(record: ToolExecutionRecord): ArtifactProjection[] {
   if (record.outcome !== 'completed' || !isRecord(record.output)) return [];
   const artifacts = record.output.artifacts;
-  if (!Array.isArray(artifacts)) return [];
+  if (artifacts === undefined) return [];
+  if (!Array.isArray(artifacts)) throw new ToolDetailProjectionError('tool_artifact_invalid');
   return artifacts.flatMap((candidate) => {
-    if (!isRecord(candidate)) return [];
+    if (!isRecord(candidate)) throw new ToolDetailProjectionError('tool_artifact_invalid');
     const { artifactId, label, workspaceId, logicalPath, uri, contentType, contentMode, sourcePage } = candidate;
-    if (typeof artifactId !== 'string' || typeof label !== 'string'
+    if (typeof artifactId !== 'string' || !artifactId.trim() || typeof label !== 'string' || !label.trim()
       || typeof contentType !== 'string' || !contentType
-      || !['fixed', 'live'].includes(String(contentMode))) throw new Error('tool_artifact_invalid');
+      || !['fixed', 'live'].includes(String(contentMode))) throw new ToolDetailProjectionError('tool_artifact_invalid');
     if (
       workspaceId !== undefined && typeof workspaceId !== 'string'
       || logicalPath !== undefined && typeof logicalPath !== 'string'
       || uri !== undefined && typeof uri !== 'string'
       || logicalPath === undefined && uri === undefined
-    ) throw new Error('tool_artifact_resource_invalid');
+    ) throw new ToolDetailProjectionError('tool_artifact_resource_invalid');
     return [{
       artifactId,
       label,
@@ -2118,13 +2182,25 @@ function projectFileChanges(record: ToolExecutionRecord): Pick<NonNullable<Activ
   if (changes === undefined) return {};
   if (!Array.isArray(changes) || changes.some((change) => {
     if (!change || typeof change !== 'object' || Array.isArray(change)) return true;
-    return typeof change.workspaceId !== 'string' || change.workspaceId !== record.preparedEffect.workspaceId
-      || typeof change.path !== 'string' || !['create', 'modify', 'delete'].includes(String(change.kind))
+    return typeof change.workspaceId !== 'string' || !change.workspaceId.trim() || change.workspaceId !== record.preparedEffect.workspaceId
+      || typeof change.path !== 'string' || !change.path.trim() || !['create', 'modify', 'delete'].includes(String(change.kind))
       || ![change.before, change.after].every((side) => side && typeof side === 'object' && !Array.isArray(side)
-        && typeof side.exists === 'boolean' && (!side.exists || typeof side.contentRef === 'string' || typeof side.error === 'string'))
+        && typeof side.exists === 'boolean'
+        && (side.sizeBytes === undefined || isNaturalSafeInteger(side.sizeBytes))
+        && (side.contentRef === undefined || typeof side.contentRef === 'string' && Boolean(side.contentRef.trim()))
+        && (side.error === undefined || typeof side.error === 'string' && Boolean(side.error.trim()))
+        && (!side.exists || typeof side.contentRef === 'string' || typeof side.error === 'string'))
       || (change.kind === 'create' && (change.before?.exists !== false || change.after?.exists !== true))
       || (change.kind === 'delete' && (change.before?.exists !== true || change.after?.exists !== false))
       || (change.kind === 'modify' && (change.before?.exists !== true || change.after?.exists !== true));
-  })) throw new Error('kernel_file_changes_invalid');
-  return { fileChanges: structuredClone(changes) as unknown as NonNullable<ActivityProjection['tool']>['fileChanges'] };
+  })) throw new ToolDetailProjectionError('kernel_file_changes_invalid');
+  return { fileChanges: changes.map(({ workspaceId, path, kind, before, after }) => ({
+    workspaceId, path, kind,
+    before: projectFileChangeSide(before), after: projectFileChangeSide(after),
+  })) };
+}
+
+function projectFileChangeSide({ exists, contentRef, sizeBytes, error }: import('@deepcode/protocol').FileChangeSide) {
+  return { exists, ...(contentRef === undefined ? {} : { contentRef }),
+    ...(sizeBytes === undefined ? {} : { sizeBytes }), ...(error === undefined ? {} : { error }) };
 }
