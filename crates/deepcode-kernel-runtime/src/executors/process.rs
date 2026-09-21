@@ -149,7 +149,7 @@ fn invoke_shell_in_temp(
                 command,
                 workspace_mode.as_str().to_owned(),
                 execution_scope.as_str().to_owned(),
-                u64::from(timeout),
+                timeout.map(u64::from),
                 terminal.map(|value| value.stdin),
             ),
             _ => {
@@ -319,15 +319,15 @@ fn finish_shell_execution(
 }
 
 fn shell_cleanup_failure<S: std::fmt::Debug>(
-    wait: KernelResult<(S, bool)>,
+    wait: KernelResult<(S, bool, bool)>,
     cleanup: KernelError,
 ) -> KernelResult<KernelToolExecutionResult> {
     match wait {
         Err(primary) => combine_shell_results(Err(primary), Err::<(), _>(cleanup)).map(|(value, ())| value),
-        Ok((status, timed_out)) => Err(KernelError::Structured {
+        Ok((status, timed_out, cancelled)) => Err(KernelError::Structured {
             code: "shell_cleanup_failed",
             stage: "execution",
-            message: format!("Shell exit status {status:?} (timedOut={timed_out}); resource cleanup failed: {cleanup}"),
+            message: format!("Shell exit status {status:?} (timedOut={timed_out}, cancelled={cancelled}); resource cleanup failed: {cleanup}"),
             details: serde_json::json!({ "exitStatus": format!("{status:?}"), "timedOut": timed_out }),
         }),
     }
@@ -340,7 +340,7 @@ fn invoke_terminal_shell(
     workspace_mode: String,
     execution_scope: String,
     terminal_stdin: String,
-    timeout_seconds: u64,
+    timeout_seconds: Option<u64>,
     workspace_id: String,
     workspace_root: PathBuf,
     cwd: PathBuf,
@@ -474,26 +474,9 @@ fn invoke_terminal_shell(
         let wait_result = write_result.and_then(|()| {
             wait_for_bounded_pty_child(
                 &mut child,
-                Duration::from_secs(timeout_seconds),
+                timeout_seconds.map(Duration::from_secs),
                 &context.cancellation,
             )
-        });
-        let wait_result = wait_result.and_then(|(status, timed_out, cancelled)| {
-            if cancelled {
-                Err(KernelError::Structured {
-                    code: "tool_execution_cancelled",
-                    stage: "execution",
-                    message: format!("{tool_name} was cancelled"),
-                    details: serde_json::json!({
-                        "toolId": tool_name,
-                        "workspaceMode": workspace_mode,
-                        "executionScope": execution_scope,
-                        "terminal": true,
-                    }),
-                })
-            } else {
-                Ok((status, timed_out))
-            }
         });
         let process_cleanup = child.terminate_and_wait().map(|_| ());
         #[cfg(windows)]
@@ -520,13 +503,13 @@ fn invoke_terminal_shell(
             Ok(stdout) => stdout,
             Err(error) => return shell_cleanup_failure(wait_result, error),
         };
-        let (status, timed_out) = wait_result?;
+        let (status, timed_out, cancelled) = wait_result?;
         stdout.truncated |= retain_tail_lines(&mut stdout.bytes, BASH_OUTPUT_LIMIT_LINES);
         trim_utf8_prefix(&mut stdout.bytes);
 
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let exit_code = i32::try_from(status.exit_code()).ok();
-        let success = !timed_out && status.success();
+        let success = !timed_out && !cancelled && status.success();
         let mut output = serde_json::json!({
             "workspaceId": workspace_id,
             "command": command_text,
@@ -559,7 +542,14 @@ fn invoke_terminal_shell(
             }
         });
         archive.finish(&mut output)?;
-        if success {
+        if cancelled {
+            Ok(known_failure(
+                invocation_id,
+                output,
+                "tool_execution_cancelled",
+                format!("{tool_name} was cancelled"),
+            ))
+        } else if success {
             Ok(ok(invocation_id, output))
         } else if timed_out {
             Ok(known_failure(
@@ -570,7 +560,10 @@ fn invoke_terminal_shell(
                 } else {
                     "bash_timed_out"
                 },
-                format!("{tool_name} command exceeded the {timeout_seconds}-second timeout."),
+                format!(
+                    "{tool_name} command exceeded its {}-second timeout.",
+                    timeout_seconds.expect("timed out with a deadline")
+                ),
             ))
         } else {
             Ok(known_failure(
@@ -1453,10 +1446,10 @@ fn join_output_reader(
 
 pub(super) fn wait_for_bounded_child(
     child: &mut Child,
-    timeout: Duration,
+    timeout: Option<Duration>,
     cancellation: &KernelCancellationToken,
 ) -> KernelResult<(ExitStatus, bool, bool)> {
-    let deadline = Instant::now() + timeout;
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
     loop {
         if let Some(status) = child
             .try_wait()
@@ -1467,7 +1460,7 @@ pub(super) fn wait_for_bounded_child(
         if cancellation.is_cancelled() {
             return terminate_child(child).map(|status| (status, false, true));
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return terminate_child(child).map(|status| (status, true, false));
         }
         thread::sleep(PROCESS_POLL_INTERVAL);
@@ -1476,10 +1469,10 @@ pub(super) fn wait_for_bounded_child(
 
 fn wait_for_bounded_pty_child(
     child: &mut PtyChildGuard,
-    timeout: Duration,
+    timeout: Option<Duration>,
     cancellation: &KernelCancellationToken,
 ) -> KernelResult<(portable_pty::ExitStatus, bool, bool)> {
-    let deadline = Instant::now() + timeout;
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
     loop {
         if let Some(status) = child
             .child
@@ -1493,7 +1486,7 @@ fn wait_for_bounded_pty_child(
                 .terminate_and_wait()
                 .map(|status| (status, false, true));
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return child
                 .terminate_and_wait()
                 .map(|status| (status, true, false));
@@ -1814,7 +1807,7 @@ unsafe extern "C" {
 pub fn execute_cli_command(
     invocation_id: String,
     mut process: Command,
-    timeout_seconds: u64,
+    timeout_seconds: Option<u64>,
     tool_name: &str,
     context: &KernelToolExecutionContext,
     process_scope_id: Option<&str>,
@@ -1909,23 +1902,9 @@ pub fn execute_cli_command(
 
     let wait_result = wait_for_bounded_child(
         &mut child,
-        Duration::from_secs(timeout_seconds),
+        timeout_seconds.map(Duration::from_secs),
         &context.cancellation,
     );
-    let wait_result = wait_result.and_then(|(status, timed_out, cancelled)| {
-        if cancelled {
-            Err(KernelError::Structured {
-                code: "tool_execution_cancelled",
-                stage: "execution",
-                message: format!("{tool_name} was cancelled"),
-                details: serde_json::json!({
-                "toolId": tool_name,
-                }),
-            })
-        } else {
-            Ok((status, timed_out))
-        }
-    });
     let process_cleanup = stop_process(&mut child);
     stop_capture.store(true, AtomicOrdering::Release);
     if let Err(cleanup) = process_cleanup {
@@ -1939,14 +1918,14 @@ pub fn execute_cli_command(
         Ok(streams) => streams,
         Err(error) => return shell_cleanup_failure(wait_result, error),
     };
-    let (status, timed_out) = wait_result?;
+    let (status, timed_out, cancelled) = wait_result?;
     bound_combined_output(&mut stdout, &mut stderr, BASH_OUTPUT_LIMIT_BYTES);
     bound_output_lines(&mut stdout, &mut stderr);
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let captured_bytes = stdout.bytes.len().saturating_add(stderr.bytes.len());
     let truncated = stdout.truncated || stderr.truncated;
     let exit_code = status.code();
-    let success = !timed_out && status.success();
+    let success = !timed_out && !cancelled && status.success();
 
     let mut output = serde_json::json!({
         "stdout": String::from_utf8_lossy(&stdout.bytes),
@@ -1955,7 +1934,14 @@ pub fn execute_cli_command(
         "truncated": truncated, "capturedBytes": captured_bytes, "durationMs": duration_ms,
     });
     archive.finish(&mut output)?;
-    if success {
+    if cancelled {
+        Ok(known_failure(
+            invocation_id,
+            output,
+            "tool_execution_cancelled",
+            format!("{tool_name} was cancelled"),
+        ))
+    } else if success {
         Ok(ok(invocation_id, output))
     } else if timed_out {
         Ok(known_failure(
@@ -1966,7 +1952,10 @@ pub fn execute_cli_command(
                 "bash" => "bash_timed_out",
                 _ => "process_timed_out",
             },
-            format!("{tool_name} command exceeded the {timeout_seconds}-second timeout."),
+            format!(
+                "{tool_name} command exceeded its {}-second timeout.",
+                timeout_seconds.expect("timed out with a deadline")
+            ),
         ))
     } else {
         Ok(known_failure(

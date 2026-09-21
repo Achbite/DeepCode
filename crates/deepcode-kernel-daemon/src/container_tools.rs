@@ -32,7 +32,7 @@ pub(crate) fn input_schema() -> Value {
         "network":{"type":"string","minLength":1,"description":"Docker network for create; defaults to bridge. Use none for offline tests."},
         "command":{"type":"string","minLength":1,"description":"Shell command for exec. Scope is the approved container, including its existing mounts."},
         "cwd":{"type":"string","description":"Absolute container directory for exec. Omit to use the container's configured directory."},
-        "timeout":{"type":"integer","minimum":1,"maximum":1800},
+        "timeout":{"type":"integer","minimum":1,"maximum":4294967295u64,"description":"Optional total runtime limit in seconds. Omit for no time limit."},
         "reason":{"type":"string","minLength":1,"description":"Brief purpose of this access or temporary test environment."}
     }})
 }
@@ -54,8 +54,11 @@ pub(crate) fn parse(value: Value) -> Result<Input, String> {
             );
         }
     }
-    if input.timeout.is_some_and(|n| n == 0 || n > 1800) {
-        return Err("timeout must be 1..1800 seconds".into());
+    if input
+        .timeout
+        .is_some_and(|n| n == 0 || n > u64::from(u32::MAX))
+    {
+        return Err("timeout must be 1..4294967295 seconds".into());
     }
     if input
         .cwd
@@ -130,7 +133,7 @@ impl Containers {
         let result = execute_cli_command(
             "container-metadata".into(),
             self.cli(docker_context, args),
-            15,
+            Some(15),
             "docker",
             &context,
             None,
@@ -244,7 +247,7 @@ impl Containers {
         let mut result = execute_cli_command(
             id.into(),
             self.cli(Some(docker_context), &args),
-            input.timeout.unwrap_or(120),
+            input.timeout,
             "docker",
             context,
             None,
@@ -333,7 +336,7 @@ impl Containers {
         let mut result = execute_cli_command(
             id.into(),
             self.cli(Some(docker_context), &args),
-            input.timeout.unwrap_or(120),
+            input.timeout,
             "docker",
             context,
             None,

@@ -66,7 +66,7 @@ impl WslExecution {
                 settings: settings.clone(),
             },
             &KernelCancellationToken::default(),
-            Duration::from_secs(15),
+            Some(Duration::from_secs(15)),
             KernelProgressSink::default(),
         )
     }
@@ -75,7 +75,7 @@ impl WslExecution {
         &self,
         request: &WorkerRequest,
         cancellation: &KernelCancellationToken,
-        timeout: Duration,
+        timeout: Option<Duration>,
         progress: KernelProgressSink,
     ) -> KernelResult<Value> {
         if !cfg!(windows) {
@@ -124,7 +124,9 @@ impl WslExecution {
                 Ok(None) => {}
             }
             if cancelled_at.is_none()
-                && (write.is_err() || cancellation.is_cancelled() || started.elapsed() > timeout)
+                && (write.is_err()
+                    || cancellation.is_cancelled()
+                    || timeout.is_some_and(|timeout| started.elapsed() > timeout))
             {
                 let _ = stdin.write_all(b"{\"cancel\":true}\n");
                 let _ = stdin.flush();
@@ -233,11 +235,11 @@ impl KernelToolExecutor for WslExecutor {
         let cancellation = context.cancellation.clone();
         let shell_call = matches!(invocation.input.tool_id().as_str(), "bash" | "powershell");
         let progress = context.progress.clone();
-        let timeout = Duration::from_secs(match &invocation.input {
+        let timeout = match &invocation.input {
             deepcode_kernel_tools::kernel_internal::KernelCanonicalInvocation::ProcessShell { timeout, .. }
-            | deepcode_kernel_tools::kernel_internal::KernelCanonicalInvocation::ProcessPowerShell { timeout, .. } => u64::from(*timeout),
-            _ => 120,
-        } + 30);
+            | deepcode_kernel_tools::kernel_internal::KernelCanonicalInvocation::ProcessPowerShell { timeout, .. } => timeout.map(|seconds| Duration::from_secs(u64::from(seconds) + 30)),
+            _ => Some(Duration::from_secs(150)),
+        };
         let shell = self
             .shell
             .clone()

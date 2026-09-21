@@ -129,7 +129,7 @@ fn shell_business_input_preserves_the_script_and_leaves_authority_to_kernel() {
     assert_eq!(command, script);
     assert_eq!(workspace_mode, KernelWorkspaceMode::Read);
     assert_eq!(execution_scope, KernelExecutionScope::Workspace);
-    assert_eq!(timeout, 120);
+    assert_eq!(timeout, None);
     assert!(terminal.is_none());
     assert!(request_host_permission.is_none());
     let script =
@@ -256,4 +256,24 @@ fn file_invocations_keep_bounds_and_distinct_unicode_spelling() {
     };
     assert_eq!(path, "src/generated/main.rs");
     assert_eq!(content, "fn main() {}\n");
+}
+
+#[test]
+fn shell_deadline_is_optional_and_explicit_values_are_preserved() {
+    let registry = KernelToolRegistry::new();
+    for tool in ["bash", "powershell"] {
+        let omitted = registry
+            .canonicalize(tool, json!({"command":"echo ready"}))
+            .unwrap()
+            .executor_arguments();
+        assert!(omitted.get("timeout").is_none());
+        let explicit = registry
+            .canonicalize(tool, json!({"command":"echo ready", "timeout":3600}))
+            .unwrap()
+            .executor_arguments();
+        assert_eq!(explicit["timeout"], 3600);
+        assert!(registry
+            .canonicalize(tool, json!({"command":"echo ready", "timeout":0}))
+            .is_err());
+    }
 }

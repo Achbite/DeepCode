@@ -125,8 +125,8 @@ pub(super) fn provider_schema_for_tool(tool: KernelToolKind) -> Value {
                 "timeout": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": 600,
-                    "description": "Optional wall-clock timeout in seconds. Defaults to 120."
+                    "maximum": 4294967295u64,
+                    "description": "Optional total runtime limit in seconds. Omit for no time limit; cancellation remains available."
                 },
                 "terminal": {
                     "type": "object",

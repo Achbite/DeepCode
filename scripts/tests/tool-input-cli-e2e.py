@@ -48,7 +48,7 @@ class ProviderHandler(fixture.MockProviderHandler):
                     ("read-default", names["read"], {"path": "probe.txt"}),
                     ("unknown-tool", "undeclared_tool", {"path": "probe.txt"}),
                     ("missing-file", names["read"], {"path": "does-not-exist.txt"}),
-                    ("bad-timeout", names["bash"], {"command": "pwd", "timeout": 601}),
+                    ("bad-timeout", names["bash"], {"command": "pwd", "timeout": 0}),
                     ("bad-field", names["edit"], {"path": "probe.txt", "workspaceMode": "write", "edits": [{"oldText": "alpha", "newText": "ALPHA"}]}),
                     ("bad-workspace", names["read"], {"path": "probe.txt", "workspace": "workspace99"}),
                     ("shell-format", names["bash"], {"command": SCRIPT, "requestHostPermission": "Verify the explicitly approved Host Shell and temporary files."}),
@@ -62,7 +62,7 @@ class ProviderHandler(fixture.MockProviderHandler):
                 missing = results["missing-file"]
                 require(missing["outcome"] == "failed" and missing["error"]["code"] == "fs_read_metadata_failed"
                         and "does-not-exist.txt" in missing["error"]["message"], "文件不存在的原始错误丢失")
-                for call_id, path, rule in [("bad-timeout", "$.timeout", "maximum"), ("bad-field", "$.workspaceMode", "additionalProperties")]:
+                for call_id, path, rule in [("bad-timeout", "$.timeout", "minimum"), ("bad-field", "$.workspaceMode", "additionalProperties")]:
                     rejected = results[call_id]
                     require(rejected["status"] == "inputRejected" and rejected["executed"] is False, "非法输入被执行")
                     require(any(issue["path"] == path and issue["rule"] == rule for issue in rejected["error"]["issues"]), "字段诊断没有到达 Provider")

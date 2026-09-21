@@ -1,6 +1,6 @@
 use crate::invocation_types::{
-    default_timeout, KernelCanonicalInvocation, KernelDeleteTarget, KernelExecutionScope,
-    KernelTerminalInput, KernelToolKind, KernelWorkspaceMode,
+    KernelCanonicalInvocation, KernelDeleteTarget, KernelExecutionScope, KernelTerminalInput,
+    KernelToolKind, KernelWorkspaceMode,
 };
 use crate::types::{ToolInputIssue, ToolValidationError};
 use serde::{de::value::MapDeserializer, Deserialize};
@@ -70,8 +70,7 @@ pub fn canonicalize_invocation(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ShellInput {
     command: String,
-    #[serde(default = "default_timeout")]
-    timeout: u32,
+    timeout: Option<u32>,
     terminal: Option<KernelTerminalInput>,
     request_host_permission: Option<String>,
 }
