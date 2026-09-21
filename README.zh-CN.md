@@ -8,11 +8,13 @@ DeepCode 是优先在本机工作的编程 Agent，提供桌面 GUI、用于脚�
 
 按[从源码编译](#从源码编译)生成当前程序包，也可在 [Releases](https://github.com/Achbite/DeepCode/releases) 有对应产物时下载。安装包与解压版的入口如下：
 
-| 平台 | 安装或启动方式 |
-| --- | --- |
+
+| 平台                  | 安装或启动方式                                                                                                     |
+| ------------------- | ----------------------------------------------------------------------------------------------------------- |
 | macOS Apple Silicon | 运行 `DeepCode-<version>-macos-arm64.pkg`，再打开 `/Applications/DeepCode-GUI.app`；解压版直接打开包内的 `DeepCode-GUI.app`。 |
-| Windows x64 | 运行 `DeepCode-<version>-win64-setup.exe`，再从开始菜单打开 DeepCode；解压版打开 `DeepCode-GUI.exe`。 |
-| Linux x64 / ARM64 | 解压对应架构的程序包后运行 `./DeepCode-GUI`。 |
+| Windows x64         | 运行 `DeepCode-<version>-win64-setup.exe`，再从开始菜单打开 DeepCode；解压版打开 `DeepCode-GUI.exe`。                         |
+| Linux x64 / ARM64   | 解压对应架构的程序包后运行 `./DeepCode-GUI`。                                                                             |
+
 
 在 **设置 → 模型与服务** 中添加 API 连接，或登录支持的 Coding Plan。新建对话、选择模型，即可描述任务。项目菜单中的 **管理工作区** 用于配置文件夹和执行环境；Windows 项目可以选择本地 Shell 或 WSL。
 
@@ -40,19 +42,21 @@ Windows Setup 会在缺少 WebView2 Evergreen Runtime 时安装它，解压版�
 先安装 Docker 和 GNU Make。Windows 请在已启用 Docker 集成的 WSL2 中运行构建命令。打包 macOS 还需要宿主机的 Xcode Command Line Tools、`rust-toolchain.toml` 指定的 Rust 工具链和 Node.js。
 
 ```bash
-git clone --branch dev-main https://github.com/Achbite/DeepCode.git
+git clone --branch main https://github.com/Achbite/DeepCode.git
 cd DeepCode
 make shell
 ```
 
 `make shell` 准备开发容器；macOS 上还会启动当前 worktree 的原生构建通道。在容器中执行下列命令，或保持容器运行后从宿主机执行：
 
-| 目标平台 | 编译命令 | 输出目录 |
-| --- | --- | --- |
-| macOS Apple Silicon | `bash ./build.sh --stage package-macos` | `bin/macos-arm64/` |
-| Windows x64 | `bash ./build.sh --stage package-windows` | `bin/win64/` |
-| Linux，与容器架构一致 | `bash ./build.sh --stage package-linux` | `bin/linux-x64/` 或 `bin/linux-arm64/` |
-| 所有可用平台 | `bash ./build.sh` | 上述受支持平台的目录 |
+
+| 目标平台                | 编译命令                                      | 输出目录                                  |
+| ------------------- | ----------------------------------------- | ------------------------------------- |
+| macOS Apple Silicon | `bash ./build.sh --stage package-macos`   | `bin/macos-arm64/`                    |
+| Windows x64         | `bash ./build.sh --stage package-windows` | `bin/win64/`                          |
+| Linux，与容器架构一致       | `bash ./build.sh --stage package-linux`   | `bin/linux-x64/` 或 `bin/linux-arm64/` |
+| 所有可用平台              | `bash ./build.sh`                         | 上述受支持平台的目录                            |
+
 
 共享 TypeScript、GUI、Linux 程序和 Windows 交叉编译都在 Docker 中执行。macOS 原生编译与签名通过通道交给 Mac 宿主。不可用的平台会明确列出，构建错误仍会返回失败。每个平台也会在 `bin/` 生成带版本号的压缩包，macOS 另生成 PKG，Windows 另生成 Setup 安装包。用户配置和会话保存在程序目录之外，不会进入程序包。
 
@@ -66,12 +70,12 @@ make ui-update UI_PACKAGE=bin/macos-arm64
 
 ## 产品介绍
 
-- **处理项目任务：** 读取和修改文件、搜索代码、执行 Bash 或 PowerShell、检查 diff。工作区访问和外部操作遵循配置的权限策略。
-- **查看任务进度：** 任务面板展示 Agent 维护的阶段列表和状态，同类工作可以合并为一个阶段。阶段进度与工具结果、Plan 审批分别呈现。
-- **预览并持续修改：** 通过截图和页面交互检查内置浏览器，选取元素或区域批注，在同一对话中继续修改。原始附件保持只读，可编辑副本可以放在 DeepCode 管理的会话目录中。
-- **使用模型服务：** API 连接与订阅服务分别配置和查看用量。Provider 返回的 Token、缓存计数与上下文估算分开呈现。
-- **扩展工具与界面：** 通过 Skill、CLI 工具、MCP 和 UI 插件扩展能力。Agent 可以发现并激活可用插件，用户也可以显式引用。外部电脑控制目前支持 macOS，每次调用需要额外授权。
-- **生成与阅读文档：** 生成 HTML、Markdown、PDF 产物。文件阅读器展示文本源码和 PDF，HTML 页面可在内置浏览器中打开。PDF 阅读使用内置 Web 阅读器，PDF 生成需要安装[文档运行环境](skills/deepcode-documents/SKILL.md)。
+- <strong>处理项目任务：</strong> 读取和修改文件、搜索代码、执行 Bash 或 PowerShell、检查 diff。工作区访问和外部操作遵循配置的权限策略。
+- <strong>查看任务进度：</strong> 任务面板展示 Agent 维护的阶段列表和状态，同类工作可以合并为一个阶段。阶段进度与工具结果、Plan 审批分别呈现。
+- <strong>预览并持续修改：</strong> 通过截图和页面交互检查内置浏览器，选取元素或区域批注，在同一对话中继续修改。原始附件保持只读，可编辑副本可以放在 DeepCode 管理的会话目录中。
+- <strong>使用模型服务：</strong> API 连接与订阅服务分别配置和查看用量。Provider 返回的 Token、缓存计数与上下文估算分开呈现。
+- <strong>扩展工具与界面：</strong> 通过 Skill、CLI 工具、MCP 和 UI 插件扩展能力。Agent 可以发现并激活可用插件，用户也可以显式引用。外部电脑控制目前支持 macOS，每次调用需要额外授权。
+- <strong>生成与阅读文档：</strong> 生成 HTML、Markdown、PDF 产物。文件阅读器展示文本源码和 PDF，HTML 页面可在内置浏览器中打开。PDF 阅读使用内置 Web 阅读器，PDF 生成需要安装[文档运行环境](skills/deepcode-documents/SKILL.md)。
 
 工作区数据、会话日志和工具执行保留在本机。选中的提示词、上下文和图片会发送给配置的模型服务；如果模型服务也在本机运行，则无需发送到远程 Provider。
 
