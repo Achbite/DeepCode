@@ -69,11 +69,12 @@ def assemble(args):
     names = {'deepcode-kernel-daemon': 'deepcode-kernel', 'deepcode-first-party-provider': 'deepcode-first-party-provider', 'deepcode-host-web': 'deepcode-host-web', 'deepcode-cli': 'deepcode-cli', 'deepcode-tui': 'deepcode-tui', 'DeepCode-GUI': 'DeepCode-GUI'}
     for source, target in names.items():
         destination = binaries / (target + suffix)
-        shutil.copy2(args.native / (source + suffix), destination)
-        if macos:
-            subprocess.run(['strip', '-x', str(destination)], check=True)
+        if windows:
+            # Avoid strip's in-place copy-back on Windows-mounted staging directories.
+            subprocess.run(['x86_64-w64-mingw32-strip', '--strip-unneeded', '-o', str(destination), str(args.native / (source + suffix))], check=True)
         else:
-            subprocess.run(['x86_64-w64-mingw32-strip' if windows else 'strip', '--strip-unneeded', str(destination)], check=True)
+            shutil.copy2(args.native / (source + suffix), destination)
+            subprocess.run(['strip', '-x' if macos else '--strip-unneeded', str(destination)], check=True)
     node = resources / 'node/bin' / ('node.exe' if windows else 'node')
     node.parent.mkdir(parents=True)
     shutil.copy2(args.node, node)

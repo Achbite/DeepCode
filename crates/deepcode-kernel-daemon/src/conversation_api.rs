@@ -1270,8 +1270,9 @@ fn save_input_resource(
         return Err("conversation_session_not_found".into());
     }
     let key = json!([session_id, input_id]).to_string();
-    let reference_id = format!("input-{}", reference_storage_segment(&key));
-    let workspace_id = format!("input-workspace-{}", reference_storage_segment(&key));
+    let key_hash = deepcode_kernel_tools::hash_bytes(key.as_bytes());
+    let reference_id = format!("input-{key_hash}");
+    let workspace_id = format!("input-workspace-{key_hash}");
     let root = session_attachment_root(&gui.paths.attachment_store_root, session_id)
         .join(reference_storage_segment(&reference_id));
     let target = root.join("user-input.txt");
@@ -1926,7 +1927,13 @@ fn session_attachment_root(root: &FsPath, session_id: &str) -> PathBuf {
 }
 
 fn reference_storage_segment(value: &str) -> String {
-    deepcode_kernel_tools::hash_bytes(value.as_bytes())
+    let hash = deepcode_kernel_tools::hash_bytes(value.as_bytes());
+    if cfg!(windows) {
+        hash.replace(':', "-")
+    } else {
+        // Retain existing on-disk paths on platforms that allow colons.
+        hash
+    }
 }
 
 fn bounded_display_name(value: &str) -> String {
