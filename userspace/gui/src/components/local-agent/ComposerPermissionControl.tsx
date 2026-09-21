@@ -106,7 +106,6 @@ export function ComposerPermissionControl({ language, composer }: { language: Ui
         {rows.map(row => <button key={row.key} type="button" className="local-agent__permission-row" disabled={busy} onClick={() => setPage(row)}>
           <span>{t(language, row.label)}</span><span>{t(language, row.values.find(([value]) => value === settings[row.key])![1])}<DeepCodeShellIcon name="chevronRight" /></span>
         </button>)}
-        <div className="local-agent__permission-caption">{t(language, sessionId ? 'agent.permission.currentTask' : 'agent.permission.newTasks')}</div>
         {grants.length > 0 && <button type="button" className="local-agent__permission-row" onClick={() => setPage('grants')}>
           <span>{t(language, 'agent.permission.runGrants')}</span><span>{grants.length}<DeepCodeShellIcon name="chevronRight" /></span>
         </button>}

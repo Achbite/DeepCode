@@ -1969,7 +1969,6 @@
 .local-agent__permission-option small { display: block; margin-top: 5px; color: var(--dc-muted); font-size: var(--dc-font-caption); line-height: 1.6; }
 .local-agent__permission-radio { width: 16px; height: 16px; flex: none; margin-top: 2px; border: 1px solid var(--dc-border-strong); border-radius: 50%; box-sizing: border-box; }
 .local-agent__permission-option[aria-checked=true] .local-agent__permission-radio { border: 5px solid var(--dc-muted); }
-.local-agent__permission-caption { margin: 8px 10px 4px; color: var(--dc-muted); font-size: var(--dc-font-micro); }
 .local-agent__permission-grants { display: grid; gap: 12px; margin: 4px 10px; font-size: var(--dc-font-caption); }
 .local-agent__permission-grants > div { display: flex; align-items: flex-start; gap: 12px; }
 .local-agent__permission-grants span { min-width: 0; flex: 1; overflow-wrap: anywhere; white-space: pre-wrap; }

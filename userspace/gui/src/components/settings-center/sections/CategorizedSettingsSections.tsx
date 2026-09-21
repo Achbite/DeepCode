@@ -209,7 +209,7 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
     t(language, 'settings.commandDenylist.title'), t(language, 'settings.commandDenylist.description'));
   const runtimeRootsMatch = category === 'permissions' && matchesSettingsQuery(query, t(language, 'settings.runtimeReadRoots.title'), t(language, 'settings.runtimeReadRoots.description'));
   const commandRulesMatch = category === 'permissions' && matchesSettingsQuery(query,
-    t(language, 'settings.commandRules.title'), t(language, 'settings.commandRules.description'));
+    t(language, 'settings.commandRules.title'));
   const onChange = (key: string, value: UserSettingValue) => {
     return patchUserSetting(key, value);
   };

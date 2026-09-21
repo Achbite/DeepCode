@@ -11,7 +11,7 @@ export default function CommandRuleSettings({ language }: { language: UiLanguage
   const [busy, setBusy] = useState(false);
   const target = useSettingsSearchTarget('agent.permissions.commandRules');
   useSettingsSearchEntries('command-rules', [{ id: 'agent.permissions.commandRules', category: 'permissions',
-    title: t(language, 'settings.commandRules.title'), keywords: t(language, 'settings.commandRules.description') }]);
+    title: t(language, 'settings.commandRules.title') }]);
   let rules;
   try { rules = decodeShellCommandRules(value); }
   catch (error) { return <p role="alert">{String(error)}</p>; }
@@ -25,7 +25,6 @@ export default function CommandRuleSettings({ language }: { language: UiLanguage
   };
   return <div ref={target} tabIndex={-1} className="settings-command-rules">
     <strong>{t(language, 'settings.commandRules.title')}</strong>
-    <p>{t(language, 'settings.commandRules.description')}</p>
     {!rules.length && <p>{t(language, 'settings.commandRules.empty')}</p>}
     {rules.map((rule, index) => <div key={JSON.stringify(rule.context)} className="settings-command-rule">
       <details><summary><code>{String(rule.context.command)}</code></summary>
