@@ -1,3 +1,4 @@
+import { isManagedProcessSnapshot } from '@deepcode/protocol';
 import { isSessionAuthorizationScope } from '@deepcode/protocol';
 import { permissionSettings } from '@deepcode/protocol';
 import { SESSION_EVENT_VERSION } from '@deepcode/protocol';
@@ -185,6 +186,17 @@ function admitEvent(snapshot: LoopSnapshot, event: NewSessionEvent): void {
     case 'run.runtime.released': {
       const view = state.runToolViews[event.runId] ?? state.runRuntimeSnapshots[event.runId];
       if (event.payload.pluginInstanceRefs.length !== view.selectedPlugins.plugins.length) throw new Error('run_runtime_release_plugin_mismatch');
+      break;
+    }
+    case 'process.updated': {
+      const job = event.payload.job;
+      const request = events.find(item => item.type === 'tool.requested' && item.callId === event.callId && item.runId === event.runId);
+      const previous = state.processes[job.jobId];
+      if (!isManagedProcessSnapshot(job) || job.sessionId !== event.sessionId || job.runId !== event.runId
+        || job.callId !== event.callId || request?.type !== 'tool.requested' || request.payload.toolName !== 'process'
+        || previous && (previous.callId !== job.callId || previous.revision >= job.revision || previous.status !== 'active')) {
+        throw new Error('managed_process_event_invalid');
+      }
       break;
     }
     case 'tool.started':

@@ -366,6 +366,7 @@ impl LocalAgentRuntime {
                     .with_plugin_settings(settings.clone())
                     .with_computer_use(plugin_selection.computer_use_instance())
                     .with_containers(plugin_selection.container_instance())
+                    .with_processes(plugin_selection.process_instance())
                     .with_browser_binding(environment.get("hostBinding").cloned().map(
                         |mut binding| {
                             binding["sessionId"] = json!(request.session_id);
@@ -937,6 +938,34 @@ pub(crate) async fn local_agent_tool_cancel(
     {
         Ok(reply) => ApiResponse::ok(reply),
         Err(error) => kernel_error(error),
+    }
+}
+
+pub(crate) async fn local_agent_processes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::managed_processes::ReadRequest>,
+) -> Json<ApiResponse> {
+    if let Err(response) = require_session_service(&state, &headers) {
+        return response;
+    }
+    let jobs = state.local_agent.kernel.jobs.clone();
+    match tokio::task::spawn_blocking(move || {
+        if body.cancel {
+            jobs.cancel_run(&body.session_id, &body.run_id)?;
+        }
+        jobs.snapshots(
+            &body.session_id,
+            &body.run_id,
+            &body.revisions,
+            body.wait_ms,
+        )
+    })
+    .await
+    {
+        Ok(Ok(jobs)) => ApiResponse::ok(json!({"jobs":jobs})),
+        Ok(Err(error)) => ApiResponse::error("managed_process_failed", error),
+        Err(error) => ApiResponse::error("managed_process_join_failed", error.to_string()),
     }
 }
 

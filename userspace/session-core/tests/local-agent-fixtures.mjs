@@ -130,6 +130,7 @@ export function emptyKernel(overrides = {}) {
     async execute() { throw new Error('unexpected_tool_execution'); },
     async cancel(callId, attemptId) { return cancelNotFound(callId, attemptId); },
     async readRecord() { return null; },
+    async readProcesses() { throw new Error('unexpected_process_read'); },
     ...overrides,
   };
 }

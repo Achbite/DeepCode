@@ -1,9 +1,10 @@
-import { isSessionAuthorizationScope } from '@deepcode/protocol';
+import { isManagedProcessSnapshot, isSessionAuthorizationScope } from '@deepcode/protocol';
 import { advanceTodoList } from './todoState.js';
 import { providerTextStreamId } from './streamIdentity.js';
 import { activeConversationEvents } from './conversationHistory.js';
 import type {
   ActivityProjection,
+  ManagedProcessSnapshot,
   AssistantDraftProjection,
   ArtifactProjection,
   JsonObject,
@@ -65,6 +66,7 @@ export interface SessionState {
   providerCallFacts: Record<string, ProviderCallFactState>;
   run: SessionProjection['run'];
   activities: Record<string, ActivityProjection>;
+  processes: Record<string, ManagedProcessSnapshot>;
   artifacts: Record<string, ArtifactProjection>;
   terminalError: SessionProjection['terminalError'];
 }
@@ -136,6 +138,7 @@ export function emptySessionState(sessionId: string): SessionState {
     providerCallFacts: {},
     run: null,
     activities: {},
+    processes: {},
     artifacts: {},
     terminalError: null,
   };
@@ -627,6 +630,11 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         inputRejection: structuredClone(event.payload.rejection.error),
       };
       break;
+    case 'process.updated': {
+      next.processes = { ...next.processes, [event.payload.job.jobId]: structuredClone(event.payload.job) };
+      projectProcess(next, event.payload.job);
+      break;
+    }
     case 'tool.completed': {
       if (next.pendingApproval?.callId === event.callId) {
         settleActivity(next, approvalActivityId(next.pendingApproval.approvalId), 'completed');
@@ -643,6 +651,17 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         ...next.activities[toolActivityId(event.callId)],
         tool,
       };
+      const record = event.payload.record;
+      if (record.preparedEffect.providerRef === 'deepcode:processes' && record.input.action === 'start'
+        && record.outcome === 'completed' && isRecord(record.output)) {
+        const initial = record.output.job;
+        if (isManagedProcessSnapshot(initial) && initial.callId === event.callId && initial.runId === event.runId
+          && initial.sessionId === event.sessionId && !next.processes[initial.jobId]) {
+          next.processes = { ...next.processes, [initial.jobId]: structuredClone(initial) };
+        }
+      }
+      const job = Object.values(next.processes).find(job => job.callId === event.callId);
+      if (job) projectProcess(next, job);
       next.artifacts = { ...next.artifacts };
       for (const artifact of artifacts) {
         next.artifacts[artifact.artifactId] = artifact;
@@ -1867,6 +1886,30 @@ function settleActivity(
   state.activities = { ...state.activities, [activityId]: { ...activity, status } };
 }
 
+function projectProcess(state: SessionState, job: ManagedProcessSnapshot): void {
+  const id = toolActivityId(job.callId);
+  const previous = state.activities[id];
+  if (!previous) throw new Error('managed_process_call_missing');
+  const activity: ActivityProjection = { ...previous, status: job.status, startedAt: job.startedAt,
+    tool: { recordId: previous.tool?.recordId, operation: job.toolName,
+      resources: job.targets.map(label => ({kind: 'logicalTarget', label})),
+      process: { jobId: job.jobId, command: job.command, output: structuredClone(job.output) },
+      ...(job.error ? { error: structuredClone(job.error) } : {}) } };
+  delete activity.liveOutput;
+  if (job.status === 'active') activity.liveOutput = structuredClone(job.output);
+  if (job.result != null) {
+    const result = job.result;
+    if (isRecord(result) && (result.exitCode === null || Number.isSafeInteger(result.exitCode))
+      && isNaturalSafeInteger(result.durationMs) && typeof result.timedOut === 'boolean') {
+      activity.tool!.process!.result = { exitCode: result.exitCode as number | null,
+        durationMs: result.durationMs, timedOut: result.timedOut };
+    } else {
+      activity.tool!.projectionError = {code: 'process_result_projection_invalid', message: '进程结果详情无法显示；原始记录已保留。'};
+    }
+  }
+  state.activities = { ...state.activities, [id]: activity };
+}
+
 class ToolDetailProjectionError extends Error {}
 
 function projectToolRecord(record: ToolExecutionRecord): {
@@ -1910,7 +1953,7 @@ function projectToolRecord(record: ToolExecutionRecord): {
       }
       return { kind: 'logicalTarget' as const, label: target };
     });
-    if (['bash', 'powershell'].includes(record.toolName)) tool.shell = projectShellActivity(record);
+    if (['bash', 'powershell'].includes(preparedEffect.operation)) tool.shell = projectShellActivity(record);
     Object.assign(tool, projectFileChanges(record));
     artifacts = artifactsFromRecord(record);
   } catch (error) {
@@ -1943,7 +1986,7 @@ function projectShellActivity(
   }
   const output = record.outcome === 'completed'
     ? record.output
-    : record.outcome === 'failed'
+    : record.outcome === 'failed' || record.outcome === 'indeterminate'
       ? record.output
       : undefined;
   // Kernel failures before a process result exists carry diagnostics (or null),

@@ -1777,7 +1777,7 @@
         "runId": { "$ref": "#/$defs/Id" },
         "callId": { "$ref": "#/$defs/Id" },
         "type": {
-          "enum": ["session.created", "session.directory-index.attached", "session.directory-index.detached", "input.accepted", "run.started", "message.committed", "message.feedback.updated", "narrative.committed", "interaction.requested", "interaction.resolved", "plan.published", "plan.confirmed", "plan.revision.requested", "plan.superseded", "plan.cancelled", "plan.invalidated", "todo.updated", "tool.requested", "tool.started", "approval.requested", "approval.resolved", "tool.completed", "session.control.rejected", "context.compaction.requested", "context.compacted", "context.composed", "provider.turn.settled", "context.updated", "run.waiting", "run.finishing", "run.runtime.released", "run.runtime.release_failed", "run.settled", "session.permissions.updated", "approval.revoked", "approval.reviewed"]
+          "enum": ["session.created", "session.directory-index.attached", "session.directory-index.detached", "input.accepted", "run.started", "message.committed", "message.feedback.updated", "narrative.committed", "interaction.requested", "interaction.resolved", "plan.published", "plan.confirmed", "plan.revision.requested", "plan.superseded", "plan.cancelled", "plan.invalidated", "todo.updated", "tool.requested", "tool.started", "approval.requested", "approval.resolved", "tool.completed", "process.updated", "session.control.rejected", "context.compaction.requested", "context.compacted", "context.composed", "provider.turn.settled", "context.updated", "run.waiting", "run.finishing", "run.runtime.released", "run.runtime.release_failed", "run.settled", "session.permissions.updated", "approval.revoked", "approval.reviewed"]
         },
         "payload": { "$ref": "#/$defs/JsonObject" }
       },
@@ -1786,7 +1786,7 @@
           "if": {
             "properties": {
               "type": {
-                "enum": ["run.started", "narrative.committed", "interaction.requested", "interaction.resolved", "plan.published", "plan.confirmed", "plan.revision.requested", "plan.superseded", "plan.cancelled", "plan.invalidated", "todo.updated", "tool.requested", "tool.started", "approval.requested", "approval.resolved", "tool.completed", "session.control.rejected", "context.compaction.requested", "context.compacted", "context.composed", "provider.turn.settled", "context.updated", "run.waiting", "run.finishing", "run.runtime.released", "run.runtime.release_failed", "run.settled", "approval.revoked", "approval.reviewed"]
+                "enum": ["run.started", "narrative.committed", "interaction.requested", "interaction.resolved", "plan.published", "plan.confirmed", "plan.revision.requested", "plan.superseded", "plan.cancelled", "plan.invalidated", "todo.updated", "tool.requested", "tool.started", "approval.requested", "approval.resolved", "tool.completed", "process.updated", "session.control.rejected", "context.compaction.requested", "context.compacted", "context.composed", "provider.turn.settled", "context.updated", "run.waiting", "run.finishing", "run.runtime.released", "run.runtime.release_failed", "run.settled", "approval.revoked", "approval.reviewed"]
               }
             }
           },
@@ -1834,7 +1834,7 @@
           "if": {
             "properties": {
               "type": {
-                "enum": ["interaction.requested", "plan.published", "plan.confirmed", "plan.revision.requested", "plan.cancelled", "tool.requested", "tool.started", "approval.requested", "approval.resolved", "tool.completed", "session.control.rejected", "approval.reviewed"]
+                "enum": ["interaction.requested", "plan.published", "plan.confirmed", "plan.revision.requested", "plan.cancelled", "tool.requested", "tool.started", "approval.requested", "approval.resolved", "tool.completed", "process.updated", "session.control.rejected", "approval.reviewed"]
               }
             }
           },

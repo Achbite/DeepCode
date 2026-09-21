@@ -544,6 +544,19 @@ pub(crate) fn render_tool_activity(
         for error in tool.error.iter().chain(&tool.projection_error) {
             writeln!(out, "  {}: {}", error.code, error.message)?;
         }
+        if let Some(process) = &tool.process {
+            writeln!(out, "  $ {}", process.command)?;
+            if activity.status != "active" {
+                render_live_tool_output(out, &process.output, None)?;
+            }
+            if let Some(result) = &process.result {
+                writeln!(
+                    out,
+                    "  exit={:?} · {} ms · timedOut={}",
+                    result.exit_code, result.duration_ms, result.timed_out
+                )?;
+            }
+        }
         if let Some(shell) = tool.shell.as_ref() {
             writeln!(out, "  $ {}", shell.command)?;
             writeln!(out, "  cwd: {}", shell.cwd)?;

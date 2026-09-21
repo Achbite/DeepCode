@@ -99,6 +99,7 @@ enum PluginContribution {
     Skill,
     Host,
     Container,
+    Process,
     Mcp { plugin_uri: String },
 }
 
@@ -173,6 +174,13 @@ impl ResolvedPluginSelection {
         self.plugins
             .iter()
             .find(|plugin| matches!(plugin.contribution, PluginContribution::Host))
+            .map(|plugin| plugin.plugin_instance_ref.clone())
+    }
+
+    pub(crate) fn process_instance(&self) -> Option<String> {
+        self.plugins
+            .iter()
+            .find(|plugin| matches!(plugin.contribution, PluginContribution::Process))
             .map(|plugin| plugin.plugin_instance_ref.clone())
     }
 
@@ -487,6 +495,32 @@ fn plugin_catalog(
             tool_prompt_provider: None,
             contribution: PluginContribution::Container,
             implementation: json!({"host":"native","plugin":"containers"}),
+            content: Arc::from(guide.as_bytes()),
+        }),
+    )?;
+    let uri = "plugin://processes@builtin";
+    let guide = include_str!("../../../plugins/processes/README.md");
+    insert_plugin_source(
+        &mut sources,
+        PluginCatalogEntry::Loaded(PluginSource {
+            public: PublicPluginCatalogItem {
+                uri: uri.into(),
+                display_name: "Processes".into(),
+                short_description: "托管长时间命令、等待结果或并行处理独立工作。".into(),
+                icon_ref: None,
+                management: Some(json!({"key":"plugins.disabled","id":uri})),
+                activation_media_types: vec![],
+                enabled: !disabled_plugins.iter().any(|id| id == uri),
+                available: !disabled_plugins.iter().any(|id| id == uri),
+                error: None,
+            },
+            plugin_artifact_ref: crate::utils::new_runtime_ref("plugin-artifact")?,
+            plugin_instance_ref: String::new(),
+            capability_refs: vec!["host:processes".into()],
+            capability_summary: "Start run-owned commands, wait for results, or cancel them. Status is delivered automatically; do independent work or wait before dependent actions.".into(),
+            tool_prompt_provider: None,
+            contribution: PluginContribution::Process,
+            implementation: json!({"host":"native","plugin":"processes"}),
             content: Arc::from(guide.as_bytes()),
         }),
     )?;

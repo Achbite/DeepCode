@@ -958,6 +958,7 @@ fn validate_new_event(
         "approval.revoked",
         "approval.reviewed",
         "tool.completed",
+        "process.updated",
         "tool.input-rejected",
         "tool.interrupted",
         "session.control.rejected",
@@ -1006,6 +1007,7 @@ fn validate_new_event(
             | "approval.resolved"
             | "approval.reviewed"
             | "tool.completed"
+            | "process.updated"
             | "tool.input-rejected"
             | "tool.interrupted"
             | "session.control.rejected"
@@ -1170,6 +1172,25 @@ fn validate_new_event(
                     ));
                 }
             }
+        }
+        "process.updated" => {
+            let job = &event["payload"]["job"];
+            if !job.is_object()
+                || job["sessionId"] != event["sessionId"]
+                || job["runId"] != event["runId"]
+                || job["callId"] != event["callId"]
+                || job["revision"].as_u64().is_none_or(|v| v == 0)
+                || !matches!(
+                    job["status"].as_str(),
+                    Some("active" | "completed" | "failed" | "cancelled")
+                )
+            {
+                return Err(LocalAgentStoreError::new(
+                    "managed_process_snapshot_invalid",
+                    "Managed process identity or status is invalid.",
+                ));
+            }
+            validate_id("jobId", required_string(job, "jobId")?)?;
         }
         "tool.started" => {
             let payload = &event["payload"];
@@ -2120,6 +2141,7 @@ fn validate_event_references(
         Some(
             "tool.started"
                 | "tool.completed"
+                | "process.updated"
                 | "tool.input-rejected"
                 | "tool.interrupted"
                 | "approval.requested"

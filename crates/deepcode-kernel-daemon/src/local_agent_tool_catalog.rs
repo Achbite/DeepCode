@@ -51,6 +51,7 @@ enum ToolExecutorBinding {
     },
     Mcp(Box<McpTool>),
     Product(Arc<ProductTools>),
+    Process,
     Browser(Value),
     Container(Arc<crate::container_tools::Containers>),
     Document {
@@ -80,6 +81,7 @@ type ExactDisposer = Box<dyn FnOnce() -> Result<(), ToolCatalogError> + Send>;
 pub(crate) enum PreparedToolInput {
     Builtin(KernelCanonicalInvocation),
     Document(DocumentInput),
+    Process(crate::managed_processes::Input),
     Container {
         input: crate::container_tools::Input,
         target: Value,
@@ -94,6 +96,9 @@ impl PreparedToolInput {
     pub(crate) fn arguments(&self) -> Value {
         match self {
             Self::Builtin(input) => input.executor_arguments(),
+            Self::Process(input) => {
+                json!({"action":input.action,"jobId":input.job_id,"waitSeconds":input.wait_seconds})
+            }
             Self::Container { input, target } => json!({"request":input,"target":target}),
             Self::Document(input) => serde_json::to_value(input).expect("DocumentInput serializes"),
             Self::Dynamic { arguments, .. } => arguments.clone(),
@@ -116,6 +121,7 @@ impl PreparedToolInput {
                 KernelCanonicalInvocation::WebFetch { url, .. } => vec![url.clone()],
                 KernelCanonicalInvocation::WebSearch { .. } => Vec::new(),
             },
+            Self::Process(_) => vec![],
             Self::Container { .. } => vec![".".into()],
             Self::Document(input) => vec![input.path.clone()],
             Self::Dynamic { targets, .. } => targets.clone(),
@@ -216,6 +222,15 @@ impl ToolProvider for ProductToolProvider {
                     binding: ToolExecutorBinding::Browser(binding.clone()),
                 });
             }
+        }
+        if let Some(instance) = &self.0.process_instance {
+            tools.push(PendingToolContribution {
+                origin: "extension", provider_ref: "deepcode:processes".into(), plugin_uri: Some("plugin://processes@builtin".into()),
+                plugin_instance_ref: Some(instance.clone()), contribution_ref: format!("{instance}/process"),
+                name: "process".into(), description: "Manage long-running commands in this run. start returns a jobId after normal Kernel approval; use wait when later work depends on the result, status for inspection, or cancel to stop that job. Status changes arrive automatically. Container jobs require the containers plugin. Existing permissions and explicit timeouts still apply.".into(),
+                input_schema: crate::managed_processes::schema(), effect_class: None, effect_scope: CatalogEffectScope::Process,
+                availability: ToolAvailability::Callable, logical_target: None, binding: ToolExecutorBinding::Process,
+            });
         }
         Ok(InstalledToolProvider {
             tools,
@@ -604,6 +619,19 @@ impl ToolCatalogSnapshot {
         )
     }
 
+    pub(crate) fn binding_for_name(
+        self: &Arc<Self>,
+        name: &str,
+    ) -> Result<PreparedCatalogBinding, ToolCatalogError> {
+        let entry = self.tools.get(name).ok_or_else(|| {
+            ToolCatalogError::new(
+                "tool_not_found",
+                format!("Execution tool {name} is not activated"),
+            )
+        })?;
+        self.binding(&entry.binding_ref, name)
+    }
+
     pub(crate) fn binding(
         self: &Arc<Self>,
         binding_ref: &str,
@@ -693,6 +721,10 @@ impl PreparedCatalogBinding {
         &self.entry().name
     }
 
+    pub(crate) fn is_process(&self) -> bool {
+        matches!(&self.entry().binding, ToolExecutorBinding::Process)
+    }
+
     pub(crate) fn container_adapter(&self) -> Option<&crate::container_tools::Containers> {
         match &self.entry().binding {
             ToolExecutorBinding::Container(adapter) => Some(adapter),
@@ -722,6 +754,9 @@ impl PreparedCatalogBinding {
         &self,
         input: &Value,
     ) -> Result<CatalogEffectScope, ToolCatalogError> {
+        if self.is_process() {
+            return Ok(CatalogEffectScope::LocalRead);
+        }
         if let ToolExecutorBinding::Browser(host) = &self.entry().binding {
             let action = input["action"].as_str().unwrap_or("");
             let network = |url: &str| {
@@ -782,6 +817,9 @@ impl PreparedCatalogBinding {
         raw_arguments: Value,
     ) -> Result<PreparedToolInput, ToolCatalogError> {
         match &self.entry().binding {
+            ToolExecutorBinding::Process => crate::managed_processes::parse(raw_arguments)
+                .map(PreparedToolInput::Process)
+                .map_err(|message| ToolCatalogError::new("tool_input_invalid", message)),
             ToolExecutorBinding::Builtin { registry, .. } => registry
                 .canonicalize(self.tool_name(), raw_arguments)
                 .map(PreparedToolInput::Builtin)

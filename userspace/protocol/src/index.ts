@@ -9,3 +9,5 @@ export * from './localAgent.js';
 export { isErrorDiagnostics, isLocalAgentErrorValue } from './errorDiagnostics.js';
 
 export * from './permissions.js';
+
+export * from './processes.js';

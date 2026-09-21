@@ -31,6 +31,7 @@ mod local_agent_search;
 mod local_agent_store;
 mod local_agent_tool_catalog;
 mod local_agent_tool_prompts;
+mod managed_processes;
 mod model_auth;
 mod model_connections;
 mod model_usage;

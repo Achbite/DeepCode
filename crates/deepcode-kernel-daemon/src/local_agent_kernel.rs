@@ -395,6 +395,7 @@ pub(crate) struct LocalAgentKernel {
     resolver: Arc<dyn WorkspaceResolverPort>,
     generations: Arc<Mutex<KernelGenerationState>>,
     active: Arc<Mutex<HashMap<String, ActiveCall>>>,
+    pub(crate) jobs: crate::managed_processes::Jobs,
 }
 
 #[derive(Clone)]
@@ -530,6 +531,7 @@ impl LocalAgentKernel {
                 released_run_bindings: HashMap::new(),
             })),
             active: Arc::new(Mutex::new(HashMap::new())),
+            jobs: Default::default(),
         })
     }
 
@@ -659,6 +661,9 @@ impl LocalAgentKernel {
             ));
         }
         self.cancel_and_drain_attempts(Some((&request.session_id, &request.run_id)))?;
+        self.jobs
+            .release_run(&request.session_id, &request.run_id)
+            .map_err(|e| LocalAgentKernelError::new("managed_process_cleanup_failed", e))?;
         let already_released = {
             let mut state = self.lock_generations()?;
             if let Some(released) = state.released_run_bindings.get(&key) {
@@ -764,7 +769,7 @@ impl LocalAgentKernel {
         let admission = self.admit(&request, &prepared)?;
         match admission {
             Admission::ApprovalRequired => {
-                let mut preview = prepared.preview(&request.tool_name);
+                let mut preview = prepared.preview(&prepared.operation);
                 if is_shell_tool(&prepared.operation)
                     || prepared.binding.container_adapter().is_some()
                 {
@@ -851,6 +856,10 @@ impl LocalAgentKernel {
                         None,
                     ),
                     (Some(ActivePhase::Executing), result) => {
+                        let output = result
+                            .as_ref()
+                            .and_then(|value| value.as_ref().ok())
+                            .map(|value| value.output.clone());
                         let failure = match result {
                             Some(Err(message)) => Some(message),
                             Some(Ok(result)) => result
@@ -870,7 +879,7 @@ impl LocalAgentKernel {
                             &started_at,
                             &completed_at,
                             "indeterminate",
-                            None,
+                            output,
                             Some(json!({
                                 "code": "tool_effect_outcome_unknown",
                                 "message": message,
@@ -982,6 +991,9 @@ impl LocalAgentKernel {
 
     pub(crate) fn shutdown_plugins(&self) -> Result<(), LocalAgentKernelError> {
         self.cancel_and_drain_attempts(None)?;
+        self.jobs
+            .shutdown()
+            .map_err(|e| LocalAgentKernelError::new("managed_process_cleanup_failed", e))?;
         let generations = {
             let state = self.lock_generations()?;
             let mut generations = Vec::new();
@@ -1081,6 +1093,37 @@ impl LocalAgentKernel {
                 format!("Kernel 工具 {} 当前被阻止，不能执行。", request.tool_name),
             ));
         }
+        if binding.is_process() {
+            let input = crate::managed_processes::parse(request.input.clone())
+                .map_err(|message| LocalAgentKernelError::input("$", "shape", &message, None))?;
+            if input.action == "start" {
+                let mut inner = request.clone();
+                inner.tool_name = input.tool.expect("validated start tool");
+                inner.tool_binding_ref = generation
+                    .catalog
+                    .binding_for_name(&inner.tool_name)
+                    .map_err(catalog_error)?
+                    .binding_ref()
+                    .to_owned();
+                inner.input = input.input.expect("validated start input");
+                if inner.input.get("workspaceId").is_some()
+                    || inner.input.get("workspace").is_some()
+                {
+                    return Err(LocalAgentKernelError::input(
+                        "$.input",
+                        "workspace",
+                        "Select workspace on the process call, not inside input.",
+                        None,
+                    ));
+                }
+                if let Some(workspace_id) = input.workspace_id {
+                    inner.input["workspaceId"] = json!(workspace_id);
+                }
+                let mut prepared = self.prepare_tool(&inner)?;
+                prepared.source_binding = Some(binding);
+                return Ok(prepared);
+            }
+        }
         let scope = match binding
             .effect_scope(&request.input)
             .map_err(catalog_error)?
@@ -1137,6 +1180,13 @@ impl LocalAgentKernel {
         } else {
             RequestedFiles::default()
         };
+        // Controls address the already admitted job; the Provider's default workspace selector is unused.
+        if binding.is_process() {
+            tool_input
+                .as_object_mut()
+                .expect("validated process input")
+                .remove("workspaceId");
+        }
         let workspace_id = match scope {
             PreparedEffectScope::WorkspaceRead
             | PreparedEffectScope::WorkspaceMutation
@@ -1319,6 +1369,7 @@ impl LocalAgentKernel {
             permissions: LocalAgentPermissionPolicy::from_settings(&effective_settings)?,
             generation,
             binding,
+            source_binding: None,
             scope,
             workspace_id,
             operation: request.tool_name.clone(),
@@ -1977,6 +2028,60 @@ impl LocalAgentKernel {
         cancellation: KernelCancellationToken,
         progress: deepcode_kernel_runtime::executors::KernelProgressSink,
     ) -> Result<KernelToolExecutionResult, String> {
+        if prepared.source_binding.is_some() {
+            let kernel = self.clone();
+            let mut inner = prepared.clone();
+            inner.source_binding = None;
+            let invocation_id = request.attempt_id.clone();
+            let request = request.clone();
+            let authority = authority.clone();
+            // Hold the catalog until the spawned invocation has released every owned resource.
+            let lease = inner.binding.begin_attempt();
+            let command = match &inner.input {
+                PreparedToolInput::Builtin(
+                    KernelCanonicalInvocation::ProcessShell { command, .. }
+                    | KernelCanonicalInvocation::ProcessPowerShell { command, .. },
+                ) => Some(command.as_str()),
+                PreparedToolInput::Container { input, .. } => input.command.as_deref(),
+                _ => None,
+            }
+            .ok_or("Managed command missing")?;
+            let snapshot = json!({
+                "jobId": random_id("job").map_err(|e| e.message)?,
+                "sessionId": request.session_id, "runId": request.run_id, "callId": request.call_id,
+                "toolName": inner.operation,
+                "command": command,
+                "targets": inner.logical_targets,
+            });
+            let job = self.jobs.start(snapshot, move |cancellation, progress| {
+                let result =
+                    kernel.execute_prepared(&inner, &request, &authority, cancellation, progress);
+                drop(lease);
+                result
+            })?;
+            return Ok(KernelToolExecutionResult {
+                invocation_id,
+                outcome: KernelToolExecutionOutcome::Completed,
+                output: json!({ "job": job }),
+                error: None,
+            });
+        }
+        if let PreparedToolInput::Process(input) = &prepared.input {
+            let job = self.jobs.control(
+                &request.session_id,
+                &request.run_id,
+                input.job_id.as_deref().ok_or("jobId missing")?,
+                &input.action,
+                input.wait_seconds,
+                &cancellation,
+            )?;
+            return Ok(KernelToolExecutionResult {
+                invocation_id: request.attempt_id.clone(),
+                outcome: KernelToolExecutionOutcome::Completed,
+                output: json!({ "job": job }),
+                error: None,
+            });
+        }
         let workspace_authority = if authority["source"] == "composite" {
             &authority["workspaceAuthority"]
         } else {
@@ -2187,6 +2292,8 @@ struct PreparedEffect {
     permissions: LocalAgentPermissionPolicy,
     generation: Arc<KernelGeneration>,
     binding: PreparedCatalogBinding,
+    // A managed start retains the plugin call identity while admitting the actual executor.
+    source_binding: Option<PreparedCatalogBinding>,
     scope: PreparedEffectScope,
     workspace_id: Option<String>,
     operation: String,
@@ -2215,17 +2322,18 @@ impl PreparedEffect {
     }
 
     fn projection(&self, request: &LocalToolExecutionRequest) -> Value {
+        let binding = self.source_binding.as_ref().unwrap_or(&self.binding);
         let mut projection = json!({
             "callId": request.call_id,
             "attemptId": request.attempt_id,
             "sessionId": request.session_id,
             "runId": request.run_id,
-            "extensionGenerationRef": self.binding.extension_generation_ref(),
-            "kernelCatalogSnapshotRef": self.binding.snapshot_ref(),
-            "toolBindingRef": self.binding.binding_ref(),
-            "contributionRef": self.binding.contribution_ref(),
-            "providerRef": self.binding.provider_ref(),
-            "origin": self.binding.origin(),
+            "extensionGenerationRef": binding.extension_generation_ref(),
+            "kernelCatalogSnapshotRef": binding.snapshot_ref(),
+            "toolBindingRef": binding.binding_ref(),
+            "contributionRef": binding.contribution_ref(),
+            "providerRef": binding.provider_ref(),
+            "origin": binding.origin(),
             "toolName": request.tool_name,
             "operation": self.operation,
             "logicalTargets": self.logical_targets,
@@ -2234,7 +2342,7 @@ impl PreparedEffect {
         if let Some(workspace_id) = self.workspace_id.as_deref() {
             projection["workspaceId"] = json!(workspace_id);
         }
-        if let Some(plugin_instance_ref) = self.binding.plugin_instance_ref() {
+        if let Some(plugin_instance_ref) = binding.plugin_instance_ref() {
             projection["pluginInstanceRef"] = json!(plugin_instance_ref);
         }
         if let Some(workspace_mode) = self.process_workspace_mode.as_deref() {
@@ -3060,6 +3168,22 @@ mod attempt_control_tests {
         input: Value,
         product: Arc<crate::local_agent_product_tools::ProductTools>,
     ) -> (LocalAgentKernel, LocalToolExecutionRequest, Value) {
+        kernel_with_executor(
+            resolver,
+            tool_name,
+            input,
+            product,
+            KernelExecutorConfig::default(),
+        )
+    }
+
+    fn kernel_with_executor(
+        resolver: Arc<dyn WorkspaceResolverPort>,
+        tool_name: &str,
+        input: Value,
+        product: Arc<crate::local_agent_product_tools::ProductTools>,
+        config: KernelExecutorConfig,
+    ) -> (LocalAgentKernel, LocalToolExecutionRequest, Value) {
         let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
         let bindings = json!([{"workspaceId":"workspace:test", "displayName":"Fixture"}]);
         journal
@@ -3069,7 +3193,7 @@ mod attempt_control_tests {
             LocalAgentKernel::open(Path::new(":memory:"), journal.clone(), resolver).unwrap();
         let generation = LocalAgentKernel::prepare_generation(
             "extension:test",
-            KernelExecutorConfig::default(),
+            config,
             Arc::new(deepcode_kernel_runtime::executors::EmptySecretProvider),
             McpRuntime::default(),
             LocalAgentPermissionPolicy::from_settings(&json!({})).unwrap(),
@@ -3111,6 +3235,110 @@ mod attempt_control_tests {
             "workspaceBindings":["workspace:test"], "input":input
         })).unwrap();
         (kernel, request, catalog)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_shell_reuses_admission_and_can_be_waited_then_cancelled() {
+        struct Workspace;
+        impl WorkspaceResolverPort for Workspace {
+            fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
+                Ok(ResolvedWorkspace {
+                    root: std::env::temp_dir().to_string_lossy().into(),
+                    access: WorkspaceAccess::Project,
+                })
+            }
+        }
+        let product = Arc::try_unwrap(crate::local_agent_product_tools::test_product_tools())
+            .ok()
+            .unwrap()
+            .with_processes(Some("instance:process".into()));
+        let config = KernelExecutorConfig {
+            shell_program: Some(
+                deepcode_kernel_runtime::shell_environment::discover("bash").unwrap(),
+            ),
+            execution_path: Some(
+                deepcode_kernel_runtime::shell_environment::resolved_agent_shell_path()
+                    .unwrap()
+                    .into_string()
+                    .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let (mut kernel, request, _) = kernel_with_executor(
+            Arc::new(Workspace),
+            "process",
+            json!({"workspaceId":"workspace:test", "action":"start", "tool":"bash",
+                "input":{"command":"printf managed-ready; sleep 30", "requestHostPermission":"Run the test shell"}}),
+            Arc::new(product),
+            config,
+        );
+        let root = std::env::temp_dir().join(random_id("managed-test").unwrap());
+        kernel.output_root = root.clone();
+        assert_eq!(
+            kernel.execute(request.clone()).unwrap()["status"],
+            "approvalRequired"
+        );
+        assert!(kernel
+            .jobs
+            .snapshots(&request.session_id, &request.run_id, &Default::default(), 0)
+            .unwrap()
+            .is_empty());
+        kernel.journal.append(&json!({"type":"session.permissions.updated","sessionId":request.session_id,
+            "payload":{"commandId":"command:allow","patches":{"agent.permissions.shell":"allow","agent.permissions.shellAccess":"full"}}})).unwrap();
+        let started = kernel.execute(request.clone()).unwrap();
+        assert_eq!(started["status"], "completed", "{started}");
+        assert_eq!(started["record"]["preparedEffect"]["toolName"], "process");
+        assert_eq!(started["record"]["preparedEffect"]["operation"], "bash");
+        let job_id = started["record"]["output"]["job"]["jobId"]
+            .as_str()
+            .unwrap();
+        let mut control = request.clone();
+        control.call_id = "call:wait".into();
+        control.attempt_id = "attempt:wait".into();
+        control.input = json!({"action":"wait", "jobId":job_id, "waitSeconds":1});
+        let waiting = kernel.execute(control.clone()).unwrap();
+        assert_eq!(
+            waiting["record"]["output"]["job"]["status"], "active",
+            "{waiting}"
+        );
+        assert_eq!(
+            waiting["record"]["output"]["job"]["output"]["stdout"],
+            "managed-ready"
+        );
+        assert!(kernel
+            .jobs
+            .control(
+                "session:other",
+                &request.run_id,
+                job_id,
+                "cancel",
+                None,
+                &Default::default()
+            )
+            .is_err());
+        control.call_id = "call:cancel".into();
+        control.attempt_id = "attempt:cancel".into();
+        control.input = json!({"action":"cancel", "jobId":job_id});
+        let stopped = kernel.execute(control).unwrap();
+        let job = &stopped["record"]["output"]["job"];
+        assert_eq!(job["status"], "cancelled", "{stopped}");
+        assert_eq!(job["result"]["success"], false);
+        let output = job["result"]["fullOutput"]["stdout"]["path"]
+            .as_str()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "managed-ready");
+        kernel
+            .jobs
+            .release_run(&request.session_id, &request.run_id)
+            .unwrap();
+        assert!(kernel
+            .jobs
+            .snapshots(&request.session_id, &request.run_id, &Default::default(), 0)
+            .unwrap()
+            .is_empty());
+        kernel.shutdown_plugins().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4438,6 +4666,7 @@ mod attempt_control_tests {
             permissions: LocalAgentPermissionPolicy::from_settings(&json!({})).unwrap(),
             generation: Arc::clone(&generation),
             binding,
+            source_binding: None,
             scope: PreparedEffectScope::Process,
             input,
             workspace_id: Some("workspace:scope".into()),

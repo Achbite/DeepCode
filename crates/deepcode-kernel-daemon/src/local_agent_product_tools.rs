@@ -21,6 +21,7 @@ pub(crate) struct ProductTools {
     pub(crate) browser_binding: Option<Value>,
     pub(crate) computer_use_instance: Option<String>,
     pub(crate) container_instance: Option<String>,
+    pub(crate) process_instance: Option<String>,
 }
 
 impl ProductTools {
@@ -32,6 +33,7 @@ impl ProductTools {
             browser_binding: None,
             computer_use_instance: None,
             container_instance: None,
+            process_instance: None,
         }
     }
 
@@ -44,6 +46,11 @@ impl ProductTools {
         self.computer_use_instance = instance;
         self
     }
+    pub(crate) fn with_processes(mut self, instance: Option<String>) -> Self {
+        self.process_instance = instance;
+        self
+    }
+
     pub(crate) fn with_containers(mut self, instance: Option<String>) -> Self {
         self.container_instance = instance;
         self

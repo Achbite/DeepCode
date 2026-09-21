@@ -1992,6 +1992,19 @@ fn render_tool_plain(language: Language, output: &mut String, activity: &Activit
         push_tool_stream_plain(output, "stderr", &live.stderr);
     }
     if let Some(tool) = activity.tool.as_ref() {
+        if let Some(process) = &tool.process {
+            output.push_str(&format!("  $ {}\n", process.command));
+            if activity.status != "active" {
+                push_tool_stream_plain(output, "stdout", &process.output.stdout);
+                push_tool_stream_plain(output, "stderr", &process.output.stderr);
+            }
+            if let Some(result) = &process.result {
+                output.push_str(&format!(
+                    "  exit={:?} · {} ms · timedOut={}\n",
+                    result.exit_code, result.duration_ms, result.timed_out
+                ));
+            }
+        }
         if let Some(shell) = tool.shell.as_ref() {
             output.push_str(&format!("  $ {}\n", shell.command));
             output.push_str(&language.format("tui.cwd", &[format!("{}", shell.cwd)]));

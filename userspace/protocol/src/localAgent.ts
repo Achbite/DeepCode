@@ -868,6 +868,12 @@ export type SessionEvent =
       payload: { attemptId: string; error: LocalAgentError };
     })
   | (SessionEventBase & {
+      type: 'process.updated';
+      runId: string;
+      callId: string;
+      payload: { job: ManagedProcessSnapshot };
+    })
+  | (SessionEventBase & {
       type: 'tool.completed';
       runId: string;
       callId: string;
@@ -1190,6 +1196,7 @@ export interface ToolActivityProjection {
   operation: string;
   resources: ActivityResourceProjection[];
   shell?: ShellActivityProjection;
+  process?: ProcessActivityProjection;
   fileChanges?: FileChangeProjection[];
 }
 
@@ -1712,7 +1719,7 @@ export type ToolExecutionRecord =
   | (ToolExecutionRecordBase & { outcome: 'denied'; error?: LocalAgentError })
   | (ToolExecutionRecordBase & { outcome: 'failed'; output?: unknown; error: LocalAgentError })
   | (ToolExecutionRecordBase & { outcome: 'cancelled' })
-  | (ToolExecutionRecordBase & { outcome: 'indeterminate'; error: LocalAgentError });
+  | (ToolExecutionRecordBase & { outcome: 'indeterminate'; output?: unknown; error: LocalAgentError });
 
 export interface ToolInputIssue {
   path: string;
@@ -1777,7 +1784,42 @@ export type ToolExecutionProgress =
   | { type: 'started'; startedAt: string }
   | { type: 'output'; stream: 'stdout' | 'stderr'; offset: number; bytes: number[] };
 
+/** Current-run execution facts published by Kernel, independent of the start receipt. */
+export interface ManagedProcessSnapshot {
+  jobId: string;
+  sessionId: string;
+  runId: string;
+  callId: string;
+  revision: number;
+  toolName: 'bash' | 'powershell' | 'container';
+  command: string;
+  targets: string[];
+  status: 'active' | 'completed' | 'failed' | 'cancelled';
+  startedAt: string;
+  lastOutputAt?: string;
+  completedAt?: string;
+  output: ToolOutputProjection;
+  result?: unknown;
+  error?: LocalAgentError;
+}
+
+export interface ProcessActivityProjection {
+  jobId: string;
+  command: string;
+  output: ToolOutputProjection;
+  result?: { exitCode: number | null; durationMs: number; timedOut: boolean };
+}
+
+export interface ProcessReadRequest {
+  sessionId: string;
+  runId: string;
+  revisions?: Record<string, number>;
+  waitMs?: number;
+  cancel?: boolean;
+}
+
 export interface KernelPort {
+  readProcesses(request: ProcessReadRequest, signal?: AbortSignal): Promise<ManagedProcessSnapshot[]>;
   execute(request: ToolExecutionRequest, onProgress?: (progress: ToolExecutionProgress) => Promise<void>): Promise<ToolExecutionReply>;
   cancel(callId: string, attemptId: string): Promise<ToolCancelReply>;
   readRecord(callId: string): Promise<ToolExecutionRecord | null>;

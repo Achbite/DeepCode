@@ -103,6 +103,8 @@ export type LoopResult =
 export interface AgentLoopDeps {
   composition: AgentComposition;
   readSnapshot(): Promise<LoopSnapshot>;
+  syncProcesses?(): Promise<void>;
+  waitProcesses?(signal: AbortSignal): Promise<void>;
   commit(event: NewSessionEvent | readonly NewSessionEvent[] | ((current: LoopSnapshot) => readonly NewSessionEvent[])): Promise<LoopSnapshot>;
   takeQueuedInputs(runId: string): Promise<LoopSnapshot>;
   updateAssistantDraft(draft: AssistantDraftProjection | null): void;
@@ -421,6 +423,10 @@ export async function runAgentLoop(
       snapshot = await deps.takeQueuedInputs(runId);
       runtime = runRuntimeSnapshot(snapshot, runId);
       throwIfAborted(signal);
+      await deps.syncProcesses?.();
+      snapshot = await deps.readSnapshot();
+      const processRevisions = new Map(Object.values(snapshot.state.processes)
+        .filter(job => job.runId === runId).map(job => [job.jobId, job.revision]));
       const preparedProviderRequest = await buildAgentProviderRequest({
         sessionId: snapshot.state.sessionId,
         runId,
@@ -588,6 +594,15 @@ export async function runAgentLoop(
           break;
         }
         case 'answer': {
+          await deps.syncProcesses?.();
+          snapshot = await deps.readSnapshot();
+          const jobs = Object.values(snapshot.state.processes).filter(job => job.runId === runId);
+          if (jobs.some(job => job.status === 'active' || job.revision !== processRevisions.get(job.jobId))) {
+            await commit([ ...orderedProviderCallFacts(turn.completion, providerCallFacts),
+              providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion), ...completionDerivedFacts ]);
+            await deps.waitProcesses?.(signal);
+            continue nextTurn;
+          }
           const messageId = turn.messageId ?? deps.nextId('message');
           const settlement = { outcome: 'completed' as const, finalMessageId: messageId };
           await commit((current) => [

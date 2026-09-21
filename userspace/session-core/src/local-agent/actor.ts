@@ -1,3 +1,4 @@
+import { ManagedProcesses } from './managedProcesses.js';
 import { validatePermissionPatches } from '@deepcode/protocol';
 import { confirmationFacts } from './planStage.js';
 import { admitSessionEvents } from './admission.js';
@@ -59,6 +60,7 @@ export class SessionActor {
   #writes = Promise.resolve();
   #active?: ActiveRun;
   #disposed = false;
+  #processes?: ManagedProcesses;
   #loopFailure?: Error;
   #snapshot?: LoopSnapshot;
   #initialEvents?: readonly SessionEvent[];
@@ -138,6 +140,7 @@ export class SessionActor {
       errors.push(error);
     }
     try {
+      await this.closeProcesses();
       await this.#composition.dispose();
     } catch (error) {
       errors.push(error);
@@ -862,11 +865,14 @@ export class SessionActor {
     signal = new AbortController().signal,
   ): Promise<void> {
     const snapshot = await this.loadSnapshot();
+    await this.ensureProcesses(command.runId);
     const result = await runAgentLoop(
       snapshot,
       command,
       {
         composition: this.#composition,
+        syncProcesses: async () => { await this.ensureProcesses(command.runId); await this.#processes?.sync(); },
+        waitProcesses: signal => this.#processes?.wait(signal) ?? Promise.resolve(),
         readSnapshot: () => this.withWrite(() => this.loadSnapshot()),
         commit: (events) => this.withWrite(async () => {
           const current = await this.loadSnapshot();
@@ -961,6 +967,7 @@ export class SessionActor {
     const runtime = snapshot.state.runRuntimeSnapshots[runId];
     if (!runtime || snapshot.state.runRuntimeReleases[runId]) return failure;
     try {
+      await this.closeProcesses();
       await this.#composition.runPreparation.release({
         sessionId: this.sessionId,
         runId,
@@ -1034,11 +1041,37 @@ export class SessionActor {
     await this.finalizeRunRuntime(snapshot, runId, settlement);
   }
 
+  private async ensureProcesses(runId: string): Promise<void> {
+    const snapshot = await this.loadSnapshot();
+    const runtime = snapshot.state.runToolViews[runId] ?? snapshot.state.runRuntimeSnapshots[runId];
+    if (!this.#processes && runtime?.selectedPlugins.plugins.some(plugin => plugin.uri === 'plugin://processes@builtin')) {
+      this.#processes = new ManagedProcesses(this.sessionId, runId, this.#composition.kernel,
+        jobs => this.withWrite(async () => {
+          const current = await this.loadSnapshot();
+          const updates = jobs.filter(job => (current.state.processes[job.jobId]?.revision ?? 0) < job.revision);
+          if (updates.length) await this.appendEvents(updates.map(job => ({type: 'process.updated' as const,
+            sessionId: this.sessionId, runId: runId, callId: job.callId, payload: {job}})), current);
+        }), error => {
+          this.#loopFailure = asError(error);
+          if (this.#active) this.#active.controller.abort(error);
+          else void this.containLoopFailure(runId, error).then(error => { this.#loopFailure = error; });
+        });
+    }
+  }
+
+  private async closeProcesses(): Promise<void> {
+    const processes = this.#processes;
+    this.#processes = undefined;
+    await processes?.close();
+  }
+
   private async finalizeRunRuntime(
     snapshot: LoopSnapshot,
     runId: string,
     settlement: RunSettlement,
   ): Promise<boolean> {
+    await this.closeProcesses();
+    snapshot = await this.loadSnapshot();
     const runtime = snapshot.state.runRuntimeSnapshots[runId];
     if (!runtime) throw new Error('run_runtime_snapshot_missing');
     if (snapshot.state.runRuntimeReleases[runId]) {

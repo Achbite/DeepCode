@@ -680,12 +680,18 @@ impl SessionProjection {
                                             && (result.timed_out || result.exit_code != Some(0))
                                 })
                         })
-                        || matches!(tool.operation.as_str(), "bash" | "powershell")
+                        || tool.process.as_ref().is_some_and(|process| {
+                            process.job_id.is_empty()
+                                || process.command.is_empty()
+                                || tool.shell.is_some()
+                        })
+                        || tool.process.is_none()
+                            && matches!(tool.operation.as_str(), "bash" | "powershell")
                             && (tool.shell.is_none() && tool.projection_error.is_none()
                                 || tool.shell.as_ref().is_some_and(|shell| {
                                     match activity.status.as_str() {
                                         "completed" => shell.result.is_none(),
-                                        "failed" => false,
+                                        "failed" | "indeterminate" => false,
                                         _ => shell.result.is_some(),
                                     }
                                 }))
@@ -1752,8 +1758,25 @@ pub struct ToolActivityProjection {
     pub projection_error: Option<ConversationError>,
     pub resources: Vec<ActivityResourceProjection>,
     pub shell: Option<ShellActivityProjection>,
+    pub process: Option<ProcessActivityProjection>,
     #[serde(default)]
     pub file_changes: Vec<FileChangeProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessActivityProjection {
+    pub job_id: String,
+    pub command: String,
+    pub output: ToolOutputProjection,
+    pub result: Option<ProcessActivityResult>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessActivityResult {
+    pub exit_code: Option<i64>,
+    pub duration_ms: u64,
+    pub timed_out: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

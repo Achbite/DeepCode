@@ -205,6 +205,8 @@ export function messagesFromJournal(
 ): ContextMessageContribution[] {
   const messages: ContextMessageContribution[] = [];
   const completionResults = new Map<string, ContextMessageContribution>();
+  const processes = new Map(events.flatMap(event => event.type === 'process.updated'
+    ? [[event.callId, event.payload.job] as const] : []));
   const approvalsByCallId = new Map(events.flatMap((event) => (
     event.type === 'approval.resolved' ? [[event.callId, event.payload] as const] : []
   )));
@@ -515,6 +517,7 @@ export function messagesFromJournal(
           providerCallId: requiredProviderCallId(providerCallIdByLogicalCallId, event.callId),
           content: JSON.stringify({
             ...toolResultForModel(event.payload.record),
+            ...(processes.has(event.callId) ? { process: processContext(processes.get(event.callId)!) } : {}),
             ...(approval ? { approval: { decision: approval.decision, scope: approval.authorizationScope ?? 'call' } } : {}),
           }),
           toolImages: toolImagesForModel(event.payload.record),
@@ -1125,4 +1128,14 @@ function toolImagesForModel(record: ToolExecutionRecord): string[] | undefined {
     if (!isRecord(image) || typeof image.artifactId !== 'string') throw new Error('Tool image artifactId is required');
     return image.artifactId;
   });
+}
+
+function processContext(job: import('@deepcode/protocol').ManagedProcessSnapshot): unknown {
+  // Keep one latest snapshot per job. Its output remains tool data in the original call/result pair.
+  const { result, output, ...status } = job;
+  const details = isRecord(result) ? { ...result } : result;
+  if (isRecord(details)) { delete details.stdout; delete details.stderr; }
+  return { ...status, output: { ...output, stdout: output.stdout.slice(-2000), stderr: output.stderr.slice(-2000),
+    truncated: output.truncated || output.stdout.length > 2000 || output.stderr.length > 2000 },
+    ...(details !== undefined ? { result: details } : {}) };
 }
