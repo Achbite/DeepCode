@@ -22,6 +22,23 @@ pub fn contextual_input_command(
     if text.is_empty() {
         return Err(language.text("tui.emptyInput").to_string());
     }
+    if let Some(patches) = text.strip_prefix("/permissions ") {
+        let patches: serde_json::Value =
+            serde_json::from_str(patches).map_err(|error| error.to_string())?;
+        return Ok(
+            json!({"schemaVersion": "deepcode.command.v3", "type":"session.permissions.set", "commandId":command_id, "sessionId":projection.session_id, "patches":patches}),
+        );
+    }
+    if let Some(authority) = text.strip_prefix("/revoke ") {
+        let grant = projection
+            .shell_authorizations
+            .iter()
+            .find(|grant| grant.authority_id == authority.trim())
+            .ok_or("No active grant with this authority ID")?;
+        return Ok(
+            json!({"schemaVersion":"deepcode.command.v3", "type":"approval.revoke", "commandId":command_id, "sessionId":projection.session_id, "runId":grant.run_id, "authorityId":grant.authority_id}),
+        );
+    }
     if text == "/reply" || text.starts_with("/reply ") {
         let response = text.strip_prefix("/reply").unwrap().trim();
         if response.is_empty() {
@@ -32,9 +49,14 @@ pub fn contextual_input_command(
         }
         if let Some(approval) = projection.pending_approval.as_ref() {
             let decision = approval_decision_for_input(language, response)?;
-            if decision == "allow-run"
-                && approval.preview.authorization_scope.as_deref() != Some("runHostShell")
-            {
+            let scope = deepcode_kernel_client::approval_scope_for_input(decision);
+            if scope.is_some_and(|scope| {
+                !approval
+                    .preview
+                    .authorization_scopes
+                    .as_ref()
+                    .is_some_and(|scopes| scopes.iter().any(|candidate| candidate == scope))
+            }) {
                 return Err(language.text("tui.runAuthorizationUnavailable").into());
             }
             return Ok(approval_response_command(
@@ -123,8 +145,15 @@ fn approval_decision_for_input(language: Language, input: &str) -> Result<&'stat
     match input.trim().to_lowercase().as_str() {
         "1" | "allow" | "允许" | "同意" => Ok("allow"),
         "2" | "deny" | "拒绝" | "不同意" => Ok("deny"),
-        "3" | "allow-run" | "允许本轮" => Ok("allow-run"),
-        _ => Err(language.text("tui.approvalReplyRequired").to_string()),
+        "3" | "allow-run" | "本轮允许此命令" => Ok("allow-run"),
+        "4" | "allow-host-run" | "本轮允许Host" => Ok("allow-host-run"),
+        "5" | "allow-files-run" => Ok("allow-files-run"),
+        "6" | "allow-files-session" => Ok("allow-files-session"),
+        _ => deepcode_kernel_client::AUTHORIZATION_OPTIONS
+            .iter()
+            .find(|(_, command)| *command == input.trim())
+            .map(|(_, command)| *command)
+            .ok_or_else(|| language.text("tui.approvalReplyRequired").to_string()),
     }
 }
 
@@ -154,7 +183,7 @@ pub(crate) mod fixtures {
         decision: serde_json::Value,
     ) -> SessionProjection {
         let mut value = json!({
-            "schemaVersion": deepcode_kernel_client::SESSION_PROJECTION_VERSION,
+            "schemaVersion": deepcode_kernel_client::SESSION_PROJECTION_VERSION, "permissionOverrides":{}, "effectivePermissions":null, "shellAuthorizations":[],
             "sessionId":"session:test", "revision":1, "display":{"creationTitle":"input"},
             "workspaceBindings":[], "sessionDirectoryIndexes":[], "timeline":[], "messages":[],
             "queuedInputs":[], "narratives":[], "plans":[], "contextCompositions":[],

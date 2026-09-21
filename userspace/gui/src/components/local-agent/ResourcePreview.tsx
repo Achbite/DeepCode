@@ -1,3 +1,6 @@
+import { ResourceTree } from './ResourceTree';
+import { FileChangePreview } from './FileChanges';
+import { resourceKey, type ResourceReference } from '../../services/conversationResources';
 import { restoredInterfaceView, takeRestoredInterfaceView, useInterfaceReloadView } from '../../services/interfaceReload';
 import type { BrowserAnnotation, BrowserAnnotationDraft, BrowserReviewEdit } from './browserReview';
 import { nextEnabledIndex } from '../shared/keyboardNavigation';
@@ -10,12 +13,10 @@ import type { SourcePosition } from './resourceLinks';
 import { t, type UiLanguage } from '../../i18n';
 import {
   readConversationArtifact,
-  readConversationImage,
-  resolveConversationResourcePath,
   type ConversationResourceReadResult,
 } from '../../services/localAgentApi';
 import { documentFormat, type DocumentFormat } from './documentResources';
-import { READER_OPEN_EVENT, readViewState, saveViewState, type ReaderTarget } from './readerState';
+import { READER_OPEN_EVENT, readViewState, saveViewState, type ReaderTarget, readerTargetKey as targetKey } from './readerState';
 import { NativeBrowserPreview } from './NativeBrowserPreview';
 import {
   hasNativeBrowser,
@@ -62,15 +63,10 @@ export function readerPageName(url: string): string {
     return url;
   }
 }
-function targetKey(target: ResolvedReaderTarget): string {
-  if (target.kind === 'file') return 'file:' + target.path;
-  if (target.kind === 'workspace')
-    return 'workspace:' + target.workspaceId + ':' + target.logicalPath;
-  if (target.kind === 'artifact') return 'artifact:' + target.artifact.artifactId;
-  return 'browser:' + target.previewId;
-}
 function tabName(tab: ReaderTab, language: UiLanguage): string {
   if (tab.page) return readerPageName(tab.page.url);
+  if (tab.target.kind === 'diff') return readerFilename(tab.target.file.path) + ' · diff';
+  if (tab.target.kind === 'resource') return tab.target.name;
   if (tab.target.kind === 'file') return readerFilename(tab.target.path);
   if (tab.target.kind === 'workspace') return readerFilename(tab.target.logicalPath);
   if (tab.target.kind === 'artifact') return readerFilename(tab.target.artifact.label);
@@ -94,6 +90,7 @@ export function useResourcePreview(sessionId: string | null) {
     expanded: boolean;
   }>({ sessionId, tabs: [], activeId: null, visible: false, expanded: false });
   useInterfaceReloadView('reader', { ...state, tabs: state.tabs.map(tab => tab.page ? { ...tab, target: { kind: 'browser', previewId: tab.page.previewId } } : tab) });
+  const [treeVisible, setTreeVisible] = useState(() => readViewState('file-tree', true));
   const [width, setWidth] = useState(() => readViewState('panel-width', 55));
   const [error, setError] = useState<string | null>(null);
   const [reviewEdit, setReviewEdit] = useState<(BrowserReviewEdit & { sessionId: string | null }) | null>(null);
@@ -259,6 +256,8 @@ export function useResourcePreview(sessionId: string | null) {
   return {
     ...live,
     width,
+    treeVisible,
+    toggleTree() { setTreeVisible(value => { saveViewState('file-tree', !value); return !value; }); },
     error,
     openTarget,
     openWorkspaceResource,
@@ -336,7 +335,8 @@ export function ResourcePreview({
                   title={tabName(tab, language)}
                 >
                   <DeepCodeShellIcon name="artifact" />
-                  <span>{tabName(tab, language)}</span>
+                  <span>{tab.target.kind === 'diff' ? readerFilename(tab.target.file.path) : tabName(tab, language)}</span>
+                  {tab.target.kind === 'diff' && <small className="reader-tab__kind">· diff</small>}
                 </button>
                 <button
                   type="button"
@@ -410,6 +410,8 @@ export function ResourcePreview({
             {preview.error}
           </p>
         )}
+        <ReaderFileHeader sessionId={preview.sessionId} target={preview.tabs.find(tab => tab.id === preview.activeId)?.target} language={language} treeVisible={preview.treeVisible} />
+        <div className="reader-workspace">
         <div className="reader-panes">
           {preview.tabs.map((tab, index) => (
             <div
@@ -428,12 +430,15 @@ export function ResourcePreview({
                   onReview={onReview}
                   reviewEdit={preview.reviewEdit?.previewId === (tab.page?.previewId ?? tab.target.previewId) ? preview.reviewEdit : null}
                 />
+              ) : tab.target.kind === 'diff' && preview.sessionId ? (
+                <FileChangePreview sessionId={preview.sessionId} file={tab.target.file} />
               ) : (
                 preview.sessionId && (
                   <ReaderDocument
                     key={tab.target.kind === 'workspace' ? `${tab.id}:${tab.target.line ?? ''}:${tab.target.column ?? ''}` : tab.id}
                     sessionId={preview.sessionId}
-                    target={tab.target as Exclude<ReaderTarget, { kind: 'browser' }>}
+                    target={tab.target as Exclude<ReaderTarget, { kind: 'browser' | 'diff' }>}
+                    active={preview.visible && preview.activeId === tab.id}
                     language={language}
                     openTarget={preview.openTarget}
                   />
@@ -448,6 +453,8 @@ export function ResourcePreview({
               openTarget={preview.openTarget}
             />
           )}
+        </div>
+        {preview.visible && preview.treeVisible && preview.sessionId && <ResourceTree key={preview.sessionId} sessionId={preview.sessionId} language={language} openTarget={preview.openTarget} />}
         </div>
       </aside>
     </>
@@ -464,6 +471,7 @@ export function ReaderControls({ language, preview, disabled }: {
   const expandLabel = preview.expanded ? (chinese ? '返回并排' : 'Restore split view') : (chinese ? '铺满工作区' : 'Expand preview');
   const sidebarLabel = chinese ? '浏览器与预览' : 'Browser and preview';
   return <>
+    {preview.visible && <button type="button" className="reader-icon-button" aria-label={chinese ? '文件树' : 'File tree'} title={chinese ? '文件树' : 'File tree'} aria-pressed={preview.treeVisible} onClick={preview.toggleTree}><DeepCodeShellIcon name="folder" /></button>}
     {preview.visible && <button type="button" className="reader-icon-button" onClick={preview.expand} aria-label={expandLabel} title={expandLabel}>
       <DeepCodeShellIcon name={preview.expanded ? 'collapse' : 'expand'} />
     </button>}
@@ -608,13 +616,15 @@ function ReaderStart({
 }
 
 function ReaderDocument({
+  active,
   sessionId,
   target,
   language,
   openTarget,
 }: {
   sessionId: string;
-  target: Exclude<ReaderTarget, { kind: 'browser' }>;
+  active: boolean;
+  target: Exclude<ReaderTarget, { kind: 'browser' | 'diff' }>;
   language: UiLanguage;
   openTarget(target: ReaderTarget): void;
 }) {
@@ -626,7 +636,7 @@ function ReaderDocument({
   const [location, setLocation] = useState<string | null>(null),
     [locationError, setLocationError] = useState<string | null>(null);
   const scroll = useRef<HTMLDivElement>(null);
-  const path = target.kind === 'workspace' ? target.logicalPath : target.kind === 'file' ? target.path : target.artifact.label,
+  const path = target.kind === 'resource' ? (target.resource.logicalPath || target.name) : target.kind === 'workspace' ? target.logicalPath : target.kind === 'file' ? target.path : target.artifact.label,
     key = sessionId + ':' + targetKey(target) + (target.kind === 'workspace' && target.line ? `:${target.line}:${target.column ?? 1}` : '');
   const sourceLine = target.kind === 'workspace' ? target.line : undefined;
   const sourceColumn = target.kind === 'workspace' ? target.column : undefined;
@@ -636,7 +646,19 @@ function ReaderDocument({
     ? Math.min(sourceColumn - 1, state.result.content.split('\n', 1)[0].length)
     : undefined;
   useEffect(() => { setStartByte(undefined); }, [target]);
+  const reference = targetResource(target);
+  const referenceId = reference && resourceKey(reference);
+  const [watchError, setWatchError] = useState('');
   useEffect(() => {
+    if (!active || !reference) return;
+    const controller = new AbortController();
+    setWatchError('');
+    void host.resources.watchResources(sessionId, [reference], controller.signal, () => setRevision(value => value + 1))
+      .catch(error => { if (!controller.signal.aborted) setWatchError(String(error)); });
+    return () => controller.abort();
+  }, [sessionId, active, referenceId, host]);
+  useEffect(() => {
+    if (!active) return;
     const controller = new AbortController();
     setState({ status: 'loading' });
     void (async () => {
@@ -676,45 +698,27 @@ function ReaderDocument({
       }
       const format = startByte === undefined && sourceLine === undefined ? documentFormat(path) : null;
       if (startByte === undefined && /\.(png|jpe?g|gif|webp|svg|bmp)$/i.test(path)) {
-        const blob = await readConversationImage(
-          sessionId,
-          target.workspaceId,
-          path,
-          controller.signal,
-        );
+        const blob = await host.resources.readResourceBlob(sessionId, reference!, 'image', controller.signal);
         if (!controller.signal.aborted) setState({ status: 'document', blob, format: 'image' });
       } else if (format === 'pdf') {
-        const blob = await host.readDocument(
-          sessionId,
-          target.workspaceId,
-          path,
-          controller.signal,
-        );
+        const blob = await host.resources.readResourceBlob(sessionId, reference!, 'document', controller.signal);
         if (!controller.signal.aborted) setState({ status: 'document', blob, format });
       } else {
-        const result = await host.readResource(
-          sessionId,
-          target.workspaceId,
-          path,
-          controller.signal,
-          startByte,
-          sourceLine,
-        );
+        const result = await host.resources.readResourceReference(sessionId, reference!, controller.signal, startByte, sourceLine);
         if (!controller.signal.aborted) setState({ status: 'text', result });
       }
     })().catch((reason) => {
       if (!controller.signal.aborted) setState({ status: 'error', error: String(reason) });
     });
     return () => controller.abort();
-  }, [sessionId, target, host, path, startByte, sourceLine, revision]);
+  }, [sessionId, target, host, path, startByte, sourceLine, revision, active]);
   useEffect(() => {
     if (scroll.current) scroll.current.scrollTop = sourceLine ? 0 : readViewState(key + ':scroll', 0);
   }, [key, state.status, sourceLine]);
   const resolve = async () => {
     if (target.kind === 'file') return target.path;
-    if (target.kind !== 'workspace')
-      return target.artifact.logicalPath ?? target.artifact.uri ?? target.artifact.artifactId;
-    return resolveConversationResourcePath(sessionId, target.workspaceId, path);
+    if (target.kind === 'artifact') return target.artifact.logicalPath ?? target.artifact.uri ?? target.artifact.artifactId;
+    return (await host.resources.resolveResourceReference(sessionId, reference!)).path;
   };
   const actions = <>
         {(state.status === 'source' || state.status === 'text') && <button
@@ -777,9 +781,9 @@ function ReaderDocument({
   return (
     <>
       {state.status !== 'document' && <div className="document-preview__toolbar document-preview__file-toolbar">
-        <span className="document-preview__format">{chinese ? '文件' : 'File'}</span>
         <div className="document-preview__actions">{actions}</div>
       </div>}
+      {state.status !== 'error' && watchError && <p role="alert" className="local-agent__resource-error">{watchError}</p>}
       {locationError && (
         <p role="alert" className="local-agent__resource-error">
           {locationError}
@@ -835,6 +839,55 @@ function ReaderDocument({
       </div>
     </>
   );
+}
+
+function targetResource(target: ReaderTarget): ResourceReference | undefined {
+  if (target.kind === 'resource') return target.resource;
+  if (target.kind === 'workspace') return { workspaceId: target.workspaceId, logicalPath: target.logicalPath };
+  if (target.kind === 'diff') {
+    const { recordId, index } = target.file.changes.at(-1)!;
+    return { change: { recordId, index }, logicalPath: '' };
+  }
+}
+
+function ReaderFileHeader({ sessionId, target, language, treeVisible }: {
+  sessionId: string | null; target?: ReaderTarget; language: UiLanguage; treeVisible: boolean;
+}) {
+  const host = useConversationHost();
+  const [error, setError] = useState('');
+  const menu = useRef<HTMLDetailsElement>(null);
+  const name = !target || target.kind === 'browser' ? '' : target.kind === 'diff' ? readerFilename(target.file.path)
+    : target.kind === 'resource' ? target.name : target.kind === 'workspace' ? readerFilename(target.logicalPath)
+    : target.kind === 'file' ? readerFilename(target.path) : target.artifact.label;
+  const open = async (action: 'code' | 'folder') => {
+    if (!sessionId || !target) return;
+    if (menu.current) menu.current.open = false;
+    setError('');
+    try {
+      const reference = targetResource(target);
+      const path = target.kind === 'file' ? target.path : reference ? (await host.resources.resolveResourceReference(sessionId, reference)).path : undefined;
+      if (!path) throw new Error('resource_has_no_local_file');
+      if (action === 'code') await host.openFile?.(path);
+      else await host.locatePath?.(path);
+    } catch (error) { setError(String(error)); }
+  };
+  useEffect(() => setError(''), [target]);
+  return <>
+    <div className="reader-file-header">
+      <strong title={name}>{name}</strong>
+      {treeVisible && <span className="reader-file-header__tree-title">{language === 'zh-CN' ? '文件' : 'Files'}</span>}
+      <details className="reader-external-open" ref={menu} data-native-overlay onKeyDown={event => {
+        if (event.key === 'Escape') { event.stopPropagation(); event.currentTarget.open = false; event.currentTarget.querySelector('summary')?.focus(); }
+      }}>
+        <summary>{language === 'zh-CN' ? '打开' : 'Open'} <DeepCodeShellIcon name="chevronDown" /></summary>
+        <div role="menu">
+          <button role="menuitem" disabled={!target || target.kind === 'browser' || target.kind === 'artifact'} onClick={() => void open('code')}>{language === 'zh-CN' ? '在 VS Code 中打开' : 'Open in VS Code'}</button>
+          <button role="menuitem" disabled={!target || target.kind === 'browser' || target.kind === 'artifact'} onClick={() => void open('folder')}>{language === 'zh-CN' ? '打开所在文件夹' : 'Show in folder'}</button>
+        </div>
+      </details>
+    </div>
+    {error && <p role="alert" className="local-agent__resource-error">{error}</p>}
+  </>;
 }
 
 async function readLiteralText(blob: Blob): Promise<string> {

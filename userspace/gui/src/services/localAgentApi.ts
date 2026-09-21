@@ -1,3 +1,5 @@
+import { isShellAuthorizationScope } from '@deepcode/protocol';
+import { validatePermissionPatches } from '@deepcode/protocol';
 import { isLocalAgentErrorValue } from '@deepcode/protocol';
 import type {
   AssistantDraftBlockProjection,
@@ -47,7 +49,7 @@ const CONTEXT_MESSAGE_BLOCK_KINDS: Readonly<
 };
 
 export interface ConversationResourceReadResult {
-  workspaceId: string;
+  workspaceId?: string | null;
   logicalPath: string;
   content: string;
   sizeBytes: number;
@@ -267,40 +269,6 @@ export async function getLocalAgentProjection(
   return decodeProjection(projection);
 }
 
-export async function readConversationResource(
-  sessionId: string,
-  workspaceId: string,
-  logicalPath: string,
-  signal?: AbortSignal,
-  startByte?: number,
-  startLine?: number,
-): Promise<ConversationResourceReadResult> {
-  const value = await request<unknown>(
-    `${API_BASE}/conversation/sessions/${encodeURIComponent(sessionId)}/resources/read`,
-    {
-      method: 'POST',
-      body: JSON.stringify({ workspaceId, logicalPath, ...(startByte !== undefined ? { startByte } : startLine !== undefined ? { startLine } : {}) }),
-      signal,
-    },
-  );
-  if (
-    !isRecord(value)
-    || value.workspaceId !== workspaceId
-    || typeof value.logicalPath !== 'string'
-    || typeof value.content !== 'string'
-    || !Number.isSafeInteger(value.sizeBytes)
-    || !Number.isSafeInteger(value.startLine)
-    || !Number.isSafeInteger(value.endLine)
-  ) {
-    throw new Error('conversation_resource_response_invalid');
-  }
-  return value as unknown as ConversationResourceReadResult;
-}
-
-export async function resolveConversationResourcePath(sessionId: string, workspaceId: string, logicalPath: string): Promise<string> {
-  return (await resolveConversationResource(sessionId, workspaceId, logicalPath)).path;
-}
-
 export async function resolveConversationResource(sessionId: string, workspaceId: string, logicalPath: string): Promise<{path: string; kind: 'file' | 'directory'}> {
   const result = await request<{path: string; kind: 'file' | 'directory'}>(`${API_BASE}/conversation/sessions/${encodeURIComponent(sessionId)}/resources/read`, {
     method: 'POST', body: JSON.stringify({workspaceId, logicalPath, format:'path'}),
@@ -335,25 +303,6 @@ export async function readConversationImage(sessionId: string, workspaceId: stri
   return response.blob();
 }
 
-export async function readConversationDocument(sessionId: string, workspaceId: string, logicalPath: string, signal?: AbortSignal): Promise<Blob> {
-  const response = await fetch(`${API_BASE}/conversation/sessions/${encodeURIComponent(sessionId)}/resources/read`, {
-    method: 'POST', signal,
-    headers: { 'Content-Type': 'application/json', ...getHostConnectionHeaders() },
-    body: JSON.stringify({ workspaceId, logicalPath, format: 'document' }),
-  });
-  const mediaType = response.headers.get('content-type')?.split(';', 1)[0].trim();
-  if (!response.ok || !['application/pdf', 'text/html', 'text/markdown'].includes(mediaType ?? '')) {
-    const detail = await response.text();
-    let message = detail;
-    try {
-      const error = JSON.parse(detail) as ApiEnvelope<never>;
-      message = error.message ?? error.error ?? detail;
-    } catch { /* Preserve a non-JSON transport error. */ }
-    throw new Error(message || `conversation_document_read_failed:HTTP ${response.status}`);
-  }
-  return response.blob();
-}
-
 export class ConversationRequestError extends Error {
   constructor(public readonly code: string, message: string) {
     super(message === code ? code : `${code}:${message}`);
@@ -366,7 +315,7 @@ export function isBinaryFileChange(error: unknown): boolean {
     && error.code === 'file_change_binary_content';
 }
 
-async function request<T>(url: string, init: RequestInit): Promise<T> {
+export async function request<T>(url: string, init: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...init,
     headers: {
@@ -396,7 +345,7 @@ function decodeProjection(value: unknown): SessionProjection {
       'sessionId',
       'revision',
       'display',
-      'modelSettings',
+      'modelSettings', 'permissionOverrides', 'effectivePermissions', 'shellAuthorizations',
       'workspaceBindings',
       'sessionDirectoryIndexes',
       'timeline',
@@ -426,6 +375,11 @@ function decodeProjection(value: unknown): SessionProjection {
     || !isIdentifier(value.sessionId)
     || !isNaturalNumber(value.revision)
     || !isSessionDisplay(value.display)
+    || !isPermissionSettings(value.permissionOverrides)
+    || !isNullable(value.effectivePermissions, isPermissionSettings)
+    || !isArrayOf(value.shellAuthorizations, item => isExactRecord(item, ['authorityId', 'runId', 'scope', 'summary', 'context'])
+      && isIdentifier(item.authorityId) && isIdentifier(item.runId) && isShellAuthorizationScope(item.scope)
+      && isNonEmptyText(item.summary) && isRecord(item.context))
     || !isNullable(value.modelSettings, isModelSettings)
     || !isWorkspaceBindings(value.workspaceBindings)
     || !isWorkspaceBindings(value.sessionDirectoryIndexes)
@@ -824,7 +778,7 @@ function isPlanPreview(value: unknown): boolean {
 
 function isProviderActivity(value: unknown): boolean {
   return isExactRecord(value, ['purpose', 'phase', 'startedAt'], ['lastContentAt'])
-    && ['agent', 'contextCompaction'].includes(String(value.purpose))
+    && ['agent', 'contextCompaction', 'approvalReview'].includes(String(value.purpose))
     && ['waitingResponse', 'reasoning', 'awaitingOutput', 'generatingOutput'].includes(String(value.phase))
     && isNonEmptyText(value.startedAt) && Number.isFinite(Date.parse(value.startedAt))
     && (value.lastContentAt === undefined || isNonEmptyText(value.lastContentAt) && Number.isFinite(Date.parse(value.lastContentAt)));
@@ -891,9 +845,14 @@ function isApproval(value: unknown): boolean {
 
 function isEffectPreview(value: unknown): boolean {
   const effects = ['localRead', 'workspaceRead', 'workspaceMutation', 'process', 'network', 'external'];
-  return isExactRecord(value, ['summary', 'effects', 'logicalTargets'], ['authorizationScope', 'authorizationContext'])
-    && (value.authorizationScope === undefined || value.authorizationScope === 'sessionBrowser' || value.authorizationScope === 'runHostShell')
-    && (value.authorizationScope !== 'runHostShell' || isRecord(value.authorizationContext))
+  return isExactRecord(value, ['summary', 'effects', 'logicalTargets'], ['authorizationScope', 'authorizationContext', 'authorizationScopes', 'approvalReviewer', 'review', 'fileAccess'])
+    && (value.authorizationScope === undefined || value.authorizationScope === 'sessionBrowser' || isShellAuthorizationScope(value.authorizationScope))
+    && (!isShellAuthorizationScope(value.authorizationScope) || isRecord(value.authorizationContext))
+    && (value.fileAccess === undefined || (isRecord(value.fileAccess) && isArrayOf(value.fileAccess.read, isNonEmptyText) && isArrayOf(value.fileAccess.write, isNonEmptyText)))
+    && (value.authorizationScopes === undefined || isArrayOf(value.authorizationScopes, scope => isShellAuthorizationScope(scope)))
+    && (value.approvalReviewer === undefined || ['user', 'agent'].includes(String(value.approvalReviewer)))
+    && (value.review === undefined || isExactRecord(value.review, ['decision', 'reason'])
+      && ['allow', 'deny', 'ask'].includes(String(value.review.decision)) && isNonEmptyText(value.review.reason))
     && isNonEmptyText(value.summary)
     && Array.isArray(value.effects)
     && value.effects.every((effect) => effects.includes(String(effect)))
@@ -929,18 +888,19 @@ function isPlanProjection(value: unknown): value is Record<string, unknown> & {
   planId: string;
   revision: number;
 } {
-  return isExactRecord(value, PLAN_FIELDS, ['decisionId'])
+  return isExactRecord(value, PLAN_FIELDS, ['decisionId', 'confirmationSource'])
     && isPlanProjectionFields(value);
 }
 
 function isPendingPlan(value: unknown): boolean {
-  return isExactRecord(value, [...PLAN_FIELDS, 'responseMode'], ['decisionId'])
+  return isExactRecord(value, [...PLAN_FIELDS, 'responseMode'], ['decisionId', 'confirmationSource'])
     && isPlanProjectionFields(value)
     && value.status === 'published'
     && value.responseMode === 'confirmReviseOrCancel';
 }
 
 function isPlanProjectionFields(value: Record<string, unknown>): boolean {
+  if (value.confirmationSource !== undefined && !['user', 'agent'].includes(String(value.confirmationSource))) return false;
   if (
     !isIdentifier(value.planId)
     || !isPositiveNaturalNumber(value.revision)
@@ -1078,7 +1038,7 @@ function isContextComposition(value: unknown): boolean {
   ], ['kernelCatalogSnapshotRef'])
     && (value.kernelCatalogSnapshotRef === undefined || isIdentifier(value.kernelCatalogSnapshotRef))
     && isIdentifier(value.providerRequestId)
-    && ['agent', 'contextCompaction'].includes(String(value.purpose))
+    && ['agent', 'contextCompaction', 'approvalReview'].includes(String(value.purpose))
     && ['normal', 'answerOnly'].includes(String(value.responseConstraint))
     && isNaturalNumber(value.dynamicInstructionBytes)
     && isIdentifier(value.runId)
@@ -1355,8 +1315,9 @@ function isLiveToolOutput(value: unknown): boolean {
 }
 
 function isInputRejection(value: unknown): boolean {
-  return isExactRecord(value, ['code', 'message', 'issues'])
-    && isNonEmptyText(value.code) && isNonEmptyText(value.message)
+  return isExactRecord(value, ['code', 'message', 'issues'], ['diagnostics'])
+    && isLocalAgentError({ code: value.code, message: value.message,
+      ...(value.diagnostics === undefined ? {} : { diagnostics: value.diagnostics }) })
     && Array.isArray(value.issues) && value.issues.length > 0
     && value.issues.every((issue) => isExactRecord(issue, ['path', 'rule', 'message'], ['expected'])
       && isNonEmptyText(issue.path) && isNonEmptyText(issue.rule) && isNonEmptyText(issue.message));
@@ -1370,8 +1331,9 @@ function isProviderHostedActivity(value: unknown): boolean {
 }
 
 function isToolActivity(value: unknown, activityStatus: string): boolean {
-  return isExactRecord(value, ['operation', 'resources'], ['shell', 'fileChanges', 'recordId', 'error'])
+  return isExactRecord(value, ['operation', 'resources'], ['shell', 'fileChanges', 'recordId', 'error', 'projectionError'])
     && (value.error === undefined || isLocalAgentError(value.error))
+    && (value.projectionError === undefined || isLocalAgentError(value.projectionError))
     && (value.recordId === undefined || isIdentifier(value.recordId))
     && isNonEmptyText(value.operation)
     && isArrayOf(value.resources, isActivityResource)
@@ -1381,7 +1343,7 @@ function isToolActivity(value: unknown, activityStatus: string): boolean {
       && [change.before, change.after].every((side) => isRecord(side) && typeof side.exists === 'boolean'
         && (!side.exists || typeof side.contentRef === 'string' || typeof side.error === 'string'))))
     && ((value.operation === 'bash' || value.operation === 'powershell')
-      ? isShellActivity(value.shell, activityStatus)
+      ? value.shell === undefined && value.projectionError !== undefined || isShellActivity(value.shell, activityStatus)
       : value.shell === undefined);
 }
 
@@ -1505,7 +1467,7 @@ function isProviderAttempt(value: unknown): boolean {
   return isExactRecord(value, ['providerRequestId', 'providerAttemptId', 'attempt', 'purpose', 'phase', 'runId', 'updatedAt'], ['error', 'retryAt'])
     && ['providerRequestId', 'providerAttemptId', 'runId'].every((key) => isIdentifier(value[key]))
     && Number.isInteger(value.attempt) && Number(value.attempt) >= 1 && Number(value.attempt) <= 5
-    && ['agent', 'contextCompaction'].includes(String(value.purpose))
+    && ['agent', 'contextCompaction', 'approvalReview'].includes(String(value.purpose))
     && ['started', 'completed', 'failed', 'retryWaiting'].includes(String(value.phase))
     && isNonEmptyText(value.updatedAt)
     && (['failed', 'retryWaiting'].includes(String(value.phase)) ? isLocalAgentError(value.error) : value.error === undefined)
@@ -1518,4 +1480,8 @@ function isFailureSnapshot(value: unknown): boolean {
     && ['providerAttemptIds', 'toolRecordIds', 'pendingCallIds', 'queuedMessageIds'].every((key) => isArrayOf(value[key], isIdentifier))
     && ['providerRequestId', 'lastMessageId'].every((key) => value[key] === undefined || isIdentifier(value[key]))
     && isNullable(value.planRef, isPlanReference);
+}
+
+function isPermissionSettings(value: unknown): boolean {
+  try { validatePermissionPatches(value); return true; } catch { return false; }
 }

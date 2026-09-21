@@ -1,3 +1,4 @@
+import CommandRuleSettings from './CommandRuleSettings';
 import { requestInterfaceReload } from '../../../services/interfaceReload';
 import React, { useMemo } from 'react';
 import type { UserSettingValue } from '@deepcode/protocol';
@@ -37,6 +38,8 @@ const AGENT_SHELL_KEYS = ['agent.windows.shell', 'agent.windows.gitBashPath'] as
 const AGENT_PERMISSION_KEYS = [
   'agent.permissions.workspaceMutation',
   'agent.permissions.engineeringDecisions',
+  'agent.permissions.shell',
+  'agent.permissions.shellAccess',
   'agent.permissions.networkRead',
   'agent.permissions.external',
 ] as const;
@@ -204,6 +207,9 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
       : category === 'permissions' ? [permissions] : [web];
   const commandDenylistMatches = category === 'permissions' && matchesSettingsQuery(query,
     t(language, 'settings.commandDenylist.title'), t(language, 'settings.commandDenylist.description'));
+  const runtimeRootsMatch = category === 'permissions' && matchesSettingsQuery(query, t(language, 'settings.runtimeReadRoots.title'), t(language, 'settings.runtimeReadRoots.description'));
+  const commandRulesMatch = category === 'permissions' && matchesSettingsQuery(query,
+    t(language, 'settings.commandRules.title'), t(language, 'settings.commandRules.description'));
   const onChange = (key: string, value: UserSettingValue) => {
     return patchUserSetting(key, value);
   };
@@ -257,10 +263,14 @@ export const AgentSettingsSection: React.FC<AgentSettingsSectionProps> = ({ quer
       </div>}
 
       {category === 'agent' && renderCard(t(language, 'settings.agent.instructions'), instructions)}
-      {category === 'permissions' && renderCard(null, permissions, commandDenylistMatches ? <CommandDenylistSettings language={language} /> : null)}
+      {category === 'permissions' && renderCard(null, permissions, commandDenylistMatches || commandRulesMatch || runtimeRootsMatch ? <>
+        {commandDenylistMatches && <CommandDenylistSettings language={language} />}
+        {commandRulesMatch && <CommandRuleSettings language={language} />}
+        {runtimeRootsMatch && <CommandDenylistSettings language={language} setting="runtimeReadRoots" />}
+      </> : null)}
       {category === 'services' && renderCard(null, web)}
       {errorMessage && <div className="settings-error">{errorMessage}</div>}
-      {category !== 'environment' && !commandDenylistMatches && groups.every((group) => group.length === 0) && (
+      {category !== 'environment' && !commandDenylistMatches && !commandRulesMatch && !runtimeRootsMatch && groups.every((group) => group.length === 0) && (
         <div className="settings-card">
           <div className="settings-card__body">{t(language, 'settings.noSearchMatch')}</div>
         </div>

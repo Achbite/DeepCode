@@ -1,3 +1,4 @@
+import type { UserSettings, ShellAuthorizationScope } from '@deepcode/protocol';
 import { takeRestoredInterfaceView } from '../services/interfaceReload';
 import { create } from 'zustand';
 import type {
@@ -102,7 +103,9 @@ export interface LocalAgentState {
   attachSessionDirectory(canonicalRoot: string): Promise<void>;
   detachSessionDirectory(workspaceId: string): Promise<void>;
   respondInteraction(response: string): Promise<CommandReply>;
-  respondApproval(decision: 'allow' | 'deny', authorizationScope?: 'runHostShell'): Promise<CommandReply>;
+  setPermissions(patches: UserSettings): Promise<CommandReply>;
+  revokeAuthorization(authorityId: string): Promise<CommandReply>;
+  respondApproval(decision: 'allow' | 'deny', authorizationScope?: ShellAuthorizationScope): Promise<CommandReply>;
   respondPlan(response: PlanResponse): Promise<CommandReply>;
   cancelRun(): Promise<CommandReply>;
   createProject(title: string, workspacePaths?: string[]): Promise<void>;
@@ -599,6 +602,23 @@ const store = create<LocalAgentState>((set, get) => ({
         response: response.trim(),
       }),
     );
+  },
+
+  setPermissions: async (patches) => {
+    const sessionId = requiredSession(get());
+    return submitDecision(set, get, `permissions:${sessionId}`, () => ({
+      schemaVersion: CONVERSATION_COMMAND_VERSION, type: 'session.permissions.set',
+      commandId: nextId('command'), sessionId, patches,
+    }));
+  },
+  revokeAuthorization: async (authorityId) => {
+    const sessionId = requiredSession(get());
+    const grant = get().projection?.shellAuthorizations.find(item => item.authorityId === authorityId);
+    if (!grant) throw new Error('approval_grant_missing');
+    return submitDecision(set, get, `revoke:${sessionId}:${authorityId}`, () => ({
+      schemaVersion: CONVERSATION_COMMAND_VERSION, type: 'approval.revoke',
+      commandId: nextId('command'), sessionId, runId: grant.runId, authorityId,
+    }));
   },
 
   respondApproval: async (decision, authorizationScope) => {

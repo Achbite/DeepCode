@@ -87,6 +87,7 @@ export function useAgentComposer(
   const attachmentControlRef = useRef<HTMLDivElement | null>(null);
   const pluginPickerRef = useRef<HTMLDivElement | null>(null);
   const permissionControlRef = useRef<HTMLDivElement | null>(null);
+  const permissionMenuRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const composerStatesRef = useRef(new Map<string, ComposerState>());
   const [failedDrafts, setFailedDrafts] = useState<Record<string, ComposerState[]>>({});
@@ -215,7 +216,7 @@ export function useAgentComposer(
     const closeOnOutsidePointer = (event: PointerEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
-      if (permissionMenuOpen && !permissionControlRef.current?.contains(target)) {
+      if (permissionMenuOpen && !permissionControlRef.current?.contains(target) && !permissionMenuRef.current?.contains(target)) {
         setPermissionMenuOpen(false);
       }
       if (attachmentMenuOpen && !attachmentControlRef.current?.contains(target)) {
@@ -649,6 +650,7 @@ export function useAgentComposer(
     attachmentControlRef,
     pluginPickerRef,
     permissionControlRef,
+    permissionMenuRef,
     textareaRef,
     recordComposerElementState,
     beginComposition,

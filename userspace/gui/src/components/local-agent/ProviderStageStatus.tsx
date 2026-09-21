@@ -26,6 +26,7 @@ const ProviderStageStatus: React.FC<Props> = ({ run, activity, toolPending, lang
   const phase = run.status === 'waiting' ? `waiting.${run.waitingReason}`
     : run.status !== 'running' ? run.status
       : activity?.purpose === 'contextCompaction' ? 'compacting'
+        : activity?.purpose === 'approvalReview' ? 'reviewing'
         : activity?.phase ?? (toolPending ? 'tools' : 'preparing');
   const elapsedSeconds = Math.max(0, Math.floor((now - startedAt) / 1000));
   const lastContentAt = activity?.lastContentAt ? Date.parse(activity.lastContentAt) : NaN;

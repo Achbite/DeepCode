@@ -6,6 +6,12 @@ import { UiPluginSlotView, useDisplayTheme } from '../../ui-plugins/UiPlugins';
 import { FileChanges } from './FileChanges';
 import { useConversationRowState } from './ConversationVirtualRow';
 
+function shellWriteScopeLabel(language: UiLanguage, writeScope: string): string {
+  const key = `agent.tool.shell.writeScope.${writeScope}`;
+  const label = t(language, key);
+  return label === key ? writeScope : label;
+}
+
 interface ToolActivityGroupProps {
   activities: ActivityProjection[];
   language: UiLanguage;
@@ -222,7 +228,7 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
         aria-expanded={expanded}
         onClick={() => {
           if (!expanded) onExpand();
-          setExpanded((current) => !current);
+          setExpanded(!expanded);
         }}
       >
         <span className="local-agent__tool-entry-icon"><DeepCodeShellIcon name={shell ? 'terminal' : isFileMutationOperation(tool?.operation) ? 'compose' : tool?.operation?.startsWith('fs.') ? 'artifact' : 'tool'} /></span>
@@ -238,6 +244,7 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
         </span>
       </button>
       {tool?.error && <p className="local-agent__tool-error" role="status"><code>{tool.error.code}</code>: {tool.error.message}</p>}
+      {tool?.projectionError && <p className="local-agent__tool-error" role="status"><code>{tool.projectionError.code}</code>: {tool.projectionError.message}</p>}
       {expanded && (
         <UiPluginSlotView slot="tool.result" input={{ kind: 'tool.result', activity, toolId: tool?.operation ?? activity.label, locale: language, theme }}>
         <div className="local-agent__tool-entry-details">
@@ -267,10 +274,7 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
                     </div>
                     <div>
                       <dt>{t(language, 'agent.tool.shell.writeScope')}</dt>
-                      <dd>{t(
-                        language,
-                        `agent.tool.shell.writeScope.${result.environment.writeScope}`,
-                      )}</dd>
+                      <dd>{shellWriteScopeLabel(language, result.environment.writeScope)}</dd>
                     </div>
                   </>
                 )}

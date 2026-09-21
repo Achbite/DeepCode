@@ -1,3 +1,4 @@
+import { t, type UiLanguage } from '../../i18n';
 import type { PlanOperation, PlanProjection } from '@deepcode/protocol';
 
 /** A presentation diff only: confirmation still addresses the complete published revision. */
@@ -20,4 +21,18 @@ export function planScopeAddition(previous: PlanProjection | undefined, current:
   if (!reason || [...before].some((item) => !after.has(item))) return null;
   const operations = current.mutationManifest.filter((item) => !before.has(JSON.stringify(item)));
   return operations.length ? { reason, operations } : null;
+}
+
+export function planOperationDetail(operation: PlanOperation, language: UiLanguage = 'zh-CN'): string {
+  const chinese = language === 'zh-CN';
+  if ('writablePaths' in operation) {
+    const paths = operation.writablePaths.map((target) => target.path + (target.kind === 'directory' ? '/' : '')).join(', ');
+    return `${t(language, 'agent.tool.shell.command')} · ${t(language, 'agent.tool.shell.writeScope')}: ${paths}${operation.command ? `\n${operation.command}` : ''}${operation.terminal ? ` · ${t(language, 'agent.plan.interactiveTerminal')}` : ''}`;
+  }
+  const label = operation.operation === 'fs.delete' ? (chinese ? '删除' : 'Delete')
+    : operation.operation === 'fs.write' ? (chinese ? '写入' : 'Write') : (chinese ? '编辑' : 'Edit');
+  const directory = operation.targetKind === 'directoryTree'
+    ? operation.operation === 'fs.delete' ? (chinese ? '（删除目录树）' : ' (delete directory tree)')
+      : (chinese ? '（目录内文件，含新建）' : ' (descendant files, including new files)') : '';
+  return `${label} · ${operation.target}${directory}`;
 }

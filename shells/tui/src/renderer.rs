@@ -149,6 +149,27 @@ fn run_label(language: Language, projection: Option<&SessionProjection>) -> Stri
     .into()
 }
 
+fn approval_actions(
+    language: Language,
+    approval: &deepcode_kernel_client::ApprovalProjection,
+) -> String {
+    let mut actions = language.text("tui.authorizationActions").to_owned();
+    for (scope, input) in deepcode_kernel_client::AUTHORIZATION_OPTIONS {
+        if approval
+            .preview
+            .authorization_scopes
+            .as_ref()
+            .is_some_and(|scopes| scopes.iter().any(|value| value == scope))
+        {
+            actions.push_str(&format!(
+                "\n/reply {input} {}",
+                language.text(&format!("agent.permission.scope.{scope}"))
+            ));
+        }
+    }
+    actions
+}
+
 fn decision_lines(
     language: Language,
     projection: Option<&SessionProjection>,
@@ -159,42 +180,37 @@ fn decision_lines(
     let (title, actions, summary) = if let Some(approval) = &projection.pending_approval {
         (
             language.text("tui.authorizationDetailsHint"),
-            if approval.preview.authorization_scope.as_deref() == Some("runHostShell") {
-                language.text("tui.authorizationRunActions")
-            } else {
-                language.text("tui.authorizationActions")
-            },
+            approval_actions(language, approval),
             approval.preview.summary.clone(),
         )
     } else if let Some(interaction) = &projection.pending_interaction {
         (
             language.text("tui.replyDetailsHint"),
-            language.text("tui.replyActions"),
+            language.text("tui.replyActions").to_owned(),
             interaction.prompt.clone(),
         )
     } else if let Some(plan) = &projection.pending_plan {
         (
             language.text("tui.planDetailsHint"),
-            language.text("tui.planActions"),
+            language.text("tui.planActions").to_owned(),
             plan.title.clone(),
         )
     } else {
         return vec![];
     };
-    vec![
-        Line::from(Span::styled(
-            title,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(actions),
-        Line::from(Span::raw(summary)),
-        Line::from(Span::styled(
-            language.text("tui.inputQueuedHint"),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ]
+    let mut lines = vec![Line::from(Span::styled(
+        title,
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    lines.extend(actions.lines().map(|line| Line::from(line.to_owned())));
+    lines.push(Line::from(summary));
+    lines.push(Line::from(Span::styled(
+        language.text("tui.inputQueuedHint"),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines
 }
 
 pub(crate) fn decision_details(
@@ -216,14 +232,7 @@ pub(crate) fn decision_details(
             text.push_str(language.text("tui.browserAuthorizationScope"));
         }
         text.push('\n');
-        text.push_str(
-            &decision_lines(language, Some(projection))
-                .iter()
-                .take(2)
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
+        text.push_str(&approval_actions(language, approval));
         return text;
     }
     if let Some(plan) = &projection.pending_plan {
@@ -475,13 +484,20 @@ mod layout_tests {
                 "fs_read_failed: 原始读取错误",
             ),
             (
+                "completed",
+                serde_json::json!({"tool":{"operation":"bash", "resources":[], "projectionError":{"code":"bash_projection_environment_invalid", "message":"原始记录保留"}}}),
+                "bash_projection_environment_invalid: 原始记录保留",
+            ),
+            (
                 "indeterminate",
                 serde_json::json!({"interruption":{"code":"result_unknown", "message":"原始传输错误"}}),
                 "result_unknown: 原始传输错误",
             ),
             (
                 "rejected",
-                serde_json::json!({"inputRejection":{"code":"workspace_target_invalid", "message":"Not a directory", "issues":[{"path":"$.path", "rule":"path", "message":"invalid path"}]}}),
+                serde_json::json!({"inputRejection":{"code":"workspace_target_invalid", "message":"Not a directory",
+                    "diagnostics":{"source":"kernel", "phase":"prepare", "category":"input", "retryable":false, "causes":[]},
+                    "issues":[{"path":"$.path", "rule":"path", "message":"invalid path"}]}}),
                 "workspace_target_invalid: Not a directory",
             ),
         ] {
@@ -751,9 +767,20 @@ impl Renderer {
                 if approval.preview.authorization_scope.as_deref() == Some("sessionBrowser") {
                     output.push_str(language.text("tui.browserAuthorizationHint"));
                 }
-                if approval.preview.authorization_scope.as_deref() == Some("runHostShell") {
-                    output.push_str(language.text("tui.runAuthorizationHint"));
+                if let Some(files) = &approval.preview.file_access {
+                    for access in ["read", "write"] {
+                        if let Some(paths) = files[access].as_array() {
+                            for path in paths {
+                                output.push_str(&format!(
+                                    "  {access}: {}\n",
+                                    path.as_str().unwrap_or("")
+                                ));
+                            }
+                        }
+                    }
                 }
+                output.push_str(&approval_actions(language, approval));
+                output.push('\n');
                 for target in &approval.preview.logical_targets {
                     output.push_str(&format!("  - {target}\n"));
                 }
@@ -1896,6 +1923,12 @@ fn tool_error_lines(activity: &ActivityProjection) -> Vec<String> {
         .interruption
         .iter()
         .chain(activity.tool.as_ref().and_then(|tool| tool.error.as_ref()))
+        .chain(
+            activity
+                .tool
+                .as_ref()
+                .and_then(|tool| tool.projection_error.as_ref()),
+        )
     {
         lines.push(format!("  {}: {}", error.code, error.message));
     }

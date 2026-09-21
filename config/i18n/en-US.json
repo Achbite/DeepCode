@@ -5,6 +5,8 @@
   "status": "active",
   "notes": "DeepCode UI localization pack. Translators can add messages/settings entries without changing frontend code.",
   "messages": {
+    "agent.permission.back": "Back to permissions",
+    "agent.permission.close": "Close permissions",
     "host.startup.failed": "Core service failed to start",
     "host.startup.log": "Startup log",
     "agent.profile.disabled": "Disabled",
@@ -518,6 +520,8 @@
     "agent.approval.targets": "Targets",
     "agent.approval.deny": "Deny",
     "agent.approval.allow": "Allow",
+    "agent.approval.allowRun": "Allow this turn",
+    "agent.approval.allowSession": "Allow this conversation",
     "agent.composer.placeholder.plan": "Or suggest changes…",
     "agent.composer.placeholder.interaction": "Or write your reply…",
     "agent.composer.placeholder.approval": "Allow or deny the action above.",
@@ -545,18 +549,16 @@
     "agent.attachment.attachSelected": "Attach selected item",
     "agent.attachment.size.bytes": "{value} B",
     "agent.attachment.size.kibibytes": "{value} KiB",
-    "agent.permission.summary.plan": "Workspace read: allowed · workspace changes: Plan-gated · Host Shell/external: {external}",
-    "agent.permission.summary.allow": "Workspace read/changes: allowed · Host Shell/external: {external}",
     "agent.permission.workspaceRead": "Workspace read",
     "agent.permission.workspaceReadAllowed": "Allowed when bound",
-    "agent.permission.workspaceMutation": "Workspace changes",
-    "agent.permission.workspaceMutationPlan": "Allow workspace changes after Plan confirmation",
-    "agent.permission.workspaceMutationAllow": "Allow changes in bound workspaces",
+    "agent.permission.workspaceMutation": "Plan confirmation",
+    "agent.permission.workspaceMutationPlan": "Ask",
+    "agent.permission.workspaceMutationAllow": "Delegate to Agent",
     "agent.permission.engineeringDecisions": "Engineering decisions",
-    "agent.permission.engineeringDecisionsAsk": "Ask when material choices are unclear",
+    "agent.permission.engineeringDecisionsAsk": "Ask",
     "agent.permission.engineeringDecisionsDelegate": "Delegate to Agent",
     "agent.permission.networkRead": "Network read",
-    "agent.permission.externalEffects": "Host Shell and external effects",
+    "agent.permission.externalEffects": "External actions",
     "agent.permission.allow": "Allow",
     "agent.permission.ask": "Ask",
     "agent.permission.deny": "Deny",
@@ -620,8 +622,10 @@
     "agent.tool.shell.environment": "Execution environment",
     "agent.tool.shell.environmentValue": "{shell} · non-interactive · augmented PATH",
     "agent.tool.shell.writeScope": "Write scope",
-    "agent.tool.shell.writeScope.kernelTemporaryOnly": "Temporary storage writable; workspace and HOME read-only",
-    "agent.tool.shell.writeScope.workspaceAndKernelTemporary": "Authorized workspace paths and temporary storage writable; HOME read-only",
+    "agent.tool.shell.writeScope.authorizedResources": "Authorized files and Agent workdir writable; HOME uses a private directory",
+    "agent.tool.shell.writeScope.workspaceAndKernelTemporary": "Workspace and temporary directory writable",
+    "agent.tool.shell.writeScope.kernelTemporaryOnly": "Only the temporary directory writable",
+    "agent.tool.shell.writeScope.hostUser": "Host user write access",
     "agent.tool.shell.stdout": "Standard output",
     "agent.tool.shell.stderr": "Standard error",
     "agent.tool.shell.exit": "Exit {code}",
@@ -933,7 +937,9 @@
     "tui.cancelled": "Cancelled",
     "tui.indeterminateHint": "Outcome unknown · /error",
     "tui.authorizationDetailsHint": "Awaiting authorization · /decision for full scope",
-    "tui.authorizationRunActions": "/reply 1 allow once · /reply 2 deny · /reply 3 allow this run",
+    "tui.authorizationFileActions": "/reply 1 allow once · 2 deny · 5 files for run · 6 session resource",
+    "tui.fileAuthorizationHint": "/reply 5 allows these files for the run; /reply 6 adds a revocable session resource.\n",
+    "tui.authorizationRunActions": "/reply 1 allow once · 2 deny · 3 allow this command for this run",
     "tui.authorizationActions": "/reply 1 allow · /reply 2 deny",
     "tui.replyDetailsHint": "Awaiting reply · /decision for options",
     "tui.replyActions": "/reply <text or option number> to answer",
@@ -960,7 +966,7 @@
     "tui.replyRequired": "Reply needed (/reply <text>): {0}\n",
     "tui.approvalRequired": "Approval needed (/reply 1 or /reply 2): {0}\n",
     "tui.browserAuthorizationHint": "After authorization, browser page operations in this conversation need no further confirmation.\n",
-    "tui.runAuthorizationHint": "/reply 3 allows host Shell for this run with the same working directory and execution environment.\n",
+    "tui.runAuthorizationHint": "/reply 3 allows this command for the run; /reply 4 allows Host Shell for the run when offered.\n",
     "tui.approvalInputHint": "Enter /reply 1 to allow or /reply 2 to deny.\n",
     "tui.cacheHitPlain": "Total cache hit {0}\n",
     "tui.sessionNotInitializedPlain": "Session is not initialized.\n",
@@ -1046,7 +1052,7 @@
     "tui.emptyInput": "Input cannot be empty.",
     "tui.replyUsage": "Usage: /reply <response, confirmation, or revision>",
     "tui.replyReferencesUnsupported": "Plugins and filesystem references cannot be attached to a decision response for an existing run.",
-    "tui.runAuthorizationUnavailable": "This operation does not offer host Shell authorization for the run.",
+    "tui.runAuthorizationUnavailable": "This operation does not offer that authorization scope for the run.",
     "tui.noPendingReply": "No plan, interaction, or operation approval is awaiting a reply.",
     "tui.focusSeparator": "Unknown command; separate /focus and the task with a space.",
     "tui.focusRequired": "/focus requires a nonempty task.",
@@ -1095,7 +1101,48 @@
     "tui.reasoning.low": "Low",
     "tui.reasoning.medium": "Medium",
     "tui.reasoning.high": "High",
-    "tui.reasoning.max": "Max"
+    "tui.reasoning.max": "Max",
+    "agent.permission.shell": "Shell approval",
+    "agent.permission.shellAccess": "Execution scope",
+    "agent.permission.review": "Review for me",
+    "agent.permission.delegate": "Delegate to Agent",
+    "agent.permission.workspaceScope": "Workspace and grants",
+    "agent.permission.fullScope": "Full environment",
+    "agent.permission.currentTask": "Current task · applies to the next operation",
+    "agent.permission.newTasks": "Defaults for new tasks",
+    "agent.permission.reviewHelp": "Review unresolved operations within the delegated scope; ask when uncertain.",
+    "agent.permission.fullHelp": "Use full user privileges in the selected environment. Approval mode and command rules still apply.",
+    "agent.permission.file.read": "Read",
+    "agent.permission.file.write": "Write",
+    "agent.permission.file.run": "Files for this turn",
+    "agent.permission.file.session": "Conversation files",
+    "settings.runtimeReadRoots.title": "Additional runtime directories",
+    "settings.runtimeReadRoots.description": "One absolute path per line. Directories and their children are read-only, for toolchains or Skill resources outside the project. This does not allow writes.",
+    "settings.runtimeReadRoots.edit": "Edit directories",
+    "settings.runtimeReadRoots.invalid": "Directories must be a list of paths.",
+    "agent.permission.runGrants": "Active grants",
+    "agent.permission.revoke": "Revoke",
+    "agent.permission.grantHelp": "Command approval binds the command and environment. Host Shell approval covers other commands in that environment, including host file writes. Grants last for the selected period and can be revoked.",
+    "agent.permission.reviewing": "Agent is reviewing",
+    "agent.permission.takeOver": "Switch to Ask",
+    "agent.permission.saveRule": "Save a rule for this command",
+    "agent.permission.ruleSaved": "Rule saved",
+    "settings.commandRules.title": "Saved command rules",
+    "settings.commandRules.description": "Match the exact command, input, workspace and environment. Rules do not prove scripts safe; the execution environment enforces isolation.",
+    "settings.commandRules.empty": "No rules. Save one explicitly from a permission request.",
+    "settings.commandRules.remove": "Delete rule",
+    "agent.activity.reviewing": "Reviewing execution permission",
+    "agent.plan.confirmedByAgent": "Confirmed by Agent",
+    "agent.permission.scope.runCommand": "Allow this command for this task",
+    "agent.permission.scope.sessionCommand": "Allow this command for this conversation",
+    "agent.permission.scope.runHostShell": "Allow Host Shell for this task",
+    "agent.permission.scope.sessionHostShell": "Allow Host Shell for this conversation",
+    "agent.permission.scope.runNetwork": "Allow network in this environment for this task",
+    "agent.permission.scope.sessionNetwork": "Allow network in this environment for this conversation",
+    "agent.permission.scope.runContainer": "Allow this container for this task",
+    "agent.permission.scope.sessionContainer": "Allow this container for this conversation",
+    "agent.permission.scope.runFiles": "Allow these files for this task",
+    "agent.permission.scope.sessionFiles": "Allow these files for this conversation"
   },
   "settings": {
     "workbench.language": {
@@ -1172,18 +1219,18 @@
       "description": "Append to the built-in instructions for new conversations."
     },
     "agent.permissions.workspaceMutation": {
-      "label": "Workspace changes",
-      "description": "Allow grants workspace changes in advance when no Plan is confirmed. A confirmed Plan authorizes its declared operations and paths. Uncovered operations require approval before execution; allowing one call does not expand the Plan.",
+      "label": "Plan confirmation",
+      "description": "Choose user confirmation or delegate Plan decisions to the Agent. Execution permissions are separate.",
       "options": {
-        "plan": "After Plan confirmation",
-        "allow": "Allow in bound workspaces"
+        "plan": "Ask",
+        "allow": "Delegate to Agent"
       }
     },
     "agent.permissions.engineeringDecisions": {
       "label": "Engineering decisions",
       "description": "Choose whether to ask you or let the Agent decide an unclear engineering approach. Missing requirements and out-of-workspace actions still require a question.",
       "options": {
-        "ask": "Ask the user",
+        "ask": "Ask",
         "delegate": "Delegate to Agent"
       }
     },
@@ -1197,8 +1244,8 @@
       }
     },
     "agent.permissions.external": {
-      "label": "Host Shell and external tools",
-      "description": "Default permissions for Host Shell and external tools. With an active Plan or Plan approval enabled, each Host Shell call needs separate approval, even when this setting is Allow. Approval grants host-user permissions for that call and leaves the Plan unchanged.",
+      "label": "External actions",
+      "description": "Default permissions for external tools. Shell has separate permission settings.",
       "options": {
         "allow": "Allow",
         "ask": "Ask every time",
@@ -1228,6 +1275,23 @@
     "mcp.servers": {
       "label": "Project MCP Servers",
       "description": "JSON array of MCP service definitions available to Agent runs."
+    },
+    "agent.permissions.shell": {
+      "label": "Shell approval",
+      "description": "Review unresolved operations within the delegated scope; ask when uncertain.",
+      "options": {
+        "ask": "Ask",
+        "review": "Review for me",
+        "allow": "Allow"
+      }
+    },
+    "agent.permissions.shellAccess": {
+      "label": "Execution scope",
+      "description": "Use full user privileges in the selected environment. Approval mode and command rules still apply.",
+      "options": {
+        "workspace": "Workspace and grants",
+        "full": "Full environment"
+      }
     }
   }
 }

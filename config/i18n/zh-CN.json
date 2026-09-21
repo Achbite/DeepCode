@@ -5,6 +5,8 @@
   "status": "active",
   "notes": "DeepCode UI localization pack. Translators can add messages/settings entries without changing frontend code.",
   "messages": {
+    "agent.permission.back": "返回权限列表",
+    "agent.permission.close": "关闭权限设置",
     "host.startup.failed": "核心服务启动失败",
     "host.startup.log": "启动日志",
     "agent.profile.disabled": "已停用",
@@ -518,6 +520,8 @@
     "agent.approval.targets": "目标",
     "agent.approval.deny": "拒绝",
     "agent.approval.allow": "允许",
+    "agent.approval.allowRun": "允许本轮",
+    "agent.approval.allowSession": "允许本会话",
     "agent.composer.placeholder.plan": "或输入修改意见…",
     "agent.composer.placeholder.interaction": "或自行撰写回复…",
     "agent.composer.placeholder.approval": "请允许或拒绝上述操作。",
@@ -545,18 +549,16 @@
     "agent.attachment.attachSelected": "附加所选项目",
     "agent.attachment.size.bytes": "{value} B",
     "agent.attachment.size.kibibytes": "{value} KiB",
-    "agent.permission.summary.plan": "工作区读取：允许 · 工作区修改：Plan 门禁 · Host Shell/外部：{external}",
-    "agent.permission.summary.allow": "工作区读取/修改：允许 · Host Shell/外部：{external}",
     "agent.permission.workspaceRead": "工作区读取",
     "agent.permission.workspaceReadAllowed": "绑定目录内允许",
-    "agent.permission.workspaceMutation": "工作区修改",
-    "agent.permission.workspaceMutationPlan": "确认 Plan 后允许工作区修改",
-    "agent.permission.workspaceMutationAllow": "直接允许修改绑定的工作区",
+    "agent.permission.workspaceMutation": "Plan 确认",
+    "agent.permission.workspaceMutationPlan": "询问",
+    "agent.permission.workspaceMutationAllow": "委托 Agent",
     "agent.permission.engineeringDecisions": "工程路线抉择",
-    "agent.permission.engineeringDecisionsAsk": "遇到不明确项时询问",
-    "agent.permission.engineeringDecisionsDelegate": "委托给 Agent",
+    "agent.permission.engineeringDecisionsAsk": "询问",
+    "agent.permission.engineeringDecisionsDelegate": "委托 Agent",
     "agent.permission.networkRead": "网络读取",
-    "agent.permission.externalEffects": "Host Shell 与外部操作",
+    "agent.permission.externalEffects": "外部操作",
     "agent.permission.allow": "允许",
     "agent.permission.ask": "询问",
     "agent.permission.deny": "拒绝",
@@ -620,8 +622,10 @@
     "agent.tool.shell.environment": "执行环境",
     "agent.tool.shell.environmentValue": "{shell} · 非交互 · PATH 已补全",
     "agent.tool.shell.writeScope": "写入范围",
-    "agent.tool.shell.writeScope.kernelTemporaryOnly": "临时存储可写；工作区与 HOME 只读",
-    "agent.tool.shell.writeScope.workspaceAndKernelTemporary": "已授权工作区路径与临时存储可写；HOME 只读",
+    "agent.tool.shell.writeScope.authorizedResources": "已授权文件与 Agent 工作目录可写；HOME 使用私有目录",
+    "agent.tool.shell.writeScope.workspaceAndKernelTemporary": "工作区与临时目录可写",
+    "agent.tool.shell.writeScope.kernelTemporaryOnly": "仅临时目录可写",
+    "agent.tool.shell.writeScope.hostUser": "宿主用户写入权限",
     "agent.tool.shell.stdout": "标准输出",
     "agent.tool.shell.stderr": "标准错误",
     "agent.tool.shell.exit": "退出码 {code}",
@@ -933,7 +937,9 @@
     "tui.cancelled": "已取消",
     "tui.indeterminateHint": "结果未确定 · /error",
     "tui.authorizationDetailsHint": "等待授权 · /decision 查看完整范围",
-    "tui.authorizationRunActions": "/reply 1 允许一次 · /reply 2 拒绝 · /reply 3 允许本轮",
+    "tui.authorizationFileActions": "/reply 1 允许一次 · 2 拒绝 · 5 本轮文件 · 6 会话资源",
+    "tui.fileAuthorizationHint": "/reply 5 本轮允许这些文件；/reply 6 添加为会话资源，可随时撤销。\n",
+    "tui.authorizationRunActions": "/reply 1 允许一次 · 2 拒绝 · 3 本轮允许此命令",
     "tui.authorizationActions": "/reply 1 允许 · /reply 2 拒绝",
     "tui.replyDetailsHint": "等待回答 · /decision 查看选项",
     "tui.replyActions": "/reply <内容或选项编号> 回答",
@@ -960,7 +966,7 @@
     "tui.replyRequired": "需要你回答（/reply <内容>）：{0}\n",
     "tui.approvalRequired": "需要你批准（/reply 1 或 /reply 2）：{0}\n",
     "tui.browserAuthorizationHint": "允许后，当前对话内的浏览器页面操作无需重复确认。\n",
-    "tui.runAuthorizationHint": "/reply 3 允许本轮相同工作目录和执行环境的宿主 Shell。\n",
+    "tui.runAuthorizationHint": "/reply 3 本轮允许此命令；/reply 4 允许本轮 Host Shell（仅在提供该范围时）。\n",
     "tui.approvalInputHint": "输入 /reply 1 允许或 /reply 2 拒绝。\n",
     "tui.cacheHitPlain": "总缓存命中 {0}\n",
     "tui.sessionNotInitializedPlain": "Session 尚未初始化。\n",
@@ -1046,7 +1052,7 @@
     "tui.emptyInput": "输入不能为空。",
     "tui.replyUsage": "用法：/reply <答复、确认或修订说明>",
     "tui.replyReferencesUnsupported": "插件和文件系统引用不能用于已有 run 的决策回应。",
-    "tui.runAuthorizationUnavailable": "当前操作未提供本轮宿主 Shell 授权。",
+    "tui.runAuthorizationUnavailable": "当前操作未提供该本轮授权范围。",
     "tui.noPendingReply": "当前没有等待答复的 Plan、交互或 effect 审批。",
     "tui.focusSeparator": "未知命令；/focus 后必须以空格分隔任务正文。",
     "tui.focusRequired": "/focus 需要非空任务正文。",
@@ -1095,7 +1101,48 @@
     "tui.reasoning.low": "低",
     "tui.reasoning.medium": "中",
     "tui.reasoning.high": "高",
-    "tui.reasoning.max": "最高"
+    "tui.reasoning.max": "最高",
+    "agent.permission.shell": "Shell 审批",
+    "agent.permission.shellAccess": "执行范围",
+    "agent.permission.review": "替我批准",
+    "agent.permission.delegate": "委托 Agent",
+    "agent.permission.workspaceScope": "工作区与已授权资源",
+    "agent.permission.fullScope": "完整执行环境",
+    "agent.permission.currentTask": "当前任务 · 下一次操作生效",
+    "agent.permission.newTasks": "新任务默认设置",
+    "agent.permission.reviewHelp": "仅在已委托范围内按需审查；无法判断时询问。",
+    "agent.permission.fullHelp": "使用当前执行环境的完整用户权限。审批方式和命令规则仍然有效。",
+    "agent.permission.file.read": "读取",
+    "agent.permission.file.write": "写入",
+    "agent.permission.file.run": "本轮文件权限",
+    "agent.permission.file.session": "会话文件权限",
+    "settings.runtimeReadRoots.title": "额外运行依赖目录",
+    "settings.runtimeReadRoots.description": "每行一个绝对路径。所列目录及子目录只读，适用于项目外的工具链和 Skill 资源；不会授予写入权限。",
+    "settings.runtimeReadRoots.edit": "编辑目录",
+    "settings.runtimeReadRoots.invalid": "目录配置必须是路径列表。",
+    "agent.permission.runGrants": "有效授权",
+    "agent.permission.revoke": "撤销",
+    "agent.permission.grantHelp": "命令授权绑定命令和执行环境；Host Shell 授权允许该环境中的其他命令，包括宿主文件写入。授权按所选期限生效，可随时撤销。",
+    "agent.permission.reviewing": "Agent 正在审查",
+    "agent.permission.takeOver": "改为询问",
+    "agent.permission.saveRule": "保存此命令规则",
+    "agent.permission.ruleSaved": "规则已保存",
+    "settings.commandRules.title": "已保存的命令规则",
+    "settings.commandRules.description": "精确匹配命令、输入、工作区和执行环境。规则不证明脚本内容安全；隔离范围仍由执行环境决定。",
+    "settings.commandRules.empty": "暂无规则，可在权限申请中明确保存。",
+    "settings.commandRules.remove": "删除规则",
+    "agent.activity.reviewing": "正在审查执行权限",
+    "agent.plan.confirmedByAgent": "Agent 已确认",
+    "agent.permission.scope.runCommand": "本次任务允许相同命令",
+    "agent.permission.scope.sessionCommand": "本会话允许相同命令",
+    "agent.permission.scope.runHostShell": "本次任务允许 Host Shell",
+    "agent.permission.scope.sessionHostShell": "本会话允许 Host Shell",
+    "agent.permission.scope.runNetwork": "本次任务允许此环境联网",
+    "agent.permission.scope.sessionNetwork": "本会话允许此环境联网",
+    "agent.permission.scope.runContainer": "本次任务允许此容器",
+    "agent.permission.scope.sessionContainer": "本会话允许此容器",
+    "agent.permission.scope.runFiles": "本次任务允许这些文件",
+    "agent.permission.scope.sessionFiles": "本会话允许这些文件"
   },
   "settings": {
     "workbench.language": {
@@ -1172,19 +1219,19 @@
       "description": "附加到内置指令后，应用于新对话。"
     },
     "agent.permissions.workspaceMutation": {
-      "label": "工作区修改",
-      "description": "没有已确认 Plan 时，“允许”提前授权工作区修改。已确认 Plan 许可声明的操作与路径；未覆盖操作执行前请求确认，允许一次不扩大 Plan。",
+      "label": "Plan 确认",
+      "description": "选择由用户确认 Plan，或委托 Agent 确认。执行权限单独管理。",
       "options": {
-        "plan": "确认计划后执行",
-        "allow": "允许修改绑定的工作区"
+        "plan": "询问",
+        "allow": "委托 Agent"
       }
     },
     "agent.permissions.engineeringDecisions": {
       "label": "工程路线抉择",
       "description": "工程路线不明确时，选择询问你或由 Agent 决定。需求缺失或工作区外操作仍会询问。",
       "options": {
-        "ask": "询问用户",
-        "delegate": "委托给 Agent"
+        "ask": "询问",
+        "delegate": "委托 Agent"
       }
     },
     "agent.permissions.networkRead": {
@@ -1197,8 +1244,8 @@
       }
     },
     "agent.permissions.external": {
-      "label": "Host Shell 与外部工具",
-      "description": "控制 Host Shell 与外部工具的默认权限。有生效 Plan 或启用 Plan 审批时，即使这里设为允许，每次 Host Shell 调用也需单独确认；批准后该调用按宿主用户权限执行，原 Plan 不变。",
+      "label": "外部操作",
+      "description": "控制外部工具的默认权限；Shell 使用单独的权限设置。",
       "options": {
         "allow": "允许",
         "ask": "每次询问",
@@ -1228,6 +1275,23 @@
     "mcp.servers": {
       "label": "项目 MCP 服务",
       "description": "可供 Agent 运行使用的 MCP 服务定义 JSON 数组。"
+    },
+    "agent.permissions.shell": {
+      "label": "Shell 审批",
+      "description": "仅在已委托范围内按需审查；无法判断时询问。",
+      "options": {
+        "ask": "询问",
+        "review": "替我批准",
+        "allow": "允许"
+      }
+    },
+    "agent.permissions.shellAccess": {
+      "label": "执行范围",
+      "description": "使用当前执行环境的完整用户权限。审批方式和命令规则仍然有效。",
+      "options": {
+        "workspace": "工作区与已授权资源",
+        "full": "完整执行环境"
+      }
     }
   }
 }
