@@ -88,6 +88,7 @@ case "$profile" in
     python3 -I -S ./scripts/tests/permission-delegation-cli.py
     python3 -I -S ./scripts/tests/file-access-cli.py
     python3 -I -S ./scripts/tests/managed-process-cli.py
+    python3 -I -S ./scripts/tests/conversation-storage.py
     ;;
   full)
     run_required
@@ -99,6 +100,7 @@ case "$profile" in
     python3 -I -S ./scripts/tests/permission-delegation-cli.py
     python3 -I -S ./scripts/tests/file-access-cli.py
     python3 -I -S ./scripts/tests/managed-process-cli.py
+    python3 -I -S ./scripts/tests/conversation-storage.py
     python3 -I -S ./scripts/tests/local-agent-e2e.py
     python3 -I -S ./scripts/tests/document-render-e2e.py
     ;;
