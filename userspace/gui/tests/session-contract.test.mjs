@@ -2464,7 +2464,7 @@ test('unavailable plugins preserve their source error and cannot be selected in 
   assert.match(html, /plugin_load_failed: Manifest cannot be read/);
 });
 
-test('tool failure summaries render the original error without reading history', async (t) => {
+test('collapsed tool failures retain their original errors in manual details', async (t) => {
   const previousSelf = globalThis.self;
   globalThis.self = {};
   t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
@@ -2474,7 +2474,7 @@ test('tool failure summaries render the original error without reading history',
     '/src/components/local-agent/ToolActivityDetails.tsx', '/src/components/local-agent/ConversationVirtualRow.tsx',
   ]);
   const layout = { state: new Map() };
-  const html = renderToStaticMarkup(createElement(ConversationVirtualRow, {
+  const render = () => renderToStaticMarkup(createElement(ConversationVirtualRow, {
     rowKey: 'tool-failure', eager: true, virtualizer: { layout: () => layout },
     children: () => createElement(ToolActivityGroup, { activities: [{
       activityId: 'activity:one', runId: 'run:one', status: 'failed', kind: 'tool', label: 'read',
@@ -2482,6 +2482,10 @@ test('tool failure summaries render the original error without reading history',
         projectionError: { code: 'tool_error_diagnostics_invalid', message: 'Original record retained.' } },
     }], language: 'zh-CN', onExpand() {}, onOpenWorkspaceResource() {} }),
   }));
+  assert.equal(render().includes('path_not_directory'), false);
+  assert.match(render(), /失败/);
+  layout.state.set('tool:activity:one:expanded', true);
+  const html = render();
   assert.match(html, /path_not_directory/);
   assert.match(html, /a.txt is not a directory/);
   assert.match(html, /tool_error_diagnostics_invalid/);
@@ -3095,4 +3099,70 @@ test('resource notifications use explicit references and preserve stream failure
   const changes = [];
   await assert.rejects(watchResources('session:files', [reference], new AbortController().signal, indices => changes.push(indices)), /watch failed/);
   assert.deepEqual(changes, [[0], [0]]);
+});
+
+test('tool groups and nested details keep manual disclosure across output and settlement', async t => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const [{ ToolActivityGroup, ProviderHostedDraftGroup }, { ConversationVirtualRow }] = await loadGuiModules(t, [
+    '/src/components/local-agent/ToolActivityDetails.tsx', '/src/components/local-agent/ConversationVirtualRow.tsx',
+  ]);
+  const layout = {state:new Map()};
+  const activities = ['A','B','C'].map((id,index) => ({activityId:id,runId:'run:manual',callId:id,sequence:index+1,
+    kind:'tool',status:'active',label:id,startedAt:String(Date.now()),
+    liveOutput:{stdout:`${id} output`,stderr:'',stdoutBytes:8,stderrBytes:0,truncated:false},
+    tool:{operation:'process',resources:[]}}));
+  const render = (hosted = false) => renderToStaticMarkup(createElement(ConversationVirtualRow, {
+    rowKey:'manual-tools', eager:true, virtualizer:{layout:()=>layout}, children:()=>hosted
+      ? createElement(ProviderHostedDraftGroup, {blocks:activities.slice(0,2).map(a=>({kind:'providerHosted',
+        providerCallId:a.callId,providerToolType:'web_search',status:a.status,action:{query:a.label}})),language:'en-US',onExpand(){}})
+      : createElement(ToolActivityGroup,{activities,language:'en-US',onExpand(){},onOpenWorkspaceResource(){}}),
+  }));
+  assert.equal(render().includes('tool-entry-heading'),false);
+  layout.state.set('tool-group:expanded',true);
+  assert.equal((render().match(/tool-entry-heading/g)||[]).length,3);
+  assert.equal(render().includes('<pre>'),false);
+  layout.state.set('tool:C:expanded',true);
+  assert.match(render(), /C output/);
+  assert.equal(render().includes('A output'),false);
+  activities[2].liveOutput.stdout = 'C second output';
+  assert.match(render(), /C second output/);
+  activities[2].status = 'failed';
+  delete activities[2].liveOutput;
+  activities[2].tool.error = {code:'exit_nonzero',message:'original failure'};
+  assert.match(render(), /original failure/);
+  assert.equal(layout.state.get('tool-group:expanded'),true);
+  assert.equal(layout.state.get('tool:C:expanded'),true);
+  layout.state.set('tool-group:expanded',false);
+  assert.equal(render().includes('original failure'),false);
+  assert.equal(render(true).includes('tool-entry-heading'),false);
+  layout.state.set('hosted-group:expanded',true);
+  assert.equal((render(true).match(/tool-entry-heading/g)||[]).length,2);
+});
+
+test('settled managed processes render stored output without live output', async t => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const [{ ToolActivityGroup }, { ConversationVirtualRow }] = await loadGuiModules(t, [
+    '/src/components/local-agent/ToolActivityDetails.tsx', '/src/components/local-agent/ConversationVirtualRow.tsx',
+  ]);
+  const layout = { state: new Map([['tool:managed:expanded', true]]) };
+  const activity = {
+    activityId: 'managed', runId: 'run:managed', callId: 'call:managed', sequence: 1,
+    kind: 'tool', status: 'completed', label: 'bash', startedAt: '1',
+    tool: { operation: 'bash', resources: [], process: {
+      jobId: 'job:managed', command: 'make build',
+      output: { stdout: 'Build finished', stderr: 'Build warning', stdoutBytes: 14, stderrBytes: 13, truncated: false },
+      result: { exitCode: 0, durationMs: 100, timedOut: false },
+    } },
+  };
+  const html = renderToStaticMarkup(createElement(ConversationVirtualRow, {
+    rowKey: 'managed-output', eager: true, virtualizer: { layout: () => layout },
+    children: () => createElement(ToolActivityGroup, {
+      activities: [activity], language: 'en-US', onExpand() {}, onOpenWorkspaceResource() {},
+    }),
+  }));
+  assert.match(html, /Build finished/);
+  assert.match(html, /Build warning/);
+  assert.doesNotMatch(html, /No output yet/);
 });

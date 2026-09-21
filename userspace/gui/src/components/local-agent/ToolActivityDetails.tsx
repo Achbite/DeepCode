@@ -30,7 +30,7 @@ export const ProviderHostedDraftGroup: React.FC<ProviderHostedDraftGroupProps> =
   language,
   onExpand,
 }) => {
-  const [expanded, setExpanded] = useConversationRowState('hosted-group:expanded', true);
+  const [expanded, setExpanded] = useConversationRowState('hosted-group:expanded', false);
   const failed = blocks.some((block) => block.status === 'failed');
   const summary = failed
       ? t(language, 'agent.providerHosted.summary.didNotCompleteMany', { count: blocks.length })
@@ -77,7 +77,7 @@ export const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
   onExpand,
   onOpenWorkspaceResource,
 }) => {
-  const [expanded, setExpanded] = useConversationRowState('tool-group:expanded', true);
+  const [expanded, setExpanded] = useConversationRowState('tool-group:expanded', false);
   const hasFailure = activities.some((activity) => (
     ['failed', 'denied', 'rejected', 'indeterminate'].includes(activity.status)
   ));
@@ -207,7 +207,9 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
   const theme = useDisplayTheme();
   const tool = activity.tool;
   const shell = tool?.shell;
+  const process = tool?.process;
   const result = shell?.result;
+  const output = activity.liveOutput ?? process?.output;
   const resources = tool?.resources.filter((resource) => !(resource.kind === 'workspacePath'
     && tool.fileChanges?.some((change) => change.workspaceId === resource.workspaceId && change.path === resource.logicalPath))) ?? [];
   if (activity.providerHosted) {
@@ -243,17 +245,18 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
           <DeepCodeShellIcon name="chevronRight" />
         </span>
       </button>
-      {tool?.error && <p className="local-agent__tool-error" role="status"><code>{tool.error.code}</code>: {tool.error.message}</p>}
-      {tool?.projectionError && <p className="local-agent__tool-error" role="status"><code>{tool.projectionError.code}</code>: {tool.projectionError.message}</p>}
       {expanded && (
         <UiPluginSlotView slot="tool.result" input={{ kind: 'tool.result', activity, toolId: tool?.operation ?? activity.label, locale: language, theme }}>
         <div className="local-agent__tool-entry-details">
+          {tool?.error && <p className="local-agent__tool-error" role="status"><code>{tool.error.code}</code>: {tool.error.message}</p>}
+          {tool?.projectionError && <p className="local-agent__tool-error" role="status"><code>{tool.projectionError.code}</code>: {tool.projectionError.message}</p>}
           <FileChanges activities={[activity]} compact />
           <dl>
             <div>
               <dt>{t(language, 'agent.tool.detail.operation')}</dt>
               <dd><code>{tool?.operation ?? activity.label}</code></dd>
             </div>
+            {process && <div><dt>{t(language, 'agent.tool.shell.command')}</dt><dd><code>{process.command}</code></dd></div>}
             {shell && (
               <>
                 <div>
@@ -354,16 +357,21 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
               )}
             </div>
           )}
-          {!result && activity.status === 'active' && activity.liveOutput && (
+          {process?.result && <div className="local-agent__shell-result-meta">
+            <span>{t(language, 'agent.tool.shell.exit', {code: process.result.exitCode ?? t(language, 'agent.tool.shell.noExitCode')})}</span>
+            <span>{t(language, 'agent.tool.shell.duration', {duration: process.result.durationMs})}</span>
+            {process.result.timedOut && <span>{t(language, 'agent.tool.shell.timedOut')}</span>}
+          </div>}
+          {!result && output && (
             <div className="local-agent__shell-result">
-              {activity.liveOutput.truncated && <small>{t(language, 'agent.tool.shell.truncated')}</small>}
-              {(['stdout', 'stderr'] as const).map((stream) => activity.liveOutput![stream] && (
+              {output.truncated && <small>{t(language, 'agent.tool.shell.truncated')}</small>}
+              {(['stdout', 'stderr'] as const).map((stream) => output[stream] && (
                 <section key={stream}>
                   <span>{t(language, `agent.tool.shell.${stream}`)}</span>
-                  <pre>{activity.liveOutput![stream]}</pre>
+                  <pre>{output[stream]}</pre>
                 </section>
               ))}
-              {!activity.liveOutput.stdout && !activity.liveOutput.stderr && (
+              {!output.stdout && !output.stderr && (
                 <small>{language === 'zh-CN' ? '尚无输出' : 'No output yet'}</small>
               )}
             </div>

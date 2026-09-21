@@ -1,3 +1,4 @@
+import { isProcessActivity } from '@deepcode/protocol';
 import { isShellAuthorizationScope } from '@deepcode/protocol';
 import { validatePermissionPatches } from '@deepcode/protocol';
 import { isLocalAgentErrorValue } from '@deepcode/protocol';
@@ -1331,7 +1332,7 @@ function isProviderHostedActivity(value: unknown): boolean {
 }
 
 function isToolActivity(value: unknown, activityStatus: string): boolean {
-  return isExactRecord(value, ['operation', 'resources'], ['shell', 'fileChanges', 'recordId', 'error', 'projectionError'])
+  return isExactRecord(value, ['operation', 'resources'], ['shell', 'process', 'fileChanges', 'recordId', 'error', 'projectionError'])
     && (value.error === undefined || isLocalAgentError(value.error))
     && (value.projectionError === undefined || isLocalAgentError(value.projectionError))
     && (value.recordId === undefined || isIdentifier(value.recordId))
@@ -1342,7 +1343,8 @@ function isToolActivity(value: unknown, activityStatus: string): boolean {
       && ['create', 'modify', 'delete'].includes(String(change.kind))
       && [change.before, change.after].every((side) => isRecord(side) && typeof side.exists === 'boolean'
         && (!side.exists || typeof side.contentRef === 'string' || typeof side.error === 'string'))))
-    && ((value.operation === 'bash' || value.operation === 'powershell')
+    && (value.process === undefined || isProcessActivity(value.process))
+    && (value.process !== undefined ? value.shell === undefined : (value.operation === 'bash' || value.operation === 'powershell')
       ? value.shell === undefined && value.projectionError !== undefined || isShellActivity(value.shell, activityStatus)
       : value.shell === undefined);
 }
@@ -1365,7 +1367,7 @@ function isShellActivity(value: unknown, activityStatus: string): boolean {
     && resultMatchesShell
     && (activityStatus === 'completed'
       ? resultValid
-      : activityStatus === 'failed'
+      : activityStatus === 'failed' || activityStatus === 'indeterminate'
         ? value.result === undefined || resultValid
         : value.result === undefined);
 }
