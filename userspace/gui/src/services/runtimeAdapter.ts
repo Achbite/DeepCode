@@ -189,7 +189,7 @@ export async function getDefaultWorkspacePath(): Promise<ApiResponse<string | nu
   }
   const response = await api.getDefaultWorkspacePath();
   return response.ok
-    ? { ok: true, data: response.data?.path ?? null }
+    ? { ok: true, data: response.data?.path }
     : { ok: false, error: response.error, message: response.message };
 }
 

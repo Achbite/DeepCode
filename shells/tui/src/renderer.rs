@@ -1,8 +1,10 @@
 use crate::app::TuiApp;
+use crate::i18n::Language;
 use deepcode_kernel_client::{
     ActivityProjection, AssistantDraftProjection, ContextCompositionProjection,
-    ContextUsageProjection, NarrativeProjection, PendingPlanProjection, PlanProjection,
-    ProjectionMessage, SessionProjection, SessionTimelineItem, TokenUsageProjection,
+    ContextUsageProjection, ExecutionPlanStep, NarrativeProjection, PendingPlanProjection,
+    PlanProjection, ProjectionMessage, SessionProjection, SessionTimelineItem,
+    TokenUsageProjection,
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
@@ -24,6 +26,7 @@ pub struct Renderer {
 
 #[derive(Clone, PartialEq)]
 struct TranscriptKey {
+    language: Language,
     session: Option<(String, u64)>,
     draft: Option<AssistantDraftProjection>,
     live_output: Vec<(String, deepcode_kernel_client::ToolOutputProjection)>,
@@ -48,6 +51,7 @@ impl Default for Renderer {
 }
 
 pub(crate) fn working_indicator(app: &TuiApp, tick: usize) -> Option<String> {
+    let language = app.language();
     if app.connection_error().is_some() {
         return None;
     }
@@ -57,7 +61,7 @@ pub(crate) fn working_indicator(app: &TuiApp, tick: usize) -> Option<String> {
         return None;
     }
     let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let mut label = run_label(Some(projection));
+    let mut label = run_label(language, Some(projection));
     if run.status == "running" {
         if let Some(activity) = projection.activities.iter().rev().find(|activity| {
             activity.kind == "tool" && activity.status == "active" && activity.run_id == run.run_id
@@ -72,9 +76,12 @@ pub(crate) fn working_indicator(app: &TuiApp, tick: usize) -> Option<String> {
             ));
         }
     }
-    Some(format!(
-        "{} {label} · /cancel 停止",
-        frames[tick % frames.len()]
+    Some(language.format(
+        "tui.working",
+        &[
+            format!("{}", frames[tick % frames.len()]),
+            format!("{}", label),
+        ],
     ))
 }
 
@@ -102,12 +109,12 @@ fn clipped(text: &str, width: u16) -> String {
     result
 }
 
-fn run_label(projection: Option<&SessionProjection>) -> String {
+fn run_label(language: Language, projection: Option<&SessionProjection>) -> String {
     let Some(projection) = projection else {
-        return "初始化".into();
+        return language.text("tui.initializing").into();
     };
     let Some(run) = &projection.run else {
-        return "就绪".into();
+        return language.text("tui.ready").into();
     };
     if run.status == "running" {
         if let Some(attempt) = projection
@@ -116,118 +123,139 @@ fn run_label(projection: Option<&SessionProjection>) -> String {
             .filter(|item| item.run_id == run.run_id)
         {
             if attempt.phase == "retryWaiting" {
-                return format!("网络重试 · 等待第 {}/5 次尝试", attempt.attempt + 1);
+                return language.format("tui.retryWaiting", &[format!("{}", attempt.attempt + 1)]);
             }
             if attempt.phase == "started" && attempt.attempt > 1 {
-                return format!("正在连接 · 第 {}/5 次尝试", attempt.attempt);
+                return language.format("tui.retryConnecting", &[format!("{}", attempt.attempt)]);
             }
         }
     }
     match run.status.as_str() {
-        "running" => "运行中",
+        "running" => language.text("tui.running"),
         "waiting" => match run.waiting_reason.as_deref() {
-            Some("approval") => "等待授权",
-            Some("plan") => "等待计划确认",
-            Some("userInput") => "等待回答",
-            _ => "等待中",
+            Some("approval") => language.text("tui.waitingApproval"),
+            Some("plan") => language.text("tui.waitingPlan"),
+            Some("userInput") => language.text("tui.waitingReply"),
+            _ => language.text("tui.waiting"),
         },
-        "releasing" => "正在结束",
-        "releaseFailed" => "资源释放失败",
-        "completed" => "已完成",
-        "failed" => "失败 · /error",
-        "cancelled" => "已取消",
-        "indeterminate" => "结果未确定 · /error",
+        "releasing" => language.text("tui.releasing"),
+        "releaseFailed" => language.text("tui.releaseFailed"),
+        "completed" => language.text("tui.completed"),
+        "failed" => language.text("tui.failedHint"),
+        "cancelled" => language.text("tui.cancelled"),
+        "indeterminate" => language.text("tui.indeterminateHint"),
         other => other,
     }
     .into()
 }
 
-fn decision_lines(projection: Option<&SessionProjection>) -> Vec<Line<'static>> {
+fn approval_actions(
+    language: Language,
+    approval: &deepcode_kernel_client::ApprovalProjection,
+) -> String {
+    let mut actions = language.text("tui.authorizationActions").to_owned();
+    for (scope, input) in deepcode_kernel_client::AUTHORIZATION_OPTIONS {
+        if approval
+            .preview
+            .authorization_scopes
+            .as_ref()
+            .is_some_and(|scopes| scopes.iter().any(|value| value == scope))
+        {
+            actions.push_str(&format!(
+                "\n/reply {input} {}",
+                language.text(&format!("agent.permission.scope.{scope}"))
+            ));
+        }
+    }
+    actions
+}
+
+fn decision_lines(
+    language: Language,
+    projection: Option<&SessionProjection>,
+) -> Vec<Line<'static>> {
     let Some(projection) = projection else {
         return vec![];
     };
     let (title, actions, summary) = if let Some(approval) = &projection.pending_approval {
         (
-            "等待授权 · /decision 查看完整范围",
-            if approval.preview.authorization_scope.as_deref() == Some("runHostShell") {
-                "/reply 1 允许一次 · /reply 2 拒绝 · /reply 3 允许本轮"
-            } else {
-                "/reply 1 允许 · /reply 2 拒绝"
-            },
+            language.text("tui.authorizationDetailsHint"),
+            approval_actions(language, approval),
             approval.preview.summary.clone(),
         )
     } else if let Some(interaction) = &projection.pending_interaction {
         (
-            "等待回答 · /decision 查看选项",
-            "/reply <内容或选项编号> 回答",
+            language.text("tui.replyDetailsHint"),
+            language.text("tui.replyActions").to_owned(),
             interaction.prompt.clone(),
         )
     } else if let Some(plan) = &projection.pending_plan {
         (
-            "等待计划确认 · /decision 查看计划",
-            "/reply 1 确认 · /reply <意见> 修订 · /cancel-plan 取消",
+            language.text("tui.planDetailsHint"),
+            language.text("tui.planActions").to_owned(),
             plan.title.clone(),
         )
     } else {
         return vec![];
     };
-    vec![
-        Line::from(Span::styled(
-            title,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(actions),
-        Line::from(Span::raw(summary)),
-        Line::from(Span::styled(
-            "普通输入会排队为后续消息",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ]
+    let mut lines = vec![Line::from(Span::styled(
+        title,
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    lines.extend(actions.lines().map(|line| Line::from(line.to_owned())));
+    lines.push(Line::from(summary));
+    lines.push(Line::from(Span::styled(
+        language.text("tui.inputQueuedHint"),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines
 }
 
-pub(crate) fn decision_details(projection: Option<&SessionProjection>) -> String {
+pub(crate) fn decision_details(
+    language: Language,
+    projection: Option<&SessionProjection>,
+) -> String {
     let Some(projection) = projection else {
-        return "Session 尚未初始化。".into();
+        return language.text("tui.sessionNotInitialized").into();
     };
     if let Some(approval) = &projection.pending_approval {
-        let mut text = format!("授权请求\n{}\n", approval.preview.summary);
+        let mut text = language.format(
+            "tui.authorizationDetails",
+            &[format!("{}", approval.preview.summary)],
+        );
         for target in &approval.preview.logical_targets {
             text.push_str(&format!("\n{target}"));
         }
         if approval.preview.authorization_scope.as_deref() == Some("sessionBrowser") {
-            text.push_str("\n允许后覆盖当前对话的浏览器页面操作。");
+            text.push_str(language.text("tui.browserAuthorizationScope"));
         }
         text.push('\n');
-        text.push_str(
-            &decision_lines(Some(projection))
-                .iter()
-                .take(2)
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
+        text.push_str(&approval_actions(language, approval));
         return text;
     }
     if let Some(plan) = &projection.pending_plan {
         let mut text = String::new();
-        render_plan_plain(&mut text, plan);
+        render_plan_plain(language, &mut text, plan);
         return text;
     }
     if let Some(interaction) = &projection.pending_interaction {
-        let mut text = format!("{}\n/reply <内容或选项编号> 回答\n", interaction.prompt);
+        let mut text = language.format("tui.replyDetails", &[format!("{}", interaction.prompt)]);
         for (index, option) in interaction.options.iter().flatten().enumerate() {
             text.push_str(&format!("\n{}. {}", index + 1, option.label));
         }
         return text;
     }
-    "当前没有待处理决策。".into()
+    language.text("tui.noPendingDecision").into()
 }
 
-pub(crate) fn failure_details(projection: Option<&SessionProjection>) -> String {
+pub(crate) fn failure_details(
+    language: Language,
+    projection: Option<&SessionProjection>,
+) -> String {
     let Some(projection) = projection else {
-        return "Session 尚未初始化。".into();
+        return language.text("tui.sessionNotInitialized").into();
     };
     let error = projection.terminal_error.as_ref().or_else(|| {
         projection
@@ -236,13 +264,17 @@ pub(crate) fn failure_details(projection: Option<&SessionProjection>) -> String 
             .map(|snapshot| &snapshot.error)
     });
     let Some(error) = error else {
-        return "当前没有失败诊断。".into();
+        return language.text("tui.noFailure").into();
     };
     let mut text = format!("{}: {}\n", error.code, error.message);
     if let Some(details) = &error.diagnostics {
-        text.push_str(&format!(
-            "\n来源 {} · 阶段 {} · 分类 {}\n",
-            details.source, details.phase, details.category
+        text.push_str(&language.format(
+            "tui.diagnosticOrigin",
+            &[
+                format!("{}", details.source),
+                format!("{}", details.phase),
+                format!("{}", details.category),
+            ],
         ));
         for cause in &details.causes {
             text.push_str(&format!(
@@ -255,39 +287,50 @@ pub(crate) fn failure_details(projection: Option<&SessionProjection>) -> String 
             ));
         }
         if let Some(path) = &details.archive_path {
-            text.push_str(&format!("\n\n请求归档：{path}"));
+            text.push_str(&language.format("tui.requestArchive", &[format!("{}", path)]));
         }
         for secondary in &details.secondary {
-            text.push_str(&format!(
-                "\n附加错误 {}: {}",
-                secondary.code, secondary.message
+            text.push_str(&language.format(
+                "tui.secondaryError",
+                &[
+                    format!("{}", secondary.code),
+                    format!("{}", secondary.message),
+                ],
             ));
         }
     }
     if let Some(snapshot) = &projection.failure_snapshot {
-        text.push_str(&format!(
-            "\n\n最近失败快照 · revision {} · 阶段 {}\n尝试 {} 次 · 工具记录 {} · 未结调用 {}",
-            snapshot.revision,
-            snapshot.phase,
-            snapshot.provider_attempt_ids.len(),
-            snapshot.tool_record_ids.len(),
-            snapshot.pending_call_ids.len()
+        text.push_str(&language.format(
+            "tui.failureSnapshot",
+            &[
+                format!("{}", snapshot.revision),
+                format!("{}", snapshot.phase),
+                format!("{}", snapshot.provider_attempt_ids.len()),
+                format!("{}", snapshot.tool_record_ids.len()),
+                format!("{}", snapshot.pending_call_ids.len()),
+            ],
         ));
         if let Some(request) = &snapshot.provider_request_id {
-            text.push_str(&format!("\n请求：{request}"));
+            text.push_str(&language.format("tui.requestId", &[format!("{}", request)]));
         }
     }
     text
 }
 
-fn push_tool_summary(lines: &mut Vec<Line<'_>>, activity: &ActivityProjection) {
+fn push_tool_summary(language: Language, lines: &mut Vec<Line<'_>>, activity: &ActivityProjection) {
     let operation = activity
         .tool
         .as_ref()
         .map(|tool| tool.operation.as_str())
         .unwrap_or(&activity.label);
     lines.push(Line::from(Span::styled(
-        format!("工具 {operation} [{}]", activity.status),
+        language.format(
+            "tui.toolSummary",
+            &[
+                format!("{}", operation),
+                status_label(language, &activity.status).to_string(),
+            ],
+        ),
         Style::default().fg(activity_color(&activity.status)),
     )));
     for error in tool_error_lines(activity) {
@@ -321,21 +364,28 @@ fn push_tool_summary(lines: &mut Vec<Line<'_>>, activity: &ActivityProjection) {
         }
     }
     lines.push(Line::from(Span::styled(
-        format!("  /tool {} 查看详情", activity.activity_id),
+        language.format(
+            "tui.toolDetailsHint",
+            &[format!("{}", activity.activity_id)],
+        ),
         Style::default().fg(Color::DarkGray),
     )));
 }
 
-pub(crate) fn tool_details(projection: Option<&SessionProjection>, activity_id: &str) -> String {
+pub(crate) fn tool_details(
+    language: Language,
+    projection: Option<&SessionProjection>,
+    activity_id: &str,
+) -> String {
     let Some(activity) = projection.and_then(|p| {
         p.activities
             .iter()
             .find(|activity| activity.activity_id == activity_id)
     }) else {
-        return format!("工具记录不存在：{activity_id}");
+        return language.format("tui.toolMissing", &[format!("{}", activity_id)]);
     };
     let mut text = String::new();
-    render_tool_plain(&mut text, activity);
+    render_tool_plain(language, &mut text, activity);
     text
 }
 
@@ -398,16 +448,16 @@ mod layout_tests {
             "liveOutput":{"stdout":"执行中\n", "stderr":"诊断\n", "stdoutBytes":10, "stderrBytes":7, "truncated":true}
         })).unwrap();
         let mut plain = String::new();
-        render_tool_plain(&mut plain, &activity);
+        render_tool_plain(Language::ZhCn, &mut plain, &activity);
         let mut lines = Vec::new();
-        push_tool_summary(&mut lines, &activity);
+        push_tool_summary(Language::ZhCn, &mut lines, &activity);
         let styled = lines
             .iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
         for output in [&plain, &styled] {
-            assert!(output.contains("[active]"));
+            assert!(output.contains("[执行中]"));
             assert!(output.contains("执行中"));
             assert!(output.contains("诊断"));
         }
@@ -418,8 +468,8 @@ mod layout_tests {
         activity.status = "completed".into();
         activity.live_output = None;
         let mut terminal = String::new();
-        render_tool_plain(&mut terminal, &activity);
-        assert!(terminal.contains("[completed]"));
+        render_tool_plain(Language::ZhCn, &mut terminal, &activity);
+        assert!(terminal.contains("[已完成]"));
         assert!(!terminal.contains("执行中"));
         assert!(!terminal.contains("实时输出"));
         assert!(!terminal.contains("已执行"));
@@ -434,13 +484,20 @@ mod layout_tests {
                 "fs_read_failed: 原始读取错误",
             ),
             (
+                "completed",
+                serde_json::json!({"tool":{"operation":"bash", "resources":[], "projectionError":{"code":"bash_projection_environment_invalid", "message":"原始记录保留"}}}),
+                "bash_projection_environment_invalid: 原始记录保留",
+            ),
+            (
                 "indeterminate",
                 serde_json::json!({"interruption":{"code":"result_unknown", "message":"原始传输错误"}}),
                 "result_unknown: 原始传输错误",
             ),
             (
                 "rejected",
-                serde_json::json!({"inputRejection":{"code":"workspace_target_invalid", "message":"Not a directory", "issues":[{"path":"$.path", "rule":"path", "message":"invalid path"}]}}),
+                serde_json::json!({"inputRejection":{"code":"workspace_target_invalid", "message":"Not a directory",
+                    "diagnostics":{"source":"kernel", "phase":"prepare", "category":"input", "retryable":false, "causes":[]},
+                    "issues":[{"path":"$.path", "rule":"path", "message":"invalid path"}]}}),
                 "workspace_target_invalid: Not a directory",
             ),
         ] {
@@ -452,15 +509,18 @@ mod layout_tests {
                 .extend(fields.as_object().unwrap().clone());
             let activity: ActivityProjection = serde_json::from_value(value).unwrap();
             let mut plain = String::new();
-            render_tool_plain(&mut plain, &activity);
+            render_tool_plain(Language::ZhCn, &mut plain, &activity);
             let mut lines = Vec::new();
-            push_tool_summary(&mut lines, &activity);
+            push_tool_summary(Language::ZhCn, &mut lines, &activity);
             assert!(plain.contains(expected));
             assert!(lines.iter().any(|line| line.to_string().contains(expected)));
         }
         let input = serde_json::from_value(serde_json::json!({"commandId":"command:q", "messageId":"message:q", "runId":"run:q",
             "text":"保留原文🙂", "filesystemReferences":[], "pluginSelections":[], "sequence":1, "createdAt":"now", "status":"notApplied"})).unwrap();
-        assert_eq!(queued_input_lines(&input), vec!["未执行: 保留原文🙂"]);
+        assert_eq!(
+            queued_input_lines(Language::ZhCn, &input),
+            vec!["未执行: 保留原文🙂"]
+        );
     }
 
     #[test]
@@ -474,6 +534,7 @@ mod layout_tests {
             client,
             Renderer::default(),
             TuiHostOptions {
+                language: Language::ZhCn,
                 workspace_path: None,
                 session_id: None,
                 plugin_uris: vec![],
@@ -520,12 +581,13 @@ mod layout_tests {
 
 impl Renderer {
     pub fn draw(&self, frame: &mut Frame<'_>, app: &TuiApp) {
+        let language = app.language();
         let area = frame.area().inner(Margin::new(1, 0));
         let input_height = input_lines(app.input(), area.width.saturating_sub(4))
             .len()
             .clamp(1, 4) as u16
             + 2;
-        let decision = decision_lines(app.projection());
+        let decision = decision_lines(language, app.projection());
         let working = working_indicator(
             app,
             (self.animation_started.elapsed().as_millis() / 150) as usize,
@@ -579,25 +641,35 @@ impl Renderer {
         if app.plugin_picker_open() {
             self.draw_plugin_picker(frame, rows[1], app);
         }
+        if app.model_picker_open() {
+            self.draw_model_picker(frame, rows[1], app);
+        }
         self.draw_footer(frame, rows[5], app);
     }
 
     pub fn render_plain(&self, app: &TuiApp) -> String {
+        let language = app.language();
         let mut output = String::from("DeepCode TUI\n");
         output.push_str("────────────────────────────────────────\n");
         if let Some(projection) = app.projection() {
-            output.push_str(&format!(
-                "session={} revision={}\n",
-                projection.session_id, projection.revision
+            output.push_str(&language.format(
+                "tui.sessionIdentity",
+                &[
+                    projection.session_id.clone(),
+                    projection.revision.to_string(),
+                ],
             ));
             for binding in &projection.session_directory_indexes {
-                output.push_str(&format!(
-                    "目录索引 {} ({})\n",
-                    binding.display_name, binding.workspace_id
+                output.push_str(&language.format(
+                    "tui.directoryIndex",
+                    &[
+                        format!("{}", binding.display_name),
+                        format!("{}", binding.workspace_id),
+                    ],
                 ));
             }
             if app.context_open() {
-                render_context_plain(&mut output, projection);
+                render_context_plain(language, &mut output, projection);
             }
             let items = timeline_items(projection);
             let last_by_run: std::collections::HashMap<_, _> = items
@@ -612,16 +684,20 @@ impl Renderer {
                     .map(str::to_string);
                 match item {
                     TimelineItem::Message { value: message, .. } => {
-                        output.push_str(&format!("{}: {}\n", message.role, message.content));
+                        output.push_str(&format!(
+                            "{}: {}\n",
+                            kind_label(language, &message.role),
+                            message.content
+                        ));
                         if !message.filesystem_references.is_empty() {
-                            output.push_str(&format!(
-                                "  文件系统引用：{}\n",
-                                message
+                            output.push_str(&language.format(
+                                "tui.filesystemReferences",
+                                &[format!("{}", message
                                     .filesystem_references
                                     .iter()
                                     .map(|reference| reference.display_name.as_str())
                                     .collect::<Vec<_>>()
-                                    .join(", ")
+                                    .join(", "))],
                             ));
                         }
                     }
@@ -631,31 +707,31 @@ impl Renderer {
                         output.push_str(&format!("{}\n", narrative.content));
                     }
                     TimelineItem::Plan { value: plan, .. } => {
-                        render_timeline_plan_plain(&mut output, plan);
+                        render_timeline_plan_plain(language, &mut output, plan);
                     }
                     TimelineItem::ToolGroup { activities, .. } => {
                         for activity in activities {
-                            render_tool_plain(&mut output, activity);
+                            render_tool_plain(language, &mut output, activity);
                         }
                     }
                 }
                 if let Some(run) = last_run {
-                    for line in round_change_lines(projection, &run) {
+                    for line in round_change_lines(language, projection, &run) {
                         output.push_str(&line);
                         output.push('\n');
                     }
                 }
             }
-            if let Some(draft) = visible_assistant_draft(projection) {
+            if let Some(draft) = projection.assistant_draft.as_ref() {
                 if let Some(preview) = draft.plan_preview.as_ref() {
-                    output.push_str(&format!(
-                        "正在生成计划 · {}\n{}\n",
-                        preview.title, preview.summary
+                    output.push_str(&language.format(
+                        "tui.generatingPlan",
+                        &[format!("{}", preview.title), format!("{}", preview.summary)],
                     ));
                     for (index, title) in preview.steps.iter().enumerate() {
                         output.push_str(&format!("{}. {title}\n", index + 1));
                     }
-                    output.push_str("生成完成后统一确认\n");
+                    output.push_str(language.text("tui.confirmWhenGenerated"));
                 }
                 for block in &draft.blocks {
                     if let Some((_, content)) = block.text() {
@@ -665,19 +741,18 @@ impl Renderer {
                 }
             }
             for input in &projection.queued_inputs {
-                for line in queued_input_lines(input) {
+                for line in queued_input_lines(language, input) {
                     output.push_str(&line);
                     output.push('\n');
                 }
             }
             if let Some(plan) = projection.pending_plan.as_ref() {
-                render_plan_plain(&mut output, plan);
+                render_plan_plain(language, &mut output, plan);
             }
             if let Some(interaction) = projection.pending_interaction.as_ref() {
-                output.push_str(&format!(
-                    "需要你回答（/reply <内容>）：{}\n",
-                    interaction.prompt
-                ));
+                output.push_str(
+                    &language.format("tui.replyRequired", &[format!("{}", interaction.prompt)]),
+                );
                 if let Some(options) = interaction.options.as_ref() {
                     for (index, option) in options.iter().enumerate() {
                         output.push_str(&format!("  {}. {}\n", index + 1, option.label));
@@ -685,20 +760,31 @@ impl Renderer {
                 }
             }
             if let Some(approval) = projection.pending_approval.as_ref() {
-                output.push_str(&format!(
-                    "需要你批准（/reply 1 或 /reply 2）：{}\n",
-                    approval.preview.summary
+                output.push_str(&language.format(
+                    "tui.approvalRequired",
+                    &[format!("{}", approval.preview.summary)],
                 ));
                 if approval.preview.authorization_scope.as_deref() == Some("sessionBrowser") {
-                    output.push_str("允许后，当前对话内的浏览器页面操作无需重复确认。\n");
+                    output.push_str(language.text("tui.browserAuthorizationHint"));
                 }
-                if approval.preview.authorization_scope.as_deref() == Some("runHostShell") {
-                    output.push_str("/reply 3 允许本轮相同工作目录和执行环境的宿主 Shell。\n");
+                if let Some(files) = &approval.preview.file_access {
+                    for access in ["read", "write"] {
+                        if let Some(paths) = files[access].as_array() {
+                            for path in paths {
+                                output.push_str(&format!(
+                                    "  {access}: {}\n",
+                                    path.as_str().unwrap_or("")
+                                ));
+                            }
+                        }
+                    }
                 }
+                output.push_str(&approval_actions(language, approval));
+                output.push('\n');
                 for target in &approval.preview.logical_targets {
                     output.push_str(&format!("  - {target}\n"));
                 }
-                output.push_str("输入 /reply 1 允许或 /reply 2 拒绝。\n");
+                output.push_str(language.text("tui.approvalInputHint"));
             }
             for activity in projection
                 .activities
@@ -707,31 +793,45 @@ impl Renderer {
             {
                 output.push_str(&format!(
                     "{} [{}]: {}\n",
-                    activity.kind, activity.status, activity.label
+                    kind_label(language, &activity.kind),
+                    status_label(language, &activity.status),
+                    activity.label
                 ));
             }
-            render_todo_plain(&mut output, projection);
+            render_todo_plain(language, &mut output, projection);
             if !app.context_open() {
-                output.push_str(&format!("总缓存命中 {}\n", cache_hit_label(projection)));
+                output.push_str(&language.format(
+                    "tui.cacheHitPlain",
+                    &[format!("{}", cache_hit_label(projection))],
+                ));
             }
-            output.push_str(&format!("{}\n", run_label(Some(projection))));
+            output.push_str(&format!("{}\n", run_label(language, Some(projection))));
             if projection.terminal_error.is_some() {
-                output.push_str(&failure_details(Some(projection)));
+                output.push_str(&failure_details(language, Some(projection)));
                 output.push('\n');
             }
         } else {
-            output.push_str("Session 尚未初始化。\n");
+            output.push_str(language.text("tui.sessionNotInitializedPlain"));
         }
         let selected_plugins = app.selected_plugin_labels();
         if !selected_plugins.is_empty() {
-            output.push_str(&format!(
-                "下一次请求插件：{}\n",
-                selected_plugins.join(", ")
+            output.push_str(&language.format(
+                "tui.nextPlugins",
+                &[format!("{}", selected_plugins.join(", "))],
             ));
         }
+        if app.model_picker_open() {
+            output.push_str(&format!("{}：\n", app.model_picker_title()));
+            for (id, label, selected) in app.model_picker_entries() {
+                output.push_str(&format!(
+                    "{} {label} ({id})\n",
+                    if selected { ">" } else { " " }
+                ));
+            }
+        }
         if app.plugin_picker_open() {
-            output.push_str("插件候选：\n");
-            for entry in app.plugin_picker_entries() {
+            output.push_str(language.text("tui.pluginCandidates"));
+            for entry in app.plugin_picker_entries(8) {
                 output.push_str(&format!(
                     "  {} {} · {} ({})\n",
                     if entry.highlighted { ">" } else { " " },
@@ -749,7 +849,7 @@ impl Renderer {
         if let Some(resource) = app.resource_preview() {
             output.push_str(&resource.content);
             if resource.truncated {
-                output.push_str("\n部分内容；/next 续读。\n");
+                output.push_str(language.text("tui.partialResource"));
             }
         }
         if app.reasoning_enabled() {
@@ -757,7 +857,9 @@ impl Renderer {
                 .projection()
                 .and_then(|projection| projection.assistant_draft.as_ref())
             {
-                output.push_str(&format!("查看推理：/reasoning {}\n", draft.turn_id));
+                output.push_str(
+                    &language.format("tui.readReasoning", &[format!("{}", draft.turn_id)]),
+                );
             }
         }
         output.push_str(app.status());
@@ -766,6 +868,7 @@ impl Renderer {
     }
 
     fn draw_header(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+        let language = app.language();
         let projection = app.projection();
         let model = projection
             .and_then(|p| {
@@ -792,10 +895,10 @@ impl Renderer {
         let model = format!(
             "{model}{}",
             effort
-                .map(|value| format!(" · {value}"))
+                .map(|value| format!(" · {}", reasoning_effort_label(language, value)))
                 .unwrap_or_default()
         );
-        let status = run_label(projection);
+        let status = run_label(language, projection);
         let left = format!("DeepCode  ·  {status}");
         let available = area
             .width
@@ -834,29 +937,38 @@ impl Renderer {
     }
 
     fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+        let language = app.language();
         let mut metrics = Vec::new();
         if let Some(projection) = app.projection() {
             if let Some(usage) = projection.context_usage.as_ref() {
-                metrics.push(format!(
-                    "上下文 {}",
-                    percent_label(
-                        usage.input_tokens.saturating_add(usage.output_tokens),
-                        usage.context_window_tokens
-                    )
+                metrics.push(language.format(
+                    "tui.contextMetric",
+                    &[format!(
+                        "{}",
+                        percent_label(
+                            usage.input_tokens.saturating_add(usage.output_tokens),
+                            usage.context_window_tokens
+                        )
+                    )],
                 ));
             }
-            metrics.push(format!(
-                "输入 {} · 输出 {}",
-                format_number(projection.token_usage.input_tokens),
-                format_number(projection.token_usage.output_tokens)
+            metrics.push(language.format(
+                "tui.tokenMetrics",
+                &[
+                    format!("{}", format_number(projection.token_usage.input_tokens)),
+                    format!("{}", format_number(projection.token_usage.output_tokens)),
+                ],
             ));
             if projection.token_usage.cache_available {
-                metrics.push(format!("总缓存命中 {}", cache_hit_label(projection)));
+                metrics.push(language.format(
+                    "tui.cacheHit",
+                    &[format!("{}", cache_hit_label(projection))],
+                ));
             }
         }
         let metrics = metrics.join(" · ");
         let hint = if area.width >= 84 {
-            "  /help · @ 插件 · PgUp/PgDn / 滚轮"
+            language.text("tui.footerHint")
         } else {
             "  /help"
         };
@@ -872,6 +984,7 @@ impl Renderer {
     }
 
     fn draw_todo(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+        let language = app.language();
         let mut lines = Vec::new();
         if let Some(todo) = app
             .projection()
@@ -879,7 +992,7 @@ impl Renderer {
         {
             if todo.items.is_empty() {
                 lines.push(Line::from(Span::styled(
-                    "暂无任务",
+                    language.text("tui.noTasks"),
                     Style::default().fg(Color::DarkGray),
                 )));
             } else {
@@ -887,19 +1000,34 @@ impl Renderer {
                     let (marker, color) = match item.status.as_str() {
                         "completed" => ("✓", Color::Green),
                         "inProgress" => ("●", Color::Cyan),
+                        "blocked" => ("!", Color::Yellow),
                         _ => ("○", Color::DarkGray),
                     };
                     lines.push(Line::from(vec![
                         Span::styled(format!("{marker} "), Style::default().fg(color)),
-                        Span::raw(item.label.as_str()),
+                        Span::raw(format!(
+                            "{} · {}",
+                            item.text,
+                            language.text(match item.status.as_str() {
+                                "completed" => "deepcodeGui.tasks.status.completed",
+                                "inProgress" => "deepcodeGui.tasks.status.inProgress",
+                                "blocked" => "deepcodeGui.tasks.status.blocked",
+                                _ => "deepcodeGui.tasks.status.pending",
+                            })
+                        )),
                     ]));
                 }
             }
         } else {
             lines.push(Line::from(Span::styled(
-                "本对话暂无任务",
+                language.text("tui.noConversationTasks"),
                 Style::default().fg(Color::DarkGray),
             )));
+        }
+        if let Some(projection) = app.projection() {
+            if let Some(note) = todo_note(language, projection) {
+                lines.push(Line::from(note));
+            }
         }
         frame.render_widget(
             Paragraph::new(lines)
@@ -908,13 +1036,14 @@ impl Renderer {
                 .block(
                     Block::default()
                         .borders(Borders::TOP)
-                        .title(" 任务 · /close 返回 "),
+                        .title(language.text("tui.tasksTitle")),
                 ),
             area,
         );
     }
 
     fn draw_resource(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+        let language = app.language();
         if let Some(detail) = app.detail_preview() {
             frame.render_widget(
                 Paragraph::new(detail)
@@ -923,7 +1052,7 @@ impl Renderer {
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title(" 按需详情 · /close "),
+                            .title(language.text("tui.detailsTitle")),
                     ),
                 area,
             );
@@ -936,25 +1065,24 @@ impl Renderer {
             Paragraph::new(resource.content.as_str())
                 .scroll((app.detail_scroll(), 0))
                 .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!(" {} · read only · /close ", resource.logical_path)),
-                ),
+                .block(Block::default().borders(Borders::ALL).title(
+                    language.format("tui.readOnlyTitle", &[format!("{}", resource.logical_path)]),
+                )),
             area,
         );
     }
 
     fn draw_context(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+        let language = app.language();
         let width = usize::from(area.width.saturating_sub(4)).max(1);
         frame.render_widget(
-            Paragraph::new(context_lines(app.projection(), width))
+            Paragraph::new(context_lines(language, app.projection(), width))
                 .wrap(Wrap { trim: false })
                 .scroll((app.detail_scroll(), 0))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(" Context · /context "),
+                        .title(language.text("tui.contextTitle")),
                 ),
             area,
         );
@@ -966,6 +1094,7 @@ impl Renderer {
             ..area
         };
         let key = TranscriptKey {
+            language: app.language(),
             session: app
                 .projection()
                 .map(|projection| (projection.session_id.clone(), projection.revision)),
@@ -1020,6 +1149,7 @@ impl Renderer {
     }
 
     fn transcript_text(&self, area: Rect, app: &TuiApp) -> Text<'static> {
+        let language = app.language();
         let mut lines = Vec::new();
         if let Some(projection) = app.projection() {
             let items = timeline_items(projection);
@@ -1042,11 +1172,7 @@ impl Renderer {
                         } else {
                             Color::DarkGray
                         };
-                        let role = match message.role.as_str() {
-                            "user" => "你",
-                            "assistant" => "DeepCode",
-                            other => other,
-                        };
+                        let role = kind_label(language, &message.role);
                         lines.push(Line::from(Span::styled(
                             role.to_string(),
                             Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -1062,14 +1188,17 @@ impl Renderer {
                         }
                         if !message.filesystem_references.is_empty() {
                             lines.push(Line::from(Span::styled(
-                                format!(
-                                    "  文件系统引用：{}",
-                                    message
-                                        .filesystem_references
-                                        .iter()
-                                        .map(|reference| reference.display_name.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
+                                language.format(
+                                    "tui.filesystemReferencesInline",
+                                    &[format!(
+                                        "{}",
+                                        message
+                                            .filesystem_references
+                                            .iter()
+                                            .map(|reference| reference.display_name.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    )],
                                 ),
                                 Style::default().fg(Color::DarkGray),
                             )));
@@ -1085,17 +1214,17 @@ impl Renderer {
                         ));
                     }
                     TimelineItem::Plan { value: plan, .. } => {
-                        push_timeline_plan_lines(&mut lines, plan);
+                        push_timeline_plan_lines(language, &mut lines, plan);
                     }
                     TimelineItem::ToolGroup { activities, .. } => {
                         for activity in activities {
-                            push_tool_summary(&mut lines, activity);
+                            push_tool_summary(language, &mut lines, activity);
                         }
                     }
                 }
                 if let Some(run) = last_run {
                     lines.extend(
-                        round_change_lines(projection, &run)
+                        round_change_lines(language, projection, &run)
                             .into_iter()
                             .map(Line::from),
                     );
@@ -1104,27 +1233,29 @@ impl Renderer {
             }
             for input in &projection.queued_inputs {
                 lines.extend(
-                    queued_input_lines(input)
+                    queued_input_lines(language, input)
                         .into_iter()
                         .flat_map(|line| Text::raw(line).lines),
                 );
             }
             if app.reasoning_enabled() {
                 if let Some(draft) = projection.assistant_draft.as_ref() {
-                    lines.push(Line::from(format!(
-                        "推理详情：/reasoning {}",
-                        draft.turn_id
-                    )));
+                    lines.push(Line::from(
+                        language.format("tui.reasoningDetails", &[format!("{}", draft.turn_id)]),
+                    ));
                 }
             }
-            if let Some(draft) = visible_assistant_draft(projection) {
+            if let Some(draft) = projection.assistant_draft.as_ref() {
                 if let Some(preview) = draft.plan_preview.as_ref() {
-                    lines.push(Line::from(format!("正在生成计划 · {}", preview.title)));
+                    lines.push(Line::from(language.format(
+                        "tui.generatingPlanInline",
+                        &[format!("{}", preview.title)],
+                    )));
                     lines.extend(Text::raw(preview.summary.clone()).lines);
                     for (index, title) in preview.steps.iter().enumerate() {
                         lines.push(Line::from(format!("{}. {title}", index + 1)));
                     }
-                    lines.push(Line::from("生成完成后统一确认"));
+                    lines.push(Line::from(language.text("tui.confirmWhenGeneratedInline")));
                 }
                 for block in &draft.blocks {
                     if let Some((_, content)) = block.text() {
@@ -1152,7 +1283,9 @@ impl Renderer {
                 lines.push(Line::from(Span::styled(
                     format!(
                         "{} [{}] · {}",
-                        activity.kind, activity.status, activity.label
+                        kind_label(language, &activity.kind),
+                        status_label(language, &activity.status),
+                        activity.label
                     ),
                     Style::default().fg(if activity.status == "completed" {
                         Color::Green
@@ -1170,7 +1303,7 @@ impl Renderer {
                 Style::default().fg(Color::Red),
             )));
             lines.push(Line::from(Span::styled(
-                "/error 查看诊断和失败快照",
+                language.text("tui.failureDetailsHint"),
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -1192,9 +1325,9 @@ impl Renderer {
                     .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Cyan)))),
             );
             lines.push(Line::from(""));
-            lines.push(Line::from("  输入消息开始工作，或使用 @ 选择插件。"));
+            lines.push(Line::from(language.text("tui.welcome")));
             lines.push(Line::from(Span::styled(
-                "  /help 帮助 · /tasks 任务 · /context 上下文",
+                language.text("tui.welcomeHint"),
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -1202,15 +1335,19 @@ impl Renderer {
     }
 
     fn draw_input(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+        let language = app.language();
         let selected_plugins = app.selected_plugin_labels();
-        let mut title = " 输入消息".to_string();
+        let mut title = language.text("tui.inputTitle").to_string();
         if let Some(profile) = app.next_message_profile() {
-            title.push_str(&format!(" · 下次 {profile}"));
+            title.push_str(&language.format("tui.nextProfile", &[format!("{}", profile)]));
         }
         if selected_plugins.is_empty() {
-            title.push_str(" · @ 插件 ");
+            title.push_str(language.text("tui.inputPluginHint"));
         } else {
-            title.push_str(&format!(" · 插件 {} ", selected_plugins.join(", ")));
+            title.push_str(&language.format(
+                "tui.inputSelectedPlugins",
+                &[format!("{}", selected_plugins.join(", "))],
+            ));
         }
         let title = clipped(&title, area.width.saturating_sub(2));
         let block = Block::default()
@@ -1237,12 +1374,61 @@ impl Renderer {
         frame.set_cursor_position((inner.x + column.min(inner.width - 1), inner.y + row));
     }
 
+    fn draw_model_picker(&self, frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+        let language = app.language();
+        let entries = app.model_picker_entries();
+        let mut lines: Vec<Line<'_>> = entries
+            .iter()
+            .map(|(_, label, selected)| {
+                Line::from(Span::styled(
+                    format!("{} {label}", if *selected { ">" } else { " " }),
+                    Style::default().fg(if *selected { Color::Cyan } else { Color::Reset }),
+                ))
+            })
+            .collect();
+        if lines.is_empty() {
+            lines.push(Line::from(language.text("tui.noEnabledModels")));
+        }
+        let selected = entries
+            .iter()
+            .position(|(_, _, selected)| *selected)
+            .unwrap_or(0);
+        let scroll = selected.saturating_sub(area.height.saturating_sub(4) as usize);
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(lines).scroll((scroll as u16, 0)).block(
+                Block::default().borders(Borders::ALL).title(format!(
+                    " {} · ↑/↓ · Enter · Esc ",
+                    app.model_picker_title()
+                )),
+            ),
+            area,
+        );
+    }
+
     fn draw_plugin_picker(&self, frame: &mut Frame<'_>, anchor: Rect, app: &TuiApp) {
-        let entries = app.plugin_picker_entries();
-        let content_height = entries.len().saturating_mul(2).max(1);
-        let height = u16::try_from(content_height.saturating_add(2))
-            .unwrap_or(anchor.height)
-            .min(anchor.height.max(1));
+        let language = app.language();
+        if anchor.height == 0 || anchor.width == 0 {
+            return;
+        }
+        let borders = if anchor.height > 2 {
+            Borders::ALL
+        } else {
+            Borders::NONE
+        };
+        let inner_height = anchor
+            .height
+            .saturating_sub(if anchor.height > 2 { 2 } else { 0 });
+        let entry_height = if inner_height >= 2 { 2 } else { 1 };
+        let entries = app.plugin_picker_entries(usize::from(inner_height / entry_height).min(8));
+        let content_height = entries
+            .len()
+            .saturating_mul(usize::from(entry_height))
+            .max(1);
+        let height =
+            u16::try_from(content_height.saturating_add(if anchor.height > 2 { 2 } else { 0 }))
+                .unwrap_or(anchor.height)
+                .min(anchor.height.max(1));
         let area = Rect {
             x: anchor.x,
             y: anchor
@@ -1254,14 +1440,14 @@ impl Renderer {
         let mut lines = Vec::new();
         if entries.is_empty() {
             lines.push(Line::from(Span::styled(
-                "没有匹配的可用插件",
+                language.text("tui.noMatchingPlugins"),
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
             for entry in entries {
                 let marker = if entry.highlighted { ">" } else { " " };
                 let selected = if entry.already_selected {
-                    " · selected"
+                    language.text("tui.pluginSelectedMarker")
                 } else {
                     ""
                 };
@@ -1272,45 +1458,55 @@ impl Renderer {
                 } else {
                     Style::default().fg(Color::Reset)
                 };
+                let width = area
+                    .width
+                    .saturating_sub(if borders == Borders::ALL { 2 } else { 0 });
                 lines.push(Line::from(Span::styled(
-                    format!("{marker} {}{selected}", entry.display_name),
+                    clipped(&format!("{marker} {}{selected}", entry.display_name), width),
                     style,
                 )));
-                lines.push(Line::from(Span::styled(
-                    format!("  {} · {}", entry.short_description, entry.uri),
-                    Style::default().fg(Color::DarkGray),
-                )));
+                if entry_height == 2 {
+                    lines.push(Line::from(Span::styled(
+                        clipped(
+                            &format!("  {} · {}", entry.short_description, entry.uri),
+                            width,
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
             }
         }
         let title = app
             .plugin_picker_query()
             .filter(|query| !query.is_empty())
-            .map(|query| format!(" Plugins · @{query} · Enter/Tab select · Esc close "))
-            .unwrap_or_else(|| " Plugins · Enter/Tab select · Esc close ".to_string());
+            .map(|query| language.format("tui.pluginPickerQueryTitle", &[format!("{}", query)]))
+            .unwrap_or_else(|| language.text("tui.pluginPickerTitle").to_string());
         frame.render_widget(Clear, area);
         frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::ALL).title(title)),
+            Paragraph::new(lines).block(Block::default().borders(borders).title(title)),
             area,
         );
     }
 }
 
 const CONTEXT_PARTITIONS: [(&str, &str); 7] = [
-    ("instructions", "系统与会话指令"),
-    ("sessionControls", "Session 控制接口"),
-    ("tools", "工具目录"),
-    ("workspaceBindings", "目录索引"),
-    ("contextProviders", "上下文提供项"),
-    ("journalMessages", "对话消息"),
-    ("filesystemReferences", "文件系统引用"),
+    ("instructions", "tui.partition.instructions"),
+    ("sessionControls", "tui.partition.sessionControls"),
+    ("tools", "tui.partition.tools"),
+    ("workspaceBindings", "tui.partition.workspaceBindings"),
+    ("contextProviders", "tui.partition.contextProviders"),
+    ("journalMessages", "tui.partition.journalMessages"),
+    ("filesystemReferences", "tui.partition.filesystemReferences"),
 ];
 
-fn context_lines(projection: Option<&SessionProjection>, bar_width: usize) -> Vec<Line<'static>> {
+fn context_lines(
+    language: Language,
+    projection: Option<&SessionProjection>,
+    bar_width: usize,
+) -> Vec<Line<'static>> {
     let Some(projection) = projection else {
         return vec![Line::from(Span::styled(
-            "Context N/A",
+            language.text("tui.contextUnavailable"),
             Style::default().fg(Color::DarkGray),
         ))];
     };
@@ -1319,7 +1515,7 @@ fn context_lines(projection: Option<&SessionProjection>, bar_width: usize) -> Ve
         let used = usage.input_tokens.saturating_add(usage.output_tokens);
         lines.push(Line::from(vec![
             Span::styled(
-                "Context ",
+                language.text("tui.contextPrefix"),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -1332,33 +1528,36 @@ fn context_lines(projection: Option<&SessionProjection>, bar_width: usize) -> Ve
             )),
         ]));
         lines.push(context_usage_bar(usage, bar_width));
-        lines.push(context_usage_legend(usage));
+        lines.push(context_usage_legend(language, usage));
     } else {
         lines.push(Line::from(Span::styled(
-            "Context N/A",
+            language.text("tui.contextUnavailable"),
             Style::default().fg(Color::DarkGray),
         )));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled(
-            "总缓存命中 ",
+            language.text("tui.cacheHitTitle"),
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(cache_detail_label(&projection.token_usage)),
+        Span::raw(cache_detail_label(language, &projection.token_usage)),
     ]));
-    let (detail, ratio) = last_request_cache_summary(projection.context_usage.as_ref());
+    let (detail, ratio) = last_request_cache_summary(language, projection.context_usage.as_ref());
     lines.push(Line::from(vec![
-        Span::styled("最近一次请求 · 输入缓存 ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            language.text("tui.lastRequestCacheTitle"),
+            Style::default().fg(Color::Cyan),
+        ),
         Span::raw(detail),
     ]));
     lines.push(cache_bar(ratio, bar_width));
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Request",
+        language.text("tui.requestTitle"),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -1371,11 +1570,15 @@ fn context_lines(projection: Option<&SessionProjection>, bar_width: usize) -> Ve
         return lines;
     };
     let metrics = context_partition_metrics(receipt);
-    for ((_, label), metric) in CONTEXT_PARTITIONS.iter().zip(metrics) {
+    for ((kind, label), metric) in CONTEXT_PARTITIONS.iter().zip(metrics) {
+        let label = language.text(label);
         let token_label = partition_token_label(metric);
         lines.push(Line::from(vec![
-            Span::styled("▪ ", Style::default().fg(partition_color(label))),
-            Span::raw(format!("{label} · {} 项 · ", metric.item_count)),
+            Span::styled("▪ ", Style::default().fg(partition_color(kind))),
+            Span::raw(language.format(
+                "tui.partitionMetric",
+                &[format!("{}", label), format!("{}", metric.item_count)],
+            )),
             if metric.estimated_input_tokens.is_some() {
                 Span::raw(token_label)
             } else {
@@ -1402,15 +1605,24 @@ fn context_usage_bar(usage: &ContextUsageProjection, width: usize) -> Line<'stat
     ])
 }
 
-fn context_usage_legend(usage: &ContextUsageProjection) -> Line<'static> {
+fn context_usage_legend(language: Language, usage: &ContextUsageProjection) -> Line<'static> {
     let used = usage.input_tokens.saturating_add(usage.output_tokens);
     let free = usage.context_window_tokens.saturating_sub(used);
     Line::from(vec![
-        Span::styled("input ", Style::default().fg(Color::Green)),
+        Span::styled(
+            language.text("tui.usageInput"),
+            Style::default().fg(Color::Green),
+        ),
         Span::raw(format_number(usage.input_tokens)),
-        Span::styled(" · output ", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            language.text("tui.usageOutput"),
+            Style::default().fg(Color::Yellow),
+        ),
         Span::raw(format_number(usage.output_tokens)),
-        Span::styled(" · free ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            language.text("tui.usageFree"),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::raw(format_number(free)),
     ])
 }
@@ -1508,9 +1720,9 @@ fn partition_index(kind: &str) -> Option<usize> {
 
 fn partition_color(label: &str) -> Color {
     match label {
-        "工具目录" | "消息附件" => Color::Yellow,
-        "目录索引" => Color::Blue,
-        "上下文提供项" | "对话消息" => Color::Green,
+        "tools" | "filesystemReferences" => Color::Yellow,
+        "workspaceBindings" => Color::Blue,
+        "contextProviders" | "journalMessages" => Color::Green,
         _ => Color::DarkGray,
     }
 }
@@ -1534,34 +1746,43 @@ fn format_number(value: u64) -> String {
     output
 }
 
-fn render_context_plain(output: &mut String, projection: &SessionProjection) {
+fn render_context_plain(language: Language, output: &mut String, projection: &SessionProjection) {
     if let Some(usage) = projection.context_usage.as_ref() {
         let used = usage.input_tokens.saturating_add(usage.output_tokens);
-        output.push_str(&format!(
-            "Context {} / {} Token · {}\n",
-            format_number(used),
-            format_number(usage.context_window_tokens),
-            percent_label(used, usage.context_window_tokens),
+        output.push_str(&language.format(
+            "tui.contextPlain",
+            &[
+                format!("{}", format_number(used)),
+                format!("{}", format_number(usage.context_window_tokens)),
+                format!("{}", percent_label(used, usage.context_window_tokens)),
+            ],
         ));
         output.push_str(&plain_usage_bar(usage, 40));
         output.push('\n');
     } else {
-        output.push_str("Context N/A\n");
+        output.push_str(language.text("tui.contextUnavailablePlain"));
     }
-    output.push_str(&format!(
-        "总缓存命中 {}\n",
-        cache_detail_label(&projection.token_usage)
+    output.push_str(&language.format(
+        "tui.cacheHitPlain",
+        &[format!(
+            "{}",
+            cache_detail_label(language, &projection.token_usage)
+        )],
     ));
-    let (detail, _) = last_request_cache_summary(projection.context_usage.as_ref());
-    output.push_str(&format!("最近一次请求 · 输入缓存 {detail}\n"));
-    output.push_str("Request\n");
+    let (detail, _) = last_request_cache_summary(language, projection.context_usage.as_ref());
+    output.push_str(&language.format("tui.lastRequestCache", &[format!("{}", detail)]));
+    output.push_str(language.text("tui.requestPlain"));
     if let Some(receipt) = current_context_receipt(projection) {
         let metrics = context_partition_metrics(receipt);
         for ((_, label), metric) in CONTEXT_PARTITIONS.iter().zip(metrics) {
-            output.push_str(&format!(
-                "  {label} · {} 项 · {}\n",
-                metric.item_count,
-                partition_token_label(metric),
+            let label = language.text(label);
+            output.push_str(&language.format(
+                "tui.partitionMetricPlain",
+                &[
+                    format!("{}", label),
+                    format!("{}", metric.item_count),
+                    format!("{}", partition_token_label(metric)),
+                ],
             ));
         }
     } else {
@@ -1614,16 +1835,23 @@ impl TimelineItem<'_> {
     }
 }
 
-fn round_change_lines(projection: &SessionProjection, run_id: &str) -> Vec<String> {
+fn round_change_lines(
+    language: Language,
+    projection: &SessionProjection,
+    run_id: &str,
+) -> Vec<String> {
     let changes = projection.file_changes_for_run(run_id);
     if changes.is_empty() {
         return Vec::new();
     }
-    let mut lines = vec![format!("本轮修改 · {run_id}")];
+    let mut lines = vec![language.format("tui.roundChanges", &[format!("{}", run_id)])];
     lines.extend(changes.into_iter().map(|(record, index, change)| {
         format!(
             "  {} {} · /diff {} {}",
-            change.kind, change.path, record, index
+            change_kind_label(language, &change.kind),
+            change.path,
+            record,
+            index
         )
     }));
     lines
@@ -1673,19 +1901,19 @@ fn timeline_items(projection: &SessionProjection) -> Vec<TimelineItem<'_>> {
         .collect()
 }
 
-fn queued_input_lines(input: &deepcode_kernel_client::QueuedInputProjection) -> Vec<String> {
+fn queued_input_lines(
+    language: Language,
+    input: &deepcode_kernel_client::QueuedInputProjection,
+) -> Vec<String> {
     let status = if input.status == "queued" {
-        "已排队"
+        language.text("tui.queued")
     } else {
-        "未执行"
+        language.text("tui.notApplied")
     };
     let mut lines = vec![format!("{status}: {}", input.text)];
-    lines.extend(
-        input
-            .filesystem_references
-            .iter()
-            .map(|reference| format!("  附件：{}", reference.display_name)),
-    );
+    lines.extend(input.filesystem_references.iter().map(|reference| {
+        language.format("tui.attachment", &[format!("{}", reference.display_name)])
+    }));
     lines
 }
 
@@ -1695,6 +1923,12 @@ fn tool_error_lines(activity: &ActivityProjection) -> Vec<String> {
         .interruption
         .iter()
         .chain(activity.tool.as_ref().and_then(|tool| tool.error.as_ref()))
+        .chain(
+            activity
+                .tool
+                .as_ref()
+                .and_then(|tool| tool.projection_error.as_ref()),
+        )
     {
         lines.push(format!("  {}: {}", error.code, error.message));
     }
@@ -1710,9 +1944,15 @@ fn tool_error_lines(activity: &ActivityProjection) -> Vec<String> {
     lines
 }
 
-fn push_timeline_plan_lines(lines: &mut Vec<Line<'_>>, plan: &PlanProjection) {
+fn push_timeline_plan_lines(language: Language, lines: &mut Vec<Line<'_>>, plan: &PlanProjection) {
     lines.push(Line::from(Span::styled(
-        format!("Plan · revision {} · {}", plan.revision, plan.status),
+        language.format(
+            "tui.planTitle",
+            &[
+                format!("{}", plan.revision),
+                status_label(language, &plan.status).to_string(),
+            ],
+        ),
         Style::default().fg(Color::Cyan),
     )));
     lines.push(Line::from(Span::styled(
@@ -1726,18 +1966,24 @@ fn push_timeline_plan_lines(lines: &mut Vec<Line<'_>>, plan: &PlanProjection) {
     }
 }
 
-fn render_tool_plain(output: &mut String, activity: &ActivityProjection) {
+fn render_tool_plain(language: Language, output: &mut String, activity: &ActivityProjection) {
     let operation = activity
         .tool
         .as_ref()
         .map(|tool| tool.operation.as_str())
         .unwrap_or(activity.label.as_str());
-    output.push_str(&format!("工具 {operation} [{}]\n", activity.status));
+    output.push_str(&language.format(
+        "tui.toolSummaryPlain",
+        &[
+            format!("{}", operation),
+            status_label(language, &activity.status).to_string(),
+        ],
+    ));
     for error in tool_error_lines(activity) {
         output.push_str(&error);
         output.push('\n');
     }
-    for detail in tool_progress_details(activity) {
+    for detail in tool_progress_details(language, activity) {
         output.push_str(&detail);
         output.push('\n');
     }
@@ -1746,35 +1992,60 @@ fn render_tool_plain(output: &mut String, activity: &ActivityProjection) {
         push_tool_stream_plain(output, "stderr", &live.stderr);
     }
     if let Some(tool) = activity.tool.as_ref() {
+        if let Some(process) = &tool.process {
+            output.push_str(&format!("  $ {}\n", process.command));
+            if activity.status != "active" {
+                push_tool_stream_plain(output, "stdout", &process.output.stdout);
+                push_tool_stream_plain(output, "stderr", &process.output.stderr);
+            }
+            if let Some(result) = &process.result {
+                output.push_str(&format!(
+                    "  exit={:?} · {} ms · timedOut={}\n",
+                    result.exit_code, result.duration_ms, result.timed_out
+                ));
+            }
+        }
         if let Some(shell) = tool.shell.as_ref() {
             output.push_str(&format!("  $ {}\n", shell.command));
-            output.push_str(&format!("  cwd: {}\n", shell.cwd));
+            output.push_str(&language.format("tui.cwd", &[format!("{}", shell.cwd)]));
             if let Some(result) = shell.result.as_ref() {
-                output.push_str(&format!(
-                    "  environment: shell={} · interactive={} · pathSource={} · writeScope={} · homeWritable={}\n",
-                    result.environment.shell,
-                    result.environment.interactive,
-                    result.environment.path_source,
-                    result.environment.write_scope,
-                    result.environment.home_writable,
+                output.push_str(&language.format(
+                    "tui.shellEnvironment",
+                    &[
+                        format!("{}", result.environment.shell),
+                        format!("{}", result.environment.interactive),
+                        format!("{}", result.environment.path_source),
+                        format!("{}", result.environment.write_scope),
+                        format!("{}", result.environment.home_writable),
+                    ],
                 ));
-                let exit = result
-                    .exit_code
-                    .map_or_else(|| "signal/timeout".to_string(), |code| code.to_string());
-                output.push_str(&format!(
-                    "  exit: {exit} · {} ms · {} bytes{}{}\n",
-                    result.duration_ms,
-                    result.captured_bytes,
-                    if result.timed_out {
-                        " · timed out"
-                    } else {
-                        ""
-                    },
-                    if result.truncated {
-                        " · truncated"
-                    } else {
-                        ""
-                    },
+                let exit = result.exit_code.map_or_else(
+                    || language.text("tui.signalTimeout").to_string(),
+                    |code| code.to_string(),
+                );
+                output.push_str(&language.format(
+                    "tui.shellExit",
+                    &[
+                        format!("{}", exit),
+                        format!("{}", result.duration_ms),
+                        format!("{}", result.captured_bytes),
+                        format!(
+                            "{}",
+                            if result.timed_out {
+                                language.text("tui.timedOut")
+                            } else {
+                                ""
+                            }
+                        ),
+                        format!(
+                            "{}",
+                            if result.truncated {
+                                language.text("tui.truncated")
+                            } else {
+                                ""
+                            }
+                        ),
+                    ],
                 ));
                 push_tool_stream_plain(output, "stdout", &result.stdout);
                 push_tool_stream_plain(output, "stderr", &result.stderr);
@@ -1784,7 +2055,10 @@ fn render_tool_plain(output: &mut String, activity: &ActivityProjection) {
             if let Some(record) = &tool.record_id {
                 output.push_str(&format!(
                     "  {} {} · /diff {} {}\n",
-                    change.kind, change.path, record, index
+                    change_kind_label(language, &change.kind),
+                    change.path,
+                    record,
+                    index
                 ));
             }
         }
@@ -1820,7 +2094,7 @@ fn push_tool_stream_plain(output: &mut String, label: &str, stream: &str) {
     }
 }
 
-fn tool_progress_details(activity: &ActivityProjection) -> Vec<String> {
+fn tool_progress_details(language: Language, activity: &ActivityProjection) -> Vec<String> {
     let mut lines = Vec::new();
     if activity.status == "active" {
         if let Some(elapsed) = activity.started_at.as_ref().and_then(|started| {
@@ -1831,40 +2105,78 @@ fn tool_progress_details(activity: &ActivityProjection) -> Vec<String> {
                 .as_millis()
                 .checked_sub(started)
         }) {
-            lines.push(format!("  已执行 {:.1}s", elapsed as f64 / 1_000.0));
+            lines.push(
+                language.format("tui.elapsed", &[format!("{:.1}", elapsed as f64 / 1_000.0)]),
+            );
         }
         if let Some(output) = activity.live_output.as_ref() {
-            lines.push(format!(
-                "  实时输出 · stdout {} bytes · stderr {} bytes{}",
-                output.stdout_bytes,
-                output.stderr_bytes,
-                if output.truncated {
-                    " · 仅保留最新片段"
-                } else {
-                    ""
-                }
+            lines.push(language.format(
+                "tui.liveOutput",
+                &[
+                    format!("{}", output.stdout_bytes),
+                    format!("{}", output.stderr_bytes),
+                    format!(
+                        "{}",
+                        if output.truncated {
+                            language.text("tui.latestOutputOnly")
+                        } else {
+                            ""
+                        }
+                    ),
+                ],
             ));
         }
     }
     lines
 }
 
-fn render_todo_plain(output: &mut String, projection: &SessionProjection) {
+fn todo_note(language: Language, projection: &SessionProjection) -> Option<String> {
+    let todo = projection.todo_list.as_ref()?;
+    if todo.items.is_empty() {
+        return None;
+    }
+    let remaining = todo
+        .items
+        .iter()
+        .filter(|item| item.status != "completed")
+        .count();
+    let ended = projection
+        .token_usage_history
+        .iter()
+        .any(|run| run.run_id == todo.run_id && run.outcome.is_some());
+    (ended && remaining > 0)
+        .then(|| language.format("tui.todoEndedRemaining", &[remaining.to_string()]))
+}
+
+fn render_todo_plain(language: Language, output: &mut String, projection: &SessionProjection) {
     let Some(todo) = projection.todo_list.as_ref() else {
         return;
     };
-    output.push_str("Todo\n");
+    output.push_str(language.text("tui.todoTitle"));
+    if let Some(note) = todo_note(language, projection) {
+        output.push_str(&format!("{note}\n"));
+    }
     if todo.items.is_empty() {
-        output.push_str("  （空）\n");
+        output.push_str(language.text("tui.empty"));
         return;
     }
     for item in &todo.items {
         let marker = match item.status.as_str() {
             "completed" => "[x]",
             "inProgress" => "[>]",
+            "blocked" => "[!]",
             _ => "[ ]",
         };
-        output.push_str(&format!("  {marker} {}\n", item.label));
+        output.push_str(&format!(
+            "  {marker} {} · {}\n",
+            item.text,
+            language.text(match item.status.as_str() {
+                "completed" => "deepcodeGui.tasks.status.completed",
+                "inProgress" => "deepcodeGui.tasks.status.inProgress",
+                "blocked" => "deepcodeGui.tasks.status.blocked",
+                _ => "deepcodeGui.tasks.status.pending",
+            })
+        ));
     }
 }
 
@@ -1898,102 +2210,173 @@ fn format_cache_percent(ratio: f64) -> String {
     }
 }
 
-fn last_request_cache_summary(usage: Option<&ContextUsageProjection>) -> (String, Option<f64>) {
+fn last_request_cache_summary(
+    language: Language,
+    usage: Option<&ContextUsageProjection>,
+) -> (String, Option<f64>) {
     let Some(usage) = usage else {
         return ("N/A".into(), None);
     };
     let (Some(hit), Some(miss)) = (usage.cache_read_input_tokens, usage.cache_miss_input_tokens)
     else {
         return (
-            format!(
-                "N/A · 输入 {} · 缓存用量未提供",
-                format_number(usage.input_tokens)
+            language.format(
+                "tui.cacheNotReported",
+                &[format!("{}", format_number(usage.input_tokens))],
             ),
             None,
         );
     };
     let ratio = (usage.input_tokens > 0).then(|| hit as f64 / usage.input_tokens as f64);
     (
-        format!(
-            "{} · 输入 {} · 命中 {} · 未命中 {}",
-            ratio
-                .map(format_cache_percent)
-                .unwrap_or_else(|| "N/A".into()),
-            format_number(usage.input_tokens),
-            format_number(hit),
-            format_number(miss)
+        language.format(
+            "tui.cacheSummary",
+            &[
+                format!(
+                    "{}",
+                    ratio
+                        .map(format_cache_percent)
+                        .unwrap_or_else(|| "N/A".into())
+                ),
+                format!("{}", format_number(usage.input_tokens)),
+                format!("{}", format_number(hit)),
+                format!("{}", format_number(miss)),
+            ],
         ),
         ratio,
     )
 }
 
-fn cache_detail_label(usage: &TokenUsageProjection) -> String {
+fn cache_detail_label(language: Language, usage: &TokenUsageProjection) -> String {
     if !usage.cache_available {
-        return format!(
-            "N/A · reports {}/{} ({})",
-            usage.reported_call_count,
-            usage.provider_call_count,
-            cache_coverage_label(usage)
+        return language.format(
+            "tui.cacheReportsUnavailable",
+            &[
+                format!("{}", usage.reported_call_count),
+                format!("{}", usage.provider_call_count),
+                format!("{}", cache_coverage_label(language, usage)),
+            ],
         );
     }
-    format!(
-        "{} · hit {} · miss {} · reports {}/{} ({})",
-        usage
-            .cache_hit_ratio
-            .map(format_cache_percent)
-            .unwrap_or_else(|| "N/A".to_string()),
-        format_number(usage.cache_read_input_tokens),
-        format_number(usage.cache_miss_input_tokens),
-        usage.reported_call_count,
-        usage.provider_call_count,
-        cache_coverage_label(usage),
+    language.format(
+        "tui.cacheReports",
+        &[
+            format!(
+                "{}",
+                usage
+                    .cache_hit_ratio
+                    .map(format_cache_percent)
+                    .unwrap_or_else(|| "N/A".to_string())
+            ),
+            format!("{}", format_number(usage.cache_read_input_tokens)),
+            format!("{}", format_number(usage.cache_miss_input_tokens)),
+            format!("{}", usage.reported_call_count),
+            format!("{}", usage.provider_call_count),
+            format!("{}", cache_coverage_label(language, usage)),
+        ],
     )
 }
 
-fn cache_coverage_label(usage: &TokenUsageProjection) -> &'static str {
+fn cache_coverage_label(language: Language, usage: &TokenUsageProjection) -> &'static str {
     if usage.cache_complete {
-        "complete"
+        language.text("tui.cacheComplete")
     } else if usage.cache_available {
-        "partial"
+        language.text("tui.cachePartial")
     } else {
-        "unavailable"
+        language.text("tui.cacheUnavailable")
     }
 }
 
-fn visible_assistant_draft(projection: &SessionProjection) -> Option<&AssistantDraftProjection> {
-    projection.assistant_draft.as_ref()
+fn render_plan_plain(language: Language, output: &mut String, plan: &PendingPlanProjection) {
+    output.push_str(&language.format("tui.pendingPlanTitle", &[format!("{}", plan.revision)]));
+    render_plan_body_plain(language, output, &plan.title, &plan.summary, &plan.steps);
+    output.push_str(language.text("tui.planResponseHint"));
 }
 
-fn render_plan_plain(output: &mut String, plan: &PendingPlanProjection) {
-    output.push_str(&format!("Plan · revision {}\n", plan.revision));
-    output.push_str(&format!("{}\n{}\n", plan.title, plan.summary));
-    for (index, step) in plan.steps.iter().enumerate() {
-        output.push_str(&format!("{}. {}\n", index + 1, step.title));
-        output.push_str(&format!("   {}\n", step.details));
-        if let Some(verification) = step.verification.as_ref() {
-            for item in verification {
-                output.push_str(&format!("   验证：{item}\n"));
-            }
-        }
-    }
-    output.push_str(
-        "输入 /reply 1 确认；/reply <意见> 修订；普通消息排队；/cancel-plan 明确取消。\n",
-    );
-}
-
-fn render_timeline_plan_plain(output: &mut String, plan: &PlanProjection) {
-    output.push_str(&format!(
-        "Plan · revision {} · {}\n",
-        plan.revision, plan.status
+fn render_timeline_plan_plain(language: Language, output: &mut String, plan: &PlanProjection) {
+    output.push_str(&language.format(
+        "tui.planTitlePlain",
+        &[
+            format!("{}", plan.revision),
+            status_label(language, &plan.status).to_string(),
+        ],
     ));
-    output.push_str(&format!("{}\n{}\n", plan.title, plan.summary));
-    for (index, step) in plan.steps.iter().enumerate() {
+    render_plan_body_plain(language, output, &plan.title, &plan.summary, &plan.steps);
+}
+
+fn render_plan_body_plain(
+    language: Language,
+    output: &mut String,
+    title: &str,
+    summary: &str,
+    steps: &[ExecutionPlanStep],
+) {
+    output.push_str(&format!("{title}\n{summary}\n"));
+    for (index, step) in steps.iter().enumerate() {
         output.push_str(&format!("{}. {}\n", index + 1, step.title));
         output.push_str(&format!("   {}\n", step.details));
         if let Some(verification) = step.verification.as_ref() {
             for item in verification {
-                output.push_str(&format!("   验证：{item}\n"));
+                output.push_str(&language.format("tui.verification", &[format!("{}", item)]));
             }
         }
     }
+}
+
+fn status_label<'a>(language: Language, status: &'a str) -> &'a str {
+    let key = match status {
+        "active" => "tui.status.active",
+        "requested" => "tui.status.requested",
+        "waiting" => "tui.status.waiting",
+        "completed" => "tui.status.completed",
+        "denied" => "tui.status.denied",
+        "rejected" => "tui.status.rejected",
+        "failed" => "tui.status.failed",
+        "cancelled" => "tui.status.cancelled",
+        "indeterminate" => "tui.status.indeterminate",
+        "published" => "tui.status.published",
+        "revisionRequested" => "tui.status.revisionRequested",
+        "confirmed" => "tui.status.confirmed",
+        "superseded" => "tui.status.superseded",
+        "invalidated" => "tui.status.invalidated",
+        _ => return status,
+    };
+    language.text(key)
+}
+
+fn kind_label<'a>(language: Language, kind: &'a str) -> &'a str {
+    let key = match kind {
+        "run" => "tui.kind.run",
+        "tool" => "tui.kind.tool",
+        "providerHosted" => "tui.kind.providerHosted",
+        "approval" => "tui.kind.approval",
+        "plan" => "tui.kind.plan",
+        "interaction" => "tui.kind.interaction",
+        "user" => "tui.kind.user",
+        "assistant" => "tui.kind.assistant",
+        "system" => "tui.kind.system",
+        _ => return kind,
+    };
+    language.text(key)
+}
+
+fn change_kind_label<'a>(language: Language, kind: &'a str) -> &'a str {
+    let key = match kind {
+        "create" => "tui.change.created",
+        "modify" => "tui.change.modified",
+        "delete" => "tui.change.deleted",
+        _ => return kind,
+    };
+    language.text(key)
+}
+
+fn reasoning_effort_label<'a>(language: Language, value: &'a str) -> &'a str {
+    let key = match value {
+        "low" => "tui.reasoning.low",
+        "medium" => "tui.reasoning.medium",
+        "high" => "tui.reasoning.high",
+        "max" => "tui.reasoning.max",
+        _ => return value,
+    };
+    language.text(key)
 }

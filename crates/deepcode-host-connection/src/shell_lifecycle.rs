@@ -1,15 +1,13 @@
 //! Shared shell ownership: private proxy, startup rollback and a live Host client lease.
+use crate::loopback_http::request_loopback_json;
 use crate::process::{terminate_owned_process_tree, wait_for_child_exit, OwnedHostProcess};
 use crate::{HostClientLease, HostStartGuard};
 use deepcode_kernel_abi::{
     HostProcessIdentity, HostShutdownReceipt, HostShutdownRequest, HOST_SHELL_TOKEN_HEADER,
     HOST_SHUTDOWN_RECEIPT_TIMEOUT_MILLIS,
 };
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::io;
 
 #[derive(Deserialize)]
 struct HostApiEnvelope<T> {
@@ -78,7 +76,7 @@ pub fn request_daemon_shutdown(
         &[(HOST_SHELL_TOKEN_HEADER, token)],
         &body,
     );
-    let Some(envelope) = request_loopback_json::<HostApiEnvelope<HostShutdownReceipt>>(
+    let Ok(envelope) = request_loopback_json::<HostApiEnvelope<HostShutdownReceipt>>(
         host,
         port,
         &request,
@@ -134,34 +132,4 @@ fn http_request_with_json_body(
     request.push_str("Connection: close\r\n\r\n");
     request.push_str(body);
     request
-}
-
-fn request_loopback_json<T: DeserializeOwned>(
-    host: &str,
-    port: &str,
-    request: &str,
-    read_timeout_millis: u64,
-) -> Option<T> {
-    let port_number = port.parse::<u16>().ok()?;
-    let addrs = (host, port_number).to_socket_addrs().ok()?;
-    addrs.into_iter().find_map(|addr| {
-        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(180)).ok()?;
-        stream
-            .set_read_timeout(Some(Duration::from_millis(read_timeout_millis)))
-            .ok()?;
-        stream
-            .set_write_timeout(Some(Duration::from_millis(300)))
-            .ok()?;
-        stream.write_all(request.as_bytes()).ok()?;
-        let mut response = Vec::with_capacity(4096);
-        stream.take(64 * 1024).read_to_end(&mut response).ok()?;
-        if !response.starts_with(b"HTTP/1.1 200") {
-            return None;
-        }
-        let body_offset = response
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .map(|offset| offset + 4)?;
-        serde_json::from_slice(&response[body_offset..]).ok()
-    })
 }

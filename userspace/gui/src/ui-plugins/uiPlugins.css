@@ -2,4 +2,3 @@
 .ui-plugin-error { padding: 12px; color: var(--color-error, var(--dc-danger)); background: var(--color-surface, transparent); border: 1px solid currentColor; border-radius: 8px; }
 .ui-plugin-error pre { font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 0; }
 .ui-plugin-loading { color: var(--text-muted); padding: 8px 0; }
-.settings-ui-plugin__status { font-size: 12px; color: var(--text-muted); }

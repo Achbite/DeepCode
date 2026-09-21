@@ -105,18 +105,6 @@ fn is_loopback_origin_token(token: &str) -> bool {
         || token.starts_with("[::1]:")
 }
 
-pub(crate) fn distribution_root() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(PathBuf::from))
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-pub(crate) fn user_config_root() -> PathBuf {
-    deepcode_host_connection::config_root(&distribution_root()).expect("解析 DeepCode 配置目录")
-}
-
 pub(crate) struct DriveLocation {
     pub(crate) display: String,
     pub(crate) path: PathBuf,
@@ -171,7 +159,20 @@ pub(crate) fn atomic_write_json(path: &PathBuf, value: &Value) -> Result<(), Str
     }
     let tmp = path.with_extension("json.tmp");
     let content = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
-    fs::write(&tmp, content).map_err(|error| format!("write {}: {error}", tmp.display()))?;
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&tmp)
+        .map_err(|error| format!("open {}: {error}", tmp.display()))?;
+    file.write_all(content.as_bytes())
+        .map_err(|error| format!("write {}: {error}", tmp.display()))?;
+    drop(file);
     fs::rename(&tmp, path).map_err(|error| format!("rename {}: {error}", path.display()))
 }
 

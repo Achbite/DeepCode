@@ -94,7 +94,7 @@ class ProviderState:
         fixture.require(len(guidance_messages) == 1, "Provider 请求没有唯一的基础工具 guidance")
         guidance = guidance_messages[0]
         fixture.require(
-            f"- {tools_by_name['fs.read']['wireName']}: Read UTF-8 workspace text directly or in bounded segments."
+            f"- {tools_by_name['fs.read']['wireName']}: Read bounded UTF-8 text from a workspace file."
             in guidance,
             "fs.read prompt snippet 未进入 Provider 请求",
         )
@@ -103,12 +103,12 @@ class ProviderState:
             "fs.read 优先于 shell 文本读取的 guidance 缺失",
         )
         fixture.require(
-            f"- {tools_by_name['bash']['wireName']}: List, search, discover, build, test, and run commands."
+            f"- {tools_by_name['bash']['wireName']}: Run a Bash script from the bound workspace root."
             in guidance,
             "bash prompt snippet 未进入 Provider 请求",
         )
         fixture.require(
-            "Do not use this as the default way to read a known UTF-8 workspace text file."
+            "Use fs.read for known UTF-8 workspace files."
             in guidance,
             "bash 与 fs.read 的职责边界 guidance 缺失",
         )
@@ -118,18 +118,19 @@ class ProviderState:
             "web.fetch prompt snippet 未进入 Provider 请求",
         )
         fixture.require(
-            "Do not use this as a substitute for unavailable search by guessing URLs"
+            "Read URLs supplied by the user or returned by search."
             in guidance,
             "web.fetch 与搜索的职责边界 guidance 缺失",
         )
         fixture.require("filesystem or Bash tools" not in joined, "附件文本仍在指示 Bash 读取")
         mcp_server_id = "fixture-old" if ordinal <= 2 else "fixture-new"
         reverse_tool = tools_by_name.get(f"mcp.{mcp_server_id}.text.reverse")
-        fixture.require(isinstance(reverse_tool, dict), "Provider 请求缺少当前代次的 MCP reverse 工具")
+        fixture.require(isinstance(reverse_tool, dict),
+            f"Provider 请求 {ordinal} 缺少 run 已绑定的 MCP reverse 工具：{mcp_server_id}")
         fixture.require(
             reverse_tool.get("origin") == "extension"
             and reverse_tool.get("pluginUri") == f"plugin://{mcp_server_id}@mcp",
-            "MCP reverse 工具没有绑定当前代次的 plugin owner",
+            "MCP reverse 工具没有绑定当前 run 的 plugin owner",
         )
         wire_name = reverse_tool["wireName"]
         for name, plugin_uri in FIRST_PARTY_TOOL_OWNERS.items():
@@ -158,17 +159,34 @@ class ProviderState:
         if ordinal == 1:
             fixture.require(GENERATION_ONE in joined, "第一轮首个请求未加载旧 Skill generation")
             fixture.require(GENERATION_TWO not in joined, "第一轮首个请求提前加载新 Skill generation")
-            fixture.require('"workspace":"workspace2"' in joined, "文件引用未使用逻辑 workspace handle")
-            fixture.require('"path":"e2e-note.txt"' in joined, "文件引用逻辑路径未进入首轮请求")
-            fixture.require('"mediaType":"text/plain"' in joined, "文件引用 mediaType 未进入首轮请求")
+            attachment_messages = [
+                fixture.message_text(message.get("content")) for message in messages
+                if isinstance(message, dict) and message.get("role") == "user"
+                and '"path":"e2e-note.txt"' in fixture.message_text(message.get("content"))
+            ]
+            fixture.require(len(attachment_messages) == 1, "文件引用逻辑路径未唯一进入首轮用户消息")
+            references = json.loads(attachment_messages[0].rsplit("\n", 1)[-1])
+            fixture.require(isinstance(references, list) and len(references) == 1, "Provider 文件引用必须唯一")
+            attachment_reference = references[0]
+            fixture.require(attachment_reference.get("mediaType") == "text/plain", "文件引用 mediaType 未进入首轮请求")
+            attachment_workspace = attachment_reference.get("workspace")
+            fixture.require(
+                isinstance(attachment_workspace, str)
+                and (attachment_workspace == "primary" or (
+                    attachment_workspace.startswith("workspace") and attachment_workspace[9:].isdigit()
+                )),
+                "文件引用未使用逻辑 workspace handle",
+            )
             fixture.require(ATTACHMENT_CONTENT not in joined, "文件内容被错误嵌入首轮 Provider 请求")
             with self._lock:
                 self._old_wire_name = wire_name
             self.first_request_started.set()
         elif ordinal == 2:
-            fixture.require(GENERATION_ONE in joined, "同一 run 的 continuation 丢失旧 Skill snapshot")
-            fixture.require(GENERATION_TWO not in joined, "同一 run 的 continuation 被新 Skill 改写")
-            fixture.require(wire_name == self.old_wire_name(), "同一 run 的 MCP 工具目录发生变化")
+            fixture.require(GENERATION_ONE not in joined, "下一请求仍使用旧 Skill 内容")
+            fixture.require(GENERATION_TWO in joined, "已绑定 Skill 的源码更新没有在下一请求加载")
+            fixture.require(wire_name == self.old_wire_name(), "nextRun MCP 配置提前影响了当前 run")
+            settings = fixture.api_json(self._daemon.base_url, "/api/user-settings", token=self._daemon.token)
+            fixture.require(settings["runtimeSettings"]["agent.permissions.networkRead"] == "allow", "内容刷新激活了 nextRun 权限")
             fixture.require(
                 any("ahpla" in content for content in results.values()),
                 "第一轮 MCP ToolRecord 未进入 Provider continuation",
@@ -217,6 +235,7 @@ class ProviderState:
             raise AssertionError(f"Provider 收到未登记的第 {ordinal} 个请求")
         return {
             "read": tools_by_name["fs.read"]["wireName"],
+            **({"readWorkspace": attachment_workspace} if ordinal == 1 else {}),
             "reverse": wire_name,
             "pdf": tools_by_name["pdf.read"]["wireName"],
             "search": tools_by_name["web.search"]["wireName"],
@@ -345,7 +364,7 @@ class MockProviderHandler(fixture.MockProviderHandler):
                 )
                 self._send_tool_calls([
                     ("provider-call-read-one", wire_names["read"], {
-                        "workspace": "workspace2",
+                        "workspace": wire_names["readWorkspace"],
                         "path": "e2e-note.txt",
                     }),
                     ("provider-call-one", wire_names["reverse"], {"text": "alpha"}),
@@ -470,13 +489,19 @@ def selected_plugin_catalog(daemon: fixture.OwnedDaemon, label: str) -> tuple[st
     fixture.require(len(typed_plugins) == len(plugins), f"{label} 插件目录项不是对象")
     uris = {plugin.get("uri") for plugin in typed_plugins}
     fixture.require(FIRST_PARTY_PLUGIN_URIS.issubset(uris), f"{label} 缺少 first-party 插件")
+    # Select this scenario's plugins without fixing the size of the extensible catalog.
+    selected_plugins = [
+        plugin for plugin in typed_plugins
+        if isinstance(plugin.get("uri"), str)
+        and (plugin["uri"] in FIRST_PARTY_PLUGIN_URIS or plugin["uri"].endswith(("@skill", "@mcp")))
+    ]
     fixture.require(
-        len(typed_plugins) == 5
+        len(selected_plugins) == 5
         and len([uri for uri in uris if isinstance(uri, str) and uri.endswith("@skill")]) == 1
         and len([uri for uri in uris if isinstance(uri, str) and uri.endswith("@mcp")]) == 1,
-        f"{label} 必须精确暴露三项 first-party 插件及当前 Skill/MCP fixture",
+        f"{label} 必须选中三项 first-party 插件及当前 Skill/MCP fixture",
     )
-    return revision, typed_plugins
+    return revision, selected_plugins
 
 
 def submit_message(
@@ -643,7 +668,7 @@ def assert_projection_flow(value: dict[str, Any]) -> None:
 
 
 def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: str) -> None:
-    runtime_root = config_root / "runtime" / "agent-runtime"
+    runtime_root = config_root / "data" / "agent-runtime"
     with fixture.sqlite_read_only(runtime_root / "session.sqlite3") as connection:
         started_rows = connection.execute(
             "SELECT run_id, payload_json FROM session_events "
@@ -653,7 +678,7 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
         lifecycle_rows = connection.execute(
             "SELECT run_id, event_type, sequence, payload_json FROM session_events "
             "WHERE session_id=? AND event_type IN "
-            "('tool.completed','context.composed','run.finishing','run.runtime.released',"
+            "('tool.completed','context.composed','run.tools.prepared','run.finishing','run.runtime.released',"
             "'run.runtime.release_failed','run.settled') ORDER BY sequence",
             (session_id,),
         ).fetchall()
@@ -683,6 +708,18 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
         payload = json.loads(encoded)
         runtime = payload.get("runtimeSnapshot")
         fixture.require(isinstance(runtime, dict), "run.started 缺少 runtimeSnapshot")
+        lifecycle = lifecycle_by_run.get(run_id, [])
+        views = {runtime["kernelCatalogSnapshotRef"]: runtime}
+        active_view = runtime
+        for event_type, _, event_payload in lifecycle:
+            if event_type == "run.tools.prepared":
+                active_view = {**runtime, **event_payload["toolView"]}
+                views[active_view["kernelCatalogSnapshotRef"]] = active_view
+        receipts = [event_payload for event_type, _, event_payload in lifecycle if event_type == "context.composed"]
+        fixture.require(len(receipts) == 2, "每个 run 必须有 tool turn 与 continuation 两个 context receipt")
+        fixture.require(all(receipt.get("kernelCatalogSnapshotRef") in views for receipt in receipts),
+            "context receipt 未引用已记录的工具视图")
+        runtime = views[receipts[0]["kernelCatalogSnapshotRef"]]
         workspace_bindings = payload.get("workspaceBindings")
         fixture.require(isinstance(workspace_bindings, list) and workspace_bindings, "run.started 缺少 workspace bindings")
         primary_workspace_id = workspace_bindings[0].get("workspaceId")
@@ -706,7 +743,7 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
             tool_name = contribution.get("canonicalToolName")
             target = runtime_tools_by_name.get(tool_name)
             fixture.require(isinstance(target, dict), "tool prompt 指向不存在的 runtime tool")
-            if tool_name in {"fs.read", "bash", "web.fetch"}:
+            if target.get("origin") == "coreBuiltin":
                 fixture.require(contribution.get("origin") == "coreBuiltin", "core tool prompt origin 漂移")
                 fixture.require("pluginUri" not in contribution, "core tool prompt 错误携带 pluginUri")
             else:
@@ -747,11 +784,11 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
         fixture.require(expected_output in json.dumps(record.get("output"), ensure_ascii=False), "MCP 输出事实错误")
         fixture.require(
             record.get("extensionGenerationRef") == runtime.get("extensionGenerationRef"),
-            "ToolRecord 与 run 的 ExtensionGenerationRef 不一致",
+            "ToolRecord 与发起请求时的 ExtensionGenerationRef 不一致",
         )
         fixture.require(
             record.get("kernelCatalogSnapshotRef") == runtime.get("kernelCatalogSnapshotRef"),
-            "ToolRecord 与 run 的 KernelCatalogSnapshotRef 不一致",
+            "ToolRecord 与发起请求时的 KernelCatalogSnapshotRef 不一致",
         )
         fixture.require(record.get("toolBindingRef") == tool.get("toolBindingRef"), "ToolBindingRef 未贯通")
         fixture.require(record.get("toolName") == tool.get("name"), "ToolRecord 工具名未贯通")
@@ -792,7 +829,6 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
                 "fs.read 没有从 Host 文件快照返回真实内容",
             )
 
-        lifecycle = lifecycle_by_run.get(run_id, [])
         event_types = [event_type for event_type, _, _ in lifecycle]
         fixture.require("run.runtime.release_failed" not in event_types, "run runtime release 失败")
         for event_type in ("run.finishing", "run.runtime.released", "run.settled"):
@@ -808,7 +844,7 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
         )
         fixture.require(released_payload.get("alreadyReleased") is False, "首次 release 被错误标为重放")
         fixture.require(
-            sorted(released_payload.get("pluginInstanceRefs", [])) == sorted(plugin["pluginInstanceRef"] for plugin in runtime["selectedPlugins"]["plugins"]),
+            sorted(released_payload.get("pluginInstanceRefs", [])) == sorted(plugin["pluginInstanceRef"] for plugin in active_view["selectedPlugins"]["plugins"]),
             "release receipt 必须恰好结束本次选中的插件实例",
         )
         completed_order = [
@@ -822,11 +858,6 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
             else [tool.get("name"), "web.search", "web.fetch"]
         )
         fixture.require(completed_order == expected_completed_order, "同一 Provider turn 的工具没有严格按请求顺序完成")
-        receipts = [
-            event_payload for event_type, _, event_payload in lifecycle
-            if event_type == "context.composed"
-        ]
-        fixture.require(len(receipts) == 2, "每个 run 必须有 tool turn 与 continuation 两个 context receipt")
         for receipt in receipts:
             fixture.require(
                 isinstance(receipt.get("dynamicInstructionBytes"), int)
@@ -919,7 +950,7 @@ def assert_shells_read_projection(
     discovered_environment = os.environ.copy()
     for key in ("DEEPCODE_API_URL", "DEEPCODE_PORT", "DEEPCODE_HOST_SHELL_TOKEN", "DEEPCODE_HOST_INSTANCE_ID"):
         discovered_environment.pop(key, None)
-    discovered_environment["DEEPCODE_CONFIG_DIR"] = str(daemon.config_root)
+    discovered_environment["DEEPCODE_USER_ROOT"] = str(daemon.config_root)
     for binary, action in ((fixture.TUI_BINARY, "--smoke"), (fixture.CLI_BINARY, "show")):
         attached = subprocess.run(
             [str(binary), "--no-auto-start-kernel", "--session", session_id, action],
@@ -981,6 +1012,7 @@ def main() -> None:
             )
             provider_url = f"http://127.0.0.1:{provider_server.server_port}/v1"
             user_settings = {
+                "workbench.language": "en-US",
                 "agent.systemPrompt": "",
                 "agent.permissions.workspaceMutation": "plan",
                 "agent.permissions.engineeringDecisions": "ask",
@@ -1039,7 +1071,9 @@ def main() -> None:
             )
 
             skill_file.write_text(f"# Runtime fixture\n\n{GENERATION_TWO}\n", encoding="utf-8")
-            patch_plugins(daemon_one, old_plugins, new_plugins)
+            patch_plugins(daemon_one,
+                {**old_plugins, "agent.permissions.networkRead": "allow"},
+                {**new_plugins, "agent.permissions.networkRead": "deny"})
             provider.release_first_request.set()
             first = fixture.wait_completed(daemon_one, provider, session_id, "first run completed")
             cli_stdout, cli_stderr = cli_ask.communicate(timeout=18)
@@ -1060,6 +1094,9 @@ def main() -> None:
                 "共享 SessionProjection 的文件引用字段不精确",
             )
 
+            # The second run still exercises the existing real web tool coverage.
+            fixture.api_json(daemon_one.base_url, "/api/user-settings", token=daemon_one.token,
+                method="PATCH", body={"patches": {"agent.permissions.networkRead": "allow"}})
             input_path = f"/api/conversation/sessions/{urllib.parse.quote(session_id, safe='')}/input-resources/command-round-two"
             upload = urllib.request.Request(daemon_one.base_url + input_path, method="POST",
                 data=LONG_INPUT.encode("utf-8"), headers={fixture.HOST_TOKEN_HEADER: daemon_one.token, "content-type": "text/plain; charset=utf-8"})
@@ -1114,7 +1151,7 @@ def main() -> None:
             fixture.require(len(segments) > 1 and "".join(segments) == LONG_INPUT, "分页读取未完整保留 Unicode 原文")
             assert_provider_count_stable(provider, 4)
             assert_shells_read_projection(daemon_two, session_id, final_revision)
-            attachment_root = config_root / "runtime" / "agent-runtime" / "attachments"
+            attachment_root = config_root / "data" / "agent-runtime" / "attachments"
             fixture.require(any(attachment_root.rglob("e2e-note.txt")), "Host 文件快照未持有到 Session 生命周期")
             path_id = urllib.parse.quote(session_id, safe="")
             fixture.api_json(

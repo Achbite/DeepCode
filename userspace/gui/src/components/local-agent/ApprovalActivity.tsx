@@ -1,4 +1,3 @@
-import React from 'react';
 import type { ActivityProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';

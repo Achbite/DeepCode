@@ -244,7 +244,7 @@
           "additionalProperties": false,
           "required": ["purpose", "phase", "startedAt"],
           "properties": {
-            "purpose": { "enum": ["agent", "contextCompaction"] },
+            "purpose": { "enum": ["agent", "contextCompaction", "approvalReview"] },
             "phase": { "enum": ["waitingResponse", "reasoning", "awaitingOutput", "generatingOutput"] },
             "startedAt": { "$ref": "#/$defs/Timestamp" },
             "lastContentAt": { "$ref": "#/$defs/Timestamp" }
@@ -486,11 +486,7 @@
     "RunRuntimeSnapshot": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "runRuntimeSnapshotRef", "extensionGenerationRef", "kernelCatalogSnapshotRef",
-        "provider", "instructions", "tools", "toolPromptContributions",
-        "providerToolAliases", "selectedPlugins"
-      ],
+      "required": ["runRuntimeSnapshotRef", "extensionGenerationRef", "kernelCatalogSnapshotRef", "provider", "instructions", "tools", "toolPromptContributions", "providerToolAliases", "selectedPlugins", "permissions"],
       "properties": {
         "runRuntimeSnapshotRef": { "$ref": "#/$defs/Id" },
         "extensionGenerationRef": { "$ref": "#/$defs/Id" },
@@ -534,7 +530,8 @@
             }
           }
         },
-        "selectedPlugins": { "$ref": "#/$defs/SelectedPluginSnapshot" }
+        "selectedPlugins": { "$ref": "#/$defs/SelectedPluginSnapshot" },
+        "permissions": { "$ref": "#/$defs/PermissionSettings" }
       }
     },
     "ProviderRequest": {
@@ -551,7 +548,7 @@
         "runId": { "$ref": "#/$defs/Id" },
         "providerRuntimeRef": { "$ref": "#/$defs/Id" },
         "profileId": { "$ref": "#/$defs/Id" },
-        "purpose": { "enum": ["agent", "contextCompaction"] },
+        "purpose": { "enum": ["agent", "contextCompaction", "approvalReview"] },
         "responseConstraint": { "enum": ["normal", "answerOnly"] },
         "maxOutputTokens": { "type": "integer", "minimum": 1 },
         "workspaceBindings": {
@@ -742,37 +739,20 @@
     "TodoItem": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["todoId", "sourceStepId", "label", "status"],
+      "required": ["text", "status"],
       "properties": {
-        "todoId": { "$ref": "#/$defs/Id" },
-        "sourceStepId": { "$ref": "#/$defs/Id" },
-        "label": { "type": "string", "minLength": 1, "maxLength": 240 },
-        "status": { "enum": ["pending", "inProgress", "completed"] }
+        "text": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["pending", "inProgress", "completed", "blocked"] }
       }
     },
-    "TodoProgressUpdate": {
+    "TodoUpdatedPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["todoId", "status"],
+      "required": ["revision", "items"],
       "properties": {
-        "todoId": { "$ref": "#/$defs/Id" },
-        "status": { "enum": ["pending", "inProgress", "completed"] }
-      }
-    },
-    "TodoProgressedPayload": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["sourcePlanId", "sourcePlanRevision", "sourceFactRef", "updates"],
-      "properties": {
-        "sourcePlanId": { "$ref": "#/$defs/Id" },
-        "sourcePlanRevision": { "type": "integer", "minimum": 1 },
-        "sourceFactRef": { "$ref": "#/$defs/Id" },
-        "updates": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 12,
-          "items": { "$ref": "#/$defs/TodoProgressUpdate" }
-        }
+        "providerCallId": { "$ref": "#/$defs/Id" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/TodoItem" } }
       }
     },
     "RunSettlement": {
@@ -1051,8 +1031,8 @@
       "properties": {
         "providerRequestId": { "$ref": "#/$defs/Id" },
         "runId": { "$ref": "#/$defs/Id" },
-        "purpose": { "enum": ["agent", "contextCompaction"] },
-        "responseConstraint": { "enum": ["normal", "toolRequired", "answerOnly"] },
+        "purpose": { "enum": ["agent", "contextCompaction", "approvalReview"] },
+        "responseConstraint": { "enum": ["normal", "answerOnly"] },
         "stableCoreHash": { "$ref": "#/$defs/Id" },
         "baseToolSchemaHash": { "$ref": "#/$defs/Id" },
         "selectedPluginSnapshotHash": { "$ref": "#/$defs/Id" },
@@ -1116,14 +1096,23 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "workspaceId", "operation", "command", "workspaceMode", "executionScope"
+            "workspaceId", "operation", "writablePaths"
           ],
           "properties": {
             "workspaceId": { "$ref": "#/$defs/Id" },
-            "operation": { "const": "bash" },
+            "operation": { "enum": ["bash", "powershell"] },
             "command": { "type": "string", "minLength": 1, "maxLength": 16384 },
-            "workspaceMode": { "const": "write" },
-            "executionScope": { "enum": ["workspace", "host"] },
+            "writablePaths": {
+              "type": "array", "minItems": 1,
+              "items": {
+                "type": "object", "additionalProperties": false,
+                "required": ["path", "kind"],
+                "properties": {
+                  "path": { "type": "string", "minLength": 1 },
+                  "kind": { "enum": ["file", "directory"] }
+                }
+              }
+            },
             "terminal": {
               "type": "object",
               "additionalProperties": false,
@@ -1242,13 +1231,16 @@
         "status": {
           "enum": [
             "published", "revisionRequested", "confirmed", "superseded", "cancelled",
-            "completed", "invalidated"
+            "invalidated"
           ]
         },
         "decisionId": { "$ref": "#/$defs/Id" },
         "sequence": { "type": "integer", "minimum": 1 },
         "createdAt": { "$ref": "#/$defs/Timestamp" },
-        "updatedAt": { "$ref": "#/$defs/Timestamp" }
+        "updatedAt": { "$ref": "#/$defs/Timestamp" },
+        "confirmationSource": {
+          "enum": ["user", "agent"]
+        }
       }
     },
     "PendingPlanProjection": {
@@ -1438,7 +1430,7 @@
           ],
           "properties": {
             "providerRequestId": { "$ref": "#/$defs/Id" },
-            "purpose": { "enum": ["agent", "contextCompaction"] },
+            "purpose": { "enum": ["agent", "contextCompaction", "approvalReview"] },
             "providerRuntimeRef": { "$ref": "#/$defs/Id" },
             "outcome": { "const": "completed" },
             "orderedCallIds": {
@@ -1467,7 +1459,7 @@
           "required": ["providerRequestId", "purpose", "providerRuntimeRef", "outcome", "error"],
           "properties": {
             "providerRequestId": { "$ref": "#/$defs/Id" },
-            "purpose": { "enum": ["agent", "contextCompaction"] },
+            "purpose": { "enum": ["agent", "contextCompaction", "approvalReview"] },
             "providerRuntimeRef": { "$ref": "#/$defs/Id" },
             "outcome": { "enum": ["failed", "indeterminate"] },
             "error": { "$ref": "#/$defs/LocalAgentError" }
@@ -1650,7 +1642,10 @@
             "commandId": { "$ref": "#/$defs/Id" },
             "sessionId": { "$ref": "#/$defs/Id" },
             "messageId": { "$ref": "#/$defs/Id" },
-            "feedback": { "type": ["string", "null"], "enum": ["up", "down", null] }
+            "feedback": {
+              "type": ["string", "null"],
+              "enum": ["up", "down", null]
+            }
           }
         },
         {
@@ -1691,16 +1686,18 @@
             "runId": { "$ref": "#/$defs/Id" },
             "callId": { "$ref": "#/$defs/Id" },
             "approvalId": { "$ref": "#/$defs/Id" },
-            "decision": { "enum": ["allow", "deny"] }
+            "decision": {
+              "enum": ["allow", "deny"]
+            },
+            "authorizationScope": {
+              "enum": ["runCommand", "sessionCommand", "runHostShell", "sessionHostShell", "runNetwork", "sessionNetwork", "runContainer", "sessionContainer", "runFiles", "sessionFiles"]
+            }
           }
         },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "schemaVersion", "type", "commandId", "sessionId", "runId", "planId", "revision",
-            "response"
-          ],
+          "required": ["schemaVersion", "type", "commandId", "sessionId", "runId", "planId", "revision", "response"],
           "properties": {
             "schemaVersion": { "const": "deepcode.command.v3" },
             "type": { "const": "plan.respond" },
@@ -1715,7 +1712,9 @@
                   "type": "object",
                   "additionalProperties": false,
                   "required": ["kind"],
-                  "properties": { "kind": { "const": "confirm" } }
+                  "properties": {
+                    "kind": { "const": "confirm" }
+                  }
                 },
                 {
                   "type": "object",
@@ -1730,10 +1729,37 @@
                   "type": "object",
                   "additionalProperties": false,
                   "required": ["kind"],
-                  "properties": { "kind": { "const": "cancel" } }
+                  "properties": {
+                    "kind": { "const": "cancel" }
+                  }
                 }
               ]
             }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "type", "commandId", "sessionId", "patches"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.command.v3" },
+            "type": { "const": "session.permissions.set" },
+            "commandId": { "$ref": "#/$defs/Id" },
+            "sessionId": { "$ref": "#/$defs/Id" },
+            "patches": { "$ref": "#/$defs/PermissionSettings" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "type", "commandId", "sessionId", "runId", "authorityId"],
+          "properties": {
+            "schemaVersion": { "const": "deepcode.command.v3" },
+            "type": { "const": "approval.revoke" },
+            "commandId": { "$ref": "#/$defs/Id" },
+            "sessionId": { "$ref": "#/$defs/Id" },
+            "runId": { "$ref": "#/$defs/Id" },
+            "authorityId": { "$ref": "#/$defs/Id" }
           }
         }
       ]
@@ -1743,7 +1769,7 @@
       "additionalProperties": false,
       "required": ["schemaVersion", "eventId", "sessionId", "sequence", "occurredAt", "type", "payload"],
       "properties": {
-        "schemaVersion": { "const": "deepcode.session-event.v4" },
+        "schemaVersion": { "const": "deepcode.session-event.v5" },
         "eventId": { "$ref": "#/$defs/Id" },
         "sessionId": { "$ref": "#/$defs/Id" },
         "sequence": { "type": "integer", "minimum": 1 },
@@ -1751,19 +1777,7 @@
         "runId": { "$ref": "#/$defs/Id" },
         "callId": { "$ref": "#/$defs/Id" },
         "type": {
-          "enum": [
-            "session.created", "session.directory-index.attached", "session.directory-index.detached",
-            "input.accepted", "run.started",
-            "message.committed", "message.feedback.updated", "narrative.committed", "interaction.requested",
-            "interaction.resolved", "plan.published", "plan.confirmed", "plan.revision.requested",
-            "plan.superseded", "plan.cancelled", "plan.completed", "plan.invalidated",
-            "todo.seeded", "todo.reconciled", "todo.progressed",
-            "tool.requested", "tool.started", "approval.requested", "approval.resolved", "tool.completed",
-            "session.control.rejected",
-            "context.compaction.requested", "context.compacted",
-            "context.composed", "provider.turn.settled", "context.updated", "run.waiting",
-            "run.finishing", "run.runtime.released", "run.runtime.release_failed", "run.settled"
-          ]
+          "enum": ["session.created", "session.directory-index.attached", "session.directory-index.detached", "input.accepted", "run.started", "message.committed", "message.feedback.updated", "narrative.committed", "interaction.requested", "interaction.resolved", "plan.published", "plan.confirmed", "plan.revision.requested", "plan.superseded", "plan.cancelled", "plan.invalidated", "todo.updated", "tool.requested", "tool.started", "approval.requested", "approval.resolved", "tool.completed", "process.updated", "session.control.rejected", "context.compaction.requested", "context.compacted", "context.composed", "provider.turn.settled", "context.updated", "run.waiting", "run.finishing", "run.runtime.released", "run.runtime.release_failed", "run.settled", "session.permissions.updated", "approval.revoked", "approval.reviewed"]
         },
         "payload": { "$ref": "#/$defs/JsonObject" }
       },
@@ -1772,42 +1786,36 @@
           "if": {
             "properties": {
               "type": {
-                "enum": [
-                  "run.started", "narrative.committed",
-                  "interaction.requested", "interaction.resolved", "plan.published", "plan.confirmed",
-                  "plan.revision.requested", "plan.superseded", "plan.cancelled", "plan.completed",
-                  "plan.invalidated", "todo.seeded", "todo.reconciled", "todo.progressed",
-                  "tool.requested", "tool.started", "approval.requested", "approval.resolved", "tool.completed",
-                  "session.control.rejected", "context.compaction.requested", "context.compacted",
-                  "context.composed", "provider.turn.settled", "context.updated", "run.waiting",
-                  "run.finishing", "run.runtime.released", "run.runtime.release_failed", "run.settled"
-                ]
+                "enum": ["run.started", "narrative.committed", "interaction.requested", "interaction.resolved", "plan.published", "plan.confirmed", "plan.revision.requested", "plan.superseded", "plan.cancelled", "plan.invalidated", "todo.updated", "tool.requested", "tool.started", "approval.requested", "approval.resolved", "tool.completed", "process.updated", "session.control.rejected", "context.compaction.requested", "context.compacted", "context.composed", "provider.turn.settled", "context.updated", "run.waiting", "run.finishing", "run.runtime.released", "run.runtime.release_failed", "run.settled", "approval.revoked", "approval.reviewed"]
               }
             }
           },
-          "then": { "required": ["runId"] }
+          "then": {
+            "required": ["runId"]
+          }
         },
         {
           "if": {
             "properties": {
               "type": { "const": "message.committed" },
               "payload": {
-                "properties": { "role": { "const": "assistant" } },
+                "properties": {
+                  "role": { "const": "assistant" }
+                },
                 "required": ["role"]
               }
             },
             "required": ["type", "payload"]
           },
-          "then": { "required": ["runId"] }
+          "then": {
+            "required": ["runId"]
+          }
         },
         {
           "if": {
             "properties": {
               "type": {
-                "enum": [
-                  "interaction.requested", "plan.published", "tool.requested",
-                  "session.control.rejected"
-                ]
+                "enum": ["interaction.requested", "plan.published", "tool.requested", "session.control.rejected"]
               }
             }
           },
@@ -1815,7 +1823,9 @@
             "properties": {
               "payload": {
                 "required": ["providerCallId"],
-                "properties": { "providerCallId": { "$ref": "#/$defs/Id" } }
+                "properties": {
+                  "providerCallId": { "$ref": "#/$defs/Id" }
+                }
               }
             }
           }
@@ -1824,15 +1834,13 @@
           "if": {
             "properties": {
               "type": {
-                "enum": [
-                  "interaction.requested", "plan.published", "plan.confirmed", "plan.revision.requested", "plan.cancelled",
-                  "tool.requested", "tool.started", "approval.requested", "approval.resolved", "tool.completed",
-                  "session.control.rejected"
-                ]
+                "enum": ["interaction.requested", "plan.published", "plan.confirmed", "plan.revision.requested", "plan.cancelled", "tool.requested", "tool.started", "approval.requested", "approval.resolved", "tool.completed", "process.updated", "session.control.rejected", "approval.reviewed"]
               }
             }
           },
-          "then": { "required": ["callId"] }
+          "then": {
+            "required": ["callId"]
+          }
         },
         {
           "if": {
@@ -1842,72 +1850,181 @@
               }
             }
           },
-          "then": { "not": { "required": ["callId"] } }
+          "then": {
+            "not": {
+              "required": ["callId"]
+            }
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "input.accepted" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/InputAcceptedPayload" } } }
+          "if": {
+            "properties": {
+              "type": { "const": "input.accepted" }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/InputAcceptedPayload" }
+            }
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "interaction.requested" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/InteractionRequestedPayload" } } }
+          "if": {
+            "properties": {
+              "type": { "const": "interaction.requested" }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/InteractionRequestedPayload" }
+            }
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "tool.started" } } },
-          "then": { "properties": { "payload": {
-            "type": "object", "additionalProperties": false,
-            "required": ["attemptId", "startedAt"],
-            "properties": { "attemptId": { "$ref": "#/$defs/Id" }, "startedAt": { "type": "string", "pattern": "^[0-9]+$" } }
-          } } }
+          "if": {
+            "properties": {
+              "type": { "const": "tool.started" }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["attemptId", "startedAt"],
+                "properties": {
+                  "attemptId": { "$ref": "#/$defs/Id" },
+                  "startedAt": { "type": "string", "pattern": "^[0-9]+$" }
+                }
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "run.started" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/RunStartedPayload" } } }
+          "if": {
+            "properties": {
+              "type": { "const": "run.started" }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/RunStartedPayload" }
+            }
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "message.committed" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/MessageCommittedPayload" } } }
+          "if": {
+            "properties": {
+              "type": { "const": "message.committed" }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/MessageCommittedPayload" }
+            }
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "narrative.committed" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/NarrativeCommittedPayload" } } }
+          "if": {
+            "properties": {
+              "type": { "const": "narrative.committed" }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/NarrativeCommittedPayload" }
+            }
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "provider.turn.settled" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/ProviderTurnSettledPayload" } } }
+          "if": {
+            "properties": {
+              "type": { "const": "provider.turn.settled" }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/ProviderTurnSettledPayload" }
+            }
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "context.updated" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/ContextUpdatedPayload" } } }
+          "if": {
+            "properties": {
+              "type": { "const": "context.updated" }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/ContextUpdatedPayload" }
+            }
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "todo.progressed" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/TodoProgressedPayload" } } }
+          "if": {
+            "properties": {
+              "type": { "const": "todo.updated" }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/TodoUpdatedPayload" }
+            }
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "run.finishing" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/RunSettlement" } } }
+          "if": {
+            "properties": {
+              "type": { "const": "run.finishing" }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/RunSettlement" }
+            }
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "run.runtime.released" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/RunRuntimeReleaseReceipt" } } }
+          "if": {
+            "properties": {
+              "type": { "const": "run.runtime.released" }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/RunRuntimeReleaseReceipt" }
+            }
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "run.runtime.release_failed" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/RunRuntimeReleaseFailedPayload" } } }
+          "if": {
+            "properties": {
+              "type": { "const": "run.runtime.release_failed" }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/RunRuntimeReleaseFailedPayload" }
+            }
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "run.settled" } } },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/RunSettlement" } } }
+          "if": {
+            "properties": {
+              "type": { "const": "run.settled" }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/RunSettlement" }
+            }
+          }
         },
         {
           "if": {
             "properties": {
               "type": {
-                "enum": [
-                  "plan.published", "plan.confirmed", "plan.revision.requested", "plan.superseded",
-                  "plan.cancelled", "plan.completed", "plan.invalidated"
-                ]
+                "enum": ["plan.published", "plan.confirmed", "plan.revision.requested", "plan.superseded", "plan.cancelled", "plan.invalidated"]
               }
             }
           },
@@ -1926,16 +2043,62 @@
         {
           "if": {
             "properties": {
-              "type": { "enum": ["todo.seeded", "todo.reconciled", "todo.progressed"] }
+              "type": { "const": "session.permissions.updated" }
             }
           },
           "then": {
             "properties": {
               "payload": {
-                "required": ["sourcePlanId", "sourcePlanRevision"],
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["commandId", "patches"],
                 "properties": {
-                  "sourcePlanId": { "$ref": "#/$defs/Id" },
-                  "sourcePlanRevision": { "type": "integer", "minimum": 1 }
+                  "commandId": { "$ref": "#/$defs/Id" },
+                  "patches": { "$ref": "#/$defs/PermissionSettings" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": { "const": "approval.revoked" }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["commandId", "authorityId"],
+                "properties": {
+                  "commandId": { "$ref": "#/$defs/Id" },
+                  "authorityId": { "$ref": "#/$defs/Id" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": { "const": "approval.reviewed" }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["approvalId", "providerRequestId", "decision", "reason"],
+                "properties": {
+                  "approvalId": { "$ref": "#/$defs/Id" },
+                  "providerRequestId": { "$ref": "#/$defs/Id" },
+                  "decision": {
+                    "enum": ["allow", "ask", "deny"]
+                  },
+                  "reason": { "type": "string" }
                 }
               }
             }
@@ -2021,16 +2184,9 @@
     "SessionProjection": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "schemaVersion", "sessionId", "revision", "display", "workspaceBindings",
-        "sessionDirectoryIndexes", "messages",
-        "narratives", "timeline", "assistantDraft", "pendingInteraction", "pendingApproval", "plans",
-        "activePlanRef", "pendingPlan",
-        "todoList", "contextUsage", "contextCompositions", "tokenUsage", "tokenUsageHistory",
-        "run", "activities", "artifacts", "terminalError"
-      ],
+      "required": ["schemaVersion", "sessionId", "revision", "display", "workspaceBindings", "sessionDirectoryIndexes", "messages", "narratives", "timeline", "assistantDraft", "pendingInteraction", "pendingApproval", "plans", "activePlanRef", "pendingPlan", "todoList", "contextUsage", "contextCompositions", "tokenUsage", "tokenUsageHistory", "run", "activities", "artifacts", "terminalError", "permissionOverrides", "effectivePermissions", "shellAuthorizations"],
       "properties": {
-        "schemaVersion": { "const": "deepcode.session-projection.v5" },
+        "schemaVersion": { "const": "deepcode.session-projection.v6" },
         "sessionId": { "$ref": "#/$defs/Id" },
         "revision": { "type": "integer", "minimum": 0 },
         "display": { "$ref": "#/$defs/SessionDisplayProjection" },
@@ -2068,14 +2224,12 @@
             {
               "type": "object",
               "additionalProperties": false,
-              "required": ["sourcePlanId", "sourcePlanRevision", "items", "sequence", "updatedAt"],
+              "required": ["runId", "revision", "items", "sequence", "updatedAt"],
               "properties": {
-                "sourcePlanId": { "$ref": "#/$defs/Id" },
-                "sourcePlanRevision": { "type": "integer", "minimum": 1 },
+                "runId": { "$ref": "#/$defs/Id" },
+                "revision": { "type": "integer", "minimum": 1 },
                 "items": {
                   "type": "array",
-                  "minItems": 1,
-                  "maxItems": 12,
                   "items": { "$ref": "#/$defs/TodoItem" }
                 },
                 "sequence": { "type": "integer", "minimum": 1 },
@@ -2101,7 +2255,31 @@
         },
         "activities": { "type": "array", "items": { "$ref": "#/$defs/JsonObject" } },
         "artifacts": { "type": "array", "items": { "$ref": "#/$defs/JsonObject" } },
-        "terminalError": { "type": ["object", "null"] }
+        "terminalError": { "type": ["object", "null"] },
+        "permissionOverrides": { "$ref": "#/$defs/PermissionSettings" },
+        "effectivePermissions": {
+          "anyOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/PermissionSettings" }
+          ]
+        },
+        "shellAuthorizations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["authorityId", "runId", "scope", "summary", "context"],
+            "properties": {
+              "authorityId": { "$ref": "#/$defs/Id" },
+              "runId": { "$ref": "#/$defs/Id" },
+              "scope": {
+                "enum": ["runCommand", "sessionCommand", "runHostShell", "sessionHostShell", "runNetwork", "sessionNetwork", "runContainer", "sessionContainer", "runFiles", "sessionFiles"]
+              },
+              "summary": { "type": "string" },
+              "context": { "type": "object" }
+            }
+          }
+        }
       }
     },
     "RunProjection": {
@@ -2184,6 +2362,36 @@
         "error": { "$ref": "#/$defs/JsonObject" },
         "startedAt": { "$ref": "#/$defs/Timestamp" },
         "completedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "PermissionSettings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent.permissions.workspaceMutation": {
+          "enum": ["plan", "allow"]
+        },
+        "agent.permissions.engineeringDecisions": {
+          "enum": ["ask", "delegate"]
+        },
+        "agent.permissions.shell": {
+          "enum": ["ask", "review", "allow"]
+        },
+        "agent.permissions.shellAccess": {
+          "enum": ["workspace", "full"]
+        },
+        "agent.permissions.networkRead": {
+          "enum": ["ask", "allow", "deny"]
+        },
+        "agent.permissions.external": {
+          "enum": ["ask", "allow", "deny"]
+        },
+        "agent.permissions.commandRules": { "type": "string" },
+        "agent.permissions.commandDenylist": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "type": "string", "minLength": 1 }
+        }
       }
     }
   }

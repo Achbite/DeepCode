@@ -18,7 +18,7 @@ fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
 require = fixture.require
 LONG_INPUT = "  原始任务与资料🙂\n" + "保持原文空白与每一项约束。  \n" * 2200
-SCRIPT = "value='hello world'\nprintf '%s\\n' \"$value\"\ncat <<'END'\nliteral $value\nEND\n"
+SCRIPT = 'value=\'hello world\'\nprintf \'%s\\n\' "$value"\ncat <<\'END\'\nliteral $value\nEND\ntest -d "$TMPDIR" && test "$TMP" = "$TMPDIR" && test "$TEMP" = "$TMPDIR" || exit 91\nprintf \'temp-write-ok\\n\' > "$TMPDIR/probe.txt" || exit $?\ntest "$(cat "$TMPDIR/probe.txt")" = temp-write-ok || exit 92\nprintf \'kernel-temp:%s\\n\' "$TMPDIR"\n'
 PHASES = [{"stepId": f"phase-{index}", "title": f"验证阶段 {index}", "details": "检查文本修改与执行结果。",
            "verification": [f"核对结果 {check}" for check in range(9)]} for index in range(13)]
 WRITE_PATHS = [{"path": "build", "kind": "directory"}] + [
@@ -46,25 +46,44 @@ class ProviderHandler(fixture.MockProviderHandler):
             if ordinal == 1:
                 self._send_tool_calls([
                     ("read-default", names["read"], {"path": "probe.txt"}),
-                    ("bad-timeout", names["bash"], {"command": "pwd", "executionScope": "host", "timeout": 601}),
+                    ("unknown-tool", "undeclared_tool", {"path": "probe.txt"}),
+                    ("missing-file", names["read"], {"path": "does-not-exist.txt"}),
+                    ("bad-timeout", names["bash"], {"command": "pwd", "timeout": 0}),
                     ("bad-field", names["edit"], {"path": "probe.txt", "workspaceMode": "write", "edits": [{"oldText": "alpha", "newText": "ALPHA"}]}),
                     ("bad-workspace", names["read"], {"path": "probe.txt", "workspace": "workspace99"}),
-                    ("shell-format", names["bash"], {"command": SCRIPT, "executionScope": "host"}),
+                    ("shell-format", names["bash"], {"command": SCRIPT, "requestHostPermission": "Verify the explicitly approved Host Shell and temporary files."}),
+                    ("blocked-command", names["bash"], {"command": "printf denylist-probe"}),
                 ])
             elif ordinal == 2:
                 require(results["read-default"]["outcome"] == "completed", "默认 workspace 文件读取失败")
-                for call_id, path, rule in [("bad-timeout", "$.timeout", "maximum"), ("bad-field", "$.workspaceMode", "additionalProperties")]:
+                rejected = results["unknown-tool"]
+                require(rejected["status"] == "inputRejected" and rejected["executed"] is False
+                        and rejected["error"]["code"] == "provider_tool_alias_unknown", "未知工具未明确拒绝")
+                missing = results["missing-file"]
+                require(missing["outcome"] == "failed" and missing["error"]["code"] == "fs_read_metadata_failed"
+                        and "does-not-exist.txt" in missing["error"]["message"], "文件不存在的原始错误丢失")
+                for call_id, path, rule in [("bad-timeout", "$.timeout", "minimum"), ("bad-field", "$.workspaceMode", "additionalProperties")]:
                     rejected = results[call_id]
                     require(rejected["status"] == "inputRejected" and rejected["executed"] is False, "非法输入被执行")
                     require(any(issue["path"] == path and issue["rule"] == rule for issue in rejected["error"]["issues"]), "字段诊断没有到达 Provider")
                 require("primary" in results["bad-workspace"]["error"]["message"], "句柄拒绝未列出合法值")
                 require(results["shell-format"]["outcome"] == "completed", "合法多行命令未执行")
+                blocked = results["blocked-command"]
+                require(blocked["outcome"] == "denied" and blocked["error"]["code"] == "command_denied_by_rule"
+                        and 'printf denylist-probe' in blocked["error"]["message"], "全部允许模式未在执行前阻止自定义黑名单命令")
+                shell_output = results["shell-format"]["output"]
+                require(shell_output["executionScope"] == "host", "Kernel 未在用户批准后选择真实 Host 执行")
+                require(shell_output["stdout"].startswith("hello world\nliteral $value\n"), "多行脚本原始输出不符")
+                temporary_lines = [line for line in shell_output["stdout"].splitlines() if line.startswith("kernel-temp:")]
+                require(len(temporary_lines) == 1, "Shell 未返回本次 Kernel 临时目录")
+                temporary = Path(temporary_lines[0].removeprefix("kernel-temp:"))
+                require(temporary.is_absolute() and not temporary.exists(), "Shell 结束后 Kernel 临时目录未删除")
                 self._send_tool_calls([("plan", names["plan"], {
                     "title": "修复 probe.txt", "summary": "按读取到的文本修改并验证。",
                     "steps": PHASES,
                     "mutationManifest": [
                         {"workspace": "primary", "operation": "fs.edit", "target": "probe.txt"},
-                        {"workspace": "primary", "operation": "bash", "workspaceMode": "write", "executionScope": "workspace", "command": "make build", "writablePaths": WRITE_PATHS},
+                        {"workspace": "primary", "operation": "bash", "command": "make build", "writablePaths": WRITE_PATHS},
                         {"workspace": "primary", "operation": "fs.edit", "target": "src", "targetKind": "directoryTree"},
                     ] + [{"workspace": "primary", "operation": "fs.write", "target": f"reserved/target-{index}.txt"} for index in range(126)],
                 })])
@@ -80,8 +99,8 @@ class ProviderHandler(fixture.MockProviderHandler):
                 require(results["directory-create"]["outcome"] == "completed", "目录授权未覆盖后代新文件")
                 require((self.provider_state.workspace / "src/nested/new.txt").read_text() == "created within approved directory\n", "目录内文件内容不符")
                 denied = results["outside-scope"]
-                require(denied["outcome"] == "denied" and denied["error"]["code"] == "workspace_mutation_plan_required", "范围外写入未被拒绝")
-                require("extra/new.txt" in denied["error"]["message"] and "directoryTree" in denied["error"]["message"], "拒绝未说明目标和已确认范围")
+                require(denied["outcome"] == "denied" and denied["error"]["code"] == "plan_scope_required", "范围外写入未返回 Plan 范围拒绝")
+                require(bool(denied["error"]["message"]), "范围拒绝的原始说明丢失")
                 require(not (self.provider_state.workspace / "extra/new.txt").exists(), "未确认的范围已执行")
                 failed = results["edit-mismatch"]
                 require(failed["outcome"] == "failed" and failed["error"]["code"] == "patch_match_not_found", "编辑原始错误码丢失")
@@ -95,8 +114,7 @@ class ProviderHandler(fixture.MockProviderHandler):
                 require(preview["hunks"][0]["before"] == "alpha\n" and preview["hunks"][0]["after"] == "ALPHA\n" and not preview["truncated"], "实际编辑摘要未到达模型")
                 todo = next(value for value in reversed(fixture.json_payloads(body)) if value.get("type") == "todo.current")
                 self._send_tool_calls([("progress", names["progress"], {
-                    "sourceFactRef": results["edit-corrected"]["recordId"],
-                    "updates": [{"todoId": item["todoId"], "status": "completed" if index == 0 else "inProgress"} for index, item in enumerate(todo["items"])],
+                    "items": [{"text": item["text"], "status": "completed" if index == 0 else "inProgress"} for index, item in enumerate(todo["items"])],
                 })])
             elif ordinal == 6:
                 self._send_tool_calls([("extend-scope", names["plan"], {
@@ -105,21 +123,22 @@ class ProviderHandler(fixture.MockProviderHandler):
                 })])
             elif ordinal == 7:
                 todo = next(value for value in reversed(fixture.json_payloads(body)) if value.get("type") == "todo.current")
-                require(todo["sourcePlanRevision"] == 2 and [item["status"] for item in todo["items"]] == ["completed"] + ["inProgress"] * 12, "确认范围补充丢失阶段进度")
+                require(todo["revision"] == 2 and [item["status"] for item in todo["items"]] == ["completed"] + ["inProgress"] * 12, "确认范围补充丢失阶段进度")
                 self._send_tool_calls([
                     ("expanded-create", names["write"], {"path": "extra/new.txt", "content": "expanded scope\n"}),
-                    ("pipeline-status", names["bash"], {"executionScope": "host", "command": "set -o pipefail\n(printf 'expected failure\\n'; exit 7) | tail -1"}),
-                    ("expected-nonzero", names["bash"], {"executionScope": "host", "command": "if (exit 7); then rc=0; else rc=$?; fi\ntest \"$rc\" -eq 7"}),
+                    ("pipeline-status", names["bash"], {"requestHostPermission": "Verify the original Host pipeline exit status.", "command": "set -o pipefail\n(printf 'expected failure\\n'; exit 7) | tail -1"}),
+                    ("expected-nonzero", names["bash"], {"requestHostPermission": "Verify a separate Host approval for expected nonzero handling.", "command": "if (exit 7); then rc=0; else rc=$?; fi\ntest \"$rc\" -eq 7"}),
                 ])
             elif ordinal == 8:
                 require(results["expanded-create"]["outcome"] == "completed", "确认范围补充后未执行")
                 require((self.provider_state.workspace / "extra/new.txt").read_text() == "expanded scope\n", "补范围后内容不符")
-                require(results["pipeline-status"]["outcome"] == "failed" and results["pipeline-status"]["output"]["exitCode"] == 7, "管道原始失败退出码丢失")
-                require(results["expected-nonzero"]["outcome"] == "completed", "预期非零处理失败")
+                require(results["pipeline-status"]["outcome"] == "failed" and results["pipeline-status"]["output"]["exitCode"] == 7,
+                        "管道原始失败退出码丢失: " + json.dumps(results["pipeline-status"], ensure_ascii=False))
+                require(results["expected-nonzero"]["outcome"] == "completed",
+                        "预期非零处理失败: " + json.dumps(results["expected-nonzero"], ensure_ascii=False))
                 todo = next(value for value in reversed(fixture.json_payloads(body)) if value.get("type") == "todo.current")
                 self._send_tool_calls([("progress-final", names["progress"], {
-                    "sourceFactRef": results["expanded-create"]["recordId"],
-                    "updates": [{"todoId": item["todoId"], "status": "completed"} for item in todo["items"]],
+                    "items": [{"text": item["text"], "status": "completed"} for item in todo["items"]],
                 })])
             elif ordinal == 9:
                 self._send_text("tool-input-cli-complete")
@@ -155,10 +174,17 @@ class ProviderHandler(fixture.MockProviderHandler):
                 item = INTRO
             elif ordinal == 2:
                 require(INTRO in body["input"], "独立 commentary 没有按原生项重放")
+                item = {"type": "function_call", "id": "fc_unknown", "call_id": "call_unknown", "name": "undeclared_tool",
+                        "arguments": "{}", "status": "completed"}
+            elif ordinal == 3:
+                output = next(item for item in body["input"] if item.get("type") == "function_call_output" and item.get("call_id") == "call_unknown")
+                result = json.loads(output["output"])
+                require(result["status"] == "inputRejected" and result["executed"] is False
+                        and result["error"]["code"] == "provider_tool_alias_unknown", "Responses 未回传未知工具拒绝")
                 read_tool = next(tool for tool in body["tools"] if "startByte" in tool.get("parameters", {}).get("properties", {}))
                 item = {"type": "function_call", "id": "fc_cli_read", "call_id": "call_cli_read", "name": read_tool["name"],
                         "arguments": json.dumps({"path": "probe.txt"}), "status": "completed"}
-            elif ordinal == 3:
+            elif ordinal == 4:
                 output = next(item for item in body["input"] if item.get("type") == "function_call_output" and item.get("call_id") == "call_cli_read")
                 result = json.loads(output["output"])
                 require(result["outcome"] == "completed" and result["output"]["content"] == "ALPHA\nbeta\n", "续跑中的真实工具结果缺失")
@@ -188,6 +214,22 @@ class ProviderHandler(fixture.MockProviderHandler):
             self.close_connection = True
 
 
+
+def require_unexecuted_approval(daemon, projection):
+    approval = projection["pendingApproval"]
+    require(approval is not None and projection["run"]["status"] == "waiting"
+            and projection["run"]["waitingReason"] == "approval", "调用未停在审批门禁")
+    runtime = daemon.config_root / "data" / "agent-runtime"
+    with fixture.sqlite_read_only(runtime / "session.sqlite3") as connection:
+        started = connection.execute("SELECT COUNT(*) FROM session_events WHERE session_id=? AND call_id=? AND event_type='tool.started'",
+                                     (projection["sessionId"], approval["callId"])).fetchone()[0]
+        require(started == 0, "用户批准前调用已进入执行边界")
+    with fixture.sqlite_read_only(runtime / "tool-record.sqlite3") as connection:
+        records = connection.execute("SELECT COUNT(*) FROM tool_records WHERE call_id=?", (approval["callId"],)).fetchone()[0]
+        require(records == 0, "待批准调用不应已有执行终态")
+    return approval
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="deepcode-tool-input-cli-") as directory:
         root = Path(directory)
@@ -203,6 +245,7 @@ def main() -> None:
         try:
             fixture.write_configuration(daemon.config_root, f"http://127.0.0.1:{server.server_port}/v1", {
                 "agent.permissions.workspaceMutation": "plan", "agent.permissions.external": "allow",
+                "agent.permissions.commandDenylist": ["rm -rf /", "printf denylist-probe"],
             })
             profiles_path = daemon.config_root / "config/user/local/settings/llm-profiles.json"
             profiles = json.loads(profiles_path.read_text())
@@ -214,6 +257,13 @@ def main() -> None:
             session_id = session["sessionId"]
             fixture.cli(daemon, session_id, "读取 probe.txt，检查工具反馈并按 Plan 修复。", expected=5)
             state.assert_healthy()
+            shell_waiting = fixture.projection(daemon, session_id)
+            shell_approval = require_unexecuted_approval(daemon, shell_waiting)
+            require(SCRIPT in shell_approval["preview"]["summary"] and shell_waiting["pendingPlan"] is None,
+                    "未声明 Shell 应先请求该调用审批")
+            require(len(state.requests) == 1, "Shell 待批准期间 Provider 已提前续跑")
+            fixture.cli(daemon, session_id, "/reply 1", expected=5)
+            state.assert_healthy()
             waiting = fixture.projection(daemon, session_id)
             require(waiting["pendingPlan"]["mutationManifest"][1]["writablePaths"] == WRITE_PATHS, "Plan 写入范围未完整保留")
             require(len(waiting["pendingPlan"]["steps"]) == 13 and len(waiting["pendingPlan"]["mutationManifest"]) == 129, "计划被旧数量限制截断")
@@ -221,6 +271,8 @@ def main() -> None:
             fixture.cli(daemon, session_id, "/reply 确认", expected=5)
             state.assert_healthy()
             extension = fixture.projection(daemon, session_id)
+            require(extension["pendingApproval"] is None and extension["run"]["waitingReason"] == "plan",
+                    "范围外写入应由 Agent 调整 Plan，不应变为命令审批")
             require(extension["pendingPlan"]["planId"] == first_plan["planId"] and extension["pendingPlan"]["revision"] == 2, "范围补充没有沿用当前 Plan")
             require(extension["pendingPlan"]["steps"] == first_plan["steps"], "只补范围重写了阶段或验收")
             require(extension["pendingPlan"]["summary"].startswith(first_plan["summary"] + "\n\n"), "只补范围丢失原目标摘要")
@@ -228,11 +280,28 @@ def main() -> None:
             expected_statuses = ["completed"] + ["inProgress"] * 12
             require([item["status"] for item in extension["todoList"]["items"]] == expected_statuses, "待确认修订重置进度")
             require(not (workspace / "extra/new.txt").exists(), "范围补充确认前发生写入")
-            require("tool-input-cli-complete" in fixture.cli(daemon, session_id, "/reply 确认").stdout, "CLI 未输出完成正文")
+            fixture.cli(daemon, session_id, "/reply 确认", expected=5)
+            state.assert_healthy()
+            pipeline_waiting = fixture.projection(daemon, session_id)
+            pipeline_approval = require_unexecuted_approval(daemon, pipeline_waiting)
+            require("set -o pipefail" in pipeline_approval["preview"]["summary"]
+                    and "external" in pipeline_approval["preview"]["effects"],
+                    "已确认 Plan 不能代替本次 Host 管道命令审批")
+            require(pipeline_waiting["plans"][-1]["mutationManifest"] == extension["pendingPlan"]["mutationManifest"],
+                    "Host 调用审批改变了 Plan 范围")
+            fixture.cli(daemon, session_id, "/reply 1", expected=5)
+            state.assert_healthy()
+            expected_waiting = fixture.projection(daemon, session_id)
+            expected_approval = require_unexecuted_approval(daemon, expected_waiting)
+            require('test "$rc" -eq 7' in expected_approval["preview"]["summary"]
+                    and "external" in expected_approval["preview"]["effects"],
+                    "前一调用审批不能覆盖下一次 Host 调用")
+            require(pipeline_approval["callId"] != expected_approval["callId"], "两条 Host 命令复用了调用身份")
+            require("tool-input-cli-complete" in fixture.cli(daemon, session_id, "/reply 1").stdout, "CLI 未输出完成正文")
             state.assert_healthy()
             after_extension = fixture.projection(daemon, session_id)
             require(after_extension["plans"][-1]["steps"] == first_plan["steps"], "确认后阶段及验收被重写")
-            require([item["todoId"] for item in after_extension["todoList"]["items"]] == [item["todoId"] for item in extension["todoList"]["items"]], "确认后 Todo 身份改变")
+            require([item["text"] for item in after_extension["todoList"]["items"]] == [item["text"] for item in extension["todoList"]["items"]], "确认后 Todo 内容改变")
             require("pasted-text-cli-complete" in fixture.cli(daemon, session_id, LONG_INPUT).stdout, "CLI 未完成粘贴原文读取")
             state.assert_healthy()
             completed = fixture.projection(daemon, session_id)
@@ -253,26 +322,39 @@ def main() -> None:
             native_projection = fixture.projection(daemon, native_session_id)
             require(native_projection["run"]["status"] == "completed", "commentary 续跑未完成")
             daemon.shutdown()
-            runtime = daemon.config_root / "runtime" / "agent-runtime"
+            runtime = daemon.config_root / "data" / "agent-runtime"
             with fixture.sqlite_read_only(runtime / "session.sqlite3") as connection:
                 rows = connection.execute("SELECT event_type, call_id, payload_json FROM session_events WHERE session_id IN (?,?) ORDER BY session_id, sequence", (session_id, native_session_id)).fetchall()
                 requested = {call_id for kind, call_id, _ in rows if kind == "tool.requested"}
                 terminal = {call_id for kind, call_id, _ in rows if kind in {"tool.completed", "tool.input-rejected", "tool.interrupted"}}
                 require(requested == terminal, "工具调用缺少持久化终态")
                 require(sum(kind == "run.runtime.released" for kind, _, _ in rows) == 3, "三个 run 未全部释放 runtime")
+                approvals = [json.loads(payload) for kind, _, payload in rows if kind == "approval.resolved"]
+                require([item["decision"] for item in approvals] == ["allow", "allow", "allow"],
+                        "应逐次批准三条 Host 命令，Plan 范围拒绝不应生成工具审批")
                 native_run = native_projection["run"]["runId"]
                 native_events = [json.loads(row[0]) for row in connection.execute(
                     "SELECT payload_json FROM session_events WHERE session_id=? AND run_id=? AND event_type='provider.turn.settled' ORDER BY sequence", (native_session_id, native_run))]
-                require(len(native_events) == 3, "独立说明、工具调用和最终回答没有保持同一 run")
+                require(len(native_events) == 4, "独立说明、调用拒绝、工具调用和最终回答没有保持同一 run")
                 require(native_events[0]["orderedCallIds"] == [] and native_events[0]["orderedOutputBlocks"][0]["kind"] == "narrative", "commentary 被持久化为最终答复")
+                require(native_events[1]["orderedCallIds"] == [] and native_events[1]["orderedOutputBlocks"][0]["kind"] == "toolCallRejected", "未知工具被登记为可执行调用")
             with fixture.sqlite_read_only(runtime / "tool-record.sqlite3") as connection:
                 records = [json.loads(row[0]) for row in connection.execute("SELECT record_json FROM tool_records WHERE session_id=?", (session_id,))]
-                shell = next(record for record in records if record["toolName"] == "bash")
+                shell = next(record for record in records if record["toolName"] == "bash" and record["input"]["command"] == SCRIPT)
                 require(shell["input"]["command"] == SCRIPT, "Bash 脚本被改写")
+                blocked = next(record for record in records if record["input"].get("command") == "printf denylist-probe")
+                require(blocked["outcome"] == "denied" and blocked["error"]["code"] == "command_denied_by_rule"
+                        and blocked["authority"]["matchedRule"] == "printf denylist-probe" and "output" not in blocked,
+                        "自定义黑名单拒绝事实未完整落库")
+                require(not any(kind == "tool.started" and call_id == blocked["callId"] for kind, call_id, _ in rows),
+                        "黑名单命令不应进入执行边界")
                 require(any(record.get("error", {}).get("code") == "patch_match_not_found" for record in records), "原始编辑失败未落库")
+                outside = next(record for record in records if record.get("error", {}).get("code") == "plan_scope_required")
+                require(not any(kind == "tool.started" and call_id == outside["callId"] for kind, call_id, _ in rows),
+                        "范围外编辑不应进入执行边界")
             require(len(state.requests) == 11, "Provider 调用次数不符")
-            require(len(state.responses_requests) == 3, "Responses 续跑调用次数不符")
-            print("[cli-e2e] PASS: directory scope, denied outside write, confirmed scope extension preserving phases, edit preview and shell exit status; 13 phases/129 initial targets, pasted text, native commentary/tool/final continuation, paired history and 3 runtime releases (fixture Provider; no GUI)")
+            require(len(state.responses_requests) == 4, "Responses 续跑调用次数不符")
+            print("[cli-e2e] PASS: unknown tools rejected in aggregate/Responses, missing-file errors preserved, explicit call approval before Host execution, configured command rule denied before spawn, Kernel TMPDIR write and cleanup, directory scope, Kernel Plan-scope denial before execution, confirmed scope extension preserving phases, edit preview and shell exit status; 13 phases/129 initial targets, pasted text, native commentary/rejection/tool/final continuation, paired history and 3 runtime releases (fixture Provider; no GUI)")
         except BaseException:
             state.assert_healthy()
             print(daemon.log_tail())

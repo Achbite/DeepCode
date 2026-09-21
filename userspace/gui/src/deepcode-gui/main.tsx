@@ -1,9 +1,13 @@
+import { installInterfaceReloadShortcut } from '../services/interfaceReload';
+import InterfaceReloadDialog from '../components/shared/InterfaceReloadDialog';
+import { requestInterfaceReload } from '../services/interfaceReload';
 import GuiTypography from '../theme/GuiTypography';
 import PaletteOverrides from '../theme/PaletteOverrides';
 import { installPaletteDefaults } from '../theme/palette';
 import { installInterfaceUpdateMonitor } from '../services/interfaceUpdates';
 import { InterfaceUpdateNotice } from '../components/shared/InterfaceUpdateNotice';
 import React from 'react';
+import '../theme/controls.css';
 import ReactDOM from 'react-dom/client';
 import DeepCodeGuiApp from './DeepCodeGuiApp';
 import { installNativeContextMenuGuard } from '../utils/nativeContextMenuGuard';
@@ -83,7 +87,7 @@ class ErrorBoundary extends React.Component<
             <h1>{activeT('deepcodeGui.bootstrap.renderFailedTitle')}</h1>
             <p>{activeT('deepcodeGui.bootstrap.renderFailedBody')}</p>
             <pre>{this.state.error.stack ?? this.state.error.message}</pre>
-            <button className="settings-button" type="button" onClick={() => window.location.reload()}>
+            <button className="settings-button" type="button" onClick={() => requestInterfaceReload()}>
               {activeT('settings.common.reload')}
             </button>
           </div>
@@ -109,6 +113,7 @@ document.documentElement.dataset.shell = isTauriShell ? 'tauri' : 'browser';
 
 installNativeContextMenuGuard();
 
+const stopReloadShortcut = installInterfaceReloadShortcut();
 const stopUpdateMonitor = installInterfaceUpdateMonitor();
 const root = ReactDOM.createRoot(rootEl);
 let compositionDisposed = false;
@@ -117,6 +122,7 @@ const disposeComposition = () => {
   compositionDisposed = true;
   window.removeEventListener('pagehide', handlePageHide);
   stopUpdateMonitor();
+  stopReloadShortcut();
   root.unmount();
   removePaletteDefaults();
 };
@@ -131,6 +137,7 @@ try {
   root.render(
     <React.StrictMode>
       <InterfaceUpdateNotice />
+      <InterfaceReloadDialog />
       <ErrorBoundary>
         <PaletteOverrides />
         <GuiTypography />

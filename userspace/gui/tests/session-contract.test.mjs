@@ -28,6 +28,20 @@ import {
   waitUntil,
 } from '../../session-core/tests/local-agent-fixtures.mjs';
 
+test('Shell history diagnostics are read without applying current execution policy', async (t) => {
+  const { isShellExecutionEnvironment } = await loadGuiModule(t, '/src/services/shellActivityCodec.ts');
+  const environment = {
+    shell: '/bin/bash', interactive: false, executionScope: 'workspace', terminal: false,
+    pathSource: 'recordedPath', writeScope: 'kernelTemporaryOnly', homeWritable: false, networkAccess: false,
+  };
+  for (const writeScope of ['kernelTemporaryOnly', 'workspaceAndKernelTemporary', 'recordedScope']) {
+    assert.equal(isShellExecutionEnvironment({ ...environment, writeScope }), true);
+  }
+  assert.equal(isShellExecutionEnvironment({ ...environment, writeScope: '' }), false);
+  assert.equal(isShellExecutionEnvironment({ ...environment, homeWritable: 'false' }), false);
+  assert.equal(isShellExecutionEnvironment({ ...environment, networkAccess: null }), false);
+});
+
 test('GUI message editing submits a revision-bound Session command and reconciles its projection', async (t) => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:gui-message-edit';
@@ -204,7 +218,7 @@ test('conflicting display slots are explicit and unload when the selection chang
 });
 
 test('document preview requests preserve workspace identity, full bytes and read failures', async (t) => {
-  const { readConversationDocument } = await loadGuiModule(t, '/src/services/localAgentApi.ts');
+  const { readResourceBlob } = await loadGuiModule(t, '/src/services/conversationResources.ts');
   let failure = false;
   const body = '<!doctype html><h1>中文报告</h1>';
   installGuiFetch(t, (url, init) => {
@@ -213,9 +227,9 @@ test('document preview requests preserve workspace identity, full bytes and read
     return failure ? Response.json({ ok: false, error: 'conversation_document_read_failed', message: 'original read error' })
       : new Response(body, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
   });
-  assert.equal(await (await readConversationDocument('session:doc', 'workspace:docs', '报告.html')).text(), body);
+  assert.equal(await (await readResourceBlob('session:doc', { workspaceId: 'workspace:docs', logicalPath: '报告.html' }, 'document')).text(), body);
   failure = true;
-  await assert.rejects(readConversationDocument('session:doc', 'workspace:docs', '报告.html'), /original read error/);
+  await assert.rejects(readResourceBlob('session:doc', { workspaceId: 'workspace:docs', logicalPath: '报告.html' }, 'document'), /original read error/);
 });
 
 test('document links retain Unicode paths and choose the appropriate reader', async (t) => {
@@ -279,9 +293,9 @@ test('document Plan scope and completed artifacts pass through Session to the GU
         input: { workspace: 'primary', path: '报告.pdf', format: 'pdf', content: '<h1>Report</h1>' } });
     } else if (calls === 3) {
       const current = await actor.snapshot();
-      const progress = request.tools.find((entry) => entry.inputSchema.properties?.sourceFactRef);
+      const progress = request.tools.find((entry) => entry.inputSchema.properties?.items);
       yield providerEvent(request.requestId, 'tool.call', { callId: 'provider-call:document-progress', name: progress.name,
-        input: { sourceFactRef: documentRecordId, updates: [{ todoId: current.todoList.items[0].todoId, status: 'completed' }] } });
+        input: { items: [{ text: current.todoList.items[0].text, status: 'completed' }] } });
     } else {
       yield providerEvent(request.requestId, 'assistant.message', { messageId: 'provider-message:document-done', content: 'Report is ready.' });
     }
@@ -418,6 +432,102 @@ test('native path selection preserves OS paths, cancellation and dialog errors',
   assert.equal(calls.length, callCount);
 });
 
+test('Windows sandbox initialization uses the injected Host origin and preserves setup failures', async (t) => {
+  const previousWindow = globalThis.window;
+  t.after(() => { if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow; });
+  const uiToken = `dcui_${'12'.repeat(32)}`;
+  globalThis.window = {
+    location: { protocol: 'http:', hostname: 'deepcode-gui.localhost', origin: 'http://deepcode-gui.localhost' },
+    __DEEPCODE_HOST_BOOT__: { schemaVersion: 'deepcode.host-ui-bootstrap', host: '127.0.0.1', port: '49123', uiToken, windowChrome: 'custom' },
+  };
+  const [{ initializeWorkspaceSandbox }] = await loadGuiModules(t, ['/src/services/apiClient.ts']);
+  let calls = 0;
+  installGuiFetch(t, (url, init) => {
+    calls += 1;
+    assert.equal(url.href, 'http://127.0.0.1:49123/api/user-settings/workspace-sandbox');
+    assert.equal(init.method, 'POST');
+    assert.equal(init.headers['x-deepcode-host-ui-token'], uiToken);
+    assert.deepEqual(JSON.parse(init.body), {});
+    return Response.json({ ok: false, error: 'workspace_sandbox_setup_failed', message: 'administrator request declined' });
+  });
+  const result = await initializeWorkspaceSandbox();
+  assert.equal(calls, 1);
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'workspace_sandbox_setup_failed');
+  assert.equal(result.message, 'administrator request declined');
+});
+
+test('Host workspace initialization preserves the current workspace or opens the native default directory', async (t) => {
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  t.after(() => {
+    if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow;
+    if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument;
+  });
+  const { initializeHostWorkspace } = await loadGuiModule(t, '/src/services/workspaceInitialization.ts');
+  globalThis.document = { documentElement: { dataset: { product: 'deepcode-gui' } } };
+  let defaultPath = '/Users/developer/DeepCode workspace';
+  const calls = [];
+  globalThis.window = { __TAURI__: { core: { invoke: async (command) => {
+    calls.push(command);
+    assert.equal(command, 'deepcode_default_workspace_path');
+    return defaultPath;
+  } } } };
+  const workspace = { id: 'workspace:current', name: 'Existing', source: 'directory', sourcePath: null,
+    folders: [{ id: 'folder:current', name: 'Existing', absolutePath: '/existing', originalPath: '/existing', isAbsolute: true }],
+    unsupportedFields: [], openedAt: '2026-09-18T00:00:00Z' };
+  let current = workspace;
+  installGuiFetch(t, (url, init) => {
+    calls.push(url.pathname);
+    if (url.pathname === '/api/workspaces/current') return Response.json({ ok: true, data: { current, fallbackUsed: false, lastError: null } });
+    assert.equal(url.pathname, '/api/workspaces/open');
+    assert.equal(init.method, 'POST');
+    assert.deepEqual(JSON.parse(init.body), { path: defaultPath });
+    return Response.json({ ok: true, data: { workspace } });
+  });
+  await initializeHostWorkspace();
+  assert.deepEqual(calls.splice(0), ['/api/workspaces/current']);
+  current = null;
+  await initializeHostWorkspace();
+  assert.deepEqual(calls.splice(0), ['/api/workspaces/current', 'deepcode_default_workspace_path', '/api/workspaces/open']);
+  defaultPath = null;
+  await initializeHostWorkspace();
+  assert.deepEqual(calls, ['/api/workspaces/current', 'deepcode_default_workspace_path']);
+});
+
+test('Host workspace initialization propagates the failing request without opening or retrying', async (t) => {
+  const previousDocument = globalThis.document;
+  t.after(() => { if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument; });
+  globalThis.document = { documentElement: { dataset: {} } };
+  const { initializeHostWorkspace } = await loadGuiModule(t, '/src/services/workspaceInitialization.ts');
+  const paths = ['/api/workspaces/current', '/api/workspaces/default-path', '/api/workspaces/open'];
+  const replies = [
+    { ok: true, data: { current: null, fallbackUsed: false, lastError: null } },
+    { ok: true, data: { path: '/workspace/default' } },
+  ];
+  let failureAt;
+  let invalidSuccess;
+  let calls;
+  installGuiFetch(t, (url) => {
+    const index = calls.length;
+    calls.push(url.pathname);
+    assert.equal(url.pathname, paths[index]);
+    return Response.json(index === failureAt
+      ? invalidSuccess ? { ok: true } : { ok: false, error: 'workspace_failed', message: `Original failure: ${paths[index]}` }
+      : replies[index]);
+  });
+  for (failureAt = 0; failureAt < paths.length; failureAt += 1) {
+    calls = [];
+    invalidSuccess = false;
+    await assert.rejects(initializeHostWorkspace(), { message: `Original failure: ${paths[failureAt]}` });
+    assert.deepEqual(calls, paths.slice(0, failureAt + 1));
+    calls = [];
+    invalidSuccess = true;
+    await assert.rejects(initializeHostWorkspace());
+    assert.deepEqual(calls, paths.slice(0, failureAt + 1));
+  }
+});
+
 test('one native reference request returns the actual file or folder kind', async (t) => {
   const previousWindow = globalThis.window;
   t.after(() => { if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow; });
@@ -453,15 +563,19 @@ test('one native reference request returns the actual file or folder kind', asyn
   assert.equal(calls, references.length + 2);
 });
 
-test('Skill settings load the existing read-only catalog route', async (t) => {
-  const items = [{ id: 'skill:example', displayName: 'Example', description: 'A text Skill.', source: 'mounted' }];
+test('Skill settings read mounted guidance from the live plugin catalog', async (t) => {
+  const catalog = { revision: 'catalog:skills', plugins: [{ uri: 'plugin://example@local',
+    displayName: 'Example', shortDescription: 'A text Skill.', source: 'mounted',
+    category: 'reference', contributionKind: 'skill', discovery: 'default',
+    activationMediaTypes: [], enabled: true, available: true,
+    management: { key: 'skills.mounts', id: 'skill:example' } }] };
   installGuiFetch(t, async (url, init) => {
-    assert.equal(url.pathname, '/api/conversation/plugins/skills');
+    assert.equal(url.pathname, '/api/conversation/plugins');
     assert.equal(init.method ?? 'GET', 'GET');
-    return Response.json({ ok: true, data: { skills: items } });
+    return Response.json({ ok: true, data: catalog });
   });
-  const [{ getSkillSettings }] = await loadGuiModules(t, ['/src/services/localAgentApi.ts']);
-  assert.deepEqual(await getSkillSettings(), items);
+  const { getPluginCatalog } = await loadGuiModule(t, '/src/services/localAgentApi.ts');
+  assert.deepEqual(await getPluginCatalog(), catalog);
 });
 
 test('GUI receives and renders live tool output at the same journal revision before completion', async (t) => {
@@ -521,16 +635,26 @@ test('GUI receives and renders live tool output at the same journal revision bef
   const [{ ToolActivityGroup }, { ConversationVirtualRow }] = await loadGuiModules(t, [
     '/src/components/local-agent/ToolActivityDetails.tsx', '/src/components/local-agent/ConversationVirtualRow.tsx',
   ]);
-  const layout = { state: new Map([[`tool:${activity.activityId}:expanded`, true]]) };
-  const html = renderToStaticMarkup(createElement(ConversationVirtualRow, {
+  const layout = { state: new Map() };
+  const renderActivity = (current = activity) => renderToStaticMarkup(createElement(ConversationVirtualRow, {
     rowKey: 'live-progress', eager: true, virtualizer: { layout: () => layout },
-    children: () => createElement(ToolActivityGroup, { sessionId, activities: [activity], language: 'zh-CN', onExpand() {}, onOpenWorkspaceResource() {} }),
+    children: () => createElement(ToolActivityGroup, { sessionId, activities: [current], language: 'zh-CN', onExpand() {}, onOpenWorkspaceResource() {} }),
   }));
+  assert.equal(renderActivity().includes('<pre>'), false, 'output arriving does not expand details');
+  assert.match(renderActivity(), /正在执行/);
+  layout.state.set(`tool:${activity.activityId}:expanded`, true);
+  const html = renderActivity();
   assert.match(html, /<pre>first line\nsecond line\n<\/pre>/);
   assert.equal(html.includes('退出码'), false, 'active output does not fabricate a final result');
+  layout.state.set(`tool:${activity.activityId}:expanded`, false);
+  assert.equal(renderActivity().includes('<pre>'), false, 'a user can keep an active tool collapsed');
+  layout.state.set(`tool:${activity.activityId}:expanded`, true);
   finish();
   const final = await waitForProjection(actor, (value) => value.run?.status === 'completed');
   assert.equal(final.activities.some((entry) => entry.liveOutput), false);
+  const completed = final.activities.find((entry) => entry.activityId === activity.activityId);
+  assert.match(renderActivity(completed), /class="local-agent__tool-entry-heading" aria-expanded="true"/,
+    'completion does not collapse details the user opened');
   assert.deepEqual(await decodeGuiProjection(final), final);
   assert.deepEqual((await readEvents(journal, sessionId)).filter((event) => event.type.startsWith('tool.')).map((event) => event.type), ['tool.requested', 'tool.started', 'tool.completed']);
 });
@@ -541,7 +665,7 @@ test('scope-only Plan review foregrounds additions and keeps the complete confir
   t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
   const { createElement } = await import('react');
   const { renderToStaticMarkup } = await import('react-dom/server');
-  const { PlanCardContent } = await loadGuiModule(t, '/src/components/local-agent/PlanCard.tsx');
+  const { default: PlanCard, PlanCardContent } = await loadGuiModule(t, '/src/components/local-agent/PlanCard.tsx');
   const { planScopeAddition } = await loadGuiModule(t, '/src/components/local-agent/planReview.ts');
   const { ConversationComposer } = await loadGuiModule(t, '/src/components/local-agent/ConversationComposer.tsx');
   const previous = {
@@ -576,8 +700,14 @@ test('scope-only Plan review foregrounds additions and keeps the complete confir
     pluginSelections: [], filteredPlugins: [], textDecision: true,
   } }));
   assert.match(decision, />确认新增范围<\/b>/);
+  assert.ok(decision.includes('Expose the shared options'));
+  assert.ok(decision.includes('include/pool/demo.hpp'));
   assert.ok(decision.includes('保留已有进度'));
   assert.equal((decision.match(/<textarea\b/g) ?? []).length, 1);
+  const adjustment = renderToStaticMarkup(createElement(PlanCard, { plan: current, previousPlan: previous, active: false, language: 'zh-CN' }));
+  assert.ok(adjustment.includes('计划范围调整'));
+  assert.equal(adjustment.includes('local-agent__plan-card'), false, 'a scope adjustment is a compact record, not a second Plan card');
+  assert.equal(adjustment.includes(previous.summary), false);
 });
 
 test('last-call, per-run, and Session cache rates use their own input token totals', async (t) => {
@@ -751,7 +881,7 @@ test('GUI consumes complete phase plans and Todo beyond the former item count', 
     runId: waiting.run.runId, planId: waiting.pendingPlan.planId, revision: 1, response: { kind: 'confirm' } });
   const confirmed = await waitForProjection(actor, (value) => value.todoList?.items.length === 13);
   assert.deepEqual(await decodeGuiProjection(confirmed), confirmed);
-  assert.deepEqual(confirmed.todoList.items.map((item) => item.sourceStepId), waiting.pendingPlan.steps.map((step) => step.stepId));
+  assert.deepEqual(confirmed.todoList.items.map((item) => item.text), waiting.pendingPlan.steps.map((step) => step.title));
 });
 
 test('Provider status separates request elapsed time from the last observed content', async (t) => {
@@ -985,7 +1115,7 @@ test('snapshot-scoped wire tool resolves to exact Kernel bindings, durable ToolR
 
 
 
-test('GUI model settings save after acknowledgement, reset effort on model change, and retain the last saved value on failure', async (t) => {
+test('GUI model settings remember effort per model across new conversations and preserve acknowledged values on failure', async (t) => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:gui-settings';
   await createSession(journal, sessionId);
@@ -1003,8 +1133,15 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
     if (url.pathname === '/api/llm/profiles') {
       if (init.method === 'PATCH') {
         const update = JSON.parse(init.body);
-        assert.deepEqual(Object.keys(update), ['defaultProfileId']);
-        defaultProfileId = update.defaultProfileId;
+        if (update.profile) {
+          assert.deepEqual(Object.keys(update), ['profile']);
+          const index = profiles.findIndex(profile => profile.id === update.profile.id);
+          assert.ok(index >= 0);
+          profiles[index] = update.profile;
+        } else {
+          assert.deepEqual(Object.keys(update), ['defaultProfileId']);
+          defaultProfileId = update.defaultProfileId;
+        }
       }
       return Response.json({ ok: true, data: { profiles, defaultProfileId } });
     }
@@ -1049,12 +1186,22 @@ test('GUI model settings save after acknowledgement, reset effort on model chang
   assert.equal((await actor.snapshot()).run, null);
   store.getState().startNewSession();
   assert.equal(store.getState().selectedProfileId, 'profile:one');
+  assert.equal(store.getState().reasoningEffortOverride, 'low');
   await store.getState().selectProfile('profile:two');
+  await store.getState().selectReasoningEffort('medium');
   store.getState().startNewSession();
   assert.equal(store.getState().selectedProfileId, 'profile:one');
+  assert.equal(store.getState().reasoningEffortOverride, 'low');
+  await store.getState().selectProfile('profile:two');
+  assert.equal(store.getState().reasoningEffortOverride, 'medium');
   const reopened = await loadGuiModelStore(t);
   await reopened.getState().refreshProfiles();
   assert.equal(reopened.getState().selectedProfileId, 'profile:one');
+  assert.equal(reopened.getState().reasoningEffortOverride, 'low');
+  await reopened.getState().selectReasoningEffort(null);
+  assert.equal(profiles[0].reasoningEffort, undefined, 'service default clears the remembered explicit effort');
+  reopened.getState().startNewSession();
+  assert.equal(reopened.getState().reasoningEffortOverride, null);
 });
 
 test('starting a draft during initialization preserves navigation and still loads usable model configuration', async (t) => {
@@ -1407,7 +1554,7 @@ test('Plan documents and previews render Markdown entities, code names and verif
     planId: 'plan:document', revision: 1, runId: 'run:document', callId: 'call:document', status: 'published',
     title: '对象池 ObjectPool&lt;T,N&gt; 升级', summary: '保留 **互斥访问** 与 `C++17`。',
     steps: [{ stepId: 'write', title: '实现 `ObjectPool<T,N>`', details: '修改 `src/pool.hpp`。\n\n- 构造对象\n- 归还对象', verification: ['编译 **通过**；`exit 0`。'] }],
-    mutationManifest: [{ workspaceId: 'workspace:private-id', operation: 'bash', workspaceMode: 'write', executionScope: 'workspace' }],
+    mutationManifest: [{ workspaceId: 'workspace:private-id', operation: 'bash', writablePaths: [{ path: 'build', kind: 'directory' }] }],
   };
   const published = renderToStaticMarkup(createElement(PlanCard, { plan, active: false, language: 'zh-CN' }));
   assert.ok(published.includes('aria-expanded="false"'), 'published plans wait for the reader to expand');
@@ -1420,7 +1567,8 @@ test('Plan documents and previews render Markdown entities, code names and verif
   assert.match(html, /<code>exit 0<\/code>/);
   assert.equal(html.includes('undefined'), false, 'optional command examples must not leak undefined');
   assert.equal(html.includes('workspace:private-id'), false, 'single-workspace review does not need internal IDs');
-  assert.ok(html.includes('允许修改'));
+  assert.ok(html.includes('写入范围'));
+  assert.ok(html.includes('build/'));
   const revisedPlan = { ...plan, revision: 2,
     steps: [{ ...plan.steps[0], verification: ['ctest 通过'] }],
     mutationManifest: [{ workspaceId: 'workspace:private-id', operation: 'fs.edit', target: 'src', targetKind: 'directoryTree' }],
@@ -1451,6 +1599,12 @@ test('Plan documents and previews render Markdown entities, code names and verif
   const collapsed = renderToStaticMarkup(createElement(PlanCard, { plan: { ...plan, status: 'confirmed' }, active: true, language: 'zh-CN' }));
   assert.equal(collapsed.includes('&amp;lt;'), false);
   assert.ok(collapsed.includes('aria-expanded="false"'));
+  const initialDecision = renderToStaticMarkup(createElement(ComposerDecisionPanels, { language: 'zh-CN', composer: {
+    pendingPlan: plan, pendingScopeAddition: null, submitting: false,
+  } }));
+  assert.ok(initialDecision.includes('ObjectPool&lt;T,N&gt;'));
+  assert.ok(initialDecision.includes('确认执行'));
+  assert.equal(initialDecision.includes('互斥访问'), false, 'the complete Plan body belongs only to its document card');
   const prompt = '保留 **容器环境** 吗？\n\n- 保留 `Dockerfile`\n- 删除演示产物';
   const question = renderToStaticMarkup(createElement(ComposerDecisionPanels, { language: 'zh-CN', composer: {
     pendingInteraction: { prompt, allowFreeform: true, options: [{ id: 'keep', label: '**保留**环境', description: '保留 `Makefile`，参见[说明](https://example.com)。' }] },
@@ -1551,6 +1705,41 @@ test('GUI refresh accepts plan preview changes without a new journal revision or
   delete incoming.assistantDraft.planPreview;
   await store.getState().refresh();
   assert.equal(store.getState().projection.assistantDraft.planPreview, undefined);
+});
+
+test('decision prose displays escaped paragraphs without rewriting code or raw content', async (t) => {
+  const { formatDecisionProse } = await loadGuiModule(t, '/src/components/local-agent/streamingMarkdown.ts');
+  const source = '请确认范围。\\n\\n保留源码。';
+  assert.equal(formatDecisionProse(source), '请确认范围。\n\n保留源码。');
+  assert.equal(source, '请确认范围。\\n\\n保留源码。');
+  const protectedText = [
+    '`printf "\\n\\n"`', '```sh\nprintf "\\n\\n"\n```',
+    '    printf "\\n\\n"', '[path](https://example.test/\\n\\n)',
+    'C:\\new\\next', 'Actual\n\nparagraph', String.raw`Literal \\n\\n`,
+  ];
+  for (const text of protectedText) assert.equal(formatDecisionProse(text), text);
+  assert.equal(formatDecisionProse('Before\\n\\n`\\n\\n` and **after**'), 'Before\n\n`\\n\\n` and **after**');
+  const { MarkdownContent } = await loadGuiModule(t, '/src/components/local-agent/BufferedMarkdown.tsx');
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const render = (decisionProse) => renderToStaticMarkup(createElement(MarkdownContent, { children: source, decisionProse }));
+  assert.equal((render(true).match(/<p>/g) ?? []).length, 2);
+  assert.match(render(false), /\\n\\n/);
+});
+
+test('browser annotations preserve the exact preview identity and separate the user comment', async (t) => {
+  const { formatBrowserAnnotation } = await loadGuiModule(t, '/src/components/local-agent/browserReview.ts');
+  const annotation = { id: 'annotation:1', mode: 'element', url: 'file:///input/interactive-test.html',
+    title: 'Page', selector: '#btn', text: 'Page content', rect: { x: 1, y: 2, width: 3, height: 4 },
+    viewport: { width: 800, height: 600, scrollX: 0, scrollY: 0 }, comment: 'Make this button white.' };
+  for (const chinese of [true, false]) {
+    const text = formatBrowserAnnotation(annotation, 'preview-12', chinese);
+    const evidence = JSON.parse(text.split('\n').filter(line => line.startsWith('> ')).map(line => line.slice(2)).join('\n'));
+    assert.equal(evidence.previewId, 'preview-12');
+    assert.equal(evidence.url, annotation.url);
+    assert.equal(evidence.selector, '#btn');
+    assert.ok(text.endsWith('\n\n' + annotation.comment));
+  }
 });
 
 test('streaming Markdown retains stable blocks and reconciles GFM and references on completion', async (t) => {
@@ -1827,6 +2016,10 @@ test('polling and command reconciliation read draft snapshots in order at the sa
   let reads = 0;
   let commands = 0;
   installGuiFetch(t, async (url, init) => {
+    if (url.pathname === '/api/llm/profiles' && init.method === 'PATCH') {
+      assert.deepEqual(Object.keys(JSON.parse(init.body)), ['profile']);
+      return Response.json({ ok: true, data: {} });
+    }
     if (url.pathname === '/api/conversation/statuses') return Response.json({ ok: true, data: [
       { sessionId, revision: base.revision, run: { runId: base.run.runId, status: base.run.status } },
     ] });
@@ -1878,6 +2071,13 @@ test('desktop startup diagnostics render the Host failure and log reference verb
   assert.match(html, /Kernel exited: exit status: 71/);
   assert.match(html, /\/runtime\/logs\/startup.log/);
   assert.equal(renderToStaticMarkup(createElement(HostStartupDiagnostic, { status: { ...status, phase: 'ready' }, language: 'zh-CN' })), '');
+  const workspaceFailure = renderToStaticMarkup(createElement(HostStartupDiagnostic, {
+    status: { ...status, phase: 'ready' }, workspaceError: 'Workspace open denied: /workspace/default',
+    language: 'zh-CN', onRetry() {},
+  }));
+  assert.match(workspaceFailure, /Workspace open denied: \/workspace\/default/);
+  assert.match(workspaceFailure, /role="alert"/);
+  assert.doesNotMatch(workspaceFailure, /host_startup_process_exited|startup.log|<button/);
 });
 
 test('conversation reading intent survives native scroll deliveries and layout growth', async (t) => {
@@ -2050,8 +2250,12 @@ test('conversation follows decision layout changes and final output until the re
 test('composer submission receipts preserve newer text and retain the complete failed draft', async (t) => {
   const { submitComposerState, emptyComposerState } = await loadGuiModule(t, '/src/components/local-agent/composerSubmission.ts');
   const original = { ...emptyComposerState(), draft: 'First request',
-    pastedTexts: [{ inputId: 'paste:one', text: 'Complete pasted content', expanded: false }],
-    filesystemPaths: [{ path: '/project/one.txt', kind: 'file' }],
+    pastedTexts: [{ inputId: 'paste:one', text: 'Complete pasted content', expanded: false,
+      browserReview: { previewId: 'preview:one', screenshot: '/project/capture.png', annotation: {
+        id: 'annotation:one', mode: 'element', url: 'https://example.test', title: 'Example', selector: 'h1', text: 'Heading',
+        rect: { x: 10, y: 20, width: 120, height: 40 }, viewport: { width: 800, height: 600, scrollX: 0, scrollY: 0 }, comment: '调整标题间距',
+      } } }],
+    filesystemPaths: [{ path: '/project/one.txt', kind: 'file' }, { path: '/project/capture.png', kind: 'file' }],
     pluginSelections: [{ selectionId: 'selection:one', uri: 'plugin://example@1', label: 'Example' }] };
   for (const fails of [false, true]) {
     let current = original;
@@ -2124,20 +2328,26 @@ test('pending approvals replace ordinary input while preserving its draft for re
   assert.match(html, /Write the requested file/);
   assert.doesNotMatch(html, /<textarea|aria-label="发送"/);
   assert.match(html, /aria-label="拒绝" aria-keyshortcuts="Escape"/);
-  assert.match(html, /aria-label="允许一次" aria-keyshortcuts="Enter"/);
+  assert.match(html, /aria-label="允许" aria-keyshortcuts="Enter"/);
   const resumed = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', composer: { ...composer, pendingApproval: null }, uiActionError: null }));
   assert.match(resumed, /<textarea[^>]*>Second request<\/textarea>/);
   const browser = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', composer: { ...composer,
     pendingApproval: { ...composer.pendingApproval, preview: { ...composer.pendingApproval.preview, authorizationScope: 'sessionBrowser' } },
   }, uiActionError: null }));
   assert.match(browser, /允许当前对话使用内置浏览器/);
-  assert.match(browser, /aria-label="允许此对话"/);
-  const runPreview = { ...composer.pendingApproval.preview, authorizationScope: 'runHostShell', authorizationContext: { workspaceId: 'workspace:one', workspaceRoot: '/project' } };
+  assert.match(browser, /aria-label="允许本会话"/);
+  const runPreview = { ...composer.pendingApproval.preview, authorizationScope: 'runHostShell', authorizationScopes: ['runCommand', 'sessionCommand', 'runHostShell', 'sessionHostShell'], authorizationContext: { workspaceId: 'workspace:one', workspaceRoot: '/project' } };
   const run = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', composer: { ...composer,
     pendingApproval: { ...composer.pendingApproval, preview: runPreview },
   }, uiActionError: null }));
-  assert.match(run, /允许本轮/);
-  assert.match(run, /允许一次/);
+  assert.match(run, /title="本会话允许 Host Shell"[^>]*>允许本会话<\/button>/);
+  assert.match(run, /aria-label="允许本轮" title="本次任务允许 Host Shell" aria-keyshortcuts="Enter"/);
+  assert.doesNotMatch(run, /<option value="(?:runCommand|sessionHostShell)"/);
+  const perCall = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', composer: { ...composer,
+    pendingApproval: { ...composer.pendingApproval, preview: { ...runPreview, authorizationScopes: [] } },
+  }, uiActionError: null }));
+  assert.doesNotMatch(perCall, /允许本轮|允许本会话/);
+  assert.match(perCall, /aria-label="允许" aria-keyshortcuts="Enter"/);
   const { emptySessionState, projectSession } = await import('../../session-core/dist/index.js');
   const wire = projectSession(emptySessionState('session:browser-wire'));
   wire.pendingApproval = { ...composer.pendingApproval, runId: 'run:browser', callId: 'call:browser', sequence: 3,
@@ -2165,7 +2375,7 @@ test('questions and Plan revisions share the main input and render a single prim
     canSend: true, showStopAction: false, textDecision: true };
   for (const decision of [
     { pendingInteraction: { interactionId: 'question:one', prompt: '需要保留什么？', allowFreeform: true, options: [] } },
-    { pendingPlan: { planId: 'plan:one', revision: 1, title: '清理工作区' } },
+    { pendingPlan: { planId: 'plan:one', revision: 1, title: '清理工作区', summary: '清理已确认文件，保留构建配置。' } },
   ]) {
     const html = renderToStaticMarkup(createElement(ConversationComposer, {
       language: 'zh-CN', composer: { ...base, ...decision }, uiActionError: null,
@@ -2190,7 +2400,7 @@ test('questions and Plan revisions share the main input and render a single prim
   assert.match(editing, /aria-label="发送"/);
   assert.doesNotMatch(editing, /aria-label="停止当前运行"/);
   const plan = renderToStaticMarkup(createElement(ConversationComposer, { language: 'zh-CN', uiActionError: null,
-    composer: { ...base, draft: '', canSend: false, pendingPlan: { planId: 'plan:one', revision: 1, title: '清理工作区' } },
+    composer: { ...base, draft: '', canSend: false, pendingPlan: { planId: 'plan:one', revision: 1, title: '清理工作区', summary: '清理已确认文件，保留构建配置。' } },
   }));
   assert.equal((plan.match(/<textarea\b/g) ?? []).length, 1);
   assert.match(plan, />确认执行<\/b>/);
@@ -2254,7 +2464,7 @@ test('unavailable plugins preserve their source error and cannot be selected in 
   assert.match(html, /plugin_load_failed: Manifest cannot be read/);
 });
 
-test('tool failure summaries render the original error without reading history', async (t) => {
+test('collapsed tool failures retain their original errors in manual details', async (t) => {
   const previousSelf = globalThis.self;
   globalThis.self = {};
   t.after(() => { if (previousSelf === undefined) delete globalThis.self; else globalThis.self = previousSelf; });
@@ -2264,15 +2474,70 @@ test('tool failure summaries render the original error without reading history',
     '/src/components/local-agent/ToolActivityDetails.tsx', '/src/components/local-agent/ConversationVirtualRow.tsx',
   ]);
   const layout = { state: new Map() };
-  const html = renderToStaticMarkup(createElement(ConversationVirtualRow, {
+  const render = () => renderToStaticMarkup(createElement(ConversationVirtualRow, {
     rowKey: 'tool-failure', eager: true, virtualizer: { layout: () => layout },
     children: () => createElement(ToolActivityGroup, { activities: [{
       activityId: 'activity:one', runId: 'run:one', status: 'failed', kind: 'tool', label: 'read',
-      tool: { operation: 'fs.read', resources: [], error: { code: 'path_not_directory', message: 'a.txt is not a directory' } },
+      tool: { operation: 'fs.read', resources: [], error: { code: 'path_not_directory', message: 'a.txt is not a directory' },
+        projectionError: { code: 'tool_error_diagnostics_invalid', message: 'Original record retained.' } },
     }], language: 'zh-CN', onExpand() {}, onOpenWorkspaceResource() {} }),
   }));
+  assert.equal(render().includes('path_not_directory'), false);
+  assert.match(render(), /失败/);
+  layout.state.set('tool:activity:one:expanded', true);
+  const html = render();
   assert.match(html, /path_not_directory/);
   assert.match(html, /a.txt is not a directory/);
+  assert.match(html, /tool_error_diagnostics_invalid/);
+  assert.match(html, /Original record retained/);
+});
+
+test('GUI consumes Session-normalized tool errors and record-local detail failures', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:projection-details';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  let turns = 0;
+  let executions = 0;
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    if (++turns === 1) {
+      for (const callId of ['denied', 'details']) yield providerEvent(request.requestId, 'tool.call', {
+        callId, name: request.tools[0].name, input: { path: 'README.md' },
+      });
+    } else yield providerEvent(request.requestId, 'text.delta', { text: 'Final answer remains readable.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel({ async execute(request) {
+    const reply = completedExecutionReply(request, { artifacts: [{ artifactId: 'bad' }] });
+    if (++executions === 1) {
+      reply.record.outcome = 'denied';
+      delete reply.record.output;
+      reply.record.error = { code: 'plan_scope_required', message: 'Original refusal.', operation: 'fs.delete', targets: ['logs'] };
+    }
+    return reply;
+  } }), fakeRunPreparation({ tools: [{
+    toolBindingRef: 'tool-binding:read:g1', name: 'fs.read', description: 'Read a file.',
+    inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } },
+    possibleEffects: ['read'], availability: 'callable', origin: 'coreBuiltin',
+  }] }).port, 'projection-details');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:projection-details', 'Inspect files.'));
+  const projection = await waitForProjection(actor, (value) => value.run?.status === 'completed');
+  assert.deepEqual(await decodeGuiProjection(projection), projection);
+  assert.ok(projection.messages.some((message) => message.content === 'Final answer remains readable.'));
+  assert.deepEqual(projection.activities.find((activity) => activity.status === 'denied').tool.error,
+    { code: 'plan_scope_required', message: 'Original refusal.' });
+  assert.equal(projection.activities.find((activity) => activity.tool?.projectionError).status, 'completed');
+  const before = await readEvents(journal, sessionId);
+  const service = new SessionService({ async *read() { yield* before; } }, { async create() { throw new Error('Read only'); } });
+  assert.deepEqual(await decodeGuiProjection(await service.snapshot(sessionId)), projection);
+  assert.deepEqual(await readEvents(journal, sessionId), before);
+  const inputRejected = structuredClone(projection);
+  const activity = inputRejected.activities.find((item) => item.status === 'denied');
+  delete activity.tool;
+  activity.status = 'rejected';
+  activity.inputRejection = { code: 'tool_input_invalid', message: 'Original input error.',
+    diagnostics: { source: 'kernel', phase: 'prepare', category: 'input', retryable: false, causes: [] },
+    issues: [{ path: '$.path', rule: 'type', message: 'Expected a string.' }] };
+  assert.deepEqual(await decodeGuiProjection(inputRejected), inputRejected);
 });
 
 test('GUI ordinary input queues during a decision without answering it or changing the active model', async (t) => {
@@ -2378,32 +2643,21 @@ test('new-session submission identifies the draft destination before publishing 
 test('model settings distinguish a failed read from a successfully empty catalog and retain loaded profiles', async (t) => {
   const { createElement } = await import('react');
   const { renderToStaticMarkup } = await import('react-dom/server');
-  const [{ default: LlmSection, LlmProfileReadNotice }, api, { t: translate }] = await loadGuiModules(t, [
-    '/src/components/settings-center/sections/LlmSection.tsx', '/src/services/apiClient.ts', '/src/i18n.ts',
+  const [{ default: LlmSection }, api] = await loadGuiModules(t, [
+    '/src/components/settings-center/sections/LlmSection.tsx', '/src/services/apiClient.ts',
   ]);
-  const emptyMessage = translate('zh-CN', 'settings.llm.empty');
-  const notice = (state, hasProfiles = false) => renderToStaticMarkup(createElement(LlmProfileReadNotice, {
-    state, hasProfiles, language: 'zh-CN',
-  }));
-  assert.equal(notice({ status: 'loading' }), '');
   const initial = renderToStaticMarkup(createElement(LlmSection));
-  assert.equal(initial.includes(emptyMessage), false, 'the first render has not read the catalog');
-  assert.equal(initial.includes(translate('en-US', 'settings.llm.empty')), false);
+  assert.match(initial, /role="status"/);
+  assert.doesNotMatch(initial, /暂无连接|No connections/, 'unread connections are not an empty catalog');
+  let unavailable = true;
   installGuiFetch(t, (url) => {
     assert.equal(url.pathname, '/api/llm/profiles');
-    throw new TypeError('Failed to fetch');
+    if (unavailable) throw new TypeError('Failed to fetch');
+    return Response.json({ ok: true, data: { profiles: [], connections: [] } });
   });
   const failed = await api.getLlmProfiles();
   assert.equal(failed.ok, false);
   assert.match(failed.message, /Failed to fetch/);
-  for (const hasProfiles of [false, true]) {
-    const html = notice({ status: 'failed', error: failed.message }, hasProfiles);
-    assert.match(html, /role="alert"/);
-    assert.match(html, /Failed to fetch/);
-    assert.equal(html.includes(emptyMessage), false);
-  }
-  assert.equal(notice({ status: 'loaded' }).includes(emptyMessage), true);
-  assert.equal(notice({ status: 'loaded' }, true), '');
   const profiles = [
     { id: 'profile:existing', name: 'Existing model', enabled: true },
     { id: 'profile:disabled', name: 'Disabled model', enabled: false },
@@ -2415,6 +2669,48 @@ test('model settings distinguish a failed read from a successfully empty catalog
   assert.equal(store.getState().defaultProfileId, profiles[0].id);
   assert.equal(store.getState().selectedProfileId, profiles[0].id);
   assert.match(store.getState().error, /Failed to fetch/);
+  unavailable = false;
+  const empty = await api.getLlmProfiles();
+  assert.equal(empty.ok, true);
+  assert.deepEqual(empty.data.profiles, []);
+  await store.getState().refreshProfiles();
+  assert.deepEqual(store.getState().profiles, []);
+  assert.equal(store.getState().defaultProfileId, null);
+  assert.equal(store.getState().error, null);
+  assert.equal(store.getState().selectedProfileId, profiles[0].id, 'reading an empty catalog does not silently change the selected model');
+});
+
+test('compact display math fences retain aligned formulas and following Markdown in streamed and settled views', async (t) => {
+  const [{ StreamingMarkdownParser }, { MarkdownContent }] = await loadGuiModules(t, [
+    '/src/components/local-agent/streamingMarkdown.ts', '/src/components/local-agent/BufferedMarkdown.tsx',
+  ]);
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const formula = String.raw`$$\begin{aligned}
+\text{buy1}_i &= \max_{i_1 \le i}(-p_{i_1})\\
+\text{sell1}_i &= \max_{i_1 \le j_1 \le i}(p_{j_1}-p_{i_1})
+\end{aligned}$$`;
+  const following = '\n\n## Verification\n\n- **Result** stays outside math.\n\n| Cost | Space |\n| --- | --- |\n| $O(n)$ | $O(1)$ |';
+  const text = '# Proof\n\n' + formula + following;
+  const render = (source, streaming) => renderToStaticMarkup(createElement(MarkdownContent, { children: source, streaming }));
+  const completed = render(text, false);
+  assert.doesNotMatch(completed, /katex-error/);
+  assert.match(completed, /class="katex-display"/);
+  assert.match(completed, /<h2>Verification<\/h2>/);
+  assert.match(completed, /<strong>Result<\/strong>/);
+  assert.match(completed, /<table>/);
+  assert.equal(render(text, true), completed);
+  const stream = new StreamingMarkdownParser();
+  for (const end of [text.indexOf('sell1'), text.indexOf('aligned}$$') + 9, text.indexOf('## Verification'), text.length]) {
+    stream.update(text.slice(0, end), true);
+  }
+  assert.deepEqual(stream.update(text, false), new StreamingMarkdownParser().update(text, false));
+  const fencedCode = render('```tex\n' + formula + '\n```', false);
+  assert.doesNotMatch(fencedCode, /class="katex/);
+  assert.match(fencedCode, /\$\$\\begin\{aligned\}/);
+  const inlineCode = render('`$$\\begin{aligned} a &= b \\end{aligned}$$`', false);
+  assert.doesNotMatch(inlineCode, /class="katex/);
+  assert.match(render('$$\na &= b\n$$\n\n## Original error', false), /katex-error/);
 });
 
 test('invalid default profiles retain editable settings and do not prevent reading conversation history', async (t) => {
@@ -2743,4 +3039,130 @@ test('startup opens a new draft even when history exists, and status failure doe
   assert.equal(store.getState().statusError, 'original_status_failure');
   assert.equal(store.getState().error, 'command_failure');
   assert.deepEqual(store.getState().projection, history);
+});
+
+
+test('settings contributions compose while tool renderers match their declared operation', async (t) => {
+  const { UiPluginRuntime } = await loadGuiModule(t, '/src/ui-plugins/runtime.ts');
+  const runtime = new UiPluginRuntime(async source => ({ apply(ctx) {
+    ctx.register(source, () => ({ update() {}, dispose() {} }));
+  } }), () => () => {});
+  t.after(() => runtime.dispose());
+  const file = (id, slot, toolId) => ({ path: `/plugins/${id}`, enabled: true,
+    manifest: { id, name:id, entry:'index.js', slots:[slot], ...(toolId ? {toolId} : {}) }, source:slot, error:null });
+  await runtime.replace([file('cost','settings.usage.panel'), file('counts','settings.usage.panel'),
+    file('reader','tool.result','fs.read'), file('shell','tool.result','bash')]);
+  assert.equal(runtime.getSnapshot().length, 4);
+  assert.ok(runtime.getSnapshot().every(item => item.status === 'active'));
+});
+
+test('image attachments reach the Provider as bound visual inputs without embedding bytes in the journal', async (t) => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:image-input';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  let request;
+  const actor = actorWith(journal, sessionId, { async *stream(value) {
+    request = value;
+    yield providerEvent(value.requestId, 'text.delta', {text:'Image received.'});
+    yield providerEvent(value.requestId, 'completed', {});
+  } }, emptyKernel(), fakeRunPreparation().port, 'image-input');
+  t.after(() => actor.dispose());
+  const command = messageCommand(sessionId, 'command:image', 'Describe the attached picture.');
+  command.filesystemReferences = [{ referenceId:'reference:image', workspaceId:workspaceBinding.workspaceId,
+    logicalPath:'picture.png',displayName:'picture.png',kind:'file',mediaType:'image/png',byteLength:100 }];
+  await actor.submit(command);
+  const projection = await waitForProjection(actor, value => value.run?.status === 'completed');
+  assert.deepEqual(request.messages.find(item => item.role === 'user').images,
+    [{workspaceId:workspaceBinding.workspaceId,logicalPath:'picture.png',mediaType:'image/png'}]);
+  assert.deepEqual(projection.messages[0].filesystemReferences, command.filesystemReferences);
+});
+
+
+test('reader identities separate current files, roots and each recorded diff', async (t) => {
+  const { readerTargetKey } = await loadGuiModule(t, '/src/components/local-agent/readerState.ts');
+  const current = { kind: 'workspace', workspaceId: 'workspace:project', logicalPath: 'same.cpp' };
+  assert.equal(readerTargetKey(current), readerTargetKey({kind: 'resource', resource: {workspaceId: current.workspaceId, logicalPath: current.logicalPath}, name: 'same.cpp'}));
+  const round = (recordId) => ({ kind: 'diff', file: { path: 'same.cpp', changes: [{ recordId, index: 0 }] } });
+  assert.notEqual(readerTargetKey(current), readerTargetKey({ ...current, workspaceId: 'workspace:session' }));
+  assert.notEqual(readerTargetKey(current), readerTargetKey(round('record:one')));
+  assert.notEqual(readerTargetKey(round('record:one')), readerTargetKey(round('record:two')));
+  assert.equal(readerTargetKey(round('record:one')), readerTargetKey(round('record:one')));
+});
+
+test('resource notifications use explicit references and preserve stream failures', async (t) => {
+  const { watchResources } = await loadGuiModule(t, '/src/services/conversationResources.ts');
+  const reference = { fileGrant: { authorityId: 'grant:selected', access: 'read', index: 0 }, logicalPath: '' };
+  installGuiFetch(t, (url, init) => {
+    assert.equal(url.pathname, '/api/conversation/sessions/session%3Afiles/resources/watch');
+    assert.deepEqual(JSON.parse(init.body), { resources: [reference] });
+    return new Response('event: ready\ndata: {}\n\nevent: change\ndata: {"indices":[0]}\n\nevent: error\ndata: {"message":"watch failed"}\n\n', { headers: { 'Content-Type': 'text/event-stream' } });
+  });
+  const changes = [];
+  await assert.rejects(watchResources('session:files', [reference], new AbortController().signal, indices => changes.push(indices)), /watch failed/);
+  assert.deepEqual(changes, [[0], [0]]);
+});
+
+test('tool groups and nested details keep manual disclosure across output and settlement', async t => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const [{ ToolActivityGroup, ProviderHostedDraftGroup }, { ConversationVirtualRow }] = await loadGuiModules(t, [
+    '/src/components/local-agent/ToolActivityDetails.tsx', '/src/components/local-agent/ConversationVirtualRow.tsx',
+  ]);
+  const layout = {state:new Map()};
+  const activities = ['A','B','C'].map((id,index) => ({activityId:id,runId:'run:manual',callId:id,sequence:index+1,
+    kind:'tool',status:'active',label:id,startedAt:String(Date.now()),
+    liveOutput:{stdout:`${id} output`,stderr:'',stdoutBytes:8,stderrBytes:0,truncated:false},
+    tool:{operation:'process',resources:[]}}));
+  const render = (hosted = false) => renderToStaticMarkup(createElement(ConversationVirtualRow, {
+    rowKey:'manual-tools', eager:true, virtualizer:{layout:()=>layout}, children:()=>hosted
+      ? createElement(ProviderHostedDraftGroup, {blocks:activities.slice(0,2).map(a=>({kind:'providerHosted',
+        providerCallId:a.callId,providerToolType:'web_search',status:a.status,action:{query:a.label}})),language:'en-US',onExpand(){}})
+      : createElement(ToolActivityGroup,{activities,language:'en-US',onExpand(){},onOpenWorkspaceResource(){}}),
+  }));
+  assert.equal(render().includes('tool-entry-heading'),false);
+  layout.state.set('tool-group:expanded',true);
+  assert.equal((render().match(/tool-entry-heading/g)||[]).length,3);
+  assert.equal(render().includes('<pre>'),false);
+  layout.state.set('tool:C:expanded',true);
+  assert.match(render(), /C output/);
+  assert.equal(render().includes('A output'),false);
+  activities[2].liveOutput.stdout = 'C second output';
+  assert.match(render(), /C second output/);
+  activities[2].status = 'failed';
+  delete activities[2].liveOutput;
+  activities[2].tool.error = {code:'exit_nonzero',message:'original failure'};
+  assert.match(render(), /original failure/);
+  assert.equal(layout.state.get('tool-group:expanded'),true);
+  assert.equal(layout.state.get('tool:C:expanded'),true);
+  layout.state.set('tool-group:expanded',false);
+  assert.equal(render().includes('original failure'),false);
+  assert.equal(render(true).includes('tool-entry-heading'),false);
+  layout.state.set('hosted-group:expanded',true);
+  assert.equal((render(true).match(/tool-entry-heading/g)||[]).length,2);
+});
+
+test('settled managed processes render stored output without live output', async t => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const [{ ToolActivityGroup }, { ConversationVirtualRow }] = await loadGuiModules(t, [
+    '/src/components/local-agent/ToolActivityDetails.tsx', '/src/components/local-agent/ConversationVirtualRow.tsx',
+  ]);
+  const layout = { state: new Map([['tool:managed:expanded', true]]) };
+  const activity = {
+    activityId: 'managed', runId: 'run:managed', callId: 'call:managed', sequence: 1,
+    kind: 'tool', status: 'completed', label: 'bash', startedAt: '1',
+    tool: { operation: 'bash', resources: [], process: {
+      jobId: 'job:managed', command: 'make build',
+      output: { stdout: 'Build finished', stderr: 'Build warning', stdoutBytes: 14, stderrBytes: 13, truncated: false },
+      result: { exitCode: 0, durationMs: 100, timedOut: false },
+    } },
+  };
+  const html = renderToStaticMarkup(createElement(ConversationVirtualRow, {
+    rowKey: 'managed-output', eager: true, virtualizer: { layout: () => layout },
+    children: () => createElement(ToolActivityGroup, {
+      activities: [activity], language: 'en-US', onExpand() {}, onOpenWorkspaceResource() {},
+    }),
+  }));
+  assert.match(html, /Build finished/);
+  assert.match(html, /Build warning/);
+  assert.doesNotMatch(html, /No output yet/);
 });

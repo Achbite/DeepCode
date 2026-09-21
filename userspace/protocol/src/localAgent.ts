@@ -1,16 +1,19 @@
+import type { UserSettings } from './userSettings.js';
+import type { ShellAuthorizationScope } from './permissions.js';
 import type { LlmReasoningEffort, LlmThinkingMode } from './llm.js';
 
 export const LOCAL_AGENT_PROTOCOL_VERSION = 'deepcode.local-agent' as const;
 export const CONVERSATION_COMMAND_VERSION = 'deepcode.command.v3' as const;
 export const COMMAND_REPLY_VERSION = 'deepcode.command-reply.v3' as const;
-export const SESSION_EVENT_VERSION = 'deepcode.session-event.v4' as const;
-export const SESSION_PROJECTION_VERSION = 'deepcode.session-projection.v5' as const;
+export const SESSION_EVENT_VERSION = 'deepcode.session-event.v5' as const;
+export const SESSION_PROJECTION_VERSION = 'deepcode.session-projection.v6' as const;
 export const PROVIDER_EVENT_VERSION = 'deepcode.provider-event' as const;
 export const KERNEL_REQUEST_VERSION = 'deepcode.kernel-request' as const;
 export const KERNEL_REPLY_VERSION = 'deepcode.kernel-reply' as const;
 export const SESSION_CONTROL_INTERACTION_REQUEST = 'interaction.request' as const;
 export const SESSION_CONTROL_PLAN_PUBLISH = 'plan.publish' as const;
-export const SESSION_CONTROL_PLAN_PROGRESS = 'plan.progress' as const;
+export const SESSION_CONTROL_TODO_UPDATE = 'todo.update' as const;
+export const SESSION_CONTROL_PLUGIN_ACTIVATE = 'plugin.activate' as const;
 
 export type JsonObject = Record<string, unknown>;
 
@@ -39,7 +42,7 @@ export interface ProviderAttemptFact {
   providerRequestId: string;
   providerAttemptId: string;
   attempt: number;
-  purpose: 'agent' | 'contextCompaction';
+  purpose: 'agent' | 'contextCompaction' | 'approvalReview';
   phase: 'started' | 'completed' | 'failed' | 'retryWaiting';
   error?: LocalAgentError;
   retryAt?: string;
@@ -134,7 +137,7 @@ export interface PluginCatalogItem {
   source: 'builtin' | 'mounted';
   category: 'functional' | 'reference';
   management?: {key: 'plugins.disabled' | 'plugins.sources' | 'mcp.servers' | 'skills.mounts'; id: string; path?: string};
-  contributionKind: 'skill' | 'mcp' | 'cli';
+  contributionKind: 'skill' | 'mcp' | 'cli' | 'host';
   discovery: 'default' | 'searchOnly';
   reference?: {toolName:'skill.read'|'doc.read';name:string};
   uri: PluginUri;
@@ -199,12 +202,10 @@ export type PlanOperation =
   | {
       workspaceId: string;
       operation: 'bash' | 'powershell';
-      /** Representative project entrypoint, for review; authorization uses the declared scope. */
+      /** Representative project entrypoint, for review; Kernel applies configured Shell permissions. */
       command?: string;
-      workspaceMode: 'write';
-      executionScope: 'workspace' | 'host';
-      /** Required for workspace execution. Source paths and build output directories. */
-      writablePaths?: Array<{ path: string; kind: 'file' | 'directory' }>;
+      /** Source paths and output directories this operation may modify. */
+      writablePaths: Array<{ path: string; kind: 'file' | 'directory' }>;
       terminal?: { stdin: string };
     };
 
@@ -234,6 +235,8 @@ export type PlanResponse =
 export type MessageFeedback = 'up' | 'down';
 
 export type ConversationCommand =
+  | { schemaVersion: typeof CONVERSATION_COMMAND_VERSION; type: 'session.permissions.set'; commandId: string; sessionId: string; patches: UserSettings }
+  | { schemaVersion: typeof CONVERSATION_COMMAND_VERSION; type: 'approval.revoke'; commandId: string; sessionId: string; runId: string; authorityId: string }
   | {
       schemaVersion: typeof CONVERSATION_COMMAND_VERSION;
       type: 'session.model-settings.set';
@@ -327,7 +330,7 @@ export type ConversationCommand =
       callId: string;
       approvalId: string;
       decision: 'allow' | 'deny';
-      authorizationScope?: 'runHostShell';
+      authorizationScope?: ShellAuthorizationScope;
     }
   | {
       schemaVersion: typeof CONVERSATION_COMMAND_VERSION;
@@ -376,6 +379,7 @@ export type ProviderOutputBlock = {
       kind: 'toolCallRejected';
       callId: string;
       providerCallId: string;
+      /** Canonical name, or the original wire name when the tool is undeclared. */
       toolName: string;
       error: LocalAgentError & { issues: ToolInputIssue[] };
     }
@@ -391,6 +395,7 @@ export type ProviderOutputBlock = {
 export interface ProviderToolCallInput {
   callId: string;
   providerCallId: string;
+  /** Canonical name, or the original wire name for provider_tool_alias_unknown. */
   toolName: string;
   arguments: string;
   error?: LocalAgentError & { issues: ToolInputIssue[] };
@@ -398,7 +403,7 @@ export interface ProviderToolCallInput {
 
 export type ProviderTurnSettlement = {
   providerRequestId: string;
-  purpose: 'agent' | 'contextCompaction';
+  purpose: 'agent' | 'contextCompaction' | 'approvalReview';
   providerRuntimeRef: string;
 } & (
   | {
@@ -548,12 +553,12 @@ export interface ContextCompositionPartitionProjection
   tokenSource?: 'sessionEstimated';
 }
 
-export type ProviderResponseConstraint = 'normal' | 'toolRequired' | 'answerOnly';
+export type ProviderResponseConstraint = 'normal' | 'answerOnly';
 
 export interface ContextCompositionReceipt {
   kernelCatalogSnapshotRef?: string;
   providerRequestId: string;
-  purpose: 'agent' | 'contextCompaction';
+  purpose: 'agent' | 'contextCompaction' | 'approvalReview';
   responseConstraint: ProviderResponseConstraint;
   dynamicInstructionBytes: number;
   messages: ContextCompositionMessage[];
@@ -564,7 +569,7 @@ export interface ContextCompositionReceipt {
 
 interface ContextCompositionProjectionBase {
   providerRequestId: string;
-  purpose: 'agent' | 'contextCompaction';
+  purpose: 'agent' | 'contextCompaction' | 'approvalReview';
   responseConstraint: ProviderResponseConstraint;
   runId: string;
   sequence: number;
@@ -580,26 +585,20 @@ export interface ContextCompositionProjection extends ContextCompositionProjecti
   partitions: ContextCompositionPartitionProjection[];
 }
 
-export type TodoStatus = 'pending' | 'inProgress' | 'completed';
+export type TodoStatus = 'pending' | 'inProgress' | 'completed' | 'blocked';
 
+/** Agent-reported progress, independent of execution evidence and permission approval. */
 export interface TodoItem {
-  todoId: string;
-  sourceStepId: string;
-  label: string;
+  text: string;
   status: TodoStatus;
 }
 
 export interface TodoListProjection {
-  sourcePlanId: string;
-  sourcePlanRevision: number;
+  runId: string;
+  revision: number;
   items: TodoItem[];
   sequence: number;
   updatedAt: string;
-}
-
-export interface TodoProgressUpdate {
-  todoId: string;
-  status: TodoStatus;
 }
 
 export type ContextCompactionTrigger = 'pressure' | 'userFocus';
@@ -621,17 +620,33 @@ export interface ContextCompactedPayload {
   summary: string;
 }
 
+export interface ShellAuthorizationProjection {
+  authorityId: string;
+  runId: string;
+  scope: ShellAuthorizationScope;
+  summary: string;
+  context: JsonObject;
+}
+
 export interface EffectPreview {
+  approvalReviewer?: 'user' | 'agent';
+  authorizationScopes?: ShellAuthorizationScope[];
+  fileAccess?: { read: string[]; write: string[] };
+  review?: { decision: 'allow' | 'deny' | 'ask'; reason: string };
+
   summary: string;
   effects: EffectKind[];
   logicalTargets: string[];
   /** An explicit browser grant applies to subsequent page operations in this Session. */
-  authorizationScope?: 'sessionBrowser' | 'runHostShell';
+  authorizationScope?: 'sessionBrowser' | ShellAuthorizationScope;
   /** Kernel-owned binding for a reusable Host Shell grant. */
   authorizationContext?: JsonObject;
 }
 
 export type SessionEvent =
+  | (SessionEventBase & { type: 'session.permissions.updated'; payload: { commandId: string; patches: UserSettings } })
+  | (SessionEventBase & { type: 'approval.revoked'; runId: string; payload: { commandId: string; authorityId: string } })
+  | (SessionEventBase & { type: 'approval.reviewed'; runId: string; callId: string; payload: { approvalId: string; providerRequestId: string; decision: 'allow' | 'deny' | 'ask'; reason: string } })
   | (SessionEventBase & { type: 'provider.attempt.updated'; runId: string; payload: ProviderAttemptFact })
   | (SessionEventBase & { type: 'run.failure.recorded'; runId: string; payload: RunFailureSnapshot })
   | (SessionEventBase & {
@@ -761,6 +776,7 @@ export type SessionEvent =
         revision: number;
         commandId: string;
         decisionId: string;
+        source?: 'user' | 'agent';
         authorities: PlanAuthority[];
       };
     })
@@ -787,34 +803,18 @@ export type SessionEvent =
       payload: { planId: string; revision: number; commandId: string };
     })
   | (SessionEventBase & {
-      type: 'plan.completed';
-      runId: string;
-      payload: { planId: string; revision: number };
-    })
-  | (SessionEventBase & {
       type: 'plan.invalidated';
       runId: string;
       payload: { planId: string; revision: number; reason: string; sourceFactRef: string };
     })
   | (SessionEventBase & {
-      type: 'todo.seeded' | 'todo.reconciled';
-      runId: string;
-      payload: {
-        sourcePlanId: string;
-        sourcePlanRevision: number;
-        items: TodoItem[];
-      };
-    })
-  | (SessionEventBase & {
-      type: 'todo.progressed';
+      type: 'todo.updated';
       runId: string;
       callId?: string;
       payload: {
         providerCallId?: string;
-        sourcePlanId: string;
-        sourcePlanRevision: number;
-        sourceFactRef: string;
-        updates: TodoProgressUpdate[];
+        revision: number;
+        items: TodoItem[];
       };
     })
   | (SessionEventBase & {
@@ -849,7 +849,9 @@ export type SessionEvent =
         commandId: string;
         decision: 'allow' | 'deny';
         authorityId: string;
-        authorizationScope?: 'runHostShell';
+        source?: 'user' | 'agent';
+        reason?: string;
+        authorizationScope?: ShellAuthorizationScope;
       };
     })
   | (SessionEventBase & {
@@ -866,10 +868,22 @@ export type SessionEvent =
       payload: { attemptId: string; error: LocalAgentError };
     })
   | (SessionEventBase & {
+      type: 'process.updated';
+      runId: string;
+      callId: string;
+      payload: { job: ManagedProcessSnapshot };
+    })
+  | (SessionEventBase & {
       type: 'tool.completed';
       runId: string;
       callId: string;
       payload: { record: ToolExecutionRecord };
+    })
+  | (SessionEventBase & {
+      type: 'session.plugins.activated';
+      runId: string;
+      callId: string;
+      payload: { providerCallId: string; pluginUris: string[] };
     })
   | (SessionEventBase & {
       type: 'session.control.rejected';
@@ -1072,7 +1086,7 @@ export interface PlanPreviewProjection {
 }
 
 export interface ProviderActivityProjection {
-  purpose: 'agent' | 'contextCompaction';
+  purpose: 'agent' | 'contextCompaction' | 'approvalReview';
   phase: 'waitingResponse' | 'reasoning' | 'awaitingOutput' | 'generatingOutput';
   startedAt: string;
   lastContentAt?: string;
@@ -1084,13 +1098,13 @@ export type PlanProjectionStatus =
   | 'confirmed'
   | 'superseded'
   | 'cancelled'
-  | 'completed'
   | 'invalidated';
 
 export interface PlanProjection extends ExecutionPlan {
   runId: string;
   callId: string;
   status: PlanProjectionStatus;
+  confirmationSource?: 'user' | 'agent';
   decisionId?: string;
   sequence: number;
   createdAt: string;
@@ -1177,9 +1191,12 @@ export interface ActivityResourceProjection {
 export interface ToolActivityProjection {
   recordId?: string;
   error?: LocalAgentError;
+  /** Detail decoding failed; the execution status and original record are unchanged. */
+  projectionError?: LocalAgentError;
   operation: string;
   resources: ActivityResourceProjection[];
   shell?: ShellActivityProjection;
+  process?: ProcessActivityProjection;
   fileChanges?: FileChangeProjection[];
 }
 
@@ -1224,7 +1241,8 @@ export interface ShellExecutionEnvironmentProjection {
   terminal: boolean;
   /** Diagnostic recorded by the producer, preserved verbatim when reading history. */
   pathSource: string;
-  writeScope: 'kernelTemporaryOnly' | 'workspaceAndKernelTemporary' | 'hostUser';
+  /** Recorded diagnostic, not an authorization for a later invocation. */
+  writeScope: string;
   homeWritable: boolean;
   networkAccess: boolean;
 }
@@ -1270,6 +1288,9 @@ export interface QueuedInputProjection {
 }
 
 export interface SessionProjection {
+  permissionOverrides: UserSettings;
+  effectivePermissions: UserSettings | null;
+  shellAuthorizations: ShellAuthorizationProjection[];
   providerAttempts?: Array<ProviderAttemptFact & { runId: string; updatedAt: string }>;
   failureSnapshot?: RunFailureSnapshot;
   modelSettings: SessionModelSettings | null;
@@ -1338,6 +1359,9 @@ export interface ConversationReadResult {
 export interface ModelMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  /** Immutable user attachments; the Host resolves bytes only at the Provider transport boundary. */
+  toolImages?: readonly string[];
+  images?: readonly { workspaceId: string; logicalPath: string; mediaType: string }[];
   reasoningContent?: string;
   reasoningSignature?: string;
   toolCallId?: string;
@@ -1391,7 +1415,7 @@ export interface ProviderRequest {
   runId: string;
   providerRuntimeRef: string;
   profileId: string;
-  purpose: 'agent' | 'contextCompaction';
+  purpose: 'agent' | 'contextCompaction' | 'approvalReview';
   responseConstraint: ProviderResponseConstraint;
   maxOutputTokens: number;
   workspaceBindings: readonly WorkspaceBindingDisplay[];
@@ -1527,6 +1551,7 @@ export interface ProviderToolAlias {
 }
 
 export interface RunRuntimeSnapshot {
+  permissions: UserSettings;
   environment: JsonObject;
   runRuntimeSnapshotRef: string;
   extensionGenerationRef: string;
@@ -1657,7 +1682,7 @@ export type WorkspaceAuthorityDecision =
     };
 
 export type NonWorkspaceAuthorityDecision =
-  | { decision: 'allow'; source: 'user' | 'userSetting'; authorityId: string; authorizationScope?: 'sessionBrowser' | 'runHostShell' }
+  | { decision: 'allow'; source: 'user' | 'agent' | 'userSetting'; authorityId: string; authorizationScope?: 'sessionBrowser' | ShellAuthorizationScope }
   | { decision: 'deny'; source: 'user'; authorityId: string }
   | { decision: 'deny'; source: 'kernel' | 'userSetting'; reason: string };
 
@@ -1694,7 +1719,7 @@ export type ToolExecutionRecord =
   | (ToolExecutionRecordBase & { outcome: 'denied'; error?: LocalAgentError })
   | (ToolExecutionRecordBase & { outcome: 'failed'; output?: unknown; error: LocalAgentError })
   | (ToolExecutionRecordBase & { outcome: 'cancelled' })
-  | (ToolExecutionRecordBase & { outcome: 'indeterminate'; error: LocalAgentError });
+  | (ToolExecutionRecordBase & { outcome: 'indeterminate'; output?: unknown; error: LocalAgentError });
 
 export interface ToolInputIssue {
   path: string;
@@ -1759,7 +1784,42 @@ export type ToolExecutionProgress =
   | { type: 'started'; startedAt: string }
   | { type: 'output'; stream: 'stdout' | 'stderr'; offset: number; bytes: number[] };
 
+/** Current-run execution facts published by Kernel, independent of the start receipt. */
+export interface ManagedProcessSnapshot {
+  jobId: string;
+  sessionId: string;
+  runId: string;
+  callId: string;
+  revision: number;
+  toolName: 'bash' | 'powershell' | 'container';
+  command: string;
+  targets: string[];
+  status: 'active' | 'completed' | 'failed' | 'cancelled';
+  startedAt: string;
+  lastOutputAt?: string;
+  completedAt?: string;
+  output: ToolOutputProjection;
+  result?: unknown;
+  error?: LocalAgentError;
+}
+
+export interface ProcessActivityProjection {
+  jobId: string;
+  command: string;
+  output: ToolOutputProjection;
+  result?: { exitCode: number | null; durationMs: number; timedOut: boolean };
+}
+
+export interface ProcessReadRequest {
+  sessionId: string;
+  runId: string;
+  revisions?: Record<string, number>;
+  waitMs?: number;
+  cancel?: boolean;
+}
+
 export interface KernelPort {
+  readProcesses(request: ProcessReadRequest, signal?: AbortSignal): Promise<ManagedProcessSnapshot[]>;
   execute(request: ToolExecutionRequest, onProgress?: (progress: ToolExecutionProgress) => Promise<void>): Promise<ToolExecutionReply>;
   cancel(callId: string, attemptId: string): Promise<ToolCancelReply>;
   readRecord(callId: string): Promise<ToolExecutionRecord | null>;

@@ -6,13 +6,6 @@
   gap: 12px;
   overflow: auto;
   padding: 12px 10px 10px;
-
-  scrollbar-width: none;
-}
-
-.deepcode-gui-left-rail::-webkit-scrollbar,
-.deepcode-gui-context-rail::-webkit-scrollbar {
-  display: none;
 }
 
 .deepcode-gui-sidebar-action,
@@ -85,9 +78,8 @@
 }
 
 .deepcode-gui-session-entry--active {
-  background: var(--dc-surface-raised);
+  background: var(--dc-surface-hover);
   color: var(--dc-foreground-strong);
-  box-shadow: var(--dc-shadow-small);
 }
 
 .deepcode-gui-sidebar-empty {
@@ -113,7 +105,6 @@
   padding: 16px 12px;
   border-left: 1px solid var(--dc-border);
   background: var(--dc-background);
-  scrollbar-width: none;
 }
 
 .deepcode-gui-context-card {
@@ -284,32 +275,13 @@
 .deepcode-local-agent-settings {
   position:relative;width:100%;height:100%;min-height:0;overflow:hidden;background:var(--dc-surface);
 }
-.deepcode-local-agent-settings .settings-body { padding-top: 56px; }
-.deepcode-local-agent-settings__drag-region {
-  position: absolute;
-  inset: 0 0 auto;
-  height: 40px;
-  -webkit-app-region: drag;
-  app-region: drag;
-}
-.deepcode-local-agent-settings__window-controls { position:absolute;right:8px;top:9px;z-index:2; }
-.deepcode-local-agent-settings:has(.window-controls) .deepcode-local-agent-settings__close { right:120px; }
-
 .deepcode-local-agent-settings__close {
-  position: absolute;
-  top: 9px;
-  right: 12px;
-  z-index: 2;
-  min-height: 29px;
-  padding: 0 10px;
-  border: 1px solid var(--dc-border);
-  border-radius: var(--dc-radius-control);
-  background: var(--dc-surface-raised);
-  color: var(--dc-muted);
-  cursor: pointer;
-  -webkit-app-region: no-drag;
-  app-region: no-drag;
+  min-height: 29px; padding: 0 10px; border: 1px solid var(--dc-border); border-radius: var(--dc-radius-control);
+  background: var(--dc-control-background); color: var(--dc-control-foreground); cursor: pointer;
+  display: inline-flex; align-items: center; gap: 8px; -webkit-app-region: no-drag; app-region: no-drag;
 }
+.deepcode-local-agent-settings__close:hover { background: var(--dc-surface-hover); }
+.deepcode-local-agent-settings__close kbd { font: 10px var(--dc-font-ui); color: #858d96; border: 1px solid #e1e5e9; border-radius: 4px; padding: 0 3px; }
 
 .deepcode-gui-sidebar-actions,
 .deepcode-gui-session-list,
@@ -673,11 +645,6 @@
   padding: 14px 12px;
   border-left: 0;
   background: var(--dc-surface);
-  scrollbar-width: none;
-}
-
-.deepcode-gui-context-panel::-webkit-scrollbar {
-  display: none;
 }
 
 .deepcode-gui-task-list-card {
@@ -701,12 +668,6 @@
   font-weight: var(--dc-weight-semibold);
 }
 
-.deepcode-gui-task-list-card__title small {
-  color: var(--dc-faint);
-  font-size: var(--dc-font-micro);
-  font-weight: var(--dc-weight-regular);
-}
-
 .deepcode-gui-task-list-card__empty {
   min-height: 64px;
   display: grid;
@@ -714,6 +675,13 @@
   color: var(--dc-faint);
   font-size: var(--dc-font-caption);
   text-align: center;
+}
+
+.deepcode-gui-task-list-card__note {
+  display: block;
+  margin-top: 10px;
+  color: var(--dc-muted);
+  font-size: var(--dc-font-caption);
 }
 
 .deepcode-gui-task-list {
@@ -747,7 +715,8 @@
   box-shadow: 0 0 0 4px var(--dc-accent-soft);
 }
 
-.deepcode-gui-task-item--waiting .deepcode-gui-task-item__dot {
+.deepcode-gui-task-item--waiting .deepcode-gui-task-item__dot,
+.deepcode-gui-task-item--blocked .deepcode-gui-task-item__dot {
   background: var(--dc-warning);
 }
 
@@ -787,6 +756,31 @@
   display: grid;
   gap: 3px;
   padding: 9px 0;
+}
+
+.deepcode-gui-output-list {
+  min-width: 0;
+  max-height: min(320px, 40vh);
+  overflow-y: auto;
+}
+
+.deepcode-gui-output-more {
+  display: block;
+  margin-top: 6px;
+  padding: 6px 4px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dc-muted);
+  font: inherit;
+  font-size: var(--dc-font-caption);
+  text-align: left;
+  cursor: pointer;
+}
+
+.deepcode-gui-output-more:hover {
+  background: var(--dc-surface-hover);
+  color: var(--dc-foreground);
 }
 
 .deepcode-gui-output-item:last-child {
@@ -948,9 +942,13 @@
 }
 
 .deepcode-gui-text-dialog footer button[type='submit'] {
-  border-color: var(--dc-accent-border);
-  background: var(--dc-accent);
-  color: var(--dc-accent-contrast);
+  border-color: var(--dc-border-strong);
+  background: transparent;
+  color: var(--dc-foreground);
+}
+
+.deepcode-gui-text-dialog :is(header, footer) button:hover:not(:disabled) {
+  background: var(--dc-surface-hover);
 }
 
 .deepcode-gui-text-dialog__message,
@@ -999,15 +997,20 @@
 }
 
 .deepcode-gui-workspace-manager {
-  width: min(620px, calc(100vw - 40px));
+  width: min(680px, calc(100vw - 48px));
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
 }
 
 .deepcode-gui-workspace-manager__list {
   display: grid;
-  gap: 6px;
+  gap: 0;
   max-height: min(360px, 50vh);
   overflow: auto;
-  padding: 0 14px 14px;
+  margin: 0 14px;
+  padding: 0;
+  border: 1px solid var(--dc-border);
+  border-radius: 12px;
 }
 
 .deepcode-gui-workspace-manager__row {
@@ -1016,14 +1019,15 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 10px;
-  border: 1px solid var(--dc-border);
-  border-radius: 10px;
+  padding: 14px;
+  border: 0;
+  border-bottom: 1px solid var(--dc-border);
   background: var(--dc-surface);
 }
 
 .deepcode-gui-workspace-manager__row > span {
   display: grid;
+  flex: 1;
   min-width: 0;
   gap: 3px;
 }
@@ -1637,3 +1641,12 @@
 @media (pointer: coarse) {
   .deepcode-session-model__menu button { min-height: 44px; }
 }
+
+.deepcode-gui-workspace-manager .settings-group { margin: 20px 0; }
+.deepcode-gui-workspace-manager .settings-card { border: 0; background: transparent; box-shadow: none; }
+
+.deepcode-gui-workspace-manager__heading { margin: 18px 14px 10px; font-size: var(--dc-font-body); }
+.deepcode-gui-workspace-manager__row > svg { flex: none; color: var(--dc-muted); }
+.deepcode-gui-workspace-manager__add { display: flex; align-items: center; gap: 10px; width: 100%; padding: 14px; border: 0; border-radius: 0; background: var(--dc-surface-subtle); color: var(--dc-foreground); text-align: left; cursor: pointer; }
+.deepcode-gui-workspace-manager__add:hover { background: var(--dc-surface-hover); }
+.deepcode-gui-workspace-manager .settings-group > h3 { margin-inline: 14px; }

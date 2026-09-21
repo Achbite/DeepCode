@@ -4,7 +4,7 @@ import { HostStartupDiagnostic } from '../components/shared/HostStartupDiagnosti
 import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
 import useAppStatusStore from '../state/appStatusStore';
 import { useSettingsStore } from '../state/settingsStore';
-import { useWorkspaceStore } from '../state/workspaceStore';
+import { initializeHostWorkspace } from '../services/workspaceInitialization';
 import { useLocalAgentStore } from '../state/localAgentStore';
 import { normalizeUiLanguage, setActiveUiLanguage, t, type UiLanguage } from '../i18n';
 import {
@@ -50,6 +50,7 @@ const HOST_STARTUP_MESSAGE_KEYS: Readonly<Record<string, string>> = {
   host_startup_ready: 'deepcodeGui.hostStartup.ready',
   host_startup_port_in_use: 'deepcodeGui.hostStartup.portInUse',
   host_startup_lock_unavailable: 'deepcodeGui.hostStartup.lockUnavailable',
+  host_startup_lock_failed: 'deepcodeGui.hostStartup.lockFailed',
   host_startup_resolving_binaries: 'deepcodeGui.hostStartup.resolvingBinaries',
   host_startup_executable_directory_unavailable:
     'deepcodeGui.hostStartup.executableDirectoryUnavailable',
@@ -113,7 +114,6 @@ const DeepCodeGuiApp: React.FC = () => {
     setServerVersion,
     setErrorMessage,
   } = useAppStatusStore();
-  const loadWorkspace = useWorkspaceStore((s) => s.loadCurrent);
   const loadUserSettings = useSettingsStore((s) => s.loadUserSettings);
   const effectiveSettings = useSettingsStore((s) => s.effectiveSettings);
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
@@ -124,6 +124,7 @@ const DeepCodeGuiApp: React.FC = () => {
   const [kernelStartBusy, setKernelStartBusy] = useState(false);
   const [hostStartup, setHostStartup] = useState<HostStartupStatusV1 | null>(null);
   const [kernelStartMessage, setKernelStartMessage] = useState<string | null>(null);
+  const [workspaceInitializationError, setWorkspaceInitializationError] = useState<string | null>(null);
   const recordRuntimeReady = useCallback((attemptId: string | null) => {
     if (attemptId) {
       setConnectedIncarnation(`host:${attemptId}`);
@@ -193,10 +194,15 @@ const DeepCodeGuiApp: React.FC = () => {
       || loadedIncarnationRef.current === connectedIncarnation
     ) return;
     loadedIncarnationRef.current = connectedIncarnation;
-    void loadWorkspace();
+    setWorkspaceInitializationError(null);
+    void initializeHostWorkspace().catch((error: unknown) => {
+      if (loadedIncarnationRef.current === connectedIncarnation) {
+        setWorkspaceInitializationError(error instanceof Error ? error.message : String(error));
+      }
+    });
     void loadUserSettings();
     void useLocalAgentStore.getState().initialize();
-  }, [apiStatus, connectedIncarnation, loadUserSettings, loadWorkspace]);
+  }, [apiStatus, connectedIncarnation, loadUserSettings]);
 
 
   useEffect(() => {
@@ -287,7 +293,7 @@ const DeepCodeGuiApp: React.FC = () => {
   }, []);
 
   return (<>
-    <HostStartupDiagnostic status={apiStatus === 'connected' ? null : hostStartup} language={language} busy={kernelStartBusy} onRetry={() => void retryKernelStart()} />
+    <HostStartupDiagnostic status={apiStatus === 'connected' ? null : hostStartup} workspaceError={workspaceInitializationError} language={language} busy={kernelStartBusy} onRetry={() => void retryKernelStart()} />
     <ConversationDisplayProvider><Suspense fallback={<BootFallback language={language} />}>
       <DeepCodeWorkbenchLayout
         apiStatus={apiStatus}

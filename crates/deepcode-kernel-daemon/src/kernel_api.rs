@@ -10,6 +10,7 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
     let session_ready = state.session_service.is_ready();
     ApiResponse::ok(json!({
         "service": "deepcode-kernel-daemon",
+        "version": env!("CARGO_PKG_VERSION"),
         "ok": session_ready,
         "status": if session_ready { "ok" } else { "degraded" },
         "kernel": "ready",
@@ -34,7 +35,7 @@ fn read_packaged_build_commit() -> Option<String> {
     packaged_build_info()
         .and_then(|value| {
             value
-                .get("buildCommit")
+                .get("sourceCommit")
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })
@@ -45,12 +46,9 @@ fn packaged_build_info() -> Option<Value> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(PathBuf::from))?;
-    [
-        exe_dir.join("build-info.json"),
-        exe_dir.join("..").join("build-info.json"),
-    ]
-    .into_iter()
-    .find_map(|path| read_best_effort_json_file(&path))
+    read_best_effort_json_file(
+        &deepcode_host_connection::runtime_root(&exe_dir).join("BUILDINFO.json"),
+    )
 }
 
 pub(crate) async fn api_route_not_found(

@@ -16,17 +16,44 @@ impl SessionReadPort for SessionServiceProcess {
 
 pub(crate) struct ProductTools {
     reader: Arc<dyn SessionReadPort>,
+    plugin_settings: Value,
     pub(crate) document_python: Option<std::path::PathBuf>,
     pub(crate) browser_binding: Option<Value>,
+    pub(crate) computer_use_instance: Option<String>,
+    pub(crate) container_instance: Option<String>,
+    pub(crate) process_instance: Option<String>,
 }
 
 impl ProductTools {
     pub(crate) fn new(reader: Arc<dyn SessionReadPort>) -> Self {
         Self {
             reader,
+            plugin_settings: json!({}),
             document_python: None,
             browser_binding: None,
+            computer_use_instance: None,
+            container_instance: None,
+            process_instance: None,
         }
+    }
+
+    pub(crate) fn with_plugin_settings(mut self, settings: Value) -> Self {
+        self.plugin_settings = settings;
+        self
+    }
+
+    pub(crate) fn with_computer_use(mut self, instance: Option<String>) -> Self {
+        self.computer_use_instance = instance;
+        self
+    }
+    pub(crate) fn with_processes(mut self, instance: Option<String>) -> Self {
+        self.process_instance = instance;
+        self
+    }
+
+    pub(crate) fn with_containers(mut self, instance: Option<String>) -> Self {
+        self.container_instance = instance;
+        self
     }
 
     pub(crate) fn with_browser_binding(mut self, binding: Option<Value>) -> Self {
@@ -51,12 +78,26 @@ impl ProductTools {
             "session.read" => self.reader.read(input),
             "skill.read" => read_skill(input),
             "doc.read" => read_doc(input),
+            "plugin.search" => {
+                let query = input["query"].as_str().unwrap_or("");
+                let limit = input["limit"].as_u64().unwrap_or(20) as usize;
+                crate::local_agent_plugins::search_plugins(&self.plugin_settings, query, limit)
+                    .map_err(|message| {
+                        SessionServiceError::new("plugin_catalog_unavailable", message)
+                    })
+            }
             _ => Err(SessionServiceError::new("tool_not_found", name)),
         }
     }
 
     pub(crate) fn definitions() -> Vec<(&'static str, String, Value)> {
         vec![
+            ("plugin.search", "Discover installed plugins when a task needs unlisted tools. Omit query to list, or use short capability keywords such as browser. Discovery does not load tools. Activate enabled, available results with the Session plugin activation tool; user mentions are optional. Disabled/unavailable results retain their diagnostic status.".into(), json!({
+                "type":"object", "additionalProperties":false, "properties":{
+                    "query":{"type":"string","maxLength":240},
+                    "limit":{"type":"integer","minimum":1,"maximum":50}
+                }
+            })),
             ("session.read", "Read persisted DeepCode conversation facts without resuming the session. Query directly; no prior Skill read is required. Start with summary; use messages, tools, plans or context for details. before is an exclusive event-sequence cursor; nextBefore continues older items. Excerpts report truncation. A session ID is required.".into(), json!({
                 "type":"object", "additionalProperties":false, "required":["sessionId"],
                 "properties": {
@@ -241,6 +282,18 @@ pub(crate) fn test_product_tools() -> Arc<ProductTools> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn plugin_search_discovers_capabilities_without_loading_tools() {
+        let tools = test_product_tools();
+        let found = tools
+            .call("plugin.search", json!({"query":"browser"}))
+            .unwrap();
+        assert!(found["plugins"].as_array().unwrap().iter().any(|plugin| {
+            plugin["uri"] == "plugin://computer-use@builtin" && plugin["enabled"] == true
+        }));
+        assert!(tools.computer_use_instance.is_none());
+    }
+
     #[test]
     fn product_docs_and_skills_are_distinct_read_only_resources() {
         let tools = test_product_tools();

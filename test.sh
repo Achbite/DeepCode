@@ -85,6 +85,10 @@ case "$profile" in
     printf '[test] CLI 与 daemon 正式入口\n'
     cargo build -p deepcode-first-party-tools -p deepcode-kernel-daemon -p deepcode-cli
     python3 -I -S ./scripts/tests/tool-input-cli-e2e.py
+    python3 -I -S ./scripts/tests/permission-delegation-cli.py
+    python3 -I -S ./scripts/tests/file-access-cli.py
+    python3 -I -S ./scripts/tests/managed-process-cli.py
+    python3 -I -S ./scripts/tests/conversation-storage.py
     ;;
   full)
     run_required
@@ -93,6 +97,10 @@ case "$profile" in
     pnpm --filter @deepcode/client build:web
     printf '[test] 本地 Agent 真实链路与共享投影壳\n'
     python3 -I -S ./scripts/tests/tool-input-cli-e2e.py
+    python3 -I -S ./scripts/tests/permission-delegation-cli.py
+    python3 -I -S ./scripts/tests/file-access-cli.py
+    python3 -I -S ./scripts/tests/managed-process-cli.py
+    python3 -I -S ./scripts/tests/conversation-storage.py
     python3 -I -S ./scripts/tests/local-agent-e2e.py
     python3 -I -S ./scripts/tests/document-render-e2e.py
     ;;

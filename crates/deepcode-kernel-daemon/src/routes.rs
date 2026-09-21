@@ -33,6 +33,19 @@ pub(crate) fn build_app(state: AppState) -> Router {
         )
         .route("/api/llm/probe", post(llm_probe))
         .route(
+            "/api/llm/connections",
+            get(model_connections::get).patch(model_connections::patch),
+        )
+        .route("/api/llm/usage", post(model_usage::query))
+        .route("/api/llm/prices", get(model_usage::catalog))
+        .route("/api/llm/auth", post(model_auth::start))
+        .route(
+            "/api/llm/auth/:id",
+            get(model_auth::read).delete(model_auth::cancel),
+        )
+        .route("/api/llm/connections/:id/logout", post(model_auth::logout))
+        .route("/api/llm/connections/:id/quota", get(model_auth::quota))
+        .route(
             "/api/local-agent/journal/sessions",
             post(local_agent_session_create),
         )
@@ -67,6 +80,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/api/local-agent/runtime/release-run",
             post(local_agent_run_runtime_release),
+        )
+        .route(
+            "/api/local-agent/kernel/processes",
+            post(local_agent_processes),
         )
         .route(
             "/api/local-agent/kernel/execute",
@@ -150,6 +167,18 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/api/conversation/sessions/:session_id/changes/read",
             post(conversation_change_read),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/resources/roots",
+            get(conversation_resource_roots),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/resources/list",
+            post(conversation_resource_list),
+        )
+        .route(
+            "/api/conversation/sessions/:session_id/resources/watch",
+            post(conversation_resources_watch),
         )
         .route(
             "/api/conversation/sessions/:session_id/resources/read",

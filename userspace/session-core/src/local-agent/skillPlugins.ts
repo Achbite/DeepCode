@@ -1,12 +1,12 @@
-import type { RunRuntimeSnapshot } from '@deepcode/protocol';
+import { permissionSettings, validatePermissionPatches } from '@deepcode/protocol';
+import type { UserSettings, RunRuntimeSnapshot } from '@deepcode/protocol';
 import type { SessionControlWireNames } from './sessionControls.js';
 
 export type InstructionContribution = RunRuntimeSnapshot['instructions'][number];
 
 export interface RunPluginConfig {
   extensionGenerationRef: string;
-  workspaceMutation: 'plan' | 'allow';
-  engineeringDecisions: 'ask' | 'delegate';
+  permissions: UserSettings;
   selectedPlugins: readonly {
     uri: string;
     displayName: string;
@@ -19,18 +19,16 @@ export function decodeRunPluginConfig(value: unknown): RunPluginConfig {
     !isRecord(value)
     || !hasExactKeys(value, [
       'extensionGenerationRef',
-      'workspaceMutation',
-      'engineeringDecisions',
+      'permissions',
       'selectedPlugins',
     ])
     || !isIdentifier(value.extensionGenerationRef)
-    || !['plan', 'allow'].includes(String(value.workspaceMutation))
-    || !['ask', 'delegate'].includes(String(value.engineeringDecisions))
     || !Array.isArray(value.selectedPlugins)
     || value.selectedPlugins.length > 16
   ) {
     throw new Error('run_plugin_config_invalid');
   }
+  validatePermissionPatches(value.permissions);
   const seen = new Set<string>();
   const selectedPlugins = value.selectedPlugins.map((item) => {
     if (
@@ -57,8 +55,7 @@ export function decodeRunPluginConfig(value: unknown): RunPluginConfig {
   });
   return {
     extensionGenerationRef: value.extensionGenerationRef,
-    workspaceMutation: value.workspaceMutation as 'plan' | 'allow',
-    engineeringDecisions: value.engineeringDecisions as 'ask' | 'delegate',
+    permissions: permissionSettings(value.permissions),
     selectedPlugins,
   };
 }
@@ -69,24 +66,19 @@ export function runtimeInstructions(
   controlNames: SessionControlWireNames = {
     interactionRequest: 'interaction_request',
     planPublish: 'plan_publish',
-    planProgress: 'plan_progress',
+    todoUpdate: 'todo_update',
+    pluginActivate: 'plugin_activate',
   },
 ): readonly InstructionContribution[] {
-  const workspaceAutonomyInstruction = config.workspaceMutation === 'allow'
-    ? `Workspace mutations do not require a Plan. Use ${controlNames.interactionRequest} only for a required user decision.`
-    : `Before workspace mutation, call ${controlNames.planPublish} and wait for confirmation. Then execute within its file and execution scope. Routine command or edit details do not require reconfirmation. Use ${controlNames.interactionRequest} only for a required decision. Read-only workspace tools do not require a Plan.`;
-  const engineeringDecisionInstruction = config.engineeringDecisions === 'delegate'
-    ? 'Choose the smallest sound engineering approach supported by workspace evidence.'
-    : 'Ask the user before materially changing requirements, public contracts, fact ownership, or the engineering approach.';
   const instructions: InstructionContribution[] = [
     ...stableCore.map((instruction) => ({ ...instruction })),
     {
       id: 'deepcode.workspace-autonomy',
-      text: `${workspaceAutonomyInstruction}\n${engineeringDecisionInstruction}`,
+      text: permissionInstructionText(config.permissions, controlNames.interactionRequest, controlNames.planPublish),
     },
     ...config.selectedPlugins.map((plugin) => ({
       id: `plugin.${instructionId(plugin.uri)}`,
-      text: `The \`${plugin.displayName}\` plugin is activated for this request by structured user input.
+      text: `The \`${plugin.displayName}\` plugin is loaded for this request. User mentions and Agent-requested activation are independent ways to select capabilities.
 
 Available capabilities:
 ${plugin.capabilitySummary}
@@ -124,4 +116,14 @@ function isIdentifier(value: unknown): value is string {
     && Boolean(value)
     && value.trim() === value
     && /^[A-Za-z0-9][A-Za-z0-9_.:@/-]*$/u.test(value);
+}
+
+export function permissionInstructionText(settings: UserSettings, interactionRequest = 'interaction_request', planPublish = 'plan_publish'): string {
+  const workspaceAutonomyInstruction = settings['agent.permissions.workspaceMutation'] === 'allow'
+    ? 'Plan decisions are delegated to you. Publish a Plan when useful; it is confirmed automatically. Execution permissions still apply.'
+    : `Before mutating project files, call ${planPublish} and wait for confirmation of the declared scope. Project reads need no Plan.`;
+  const engineeringDecisionInstruction = settings['agent.permissions.engineeringDecisions'] === 'delegate'
+    ? `Engineering decisions are delegated. Choose the smallest sound approach; use ${interactionRequest} for missing facts or decisions outside the task.`
+    : `Use ${interactionRequest} before materially changing requirements, public contracts, fact ownership, or the engineering approach.`;
+  return `${workspaceAutonomyInstruction}\nSession working directories hold editable drafts and previews; changes there need no Plan.\n${engineeringDecisionInstruction}`;
 }

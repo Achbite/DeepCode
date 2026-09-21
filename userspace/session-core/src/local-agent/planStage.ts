@@ -1,11 +1,12 @@
+import { todoUpdateFact } from './todoState.js';
 import type {
-  ExecutionPlan, NewSessionEvent, PlanProjection, RunSettlement, SessionEvent, SessionProjection,
+  NewSessionEvent, PlanAuthority, SessionProjection,
 } from '@deepcode/protocol';
-import { SESSION_CONTROL_PLAN_PROGRESS, SESSION_CONTROL_PLAN_PUBLISH } from '@deepcode/protocol';
+import { SESSION_CONTROL_PLAN_PUBLISH } from '@deepcode/protocol';
 import { canonicalJsonValue } from './providerToolCodec.js';
 import { LoopFailure } from './loopFailure.js';
 import type { SessionState } from './reducer.js';
-import type { PlanPublicationDraft, PlanScopeExtension, SessionControlCall } from './sessionControls.js';
+import type { PlanPublicationDraft, PlanScopeExtension } from './sessionControls.js';
 
 /** Plan lifecycle is derived from the Session journal, never a second loop or store. */
 export function publishPlan(
@@ -18,7 +19,7 @@ export function publishPlan(
   nextId: (kind: string) => string,
 ): NewSessionEvent {
   const latest = state.plans.findLast((plan) => plan.runId === runId);
-  const previous = latest && ['confirmed', 'completed', 'revisionRequested'].includes(latest.status)
+  const previous = latest && ['confirmed', 'revisionRequested'].includes(latest.status)
     ? latest : undefined;
   const planId = previous?.planId ?? nextId('plan');
   if (!planId || planId === callId || planId === providerCallId || callId === providerCallId) {
@@ -76,137 +77,59 @@ export function publishPlan(
   };
 }
 
-export function todoItemsForPlan(
-  plan: PlanProjection,
-  previous: SessionProjection['todoList'],
-  previousPlan: ExecutionPlan | undefined,
+export function confirmationFacts(state: SessionState, plan: NonNullable<SessionProjection['pendingPlan']>,
+  commandId: string, source: 'user' | 'agent', nextId: (kind: string) => string): NewSessionEvent[] {
+  const decisionId = nextId('plan-decision');
+  const previous = planToSupersede(state, plan.planId, plan.revision);
+  const events: NewSessionEvent[] = [];
+  if (previous) events.push({ type: 'plan.superseded', sessionId: state.sessionId, runId: plan.runId,
+    payload: { ...previous, supersededByPlanId: plan.planId, supersededByRevision: plan.revision } });
+  events.push({ type: 'plan.confirmed', sessionId: state.sessionId, runId: plan.runId, callId: plan.callId,
+    payload: { planId: plan.planId, revision: plan.revision, commandId, source, decisionId,
+      authorities: planAuthoritiesForConfirmation(plan, state.sessionId, decisionId, nextId) } });
+  if (state.todoList?.runId !== plan.runId) events.push(todoUpdateFact(state.sessionId, plan.runId, state.todoList,
+    plan.steps.map(step => ({ text: step.title, status: 'pending' }))));
+  return events;
+}
+
+export function planAuthoritiesForConfirmation(
+  plan: NonNullable<SessionProjection['pendingPlan']>,
+  sessionId: string,
+  decisionId: string,
   nextId: (kind: string) => string,
-): NonNullable<SessionProjection['todoList']>['items'] {
-  const previousByStep = new Map(previous?.sourcePlanId === plan.planId
-    ? previous.items.map((item) => [item.sourceStepId, item] as const) : []);
-  return plan.steps.map((step) => {
-    const existing = previousByStep.get(step.stepId);
-    const priorStep = previousPlan?.steps.find((candidate) => candidate.stepId === step.stepId);
-    const unchanged = priorStep && JSON.stringify(canonicalJsonValue(priorStep)) === JSON.stringify(canonicalJsonValue(step));
-    return {
-      todoId: existing?.todoId ?? nextId('todo'), sourceStepId: step.stepId, label: step.title,
-      status: existing && unchanged ? existing.status : 'pending',
-    };
-  });
+): PlanAuthority[] {
+  const workspaceIds = [...new Set(plan.mutationManifest.map((operation) => operation.workspaceId))];
+  return workspaceIds.map((workspaceId) => ({
+    authorityId: nextId('plan-authority'),
+    planId: plan.planId,
+    revision: plan.revision,
+    decisionId,
+    sessionId,
+    runId: plan.runId,
+    workspaceId,
+    coveredOperations: plan.mutationManifest
+      .filter((operation) => operation.workspaceId === workspaceId)
+      .map((operation) => ({ ...operation })),
+  }));
 }
 
-export function planProgressFact(
-  snapshot: { state: SessionState; events: readonly SessionEvent[] },
-  runId: string,
-  turn: Extract<SessionControlCall, { kind: 'planProgress' }> & { providerCallId: string },
-): NewSessionEvent {
-  const { state, events } = snapshot;
-  const active = state.activePlanRef;
-  const todo = state.todoList;
-  const plan = state.plans.find((candidate) => candidate.planId === active?.planId && candidate.revision === active.revision);
-  const reject = (code: string, reason: string): NewSessionEvent => ({
-    type: 'session.control.rejected', sessionId: state.sessionId, runId, callId: turn.callId,
-    payload: {
-      providerCallId: turn.providerCallId, toolName: SESSION_CONTROL_PLAN_PROGRESS,
-      input: { sourceFactRef: turn.sourceFactRef, updates: turn.updates },
-      error: { code, message: reason },
-    },
-  });
-  if (!plan || plan.runId !== runId || plan.status !== 'confirmed' || !todo
-    || todo.sourcePlanId !== plan.planId || todo.sourcePlanRevision !== plan.revision) {
-    return reject('plan_progress_not_active', 'There is no confirmed active Plan in this run. Do not update previous Todo IDs. Provide a final explanation of the recorded results, or publish a Plan if new scope is required.');
-  }
-  const unknown = turn.updates.filter((update) => !todo.items.some((item) => item.todoId === update.todoId));
-  if (unknown.length > 0) {
-    const candidates = todo.items.map((item) => item.todoId);
-    const nearest = unknown.map((item) => ({
-      todoId: item.todoId, nearestTodoId: nearestTodoId(item.todoId, candidates),
-    }));
-    return reject(
-      'plan_progress_todo_unknown',
-      `Unknown Todo IDs: ${JSON.stringify(unknown.map((item) => item.todoId))}. No updates were applied. Nearest valid Todo IDs: ${JSON.stringify(nearest)}. Current Plan and Todo: ${JSON.stringify(todo)}.`,
-    );
-  }
-  const evidenceError = planProgressEvidence(events, runId, turn.sourceFactRef, turn.updates);
-  if (evidenceError) return reject(evidenceError.code, evidenceError.message);
-  return {
-    type: 'todo.progressed', sessionId: state.sessionId, runId, callId: turn.callId,
-    payload: {
-      providerCallId: turn.providerCallId, sourcePlanId: plan.planId, sourcePlanRevision: plan.revision,
-      sourceFactRef: turn.sourceFactRef, updates: turn.updates,
-    },
-  };
-}
-
-export function planProgressEvidence(
-  events: readonly SessionEvent[], runId: string, sourceFactRef: string,
-  updates: readonly { status: string }[],
-): { code: string; message: string } | null {
-  const evidence = events.find((event) => event.type === 'tool.completed' && event.runId === runId
-    && event.payload.record.recordId === sourceFactRef);
-  if (!evidence || evidence.type !== 'tool.completed') return {
-    code: 'plan_progress_evidence_missing',
-    message: `No tool result recordId ${sourceFactRef} exists in this run. Use a recordId already received before this turn; earlier investigation results are valid.`,
-  };
-  if (updates.some((update) => update.status === 'completed') && evidence.payload.record.outcome !== 'completed') return {
-    code: 'plan_progress_evidence_failed',
-    message: `Tool result ${sourceFactRef} has outcome ${evidence.payload.record.outcome}; it cannot support completed Todo. Preserve unfinished steps and explain the failure if execution cannot continue.`,
-  };
-  return null;
-}
-
-export function completedPlanAwaitingLifecycle(state: SessionState, runId: string): { planId: string; revision: number } | null {
-  const todo = state.todoList;
-  if (!todo) return null;
-  const plan = state.plans.find((candidate) => candidate.planId === todo.sourcePlanId && candidate.revision === todo.sourcePlanRevision);
-  return plan?.runId === runId && plan.status === 'confirmed' && todo.items.length > 0
-    && todo.items.every((item) => item.status === 'completed')
-    ? { planId: plan.planId, revision: plan.revision } : null;
-}
-
-/** Publishing a final explanation never marks pending Todo or failed work completed. */
-export function planFinalSettlement(state: SessionState, runId: string, finalMessageId: string): RunSettlement {
-  const todo = state.todoList;
-  const plan = todo && state.plans.find((candidate) => candidate.runId === runId
-    && candidate.planId === todo.sourcePlanId && candidate.revision === todo.sourcePlanRevision);
-  const unfinished = plan && todo ? todo.items.filter((item) => item.status !== 'completed') : [];
-  if (unfinished.length > 0) return {
-    outcome: 'failed', error: {
-      code: 'plan_incomplete',
-      message: `最终说明已输出；计划仍有 ${unfinished.length} 项未完成：${unfinished.map((item) => item.label).join('、')}。已执行的工具结果和任务状态保持原样。`,
-    },
-  };
-  return { outcome: 'completed', finalMessageId };
-}
-
-/**
- * Suggests the closest valid Todo ID for a mistyped one. The batch stays atomic,
- * but the rejecting message must let the model correct a single character.
- */
-function nearestTodoId(value: string, candidates: readonly string[]): string | null {
-  let best: string | null = null;
-  let bestDistance = Number.POSITIVE_INFINITY;
-  for (const candidate of candidates) {
-    const distance = editDistance(value, candidate);
-    if (distance < bestDistance) {
-      bestDistance = distance;
-      best = candidate;
-    }
-  }
-  return best;
-}
-
-function editDistance(left: string, right: string): number {
-  if (left === right) return 0;
-  let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
-  let current = new Array<number>(right.length + 1);
-  for (let i = 1; i <= left.length; i += 1) {
-    current[0] = i;
-    for (let j = 1; j <= right.length; j += 1) {
-      const substitution = previous[j - 1] + (left[i - 1] === right[j - 1] ? 0 : 1);
-      current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, substitution);
-    }
-    [previous, current] = [current, previous];
-  }
-  return previous[right.length];
+export function planToSupersede(
+  state: SessionState,
+  nextPlanId: string,
+  nextRevision: number,
+): { planId: string; revision: number } | null {
+  if (state.activePlanRef && (
+    state.activePlanRef.planId !== nextPlanId
+    || state.activePlanRef.revision !== nextRevision
+  )) return { ...state.activePlanRef };
+  const previousRevision = state.plans
+    .filter((candidate) => (
+      candidate.planId === nextPlanId
+      && candidate.revision < nextRevision
+      && (candidate.status === 'confirmed' || candidate.status === 'revisionRequested')
+    ))
+    .sort((left, right) => right.revision - left.revision)[0];
+  return previousRevision
+    ? { planId: previousRevision.planId, revision: previousRevision.revision }
+    : null;
 }

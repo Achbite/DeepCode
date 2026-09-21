@@ -3,7 +3,7 @@ import { Fragment, jsx, jsxs } from 'react/jsx-runtime';
 import { toJsxRuntime } from 'hast-util-to-jsx-runtime';
 import { CodeContent, ImageContent, MermaidContent } from './RichContent';
 import { MarkdownTable } from './MarkdownTable';
-import { StreamingMarkdownParser, type MarkdownBlock } from './streamingMarkdown';
+import { formatDecisionProse, StreamingMarkdownParser, type MarkdownBlock } from './streamingMarkdown';
 import { StreamingTextBuffer } from './streamingText';
 import type { ElementContent, Root, RootContent } from 'hast';
 import './richContent.css';
@@ -29,9 +29,9 @@ const RenderedBlock = memo(function RenderedBlock({ block }: { block: MarkdownBl
   return <StreamingContext.Provider value={block.streaming}>{toJsxRuntime(readableResourceLinks(block.tree), { Fragment, jsx, jsxs, components: COMPONENTS })}</StreamingContext.Provider>;
 });
 
-export const MarkdownContent = memo(function MarkdownContent({ children, streaming = false }: { children: string; streaming?: boolean }) {
+export const MarkdownContent = memo(function MarkdownContent({ children, streaming = false, decisionProse = false }: { children: string; streaming?: boolean; decisionProse?: boolean }) {
   const parser = useRef(new StreamingMarkdownParser());
-  const blocks = useMemo(() => parser.current.update(children, streaming), [children, streaming]);
+  const blocks = useMemo(() => parser.current.update(decisionProse ? formatDecisionProse(children) : children, streaming), [children, streaming, decisionProse]);
   return <div className="conversation-markdown">{blocks.map((block) => <RenderedBlock key={block.key} block={block} />)}</div>;
 });
 

@@ -3,6 +3,8 @@ use rusqlite::{params, Connection};
 
 const CATALOG_SCHEMA: &str = include_str!("../../../contracts/agent-runtime/catalog.sql");
 const CATALOG_VERSION: u32 = 2;
+const SESSION_WORKDIR_SCHEMA: &str =
+    include_str!("../../../contracts/agent-runtime/session-workdirs.sql");
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -16,8 +18,9 @@ pub(crate) struct ConversationWorkspaceRecord {
     pub(crate) workspace_id: String,
     pub(crate) display_name: String,
     pub(crate) canonical_root: String,
-    /// Present only for Host-owned message file snapshots.
+    /// Present for Host-owned input snapshots and session working directories.
     pub(crate) owner_session_id: Option<String>,
+    pub(crate) session_workdir: bool,
     pub(crate) created_at: String,
 }
 
@@ -80,6 +83,9 @@ impl ConversationCatalog {
                 ))
             }
         }
+        connection
+            .execute_batch(SESSION_WORKDIR_SCHEMA)
+            .map_err(|error| format!("创建会话工作目录目录表失败：{error}"))?;
         Self::read_all(&connection)
     }
 
@@ -111,6 +117,17 @@ impl ConversationCatalog {
                 params![workspace.workspace_id, workspace.display_name, workspace.canonical_root,
                     workspace.owner_session_id, workspace.created_at],
             ).map_err(|error| format!("Write workspace catalog: {error}"))?;
+            if workspace.session_workdir {
+                if workspace.owner_session_id.is_none() {
+                    return Err("Session working directory requires an owner Session".into());
+                }
+                transaction
+                    .execute(
+                        "INSERT INTO session_workdirs(workspace_id) VALUES (?1)",
+                        [&workspace.workspace_id],
+                    )
+                    .map_err(|error| format!("Write session working directory: {error}"))?;
+            }
         }
         if let Some(project) = &project {
             transaction.execute(
@@ -340,8 +357,10 @@ impl ConversationCatalog {
         {
             let mut statement = connection
                 .prepare(
-                    "SELECT workspace_id, display_name, canonical_root, owner_session_id, created_at
-                     FROM workspaces ORDER BY created_at, workspace_id",
+                    "SELECT w.workspace_id, w.display_name, w.canonical_root, w.owner_session_id, w.created_at,
+                            d.workspace_id IS NOT NULL
+                     FROM workspaces w LEFT JOIN session_workdirs d ON d.workspace_id=w.workspace_id
+                     ORDER BY w.created_at, w.workspace_id",
                 )
                 .map_err(|error| format!("读取 workspace catalog 失败：{error}"))?;
             let rows = statement
@@ -352,6 +371,7 @@ impl ConversationCatalog {
                         canonical_root: row.get(2)?,
                         owner_session_id: row.get(3)?,
                         created_at: row.get(4)?,
+                        session_workdir: row.get(5)?,
                     })
                 })
                 .map_err(|error| format!("读取 workspace catalog 失败：{error}"))?;
@@ -446,9 +466,16 @@ impl ConversationCatalog {
             .collect::<std::collections::HashSet<_>>();
         let mut workspace_ids = std::collections::HashSet::new();
         let mut canonical_roots = std::collections::HashSet::new();
+        let mut workdir_owners = std::collections::HashSet::new();
         for workspace in &self.workspaces {
             validate_record_id("workspaceId", &workspace.workspace_id)?;
             validate_title(&workspace.display_name)?;
+            if workspace.session_workdir
+                && (workspace.owner_session_id.is_none()
+                    || !workdir_owners.insert(workspace.owner_session_id.as_deref()))
+            {
+                return Err("Session working directory owner is missing or duplicated".into());
+            }
             if workspace
                 .owner_session_id
                 .as_deref()
@@ -666,6 +693,7 @@ mod tests {
             display_name: id.into(),
             canonical_root: root.to_string_lossy().into(),
             owner_session_id: owner.map(str::to_string),
+            session_workdir: false,
             created_at: "now".into(),
         }
     }

@@ -5,18 +5,25 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('package_runtime', ROOT / 'scripts/package-runtime.py')
 package = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package)
+bridge_spec = importlib.util.spec_from_file_location('macos_bridge', ROOT / 'scripts/macos-build-bridge.py')
+bridge = importlib.util.module_from_spec(bridge_spec)
+bridge_spec.loader.exec_module(bridge)
+installer_spec = importlib.util.spec_from_file_location('package_installers', ROOT / 'scripts/package-installers.py')
+installers = importlib.util.module_from_spec(installer_spec)
+installer_spec.loader.exec_module(installers)
 
 # These commands stand in for native compilers/host availability only. The real
 # build.sh owns target selection, shared preparation, error handling and cleanup.
@@ -116,6 +123,87 @@ class BuildTests(unittest.TestCase):
         self.assertTrue((transaction / 'shared/input.txt').is_file())
 
 
+class BridgeCleanupTests(unittest.TestCase):
+    def test_worker_publication_failure_releases_watcher(self):
+        with tempfile.TemporaryDirectory(prefix='deepcode-worker-') as directory:
+            root = Path(directory)
+            watcher = Mock()
+            watcher.poll.return_value = None
+            with patch.object(bridge, 'BRIDGE', root), \
+                    patch.object(bridge, 'WORKER', root / 'worker.json'), \
+                    patch.object(bridge.subprocess, 'Popen', return_value=watcher), \
+                    patch.object(bridge.signal, 'signal'), \
+                    patch.object(bridge, 'write_json', side_effect=OSError('worker publication failed')):
+                with self.assertRaisesRegex(OSError, 'worker publication failed'):
+                    bridge.serve('owned-container')
+            watcher.terminate.assert_called_once()
+            watcher.wait.assert_called_once()
+
+    @unittest.skipUnless(sys.platform == 'linux', 'owned orphan reaping fixture requires Linux')
+    def test_exited_leader_does_not_leave_descendant_holding_output(self):
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(previous), 0, 0, 0), 0)
+        self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0)
+        process = None
+        descendant = None
+        try:
+            process = subprocess.Popen([
+                sys.executable, '-c',
+                "import os,signal,time\n"
+                "pid=os.fork()\n"
+                "if pid:\n print(pid,flush=True);os._exit(7)\n"
+                "signal.signal(signal.SIGINT,signal.SIG_IGN)\n"
+                "print('ready',flush=True)\n"
+                "time.sleep(30)\n",
+            ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+            lines = [process.stdout.readline().strip() for _ in range(2)]
+            self.assertIn('ready', lines)
+            descendant = int(next(line for line in lines if line.isdigit()))
+            self.assertEqual(process.wait(timeout=3), 7)
+            bridge.stop_process(process)
+            output, _ = process.communicate(timeout=3)
+            self.assertEqual(output, '')
+            self.assertEqual(process.returncode, 7)
+            _, status = os.waitpid(descendant, 0)
+            descendant = None
+            self.assertEqual(os.waitstatus_to_exitcode(status), -signal.SIGKILL)
+            with self.assertRaises(ProcessLookupError):
+                os.killpg(process.pid, 0)
+            bridge.stop_process(process)  # Already gone is a valid completion race.
+        finally:
+            if process is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=3)
+                process.stdout.close()
+            if descendant is not None:
+                os.waitpid(descendant, 0)
+            self.assertEqual(libc.prctl(36, previous.value, 0, 0, 0), 0)
+
+    def test_cleanup_failure_retains_transaction_and_original_failure(self):
+        with tempfile.TemporaryDirectory(prefix='deepcode-bridge-') as directory:
+            root = Path(directory)
+            transaction = root / 'transaction'
+            transaction.mkdir()
+            marker = transaction / 'macos-request'
+            marker.write_text(root.name)
+            child = Mock(pid=42)
+            child.poll.return_value = 7
+            log = Mock()
+            with patch.object(bridge.os, 'killpg', side_effect=PermissionError('owned group permission denied')):
+                with self.assertRaisesRegex(PermissionError, 'owned group permission denied'):
+                    bridge.finish_process(root, {'transaction': str(transaction)}, child, log)
+            self.assertTrue(marker.exists())
+            result = json.loads((root / 'result.json').read_text())
+            self.assertEqual(result['exitCode'], 7)
+            self.assertIn('owned group permission denied', result['message'])
+            log.close.assert_called_once()
+
+
 class PublicationTests(unittest.TestCase):
     def setUp(self):
         scratch = tempfile.TemporaryDirectory(prefix='deepcode-publish-')
@@ -159,6 +247,28 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(files(self.destination), before)
         self.assertEqual(self.archive.read_bytes(), b'previous archive')
 
+    def test_installer_publication_failure_restores_program_archive_and_installer(self):
+        before = files(self.destination)
+        self.archive.write_bytes(b'previous archive')
+        output = self.root / 'DeepCode-setup.exe'
+        output.write_bytes(b'previous installer')
+        source = self.root / 'transaction/DeepCode-setup.exe'
+        write(self.root, 'transaction/DeepCode-setup.exe', b'current installer')
+        replace = Path.replace
+        def fail_installer(path, target):
+            if path == source:
+                raise OSError('installer destination busy')
+            return replace(path, target)
+        with patch.object(Path, 'replace', fail_installer):
+            with self.assertRaisesRegex(OSError, 'installer destination busy'):
+                package.publish(self.stage, self.destination, self.archive, source)
+        self.assertEqual(files(self.destination), before)
+        self.assertEqual(self.archive.read_bytes(), b'previous archive')
+        self.assertEqual(output.read_bytes(), b'previous installer')
+        package.publish(self.stage, self.destination, self.archive, source)
+        self.assertEqual(output.read_bytes(), b'current installer')
+        self.assertEqual((self.destination / 'runtime/session.sqlite3').read_bytes(), b'user history')
+
     @unittest.skipUnless(sys.platform == 'linux', 'mapped image fixture requires Linux')
     def test_mapped_windows_images_are_rejected_before_program_replacement(self):
         destination = self.root / 'win64'
@@ -180,6 +290,35 @@ class PublicationTests(unittest.TestCase):
             finally:
                 process.terminate()
                 process.wait(timeout=5)
+
+
+class InstallerTests(unittest.TestCase):
+    def test_macos_payload_installs_cli_against_the_same_app_resources(self):
+        with tempfile.TemporaryDirectory(prefix='deepcode-pkg-') as directory:
+            root = Path(directory)
+            stage = root / 'stage'
+            write(stage, 'DeepCode-GUI.app/Contents/MacOS/deepcode-cli', b'CLI')
+            write(stage, 'DeepCode-GUI.app/Contents/Resources/session-core/dist/index.js', b'Session')
+            def inspect(command, **kwargs):
+                payload = Path(command[command.index('--root') + 1])
+                self.assertEqual((payload / 'Applications/DeepCode-GUI.app/Contents/MacOS/deepcode-cli').read_bytes(), b'CLI')
+                launcher = (payload / 'usr/local/bin/deepcode').read_text()
+                self.assertIn('DEEPCODE_RUNTIME_DIR="$APP_DIR/Resources"', launcher)
+                self.assertNotIn('DEEPCODE_USER_ROOT=', launcher)
+                self.assertIn('exec "$APP_DIR/MacOS/deepcode-cli" "$@"', launcher)
+                self.assertFalse((payload / 'Users').exists())
+            with patch.object(installers.subprocess, 'run', side_effect=inspect):
+                installers.macos(stage, root / 'DeepCode.pkg', '0.6.2')
+
+    def test_windows_setup_compiles_from_current_runtime(self):
+        with tempfile.TemporaryDirectory(prefix='deepcode-nsis-') as directory:
+            root = Path(directory)
+            stage = root / 'stage'
+            write(stage, 'DeepCode-GUI.exe', b'disposable native compiler output')
+            write(stage, 'libexec/windows-environment.ps1', b'exit 0')
+            output = root / 'DeepCode-setup.exe'
+            installers.windows(stage, output, '0.6.2')
+            self.assertEqual(output.read_bytes()[:2], b'MZ')
 
 
 if __name__ == '__main__':

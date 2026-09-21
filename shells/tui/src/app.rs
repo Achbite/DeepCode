@@ -1,10 +1,9 @@
+use crate::i18n::Language;
 use crate::renderer::Renderer;
 use deepcode_kernel_client::{
-    approval_response_command, cancel_command, focus_command, interaction_response_command,
-    is_terminal_run_status, message_command_with_profile_and_plugins, plan_cancel_command,
-    plan_confirm_command, plan_revision_command, ConversationResourceReadResult,
-    CreateConversationSessionRequest, HttpKernelClient, InteractionProjection, PluginCatalogItem,
-    PluginCatalogProjection, PluginSelectionInput, SessionProjection,
+    cancel_command, is_terminal_run_status, plan_cancel_command, ConversationResourceReadResult,
+    CreateConversationSessionRequest, HttpKernelClient, PluginCatalogItem, PluginCatalogProjection,
+    PluginSelectionInput, SessionProjection,
 };
 use serde_json::json;
 use std::cell::Cell;
@@ -17,6 +16,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct TuiHostOptions {
+    pub language: Language,
     pub workspace_path: Option<PathBuf>,
     pub session_id: Option<String>,
     pub plugin_uris: Vec<String>,
@@ -45,6 +45,12 @@ pub struct PluginPickerEntry {
     pub already_selected: bool,
 }
 
+#[derive(Clone)]
+struct ModelPicker {
+    connection_id: Option<String>,
+    selected: usize,
+}
+
 pub struct TuiApp {
     client: HttpKernelClient,
     renderer: Renderer,
@@ -54,6 +60,9 @@ pub struct TuiApp {
     status: String,
     connection_error: Option<String>,
     next_message_profile_id: Option<String>,
+    model_connections: Option<deepcode_kernel_client::ModelConnections>,
+    model_profiles: Vec<deepcode_kernel_client::ModelProfile>,
+    model_picker: Option<ModelPicker>,
     plugin_catalog: Option<PluginCatalogProjection>,
     selected_plugins: Vec<PluginSelectionInput>,
     selected_mentions: Vec<SelectedMention>,
@@ -70,8 +79,9 @@ pub struct TuiApp {
 
 impl TuiApp {
     pub fn new(client: HttpKernelClient, renderer: Renderer, host: TuiHostOptions) -> Self {
+        let language = host.language;
         Self {
-            status: format!("API {} · 初始化", client.base_url()),
+            status: language.format("tui.initializingApi", &[format!("{}", client.base_url())]),
             connection_error: None,
             client,
             renderer,
@@ -79,6 +89,9 @@ impl TuiApp {
             projection: None,
             input: String::new(),
             next_message_profile_id: None,
+            model_connections: None,
+            model_profiles: Vec::new(),
+            model_picker: None,
             plugin_catalog: None,
             selected_plugins: Vec::new(),
             selected_mentions: Vec::new(),
@@ -102,7 +115,10 @@ impl TuiApp {
                 Some(path) => match path.canonicalize() {
                     Ok(root) => Some(vec![root.to_string_lossy().to_string()]),
                     Err(error) => {
-                        self.status = format!("工作区不可用：{error}");
+                        self.status = self
+                            .host
+                            .language
+                            .format("tui.workspaceUnavailable", &[format!("{}", error)]);
                         return Err(self.status.clone());
                     }
                 },
@@ -123,17 +139,27 @@ impl TuiApp {
                     .client
                     .conversation_plugin_catalog()
                     .await
-                    .map_err(|error| format!("插件目录加载失败：{error}"))?;
-                let selected_plugins =
-                    plugin_selections_from_uris(&catalog, &self.host.plugin_uris)?;
-                self.status = "就绪 · /help 查看命令".to_string();
+                    .map_err(|error| {
+                        self.host
+                            .language
+                            .format("tui.pluginCatalogLoadFailed", &[format!("{}", error)])
+                    })?;
+                let selected_plugins = plugin_selections_from_uris(
+                    self.host.language,
+                    &catalog,
+                    &self.host.plugin_uris,
+                )?;
+                self.status = self.host.language.text("tui.readyHelp").to_string();
                 self.projection = Some(projection);
                 self.plugin_catalog = Some(catalog);
                 self.selected_plugins = selected_plugins;
                 Ok(())
             }
             Err(error) => {
-                self.status = format!("Session 初始化失败：{error}");
+                self.status = self
+                    .host
+                    .language
+                    .format("tui.sessionInitializationFailed", &[format!("{}", error)]);
                 Err(self.status.clone())
             }
         }
@@ -152,7 +178,13 @@ impl TuiApp {
                 self.connection_error = None;
                 self.projection = Some(projection);
             }
-            Err(error) => self.connection_error = Some(format!("刷新共享投影失败：{error}")),
+            Err(error) => {
+                self.connection_error = Some(
+                    self.host
+                        .language
+                        .format("tui.projectionRefreshFailed", &[format!("{}", error)]),
+                )
+            }
         }
     }
 
@@ -169,7 +201,7 @@ impl TuiApp {
                 self.tasks_open = false;
                 self.resource_preview = None;
                 self.detail_scroll = 0;
-                self.detail_preview = Some("DeepCode 命令\n\n@ 选择下一次请求的插件\n/tasks 查看任务\n/context 查看上下文\n/focus <task> 开始任务\n/model <profile> 选择后续请求的模型\n/attach <path> 附加目录\n/detach <workspace-id> 移除目录索引\n/open <workspace-id> <logical-path> 读取文件\n/next 继续读取\n/diff <record-id> <index> 查看修改\n/reasoning 开关推理详情\n/reasoning <request-id> 按需读取推理\n/cancel 取消运行\n/cancel-plan 取消计划\n/close 返回会话\n/clear 清空输入\n/show 查看会话信息\n/error 失败诊断与快照\n/decision 当前决策详情\n/tool <activity-id> 工具详情\n/quit 退出\n\nPgUp / PgDn 滚动当前视图；普通消息随时排队；/reply <答复> 回应交互或修订计划，/reply 1 确认计划。".into());
+                self.detail_preview = Some(self.host.language.text("tui.commandHelp").into());
             }
             "/show" => self.status = self.projection_label(),
             "/error" | "/decision" => {
@@ -178,15 +210,14 @@ impl TuiApp {
                 self.resource_preview = None;
                 self.detail_scroll = 0;
                 self.detail_preview = Some(if input == "/error" {
-                    crate::renderer::failure_details(self.projection.as_ref())
+                    crate::renderer::failure_details(self.host.language, self.projection.as_ref())
                 } else {
-                    crate::renderer::decision_details(self.projection.as_ref())
+                    crate::renderer::decision_details(self.host.language, self.projection.as_ref())
                 });
             }
             "/clear" => {
                 self.clear_input();
-                self.status =
-                    "可见输入与下一次请求的插件选择已清理；durable Session 未修改".to_string();
+                self.status = self.host.language.text("tui.inputCleared").to_string();
             }
             "/context" => self.toggle_context(),
             "/tasks" => {
@@ -199,7 +230,12 @@ impl TuiApp {
             "/next" => self.next_resource().await,
             "/reasoning" => {
                 self.reasoning_enabled = !self.reasoning_enabled;
-                self.status = if self.reasoning_enabled { "推理详情已开启；使用 /reasoning <request-id> [offset] 展开，/reasoning-history 查阅历史。" } else { "推理详情已关闭，仅显示状态。" }.into();
+                self.status = if self.reasoning_enabled {
+                    self.host.language.text("tui.reasoningEnabled")
+                } else {
+                    self.host.language.text("tui.reasoningDisabled")
+                }
+                .into();
             }
             value if value.starts_with("/diff ") => self.read_detail(value, false).await,
             value if value.starts_with("/reasoning ") || value == "/reasoning-history" => {
@@ -210,7 +246,7 @@ impl TuiApp {
                 self.tasks_open = false;
                 self.resource_preview = None;
                 self.detail_preview = None;
-                self.status = "已关闭辅助视图。".to_string();
+                self.status = self.host.language.text("tui.viewClosed").to_string();
             }
             value if value.starts_with("/tool ") => {
                 self.context_open = false;
@@ -218,6 +254,7 @@ impl TuiApp {
                 self.resource_preview = None;
                 self.detail_scroll = 0;
                 self.detail_preview = Some(crate::renderer::tool_details(
+                    self.host.language,
                     self.projection.as_ref(),
                     value.trim_start_matches("/tool ").trim(),
                 ));
@@ -233,18 +270,31 @@ impl TuiApp {
                 self.detach_directory(value.trim_start_matches("/detach ").trim())
                     .await
             }
+            "/model" | "/connection" => {
+                self.open_model_picker().await;
+            }
             value if value.starts_with("/model ") => {
-                self.select_model(value.trim_start_matches("/model ").trim())
+                self.open_model_picker().await;
+                if self.model_picker.is_some() {
+                    self.select_model(value.trim_start_matches("/model ").trim());
+                }
             }
             value
                 if value == "/focus"
                     || value.starts_with("/focus ")
                     || value == "/reply"
-                    || value.starts_with("/reply ") =>
+                    || value.starts_with("/reply ")
+                    || value.starts_with("/permissions ")
+                    || value.starts_with("/revoke ") =>
             {
                 self.submit_contextual_input(value).await
             }
-            value if value.starts_with('/') => self.status = format!("未知命令：{value}"),
+            value if value.starts_with('/') => {
+                self.status = self
+                    .host
+                    .language
+                    .format("tui.unknownCommand", &[format!("{}", value)])
+            }
             value if value.starts_with('@') => self.select_plugin_from_plain_input(value).await,
             _ => self.submit_contextual_input(line).await,
         }
@@ -253,7 +303,11 @@ impl TuiApp {
 
     async fn submit_contextual_input(&mut self, text: &str) {
         let Some(projection) = self.projection.as_ref() else {
-            self.status = "Session 尚未初始化。".to_string();
+            self.status = self
+                .host
+                .language
+                .text("tui.sessionNotInitialized")
+                .to_string();
             return;
         };
         let session_id = projection.session_id.clone();
@@ -265,10 +319,16 @@ impl TuiApp {
             }
         };
         if self
-            .submit_command(&session_id, command, "消息提交失败")
+            .submit_command(
+                &session_id,
+                command,
+                self.host.language.text("tui.messageSubmitFailed"),
+            )
             .await
             && text != "/reply"
             && !text.starts_with("/reply ")
+            && !text.starts_with("/permissions ")
+            && !text.starts_with("/revoke ")
         {
             self.clear_plugin_selections();
         }
@@ -279,128 +339,242 @@ impl TuiApp {
         projection: &SessionProjection,
         text: &str,
     ) -> Result<serde_json::Value, String> {
-        let session_id = projection.session_id.clone();
-        let is_reply = text == "/reply" || text.starts_with("/reply ");
-        let command = if is_reply {
-            let response = text.strip_prefix("/reply").unwrap().trim();
-            if response.is_empty() {
-                return Err("用法：/reply <答复、确认或修订说明>".into());
-            }
-            if let Some(approval) = projection.pending_approval.as_ref() {
-                let decision = approval_decision_for_input(response)?;
-                if decision == "allow-run"
-                    && approval.preview.authorization_scope.as_deref() != Some("runHostShell")
-                {
-                    return Err("当前操作未提供本轮宿主 Shell 授权。".into());
-                }
-                approval_response_command(&session_id, &new_id("command"), approval, decision)
-            } else if let Some(plan) = projection.pending_plan.as_ref() {
-                if is_plan_confirmation_input(response) {
-                    plan_confirm_command(&session_id, &new_id("command"), plan)
-                } else {
-                    plan_revision_command(&session_id, &new_id("command"), plan, response)
-                }
-            } else if let Some(interaction) = projection.pending_interaction.as_ref() {
-                let response = interaction_response_for_input(interaction, response);
-                interaction_response_command(
-                    &session_id,
-                    &new_id("command"),
-                    interaction,
-                    &response,
-                )
-            } else {
-                return Err("当前没有等待答复的 Plan、交互或 effect 审批。".into());
-            }
-        } else {
-            let active_run = projection
-                .run
+        // TUI selections apply to the next message and remain selected during a reply.
+        let is_reply = text == "/reply"
+            || text.starts_with("/reply ")
+            || text.starts_with("/permissions ")
+            || text.starts_with("/revoke ");
+        crate::conversation_input::contextual_input_command(
+            self.host.language,
+            projection,
+            text,
+            &new_id("command"),
+            self.next_message_profile_id.as_deref(),
+            &[],
+            self.plugin_catalog
                 .as_ref()
-                .filter(|run| matches!(run.status.as_str(), "running" | "waiting"));
-            let profile_id = if active_run.is_some() {
-                None
+                .map_or("", |catalog| catalog.revision.as_str()),
+            if is_reply {
+                &[]
             } else {
-                self.next_message_profile_id.as_deref()
-            };
-            let catalog_revision = self
-                .plugin_catalog
-                .as_ref()
-                .map(|catalog| catalog.revision.as_str())
-                .unwrap_or("");
-            if let Some(task) = focus_task(text) {
-                let Some(task) = task else {
-                    return Err("/focus 需要非空任务正文。".to_string());
-                };
-                focus_command(
-                    &session_id,
-                    &new_id("command"),
-                    task,
-                    profile_id,
-                    &[],
-                    catalog_revision,
-                    &self.selected_plugins,
-                )
-            } else {
-                let mut command = message_command_with_profile_and_plugins(
-                    &session_id,
-                    &new_id("command"),
-                    text,
-                    profile_id,
-                    &[],
-                    catalog_revision,
-                    &self.selected_plugins,
-                );
-                if let Some(run) = active_run {
-                    command["runId"] = json!(run.run_id);
-                }
-                command
-            }
-        };
-        Ok(command)
+                &self.selected_plugins
+            },
+        )
     }
 
     pub async fn cancel_plan(&mut self) {
         let Some(projection) = self.projection.as_ref() else {
-            self.status = "Session 尚未初始化。".to_string();
+            self.status = self
+                .host
+                .language
+                .text("tui.sessionNotInitialized")
+                .to_string();
             return;
         };
         let Some(plan) = projection.pending_plan.as_ref() else {
             self.clear_input();
-            self.status = "当前没有待处理 Plan。".to_string();
+            self.status = self.host.language.text("tui.noPendingPlan").to_string();
             return;
         };
         let session_id = projection.session_id.clone();
         let command = plan_cancel_command(&session_id, &new_id("command"), plan);
         self.clear_input();
-        self.submit_command(&session_id, command, "取消 Plan 失败")
-            .await;
+        self.submit_command(
+            &session_id,
+            command,
+            self.host.language.text("tui.planCancelFailed"),
+        )
+        .await;
+    }
+
+    async fn open_model_picker(&mut self) {
+        match tokio::try_join!(
+            self.client.model_connections(),
+            self.client.model_profiles()
+        ) {
+            Ok((connections, profiles)) => {
+                self.model_connections = Some(connections);
+                self.model_profiles = profiles.profiles;
+                self.plugin_picker = None;
+                self.model_picker = Some(ModelPicker {
+                    connection_id: None,
+                    selected: 0,
+                });
+                self.status = self.host.language.text("tui.connectionPickerHint").into();
+            }
+            Err(error) => {
+                self.model_picker = None;
+                self.status = self
+                    .host
+                    .language
+                    .format("tui.modelCatalogFailed", &[format!("{}", error)]);
+            }
+        }
     }
 
     fn select_model(&mut self, profile_id: &str) {
-        if profile_id.is_empty() {
-            self.status = "用法：/model <profile>".to_string();
+        let Some(profile) = self
+            .model_profiles
+            .iter()
+            .find(|p| p.id == profile_id && p.parameters.enabled)
+        else {
+            self.status = self.host.language.text("tui.modelUnavailable").into();
             return;
+        };
+        let connection_name = self
+            .model_connections
+            .as_ref()
+            .and_then(|c| {
+                c.connections
+                    .iter()
+                    .find(|c| c.connection.id == profile.connection_id)
+            })
+            .map(|c| c.connection.name.as_str())
+            .unwrap_or(&profile.connection_id);
+        self.next_message_profile_id = Some(profile_id.into());
+        self.status = self.host.language.format(
+            "tui.nextModel",
+            &[
+                format!("{}", connection_name),
+                format!("{}", profile.parameters.name),
+            ],
+        );
+        self.model_picker = None;
+    }
+
+    pub fn model_picker_open(&self) -> bool {
+        self.model_picker.is_some()
+    }
+    pub fn model_picker_title(&self) -> &str {
+        if self
+            .model_picker
+            .as_ref()
+            .is_some_and(|p| p.connection_id.is_some())
+        {
+            self.host.language.text("tui.chooseModel")
+        } else {
+            self.host.language.text("tui.chooseConnection")
         }
-        self.next_message_profile_id = Some(profile_id.to_string());
-        self.status = format!("后续普通消息将提交模型 Profile {profile_id}；当前 run 不变。");
+    }
+    pub fn model_picker_entries(&self) -> Vec<(String, String, bool)> {
+        let Some(picker) = &self.model_picker else {
+            return vec![];
+        };
+        let entries: Vec<(String, String)> = if let Some(id) = &picker.connection_id {
+            self.model_profiles
+                .iter()
+                .filter(|p| &p.connection_id == id && p.parameters.enabled)
+                .map(|p| {
+                    (
+                        p.id.clone(),
+                        format!("{} · {}", p.parameters.name, p.parameters.model),
+                    )
+                })
+                .collect()
+        } else {
+            self.model_connections
+                .as_ref()
+                .map(|catalog| {
+                    catalog
+                        .connections
+                        .iter()
+                        .map(|c| {
+                            (
+                                c.connection.id.clone(),
+                                format!(
+                                    "{} · {} · {}",
+                                    c.connection.name,
+                                    if c.connection.billing_mode == "subscription" {
+                                        "Coding Plan"
+                                    } else {
+                                        "API"
+                                    },
+                                    match c.auth_status.as_str() {
+                                        "ready" => self.host.language.text("tui.available"),
+                                        "needsLogin" => self.host.language.text("tui.needsLogin"),
+                                        _ => self.host.language.text("tui.notConfigured"),
+                                    }
+                                ),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, (id, label))| (id, label, i == picker.selected))
+            .collect()
+    }
+    pub fn model_picker_move(&mut self, delta: isize) {
+        let count = self.model_picker_entries().len();
+        if let Some(picker) = &mut self.model_picker {
+            if count > 0 {
+                picker.selected =
+                    (picker.selected as isize + delta).rem_euclid(count as isize) as usize;
+            }
+        }
+    }
+    pub fn model_picker_select(&mut self) {
+        let Some(picker) = self.model_picker.clone() else {
+            return;
+        };
+        let Some((id, _, _)) = self.model_picker_entries().get(picker.selected).cloned() else {
+            return;
+        };
+        if picker.connection_id.is_none() {
+            self.model_picker = Some(ModelPicker {
+                connection_id: Some(id),
+                selected: 0,
+            });
+        } else {
+            self.select_model(&id);
+        }
+    }
+    pub fn model_picker_back(&mut self) {
+        if self
+            .model_picker
+            .as_ref()
+            .is_some_and(|p| p.connection_id.is_some())
+        {
+            self.model_picker = Some(ModelPicker {
+                connection_id: None,
+                selected: 0,
+            });
+        } else {
+            self.model_picker = None;
+        }
     }
 
     async fn cancel_run(&mut self) {
         let Some(projection) = self.projection.as_ref() else {
-            self.status = "Session 尚未初始化。".to_string();
+            self.status = self
+                .host
+                .language
+                .text("tui.sessionNotInitialized")
+                .to_string();
             return;
         };
         let Some(run) = projection.run.as_ref() else {
-            self.status = "当前没有运行。".to_string();
+            self.status = self.host.language.text("tui.noRun").to_string();
             return;
         };
         if is_terminal_run_status(&run.status) {
-            self.status = format!("run {} 已经结束。", run.run_id);
+            self.status = self
+                .host
+                .language
+                .format("tui.runEnded", &[format!("{}", run.run_id)]);
             return;
         }
         let session_id = projection.session_id.clone();
         let command = cancel_command(&session_id, &new_id("command"), &run.run_id);
-        self.submit_command(&session_id, command, "取消命令失败")
-            .await;
+        self.submit_command(
+            &session_id,
+            command,
+            self.host.language.text("tui.cancelFailed"),
+        )
+        .await;
     }
 
     async fn next_resource(&mut self) {
@@ -408,7 +582,7 @@ impl TuiApp {
             return;
         };
         let Some(next) = resource.next_byte else {
-            self.status = "资源已读到末尾。".into();
+            self.status = self.host.language.text("tui.resourceEnd").into();
             return;
         };
         let Some(projection) = &self.projection else {
@@ -425,7 +599,7 @@ impl TuiApp {
             .await
         {
             Ok(resource) => {
-                self.status = "已读取下一段；/next 续读。".into();
+                self.status = self.host.language.text("tui.resourceNext").into();
                 self.detail_scroll = 0;
                 self.resource_preview = Some(resource);
             }
@@ -435,7 +609,7 @@ impl TuiApp {
 
     async fn read_detail(&mut self, command: &str, reasoning: bool) {
         if reasoning && !self.reasoning_enabled {
-            self.status = "先输入 /reasoning 开启可选详情。".into();
+            self.status = self.host.language.text("tui.reasoningEnableFirst").into();
             return;
         }
         let Some(projection) = &self.projection else {
@@ -445,7 +619,7 @@ impl TuiApp {
         let result: Result<String, String> = if reasoning {
             let offset = words.get(2).map(|value| value.parse::<u64>()).transpose();
             match offset {
-                Err(_) => Err("推理 offset 必须为非负整数。".into()),
+                Err(_) => Err(self.host.language.text("tui.reasoningOffsetInvalid").into()),
                 Ok(offset) => {
                     let query = if let Some(request) = words.get(1) {
                         json!({ "view": "reasoning", "providerRequestId": request, "offset": offset.unwrap_or(0) })
@@ -470,10 +644,10 @@ impl TuiApp {
                     .await
                     .map(|change| change.unified_diff())
                     .map_err(|error| error.to_string()),
-                Err(_) => Err("Diff index 必须为非负整数。".into()),
+                Err(_) => Err(self.host.language.text("tui.diffIndexInvalid").into()),
             }
         } else {
-            Err("用法：/diff <record-id> <file-index>".into())
+            Err(self.host.language.text("tui.diffUsage").into())
         };
         match result {
             Ok(content) => {
@@ -481,7 +655,7 @@ impl TuiApp {
                 self.detail_preview = Some(content);
                 self.resource_preview = None;
                 self.context_open = false;
-                self.status = "按需详情 · /close 关闭".into();
+                self.status = self.host.language.text("tui.detailStatus").into();
             }
             Err(error) => self.status = error,
         }
@@ -491,7 +665,7 @@ impl TuiApp {
         let mut parts = command.splitn(3, ' ');
         let _ = parts.next();
         let Some(workspace_id) = parts.next().filter(|value| !value.is_empty()) else {
-            self.status = "用法：/open <workspace-id> <logical-path>".to_string();
+            self.status = self.host.language.text("tui.openUsage").to_string();
             return;
         };
         let Some(logical_path) = parts
@@ -499,7 +673,7 @@ impl TuiApp {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         else {
-            self.status = "用法：/open <workspace-id> <logical-path>".to_string();
+            self.status = self.host.language.text("tui.openUsage").to_string();
             return;
         };
         let Some(session_id) = self
@@ -507,7 +681,11 @@ impl TuiApp {
             .as_ref()
             .map(|projection| projection.session_id.clone())
         else {
-            self.status = "Session 尚未初始化。".to_string();
+            self.status = self
+                .host
+                .language
+                .text("tui.sessionNotInitialized")
+                .to_string();
             return;
         };
         match self
@@ -517,21 +695,29 @@ impl TuiApp {
         {
             Ok(resource) => {
                 self.context_open = false;
-                self.status = format!(
-                    "只读资源 {} · {} bytes",
-                    resource.logical_path, resource.size_bytes
+                self.status = self.host.language.format(
+                    "tui.readOnlyResource",
+                    &[
+                        format!("{}", resource.logical_path),
+                        format!("{}", resource.size_bytes),
+                    ],
                 );
                 self.detail_preview = None;
                 self.detail_scroll = 0;
                 self.resource_preview = Some(resource);
             }
-            Err(error) => self.status = format!("资源读取失败：{error}"),
+            Err(error) => {
+                self.status = self
+                    .host
+                    .language
+                    .format("tui.resourceReadFailed", &[format!("{}", error)])
+            }
         }
     }
 
     async fn attach_directory(&mut self, path: &str) {
         if path.is_empty() {
-            self.status = "用法：/attach <path>".to_string();
+            self.status = self.host.language.text("tui.attachUsage").to_string();
             return;
         }
         let Some(session_id) = self
@@ -539,7 +725,11 @@ impl TuiApp {
             .as_ref()
             .map(|projection| projection.session_id.clone())
         else {
-            self.status = "Session 尚未初始化。".to_string();
+            self.status = self
+                .host
+                .language
+                .text("tui.sessionNotInitialized")
+                .to_string();
             return;
         };
         match self
@@ -549,15 +739,20 @@ impl TuiApp {
         {
             Ok(projection) => {
                 self.projection = Some(projection);
-                self.status = "目录索引已附加；从下一次 run 起生效。".to_string();
+                self.status = self.host.language.text("tui.directoryAttached").to_string();
             }
-            Err(error) => self.status = format!("目录索引附加失败：{error}"),
+            Err(error) => {
+                self.status = self
+                    .host
+                    .language
+                    .format("tui.directoryAttachFailed", &[format!("{}", error)])
+            }
         }
     }
 
     async fn detach_directory(&mut self, workspace_id: &str) {
         if workspace_id.is_empty() {
-            self.status = "用法：/detach <workspace-id>".to_string();
+            self.status = self.host.language.text("tui.detachUsage").to_string();
             return;
         }
         let Some(session_id) = self
@@ -565,7 +760,11 @@ impl TuiApp {
             .as_ref()
             .map(|projection| projection.session_id.clone())
         else {
-            self.status = "Session 尚未初始化。".to_string();
+            self.status = self
+                .host
+                .language
+                .text("tui.sessionNotInitialized")
+                .to_string();
             return;
         };
         match self
@@ -575,9 +774,14 @@ impl TuiApp {
         {
             Ok(projection) => {
                 self.projection = Some(projection);
-                self.status = "目录索引已移除；运行中的 run 保留冻结快照。".to_string();
+                self.status = self.host.language.text("tui.directoryDetached").to_string();
             }
-            Err(error) => self.status = format!("目录索引移除失败：{error}"),
+            Err(error) => {
+                self.status = self
+                    .host
+                    .language
+                    .format("tui.directoryDetachFailed", &[format!("{}", error)])
+            }
         }
     }
 
@@ -597,7 +801,7 @@ impl TuiApp {
             .await
         {
             Ok(reply) if reply.status != "rejected" => {
-                self.status = format!("命令已接纳 · revision {}", reply.revision);
+                self.status = self.host.language.text("tui.commandAccepted").to_string();
                 self.poll().await;
                 true
             }
@@ -611,13 +815,17 @@ impl TuiApp {
                 });
                 self.status = error
                     .map(|error| format!("{}：{}", error.code, error.message))
-                    .unwrap_or_else(|| "命令被拒绝。".to_string());
+                    .unwrap_or_else(|| self.host.language.text("tui.commandRejected").to_string());
                 if refresh_plugins {
                     self.clear_plugin_selections();
                     if let Err(error) = self.refresh_plugin_catalog().await {
-                        self.status = format!("{}；插件目录刷新失败：{error}", self.status);
+                        self.status = self.host.language.format(
+                            "tui.pluginRefreshSecondary",
+                            &[format!("{}", self.status), format!("{}", error)],
+                        );
                     } else {
-                        self.status.push_str("；插件目录已刷新，请重新选择。");
+                        self.status
+                            .push_str(self.host.language.text("tui.pluginRefreshed"));
                     }
                 }
                 false
@@ -632,18 +840,19 @@ impl TuiApp {
     pub fn action_required(&self) -> Option<String> {
         self.projection.as_ref().and_then(|projection| {
             if projection.pending_plan.is_some() {
-                Some(
-                    "Agent 正在等待 /reply 1 确认 Plan、/reply <修订说明> 或 /cancel-plan。"
-                        .to_string(),
-                )
+                Some(self.host.language.text("tui.actionPlan").to_string())
             } else if projection.pending_interaction.is_some() {
-                Some("Agent 正在等待 /reply <答复> 回答中间问题。".to_string())
+                Some(self.host.language.text("tui.actionReply").to_string())
             } else if projection.pending_approval.is_some() {
-                Some("Agent 正在等待 /reply 1 允许或 /reply 2 拒绝 effect。".to_string())
+                Some(self.host.language.text("tui.actionApproval").to_string())
             } else {
                 None
             }
         })
+    }
+
+    pub fn language(&self) -> Language {
+        self.host.language
     }
 
     pub fn renderer(&self) -> &Renderer {
@@ -809,7 +1018,7 @@ impl TuiApp {
         else {
             return false;
         };
-        if let Some(error) = plugin_unavailable_reason(&plugin) {
+        if let Some(error) = plugin_unavailable_reason(self.host.language, &plugin) {
             self.status = error;
             return true;
         }
@@ -820,7 +1029,10 @@ impl TuiApp {
             .any(|selection| selection.uri == plugin.uri)
         {
             self.plugin_picker = None;
-            self.status = format!("插件已为下一次请求选择：{}", plugin.display_name);
+            self.status = self.host.language.format(
+                "tui.pluginAlreadySelected",
+                &[format!("{}", plugin.display_name)],
+            );
             return true;
         }
         let mention = format!("@{}", plugin.display_name);
@@ -839,27 +1051,32 @@ impl TuiApp {
             label: plugin.display_name.clone(),
         });
         self.plugin_picker = None;
-        self.status = format!("已为下一次请求选择插件：{}", plugin.display_name);
+        self.status = self
+            .host
+            .language
+            .format("tui.pluginSelected", &[format!("{}", plugin.display_name)]);
         true
     }
 
-    pub fn plugin_picker_entries(&self) -> Vec<PluginPickerEntry> {
+    pub fn plugin_picker_entries(&self, visible_count: usize) -> Vec<PluginPickerEntry> {
         let selected_index = self
             .plugin_picker
             .as_ref()
             .map(|picker| picker.selected_index)
             .unwrap_or(0);
+        let start = selected_index.saturating_sub(visible_count.saturating_sub(1));
         self.filtered_plugin_items()
             .into_iter()
-            .take(8)
             .enumerate()
+            .skip(start)
+            .take(visible_count)
             .map(|(index, plugin)| PluginPickerEntry {
                 already_selected: self
                     .selected_plugins
                     .iter()
                     .any(|selection| selection.uri == plugin.uri),
                 display_name: plugin.display_name.clone(),
-                short_description: plugin_unavailable_reason(plugin)
+                short_description: plugin_unavailable_reason(self.host.language, plugin)
                     .unwrap_or_else(|| plugin.short_description.clone()),
                 uri: plugin.uri.clone(),
                 highlighted: index == selected_index,
@@ -944,21 +1161,29 @@ impl TuiApp {
                                 .plugins
                                 .iter()
                                 .map(|plugin| {
-                                    plugin_unavailable_reason(plugin).unwrap_or_else(|| {
-                                        format!("{} ({})", plugin.display_name, plugin.uri)
-                                    })
+                                    plugin_unavailable_reason(self.host.language, plugin)
+                                        .unwrap_or_else(|| {
+                                            format!("{} ({})", plugin.display_name, plugin.uri)
+                                        })
                                 })
                                 .collect::<Vec<_>>()
                                 .join("；")
                         })
                         .unwrap_or_default();
                     self.status = if labels.is_empty() {
-                        "当前没有可用插件。".to_string()
+                        self.host.language.text("tui.noPlugins").to_string()
                     } else {
-                        format!("插件目录：{labels}")
+                        self.host
+                            .language
+                            .format("tui.pluginCatalog", &[format!("{}", labels)])
                     };
                 }
-                Err(error) => self.status = format!("插件目录刷新失败：{error}"),
+                Err(error) => {
+                    self.status = self
+                        .host
+                        .language
+                        .format("tui.pluginRefreshFailed", &[format!("{}", error)])
+                }
             }
             return;
         }
@@ -972,10 +1197,13 @@ impl TuiApp {
                 .cloned()
         });
         let Some(plugin) = plugin else {
-            self.status = format!("未选择插件：没有精确匹配 {query}；输入 @ 查看候选。");
+            self.status = self
+                .host
+                .language
+                .format("tui.pluginNoMatch", &[format!("{}", query)]);
             return;
         };
-        if let Some(error) = plugin_unavailable_reason(&plugin) {
+        if let Some(error) = plugin_unavailable_reason(self.host.language, &plugin) {
             self.status = error;
             return;
         }
@@ -984,7 +1212,10 @@ impl TuiApp {
             .iter()
             .any(|selection| selection.uri == plugin.uri)
         {
-            self.status = format!("插件已为下一次请求选择：{}", plugin.display_name);
+            self.status = self.host.language.format(
+                "tui.pluginAlreadySelected",
+                &[format!("{}", plugin.display_name)],
+            );
             return;
         }
         self.selected_plugins.push(PluginSelectionInput {
@@ -992,7 +1223,10 @@ impl TuiApp {
             uri: plugin.uri,
             label: plugin.display_name.clone(),
         });
-        self.status = format!("已为下一次请求选择插件：{}", plugin.display_name);
+        self.status = self
+            .host
+            .language
+            .format("tui.pluginSelected", &[format!("{}", plugin.display_name)]);
     }
 
     async fn refresh_plugin_catalog(&mut self) -> Result<(), String> {
@@ -1015,23 +1249,36 @@ impl TuiApp {
         self.projection
             .as_ref()
             .map(|projection| {
-                format!(
-                    "session {} · revision {} · {} transcript item(s) · indexes [{}]",
-                    projection.session_id,
-                    projection.revision,
-                    projection.messages.len() + projection.narratives.len(),
-                    projection
-                        .session_directory_indexes
-                        .iter()
-                        .map(|binding| format!(
-                            "{} ({})",
-                            binding.display_name, binding.workspace_id
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                self.host.language.format(
+                    "tui.projectionLabel",
+                    &[
+                        format!("{}", projection.session_id),
+                        format!("{}", projection.revision),
+                        format!(
+                            "{}",
+                            projection.messages.len() + projection.narratives.len()
+                        ),
+                        format!(
+                            "{}",
+                            projection
+                                .session_directory_indexes
+                                .iter()
+                                .map(|binding| format!(
+                                    "{} ({})",
+                                    binding.display_name, binding.workspace_id
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    ],
                 )
             })
-            .unwrap_or_else(|| "Session 尚未初始化。".to_string())
+            .unwrap_or_else(|| {
+                self.host
+                    .language
+                    .text("tui.sessionNotInitialized")
+                    .to_string()
+            })
     }
 
     fn toggle_context(&mut self) {
@@ -1040,40 +1287,15 @@ impl TuiApp {
         self.detail_scroll = 0;
         if self.context_open {
             self.resource_preview = None;
-            self.status = "上下文视图已打开。".to_string();
+            self.status = self.host.language.text("tui.contextOpened").to_string();
         } else {
-            self.status = "上下文视图已关闭。".to_string();
+            self.status = self.host.language.text("tui.contextClosed").to_string();
         }
     }
 }
 
-fn approval_decision_for_input(input: &str) -> Result<&'static str, String> {
-    match input.trim().to_lowercase().as_str() {
-        "1" | "allow" | "允许" | "同意" => Ok("allow"),
-        "2" | "deny" | "拒绝" | "不同意" => Ok("deny"),
-        "3" | "allow-run" | "允许本轮" => Ok("allow-run"),
-        _ => Err("当前等待 effect 裁决：输入 /reply 1（允许）或 /reply 2（拒绝）。".to_string()),
-    }
-}
-
-fn is_plan_confirmation_input(input: &str) -> bool {
-    matches!(
-        input.trim().to_ascii_lowercase().as_str(),
-        "1" | "y" | "yes" | "confirm"
-    ) || matches!(input.trim(), "确认" | "同意")
-}
-
-fn interaction_response_for_input(interaction: &InteractionProjection, input: &str) -> String {
-    input
-        .parse::<usize>()
-        .ok()
-        .and_then(|index| index.checked_sub(1))
-        .and_then(|index| interaction.options.as_ref()?.get(index))
-        .map(|option| option.label.clone())
-        .unwrap_or_else(|| input.to_string())
-}
-
 fn plugin_selections_from_uris(
+    language: Language,
     catalog: &PluginCatalogProjection,
     plugin_uris: &[String],
 ) -> Result<Vec<PluginSelectionInput>, String> {
@@ -1087,8 +1309,8 @@ fn plugin_selections_from_uris(
             .plugins
             .iter()
             .find(|plugin| plugin.uri == *uri)
-            .ok_or_else(|| format!("插件不在当前目录中或不可用：{uri}"))?;
-        if let Some(error) = plugin_unavailable_reason(plugin) {
+            .ok_or_else(|| language.format("tui.pluginNotInCatalog", &[format!("{}", uri)]))?;
+        if let Some(error) = plugin_unavailable_reason(language, plugin) {
             return Err(error);
         }
         selections.push(PluginSelectionInput {
@@ -1100,7 +1322,7 @@ fn plugin_selections_from_uris(
     Ok(selections)
 }
 
-fn plugin_unavailable_reason(plugin: &PluginCatalogItem) -> Option<String> {
+fn plugin_unavailable_reason(language: Language, plugin: &PluginCatalogItem) -> Option<String> {
     if plugin.available && plugin.enabled {
         return None;
     }
@@ -1109,7 +1331,10 @@ fn plugin_unavailable_reason(plugin: &PluginCatalogItem) -> Option<String> {
             "{}：{} ({})",
             plugin.display_name, error.message, error.code
         ),
-        None => format!("插件不可用：{}", plugin.display_name),
+        None => language.format(
+            "tui.pluginUnavailable",
+            &[format!("{}", plugin.display_name)],
+        ),
     })
 }
 
@@ -1129,16 +1354,6 @@ fn plugin_trigger(input: &str) -> Option<usize> {
     .then_some(start)
 }
 
-fn focus_task(input: &str) -> Option<Option<&str>> {
-    if input == "/focus" {
-        return Some(None);
-    }
-    input
-        .strip_prefix("/focus ")
-        .map(str::trim)
-        .map(|task| (!task.is_empty()).then_some(task))
-}
-
 fn new_id(kind: &str) -> String {
     let clock = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1151,6 +1366,7 @@ fn new_id(kind: &str) -> String {
 #[cfg(test)]
 mod input_tests {
     use super::*;
+    use crate::conversation_input::fixtures::{pending_decisions, waiting_projection};
     fn test_app() -> TuiApp {
         let client = HttpKernelClient::new(
             deepcode_kernel_client::KernelClientConfig::new("http://127.0.0.1:1")
@@ -1161,62 +1377,12 @@ mod input_tests {
             client,
             Renderer::default(),
             TuiHostOptions {
+                language: Language::ZhCn,
                 workspace_path: None,
                 session_id: None,
                 plugin_uris: vec![],
             },
         )
-    }
-    fn waiting_projection(field: &str, decision: serde_json::Value) -> SessionProjection {
-        let mut value = json!({
-            "schemaVersion": deepcode_kernel_client::SESSION_PROJECTION_VERSION,
-            "sessionId":"session:test", "revision":1, "display":{"creationTitle":"input"},
-            "workspaceBindings":[], "sessionDirectoryIndexes":[], "timeline":[], "messages":[],
-            "queuedInputs":[], "narratives":[], "plans":[], "contextCompositions":[],
-            "tokenUsageHistory":[], "activities":[], "artifacts":[],
-            "tokenUsage":{"providerCallCount":0,"reportedCallCount":0,"inputTokens":0,"outputTokens":0,
-              "cacheReadInputTokens":0,"cacheMissInputTokens":0,"cacheAvailable":false,"cacheComplete":false},
-            "run":{"runId":"run:test","profileId":"profile:current","workspaceBindings":[],"status":"waiting"}
-        });
-        value[field] = decision;
-        serde_json::from_value(value).unwrap()
-    }
-
-    fn pending_decisions() -> [(
-        &'static str,
-        serde_json::Value,
-        &'static str,
-        &'static str,
-        serde_json::Value,
-    ); 3] {
-        [
-            (
-                "pendingPlan",
-                json!({"planId":"plan:test","revision":1,"runId":"run:test","callId":"call:plan",
-                "title":"Plan","summary":"Review","steps":[],"mutationManifest":[],"status":"published",
-                "responseMode":"confirmReviseOrCancel","sequence":1,"createdAt":"now","updatedAt":"now"}),
-                "plan.respond",
-                "response",
-                json!({"kind":"confirm"}),
-            ),
-            (
-                "pendingInteraction",
-                json!({"interactionId":"interaction:test","runId":"run:test","callId":"call:question",
-                "kind":"question","prompt":"Choose","options":[{"id":"a","label":"Option A"}],
-                "allowFreeform":true,"sequence":1,"createdAt":"now"}),
-                "interaction.respond",
-                "response",
-                json!("Option A"),
-            ),
-            (
-                "pendingApproval",
-                json!({"approvalId":"approval:test","runId":"run:test","callId":"call:effect",
-                "preview":{"summary":"Write","effects":[],"logicalTargets":[]},"sequence":1,"createdAt":"now"}),
-                "approval.respond",
-                "decision",
-                json!("allow"),
-            ),
-        ]
     }
     #[test]
     fn pending_plain_input_queues_while_explicit_reply_keeps_decision_semantics() {
@@ -1480,10 +1646,113 @@ mod input_tests {
             "source":"mounted","category":"functional","contributionKind":"mcp","discovery":"default",
             "enabled":false,"available":false,"error":{"code":"plugin_manifest_invalid","message":"manifest parse failed"}
         }]})).unwrap();
-        let error = plugin_selections_from_uris(&catalog, &["plugin://broken@mcp".into()])
-            .err()
-            .unwrap();
+        let error =
+            plugin_selections_from_uris(Language::ZhCn, &catalog, &["plugin://broken@mcp".into()])
+                .err()
+                .unwrap();
         assert!(error.contains("plugin_manifest_invalid"));
         assert!(error.contains("manifest parse failed"));
+    }
+
+    #[test]
+    fn plugin_picker_keeps_ninth_and_wrapped_selection_visible_and_selectable() {
+        let mut app = test_app();
+        app.plugin_catalog = Some(serde_json::from_value(json!({"revision":"catalog:test", "plugins":
+            (1..=10).map(|index| json!({
+                "uri":format!("plugin://item{index}@builtin"), "displayName":format!("Plugin {index:02}"),
+                "shortDescription":"A long plugin description that must not push the selected item out of view".repeat(3),
+                "activationMediaTypes":[],"source":"builtin","category":"functional",
+                "contributionKind":"tool","discovery":"default","enabled":true,"available":true
+            })).collect::<Vec<_>>()
+        })).unwrap());
+        app.push_input('@');
+        for _ in 0..8 {
+            app.plugin_picker_move(1);
+        }
+        for (delta, name) in [
+            (0, "Plugin 09"),
+            (1, "Plugin 10"),
+            (1, "Plugin 01"),
+            (-1, "Plugin 10"),
+        ] {
+            app.plugin_picker_move(delta);
+            let entries = app.plugin_picker_entries(8);
+            assert_eq!(entries.iter().filter(|entry| entry.highlighted).count(), 1);
+            assert!(entries
+                .iter()
+                .any(|entry| entry.highlighted && entry.display_name == name));
+            for height in [12, 24] {
+                let text = screen_rows(&app, 60, height).join("\n");
+                assert!(text.contains(&format!("> {name}")), "{height}: {text}");
+            }
+        }
+        app.plugin_picker_move(-1);
+        assert!(app.plugin_picker_select());
+        assert_eq!(app.selected_plugins.len(), 1);
+        assert_eq!(app.selected_plugins[0].uri, "plugin://item9@builtin");
+        assert_eq!(app.input(), "@Plugin 09 ");
+    }
+
+    #[tokio::test]
+    async fn bilingual_views_translate_shell_text_and_keep_original_content() {
+        for (language, help, context, tasks, reply, error_label) in [
+            (
+                Language::ZhCn,
+                "DeepCode 命令",
+                "上下文",
+                "任务",
+                "等待回答",
+                "当前没有失败诊断",
+            ),
+            (
+                Language::EnUs,
+                "DeepCode commands",
+                "Context",
+                "Tasks",
+                "Awaiting reply",
+                "No failure diagnostics",
+            ),
+        ] {
+            let mut app = test_app();
+            app.host.language = language;
+            app.status = language.text("tui.readyHelp").to_string();
+            app.projection = Some(waiting_projection(
+                "pendingInteraction",
+                json!({
+                    "interactionId":"interaction:test","runId":"run:test","callId":"call:test",
+                    "kind":"question","prompt":"Provider 原文 {0}","options":[],"allowFreeform":true,
+                    "sequence":1,"createdAt":"now"
+                }),
+            ));
+            app.projection
+                .as_mut()
+                .unwrap()
+                .run
+                .as_mut()
+                .unwrap()
+                .waiting_reason = Some("userInput".into());
+            app.push_input_text("用户 original input {0}");
+            let screen = screen_rows(&app, 90, 24).join("\n");
+            assert!(screen.contains(reply), "{screen}");
+            assert!(screen.contains("Provider 原文 {0}"), "{screen}");
+            assert!(screen.contains("用户 original input {0}"), "{screen}");
+            app.submit_line("/help").await;
+            assert!(app.detail_preview().unwrap().contains(help));
+            app.submit_line("/error").await;
+            assert!(app.detail_preview().unwrap().contains(error_label));
+            app.submit_line("/context").await;
+            assert!(screen_rows(&app, 90, 24).join("\n").contains(context));
+            app.submit_line("/tasks").await;
+            assert!(screen_rows(&app, 90, 24).join("\n").contains(tasks));
+            let projection = app.projection().unwrap();
+            let unknown = app
+                .contextual_input_command(projection, "/bad")
+                .unwrap_err();
+            assert!(unknown.contains("/bad"));
+            assert_eq!(
+                projection.pending_interaction.as_ref().unwrap().prompt,
+                "Provider 原文 {0}"
+            );
+        }
     }
 }

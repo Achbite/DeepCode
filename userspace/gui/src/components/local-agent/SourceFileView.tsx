@@ -1,6 +1,6 @@
 import { Compartment, EditorState } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
-import React, { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { loadCodeLanguage } from './codeLanguage';
 import { codeViewerExtensions } from './codeViewer';
 import { readViewState, saveViewState } from './readerState';

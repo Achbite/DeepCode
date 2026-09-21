@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 
 pub const CONVERSATION_COMMAND_VERSION: &str = "deepcode.command.v3";
-pub const SESSION_PROJECTION_VERSION: &str = "deepcode.session-projection.v5";
+pub const SESSION_PROJECTION_VERSION: &str = "deepcode.session-projection.v6";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -160,6 +160,9 @@ pub struct SessionProjection {
     pub revision: u64,
     pub display: SessionDisplayProjection,
     pub model_settings: Option<SessionModelSettings>,
+    pub permission_overrides: Value,
+    pub effective_permissions: Option<Value>,
+    pub shell_authorizations: Vec<ShellAuthorizationProjection>,
     pub workspace_bindings: Vec<WorkspaceBindingDisplay>,
     pub session_directory_indexes: Vec<WorkspaceBindingDisplay>,
     pub timeline: Vec<SessionTimelineItem>,
@@ -231,7 +234,10 @@ impl SessionProjection {
         }
         if self.provider_attempts.iter().any(|attempt| {
             !(1..=5).contains(&attempt.attempt)
-                || !matches!(attempt.purpose.as_str(), "agent" | "contextCompaction")
+                || !matches!(
+                    attempt.purpose.as_str(),
+                    "agent" | "contextCompaction" | "approvalReview"
+                )
                 || !matches!(
                     attempt.phase.as_str(),
                     "started" | "completed" | "failed" | "retryWaiting"
@@ -310,12 +316,13 @@ impl SessionProjection {
                             .any(|title| title.encode_utf16().count() > 256)
                 })
                 || draft.activity.as_ref().is_some_and(|activity| {
-                    !matches!(activity.purpose.as_str(), "agent" | "contextCompaction")
-                        || !matches!(
-                            activity.phase.as_str(),
-                            "waitingResponse" | "reasoning" | "awaitingOutput" | "generatingOutput"
-                        )
-                        || activity.started_at.is_empty()
+                    !matches!(
+                        activity.purpose.as_str(),
+                        "agent" | "contextCompaction" | "approvalReview"
+                    ) || !matches!(
+                        activity.phase.as_str(),
+                        "waitingResponse" | "reasoning" | "awaitingOutput" | "generatingOutput"
+                    ) || activity.started_at.is_empty()
                         || activity
                             .last_content_at
                             .as_deref()
@@ -425,7 +432,12 @@ impl SessionProjection {
                     .preview
                     .authorization_scope
                     .as_deref()
-                    .is_some_and(|scope| !matches!(scope, "sessionBrowser" | "runHostShell"))
+                    .is_some_and(|scope| {
+                        scope != "sessionBrowser"
+                            && !AUTHORIZATION_OPTIONS
+                                .iter()
+                                .any(|(candidate, _)| *candidate == scope)
+                    })
         }) {
             return Err("shared Session projection has an invalid approval".to_string());
         }
@@ -458,22 +470,17 @@ impl SessionProjection {
             return Err("shared Session projection has an invalid pending plan".to_string());
         }
         if self.todo_list.as_ref().is_some_and(|todo_list| {
-            let mut ids = HashSet::new();
-            let mut step_ids = HashSet::new();
-            todo_list.source_plan_id.is_empty()
-                || todo_list.source_plan_revision == 0
-                || todo_list.items.is_empty()
-                || self.plans.iter().all(|plan| {
-                    plan.plan_id != todo_list.source_plan_id
-                        || plan.revision != todo_list.source_plan_revision
-                })
+            todo_list.run_id.is_empty()
+                || todo_list.revision == 0
+                || todo_list.sequence == 0
+                || todo_list.sequence > self.revision
+                || todo_list.updated_at.is_empty()
                 || todo_list.items.iter().any(|item| {
-                    item.todo_id.is_empty()
-                        || item.source_step_id.is_empty()
-                        || item.label.is_empty()
-                        || !matches!(item.status.as_str(), "pending" | "inProgress" | "completed")
-                        || !ids.insert(item.todo_id.as_str())
-                        || !step_ids.insert(item.source_step_id.as_str())
+                    item.text.trim().is_empty()
+                        || !matches!(
+                            item.status.as_str(),
+                            "pending" | "inProgress" | "completed" | "blocked"
+                        )
                 })
         }) {
             return Err("shared Session projection has an invalid todo list".to_string());
@@ -506,14 +513,17 @@ impl SessionProjection {
         if self.context_compositions.iter().any(|receipt| {
             receipt.provider_request_id.is_empty()
                 || receipt.run_id.is_empty()
-                || !matches!(receipt.purpose.as_str(), "agent" | "contextCompaction")
+                || !matches!(
+                    receipt.purpose.as_str(),
+                    "agent" | "contextCompaction" | "approvalReview"
+                )
                 || receipt.sequence == 0
                 || receipt.sequence > self.revision
                 || receipt.created_at.is_empty()
                 || !provider_request_ids.insert(receipt.provider_request_id.as_str())
                 || !matches!(
                     receipt.response_constraint.as_str(),
-                    "normal" | "toolRequired" | "answerOnly"
+                    "normal" | "answerOnly"
                 )
                 || invalid_context_composition_shape(receipt)
         }) || self
@@ -652,6 +662,10 @@ impl SessionProjection {
                             .error
                             .as_ref()
                             .is_some_and(|error| error.code.is_empty() || error.message.is_empty())
+                        || tool
+                            .projection_error
+                            .as_ref()
+                            .is_some_and(|error| error.code.is_empty() || error.message.is_empty())
                         || tool.shell.as_ref().is_some_and(|shell| {
                             !matches!(tool.operation.as_str(), "bash" | "powershell")
                                 || shell.command.trim().is_empty()
@@ -666,12 +680,18 @@ impl SessionProjection {
                                             && (result.timed_out || result.exit_code != Some(0))
                                 })
                         })
-                        || matches!(tool.operation.as_str(), "bash" | "powershell")
-                            && (tool.shell.is_none()
+                        || tool.process.as_ref().is_some_and(|process| {
+                            process.job_id.is_empty()
+                                || process.command.is_empty()
+                                || tool.shell.is_some()
+                        })
+                        || tool.process.is_none()
+                            && matches!(tool.operation.as_str(), "bash" | "powershell")
+                            && (tool.shell.is_none() && tool.projection_error.is_none()
                                 || tool.shell.as_ref().is_some_and(|shell| {
                                     match activity.status.as_str() {
                                         "completed" => shell.result.is_none(),
-                                        "failed" => false,
+                                        "failed" | "indeterminate" => false,
                                         _ => shell.result.is_some(),
                                     }
                                 }))
@@ -799,7 +819,12 @@ impl SessionProjection {
                 != self
                     .activities
                     .iter()
-                    .filter(|activity| matches!(activity.kind.as_str(), "tool" | "providerHosted" | "approval"))
+                    .filter(|activity| {
+                        matches!(
+                            activity.kind.as_str(),
+                            "tool" | "providerHosted" | "approval"
+                        )
+                    })
                     .count()
         {
             return Err("shared Session projection canonical timeline is incomplete".to_string());
@@ -1397,6 +1422,20 @@ pub struct EffectPreview {
     pub logical_targets: Vec<String>,
     pub authorization_scope: Option<String>,
     pub authorization_context: Option<Value>,
+    pub authorization_scopes: Option<Vec<String>>,
+    pub file_access: Option<Value>,
+    pub approval_reviewer: Option<String>,
+    pub review: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShellAuthorizationProjection {
+    pub authority_id: String,
+    pub run_id: String,
+    pub scope: String,
+    pub summary: String,
+    pub context: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1418,8 +1457,6 @@ pub struct PlanOperation {
     pub target: Option<String>,
     pub target_kind: Option<String>,
     pub command: Option<String>,
-    pub workspace_mode: Option<String>,
-    pub execution_scope: Option<String>,
     pub terminal: Option<PlanTerminalInput>,
     pub writable_paths: Option<Vec<PlanWritePath>>,
 }
@@ -1459,6 +1496,7 @@ pub struct PlanProjection {
     pub mutation_manifest: Vec<PlanOperation>,
     pub status: String,
     pub decision_id: Option<String>,
+    pub confirmation_source: Option<String>,
     pub sequence: u64,
     pub created_at: String,
     pub updated_at: String,
@@ -1484,6 +1522,7 @@ pub struct PendingPlanProjection {
     pub mutation_manifest: Vec<PlanOperation>,
     pub status: String,
     pub decision_id: Option<String>,
+    pub confirmation_source: Option<String>,
     pub response_mode: String,
     pub sequence: u64,
     pub created_at: String,
@@ -1491,21 +1530,19 @@ pub struct PendingPlanProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TodoListProjection {
-    pub source_plan_id: String,
-    pub source_plan_revision: u64,
+    pub run_id: String,
+    pub revision: u64,
     pub items: Vec<TodoItem>,
     pub sequence: u64,
     pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TodoItem {
-    pub todo_id: String,
-    pub source_step_id: String,
-    pub label: String,
+    pub text: String,
     pub status: String,
 }
 
@@ -1691,6 +1728,7 @@ pub struct ToolOutputProjection {
 pub struct ToolInputRejectionProjection {
     pub code: String,
     pub message: String,
+    pub diagnostics: Option<ErrorDiagnostics>,
     pub issues: Vec<ToolInputIssueProjection>,
 }
 
@@ -1717,10 +1755,28 @@ pub struct ToolActivityProjection {
     pub record_id: Option<String>,
     pub operation: String,
     pub error: Option<ConversationError>,
+    pub projection_error: Option<ConversationError>,
     pub resources: Vec<ActivityResourceProjection>,
     pub shell: Option<ShellActivityProjection>,
+    pub process: Option<ProcessActivityProjection>,
     #[serde(default)]
     pub file_changes: Vec<FileChangeProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessActivityProjection {
+    pub job_id: String,
+    pub command: String,
+    pub output: ToolOutputProjection,
+    pub result: Option<ProcessActivityResult>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessActivityResult {
+    pub exit_code: Option<i64>,
+    pub duration_ms: u64,
+    pub timed_out: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1973,6 +2029,27 @@ pub fn interaction_response_command(
     })
 }
 
+/// Shells display only scopes offered by the shared Kernel preview.
+pub const AUTHORIZATION_OPTIONS: &[(&str, &str)] = &[
+    ("runCommand", "allow-run"),
+    ("sessionCommand", "allow-session"),
+    ("runHostShell", "allow-host-run"),
+    ("sessionHostShell", "allow-host-session"),
+    ("runNetwork", "allow-network-run"),
+    ("sessionNetwork", "allow-network-session"),
+    ("runContainer", "allow-container-run"),
+    ("sessionContainer", "allow-container-session"),
+    ("runFiles", "allow-files-run"),
+    ("sessionFiles", "allow-files-session"),
+];
+
+pub fn approval_scope_for_input(decision: &str) -> Option<&'static str> {
+    AUTHORIZATION_OPTIONS
+        .iter()
+        .find(|(_, input)| *input == decision)
+        .map(|(scope, _)| *scope)
+}
+
 pub fn approval_response_command(
     session_id: &str,
     command_id: &str,
@@ -1987,10 +2064,10 @@ pub fn approval_response_command(
         "runId": approval.run_id,
         "callId": approval.call_id,
         "approvalId": approval.approval_id,
-        "decision": if decision == "allow-run" { "allow" } else { decision },
+        "decision": if approval_scope_for_input(decision).is_some() { "allow" } else { decision },
     });
-    if decision == "allow-run" {
-        command["authorizationScope"] = json!("runHostShell");
+    if let Some(scope) = approval_scope_for_input(decision) {
+        command["authorizationScope"] = json!(scope);
     }
     command
 }
@@ -2061,7 +2138,6 @@ fn valid_plan_projection(plan: &PlanProjection) -> bool {
                 | "confirmed"
                 | "superseded"
                 | "cancelled"
-                | "completed"
                 | "invalidated"
         )
         && plan.sequence > 0
@@ -2111,8 +2187,6 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                             .as_deref()
                             .is_some_and(|target| !target.is_empty())
                             && operation.command.is_none()
-                            && operation.workspace_mode.is_none()
-                            && operation.execution_scope.is_none()
                             && operation.terminal.is_none()
                             && operation.writable_paths.is_none()
                     }
@@ -2126,8 +2200,6 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                                 None | Some("file" | "directoryTree")
                             )
                             && operation.command.is_none()
-                            && operation.workspace_mode.is_none()
-                            && operation.execution_scope.is_none()
                             && operation.terminal.is_none()
                             && operation.writable_paths.is_none()
                     }
@@ -2138,25 +2210,14 @@ fn valid_plan_body(steps: &[ExecutionPlanStep], operations: &[PlanOperation]) ->
                                 .command
                                 .as_deref()
                                 .is_none_or(|command| !command.is_empty())
-                            && operation.workspace_mode.as_deref() == Some("write")
-                            && matches!(
-                                operation.execution_scope.as_deref(),
-                                Some("workspace" | "host")
-                            )
-                            && match &operation.writable_paths {
-                                None => operation.execution_scope.as_deref() == Some("host"),
-                                Some(paths) => {
-                                    !paths.is_empty()
-                                        && paths.iter().all(|target| {
-                                            target.path != "."
-                                                && is_normalized_logical_path(&target.path)
-                                                && matches!(
-                                                    target.kind.as_str(),
-                                                    "file" | "directory"
-                                                )
-                                        })
-                                }
-                            }
+                            && operation.writable_paths.as_ref().is_some_and(|paths| {
+                                !paths.is_empty()
+                                    && paths.iter().all(|target| {
+                                        target.path != "."
+                                            && is_normalized_logical_path(&target.path)
+                                            && matches!(target.kind.as_str(), "file" | "directory")
+                                    })
+                            })
                             && operation
                                 .terminal
                                 .as_ref()
@@ -2259,17 +2320,7 @@ fn valid_shell_execution_environment(environment: &ShellExecutionEnvironmentProj
         && matches!(environment.execution_scope.as_str(), "workspace" | "host")
         && environment.interactive == environment.terminal
         && !environment.path_source.trim().is_empty()
-        && if environment.execution_scope == "host" {
-            environment.write_scope == "hostUser"
-                && environment.home_writable
-                && environment.network_access
-        } else {
-            matches!(
-                environment.write_scope.as_str(),
-                "kernelTemporaryOnly" | "workspaceAndKernelTemporary"
-            ) && !environment.home_writable
-                && !environment.network_access
-        }
+        && !environment.write_scope.trim().is_empty()
 }
 
 fn is_normalized_logical_path(value: &str) -> bool {
@@ -2288,7 +2339,7 @@ mod tests {
 
     fn projection_value() -> Value {
         let mut value = json!({
-            "schemaVersion": SESSION_PROJECTION_VERSION,
+            "schemaVersion": SESSION_PROJECTION_VERSION, "permissionOverrides":{}, "effectivePermissions":null, "shellAuthorizations":[],
             "sessionId": "session:test",
             "revision": 8,
             "display": { "creationTitle": "测试" },
@@ -2338,7 +2389,7 @@ mod tests {
                     "details": "读取 README。"
                 }],
                 "mutationManifest": [],
-                "status": "completed",
+                "status": "confirmed",
                 "decisionId": "decision:plan",
                 "sequence": 2,
                 "createdAt": "2026-08-25T00:00:01.000Z",
@@ -2347,12 +2398,10 @@ mod tests {
             "activePlanRef": null,
             "pendingPlan": null,
             "todoList": {
-                "sourcePlanId": "plan:test",
-                "sourcePlanRevision": 1,
+                "runId": "run:test",
+                "revision": 1,
                 "items": [{
-                    "todoId": "todo:read",
-                    "sourceStepId": "step:read",
-                    "label": "读取入口",
+                    "text": "读取入口",
                     "status": "completed"
                 }],
                 "sequence": 3,
@@ -2375,9 +2424,6 @@ mod tests {
                 "purpose": "agent",
                 "runId": "run:test",
                 "responseConstraint": "normal",
-                "stableCoreHash": "context-hash-v1:0000000000000001",
-                "baseToolSchemaHash": "context-hash-v1:0000000000000002",
-                "selectedPluginSnapshotHash": "context-hash-v1:0000000000000003",
                 "dynamicInstructionBytes": 128,
                 "messages": [{
                     "messageIndex": 0,
@@ -2527,6 +2573,36 @@ mod tests {
     }
 
     #[test]
+    fn shell_plan_projection_uses_business_paths_without_model_authority() {
+        for shell in ["bash", "powershell"] {
+            let mut value = projection_value();
+            value["plans"][0]["mutationManifest"] = json!([{
+                "workspaceId": "workspace:test", "operation": shell,
+                "writablePaths": [{"path":"build", "kind":"directory"}]
+            }]);
+            let projection: SessionProjection = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(projection.validate(), Ok(()));
+            for paths in [
+                Value::Null,
+                json!([]),
+                json!([{"path":"../outside", "kind":"file"}]),
+            ] {
+                let mut invalid = value.clone();
+                invalid["plans"][0]["mutationManifest"][0]["writablePaths"] = paths;
+                assert!(serde_json::from_value::<SessionProjection>(invalid)
+                    .unwrap()
+                    .validate()
+                    .is_err());
+            }
+            for (field, authority) in [("workspaceMode", "write"), ("executionScope", "host")] {
+                let mut invalid = value.clone();
+                invalid["plans"][0]["mutationManifest"][0][field] = json!(authority);
+                assert!(serde_json::from_value::<SessionProjection>(invalid).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn queued_input_and_original_tool_error_are_shared_facts() {
         let mut value = projection_value();
         value["queuedInputs"] = json!([{
@@ -2673,6 +2749,33 @@ mod tests {
     #[test]
     fn validates_canonical_shell_command_and_result_projection() {
         let mut value = projection_value();
+        let mut unreadable = value.clone();
+        unreadable["activities"][0]["tool"] = json!({
+            "operation": "bash", "resources": [], "recordId": "record:original",
+            "projectionError": {"code":"bash_projection_environment_invalid", "message":"Tool details are unavailable."}
+        });
+        let readable: SessionProjection = serde_json::from_value(unreadable.clone()).unwrap();
+        assert_eq!(readable.validate(), Ok(()));
+        assert_eq!(readable.activities[0].status, "completed");
+        assert_eq!(
+            readable.activities[0]
+                .tool
+                .as_ref()
+                .unwrap()
+                .projection_error
+                .as_ref()
+                .unwrap()
+                .code,
+            "bash_projection_environment_invalid"
+        );
+        unreadable["activities"][0]["tool"]
+            .as_object_mut()
+            .unwrap()
+            .remove("projectionError");
+        assert!(serde_json::from_value::<SessionProjection>(unreadable)
+            .unwrap()
+            .validate()
+            .is_err());
         value["activities"][0]["label"] = json!("bash");
         value["activities"][0]["tool"] = json!({
             "operation": "bash",
@@ -2702,8 +2805,8 @@ mod tests {
                         "executionScope": "workspace",
                         "terminal": false,
                         "pathSource": "hostPlusStandardDeveloperPaths",
-                        "writeScope": "workspaceAndKernelTemporary",
-                        "homeWritable": false,
+                        "writeScope": "authorizedResources",
+                        "homeWritable": true,
                         "networkAccess": false
                     }
                 }
@@ -2721,11 +2824,41 @@ mod tests {
             Some("make build")
         );
 
-        value["activities"][0]["tool"]["shell"]["result"]["environment"]["writeScope"] =
-            json!("kernelTemporaryOnly");
+        for scope in [
+            "workspaceAndKernelTemporary",
+            "kernelTemporaryOnly",
+            "recordedScope",
+        ] {
+            let mut recorded = value.clone();
+            let environment =
+                &mut recorded["activities"][0]["tool"]["shell"]["result"]["environment"];
+            environment["writeScope"] = json!(scope);
+            environment["homeWritable"] = json!(false);
+            let projection: SessionProjection = serde_json::from_value(recorded).unwrap();
+            assert_eq!(projection.validate(), Ok(()));
+            let environment = &projection.activities[0]
+                .tool
+                .as_ref()
+                .unwrap()
+                .shell
+                .as_ref()
+                .unwrap()
+                .result
+                .as_ref()
+                .unwrap()
+                .environment;
+            assert_eq!(environment.write_scope, scope);
+            assert!(!environment.home_writable);
+        }
+
+        value["activities"][0]["tool"]["shell"]["result"]["environment"]["executionScope"] =
+            json!("host");
         let read_projection: SessionProjection =
             serde_json::from_value(value.clone()).expect("read shell projection decodes");
-        assert_eq!(read_projection.validate(), Ok(()));
+        assert!(
+            read_projection.validate().is_err(),
+            "Recorded environment must match the invocation execution scope"
+        );
 
         value["activities"][0]["tool"]["shell"]["executionScope"] = json!("host");
         value["activities"][0]["tool"]["shell"]["result"]["environment"]["executionScope"] =
@@ -2740,8 +2873,7 @@ mod tests {
             serde_json::from_value(value.clone()).expect("host shell projection decodes");
         assert_eq!(host_projection.validate(), Ok(()));
 
-        value["activities"][0]["tool"]["shell"]["result"]["environment"]["writeScope"] =
-            json!("unexpectedScope");
+        value["activities"][0]["tool"]["shell"]["result"]["environment"]["writeScope"] = json!("");
         let invalid_projection: SessionProjection =
             serde_json::from_value(value).expect("invalid shell projection still decodes");
         assert!(invalid_projection.validate().is_err());
@@ -2831,12 +2963,12 @@ impl FileChangeContent {
             if self.before.is_some() {
                 self.path.as_str()
             } else {
-                "/dev/null (不存在)"
+                "/dev/null"
             },
             if self.after.is_some() {
                 self.path.as_str()
             } else {
-                "/dev/null (不存在)"
+                "/dev/null"
             },
             if old_end == start { 0 } else { start + 1 },
             old_end - start,

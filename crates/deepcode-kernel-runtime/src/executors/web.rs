@@ -631,6 +631,7 @@ mod tests {
             workspace_id: None,
             private_resolved_targets: vec![],
             workspace_write_targets: None,
+            file_access: Default::default(),
             cancellation: KernelCancellationToken::default(),
             progress: Default::default(),
         }
@@ -740,17 +741,21 @@ mod tests {
     #[test]
     fn web_fetch_rejects_non_http_urls_at_the_shared_http_boundary() {
         let error = invoke_web_fetch(
-            invocation(
-                "invocation:fetch",
-                "web.fetch",
-                json!({"url": "ftp://example.invalid/document"}),
-            ),
+            // Exercise the HTTP boundary independently of input canonicalization.
+            KernelToolInvocation {
+                id: "invocation:fetch".into(),
+                input: KernelCanonicalInvocation::WebFetch {
+                    url: "ftp://example.invalid/document".into(),
+                    max_bytes: 1_024,
+                },
+            },
             KernelToolExecutionContext {
                 output_directory: None,
                 workspace_root: None,
                 workspace_id: None,
                 private_resolved_targets: vec![],
                 workspace_write_targets: None,
+                file_access: Default::default(),
                 cancellation: KernelCancellationToken::default(),
                 progress: Default::default(),
             },

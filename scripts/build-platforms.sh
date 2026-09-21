@@ -30,7 +30,7 @@ check_platform() {
       pkg-config --exists openssl gtk+-3.0 webkit2gtk-4.1 ayatana-appindicator3-0.1 librsvg-2.0 || { printf 'Linux desktop SDK is incomplete.\n' >&2; exit 1; }
       ;;
     windows)
-      require x86_64-w64-mingw32-gcc; require x86_64-w64-mingw32-g++; require x86_64-w64-mingw32-strip
+      require x86_64-w64-mingw32-gcc; require x86_64-w64-mingw32-g++; require x86_64-w64-mingw32-strip; require makensis
       [ -d "$(rustc --print target-libdir --target "$WINDOWS_TARGET")" ] || { printf 'Rust Windows GNU target is not installed.\n' >&2; exit 1; }
       [ -f "${DEEPCODE_WINDOWS_NODE_BIN}" ]
       ;;
@@ -62,10 +62,10 @@ case "${1:-}" in
   --native)
     configure_cache
     case "$2" in
-      native-gui) cargo build --locked --release --manifest-path "$GUI_MANIFEST" ;;
-      daemon) cargo build --locked --release -p deepcode-kernel-daemon -p deepcode-first-party-tools ;;
-      cli) cargo build --locked --release -p deepcode-cli ;;
-      tui) cargo build --locked --release -p deepcode-tui ;;
+      native-gui) cargo build --release --manifest-path "$GUI_MANIFEST" ;;
+      daemon) cargo build --release -p deepcode-kernel-daemon -p deepcode-first-party-tools ;;
+      cli) cargo build --release -p deepcode-cli ;;
+      tui) cargo build --release -p deepcode-tui ;;
       *) printf 'Unknown native stage: %s\n' "$2" >&2; exit 2 ;;
     esac
     ;;
@@ -86,22 +86,28 @@ case "${1:-}" in
     else
       case "$(uname -m)" in x86_64) platform_dir=linux-x64 ;; aarch64) platform_dir=linux-arm64 ;; *) printf 'Unsupported Linux architecture.\n' >&2; exit 1 ;; esac
     fi
-    cargo build --locked --release "${target_args[@]}" -p deepcode-kernel-daemon -p deepcode-first-party-tools -p deepcode-host-web -p deepcode-cli -p deepcode-tui
+    cargo build --release "${target_args[@]}" -p deepcode-kernel-daemon -p deepcode-first-party-tools -p deepcode-host-web -p deepcode-cli -p deepcode-tui
     if [ "$platform" = windows ]; then
       messages="$(dirname "$shared")/windows-native.jsonl"
-      cargo build --locked --release "${target_args[@]}" --manifest-path "$GUI_MANIFEST" --message-format=json-render-diagnostics > "$messages"
+      cargo build --release "${target_args[@]}" --manifest-path "$GUI_MANIFEST" --message-format=json-render-diagnostics > "$messages"
       # Read this Cargo invocation's dependency output, not a glob over cached builds.
       loader="$(python3 -c 'import json,sys; from pathlib import Path; messages=map(json.loads,open(sys.argv[1])); output=next(m["out_dir"] for m in messages if m.get("reason")=="build-script-executed" and m["package_id"].split("#")[-1].startswith("webview2-com-sys@")); print(Path(output)/"x64/WebView2Loader.dll")' "$messages")"
       loader_args=(--webview-loader "$loader")
     else
-      cargo build --locked --release --manifest-path "$GUI_MANIFEST"
+      cargo build --release --manifest-path "$GUI_MANIFEST"
     fi
     stage="$(mktemp -d "$(dirname "$shared")/$platform_dir.XXXXXX")"
     python3 scripts/package-runtime.py assemble --root "$ROOT_DIR" --platform "$platform_dir" --stage "$stage" --shared "$shared" --native "$native" --node "$node" --node-license "$node_license" "${loader_args[@]}"
     version="$(node -p 'require("./package.json").version')"
     archive="$output/DeepCode-$version-$platform_dir.tar.gz"
     [ "$platform" != windows ] || archive="$output/DeepCode-$version-$platform_dir.zip"
-    python3 scripts/package-runtime.py publish "$stage" "$output/$platform_dir" "$archive"
+    installer_args=()
+    if [ "$platform" = windows ]; then
+      installer="$(dirname "$shared")/DeepCode-$version-win64-setup.exe"
+      python3 scripts/package-installers.py win64 "$stage" "$installer"
+      installer_args=(--installer "$installer")
+    fi
+    python3 scripts/package-runtime.py publish "$stage" "$output/$platform_dir" "$archive" "${installer_args[@]}"
     ;;
   *) printf 'Internal usage: --check platform | --shared directory | --native stage | --package platform shared output\n' >&2; exit 2 ;;
 esac

@@ -29,8 +29,8 @@ export function codeViewerExtensions(language: Language | null, dark: boolean, f
       '.cm-gutters': { backgroundColor: 'var(--dc-code-background)', color: 'var(--dc-muted)', border: 'none' },
       '.cm-selectionBackground, &.cm-focused .cm-selectionBackground': { backgroundColor: 'var(--dc-surface-active)' },
       '.cm-panels': { color: 'var(--dc-foreground)', backgroundColor: 'var(--dc-surface)' },
-      '.cm-searchMatch': { backgroundColor: 'var(--dc-surface-active)', outline: '1px solid var(--dc-accent)' },
-      '.cm-searchMatch-selected': { outline: '2px solid var(--dc-accent)' },
+      '.cm-searchMatch': { backgroundColor: 'var(--dc-surface-active)', outline: '1px solid var(--dc-border-strong)' },
+      '.cm-searchMatch-selected': { outline: '2px solid var(--dc-focus-ring, var(--dc-border-strong))' },
     }, { dark }),
   ];
 }

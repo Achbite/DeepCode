@@ -1,12 +1,13 @@
-/* Components with their own visible focus treatment can override this default. */
-:where(button, input, select, textarea, summary, a, [tabindex], [contenteditable]):focus-visible {
-  outline: 2px solid var(--dc-focus-ring, var(--accent, Highlight));
-  outline-offset: 2px;
+/* Focus stays on the control surface; it does not add an enclosing ring. */
+:is(button, input, select, textarea, summary, a, [tabindex], [contenteditable]):focus {
+  outline: none;
 }
 
-/* Buttons use a surface change for keyboard focus, including body-portalled dialogs. */
+:root[data-product='deepcode-gui'] :is(input[type='checkbox'], input[type='radio'], input[type='range']) {
+  accent-color: var(--dc-foreground);
+}
+
 :root[data-product='deepcode-gui'] body :is(button, [role='button'], [role='tab'], summary):focus-visible {
-  outline: none;
   box-shadow: none;
   background-color: var(--dc-surface-hover);
   color: var(--dc-foreground);

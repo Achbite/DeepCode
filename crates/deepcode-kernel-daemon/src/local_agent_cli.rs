@@ -1,10 +1,13 @@
 //! Direct CLI execution, pinned to the prepared contribution and owned by one attempt.
 use crate::local_agent_mcp::{McpRuntimeError, McpToolCallFailure, McpToolCallResult};
+use deepcode_host_connection::process::{
+    spawn_owned_host_process, terminate_owned_process_tree_checked, OwnedHostProcess,
+};
 use deepcode_kernel_runtime::executors::KernelToolExecutionContext;
 use serde_json::{json, Value};
 use std::{
     io::{Read, Write},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -53,27 +56,28 @@ impl CliClient {
         if let Some(directory) = &context.workspace_root {
             command.current_dir(directory);
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-        let child = command
-            .spawn()
+        let child = spawn_owned_host_process(&mut command)
             .map_err(|error| fail("cli_spawn_failed", format!("{}: {error}", self.command)))?;
-        let mut owned = OwnedCli(child, false);
+        let mut owned = OwnedCli {
+            process: child,
+            stopped: false,
+            workers: None,
+        };
         let mut stdin = owned
-            .0
+            .process
+            .child
             .stdin
             .take()
             .ok_or_else(|| fail("cli_pipe_failed", "stdin is unavailable".into()))?;
         let stdout = owned
-            .0
+            .process
+            .child
             .stdout
             .take()
             .ok_or_else(|| fail("cli_pipe_failed", "stdout is unavailable".into()))?;
         let stderr = owned
-            .0
+            .process
+            .child
             .stderr
             .take()
             .ok_or_else(|| fail("cli_pipe_failed", "stderr is unavailable".into()))?;
@@ -86,6 +90,11 @@ impl CliClient {
                 .map_err(|error| error.to_string())
                 .and_then(|_| stdin.flush().map_err(|error| error.to_string()))
         });
+        owned.workers = Some(CliWorkers {
+            input,
+            output,
+            errors,
+        });
         let start = Instant::now();
         let status = loop {
             if context.cancellation.is_cancelled() {
@@ -94,59 +103,89 @@ impl CliClient {
             if start.elapsed() >= Duration::from_secs(60) {
                 break Err(fail("cli_timeout", "CLI call exceeded 60 seconds".into()));
             }
-            match owned.0.try_wait() {
+            match owned.process.child.try_wait() {
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) => std::thread::sleep(Duration::from_millis(25)),
                 Err(error) => break Err(fail("cli_wait_failed", error.to_string())),
             }
         };
-        owned.stop(); // Reap this attempt's process group, including pipe-holding children.
+        if let Err(error) = owned.stop() {
+            let mut original = match status {
+                Err(error) => error,
+                Ok(status) if !status.success() => fail(
+                    "cli_process_failed",
+                    format!("{} exited {status}", self.command),
+                ),
+                Ok(_) => fail(
+                    "cli_cleanup_failed",
+                    "CLI process tree cleanup failed".into(),
+                ),
+            };
+            original
+                .message
+                .push_str(&format!("; cleanup failed: {error}"));
+            return Err(original);
+        }
+        let CliWorkers {
+            input,
+            output,
+            errors,
+        } = owned
+            .workers
+            .take()
+            .expect("CLI workers belong to this attempt");
+        // Collect every worker before propagating a failure; none outlives this attempt.
         let input = input
             .join()
-            .map_err(|_| fail("cli_input_failed", "CLI stdin worker failed".into()))?;
+            .map_err(|_| fail("cli_input_failed", "CLI stdin worker failed".into()))
+            .and_then(|result| result.map_err(|message| fail("cli_input_failed", message)));
         let output = output
             .join()
-            .map_err(|_| fail("cli_output_failed", "CLI stdout worker failed".into()))?
-            .map_err(|message| fail("cli_output_failed", message))?;
+            .map_err(|_| fail("cli_output_failed", "CLI stdout worker failed".into()))
+            .and_then(|result| result.map_err(|message| fail("cli_output_failed", message)));
         let errors = errors
             .join()
-            .map_err(|_| fail("cli_output_failed", "CLI stderr worker failed".into()))?
-            .map_err(|message| fail("cli_output_failed", message))?;
-        let status = status?;
-        if !status.success() {
-            return Err(fail(
-                "cli_process_failed",
-                format!(
-                    "{} exited {status}: {}",
-                    self.command,
-                    String::from_utf8_lossy(&errors)
-                ),
-            ));
-        }
-        input.map_err(|message| fail("cli_input_failed", message))?;
-        let value: Value = serde_json::from_slice(&output).map_err(|error| {
-            fail(
-                "cli_output_invalid",
-                format!("CLI must return one JSON result: {error}"),
-            )
-        })?;
-        let failure = value
-            .get("error")
-            .filter(|error| !error.is_null())
-            .map(|error| McpToolCallFailure {
-                code: error["code"]
-                    .as_str()
-                    .unwrap_or("cli_tool_failed")
-                    .to_string(),
-                message: error["message"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| error.to_string()),
-            });
-        Ok(McpToolCallResult {
-            output: value,
-            failure,
-        })
+            .map_err(|_| fail("cli_output_failed", "CLI stderr worker failed".into()))
+            .and_then(|result| result.map_err(|message| fail("cli_output_failed", message)));
+        (|| {
+            let status = status?;
+            if !status.success() {
+                let detail = match &errors {
+                    Ok(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                    Err(error) => format!("stderr capture failed: {}", error.message),
+                };
+                return Err(fail(
+                    "cli_process_failed",
+                    format!("{} exited {status}: {detail}", self.command),
+                ));
+            }
+            input?;
+            let output = output?;
+            errors?;
+            let value: Value = serde_json::from_slice(&output).map_err(|error| {
+                fail(
+                    "cli_output_invalid",
+                    format!("CLI must return one JSON result: {error}"),
+                )
+            })?;
+            let failure = value
+                .get("error")
+                .filter(|error| !error.is_null())
+                .map(|error| McpToolCallFailure {
+                    code: error["code"]
+                        .as_str()
+                        .unwrap_or("cli_tool_failed")
+                        .to_string(),
+                    message: error["message"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| error.to_string()),
+                });
+            Ok(McpToolCallResult {
+                output: value,
+                failure,
+            })
+        })()
     }
 }
 fn bounded_output(mut reader: impl Read, limit: usize) -> Result<Vec<u8>, String> {
@@ -170,32 +209,51 @@ fn bounded_output(mut reader: impl Read, limit: usize) -> Result<Vec<u8>, String
         Ok(result)
     }
 }
-struct OwnedCli(Child, bool);
+struct CliWorkers {
+    input: std::thread::JoinHandle<Result<(), String>>,
+    output: std::thread::JoinHandle<Result<Vec<u8>, String>>,
+    errors: std::thread::JoinHandle<Result<Vec<u8>, String>>,
+}
+
+struct OwnedCli {
+    process: OwnedHostProcess,
+    stopped: bool,
+    workers: Option<CliWorkers>,
+}
 impl OwnedCli {
-    fn stop(&mut self) {
-        if self.1 {
-            return;
+    fn stop(&mut self) -> std::io::Result<()> {
+        if self.stopped {
+            return Ok(());
         }
-        self.1 = true;
-        #[cfg(unix)]
-        unsafe {
-            unsafe extern "C" {
-                fn kill(pid: i32, signal: i32) -> i32;
-            }
-            kill(-(self.0.id() as i32), 9);
-        }
-        #[cfg(windows)]
-        {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &self.0.id().to_string(), "/T", "/F"])
-                .output();
-        }
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        terminate_owned_process_tree_checked(&mut self.process)?;
+        self.stopped = true;
+        Ok(())
     }
 }
 impl Drop for OwnedCli {
     fn drop(&mut self) {
-        self.stop();
+        if let Err(error) = self.stop() {
+            eprintln!("CLI process cleanup failed: {error}");
+            return;
+        }
+        if let Some(workers) = self.workers.take() {
+            for (stream, result) in [
+                ("stdin", workers.input.join().map(|value| value.map(|_| ()))),
+                (
+                    "stdout",
+                    workers.output.join().map(|value| value.map(|_| ())),
+                ),
+                (
+                    "stderr",
+                    workers.errors.join().map(|value| value.map(|_| ())),
+                ),
+            ] {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!("CLI {stream} cleanup failed: {error}"),
+                    Err(_) => eprintln!("CLI {stream} worker panicked during cleanup"),
+                }
+            }
+        }
     }
 }

@@ -19,7 +19,14 @@ import type {
   UiPluginView,
   UiPluginFile,
 } from './types';
+import { queryModelUsage, startModelAuth, getModelAuth, cancelModelAuth, logoutModelConnection, getModelQuota } from '../services/apiClient';
+import type { ApiResponse } from '@deepcode/protocol';
 import './uiPlugins.css';
+function result<T>(response: ApiResponse<T>): T {
+  if (!response.ok || response.data === undefined) throw new Error(response.message ?? response.error ?? 'Empty response');
+  return response.data;
+}
+
 
 function insertStyle(css: string): () => void {
   const style = document.createElement('style');
@@ -124,19 +131,27 @@ export function UiPluginSlotView({
   slot,
   input,
   children,
+  pluginPath,
+  onConnectionChanged,
 }: {
   slot: Exclude<UiPluginSlot, 'theme'>;
   input: UiPluginInput;
   children: React.ReactNode;
+  pluginPath?: string;
+  onConnectionChanged?(): Promise<void>;
 }) {
   const context = useContext(Context);
   const { entries } = useUiPlugins();
   const entry = entries.find(
-    (candidate) => candidate.status !== 'disabled' && candidate.manifest?.slots.includes(slot),
+    (candidate) => candidate.status !== 'disabled' && candidate.manifest?.slots.includes(slot)
+      && (!pluginPath || candidate.path === pluginPath)
+      && (slot !== 'tool.result' || (input.kind === 'tool.result' && candidate.manifest.toolId === input.toolId))
+      && (slot !== 'settings.connection.detail' || !candidate.manifest.adapterId || (input.kind === 'settings.connection' && candidate.manifest.adapterId === input.connection.adapterId)),
   );
   const renderer = entry?.renderers.get(slot);
   const container = useRef<HTMLDivElement>(null);
   const mounted = useRef<UiPluginView | null>(null);
+  const connectionChanged = useRef(onConnectionChanged); connectionChanged.current = onConnectionChanged;
   const latestInput = useRef(input);
   latestInput.current = input;
   const positions = useRef<Array<{ element: HTMLElement; top: number; left: number }>>([]);
@@ -147,7 +162,35 @@ export function UiPluginSlotView({
     const scope = createPluginScope(insertStyle, (error) => context.runtime.report(entry, error));
     const detach = context.runtime.attachView(entry, () => scope.dispose());
     try {
-      const view = renderer(root, latestInput.current, scope);
+      const value = latestInput.current;
+      const authFlows = new Set<string>();
+      scope.onDispose(async () => { await Promise.all([...authFlows].map(async id => { result(await cancelModelAuth(id)); })); authFlows.clear(); });
+      const requireFlow = (id: string) => { if (!authFlows.has(id)) throw new Error('Auth flow is outside this view scope.'); };
+      const viewScope = {
+        ...scope,
+        ...(slot.startsWith('settings.') && entry.manifest?.capabilities?.includes('usage.read') ? {
+          usage: { query: async (query: import('@deepcode/protocol').UsageQuery, signal: AbortSignal) => result(await queryModelUsage(query, AbortSignal.any([scope.signal, signal]))) },
+        } : {}),
+        ...(slot === 'settings.connection.detail' && value.kind === 'settings.connection' && entry.manifest?.capabilities?.includes('connection.auth') ? {
+          connection: {
+            startLogin: async (method: 'browser' | 'deviceCode') => {
+              if (scope.signal.aborted) throw new Error('View disposed.');
+              const flow = result(await startModelAuth(value.connection.id, method));
+              if (scope.signal.aborted) { result(await cancelModelAuth(flow.id)); throw new Error('View disposed.'); }
+              authFlows.add(flow.id); return flow;
+            },
+            readLogin: async (id: string, signal: AbortSignal) => {
+              requireFlow(id); const flow = result(await getModelAuth(id, AbortSignal.any([scope.signal, signal])));
+              if (flow.status !== 'pending') { authFlows.delete(id); if (flow.status === 'complete') await connectionChanged.current?.(); }
+              return flow;
+            },
+            cancelLogin: async (id: string) => { requireFlow(id); const flow = result(await cancelModelAuth(id)); authFlows.delete(id); return flow; },
+            logout: async () => { if (scope.signal.aborted) throw new Error('View disposed.'); result(await logoutModelConnection(value.connection.id)); await connectionChanged.current?.(); },
+            readQuota: async (signal: AbortSignal) => result(await getModelQuota(value.connection.id, AbortSignal.any([scope.signal, signal]))),
+          },
+        } : {}),
+      };
+      const view = renderer(root, value, viewScope);
       if (!view || typeof view.update !== 'function' || typeof view.dispose !== 'function')
         throw new Error('UI renderer must return update and dispose functions.');
       mounted.current = view;
@@ -215,4 +258,16 @@ export function UiPluginSlotView({
 
 export function useDisplayTheme(): string {
   return String(useSettingsStore((state) => state.effectiveSettings['gui.colorTheme']) ?? 'light');
+}
+
+/** Settings contributions compose in installation order instead of replacing built-in controls. */
+export function UiSettingsContributions({ slot, input, onConnectionChanged }: {
+  slot: Extract<UiPluginSlot, `settings.${string}`>;
+  input: Extract<UiPluginInput, { kind: `settings.${string}` }>;
+  onConnectionChanged?(): Promise<void>;
+}) {
+  const { entries } = useUiPlugins();
+  return <>{entries.filter(entry => entry.status !== 'disabled' && entry.manifest?.slots.includes(slot)
+    && (slot !== 'settings.connection.detail' || !entry.manifest?.adapterId || (input.kind === 'settings.connection' && entry.manifest.adapterId === input.connection.adapterId)))
+    .map(entry => <section key={entry.path} className="ui-settings-contribution"><UiPluginSlotView slot={slot} input={input} pluginPath={entry.path} onConnectionChanged={onConnectionChanged}>{null}</UiPluginSlotView></section>)}</>;
 }

@@ -7,10 +7,10 @@ mod invocation_types;
 mod registrations;
 mod types;
 
-pub use catalog::{
-    KernelToolCatalogError, KernelToolRegistry, ToolInputIssue,
+pub use catalog::{KernelToolCatalogError, KernelToolRegistry};
+pub use types::{
+    ToolAvailability, ToolDescriptor, ToolEffectClass, ToolEffectScope, ToolInputIssue,
 };
-pub use types::{ToolAvailability, ToolDescriptor, ToolEffectClass, ToolEffectScope};
 
 /// Kernel-private, cross-crate adapter types.
 ///
@@ -22,8 +22,8 @@ pub mod kernel_internal {
         canonicalize_invocation, normalize_workspace_path, InvocationNormalizationError,
     };
     pub use crate::invocation_types::{
-        process_shell_hard_deny_reason, KernelCanonicalInvocation, KernelDeleteTarget,
-        KernelTextEdit, KernelToolKind, KernelWorkspaceMode, KernelExecutionScope, MAX_CANONICAL_INVOCATION_BYTES,
+        KernelCanonicalInvocation, KernelDeleteTarget, KernelExecutionScope, KernelTextEdit,
+        KernelToolKind, KernelWorkspaceMode, MAX_CANONICAL_INVOCATION_BYTES,
         MAX_TERMINAL_STDIN_BYTES,
     };
 }

@@ -1,9 +1,12 @@
+import { ManagedProcesses } from './managedProcesses.js';
+import { validatePermissionPatches } from '@deepcode/protocol';
+import { confirmationFacts } from './planStage.js';
 import { admitSessionEvents } from './admission.js';
 import { failureSnapshotEvent } from './failureSnapshot.js';
 import { errorFact } from './loopFailure.js';
 import { LiveReasoning } from './reasoningRead.js';
 import { LiveToolOutput } from './liveToolOutput.js';
-import { todoItemsForPlan } from './planStage.js';
+import { todoUpdateFact } from './todoState.js';
 import { savedSessionEnvironment } from './sessionEnvironment.js';
 import type {
   AssistantDraftProjection,
@@ -57,6 +60,7 @@ export class SessionActor {
   #writes = Promise.resolve();
   #active?: ActiveRun;
   #disposed = false;
+  #processes?: ManagedProcesses;
   #loopFailure?: Error;
   #snapshot?: LoopSnapshot;
   #initialEvents?: readonly SessionEvent[];
@@ -136,6 +140,7 @@ export class SessionActor {
       errors.push(error);
     }
     try {
+      await this.closeProcesses();
       await this.#composition.dispose();
     } catch (error) {
       errors.push(error);
@@ -164,6 +169,10 @@ export class SessionActor {
     }
 
     switch (command.type) {
+      case 'session.permissions.set':
+        return await this.handlePermissions(command);
+      case 'approval.revoke':
+        return await this.handleRevoke(command);
       case 'session.model-settings.set':
         return await this.handleModelSettings(command);
       case 'session.directory-index.attach':
@@ -187,6 +196,38 @@ export class SessionActor {
       case 'plan.respond':
         return await this.handlePlan(command);
     }
+  }
+
+  private async handlePermissions(command: Extract<ConversationCommand, { type: 'session.permissions.set' }>): Promise<CommandReply> {
+    try { validatePermissionPatches(command.patches); }
+    catch { return this.recordRejection(command, 'permission_settings_invalid', '权限设置无效。'); }
+    const snapshot = await this.loadSnapshot();
+    const events: NewSessionEvent[] = [{ type: 'session.permissions.updated', sessionId: this.sessionId,
+      payload: { commandId: command.commandId, patches: command.patches } }];
+    // A change to Shell policy invalidates outstanding reusable grants, visibly.
+    if (Object.keys(command.patches).some(key => ['agent.permissions.shell', 'agent.permissions.shellAccess', 'agent.permissions.commandRules', 'agent.permissions.commandDenylist', 'agent.permissions.networkRead'].includes(key))) {
+      events.push(...snapshot.state.shellAuthorizations.map(grant => ({ type: 'approval.revoked' as const,
+        sessionId: this.sessionId, runId: grant.runId, payload: { commandId: command.commandId, authorityId: grant.authorityId } })));
+    }
+    if (snapshot.state.pendingPlan && command.patches['agent.permissions.workspaceMutation'] === 'allow') {
+      events.push(...confirmationFacts(snapshot.state, snapshot.state.pendingPlan, command.commandId, 'agent', this.#nextId));
+    }
+    const reply = await this.commitCommand(command, events, acceptedReply(command));
+    if (!this.#active && snapshot.state.run?.status === 'waiting'
+      && (snapshot.state.run.waitingReason === 'approval'
+        || (snapshot.state.pendingPlan && command.patches['agent.permissions.workspaceMutation'] === 'allow'))) {
+      this.startLoop({ type: 'resume', runId: snapshot.state.run.runId });
+    }
+    return reply;
+  }
+
+  private async handleRevoke(command: Extract<ConversationCommand, { type: 'approval.revoke' }>): Promise<CommandReply> {
+    const snapshot = await this.loadSnapshot();
+    if (!snapshot.state.shellAuthorizations.some(grant => grant.runId === command.runId && grant.authorityId === command.authorityId)) {
+      return this.recordRejection(command, 'approval_grant_missing', '该授权已经结束或撤销。');
+    }
+    return this.commitCommand(command, [{ type: 'approval.revoked', sessionId: this.sessionId, runId: command.runId,
+      payload: { commandId: command.commandId, authorityId: command.authorityId } }], acceptedReply(command));
   }
 
   private async handleModelSettings(
@@ -658,7 +699,7 @@ export class SessionActor {
         '该 effect 裁决已经关闭或不属于当前运行。',
       );
     }
-    if (command.authorizationScope && (command.decision !== 'allow' || approval.preview.authorizationScope !== command.authorizationScope)) {
+    if (command.authorizationScope && (command.decision !== 'allow' || !(approval.preview.authorizationScopes ?? [approval.preview.authorizationScope]).includes(command.authorizationScope))) {
       return await this.recordRejection(command, 'approval_scope_invalid', '当前操作未提供该授权范围。');
     }
     const reply = await this.commitCommand(
@@ -672,6 +713,7 @@ export class SessionActor {
           approvalId: command.approvalId,
           commandId: command.commandId,
           decision: command.decision,
+          source: 'user',
           authorityId: this.#nextId('authority'),
           ...(command.authorizationScope ? { authorizationScope: command.authorizationScope } : {}),
         },
@@ -712,57 +754,7 @@ export class SessionActor {
 
     const events: NewSessionEvent[] = [];
     if (command.response.kind === 'confirm') {
-      const decisionId = this.#nextId('plan-decision');
-      const superseded = planToSupersede(snapshot.state, plan.planId, plan.revision);
-      if (superseded) {
-        events.push({
-          type: 'plan.superseded',
-          sessionId: this.sessionId,
-          runId: command.runId,
-          payload: {
-            planId: superseded.planId,
-            revision: superseded.revision,
-            supersededByPlanId: plan.planId,
-            supersededByRevision: plan.revision,
-          },
-        });
-      }
-      const authorities = planAuthoritiesForConfirmation(
-        plan,
-        this.sessionId,
-        decisionId,
-        this.#nextId,
-      );
-      events.push({
-        type: 'plan.confirmed',
-        sessionId: this.sessionId,
-        runId: command.runId,
-        callId: plan.callId,
-        payload: {
-          planId: plan.planId,
-          revision: plan.revision,
-          commandId: command.commandId,
-          decisionId,
-          authorities,
-        },
-      });
-      const previousTodo = snapshot.state.todoList;
-      const previousPlan = previousTodo && snapshot.state.plans.find((candidate) => (
-        candidate.planId === previousTodo.sourcePlanId && candidate.revision === previousTodo.sourcePlanRevision
-      ));
-      const todoItems = todoItemsForPlan(plan, previousTodo, previousPlan ?? undefined, this.#nextId);
-      events.push({
-        type: snapshot.state.todoList?.sourcePlanId === plan.planId
-          ? 'todo.reconciled'
-          : 'todo.seeded',
-        sessionId: this.sessionId,
-        runId: command.runId,
-        payload: {
-          sourcePlanId: plan.planId,
-          sourcePlanRevision: plan.revision,
-          items: todoItems,
-        },
-      });
+      events.push(...confirmationFacts(snapshot.state, plan, command.commandId, 'user', this.#nextId));
     } else if (command.response.kind === 'requestRevision') {
       const messageId = this.#nextId('message');
       events.push({
@@ -873,11 +865,15 @@ export class SessionActor {
     signal = new AbortController().signal,
   ): Promise<void> {
     const snapshot = await this.loadSnapshot();
+    await this.ensureProcesses(command.runId);
     const result = await runAgentLoop(
       snapshot,
       command,
       {
         composition: this.#composition,
+        syncProcesses: async () => { await this.ensureProcesses(command.runId); await this.#processes?.sync(); },
+        waitProcesses: signal => this.#processes?.wait(signal) ?? Promise.resolve(),
+        readSnapshot: () => this.withWrite(() => this.loadSnapshot()),
         commit: (events) => this.withWrite(async () => {
           const current = await this.loadSnapshot();
           const batch = typeof events === 'function' ? events(current) : Array.isArray(events) ? events : [events];
@@ -892,11 +888,7 @@ export class SessionActor {
           if (!runtime) throw new Error('run_runtime_snapshot_missing');
           const activeView = current.state.runToolViews[runId] ?? runtime;
           const initialSelections = recoveryPluginSelection(current, runId, runtime).pluginSelections ?? [];
-          const previousSelections = current.events.flatMap((event) => (
-            event.type === 'message.committed' && event.runId === runId && event.payload.role === 'user'
-              ? event.payload.pluginSelections ?? [] : []
-          ));
-          const selections = [...new Map([...initialSelections, ...previousSelections, ...queued.flatMap((input) => input.pluginSelections)]
+          const selections = [...new Map([...initialSelections, ...queued.flatMap((input) => input.pluginSelections)]
             .map((selection) => [selection.uri, selection])).values()];
           const events: NewSessionEvent[] = [];
           if (selections.length || activeView.selectedPlugins.plugins.length) {
@@ -975,6 +967,7 @@ export class SessionActor {
     const runtime = snapshot.state.runRuntimeSnapshots[runId];
     if (!runtime || snapshot.state.runRuntimeReleases[runId]) return failure;
     try {
+      await this.closeProcesses();
       await this.#composition.runPreparation.release({
         sessionId: this.sessionId,
         runId,
@@ -1048,11 +1041,37 @@ export class SessionActor {
     await this.finalizeRunRuntime(snapshot, runId, settlement);
   }
 
+  private async ensureProcesses(runId: string): Promise<void> {
+    const snapshot = await this.loadSnapshot();
+    const runtime = snapshot.state.runToolViews[runId] ?? snapshot.state.runRuntimeSnapshots[runId];
+    if (!this.#processes && runtime?.selectedPlugins.plugins.some(plugin => plugin.uri === 'plugin://processes@builtin')) {
+      this.#processes = new ManagedProcesses(this.sessionId, runId, this.#composition.kernel,
+        jobs => this.withWrite(async () => {
+          const current = await this.loadSnapshot();
+          const updates = jobs.filter(job => (current.state.processes[job.jobId]?.revision ?? 0) < job.revision);
+          if (updates.length) await this.appendEvents(updates.map(job => ({type: 'process.updated' as const,
+            sessionId: this.sessionId, runId: runId, callId: job.callId, payload: {job}})), current);
+        }), error => {
+          this.#loopFailure = asError(error);
+          if (this.#active) this.#active.controller.abort(error);
+          else void this.containLoopFailure(runId, error).then(error => { this.#loopFailure = error; });
+        });
+    }
+  }
+
+  private async closeProcesses(): Promise<void> {
+    const processes = this.#processes;
+    this.#processes = undefined;
+    await processes?.close();
+  }
+
   private async finalizeRunRuntime(
     snapshot: LoopSnapshot,
     runId: string,
     settlement: RunSettlement,
   ): Promise<boolean> {
+    await this.closeProcesses();
+    snapshot = await this.loadSnapshot();
     const runtime = snapshot.state.runRuntimeSnapshots[runId];
     if (!runtime) throw new Error('run_runtime_snapshot_missing');
     if (snapshot.state.runRuntimeReleases[runId]) {
@@ -1233,48 +1252,6 @@ function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-function planAuthoritiesForConfirmation(
-  plan: NonNullable<SessionProjection['pendingPlan']>,
-  sessionId: string,
-  decisionId: string,
-  nextId: (kind: string) => string,
-): PlanAuthority[] {
-  const workspaceIds = [...new Set(plan.mutationManifest.map((operation) => operation.workspaceId))];
-  return workspaceIds.map((workspaceId) => ({
-    authorityId: nextId('plan-authority'),
-    planId: plan.planId,
-    revision: plan.revision,
-    decisionId,
-    sessionId,
-    runId: plan.runId,
-    workspaceId,
-    coveredOperations: plan.mutationManifest
-      .filter((operation) => operation.workspaceId === workspaceId)
-      .map((operation) => ({ ...operation })),
-  }));
-}
-
-function planToSupersede(
-  state: LoopSnapshot['state'],
-  nextPlanId: string,
-  nextRevision: number,
-): { planId: string; revision: number } | null {
-  if (state.activePlanRef && (
-    state.activePlanRef.planId !== nextPlanId
-    || state.activePlanRef.revision !== nextRevision
-  )) return { ...state.activePlanRef };
-  const previousRevision = state.plans
-    .filter((candidate) => (
-      candidate.planId === nextPlanId
-      && candidate.revision < nextRevision
-      && (candidate.status === 'confirmed' || candidate.status === 'revisionRequested')
-    ))
-    .sort((left, right) => right.revision - left.revision)[0];
-  return previousRevision
-    ? { planId: previousRevision.planId, revision: previousRevision.revision }
-    : null;
-}
-
 function validInteractionResponse(interaction: InteractionProjection, response: string): boolean {
   if (!response) return false;
   return interaction.allowFreeform || Boolean(interaction.options?.some((option) => (
@@ -1359,10 +1336,14 @@ function recoveryPluginSelection(
     event.type === 'input.accepted'
     && event.payload.messageId === started.payload.inputMessageId
   ));
-  const selections = input?.payload.pluginSelections ?? [];
+  const active = snapshot.state.runToolViews[runId]?.selectedPlugins ?? runtime.selectedPlugins;
+  const selections = active.plugins.map((plugin, index) => (
+    input?.payload.pluginSelections?.find(selection => selection.uri === plugin.uri)
+    ?? { selectionId: `plugin-selection:${runId}:${index}`, uri: plugin.uri, label: plugin.uri.slice(0, 160) }
+  ));
   if (selections.length === 0) return {};
   return {
-    pluginCatalogRevision: runtime.selectedPlugins.catalogRevision,
+    pluginCatalogRevision: active.catalogRevision,
     pluginSelections: selections.map((selection) => ({ ...selection })),
   };
 }

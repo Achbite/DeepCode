@@ -31,6 +31,8 @@ export const CORE_TOOL_ORDER = [
   'browser.page',
   'browser.service',
   'browser.capture',
+  'browser.observe',
+  'computer.control',
 ] as const;
 
 export interface ProviderToolCodec {
@@ -46,6 +48,8 @@ export interface ProviderToolCodec {
 }
 
 interface ProviderMessageToolCodec {
+  /** A rejected model name is replay data, never an executable alias. */
+  rejectedWireName?: string;
   wireByCanonical: ReadonlyMap<string, string>;
   workspaceIdByHandle: ReadonlyMap<string, string>;
   workspaceHandleById: ReadonlyMap<string, string>;
@@ -263,10 +267,21 @@ export function encodeProviderMessage(
   journalCodecsByCallId: ReadonlyMap<string, ProviderMessageToolCodec> = new Map(),
 ): ModelMessage {
   const encoded = cloneModelMessage(message);
+  if (encoded.role === 'tool' && encoded.toolCallId) {
+    const callCodec = journalCodecsByCallId.get(encoded.toolCallId) ?? codec;
+    // These are structured Session results, not model-authored JSON to repair.
+    const result: unknown = JSON.parse(encoded.content);
+    if (isRecord(result)) {
+      for (const key of ['output', 'error']) {
+        if (isRecord(result[key])) result[key] = encodeWorkspaceIdentity(callCodec, result[key] as JsonObject);
+      }
+      encoded.content = JSON.stringify(result);
+    }
+  }
   if (!encoded.toolCalls) return encoded;
   encoded.toolCalls = encoded.toolCalls.map((call) => {
-    const callCodec = journalCodecsByCallId.get(call.callId) ?? codec;
-    const wire = callCodec.wireByCanonical.get(call.name);
+    const callCodec: ProviderMessageToolCodec = journalCodecsByCallId.get(call.callId) ?? codec;
+    const wire = callCodec.rejectedWireName ?? callCodec.wireByCanonical.get(call.name);
     if (!wire) {
       throw new LoopFailure(
         'provider_tool_continuation_unknown',
@@ -324,15 +339,19 @@ export function providerMessageCodecsByCallId(
       currentRequests.set(event.runId, codec);
       continue;
     }
-    const completed = event.type === 'provider.turn.settled' && event.payload.outcome === 'completed';
-    const callIds = event.type === 'provider.turn.settled' && event.payload.outcome === 'completed' ? event.payload.toolCallInputs?.map((call) => call.callId) ?? []
+    // Session grants can outlive edited-away calls; tool.requested owns their codec.
+    if (event.type === 'approval.requested' || event.type === 'approval.resolved') continue;
+    const completion = event.type === 'provider.turn.settled' && event.payload.outcome === 'completed' ? event.payload : undefined;
+    const inputs = completion?.toolCallInputs ?? [];
+    const callIds = completion ? inputs.map((call) => call.callId)
       : 'callId' in event && event.callId ? [event.callId] : [];
     if (!callIds.length || !('runId' in event) || !event.runId) continue;
-    const codec = completed ? requests.get(event.payload.providerRequestId) : currentRequests.get(event.runId);
+    const codec = completion ? requests.get(completion.providerRequestId) : currentRequests.get(event.runId);
     for (const callId of callIds) {
       if (result.has(callId)) continue;
       if (!codec) throw new LoopFailure('provider_tool_call_runtime_missing', `调用缺少请求工具视图：${callId}`);
-      result.set(callId, codec);
+      const rejected = inputs.find((call) => call.callId === callId && call.error?.code === 'provider_tool_alias_unknown');
+      result.set(callId, rejected ? { ...codec, rejectedWireName: rejected.toolName } : codec);
     }
   }
   return result;

@@ -1,4 +1,4 @@
-import { request as httpRequest } from 'node:http';
+import { request as httpRequest, type IncomingMessage } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { Readable } from 'node:stream';
 
@@ -14,9 +14,11 @@ export function postLocalStream(
     const request = target.protocol === 'http:' ? httpRequest
       : target.protocol === 'https:' ? httpsRequest : null;
     if (!request) throw new Error(`local_stream_protocol_invalid:${target.protocol}`);
+    let responseBody: IncomingMessage | undefined;
     const outgoing = request(target, {
-      method: 'POST', headers, signal, agent: false, timeout: 0,
+      method: 'POST', headers, agent: false, timeout: 0,
     }, (incoming) => {
+      responseBody = incoming;
       try {
         const responseHeaders = new Headers();
         for (let index = 0; index < incoming.rawHeaders.length; index += 2) {
@@ -33,7 +35,16 @@ export function postLocalStream(
         reject(error);
       }
     });
+    const abort = () => {
+      const error = new Error('The operation was aborted', { cause: signal.reason });
+      error.name = 'AbortError';
+      responseBody?.destroy(error);
+      outgoing.destroy(error);
+    };
     outgoing.once('error', reject);
-    outgoing.end(body);
+    outgoing.once('close', () => signal.removeEventListener('abort', abort));
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+    else outgoing.end(body);
   });
 }

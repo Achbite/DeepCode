@@ -1,8 +1,10 @@
+import { isManagedProcessSnapshot } from '@deepcode/protocol';
+import { isSessionAuthorizationScope } from '@deepcode/protocol';
+import { permissionSettings } from '@deepcode/protocol';
 import { SESSION_EVENT_VERSION } from '@deepcode/protocol';
 import type { CommandReply, ConversationCommand, NewSessionEvent, SessionEvent } from '@deepcode/protocol';
 import { loopSnapshot, pendingToolRequests, type LoopSnapshot } from './loop.js';
 import { reduceSession } from './reducer.js';
-import { planProgressEvidence } from './planStage.js';
 
 /** New writes are admitted here; replay preserves already-recorded failure facts. */
 export function admitSessionEvents(
@@ -10,7 +12,7 @@ export function admitSessionEvents(
   events: readonly NewSessionEvent[],
   command?: { input: ConversationCommand; reply: Omit<CommandReply, 'revision'> },
 ): void {
-  if (command) admitCommandBatch(command.input, events, command.reply);
+  if (command) admitCommandBatch(current, command.input, events, command.reply);
   let snapshot = current;
   for (const event of events) {
     admitEvent(snapshot, event);
@@ -26,7 +28,7 @@ export function admitSessionEvents(
   }
 }
 
-function admitCommandBatch(command: ConversationCommand, events: readonly NewSessionEvent[], reply: Omit<CommandReply, 'revision'>): void {
+function admitCommandBatch(current: LoopSnapshot, command: ConversationCommand, events: readonly NewSessionEvent[], reply: Omit<CommandReply, 'revision'>): void {
   if (reply.sessionId !== command.sessionId || reply.commandId !== command.commandId
     || events.some((event) => event.sessionId !== command.sessionId)) throw new Error('session_command_identity_mismatch');
   if (reply.status === 'rejected') {
@@ -38,11 +40,10 @@ function admitCommandBatch(command: ConversationCommand, events: readonly NewSes
     || event.type === 'plan.revision.requested' || event.type === 'plan.cancelled')
     && event.payload.planId === command.planId && event.payload.revision === command.revision
     && event.payload.commandId === command.commandId);
-  const todos = events.filter((event) => (event.type === 'todo.seeded' || event.type === 'todo.reconciled')
-    && event.payload.sourcePlanId === command.planId && event.payload.sourcePlanRevision === command.revision);
+  const todos = events.filter(event => event.type === 'todo.updated');
   const expected = { confirm: 'plan.confirmed', requestRevision: 'plan.revision.requested', cancel: 'plan.cancelled' } as const;
   if (decisions.length !== 1 || decisions[0].type !== expected[command.response.kind]
-    || todos.length !== (command.response.kind === 'confirm' ? 1 : 0)) throw new Error('plan_command_event_batch_invalid');
+    || todos.length !== (command.response.kind === 'confirm' && current.state.todoList?.runId !== command.runId ? 1 : 0)) throw new Error('plan_command_event_batch_invalid');
 }
 
 function admitEvent(snapshot: LoopSnapshot, event: NewSessionEvent): void {
@@ -52,7 +53,11 @@ function admitEvent(snapshot: LoopSnapshot, event: NewSessionEvent): void {
   const pendingProvider = state.contextCompositions.some((receipt) => receipt.runId === runId
     && !state.providerTurns[receipt.providerRequestId]);
   const userInput = event.type === 'input.accepted' || event.type === 'message.committed' && event.payload.role !== 'assistant';
-  if (runId && event.type !== 'run.started' && !userInput
+  const revokedGrant = event.type === 'approval.revoked'
+    ? state.shellAuthorizations.find((grant) => grant.authorityId === event.payload.authorityId && grant.runId === event.runId)
+    : undefined;
+  if (event.type === 'approval.revoked' && !revokedGrant) throw new Error('approval_grant_missing');
+  if (runId && event.type !== 'run.started' && !userInput && !(revokedGrant && isSessionAuthorizationScope(revokedGrant.scope))
     && (state.run?.runId !== runId || state.tokenUsageHistory[runId]?.outcome)) {
     throw new Error('session_event_run_not_active');
   }
@@ -87,19 +92,39 @@ function admitEvent(snapshot: LoopSnapshot, event: NewSessionEvent): void {
     case 'tool.requested':
     case 'plan.published':
     case 'session.control.rejected':
+    case 'session.plugins.activated':
       if (!pendingProvider) throw new Error('provider_turn_composition_missing');
       break;
-    case 'todo.seeded':
-    case 'todo.reconciled':
-      if (state.activePlanRef?.planId !== event.payload.sourcePlanId
-        || state.activePlanRef.revision !== event.payload.sourcePlanRevision) throw new Error('todo_source_plan_inactive');
-      break;
-    case 'todo.progressed': {
-      if (event.callId && !pendingProvider) throw new Error('provider_turn_composition_missing');
-      const error = planProgressEvidence(events, event.runId, event.payload.sourceFactRef, event.payload.updates);
-      if (error) throw new Error(error.code);
+    case 'todo.updated': {
+      if (event.callId) {
+        if (!pendingProvider) throw new Error('provider_turn_composition_missing');
+      } else {
+        const confirmed = events.at(-1);
+        const plan = confirmed?.type === 'plan.confirmed' && state.plans.find(plan =>
+          plan.planId === confirmed.payload.planId && plan.revision === confirmed.payload.revision);
+        if (!plan || plan.runId !== runId || state.todoList?.runId === runId
+          || event.payload.items.length !== plan.steps.length
+          || event.payload.items.some((item, index) => item.text !== plan.steps[index].title || item.status !== 'pending')) {
+          throw new Error('todo_initialization_invalid');
+        }
+      }
       break;
     }
+    case 'plan.confirmed':
+      if (event.payload.source === 'agent' && permissionSettings({ ...state.runRuntimeSnapshots[event.runId]?.permissions,
+        ...state.permissionOverrides })['agent.permissions.workspaceMutation'] !== 'allow') throw new Error('plan_delegation_missing');
+      break;
+    case 'approval.resolved':
+      if (event.payload.source === 'agent') {
+        const permissions = permissionSettings({ ...state.runRuntimeSnapshots[event.runId]?.permissions, ...state.permissionOverrides });
+        if (permissions['agent.permissions.shell'] !== 'review'
+          || state.pendingApproval?.preview.approvalReviewer !== 'agent'
+          || state.pendingApproval?.preview.review?.decision !== event.payload.decision
+          || (event.payload.authorizationScope && (event.payload.decision !== 'allow'
+            || event.payload.authorizationScope !== state.pendingApproval?.preview.authorizationScope
+            || !state.pendingApproval.preview.authorizationScopes?.includes(event.payload.authorizationScope)))) throw new Error('approval_delegation_missing');
+      }
+      break;
     case 'plan.superseded':
       if (event.payload.planId === event.payload.supersededByPlanId
         && event.payload.revision === event.payload.supersededByRevision) throw new Error('plan_supersede_invalid');
@@ -133,6 +158,7 @@ function admitEvent(snapshot: LoopSnapshot, event: NewSessionEvent): void {
       if (pendingProvider) throw new Error('provider_turn_still_active');
       const compaction = events.some((item) => item.type === 'context.compaction.requested'
         && item.runId === runId && item.payload.providerRequestId === event.payload.providerRequestId);
+      if (event.payload.purpose === 'approvalReview' && (!state.pendingApproval || event.payload.tools.length)) throw new Error('approval_review_context_invalid');
       if ((event.payload.purpose === 'contextCompaction') !== compaction) throw new Error('context_composition_purpose_mismatch');
       const runtime = state.runRuntimeSnapshots[event.runId];
       const view = state.runToolViews[event.runId] ?? runtime;
@@ -160,6 +186,17 @@ function admitEvent(snapshot: LoopSnapshot, event: NewSessionEvent): void {
     case 'run.runtime.released': {
       const view = state.runToolViews[event.runId] ?? state.runRuntimeSnapshots[event.runId];
       if (event.payload.pluginInstanceRefs.length !== view.selectedPlugins.plugins.length) throw new Error('run_runtime_release_plugin_mismatch');
+      break;
+    }
+    case 'process.updated': {
+      const job = event.payload.job;
+      const request = events.find(item => item.type === 'tool.requested' && item.callId === event.callId && item.runId === event.runId);
+      const previous = state.processes[job.jobId];
+      if (!isManagedProcessSnapshot(job) || job.sessionId !== event.sessionId || job.runId !== event.runId
+        || job.callId !== event.callId || request?.type !== 'tool.requested' || request.payload.toolName !== 'process'
+        || previous && (previous.callId !== job.callId || previous.revision >= job.revision || previous.status !== 'active')) {
+        throw new Error('managed_process_event_invalid');
+      }
       break;
     }
     case 'tool.started':

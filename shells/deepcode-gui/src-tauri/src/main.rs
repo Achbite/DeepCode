@@ -1,25 +1,25 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-#[path = "../../../shared/open_file.rs"]
-mod open_file;
 #[path = "../../../shared/file_reader.rs"]
 mod file_reader;
+#[path = "../../../shared/open_file.rs"]
+mod open_file;
 
-#[path = "../../../shared/native_path_dialog/mod.rs"]
-mod native_path_dialog;
 #[path = "../../../shared/native_browser/mod.rs"]
 mod native_browser;
+#[path = "../../../shared/native_path_dialog/mod.rs"]
+mod native_path_dialog;
 
+use deepcode_host_connection::loopback_http::request_loopback_json;
 use deepcode_kernel_abi::{
     is_valid_host_instance_id, is_valid_host_shell_token, is_valid_host_ui_token,
     HostProcessIdentity, HOST_INSTANCE_ID_ENV, HOST_INSTANCE_ID_PREFIX, HOST_SHELL_TOKEN_ENV,
     HOST_SHELL_TOKEN_HEADER, HOST_SHELL_TOKEN_PREFIX, HOST_TOKEN_ENTROPY_BYTES, HOST_UI_TOKEN_ENV,
     HOST_UI_TOKEN_HEADER, HOST_UI_TOKEN_PREFIX, KERNEL_DAEMON_SERVICE,
 };
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -40,34 +40,27 @@ const APP_ASSET_DIR: &str = "web-deepcode-gui";
 
 struct RuntimeLocations {
     resources: PathBuf,
-    config: PathBuf,
+    user: deepcode_host_connection::UserDirectories,
 }
 
 static RUNTIME_LOCATIONS: OnceLock<RuntimeLocations> = OnceLock::new();
 
 fn initialize_runtime_locations(app: &tauri::App) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    let (resources, distribution) = {
-        let resources = app.path().resource_dir().map_err(std::io::Error::other)?;
-        let bundle = objc2_foundation::NSBundle::mainBundle();
-        let bundle_path = PathBuf::from(bundle.bundlePath().to_string());
-        let distribution = bundle_path.parent().ok_or_else(|| std::io::Error::other("bundle directory is unavailable"))?.to_path_buf();
-        (resources, distribution)
-    };
-    #[cfg(not(target_os = "macos"))]
-    let (resources, distribution) = {
-        let _ = app;
-        let exe_dir = current_exe_dir()
-            .ok_or_else(|| std::io::Error::other("executable directory is unavailable"))?;
-        (exe_dir.clone(), exe_dir)
-    };
-    let config = std::env::var_os("DEEPCODE_CONFIG_DIR").map(PathBuf::from).unwrap_or(distribution);
-    RUNTIME_LOCATIONS.set(RuntimeLocations { resources, config })
+    let _ = app;
+    let executable_dir = current_exe_dir()
+        .ok_or_else(|| std::io::Error::other("executable directory is unavailable"))?;
+    let resources = deepcode_host_connection::runtime_root(&executable_dir);
+    let user = deepcode_host_connection::UserDirectories::resolve()?;
+    user.create()?;
+    RUNTIME_LOCATIONS
+        .set(RuntimeLocations { resources, user })
         .map_err(|_| std::io::Error::other("runtime locations already initialized"))
 }
 
 fn runtime_locations() -> &'static RuntimeLocations {
-    RUNTIME_LOCATIONS.get().expect("Host runtime locations initialized before opening windows")
+    RUNTIME_LOCATIONS
+        .get()
+        .expect("Host runtime locations initialized before opening windows")
 }
 
 struct HostProcessGroup {
@@ -288,21 +281,21 @@ impl Drop for HostProcessGroup {
 
 fn main() {
     let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
-            native_path_dialog::deepcode_pick_path,
-            open_file::deepcode_open_file,
-            file_reader::deepcode_read_local_file,
-            open_file::deepcode_locate_path,
-            deepcode_boot_target,
-            deepcode_default_workspace_path,
-            deepcode_host_startup_status,
-            deepcode_start_kernel_after_permission,
-            deepcode_window_minimize,
-            deepcode_window_toggle_maximize,
-            deepcode_window_close,
-            deepcode_open_external_url,
-            native_browser::deepcode_browser_host,
-            native_browser::deepcode_browser_command
-            ];
+        native_path_dialog::deepcode_pick_path,
+        open_file::deepcode_open_file,
+        file_reader::deepcode_read_local_file,
+        open_file::deepcode_locate_path,
+        deepcode_boot_target,
+        deepcode_default_workspace_path,
+        deepcode_host_startup_status,
+        deepcode_start_kernel_after_permission,
+        deepcode_window_minimize,
+        deepcode_window_toggle_maximize,
+        deepcode_window_close,
+        deepcode_open_external_url,
+        native_browser::deepcode_browser_host,
+        native_browser::deepcode_browser_command
+    ];
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .register_uri_scheme_protocol(APP_ASSET_SCHEME, |_ctx, request| {
@@ -310,7 +303,9 @@ fn main() {
         })
         .invoke_handler(move |invoke| {
             if invoke.message.webview_ref().label() != "main" {
-                invoke.resolver.reject("Host commands belong to the primary GUI view.");
+                invoke
+                    .resolver
+                    .reject("Host commands belong to the primary GUI view.");
                 return true;
             }
             handler(invoke)
@@ -322,18 +317,66 @@ fn main() {
             let registration = Arc::clone(&host_tokens.browser_registration);
             let browser_id = host_tokens.browser_instance_id.clone();
             let callback_token = host_tokens.browser_token.clone();
-            host_tokens.browser_endpoint = native_browser::start(app.handle(), host_tokens.browser_instance_id.clone(), host_tokens.browser_token.clone(), host_bootstrap_script(&target, &host_tokens, true), Box::new(move || {
-                if let Ok(mut registration) = registration.lock() {
-                    if let Some((host,port,token,endpoint)) = registration.take() {
-                        let _ = register_native_browser(&host,&port,&token,&browser_id,&endpoint,&callback_token,true);
+            host_tokens.browser_endpoint = native_browser::start(
+                app.handle(),
+                runtime_locations().user.clone(),
+                host_tokens.browser_instance_id.clone(),
+                host_tokens.browser_token.clone(),
+                host_bootstrap_script(&target, &host_tokens, true),
+                Box::new(move || {
+                    if let Ok(mut registration) = registration.lock() {
+                        if let Some((host, port, token, endpoint)) = registration.take() {
+                            let _ = register_native_browser(
+                                &host,
+                                &port,
+                                &token,
+                                &browser_id,
+                                &endpoint,
+                                &callback_token,
+                                true,
+                            );
+                        }
                     }
-                }
-            })).map_err(std::io::Error::other)?;
+                }),
+            )
+            .map_err(std::io::Error::other)?;
             app.manage(target.clone());
             app.manage(host_tokens.clone());
             app.manage(HostProcessGroup::new(None));
             app.manage(HostStartupStatusStore::new());
             create_main_window(app, &target, &host_tokens)?;
+            let menu = tauri::menu::Menu::default(app.handle())?;
+            let reload = tauri::menu::MenuItem::with_id(
+                app,
+                "reload-interface",
+                "重新加载界面",
+                true,
+                Some("CmdOrCtrl+Shift+R"),
+            )?;
+            let mut added = false;
+            for item in menu.items()? {
+                if let tauri::menu::MenuItemKind::Submenu(submenu) = item {
+                    if submenu.text()? == "View" {
+                        submenu.insert(&reload, 0)?;
+                        added = true;
+                        break;
+                    }
+                }
+            }
+            if !added {
+                menu.append(&tauri::menu::Submenu::with_items(
+                    app,
+                    "视图",
+                    true,
+                    &[&reload],
+                )?)?;
+            }
+            app.set_menu(menu)?;
+            app.on_menu_event(|app, event| {
+                if event.id().as_ref() == "reload-interface" {
+                    let _ = tauri::Emitter::emit_to(app, "main", "deepcode:reload-interface", ());
+                }
+            });
             // Actual Host I/O reports access failures. Do not enumerate parent
             // directories before startup or block the native window event loop.
             let app_handle = app.handle().clone();
@@ -381,7 +424,7 @@ struct HostConnectionTokens {
     browser_endpoint: String,
     browser_instance_id: String,
     browser_token: String,
-    browser_registration: Arc<Mutex<Option<(String,String,String,String)>>>,
+    browser_registration: Arc<Mutex<Option<(String, String, String, String)>>>,
 }
 
 impl HostConnectionTokens {
@@ -621,6 +664,7 @@ fn create_main_window(
     let boot_url = format!("{APP_ASSET_SCHEME}://localhost/index.html");
     let initialization_script = host_bootstrap_script(target, host_tokens, false);
     let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(boot_url.parse()?))
+        .data_directory(runtime_locations().user.cache_dir.join("webview"))
         .initialization_script(initialization_script)
         .on_navigation(trusted_app_navigation)
         .title("DeepCode-GUI")
@@ -647,7 +691,11 @@ fn create_main_window(
     Ok(())
 }
 
-fn host_bootstrap_script(target: &LaunchTarget, host_tokens: &HostConnectionTokens, preview: bool) -> String {
+fn host_bootstrap_script(
+    target: &LaunchTarget,
+    host_tokens: &HostConnectionTokens,
+    preview: bool,
+) -> String {
     let bootstrap = serde_json::json!({
         "schemaVersion":"deepcode.host-ui-bootstrap", "host":target.host, "port":target.port.to_string(),
         "uiToken":host_tokens.ui_token(), "windowChrome":if cfg!(target_os="macos") && !preview {"nativeOverlay"} else {"custom"}
@@ -678,7 +726,8 @@ fn serve_bundled_asset(web_dir_name: &str, request: Request<Vec<u8>>) -> Respons
 }
 
 fn resolve_asset_path(web_dir_name: &str, uri_path: &str) -> Result<PathBuf, String> {
-    let web_root = std::env::var_os("DEEPCODE_CLIENT_DIST").map(PathBuf::from)
+    let web_root = std::env::var_os("DEEPCODE_CLIENT_DIST")
+        .map(PathBuf::from)
         .unwrap_or_else(|| runtime_locations().resources.join(web_dir_name));
     let requested = uri_path.trim_start_matches('/');
     let relative = if requested.is_empty() {
@@ -903,15 +952,25 @@ fn spawn_host_processes_if_available(
     if processes.is_shutting_down() {
         return Err(startup_stopped_failure());
     }
-    let _start_lock = acquire_kernel_start_lock(&target.host, &target.port).ok_or_else(|| {
-        startup_failure(
-            "startAdmission",
-            "host_startup_lock_unavailable",
-            None,
-            "Another Host startup attempt owns the startup lock.",
-            true,
-        )
-    })?;
+    let _start_lock = acquire_kernel_start_lock(&target.host, &target.port)
+        .map_err(|error| {
+            startup_failure(
+                "startAdmission",
+                "host_startup_lock_failed",
+                None,
+                format!("Host startup lock failed: {error}"),
+                true,
+            )
+        })?
+        .ok_or_else(|| {
+            startup_failure(
+                "startAdmission",
+                "host_startup_lock_unavailable",
+                None,
+                "Another Host startup attempt owns the startup lock.",
+                true,
+            )
+        })?;
     status.update(
         attempt_id,
         "starting",
@@ -956,9 +1015,9 @@ fn spawn_host_processes_if_available(
             })?;
     let daemon_dir = parent_dir(&daemon_path).unwrap_or_else(|| exe_dir.clone());
     let proxy_dir = parent_dir(&proxy_path).unwrap_or_else(|| exe_dir.clone());
-    let config_root = runtime_locations().config.clone();
+    let data_root = runtime_locations().user.data_dir.clone();
 
-    let shared_start_guard = deepcode_host_connection::HostStartGuard::acquire(&config_root)
+    let shared_start_guard = deepcode_host_connection::HostStartGuard::acquire(&data_root)
         .map_err(|error| {
             startup_failure(
                 "sharedHost",
@@ -968,17 +1027,17 @@ fn spawn_host_processes_if_available(
                 true,
             )
         })?;
-    let config_root = config_root.canonicalize().map_err(|error| {
+    let data_root = data_root.canonicalize().map_err(|error| {
         startup_failure(
             "sharedHost",
-            "host_config_root_invalid",
+            "host_data_root_invalid",
             None,
             error.to_string(),
             false,
         )
     })?;
     let shared =
-        deepcode_host_connection::LocalHostConnection::discover(&config_root).map_err(|error| {
+        deepcode_host_connection::LocalHostConnection::discover(&data_root).map_err(|error| {
             startup_failure(
                 "sharedHost",
                 "host_connection_discovery_failed",
@@ -1001,7 +1060,8 @@ fn spawn_host_processes_if_available(
         host_tokens.instance_id = connection.identity.instance_id.clone();
     }
 
-    let web_dir = std::env::var_os("DEEPCODE_CLIENT_DIST").map(PathBuf::from)
+    let web_dir = std::env::var_os("DEEPCODE_CLIENT_DIST")
+        .map(PathBuf::from)
         .unwrap_or_else(|| runtime_locations().resources.join(APP_ASSET_DIR));
 
     let (mut daemon, daemon_identity) = if let Some(connection) = shared {
@@ -1039,11 +1099,13 @@ fn spawn_host_processes_if_available(
             return Err(startup_stopped_failure());
         }
         let mut daemon_command = Command::new(daemon_path);
+        runtime_locations()
+            .user
+            .configure_child(&mut daemon_command);
         daemon_command
             .current_dir(&daemon_dir)
             .env("DEEPCODE_HOST", &target.host)
             .env("DEEPCODE_PORT", &target.daemon_port)
-            .env("DEEPCODE_CONFIG_DIR", config_root)
             .env("DEEPCODE_RUNTIME_DIR", &runtime_locations().resources)
             .env_remove(HOST_UI_TOKEN_ENV)
             .env(HOST_SHELL_TOKEN_ENV, host_tokens.daemon_token())
@@ -1134,11 +1196,23 @@ fn spawn_host_processes_if_available(
         (Some(daemon), daemon_identity)
     };
 
-    if let Err(message) = register_native_browser(&target.host,&target.daemon_port,host_tokens.daemon_token(),
-        &host_tokens.browser_instance_id,&host_tokens.browser_endpoint,&host_tokens.browser_token,false) {
+    if let Err(message) = register_native_browser(
+        &target.host,
+        &target.daemon_port,
+        host_tokens.daemon_token(),
+        &host_tokens.browser_instance_id,
+        &host_tokens.browser_endpoint,
+        &host_tokens.browser_token,
+        false,
+    ) {
         eprintln!("[native-browser] {message}");
     } else if let Ok(mut registration) = host_tokens.browser_registration.lock() {
-        *registration=Some((target.host.clone(),target.daemon_port.clone(),host_tokens.daemon.clone(),host_tokens.browser_endpoint.clone()));
+        *registration = Some((
+            target.host.clone(),
+            target.daemon_port.clone(),
+            host_tokens.daemon.clone(),
+            host_tokens.browser_endpoint.clone(),
+        ));
     }
     status.update(
         attempt_id,
@@ -1376,8 +1450,7 @@ fn startup_stopped_failure() -> HostStartupFailure {
 }
 
 fn prepare_host_startup_diagnostics(attempt_id: &str) -> std::io::Result<HostDiagnosticAttempt> {
-    let base = &runtime_locations().config;
-    let root = base.join("diagnostics").join("host-startup");
+    let root = runtime_locations().user.log_dir.join("host-startup");
     let directory = root.join(attempt_id);
     std::fs::create_dir_all(&directory)?;
     set_private_directory_permissions(&root)?;
@@ -1445,43 +1518,52 @@ impl Drop for KernelStartLock {
     }
 }
 
-fn acquire_kernel_start_lock(host: &str, port: &str) -> Option<KernelStartLock> {
-    let path = std::env::temp_dir().join(format!(
+fn acquire_kernel_start_lock(host: &str, port: &str) -> std::io::Result<Option<KernelStartLock>> {
+    let path = runtime_locations().user.temp_dir.join(format!(
         "deepcode-kernel-start-{}-{}.lock",
         sanitize_lock_component(host),
         sanitize_lock_component(port)
     ));
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
+    let create = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+    };
+    let result = match create() {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if kernel_start_lock_is_stale(&path)? {
+                std::fs::remove_file(&path)?;
+                create()
+            } else {
+                Err(error)
+            }
+        }
+        result => result,
+    };
+    match result {
         Ok(mut file) => {
-            let _ = std::io::Write::write_all(
+            let lock = KernelStartLock { path };
+            std::io::Write::write_all(
                 &mut file,
                 format!("pid={}\n", std::process::id()).as_bytes(),
-            );
-            Some(KernelStartLock { path })
+            )?;
+            Ok(Some(lock))
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if kernel_start_lock_is_stale(&path) {
-                let _ = std::fs::remove_file(&path);
-                return acquire_kernel_start_lock(host, port);
-            }
             wait_for_kernel_listener(host, port, 40);
-            None
+            Ok(None)
         }
-        Err(_) => None,
+        Err(error) => Err(error),
     }
 }
 
-fn kernel_start_lock_is_stale(path: &Path) -> bool {
+fn kernel_start_lock_is_stale(path: &Path) -> std::io::Result<bool> {
     std::fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.elapsed().ok())
+        .and_then(|metadata| metadata.modified())?
+        .elapsed()
         .map(|age| age > Duration::from_secs(30))
-        .unwrap_or(false)
+        .map_err(std::io::Error::other)
 }
 
 fn sanitize_lock_component(value: &str) -> String {
@@ -1670,7 +1752,7 @@ fn matching_public_identity(
     expected_pid: u32,
 ) -> Option<HostProcessIdentity> {
     let request = http_request(host, port, "GET", "/api/host/identity", &[]);
-    let Some(envelope) =
+    let Ok(envelope) =
         request_loopback_json::<HostApiEnvelope<HostProcessIdentity>>(host, port, &request, 300)
     else {
         return None;
@@ -1697,7 +1779,7 @@ fn authenticated_health_status(
     token: &str,
 ) -> AuthenticatedHealthStatus {
     let request = http_request(host, port, "GET", "/api/health", &[(token_header, token)]);
-    let Some(envelope) =
+    let Ok(envelope) =
         request_loopback_json::<HostApiEnvelope<HostHealthData>>(host, port, &request, 500)
     else {
         return AuthenticatedHealthStatus::Unavailable;
@@ -1734,42 +1816,40 @@ fn http_request(
     request
 }
 
-fn register_native_browser(host:&str,port:&str,token:&str,id:&str,endpoint:&str,callback_token:&str,remove:bool)->Result<(),String> {
-    let body=serde_json::json!({"hostInstanceId":id,"endpoint":endpoint,"callbackToken":callback_token,"remove":remove}).to_string();
-    let request=http_request(host,port,"POST","/api/host/native-browser",&[(HOST_SHELL_TOKEN_HEADER,token),("Content-Type","application/json")])
-        .replace("Content-Length: 0",&format!("Content-Length: {}",body.len())) + &body;
-    let response:serde_json::Value=request_loopback_json(host,port,&request,6000).ok_or("Native browser registration connection failed.")?;
-    if response["ok"]==true {Ok(())} else {Err(response["message"].as_str().unwrap_or("Native browser registration failed.").into())}
-}
-
-fn request_loopback_json<T: DeserializeOwned>(
+fn register_native_browser(
     host: &str,
     port: &str,
-    request: &str,
-    read_timeout_millis: u64,
-) -> Option<T> {
-    let port_number = port.parse::<u16>().ok()?;
-    let addrs = (host, port_number).to_socket_addrs().ok()?;
-    addrs.into_iter().find_map(|addr| {
-        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(180)).ok()?;
-        stream
-            .set_read_timeout(Some(Duration::from_millis(read_timeout_millis)))
-            .ok()?;
-        stream
-            .set_write_timeout(Some(Duration::from_millis(300)))
-            .ok()?;
-        stream.write_all(request.as_bytes()).ok()?;
-        let mut response = Vec::with_capacity(4096);
-        stream.take(64 * 1024).read_to_end(&mut response).ok()?;
-        if !response.starts_with(b"HTTP/1.1 200") {
-            return None;
-        }
-        let body_offset = response
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .map(|offset| offset + 4)?;
-        serde_json::from_slice(&response[body_offset..]).ok()
-    })
+    token: &str,
+    id: &str,
+    endpoint: &str,
+    callback_token: &str,
+    remove: bool,
+) -> Result<(), String> {
+    let body=serde_json::json!({"hostInstanceId":id,"endpoint":endpoint,"callbackToken":callback_token,"remove":remove}).to_string();
+    let request = http_request(
+        host,
+        port,
+        "POST",
+        "/api/host/native-browser",
+        &[
+            (HOST_SHELL_TOKEN_HEADER, token),
+            ("Content-Type", "application/json"),
+        ],
+    )
+    .replace(
+        "Content-Length: 0",
+        &format!("Content-Length: {}", body.len()),
+    ) + &body;
+    let response: serde_json::Value = request_loopback_json(host, port, &request, 6000)
+        .map_err(|error| format!("Native browser registration connection failed: {error}"))?;
+    if response["ok"] == true {
+        Ok(())
+    } else {
+        Err(response["message"]
+            .as_str()
+            .unwrap_or("Native browser registration failed.")
+            .into())
+    }
 }
 
 fn admit_private_host_ports(

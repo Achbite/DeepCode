@@ -1,4 +1,3 @@
-import React from 'react';
 import type { UiLanguage } from '../../i18n';
 import ThemeLibrarySettings from './ThemeLibrarySettings';
 import GuiFontSettings from './GuiFontSettings';

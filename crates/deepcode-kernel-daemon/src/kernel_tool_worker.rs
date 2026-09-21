@@ -34,7 +34,10 @@ pub(crate) fn run() -> Result<(), String> {
             if tool_id != "bash" && !tool_id.starts_with("fs.") {
                 return Err("WSL worker accepts workspace filesystem and Bash tools only.".into());
             }
-            invocation.input.validate().map_err(|error| error.to_string())?;
+            invocation
+                .input
+                .validate()
+                .map_err(|error| error.to_string())?;
             let cancellation = context.cancellation.clone();
             context.progress = KernelProgressSink::new(|progress| {
                 let _ = write_frame(&WorkerFrame::Progress { progress });
@@ -79,6 +82,23 @@ pub(crate) fn run() -> Result<(), String> {
                         target.path = translate(&target.path.to_string_lossy())?.into();
                     }
                 }
+                for path in context
+                    .file_access
+                    .read
+                    .iter_mut()
+                    .chain(&mut context.file_access.read_only)
+                {
+                    *path = translate(&path.to_string_lossy())?.into();
+                }
+                for target in &mut context.file_access.write {
+                    target.path = translate(&target.path.to_string_lossy())?.into();
+                }
+                context.file_access.home = context
+                    .file_access
+                    .home
+                    .as_ref()
+                    .map(|path| translate(&path.to_string_lossy()).map(PathBuf::from))
+                    .transpose()?;
                 let registry = KernelToolRegistry::new();
                 let executors = KernelExecutorRegistry::from_executors(builtin_executors(
                     &registry,

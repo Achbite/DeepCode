@@ -1,3 +1,4 @@
+import { requestInterfaceReload } from '../../services/interfaceReload';
 import React, { useSyncExternalStore } from 'react';
 import { t, activeT } from '../../i18n';
 import { useUiLanguage } from '../../useUiLanguage';
@@ -13,7 +14,7 @@ export function InterfaceUpdateNotice() {
       <span>{t(language, 'interfaceUpdate.saveFirst')}</span>
       {update.error && <details><summary>{t(language, 'interfaceUpdate.details')}</summary><pre>{update.error}</pre></details>}
     </div>
-    <button type="button" onClick={() => window.location.reload()}>{t(language, 'interfaceUpdate.reload')}</button>
+    <button type="button" onClick={() => requestInterfaceReload()}>{t(language, 'interfaceUpdate.reload')}</button>
   </aside>;
 }
 
@@ -27,7 +28,7 @@ export class InterfaceLoadBoundary extends React.Component<{ children: React.Rea
     return <section className="interface-load-error" role="alert">
       <h3>{activeT('interfaceUpdate.failed')}</h3><p>{activeT('interfaceUpdate.saveFirst')}</p>
       <pre>{this.state.error.message}</pre>
-      <button type="button" onClick={() => window.location.reload()}>{activeT('interfaceUpdate.reload')}</button>
+      <button type="button" onClick={() => requestInterfaceReload()}>{activeT('interfaceUpdate.reload')}</button>
     </section>;
   }
 }

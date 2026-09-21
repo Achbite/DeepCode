@@ -12,6 +12,7 @@ deepcode-kernel-abi.workspace = true
 deepcode-kernel-tools.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, features = ["gzip", "brotli", "deflate"] }
+notify = "=8.2.0"
 encoding_rs = "0.8"
 htmd = "=0.2.2"
 serde.workspace = true

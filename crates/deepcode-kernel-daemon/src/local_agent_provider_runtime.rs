@@ -228,6 +228,17 @@ mod tests {
     fn session_override_reaches_the_provider_body_without_mutating_the_profile_or_enabling_thinking(
     ) {
         let configured = ResolvedLlmProfile {
+            connection: crate::model_connections::ModelConnection {
+                id: "connection:test".into(),
+                name: "Test".into(),
+                adapter_id: "openai".into(),
+                billing_mode: "metered".into(),
+                base_url: "https://api.openai.com/v1".into(),
+                credential_kind: "apiKey".into(),
+                credential_ref: None,
+            },
+            account_id: None,
+            image_input: false,
             kind: "openaiCompatible".into(),
             provider_flavor: Some("deepseek".into()),
             base_url: None,
@@ -246,7 +257,6 @@ mod tests {
             &[serde_json::from_value(json!({"role":"user","content":"Inspect source."})).unwrap()],
             &[],
             true,
-            false,
         );
         assert_eq!(body["reasoning_effort"], "low");
         assert_eq!(configured.reasoning_effort.as_deref(), Some("max"));

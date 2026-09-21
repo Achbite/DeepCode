@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { PERMISSION_DEFAULTS } from '../../protocol/dist/index.js';
 import { SessionActor, sessionControlToolDefinitions } from '../dist/index.js';
 
 export const workspaceBinding = {
@@ -41,6 +42,7 @@ export function fakeRunPreparation(options = {}) {
         prepared.push(structuredClone(request));
         const snapshot = runtimeSnapshot(request.runId, {
           environment: options.environment,
+          permissions: options.permissions,
           profileId: request.profileId ?? options.profileId ?? 'profile:default',
           contextWindowTokens: options.contextWindowTokens,
           maxOutputTokens: options.maxOutputTokens,
@@ -52,6 +54,11 @@ export function fakeRunPreparation(options = {}) {
           reasoningEffort: request.reasoningEffortOverride ?? options.reasoningEffort,
           reasoningEffortOverride: request.reasoningEffortOverride,
         });
+        snapshot.selectedPlugins.plugins = (request.pluginSelections ?? []).map(selection => ({
+          uri: selection.uri, pluginArtifactRef: `artifact:${selection.uri}`,
+          pluginInstanceRef: `instance:${selection.uri}`, extensionGenerationRef: snapshot.extensionGenerationRef,
+          capabilityRefs: [],
+        }));
         snapshots.push(structuredClone(snapshot));
         return { runtimeSnapshot: snapshot };
       },
@@ -94,6 +101,7 @@ export function runtimeSnapshot(runId, options = {}) {
     }));
   return {
     runRuntimeSnapshotRef: `runtime-snapshot:${runId}`,
+    permissions: { ...PERMISSION_DEFAULTS, ...options.permissions },
     extensionGenerationRef: 'extension-generation:g1',
     kernelCatalogSnapshotRef: `kernel-catalog:${runId}`,
     provider,
@@ -122,6 +130,7 @@ export function emptyKernel(overrides = {}) {
     async execute() { throw new Error('unexpected_tool_execution'); },
     async cancel(callId, attemptId) { return cancelNotFound(callId, attemptId); },
     async readRecord() { return null; },
+    async readProcesses() { throw new Error('unexpected_process_read'); },
     ...overrides,
   };
 }
@@ -217,14 +226,13 @@ export function cancelNotFound(callId, attemptId) {
   };
 }
 
-export function* planProgressEvents(request, status = 'completed', native = false) {
-  const tool = request.tools.find((candidate) => candidate.inputSchema?.properties?.sourceFactRef);
+export function* todoUpdateEvents(request, status = 'completed', native = false) {
+  const tool = request.tools.find((candidate) => candidate.inputSchema?.properties?.items);
   const payloads = request.messages.map(jsonMessagePayload);
   const todo = payloads.findLast((payload) => payload?.type === 'todo.current');
-  const record = payloads.findLast((payload) => payload?.recordId);
-  assert.ok(tool && todo && record, 'progress requires the control, current Todo and real tool result');
+  assert.ok(tool && todo, 'progress uses the control and current Todo without execution evidence');
   const callId = `provider-call:progress:${request.requestId}`;
-  const input = { sourceFactRef: record.recordId, updates: todo.items.map((item) => ({ todoId: item.todoId, status })) };
+  const input = { items: todo.items.map((item) => ({ text: item.text, status })) };
   yield native
     ? providerEvent(request.requestId, 'output.item.completed', { outputIndex: 0,
       item: { type: 'function_call', call_id: callId, name: tool.name, arguments: JSON.stringify(input), status: 'completed' } })

@@ -1,17 +1,25 @@
 use super::*;
 
 pub(super) fn invocation(id: impl Into<String>, tool: &str, input: Value) -> KernelToolInvocation {
+    // Execution mode/scope are prepared Kernel facts, not Provider input.
+    let input: KernelCanonicalInvocation = if matches!(tool, "bash" | "powershell") {
+        serde_json::from_value(serde_json::json!({"toolId": tool, "arguments": input})).unwrap()
+    } else {
+        KernelToolRegistry::default()
+            .canonicalize(tool, input)
+            .unwrap()
+    };
+    input.validate().unwrap();
     KernelToolInvocation {
         id: id.into(),
-        input: KernelToolRegistry::default()
-            .canonicalize(tool, input)
-            .unwrap(),
+        input,
     }
 }
 
 #[cfg(unix)]
 fn shell_executor() -> ConfiguredShellExecutor {
     ConfiguredShellExecutor {
+        temporary_root: None,
         program: Some(
             crate::shell_environment::discover("bash").expect("fixture Bash environment"),
         ),
@@ -167,6 +175,7 @@ fn context_with_target(root: &Path, relative_path: &str) -> KernelToolExecutionC
         workspace_root: Some(canonical_root.to_string_lossy().to_string()),
         workspace_id: Some("workspace:test".to_string()),
         workspace_write_targets: None,
+        file_access: crate::file_access::FileAccessScope::workspace(&canonical_root).unwrap(),
         private_resolved_targets: vec![canonical_root
             .join(relative_path)
             .to_string_lossy()
@@ -372,12 +381,8 @@ fn cancelled_child_is_reaped_before_wait_returns() {
     let cancellation = KernelCancellationToken::default();
     cancellation.cancel();
 
-    let (_status, timed_out, cancelled) = wait_for_bounded_child(
-        &mut child,
-        std::time::Duration::from_secs(30),
-        &cancellation,
-    )
-    .expect("cancel and reap child");
+    let (_status, timed_out, cancelled) =
+        wait_for_bounded_child(&mut child, None, &cancellation).expect("cancel and reap child");
     assert!(!timed_out);
     assert!(cancelled);
     assert!(child.try_wait().expect("poll reaped child").is_some());
@@ -423,9 +428,9 @@ fn bash_executes_in_the_bound_workspace_and_reports_environment() {
     );
     assert_eq!(
         result.output["environment"]["writeScope"],
-        "workspaceAndKernelTemporary"
+        "authorizedResources"
     );
-    assert_eq!(result.output["environment"]["homeWritable"], false);
+    assert_eq!(result.output["environment"]["homeWritable"], true);
     assert_eq!(result.output["environment"]["networkAccess"], false);
     assert_eq!(
         fs::read_to_string(workspace.0.join("build/generated.txt")).unwrap(),
@@ -458,7 +463,7 @@ fn bash_cleans_its_owned_temporary_directory() {
     assert_eq!(result.output["workspaceMode"], "read");
     assert_eq!(
         result.output["environment"]["writeScope"],
-        "kernelTemporaryOnly"
+        "authorizedResources"
     );
     assert_eq!(result.output["environment"]["networkAccess"], false);
     let temporary = result.output["stdout"]
@@ -563,6 +568,83 @@ fn bash_host_scope_reports_the_host_execution_boundary() {
     assert_eq!(result.output["environment"]["writeScope"], "hostUser");
     assert_eq!(result.output["environment"]["homeWritable"], true);
     assert_eq!(result.output["environment"]["networkAccess"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn host_shell_pipe_and_pty_share_owned_temp_lifetime() {
+    for (terminal, exit_code) in [(false, 0), (true, 7)] {
+        let workspace = TempWorkspace::new("host-shell-owned-temp");
+        let mut arguments = serde_json::json!({
+            "command": format!("test \"$TMPDIR\" = \"$TMP\" && test \"$TMPDIR\" = \"$TEMP\" || exit 99; printf temporary > \"$TMPDIR/owned.txt\"; printf '%s' \"$TMPDIR\"; exit {exit_code}"),
+            "workspaceMode": "read", "executionScope": "host", "timeout": 5
+        });
+        if terminal {
+            arguments["terminal"] = serde_json::json!({"stdin": ""});
+        }
+        let result = shell_executor()
+            .invoke(
+                invocation("host-temp", "bash", arguments),
+                context_with_target(&workspace.0, "."),
+            )
+            .unwrap();
+        assert_eq!(result.output["exitCode"], exit_code);
+        assert_eq!(result.output["terminal"], terminal);
+        let temporary = result.output["stdout"].as_str().unwrap();
+        assert!(temporary.contains("deepcode-agent-shell-"), "{temporary}");
+        assert!(!Path::new(temporary).exists());
+        if exit_code != 0 {
+            assert_eq!(result.error.unwrap().code, "bash_exit_nonzero");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn host_shell_cancellation_releases_pipe_and_pty_temporary_directories() {
+    for terminal in [false, true] {
+        let workspace = TempWorkspace::new("host-shell-cancel-temp");
+        let mut context = context_with_target(&workspace.0, ".");
+        let cancellation = context.cancellation.clone();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = captured.clone();
+        context.progress = KernelProgressSink::new(move |event| {
+            if let KernelToolProgress::Output { bytes, .. } = event {
+                let mut captured = output.lock().unwrap();
+                captured.extend(bytes);
+                if captured.last() == Some(&b'\n')
+                    && String::from_utf8_lossy(&captured).contains("deepcode-agent-shell-")
+                {
+                    cancellation.cancel();
+                }
+            }
+        });
+        let mut arguments = serde_json::json!({
+            "command": "printf temporary > \"$TMPDIR/owned.txt\"; printf '%s\\n' \"$TMPDIR\"; sleep 20",
+            "workspaceMode": "read", "executionScope": "host", "timeout": 5
+        });
+        if terminal {
+            arguments["terminal"] = serde_json::json!({"stdin": ""});
+        }
+        let result = shell_executor()
+            .invoke(invocation("host-cancel", "bash", arguments), context)
+            .unwrap();
+        assert_eq!(result.outcome, KernelToolExecutionOutcome::Failed);
+        assert_eq!(result.error.unwrap().code, "tool_execution_cancelled");
+        assert_eq!(result.output["success"], false);
+        let archive = result.output["fullOutput"]["stdout"]["path"]
+            .as_str()
+            .unwrap();
+        assert!(fs::read_to_string(archive)
+            .unwrap()
+            .contains("deepcode-agent-shell-"));
+        let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        let temporary = output
+            .lines()
+            .find(|line| line.contains("deepcode-agent-shell-"))
+            .expect("owned directory emitted before cancellation");
+        assert!(!Path::new(temporary).exists());
+    }
 }
 
 #[cfg(unix)]
@@ -784,5 +866,55 @@ fn fs_read_distinguishes_missing_metadata_from_a_directory() {
             }
             error => panic!("unexpected read error: {error}"),
         }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_deadline_and_cancellation_retain_logs_and_stop_execution() {
+    for timed_out in [false, true] {
+        let workspace = TempWorkspace::new("shell-stop-archive");
+        let mut context = context_with_target(&workspace.0, ".");
+        let cancel = context.cancellation.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        context.progress = KernelProgressSink::new(move |event| {
+            if matches!(event, KernelToolProgress::Output { .. }) {
+                let _ = send.send(());
+            }
+        });
+        let mut input = serde_json::json!({"command":"printf started; trap '' TERM; sleep 30", "executionScope":"host"});
+        if timed_out {
+            input["timeout"] = serde_json::json!(1);
+        }
+        let started = std::time::Instant::now();
+        let task = std::thread::spawn(move || {
+            shell_executor().invoke(invocation("stop-archive", "bash", input), context)
+        });
+        receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("execution output");
+        if !timed_out {
+            cancel.cancel();
+        }
+        let result = task.join().unwrap().unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "termination must be bounded even if TERM is ignored"
+        );
+        assert_eq!(result.output["success"], false);
+        assert_eq!(result.output["timedOut"], timed_out);
+        assert_eq!(
+            result.error.unwrap().code,
+            if timed_out {
+                "bash_timed_out"
+            } else {
+                "tool_execution_cancelled"
+            }
+        );
+        assert_eq!(result.output["stdout"], "started");
+        let path = result.output["fullOutput"]["stdout"]["path"]
+            .as_str()
+            .unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "started");
     }
 }

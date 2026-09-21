@@ -38,10 +38,12 @@ export function errorFact(error: unknown): LocalAgentError {
       }) } : {}) } };
 }
 
-/** A completed Provider response could not be interpreted; its completion is known. */
+/** The Provider completed before interpretation, persistence, or cleanup failed. */
 export class ProviderCompletedFailure extends LoopFailure {
-  constructor(code: string, message: string) {
-    super(code, message);
+  constructor(error: unknown) {
+    const failure = errorFact(error);
+    super(failure.code, failure.message, failure.diagnostics);
     this.name = 'ProviderCompletedFailure';
+    this.cause = error;
   }
 }

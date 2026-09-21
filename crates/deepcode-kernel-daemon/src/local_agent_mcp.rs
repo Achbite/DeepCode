@@ -3,12 +3,15 @@ use crate::local_agent_first_party_plugins::{
     self, FirstPartyPluginDescriptor, FirstPartyToolBinding, FirstPartyToolDescriptor,
     FirstPartyToolEffect,
 };
+use deepcode_host_connection::process::{
+    spawn_owned_host_process, terminate_owned_process_tree_checked, OwnedHostProcess,
+};
 use deepcode_kernel_runtime::executors::{KernelCancellationToken, KernelToolExecutionContext};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -824,7 +827,7 @@ impl McpClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let child = command.spawn().map_err(|error| {
+        let child = spawn_owned_host_process(&mut command).map_err(|error| {
             McpRuntimeError::new(
                 "mcp_server_spawn_failed",
                 format!("启动 MCP Server {} 失败：{error}", server.id),
@@ -837,14 +840,13 @@ impl McpClient {
         let stdout = starting.child_mut().stdout.take().ok_or_else(|| {
             McpRuntimeError::new("mcp_server_pipe_failed", "MCP Server 缺少标准输出管道。")
         })?;
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(1);
         let stdout_reader = std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
-                let mut frame = Vec::new();
-                match reader.read_until(b'\n', &mut frame) {
-                    Ok(0) => break,
-                    Ok(_) => {
+                match read_frame(&mut reader) {
+                    Ok(None) => break,
+                    Ok(Some(frame)) => {
                         if sender.send(Ok(frame)).is_err() {
                             break;
                         }
@@ -862,17 +864,34 @@ impl McpClient {
                 while stderr.read(&mut buffer).is_ok_and(|read| read > 0) {}
             })
         });
+        let (writes, pending_writes) = mpsc::channel::<McpWrite>();
+        let stdin_writer = std::thread::spawn(move || {
+            let mut stdin = BufWriter::new(stdin);
+            for write in pending_writes {
+                let result = stdin
+                    .write_all(&write.bytes)
+                    .and_then(|()| stdin.flush())
+                    .map_err(|error| error.to_string());
+                let failed = result.is_err();
+                let _ = write.complete.send(result);
+                if failed {
+                    break;
+                }
+            }
+        });
         let child = starting.commit();
         let client = Self {
             server_id: Arc::from(server.id.as_str()),
             process: Arc::new(Mutex::new(OwnedMcpProcess {
-                child,
-                stdin: Some(BufWriter::new(stdin)),
-                responses: receiver,
+                owned: child,
+                writes: Some(writes),
+                responses: Some(receiver),
+                stdin_writer: Some(stdin_writer),
                 stdout_reader: Some(stdout_reader),
                 stderr_reader,
                 next_id: 1,
                 stopped: false,
+                stop_error: None,
             })),
         };
         client.request(
@@ -966,11 +985,15 @@ impl McpClient {
         let mut process = self.process.lock().map_err(|_| {
             McpRuntimeError::new("mcp_server_lock_failed", "MCP Server 状态锁已损坏。")
         })?;
-        process.write_message(&json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        }))
+        process.write_message(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+            }),
+            None,
+            Instant::now() + MCP_RESPONSE_TIMEOUT,
+        )
     }
 
     fn shutdown(&self) -> Result<(), McpRuntimeError> {
@@ -1017,19 +1040,23 @@ fn decode_tool_call_result(
 }
 
 struct ChildStartupGuard {
-    child: Option<Child>,
+    child: Option<OwnedHostProcess>,
 }
 
 impl ChildStartupGuard {
-    fn new(child: Child) -> Self {
+    fn new(child: OwnedHostProcess) -> Self {
         Self { child: Some(child) }
     }
 
     fn child_mut(&mut self) -> &mut Child {
-        self.child.as_mut().expect("starting child is present")
+        &mut self
+            .child
+            .as_mut()
+            .expect("starting child is present")
+            .child
     }
 
-    fn commit(mut self) -> Child {
+    fn commit(mut self) -> OwnedHostProcess {
         self.child.take().expect("starting child is present")
     }
 }
@@ -1037,20 +1064,28 @@ impl ChildStartupGuard {
 impl Drop for ChildStartupGuard {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Err(error) = terminate_owned_process_tree_checked(child) {
+                eprintln!("MCP startup cleanup failed: {error}");
+            }
         }
     }
 }
 
+struct McpWrite {
+    bytes: Vec<u8>,
+    complete: mpsc::Sender<Result<(), String>>,
+}
+
 struct OwnedMcpProcess {
-    child: Child,
-    stdin: Option<BufWriter<ChildStdin>>,
-    responses: Receiver<Result<Vec<u8>, String>>,
+    owned: OwnedHostProcess,
+    writes: Option<mpsc::Sender<McpWrite>>,
+    responses: Option<Receiver<Result<Vec<u8>, String>>>,
+    stdin_writer: Option<JoinHandle<()>>,
     stdout_reader: Option<JoinHandle<()>>,
     stderr_reader: Option<JoinHandle<()>>,
     next_id: u64,
     stopped: bool,
+    stop_error: Option<McpRuntimeError>,
 }
 
 impl std::fmt::Debug for OwnedMcpProcess {
@@ -1075,51 +1110,56 @@ impl OwnedMcpProcess {
         }
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
-        self.write_message(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        }))?;
         let deadline = Instant::now() + MCP_RESPONSE_TIMEOUT;
+        self.write_message(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            }),
+            cancellation,
+            deadline,
+        )?;
         loop {
             if cancellation.is_some_and(KernelCancellationToken::is_cancelled) {
-                self.stop()?;
-                return Err(McpRuntimeError::new(
+                return Err(self.stop_after_error(McpRuntimeError::new(
                     "mcp_tool_cancelled",
                     format!("MCP Server {server_id} request was cancelled and reclaimed."),
-                ));
+                )));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                self.stop()?;
-                return Err(McpRuntimeError::new(
+                return Err(self.stop_after_error(McpRuntimeError::new(
                     "mcp_server_timeout",
                     format!("MCP Server {server_id} 请求超时。"),
-                ));
+                )));
             }
             let frame = match self
                 .responses
+                .as_ref()
+                .expect("running MCP process has a response receiver")
                 .recv_timeout(remaining.min(MCP_CANCEL_POLL_INTERVAL))
             {
                 Ok(Ok(frame)) => frame,
                 Ok(Err(error)) => {
-                    return Err(McpRuntimeError::new(
+                    return Err(self.stop_after_error(McpRuntimeError::new(
                         "mcp_server_read_failed",
                         format!("读取 MCP Server {server_id} 失败：{error}"),
-                    ))
+                    )))
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Err(McpRuntimeError::new(
+                    return Err(self.stop_after_error(McpRuntimeError::new(
                         "mcp_server_ended",
                         format!("MCP Server {server_id} 已退出。"),
-                    ))
+                    )))
                 }
             };
-            let value = decode_frame(server_id, frame)?;
+            let value =
+                decode_frame(server_id, frame).map_err(|error| self.stop_after_error(error))?;
             if value.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
@@ -1138,7 +1178,12 @@ impl OwnedMcpProcess {
         }
     }
 
-    fn write_message(&mut self, value: &Value) -> Result<(), McpRuntimeError> {
+    fn write_message(
+        &mut self,
+        value: &Value,
+        cancellation: Option<&KernelCancellationToken>,
+        deadline: Instant,
+    ) -> Result<(), McpRuntimeError> {
         if self.stopped {
             return Err(McpRuntimeError::new(
                 "mcp_server_stopped",
@@ -1158,48 +1203,82 @@ impl OwnedMcpProcess {
             ));
         }
         encoded.push(b'\n');
-        let stdin = self.stdin.as_mut().ok_or_else(|| {
+        let writes = self.writes.as_ref().ok_or_else(|| {
             McpRuntimeError::new("mcp_server_stopped", "MCP Server 输入已经关闭。")
         })?;
-        stdin.write_all(&encoded).map_err(|error| {
-            McpRuntimeError::new(
+        let (complete, result) = mpsc::channel();
+        if writes
+            .send(McpWrite {
+                bytes: encoded,
+                complete,
+            })
+            .is_err()
+        {
+            return Err(self.stop_after_error(McpRuntimeError::new(
                 "mcp_server_write_failed",
-                format!("写入 MCP Server 失败：{error}"),
-            )
-        })?;
-        stdin.flush().map_err(|error| {
-            McpRuntimeError::new(
-                "mcp_server_write_failed",
-                format!("刷新 MCP Server 输入失败：{error}"),
-            )
-        })
+                "MCP stdin writer has stopped.",
+            )));
+        }
+        loop {
+            if cancellation.is_some_and(KernelCancellationToken::is_cancelled) {
+                return Err(self.stop_after_error(McpRuntimeError::new(
+                    "mcp_tool_cancelled",
+                    "MCP request was cancelled during write.",
+                )));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(self.stop_after_error(McpRuntimeError::new(
+                    "mcp_server_timeout",
+                    "MCP request timed out during write.",
+                )));
+            }
+            match result.recv_timeout(remaining.min(MCP_CANCEL_POLL_INTERVAL)) {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error)) => {
+                    return Err(self.stop_after_error(McpRuntimeError::new(
+                        "mcp_server_write_failed",
+                        format!("写入 MCP Server 失败：{error}"),
+                    )))
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(self.stop_after_error(McpRuntimeError::new(
+                        "mcp_server_write_failed",
+                        "MCP stdin writer ended before reporting its result.",
+                    )))
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+
+    fn stop_after_error(&mut self, mut error: McpRuntimeError) -> McpRuntimeError {
+        if let Err(cleanup) = self.stop() {
+            error.message.push_str(&format!(
+                "; cleanup failed: {}: {}",
+                cleanup.code, cleanup.message
+            ));
+        }
+        error
     }
 
     fn stop(&mut self) -> Result<(), McpRuntimeError> {
-        if self.stopped && self.stdout_reader.is_none() && self.stderr_reader.is_none() {
-            return Ok(());
+        if self.stopped {
+            return self.stop_error.clone().map_or(Ok(()), Err);
         }
-        self.stdin.take();
+        self.writes.take();
+        self.responses.take();
+        if let Err(error) = terminate_owned_process_tree_checked(&mut self.owned) {
+            let error = McpRuntimeError::new(
+                "mcp_server_stop_failed",
+                format!("回收 MCP Server process tree 失败：{error}"),
+            );
+            self.stop_error = Some(error.clone());
+            return Err(error);
+        }
         let mut first_error = None;
-        if self.child.try_wait().ok().flatten().is_none() {
-            if let Err(error) = self.child.kill() {
-                first_error.get_or_insert_with(|| {
-                    McpRuntimeError::new(
-                        "mcp_server_stop_failed",
-                        format!("停止 MCP Server 失败：{error}"),
-                    )
-                });
-            }
-        }
-        if let Err(error) = self.child.wait() {
-            first_error.get_or_insert_with(|| {
-                McpRuntimeError::new(
-                    "mcp_server_wait_failed",
-                    format!("回收 MCP Server 失败：{error}"),
-                )
-            });
-        }
         for (stream, reader) in [
+            ("stdin", self.stdin_writer.take()),
             ("stdout", self.stdout_reader.take()),
             ("stderr", self.stderr_reader.take()),
         ] {
@@ -1213,13 +1292,19 @@ impl OwnedMcpProcess {
             }
         }
         self.stopped = true;
+        self.stop_error = first_error.clone();
         first_error.map_or(Ok(()), Err)
     }
 }
 
 impl Drop for OwnedMcpProcess {
     fn drop(&mut self) {
-        let _ = self.stop();
+        if let Err(error) = self.stop() {
+            eprintln!(
+                "MCP process cleanup failed: {}: {}",
+                error.code, error.message
+            );
+        }
     }
 }
 
@@ -1255,17 +1340,27 @@ fn validate_server(server: &McpServerSetting) -> Result<(), McpRuntimeError> {
     Ok(())
 }
 
-fn decode_frame(server_id: &str, mut frame: Vec<u8>) -> Result<Value, McpRuntimeError> {
+fn read_frame(reader: &mut impl BufRead) -> std::io::Result<Option<Vec<u8>>> {
+    let mut frame = Vec::new();
+    let count = reader
+        .take((MAX_MCP_FRAME_BYTES + 2) as u64)
+        .read_until(b'\n', &mut frame)?;
+    if count == 0 {
+        return Ok(None);
+    }
     if frame.len() > MAX_MCP_FRAME_BYTES + 1 || frame.last() != Some(&b'\n') {
-        return Err(McpRuntimeError::new(
-            "mcp_response_invalid",
-            format!("MCP Server {server_id} 回复过大或未按行结束。"),
+        return Err(std::io::Error::other(
+            "MCP response exceeds the frame limit or lacks its final newline",
         ));
     }
     frame.pop();
     if frame.last() == Some(&b'\r') {
         frame.pop();
     }
+    Ok(Some(frame))
+}
+
+fn decode_frame(server_id: &str, frame: Vec<u8>) -> Result<Value, McpRuntimeError> {
     let value: Value = serde_json::from_slice(&frame).map_err(|error| {
         McpRuntimeError::new(
             "mcp_response_json_invalid",
@@ -1374,6 +1469,148 @@ const fn enabled_by_default() -> bool {
 mod tests {
     use super::*;
 
+    struct TestDirectory(std::path::PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let id = crate::utils::new_runtime_ref("mcp-io-test").unwrap();
+            let path = std::env::temp_dir().join(id.replace(':', "-"));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn server(&self, behavior: &str) -> McpClient {
+            let script = self.0.join("server.py");
+            std::fs::write(&script, format!("import json,os,sys,time,subprocess\nfrom pathlib import Path\nfor line in sys.stdin:\n    request=json.loads(line)\n    if request['method']=='initialize':\n        print(json.dumps({{'jsonrpc':'2.0','id':request['id'],'result':{{}}}}),flush=True)\n    else:\n{behavior}\n")).unwrap();
+            McpClient::start(&serde_json::from_value(json!({
+                "id":"io-test", "name":"I/O test", "transport":"stdio",
+                "command":"python3", "args":format!("{} {}", script.display(), self.0.display()),
+                "enabled":true
+            })).unwrap()).unwrap()
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn bounded_worker_result<T>(
+        receiver: Receiver<T>,
+        worker: JoinHandle<()>,
+        owned_group: u32,
+    ) -> T {
+        let result = receiver.recv_timeout(Duration::from_secs(5));
+        if result.is_err() {
+            // The failed check still owns this fixture's group; unblock its pipes before unwinding.
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{owned_group}")])
+                .status();
+        }
+        worker.join().unwrap();
+        result.expect("owned process and pipe workers must finish within five seconds")
+    }
+
+    #[test]
+    fn oversized_frame_is_rejected_before_reading_the_entire_source() {
+        let mut source = std::io::Cursor::new(vec![b'x'; MAX_MCP_FRAME_BYTES + 1024]);
+        let error = read_frame(&mut source).unwrap_err();
+        assert!(error.to_string().contains("frame limit"));
+        assert_eq!(source.position(), (MAX_MCP_FRAME_BYTES + 2) as u64);
+        assert!(read_frame(&mut std::io::Cursor::new(b"{}\n"))
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_interrupts_a_blocked_mcp_stdin_write() {
+        let directory = TestDirectory::new();
+        let client = directory.server("        if request['method']=='notifications/initialized':\n            Path(sys.argv[1], 'ready').write_text('ready')\n            time.sleep(60)");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !directory.0.join("ready").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(directory.0.join("ready").exists());
+        let owned_group = client.process.lock().unwrap().owned.child.id();
+        let cancellation = KernelCancellationToken::default();
+        let call_cancellation = cancellation.clone();
+        let caller = client.clone();
+        let (send, receive) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = caller.call_tool(
+                "blocked",
+                json!({"text":"x".repeat(1024 * 1024)}),
+                None,
+                &call_cancellation,
+            );
+            let _ = send.send(result);
+        });
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        cancellation.cancel();
+        let result = bounded_worker_result(receive, worker, owned_group);
+        assert_eq!(result.unwrap_err().code, "mcp_tool_cancelled");
+        client.shutdown().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_shutdown_reclaims_pipe_holders_after_the_launcher_exits() {
+        let directory = TestDirectory::new();
+        let client = directory.server("        if request['method']=='tools/call':\n            child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n            print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{'childPid':child.pid}}),flush=True)\n            break");
+        let owned_group = client.process.lock().unwrap().owned.child.id();
+        let result = client
+            .call_tool("spawn", json!({}), None, &Default::default())
+            .unwrap();
+        assert!(result.output["childPid"].as_u64().is_some());
+        let stopper = client.clone();
+        let (send, receive) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = send.send(stopper.shutdown());
+        });
+        bounded_worker_result(receive, worker, owned_group).unwrap();
+        client.shutdown().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_completion_reclaims_pipe_holders_after_the_launcher_exits() {
+        let directory = TestDirectory::new();
+        let pid_path = directory.0.join("pid");
+        let cli = CliClient {
+            command: "python3".into(),
+            args: vec!["-c".into(), "import json,os,sys,subprocess; from pathlib import Path; json.load(sys.stdin); Path(sys.argv[1]).write_text(str(os.getpid())); child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); print(json.dumps({'childPid':child.pid}),flush=True)".into(), pid_path.to_string_lossy().into()],
+            entry: None,
+        };
+        let (send, receive) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let context = KernelToolExecutionContext {
+                output_directory: None,
+                workspace_root: None,
+                workspace_id: None,
+                private_resolved_targets: vec![],
+                workspace_write_targets: None,
+                file_access: Default::default(),
+                cancellation: Default::default(),
+                progress: Default::default(),
+            };
+            let _ = send.send(cli.call("spawn", json!({}), None, &context));
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !pid_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let owned_group = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
+        let result = bounded_worker_result(receive, worker, owned_group).unwrap();
+        assert!(result.failure.is_none());
+        assert!(result.output["childPid"].as_u64().is_some());
+    }
+
     #[test]
     fn multiple_tools_share_the_instance_until_the_last_runtime_view_releases() {
         struct Directory(std::path::PathBuf);
@@ -1417,6 +1654,7 @@ for line in sys.stdin:
             workspace_id: None,
             private_resolved_targets: vec![],
             workspace_write_targets: None,
+            file_access: Default::default(),
             cancellation: KernelCancellationToken::default(),
             progress: Default::default(),
         };
@@ -1497,6 +1735,7 @@ for line in sys.stdin:
             workspace_id: None,
             private_resolved_targets: vec![],
             workspace_write_targets: None,
+            file_access: Default::default(),
             cancellation: KernelCancellationToken::default(),
             progress: Default::default(),
         };
@@ -1577,6 +1816,7 @@ for line in sys.stdin:
             workspace_id: None,
             private_resolved_targets: Vec::new(),
             workspace_write_targets: None,
+            file_access: Default::default(),
             cancellation,
             progress: Default::default(),
         };

@@ -1,7 +1,7 @@
 use crate::prelude::*;
 use deepcode_kernel_abi::{
-    HostResultSource, HostUnsupportedWorkspaceField, HostWorkspaceFolder,
-    HostWorkspaceOpened, HostWorkspaceSaved, HostWorkspaceSourceKind, HostWorkspaceSpec,
+    HostResultSource, HostUnsupportedWorkspaceField, HostWorkspaceFolder, HostWorkspaceOpened,
+    HostWorkspaceSaved, HostWorkspaceSourceKind, HostWorkspaceSpec,
 };
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};

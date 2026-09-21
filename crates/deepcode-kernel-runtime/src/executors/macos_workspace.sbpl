@@ -1,0 +1,8 @@
+(version 1)
+(allow default)
+(deny network*)
+(deny file-write*)
+(deny file-read*)
+; dyld opens the root directory when starting a process; descendants stay restricted.
+(allow file-read-data (literal "/"))
+(allow file-write* (literal "/dev/null"))

@@ -226,10 +226,7 @@ fn trusted_cors_origin(origin: &HeaderValue) -> bool {
 }
 
 fn trusted_desktop_origin(origin: &str) -> bool {
-    if matches!(
-        origin,
-        "deepcode-gui://localhost"
-    ) {
+    if matches!(origin, "deepcode-gui://localhost") {
         return true;
     }
     let Some(authority) = origin.strip_prefix("http://") else {
@@ -404,10 +401,13 @@ async fn proxy_api(
     {
         request = request.header(reqwest::header::CONTENT_TYPE, content_type);
     }
-    let request = request.timeout(Duration::from_secs(60));
-    match request.send().await {
-        Ok(response) => proxy_response(response).await,
-        Err(error) => proxy_request_error("kernel_daemon_proxy_failed", &error),
+    // Bound connection/headers separately: an SSE subscription lives until its owner closes it.
+    match tokio::time::timeout(Duration::from_secs(60), request.send()).await {
+        Ok(Ok(response)) => proxy_response(response).await,
+        Ok(Err(error)) => proxy_request_error("kernel_daemon_proxy_failed", &error),
+        Err(error) => {
+            ApiResponse::error("kernel_daemon_proxy_timeout", error.to_string()).into_response()
+        }
     }
 }
 
@@ -444,6 +444,9 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
     match (method, segments.as_slice()) {
+        ("GET", ["api", "conversation", "sessions", _, "resources", "roots"])
+        | ("POST", ["api", "conversation", "sessions", _, "resources", "list" | "watch"]) => true,
+
         ("GET", ["api", "health"])
         | ("GET", ["api", "workspaces", "current"])
         | ("GET", ["api", "workspaces", "default-path"])
@@ -459,6 +462,11 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("GET", ["api", "llm", "profiles"])
         | ("PATCH", ["api", "llm", "profiles"])
         | ("POST", ["api", "llm", "probe"])
+        | ("GET", ["api", "llm", "connections"])
+        | ("PATCH", ["api", "llm", "connections"])
+        | ("POST", ["api", "llm", "usage"])
+        | ("GET", ["api", "llm", "prices"])
+        | ("POST", ["api", "llm", "auth"])
         | ("GET", ["api", "conversation", "catalog"])
         | ("GET", ["api", "conversation", "statuses"])
         | ("GET", ["api", "conversation", "plugins"])
@@ -482,6 +490,10 @@ fn host_proxy_path_allowed(method: &str, path: &str) -> bool {
         | ("POST", ["api", "terminal", "sessions", _, "restart"])
         | ("PATCH", ["api", "terminal", "sessions", _])
         | ("DELETE", ["api", "terminal", "sessions", _])
+        | ("GET", ["api", "llm", "auth", _])
+        | ("DELETE", ["api", "llm", "auth", _])
+        | ("POST", ["api", "llm", "connections", _, "logout"])
+        | ("GET", ["api", "llm", "connections", _, "quota"])
         | ("POST", ["api", "conversation", "sessions", _, "commands"])
         | ("PATCH", ["api", "conversation", "projects", _])
         | ("DELETE", ["api", "conversation", "projects", _])
@@ -557,6 +569,28 @@ mod tests {
         assert!(!host_proxy_path_allowed(
             "POST",
             "/api/conversation/plugins/skills"
+        ));
+    }
+
+    #[test]
+    fn host_proxy_exposes_model_services_without_opening_internal_provider_routes() {
+        for (method, path) in [
+            ("GET", "/api/llm/connections"),
+            ("PATCH", "/api/llm/connections"),
+            ("POST", "/api/llm/usage"),
+            ("GET", "/api/llm/prices"),
+            ("POST", "/api/llm/auth"),
+            ("GET", "/api/llm/auth/flow-1"),
+            ("DELETE", "/api/llm/auth/flow-1"),
+            ("POST", "/api/llm/connections/connection-1/logout"),
+            ("GET", "/api/llm/connections/connection-1/quota"),
+        ] {
+            assert!(host_proxy_path_allowed(method, path), "{method} {path}");
+        }
+        assert!(!host_proxy_path_allowed("GET", "/api/llm/secrets"));
+        assert!(!host_proxy_path_allowed(
+            "POST",
+            "/api/local-agent/provider"
         ));
     }
 }
@@ -658,8 +692,8 @@ async fn proxy_response(response: reqwest::Response) -> Response {
                 ApiResponse::error("proxy_response_build_failed", error.to_string()).into_response()
             });
     }
-    match response.bytes().await {
-        Ok(bytes) => {
+    match tokio::time::timeout(Duration::from_secs(60), response.bytes()).await {
+        Ok(Ok(bytes)) => {
             let mut builder = Response::builder().status(status);
             if let Some(content_type) = content_type {
                 builder = builder.header(header::CONTENT_TYPE, content_type);
@@ -668,6 +702,9 @@ async fn proxy_response(response: reqwest::Response) -> Response {
                 ApiResponse::error("proxy_response_build_failed", error.to_string()).into_response()
             })
         }
-        Err(error) => proxy_request_error("proxy_response_read_failed", &error),
+        Ok(Err(error)) => proxy_request_error("proxy_response_read_failed", &error),
+        Err(error) => {
+            ApiResponse::error("proxy_response_read_timeout", error.to_string()).into_response()
+        }
     }
 }

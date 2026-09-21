@@ -1,19 +1,59 @@
-# DeepCode 完整运行包
+# DeepCode 安装与用户文件
 
-当前产品提供一个 DeepCode-GUI，以及共享 Session/Kernel 的 CLI、TUI。独立 Editor 已退役，编辑能力后续由 VS Code 插件提供。
+DeepCode 提供图形界面、CLI 和 TUI。三种入口共享模型设置、会话历史和后台服务。运行包包含所需的 Node 和程序资源，无需安装开发工具链。
 
-macOS 的 `DeepCode-GUI.app` 包含所有程序和运行资源，可以整体移动。`DeepCode-CLI.command`、`DeepCode-TUI.command` 指向同目录 App 内的可执行文件。GUI 通过平台 Bundle/Resource API 定位资源；启动器显式传递资源位置。Linux/Windows 的 GUI、CLI/TUI、Kernel、first-party provider、Host Web、Node、Session JS 和 Web 资源各保留一份。
+## macOS
 
-包内没有源码树、构建缓存、开发依赖或用户数据库。Linux 桌面仍需要系统 GTK/WebKitGTK，Windows GUI 需要系统 WebView2 Evergreen Runtime。随包保留 Node 和前端依赖许可证；这些系统运行库不重复打进程序包。
+打开 `DeepCode-<version>-macos-arm64.pkg` 完成安装。应用位于 `/Applications/DeepCode-GUI.app`；终端可使用 `deepcode`、`deepcode-cli` 和 `deepcode-tui`，命令安装在 `/usr/local/bin`。
 
-`DEEPCODE_CONFIG_DIR` 可指定现有用户数据位置。macOS 启动器及 GUI 默认沿用包所在目录的数据根，移动 App 时可显式指定原数据根；本次整理不迁移已有数据。Linux/Windows GUI 保持程序目录的数据根，直接 CLI/TUI 保持现有 Host config_root 规则。已有输出目录中的 config、runtime、会话、日志等不会被构建覆盖或放进压缩包。
+解压版可直接打开 `DeepCode-GUI.app`，或使用同目录的 `DeepCode-CLI.command`、`DeepCode-TUI.command`。移动解压版时应保留这些文件的相对位置。用户文件存放在下表所列目录，与应用位置无关。
 
-开发环境先在目标 worktree 使用 `make shell` 准备 Docker；Mac 上同时自动准备绑定当前 worktree 和容器的宿主打包通道。随后在容器或宿主执行 `bash build.sh` 均会尝试所有可用平台；`--stage package-linux`、`--stage package-windows`、`--stage package-macos` 可指定单平台。容器生成一次共享 TypeScript/GUI 产物，macOS 请求通过共享目录交给宿主，由宿主既有工具链编译 Darwin、组装并签名。
+## Windows
 
-已知存在 Mac 宿主时，通道或工具链失败会使构建返回非零退出码；没有 Mac 构建能力时，默认构建明确跳过，显式指定 macOS 则报错。最终摘要列出实际更新和跳过的平台。通道传回本次日志及退出码，取消只停止本次原生构建；容器停止、`make reset-dev` 或 `make clean` 会结束对应通道。同一 worktree 同时只允许一个构建写入共享产物，宿主未确认退出时保留 staging 和锁，并报告路径。构建不自动安装 Node/Rust、不失败换源重试。通过 PATH 或 DEEPCODE_MACOS_CARGO、DEEPCODE_MACOS_NODE_BIN 指定已安装工具；宿主通道不进入发行包。
+运行 `DeepCode-<version>-win64-setup.exe`。默认程序目录为 `%LOCALAPPDATA%\Programs\DeepCode`。安装器创建开始菜单入口并添加用户 PATH，重新打开终端后可使用 `deepcode`、`deepcode-cli` 和 `deepcode-tui`。
 
-一次 package 调用只准备一次依赖、编译一次共享 TypeScript、检查一次 GUI 类型并构建一次 GUI。Cargo target、registry、pnpm store、已有 sccache 保留；不同 worktree 使用独立可变 target/node_modules。每次清理 TS/Vite 输出并新建空 staging，完整组装后替换明确的程序内容，因此删除的文件和旧 chunk 不会残留。构建号/提交只用于追溯，不用于跨组件相等校验。
+GUI 需要 WebView2 Evergreen Runtime。Setup 检测到缺失时会下载并运行微软安装器；无法完成时会显示错误。解压版使用同一套用户目录，GUI 入口为 `DeepCode-GUI.exe`，命令入口为 `deepcode-cli.bat` 和 `deepcode-tui.bat`。卸载移除程序和本安装添加的 PATH 项，保留用户文件。
 
-`make ui` 只构建共享 JS 和 GUI，输出 `bin/ui/web-deepcode-gui`。`make ui-update UI_PACKAGE=bin/macos-arm64` 或 `python3 scripts/update-ui.py --assets <完整 GUI 目录> --package <现有包目录或 App>` 会完整替换一个 GUI 目录，macOS 同时重新签名。更新后关闭并重开窗口。开发调试使用 `make dev-deepcode-gui` 的 Vite HMR；TypeScript 必须先转译，Session JS 更新需结束当前活动运行并受控重启 Host，不在活动 Agent Loop 内替换模块。
+## Linux
 
-输出同时提供完整目录和压缩包。后续安装器可消费同一份运行内容完成新装或程序替换，NSIS/PKG 等安装格式不属于当前阶段。程序包构建成功与平台交互验收是不同结果。
+解压后使用包内 `DeepCode-GUI`、`deepcode-cli` 或 `deepcode-tui`。桌面环境需要 GTK 和 WebKitGTK。工作区 Shell 的环境要求见[执行环境](product/execution-environments.md)。
+
+## 用户目录
+
+| 用途 | macOS | Windows | Linux |
+| --- | --- | --- | --- |
+| 配置 | `~/Library/Application Support/DeepCode/config` | `%APPDATA%\DeepCode\config` | `${XDG_CONFIG_HOME:-~/.config}/DeepCode` |
+| 持久数据 | `~/Library/Application Support/DeepCode/data` | `%LOCALAPPDATA%\DeepCode\Data` | `${XDG_DATA_HOME:-~/.local/share}/DeepCode` |
+| 缓存 | `~/Library/Caches/DeepCode` | `%LOCALAPPDATA%\DeepCode\Cache` | `${XDG_CACHE_HOME:-~/.cache}/DeepCode` |
+| 临时文件 | 系统用户临时目录下的 `DeepCode` | `%TEMP%\DeepCode` | 系统临时目录下的 `DeepCode` |
+| 日志 | `~/Library/Logs/DeepCode` | `%LOCALAPPDATA%\DeepCode\Logs` | `${XDG_STATE_HOME:-~/.local/state}/DeepCode/log` |
+
+配置目录中的 `user/local/settings` 保存设置和模型配置，`user/local/secrets` 保存本地凭据。持久数据目录中的 `agent-runtime` 保存会话数据库、附件、工具记录和会话工作目录。会话引用的预览、截图和生成文件随会话保留，不属于可清理缓存。
+
+缓存用于可重新生成的内容。macOS WebKit 的网站存储由系统管理，使用其标准 Library 目录。每次 Shell 调用拥有独立临时目录，调用及其子进程结束后清理；需要后续使用的文件应保存到会话工作目录或已授权项目目录。GUI 启动诊断位于日志目录的 `host-startup`，CLI 启动的后台服务日志为 `deepcode-kernel.log`。
+
+可通过 `DEEPCODE_USER_ROOT` 显式指定独立用户根。该模式将 DeepCode 管理的配置、持久数据、缓存、临时文件和日志分别放入所选根下的 `config`、`data`、`cache`、`tmp`、`logs`，同一次使用的各入口应设置相同值。未设置时使用上表的平台默认目录。程序资源位置由应用和启动器自动设置，不需要全局配置内部环境变量。
+
+## 配置准备与备份
+
+安装或首次启动时，DeepCode 创建所需用户目录。macOS 使用实际启动应用的用户目录；Windows Setup 使用当前安装用户的目录。
+
+发现冲突配置时，DeepCode 先将原文件及校验错误保存到持久数据目录的 `config-backups/<记录目录>`，再清除过期权限字段并补齐缺省权限项。不符合当前结构的模型配置恢复为内置模板，之后需在设置中重新配置模型服务。有效权限和其他设置、本地密钥文件及会话数据保留。
+
+有效文件不改写，重复启动不重复备份。损坏 JSON、文件读取失败和无效默认模型选择会保留原错误。备份或写入失败时显示错误；应用正在使用的数据目录不能同时执行安装配置准备。
+
+## 更新与功能配置
+
+更新前结束或取消正在执行的任务，并关闭 DeepCode 的各个入口。若曾用 `deepcode-cli start-host` 启动常驻后台服务，先执行 `deepcode-cli stop-host`，再运行新安装包或替换解压版程序。设置、会话和附件位于用户目录，更新程序不会覆盖这些文件。
+
+| 调整内容 | 生效时机 |
+| --- | --- |
+| 已启用 UI 插件的编译后入口模块或 manifest | 保存后在当前 GUI 窗口更新；TypeScript 源码需先编译为插件声明的 JavaScript 入口。 |
+| 当前运行已选用的 Skill、CLI 插件内容 | 下一次模型请求前重新准备；已有请求、待审批调用和正在执行的调用保留原内容与绑定。 |
+| 模型、权限、插件注册和执行环境设置 | 下一次运行生效。 |
+| 更新后的 GUI 资源 | macOS 使用 Cmd+Shift+R，其他平台使用 Ctrl+Shift+R 重载界面。 |
+| Session、Kernel、原生程序或内置产品说明 | 安装对应构建产物并重启相关进程，修改源码不会直接更新运行中的程序。 |
+
+Skill、CLI 插件及运行设置的生效边界适用于 GUI、CLI 和 TUI；UI 插件仅影响图形界面。完整程序更新后重新打开 DeepCode。详见[插件说明](product/ui-plugins.md)和[模型服务](product/model-services.md)。
+
+PDF 阅读使用包内 Web 阅读器，不需要安装 Python。PDF 导出需要可用的 WeasyPrint Python 环境，可在设置中指定 Python 路径。

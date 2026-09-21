@@ -1,21 +1,22 @@
 import UiIcon from '../../icons/registry';
-import React from 'react';
 import type { HostStartupStatusV1 } from '../../services/runtimeAdapter';
 import { t, type UiLanguage } from '../../i18n';
 import './hostStartupDiagnostic.css';
 
-export function HostStartupDiagnostic({ status, language, onRetry, busy = false }: { status: HostStartupStatusV1 | null; language: UiLanguage; onRetry?: () => void; busy?: boolean }) {
-  if (!status || !['failed', 'blocked'].includes(status.phase)) return null;
+export function HostStartupDiagnostic({ status, workspaceError, language, onRetry, busy = false }: { status: HostStartupStatusV1 | null; workspaceError?: string | null; language: UiLanguage; onRetry?: () => void; busy?: boolean }) {
+  const failedStatus = status && ['failed', 'blocked'].includes(status.phase) ? status : null;
+  if (!failedStatus && !workspaceError) return null;
   return <section className="host-startup-diagnostic" role="alert">
-    <h3>{t(language, 'host.startup.failed')}</h3>
-    <p>{status.code}</p>
+    <h3>{t(language, failedStatus ? 'host.startup.failed' : 'workspace.error.load')}</h3>
+    {failedStatus && <p>{failedStatus.code}</p>}
     <details open>
       <summary>{t(language, 'agent.tool.detail.error')}<UiIcon name="chevronDown" size={14} /></summary>
-      <pre tabIndex={0}>{status.message}</pre>
+      {failedStatus && <pre tabIndex={0}>{failedStatus.message}</pre>}
+      {workspaceError && <pre tabIndex={0}>{workspaceError}</pre>}
     </details>
-    {status.diagnosticRef && <div className="host-startup-diagnostic__log">
-      <span>{t(language, 'host.startup.log')}</span><code>{status.diagnosticRef}</code>
+    {failedStatus?.diagnosticRef && <div className="host-startup-diagnostic__log">
+      <span>{t(language, 'host.startup.log')}</span><code>{failedStatus.diagnosticRef}</code>
     </div>}
-    {onRetry && <button type="button" className="settings-button" disabled={busy} onClick={onRetry}>{t(language, busy ? 'deepcodeGui.statusAction.starting' : 'deepcodeGui.statusAction.retry')}</button>}
+    {failedStatus && onRetry && <button type="button" className="settings-button" disabled={busy} onClick={onRetry}>{t(language, busy ? 'deepcodeGui.statusAction.starting' : 'deepcodeGui.statusAction.retry')}</button>}
   </section>;
 }

@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 CARGO="${DEEPCODE_MACOS_CARGO:-$(command -v cargo || printf '%s/bin/cargo' "${CARGO_HOME:-$HOME/.cargo}")}"
 NODE="${DEEPCODE_MACOS_NODE_BIN:-$(command -v node)}"
 command -v "$CARGO" >/dev/null || { printf 'Set DEEPCODE_MACOS_CARGO to the installed cargo executable.\n' >&2; exit 1; }
-for tool in xcrun codesign strip python3; do command -v "$tool" >/dev/null; done
+for tool in xcrun codesign strip python3 pkgbuild; do command -v "$tool" >/dev/null; done
 xcrun --find clang >/dev/null
 xcrun --sdk macosx --show-sdk-path >/dev/null
 [ -x "$NODE" ] || { printf 'Set DEEPCODE_MACOS_NODE_BIN to the installed Node runtime.\n' >&2; exit 1; }
@@ -18,10 +18,12 @@ NODE_LICENSE="${DEEPCODE_MACOS_NODE_LICENSE:-$(python3 -c 'from pathlib import P
 SHARED="$1"
 OUTPUT="$2"
 export CARGO_TARGET_DIR="${DEEPCODE_MACOS_CARGO_TARGET_DIR:-$ROOT_DIR/target/macos-arm64}"
-"$CARGO" build --locked --release -p deepcode-kernel-daemon -p deepcode-first-party-tools -p deepcode-host-web -p deepcode-cli -p deepcode-tui
-"$CARGO" build --locked --release --manifest-path "$ROOT_DIR/shells/deepcode-gui/src-tauri/Cargo.toml"
+"$CARGO" build --release -p deepcode-kernel-daemon -p deepcode-first-party-tools -p deepcode-host-web -p deepcode-cli -p deepcode-tui
+"$CARGO" build --release --manifest-path "$ROOT_DIR/shells/deepcode-gui/src-tauri/Cargo.toml"
 STAGE="$(mktemp -d "$(dirname "$SHARED")/macos-arm64.XXXXXX")"
 trap 'rm -rf -- "$STAGE"' EXIT
 python3 scripts/package-runtime.py assemble --root "$ROOT_DIR" --platform macos-arm64 --stage "$STAGE" --shared "$SHARED" --native "$CARGO_TARGET_DIR/release" --node "$NODE" --node-license "$NODE_LICENSE"
 VERSION="$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')"
-python3 scripts/package-runtime.py publish "$STAGE" "$OUTPUT/macos-arm64" "$OUTPUT/DeepCode-$VERSION-macos-arm64.tar.gz"
+INSTALLER="$(dirname "$SHARED")/DeepCode-$VERSION-macos-arm64.pkg"
+python3 scripts/package-installers.py macos-arm64 "$STAGE" "$INSTALLER"
+python3 scripts/package-runtime.py publish "$STAGE" "$OUTPUT/macos-arm64" "$OUTPUT/DeepCode-$VERSION-macos-arm64.tar.gz" --installer "$INSTALLER"

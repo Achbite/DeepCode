@@ -134,7 +134,6 @@ textarea {
 .deepcode-gui-titlebar .reader-icon-button { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; flex: 0 0 28px; padding: 5px; border: 0; border-radius: 6px; color: var(--dc-muted); background: transparent; cursor: pointer; }
 .deepcode-gui-titlebar .reader-icon-button:is(:hover,[aria-pressed=true]) { color: var(--dc-accent); background: var(--dc-surface-hover); }
 .deepcode-gui-titlebar .reader-icon-button svg { width: 17px; height: 17px; }
-.deepcode-gui-titlebar :is(button,[role=tab]):focus-visible { outline: 2px solid var(--dc-focus-ring); outline-offset: -2px; }
 .deepcode-gui-titlebar .local-agent__header--expanded { grid-template-columns: minmax(0, 1fr); }
 .deepcode-gui-titlebar .local-agent__header--expanded .local-agent__header-conversation { display: none; }
 .deepcode-gui-titlebar .local-agent__header--expanded .local-agent__header-preview { grid-column: 1; }

@@ -1,3 +1,4 @@
+import { useInterfaceReloadGuard } from '../../services/interfaceReload';
 import { useSettingsSearchTarget } from './settingsSearch';
 import { useSettingsHelp } from './SettingsHelp';
 import React, { useEffect, useState } from 'react';
@@ -45,6 +46,7 @@ const SettingsField: React.FC<SettingsFieldProps> = ({
   const [error, setError] = useState<string | null>(null);
   const editable = !['boolean', 'select'].includes(definition.control);
   const dirty = draft.text !== savedText;
+  useInterfaceReloadGuard(editable && dirty, definition.label, saving);
   useEffect(() => setDraft((current) => reconcileSettingDraft(current, savedText)), [savedText]);
   const perform = async (operation: () => Promise<unknown>) => {
     setSaving(true); setError(null);

@@ -137,196 +137,40 @@ pub(crate) async fn llm_profiles_patch(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Json<ApiResponse> {
-    let _runtime_transition = match state.local_agent.runtime_transition() {
-        Ok(transition) => transition,
+    let _transition = match state.local_agent.runtime_transition() {
+        Ok(value) => value,
         Err(error) => return ApiResponse::error("runtime_transition_lock_failed", error),
     };
-    let Some(body_object) = body.as_object() else {
-        return ApiResponse::error(
-            "invalid_llm_profiles_request",
-            "LLM Profile 更新必须是 JSON 对象。",
-        );
-    };
-    const REQUEST_FIELDS: &[&str] = &[
-        "profiles",
-        "profile",
-        "removeProfileId",
-        "defaultProfileId",
-        "secrets",
-    ];
-    if body_object
-        .keys()
-        .any(|field| !REQUEST_FIELDS.contains(&field.as_str()))
-    {
-        return ApiResponse::error(
-            "invalid_llm_profiles_request",
-            "LLM Profile 更新包含未知字段。",
-        );
-    }
-    if !["profiles", "profile", "removeProfileId"]
-        .iter()
-        .any(|field| body_object.contains_key(*field))
-    {
-        let Some(profile_id) = body
-            .get("defaultProfileId")
-            .and_then(Value::as_str)
-            .filter(|_| !body_object.contains_key("secrets"))
-        else {
-            return ApiResponse::error(
-                "invalid_llm_profiles_request",
-                "仅选择默认模型时需要 defaultProfileId，不能同时修改 secrets。",
-            );
-        };
-        let mut gui = state.gui.lock().expect("gui state lock");
-        let path = gui.paths.llm_profiles_path.clone();
-        if let Err(error) = gui.llm_profiles.select_default(&path, profile_id) {
-            return ApiResponse::error("select_default_llm_profile_failed", error);
-        }
-        return gui.llm_profiles.settings_response(&path);
-    }
-    let body = {
-        let gui = state.gui.lock().expect("gui state lock");
-        match expand_profile_edit(&gui.llm_profiles, body) {
-            Ok(body) => body,
-            Err(error) => return ApiResponse::error("invalid_llm_profiles_request", error),
-        }
-    };
-    let Some(profile_items) = body.get("profiles").and_then(Value::as_array) else {
-        return ApiResponse::error("invalid_llm_profiles", "profiles 必须是数组。");
-    };
-    let mut profiles = Value::Array(profile_items.clone());
-    let mut profile_ids = std::collections::HashSet::new();
-    for profile in profile_items {
-        let Some(profile_id) = profile
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty() && value.trim() == *value)
-        else {
-            return ApiResponse::error("invalid_llm_profile", "每个 LLM Profile 都必须有非空 id。");
-        };
-        if !profile_ids.insert(profile_id.to_string()) {
-            return ApiResponse::error(
-                "duplicate_llm_profile",
-                format!("LLM Profile id 重复：{profile_id}"),
-            );
-        }
-        if let Err(error) = validate_llm_profile(profile) {
-            return ApiResponse::error(
-                "invalid_llm_profile_schema",
-                format!("LLM Profile {profile_id}: {error}"),
-            );
-        }
-    }
-
-    let requested_default = match body.get("defaultProfileId") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(id)) if !id.is_empty() && id.trim() == id => Some(id.as_str()),
-        _ => {
-            return ApiResponse::error(
-                "invalid_default_llm_profile",
-                "defaultProfileId 必须是非空模型 ID 或 null。",
+    let mut gui = state.gui.lock().expect("gui state lock");
+    let result = (|| -> Result<Value, String> {
+        let object = body.as_object().ok_or("模型更新必须是对象。")?;
+        if object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "profiles" | "profile" | "removeProfileId" | "defaultProfileId"
             )
+        }) {
+            return Err("模型更新包含未知字段。".into());
         }
-    };
-    if let Some(default_id) = requested_default {
-        let enabled = profile_items.iter().any(|profile| {
-            profile.get("id").and_then(Value::as_str) == Some(default_id)
-                && llm_profile_value_is_enabled(profile)
-        });
-        if !enabled {
-            return ApiResponse::error(
-                "invalid_default_llm_profile",
-                "defaultProfileId 必须指向一个已启用的 Profile。",
-            );
+        let path = gui.paths.llm_profiles_path.clone();
+        if object.len() == 1 && object.contains_key("defaultProfileId") {
+            gui.llm_profiles.select_default(
+                &path,
+                body["defaultProfileId"].as_str().ok_or("请选择模型。")?,
+            )?;
+        } else {
+            let expanded = expand_profile_edit(&gui.llm_profiles, body)?;
+            let mut next = crate::model_connections::document(&gui)?;
+            next["profiles"] = expanded["profiles"].clone();
+            next["defaultProfileId"] = expanded["defaultProfileId"].clone();
+            crate::model_connections::store(&mut gui, next, None)?;
         }
+        crate::model_connections::document(&gui)
+    })();
+    match result {
+        Ok(value) => ApiResponse::ok(value),
+        Err(error) => ApiResponse::error("llm_profile_save_failed", error),
     }
-
-    let submitted_secrets = body.get("secrets").cloned().unwrap_or_else(|| json!({}));
-    let Some(submitted_secrets) = submitted_secrets.as_object() else {
-        return ApiResponse::error("invalid_llm_secrets", "secrets 必须是 JSON 对象。");
-    };
-    if submitted_secrets.iter().any(|(profile_id, value)| {
-        !profile_ids.contains(profile_id)
-            || !(value.is_null()
-                || value
-                    .as_str()
-                    .is_some_and(|secret| !secret.trim().is_empty()))
-    }) {
-        return ApiResponse::error(
-            "invalid_llm_secrets",
-            "secrets 只能把已提交的 Profile id 映射到非空字符串或 null。",
-        );
-    }
-
-    let (profiles_path, secrets_path, old_secret_store) = {
-        let gui = state.gui.lock().expect("gui state lock");
-        let old_secret_store = match read_optional_json_file(&gui.paths.llm_secrets_path) {
-            Ok(Some(value)) if llm_secret_store_is_current(&value) => value,
-            Ok(Some(_)) => {
-                return ApiResponse::error(
-                    "llm_secret_store_invalid",
-                    "本地 LLM secret 文件不是当前字符串映射格式。",
-                )
-            }
-            Err(error) => return ApiResponse::error("llm_secret_store_unreadable", error),
-            Ok(None) => json!({}),
-        };
-        (
-            gui.paths.llm_profiles_path.clone(),
-            gui.paths.llm_secrets_path.clone(),
-            old_secret_store,
-        )
-    };
-    let mut next_secret_store = old_secret_store.clone();
-    let secret_object = next_secret_store
-        .as_object_mut()
-        .expect("validated local secret object");
-    secret_object.retain(|profile_id, _| profile_ids.contains(profile_id));
-    let profile_array = profiles.as_array_mut().expect("cloned profile array");
-    for profile in profile_array {
-        let profile_id = profile
-            .get("id")
-            .and_then(Value::as_str)
-            .expect("validated profile id")
-            .to_string();
-        match submitted_secrets.get(&profile_id) {
-            Some(Value::String(secret)) => {
-                secret_object.insert(profile_id.clone(), json!(secret));
-                profile["secretRef"] = json!(format!("local-secret:{profile_id}"));
-            }
-            Some(Value::Null) => {
-                secret_object.remove(&profile_id);
-                if let Some(profile) = profile.as_object_mut() {
-                    profile.remove("secretRef");
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut next_profiles = json!({
-        "profiles": profiles,
-        "defaultProfileId": requested_default
-    });
-    if let Err(error) = validate_llm_profile_store(&next_profiles) {
-        return ApiResponse::error("invalid_llm_profile_store_schema", error);
-    }
-    if let Err(error) = atomic_write_json(&secrets_path, &next_secret_store) {
-        return ApiResponse::error("write_llm_secrets_failed", error);
-    }
-    if let Err(error) = atomic_write_json(&profiles_path, &next_profiles) {
-        let rollback_error = atomic_write_json(&secrets_path, &old_secret_store).err();
-        let message = rollback_error
-            .map(|rollback| format!("{error}；secret 回滚失败：{rollback}"))
-            .unwrap_or(error);
-        return ApiResponse::error("write_llm_profiles_failed", message);
-    }
-    {
-        let mut gui = state.gui.lock().expect("gui state lock");
-        gui.llm_profiles = LlmProfileStore::Ready(next_profiles.clone());
-    }
-    next_profiles["storePath"] = json!(profiles_path.to_string_lossy());
-    ApiResponse::ok(next_profiles)
 }
 
 pub(crate) async fn llm_probe(
@@ -339,7 +183,7 @@ pub(crate) async fn llm_probe(
         let gui = state.gui.lock().expect("gui state lock");
         resolve_llm_profile(&gui, profile_id)
     };
-    let profile = match profile {
+    let mut profile = match profile {
         Ok(profile) => profile,
         Err(error) => {
             return ApiResponse::ok(json!({
@@ -349,7 +193,23 @@ pub(crate) async fn llm_probe(
             }))
         }
     };
-    match probe_llm_profile_stream(&state.local_agent.provider_transport.client, &profile).await {
+    if let Err(error) = crate::model_auth::authorize(&state, &mut profile).await {
+        return ApiResponse::error("provider_authentication_failed", error);
+    }
+    let mut usage_call = match state
+        .model_usage
+        .begin(&profile, &json!({"profileId":profile_id,"purpose":"probe"}))
+    {
+        Ok(call) => call,
+        Err(error) => return ApiResponse::error("usage_record_failed", error),
+    };
+    match probe_llm_profile_stream(
+        &state.local_agent.provider_transport.client,
+        &profile,
+        &mut usage_call,
+    )
+    .await
+    {
         Ok(output) => ApiResponse::ok(json!({
             "ok": output.response_present,
             "provider": profile.kind,
@@ -393,8 +253,13 @@ pub(crate) fn default_user_settings() -> Value {
         "agent.projectEnvironments": "{}",
         "agent.permissions.workspaceMutation": "plan",
         "agent.permissions.engineeringDecisions": "ask",
+        "agent.permissions.shell": "ask",
+        "agent.permissions.shellAccess": "workspace",
+        "agent.permissions.commandRules": "[]",
+        "agent.permissions.runtimeReadRoots": [],
         "agent.permissions.networkRead": "allow",
         "agent.permissions.external": "ask",
+        "agent.permissions.commandDenylist": crate::command_denylist::DEFAULT_COMMANDS,
         "agent.web.search.endpointTemplate": "",
         "agent.web.search.authHeaderName": "Authorization",
         "agent.web.search.authSecretRef": "",
@@ -414,6 +279,9 @@ pub(crate) fn default_user_settings() -> Value {
 }
 
 pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), String> {
+    crate::command_denylist::CommandDenylist::from_settings(settings)?;
+    crate::local_agent_kernel::LocalAgentPermissionPolicy::from_settings(settings)
+        .map_err(|error| error.message)?;
     if settings
         .get("agent.documents.pythonPath")
         .is_some_and(|value| !value.is_string())
@@ -433,6 +301,11 @@ pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), St
                     | "agent.permissions.engineeringDecisions"
                     | "agent.permissions.networkRead"
                     | "agent.permissions.external"
+                    | "agent.permissions.commandDenylist"
+                    | "agent.permissions.shell"
+                    | "agent.permissions.shellAccess"
+                    | "agent.permissions.commandRules"
+                    | "agent.permissions.runtimeReadRoots"
             ) {
                 return Err(format!("{key} 不是当前 Agent Runtime 权限设置。"));
             }
@@ -481,4 +354,18 @@ pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), St
         }
     }
     Ok(())
+}
+
+/// The persisted run receives the same permission defaults as Kernel admission.
+pub(crate) fn permission_settings(settings: &Value) -> Value {
+    let defaults = default_user_settings();
+    Value::Object(
+        defaults
+            .as_object()
+            .expect("settings defaults")
+            .iter()
+            .filter(|(key, _)| key.starts_with("agent.permissions."))
+            .map(|(key, default)| (key.clone(), settings.get(key).unwrap_or(default).clone()))
+            .collect(),
+    )
 }

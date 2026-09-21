@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import { t, type UiLanguage } from '../../i18n';
 import { useSettingsStore } from '../../state/settingsStore';
 import { normalizeGuiAccentColor, type GuiResolvedTheme } from '../../theme/deepcodeGuiTheme';

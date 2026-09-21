@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ConversationNavigationEntry } from './conversationWindow';
 import type { ConversationViewport } from './useConversationViewport';
 import type { UiLanguage } from '../../i18n';
