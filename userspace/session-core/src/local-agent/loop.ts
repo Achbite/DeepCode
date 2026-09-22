@@ -342,7 +342,7 @@ export async function runAgentLoop(
           attemptId: requestEvent.payload.attemptId,
           toolName: requestEvent.payload.toolName,
           input: requestEvent.payload.input,
-          workspaceBindings: runWorkspaceBindings(snapshot, runId).map((binding) => binding.workspaceId),
+          workspaceBindings: contextForToolRequest(snapshot, requestEvent).workspaceBindings.map(binding => binding.itemId),
           ...(selectedPlanAuthorities(snapshot.events, runId).length
             ? { planAuthorities: selectedPlanAuthorities(snapshot.events, runId) }
             : {}),
@@ -2221,11 +2221,17 @@ function runRuntimeSnapshot(snapshot: LoopSnapshot, runId: string): RunRuntimeSn
       view.providerToolAliases.find(alias => alias.canonicalName === SESSION_CONTROL_PLAN_PUBLISH)?.wireName) } : instruction) };
 }
 
+function contextForToolRequest(snapshot: LoopSnapshot, request: Extract<SessionEvent, { type: 'tool.requested' }>) {
+  const turn = Object.values(snapshot.state.providerTurns).find(turn => turn.runId === request.runId && turn.orderedCallIds?.includes(request.callId));
+  const receipt = snapshot.state.contextCompositions.find(item => item.runId === request.runId && item.providerRequestId === turn?.providerRequestId);
+  if (!receipt) throw new LoopFailure('tool_request_binding_missing', '工具调用缺少所属 Provider 请求视图。');
+  return receipt;
+}
+
 function runtimeForToolRequest(snapshot: LoopSnapshot, request: Extract<SessionEvent, { type: 'tool.requested' }>): RunRuntimeSnapshot {
-  const turn = Object.values(snapshot.state.providerTurns).find((turn) => turn.orderedCallIds?.includes(request.callId));
-  const receipt = snapshot.state.contextCompositions.find((item) => item.providerRequestId === turn?.providerRequestId);
+  const receipt = contextForToolRequest(snapshot, request);
   const base = snapshot.state.runRuntimeSnapshots[request.runId];
-  if (!base || !receipt) throw new LoopFailure('tool_request_binding_missing', '工具调用缺少所属 Provider 请求视图。');
+  if (!base) throw new LoopFailure('tool_request_binding_missing', '工具调用缺少所属 run。');
   if (!receipt.kernelCatalogSnapshotRef || receipt.kernelCatalogSnapshotRef === base.kernelCatalogSnapshotRef) return base;
   const prepared = snapshot.events.find((event) => event.type === 'run.tools.prepared'
     && event.runId === request.runId && event.payload.toolView.kernelCatalogSnapshotRef === receipt.kernelCatalogSnapshotRef);

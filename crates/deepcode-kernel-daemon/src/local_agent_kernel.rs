@@ -1066,13 +1066,14 @@ impl LocalAgentKernel {
         &self,
         request: &LocalToolExecutionRequest,
     ) -> Result<(), LocalAgentKernelError> {
-        let committed = self
-            .journal
-            .run_workspace_binding_ids(&request.session_id, &request.run_id)?;
-        if committed != request.workspace_bindings {
+        if !self.journal.has_workspace_binding_view(
+            &request.session_id,
+            &request.run_id,
+            &request.workspace_bindings,
+        )? {
             return Err(LocalAgentKernelError::new(
                 "session_workspace_snapshot_mismatch",
-                "Kernel 请求的 workspaceBindings 与当前 run 冻结快照不一致。",
+                "Kernel 请求的 workspaceBindings 不属于当前 run 已提交的资源视图。",
             ));
         }
         Ok(())

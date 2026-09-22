@@ -7,7 +7,10 @@ import type { LoopSnapshot } from './loop.js';
 /** A single text-only decision within the Session's existing Provider lifecycle. */
 export function prepareApprovalReview(snapshot: LoopSnapshot, runtime: RunRuntimeSnapshot,
   approval: NonNullable<SessionProjection['pendingApproval']>, requestId: string) {
-  const taskContext = messagesFromJournal(snapshot.events, approval.runId, snapshot.state.workspaceBindings)
+  const run = snapshot.state.run;
+  if (!run || run.runId !== approval.runId) throw new Error('approval_review_run_mismatch');
+  const workspaceBindings = run.workspaceBindings.map(binding => ({ ...binding }));
+  const taskContext = messagesFromJournal(snapshot.events, approval.runId, workspaceBindings)
     .filter(item => item.message.role === 'user' || item.contributionId.startsWith('context-checkpoint:'))
     .map(item => ({ role: item.message.role, content: item.message.content }));
   const activePlan = snapshot.state.plans.find(plan => plan.planId === snapshot.state.activePlanRef?.planId
@@ -23,7 +26,7 @@ export function prepareApprovalReview(snapshot: LoopSnapshot, runtime: RunRuntim
     protocolVersion: LOCAL_AGENT_PROTOCOL_VERSION, requestId, sessionId: snapshot.state.sessionId, runId: approval.runId,
     providerRuntimeRef: runtime.provider.providerRuntimeRef, profileId: runtime.provider.profileId,
     purpose: 'approvalReview', responseConstraint: 'answerOnly', maxOutputTokens: runtime.provider.maxOutputTokens,
-    workspaceBindings: snapshot.state.workspaceBindings.map(binding => ({ ...binding })),
+    workspaceBindings,
     messages: contributions.map(item => item.message), tools: [], hostedTools: [],
   };
   return { request, receipt: buildContextCompositionReceipt(requestId, 'approvalReview', 'answerOnly', contributions,

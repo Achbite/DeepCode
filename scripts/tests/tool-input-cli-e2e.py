@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import http.server
 import importlib.util
 import json
@@ -30,6 +31,9 @@ INTRO = {"type": "message", "id": "msg_cli_intro", "role": "assistant", "phase":
 
 class ProviderHandler(fixture.MockProviderHandler):
     def do_POST(self) -> None:  # noqa: N802
+        if getattr(self.provider_state, "attachment_mode", False):
+            self.respond_attachments()
+            return
         if self.path.endswith("/responses"):
             self.respond_native()
             return
@@ -161,6 +165,40 @@ class ProviderHandler(fixture.MockProviderHandler):
                 self.send_error(500)
             self.close_connection = True
 
+    def respond_attachments(self) -> None:
+        try:
+            body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+            state = self.provider_state
+            state.attachment_requests.append(body)
+            ordinal = len(state.attachment_requests)
+            tools = {tool["function"]["name"]: tool["function"] for tool in body["tools"]}
+            read_name = next(name for name, tool in tools.items() if "startByte" in tool["parameters"].get("properties", {}))
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream; charset=utf-8")
+            self.send_header("connection", "close")
+            self.end_headers()
+            if ordinal == 1:
+                state.attachment_started.set()
+                require(state.attachment_release.wait(30), "附件请求未获准继续")
+                self._send_tool_calls([("before-attachment", read_name, {"path": "probe.txt"})])
+            elif ordinal == 2:
+                require(body["messages"][:len(state.attachment_requests[0]["messages"])] == state.attachment_requests[0]["messages"], "追加附件改写了旧请求前缀")
+                parts = [part for message in body["messages"] if isinstance(message.get("content"), list) for part in message["content"]]
+                require(any(part.get("type") == "image_url" and part["image_url"]["url"] == state.attachment_image_url for part in parts), "PNG 没有按真实字节编码进入 Provider")
+                content = next(message["content"] for message in reversed(body["messages"]) if message["role"] == "user" and isinstance(message["content"], str) and "notes.txt" in message["content"])
+                references = json.loads(content[content.index('[{"referenceId"'):])
+                reference = next(item for item in references if item["path"] == "notes.txt")
+                self._send_tool_calls([("queued-file-read", read_name, {"workspace": reference["workspace"], "path": reference["path"]})])
+            elif ordinal == 3:
+                result = next(json.loads(message["content"]) for message in body["messages"] if message.get("tool_call_id") == "queued-file-read")
+                require(result["outcome"] == "completed" and result["output"]["content"] == "queued notes\n", "Kernel 未读取本轮新接纳的文件快照")
+                self._send_text("queued-attachments-complete")
+            else:
+                raise AssertionError(f"多余附件请求：{ordinal}")
+        except BaseException as error:
+            self.provider_state.record_failure(error)
+            self.close_connection = True
+
     def respond_native(self) -> None:
         headers_sent = False
         try:
@@ -230,6 +268,43 @@ def require_unexecuted_approval(daemon, projection):
     return approval
 
 
+def verify_queued_attachments(daemon, state, root, workspace) -> None:
+    state.attachment_mode = True
+    state.attachment_requests = []
+    state.attachment_started = threading.Event()
+    state.attachment_release = threading.Event()
+    png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=")
+    (root / "screen.png").write_bytes(png)
+    (root / "notes.txt").write_text("queued notes\n")
+    state.attachment_image_url = "data:image/png;base64," + base64.b64encode(png).decode()
+    session_id = fixture.create_session(daemon, workspace)["sessionId"]
+    endpoint = f"/api/conversation/sessions/{session_id}"
+    def submit(command_id, text, **extra):
+        return fixture.api_json(daemon.base_url, endpoint + "/commands", token=daemon.token, method="POST", body={
+            "schemaVersion": "deepcode.command.v3", "type": "message.submit", "commandId": command_id,
+            "sessionId": session_id, "text": text, **extra,
+        })
+    try:
+        require(submit("command:attachment-start", "Read the file, then consider my attachments.", profileId="e2e-main")["status"] == "accepted", "附件任务未接纳")
+        require(state.attachment_started.wait(20), "初始 Provider 请求未开始")
+        run_id = fixture.projection(daemon, session_id)["run"]["runId"]
+        for filename in ["screen.png", "notes.txt"]:
+            references = fixture.api_json(daemon.base_url, endpoint + "/filesystem-references/resolve", token=daemon.token, method="POST", body={
+                "references": [{"path": str(root / filename), "kind": "file"}],
+            })
+            reply = submit(f"command:attach-{filename}", "", runId=run_id, filesystemReferences=references)
+            require(reply["status"] == "accepted", "运行中仅附件消息被拒绝: " + json.dumps(reply, ensure_ascii=False))
+        queued = fixture.projection(daemon, session_id)
+        require(len(queued["queuedInputs"]) == 2, "附件未留在同一任务队列")
+        state.attachment_release.set()
+        completed = fixture.wait_completed(daemon, state, session_id, "queued-attachments-complete")
+        require(completed["run"]["runId"] == run_id and not completed["queuedInputs"], "附件另起任务或未消费")
+        require(len(state.attachment_requests) == 3, "附件链路请求次数不符")
+        print("[attachment-e2e] PASS: same-run image-only and file-only input, real PNG Provider encoding, immutable old prefix and Kernel snapshot read")
+    finally:
+        state.attachment_release.set()
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="deepcode-tool-input-cli-") as directory:
         root = Path(directory)
@@ -250,6 +325,7 @@ def main() -> None:
             profiles_path = daemon.config_root / "config/user/local/settings/llm-profiles.json"
             profiles = json.loads(profiles_path.read_text())
             profiles["profiles"][0]["maxOutputTokens"] = 16384
+            profiles["profiles"][0]["imageInput"] = True
             profiles["profiles"].append({**profiles["profiles"][0], "id": "e2e-responses", "kind": "responses"})
             profiles_path.write_text(json.dumps(profiles))
             daemon.start()
@@ -321,6 +397,7 @@ def main() -> None:
             state.assert_healthy()
             native_projection = fixture.projection(daemon, native_session_id)
             require(native_projection["run"]["status"] == "completed", "commentary 续跑未完成")
+            verify_queued_attachments(daemon, state, root, workspace)
             daemon.shutdown()
             runtime = daemon.config_root / "data" / "agent-runtime"
             with fixture.sqlite_read_only(runtime / "session.sqlite3") as connection:

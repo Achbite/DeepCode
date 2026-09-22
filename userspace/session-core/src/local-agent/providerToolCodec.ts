@@ -325,10 +325,10 @@ export function providerMessageCodecsByCallId(
       if (!base || !runtime) throw new LoopFailure('provider_tool_call_runtime_missing', 'Provider 请求缺少工具视图。');
       const workspaceIdByHandle = new Map<string, string>();
       const workspaceHandleById = new Map<string, string>();
-      base.workspaceBindings.forEach((binding, index) => {
+      event.payload.workspaceBindings.forEach((binding, index) => {
         const handle = index === 0 ? 'primary' : `workspace${index + 1}`;
-        workspaceIdByHandle.set(handle, binding.workspaceId);
-        workspaceHandleById.set(binding.workspaceId, handle);
+        workspaceIdByHandle.set(handle, binding.itemId);
+        workspaceHandleById.set(binding.itemId, handle);
       });
       const codec = {
         wireByCanonical: new Map(runtime.providerToolAliases.map((alias) => [alias.canonicalName, alias.wireName])),

@@ -79,6 +79,13 @@ function admitEvent(snapshot: LoopSnapshot, event: NewSessionEvent): void {
       break;
     }
     case 'message.committed':
+      if (event.payload.role === 'user' && event.runId && event.payload.filesystemReferences?.length) {
+        if (pendingProvider || pendingToolRequests(events, event.runId).length) throw new Error('input_resources_turn_active');
+        if (event.payload.filesystemReferences.some(reference => reference.kind === 'directory'
+          && !state.run?.workspaceBindings.some(binding => binding.workspaceId === reference.workspaceId))) {
+          throw new Error('input_resources_directory_change');
+        }
+      }
     case 'narrative.committed':
       if ('providerRequestId' in event.payload) {
         const requestId = event.payload.providerRequestId;
@@ -160,6 +167,10 @@ function admitEvent(snapshot: LoopSnapshot, event: NewSessionEvent): void {
         && item.runId === runId && item.payload.providerRequestId === event.payload.providerRequestId);
       if (event.payload.purpose === 'approvalReview' && (!state.pendingApproval || event.payload.tools.length)) throw new Error('approval_review_context_invalid');
       if ((event.payload.purpose === 'contextCompaction') !== compaction) throw new Error('context_composition_purpose_mismatch');
+      if (JSON.stringify(event.payload.workspaceBindings.map(binding => binding.itemId))
+        !== JSON.stringify(state.run?.workspaceBindings.map(binding => binding.workspaceId))) {
+        throw new Error('context_workspace_snapshot_mismatch');
+      }
       const runtime = state.runRuntimeSnapshots[event.runId];
       const view = state.runToolViews[event.runId] ?? runtime;
       if (event.payload.kernelCatalogSnapshotRef && event.payload.kernelCatalogSnapshotRef !== view.kernelCatalogSnapshotRef) {

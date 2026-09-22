@@ -1086,11 +1086,11 @@ pub(crate) async fn local_agent_provider_stream(
     ) {
         return local_provider_error(&request_id, code, message);
     }
-    let frozen_workspace_ids = match state
-        .local_agent
-        .journal
-        .run_workspace_binding_ids(&body.session_id, &body.run_id)
-    {
+    let frozen_workspace_ids = match state.local_agent.journal.provider_workspace_binding_ids(
+        &body.session_id,
+        &body.run_id,
+        &body.request_id,
+    ) {
         Ok(bindings) => bindings,
         Err(error) => {
             return local_provider_error(&request_id, error.code, &error.message);
@@ -1105,7 +1105,7 @@ pub(crate) async fn local_agent_provider_stream(
         return local_provider_error(
             &request_id,
             "provider_workspace_snapshot_mismatch",
-            "Provider 请求的目录集合与 run.started 冻结快照不一致。",
+            "Provider 请求的资源集合与该请求已提交的资源视图不一致。",
         );
     }
     let runtime = state.local_agent.provider_runtimes.resolve(
