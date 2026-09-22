@@ -542,6 +542,10 @@
     "agent.attachment.removeDirectoryIndex": "Remove folder index {name}",
     "agent.attachment.removePendingDirectory": "Remove folder from this message",
     "agent.attachment.deferred": "Directory-index changes apply next run; the active run keeps its frozen start snapshot.",
+    "agent.error.dismiss": "Dismiss message",
+    "agent.link.chooseTarget": "Choose a location to open",
+    "agent.link.multipleTargets": "This path exists in multiple folders. Choose a target.",
+    "agent.link.unableToOpen": "Unable to open this location.",
     "agent.attachment.menu": "Add",
     "agent.attachment.filesAndFolders": "Files and folders",
     "agent.attachment.pickerTitle": "Choose files and folders",
@@ -1179,6 +1183,19 @@
     "gui.showReasoning": {
       "label": "Reasoning details",
       "description": "Click the reasoning status to read reasoning supplied by the model. Off by default; this display preference does not change reasoning effort."
+    },
+    "gui.usageWidget.enabled": {
+      "label": "Usage widget",
+      "description": "Show costs or quota for the selected connection."
+    },
+    "gui.usageWidget.visibility": {
+      "label": "Widget visibility",
+      "description": "Choose how the widget appears.",
+      "options": {
+        "summary": "Summary",
+        "collapsed": "Collapsed",
+        "hidden": "Hidden"
+      }
     },
     "gui.showContextRail": {
       "label": "Show context rail",

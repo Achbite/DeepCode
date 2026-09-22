@@ -1,3 +1,4 @@
+import { UiRegion } from '../../ui-plugins/UiRegion';
 import type { BrowserAnnotationDraft } from './browserReview';
 import React, { useId, useLayoutEffect, useRef } from 'react';
 import { t, type UiLanguage } from '../../i18n';
@@ -9,12 +10,14 @@ import { ComposerPermissionControl } from './ComposerPermissionControl';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import type { AgentComposer } from './useAgentComposer';
 import { pastedTextTitle } from '../../services/pastedText';
+import { DismissibleError } from './DismissibleError';
 
 interface ConversationComposerProps {
   changeBar?: React.ReactNode;
   language: UiLanguage;
   composer: AgentComposer;
   uiActionError: string | null;
+  onDismissUiActionError(): void;
   onEditBrowserReview(review: BrowserAnnotationDraft): void;
 }
 
@@ -23,6 +26,7 @@ export function ConversationComposer({
   language,
   composer,
   uiActionError,
+  onDismissUiActionError,
   onEditBrowserReview,
 }: ConversationComposerProps) {
   const connections = useLocalAgentStore(state => state.connections);
@@ -40,8 +44,8 @@ export function ConversationComposer({
     reasoningEffortOverride,
     modelSettingsBusy,
     cancelRun,
-    selectProfile,
-    selectReasoningEffort,
+    selectModel,
+    modelSelectionConfirmed,
     draft,
     setDraft,
     pendingFilesystemPaths,
@@ -76,6 +80,14 @@ export function ConversationComposer({
     canSend,
     showStopAction,
   } = composer;
+  const regionData = { kind: 'composer' as const, draft, canSend, canStop: showStopAction, attachments: pendingFilesystemPaths };
+  const regionActions = {
+    updateDraft: (text: string) => updateDraft(text, text.length),
+    submitDraft,
+    stopRun: async () => { if (showStopAction) await cancelRun(); },
+    pickAttachments: () => setAttachmentDialogOpen(true),
+    addAttachments: composer.selectMessageAttachments,
+  };
   const pickerId = useId();
   const annotations = composer.pastedTexts.filter(item => item.browserReview);
   const attachmentRail = useRef<HTMLDivElement>(null);
@@ -116,14 +128,14 @@ export function ConversationComposer({
   }, [inputMode, textareaRef]);
 
   return (
-    <footer className={`local-agent__composer-shell${pendingPlan || pendingInteraction || pendingApproval
+    <UiRegion slot="composer.layout" data={regionData} actions={regionActions}><footer className={`local-agent__composer-shell${pendingPlan || pendingInteraction || pendingApproval
       ? ' local-agent__composer-shell--decision'
       : ''}`}>
-      {error && <div className="local-agent__error">{error}</div>}
-      {attachmentError && <div className="local-agent__error">{attachmentError}</div>}
-      {uiActionError && <div className="local-agent__error">{uiActionError.includes('\n')
+      {error && <DismissibleError language={language} onDismiss={composer.clearError}>{error}</DismissibleError>}
+      {attachmentError && <DismissibleError language={language} onDismiss={composer.clearAttachmentError}>{attachmentError}</DismissibleError>}
+      {uiActionError && <DismissibleError language={language} onDismiss={onDismissUiActionError}>{uiActionError.includes('\n')
         ? <details><summary>{uiActionError.split('\n')[0]}</summary><pre>{uiActionError.slice(uiActionError.indexOf('\n') + 1)}</pre></details>
-        : uiActionError}</div>}
+        : uiActionError}</DismissibleError>}
       {composer.failedDrafts.map((failed, index) => <details className="local-agent__failed-draft" key={index}>
         <summary>{language === 'zh-CN' ? '未发送草稿已保留' : 'Unsent draft saved'}</summary>
         <pre>{[failed.draft, ...failed.pastedTexts.map((item) => item.text)].filter(Boolean).join('\n\n')}</pre>
@@ -336,7 +348,7 @@ export function ConversationComposer({
           onPaste={composer.pasteText}
         />
         <div className="local-agent__composer-footer">
-          {!composer.textDecision && !composer.editingMessage && <div className="local-agent__composer-tools">
+          {!composer.textDecision && !composer.editingMessage && <UiRegion slot="composer.attachments" data={regionData} actions={regionActions}><div className="local-agent__composer-tools">
             <div ref={attachmentControlRef} className="local-agent__attachment-control">
               <button
                 type="button"
@@ -395,8 +407,8 @@ export function ConversationComposer({
               )}
             </div>
             <ComposerPermissionControl language={language} composer={composer} />
-          </div>}
-          <div className="local-agent__composer-actions">
+          </div></UiRegion>}
+          <UiRegion slot="composer.actions" data={regionData} actions={regionActions}><div className="local-agent__composer-actions">
             {!composer.textDecision && !composer.editingMessage && <SessionModelSelector
               key={composer.conversationKey}
               language={language}
@@ -407,8 +419,8 @@ export function ConversationComposer({
               contextUsage={projection?.contextUsage ?? null}
               contextCompositions={projection?.contextCompositions ?? []}
               busy={loading || submitting || modelSettingsBusy}
-              onProfileChange={selectProfile}
-              onReasoningEffortChange={selectReasoningEffort}
+              confirmed={modelSelectionConfirmed}
+              onSelect={selectModel}
             />}
             <div className="local-agent__composer-primary-actions">
               {(pendingPlan || pendingInteraction?.allowFreeform) && <button
@@ -452,7 +464,7 @@ export function ConversationComposer({
                 {composer.editingMessage ? t(language, 'agent.message.regenerate') : composer.textDecision ? t(language, 'agent.composer.send') : <DeepCodeShellIcon name="arrowUp" />}
               </button>}
             </div>
-          </div>
+          </div></UiRegion>
         </div>
         </>}
       </div>
@@ -461,7 +473,7 @@ export function ConversationComposer({
           <TotalCacheUsage projection={projection} language={language} />
         </div>
       )}
-    </footer>
+    </footer></UiRegion>
   );
 }
 

@@ -232,6 +232,52 @@ test('document preview requests preserve workspace identity, full bytes and read
   await assert.rejects(readResourceBlob('session:doc', { workspaceId: 'workspace:docs', logicalPath: '报告.html' }, 'document'), /original read error/);
 });
 
+test('multi-workspace links resolve exact targets and never guess through read errors', async t => {
+  const { resolveLocalTargets, parseLocalTarget } = await loadGuiModule(t, '/src/components/local-agent/resourceLinks.ts');
+  const roots = [{ workspaceId: 'main', root: '/project' }, { workspaceId: 'drafts', root: '/session' }];
+  const missing = Object.assign(new Error('canonicalize /session/README.md: No such file'), { code: 'host_inspection_path_not_found' });
+  const calls = [];
+  const one = await resolveLocalTargets(parseLocalTarget('README.md:12:3'), roots, async (workspace, path) => {
+    calls.push([workspace, path]);
+    if (workspace === 'drafts') throw missing;
+    return { path: `/project/${path}`, kind: 'file' };
+  });
+  assert.deepEqual(calls, [['main', 'README.md'], ['drafts', 'README.md']]);
+  assert.deepEqual(one, [{ workspaceId: 'main', logicalPath: 'README.md', path: '/project/README.md', line: 12, column: 3 }]);
+  const multiple = await resolveLocalTargets(parseLocalTarget('README.md'), roots, async (workspace, path) => ({ path: `${roots.find(root => root.workspaceId === workspace).root}/${path}`, kind: 'file' }));
+  assert.equal(multiple.length, 2, 'the UI must offer both targets');
+  const denied = Object.assign(new Error('permission denied'), { code: 'host_inspection_path_unavailable' });
+  await assert.rejects(resolveLocalTargets(parseLocalTarget('README.md'), roots, async workspace => {
+    if (workspace === 'drafts') throw denied;
+    return { path: '/project/README.md', kind: 'file' };
+  }), error => error === denied);
+  await assert.rejects(resolveLocalTargets(parseLocalTarget('README.md'), roots, async () => { throw missing; }), /canonicalize.*No such file/);
+  const { ResourceLinkChoices } = await loadGuiModule(t, '/src/components/local-agent/ResourceLinkChoices.tsx');
+  let selected;
+  const dialog = ResourceLinkChoices({ targets: multiple, language: 'zh-CN', onSelect: target => { selected = target; }, onClose() {} });
+  const list = dialog.props.children.find(child => child.type === 'ul');
+  list.props.children[1].props.children.props.onClick();
+  assert.equal(selected, multiple[1]);
+});
+
+test('error dismissal clears only its owner and allows the next error to appear', async t => {
+  const { DismissibleError } = await loadGuiModule(t, '/src/components/local-agent/DismissibleError.tsx');
+  const store = await loadGuiModelStore(t);
+  const projection = { retained: 'failed execution facts' };
+  store.setState({ sessionId: 'session:error', error: 'command failed', errorSource: 'command', projection });
+  const view = DismissibleError({ language: 'zh-CN', children: store.getState().error, onDismiss: store.getState().clearError });
+  assert.equal(view.props.role, 'alert');
+  const close = view.props.children.find(child => child.type === 'button');
+  assert.equal(close.props['aria-label'], '关闭提示');
+  close.props.onClick();
+  assert.equal(store.getState().error, null);
+  assert.equal(store.getState().projection, projection);
+  store.setState({ error: 'new failure', errorSource: 'command' });
+  const next = DismissibleError({ language: 'en-US', children: store.getState().error, onDismiss: store.getState().clearError });
+  assert.equal(next.props.children[0].props.children, 'new failure');
+  assert.equal(next.props.children[1].props['aria-label'], 'Dismiss message');
+});
+
 test('document links retain Unicode paths and choose the appropriate reader', async (t) => {
   const { documentFormat, workspaceResourceLink } = await loadGuiModule(t, '/src/components/local-agent/documentResources.ts');
   assert.equal(documentFormat('Reports/REPORT.PDF'), 'pdf');
@@ -241,6 +287,15 @@ test('document links retain Unicode paths and choose the appropriate reader', as
   assert.deepEqual(workspaceResourceLink('workspace://workspace%3Adoc/reports%2F%E6%8A%A5%E5%91%8A%20a.pdf'), { workspaceId: 'workspace:doc', logicalPath: 'reports/报告 a.pdf' });
   assert.equal(workspaceResourceLink('https://example.com/report.pdf'), null);
   assert.equal(workspaceResourceLink('workspace://workspace:doc/%FF'), null);
+});
+
+test('reader text decoding preserves Unicode BOM documents and rejects unsupported bytes', async (t) => {
+  const { readDocumentText } = await loadGuiModule(t, '/src/components/local-agent/documentResources.ts');
+  assert.equal(await readDocumentText(new Blob(['# 中文文档\n正文'])), '# 中文文档\n正文');
+  assert.equal(await readDocumentText(new Blob([Uint8Array.from([0xff, 0xfe, 0x2d, 0x4e, 0x87, 0x65])])), '中文');
+  assert.equal(await readDocumentText(new Blob([Uint8Array.from([0xfe, 0xff, 0x4e, 0x2d, 0x65, 0x87])])), '中文');
+  await assert.rejects(readDocumentText(new Blob([Uint8Array.from([0xff, 0x00, 0xa1])])));
+  await assert.rejects(readDocumentText(new Blob(['text\0binary'])), /file_encoding_unsupported/);
 });
 
 test('local links preserve locations, workspace roots and unambiguous readable labels', async (t) => {
@@ -531,7 +586,7 @@ test('Host workspace initialization propagates the failing request without openi
 test('one native reference request returns the actual file or folder kind', async (t) => {
   const previousWindow = globalThis.window;
   t.after(() => { if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow; });
-  const [{ pickNativePath }] = await loadGuiModules(t, ['/src/services/runtimeAdapter.ts']);
+  const [{ pickNativePath, pickNativePaths }] = await loadGuiModules(t, ['/src/services/runtimeAdapter.ts']);
   const options = { kind: 'path', title: 'Files and folders', selectLabel: 'Attach', cancelLabel: 'Cancel' };
   let selection;
   let failure;
@@ -553,14 +608,17 @@ test('one native reference request returns the actual file or folder kind', asyn
     { path: '/Users/developer/project/Makefile', kind: 'file' },
   ];
   for (const reference of references) {
-    selection = reference;
+    selection = [reference];
     assert.deepEqual(await pickNativePath(options), reference);
   }
+  selection = [references[0], references[3]];
+  assert.deepEqual(await pickNativePaths({ ...options, multiple: true }), selection);
+  await assert.rejects(pickNativePath(options), /native_path_selection_count_invalid/);
   selection = null;
   assert.equal(await pickNativePath(options), null);
   failure = new Error('native selection failed');
   await assert.rejects(pickNativePath(options), (error) => error === failure);
-  assert.equal(calls, references.length + 2);
+  assert.equal(calls, references.length + 4);
 });
 
 test('Skill settings read mounted guidance from the live plugin catalog', async (t) => {
@@ -641,7 +699,8 @@ test('GUI receives and renders live tool output at the same journal revision bef
     children: () => createElement(ToolActivityGroup, { sessionId, activities: [current], language: 'zh-CN', onExpand() {}, onOpenWorkspaceResource() {} }),
   }));
   assert.equal(renderActivity().includes('<pre>'), false, 'output arriving does not expand details');
-  assert.match(renderActivity(), /正在执行/);
+  assert.match(renderActivity(), /正在调用 1 个工具/);
+  layout.state.set('tool-group:expanded', true);
   layout.state.set(`tool:${activity.activityId}:expanded`, true);
   const html = renderActivity();
   assert.match(html, /<pre>first line\nsecond line\n<\/pre>/);
@@ -1464,6 +1523,40 @@ test('large GUI input uploads the complete text and submits only the resulting r
   });
   await api.submitLocalAgentCommand({ schemaVersion: 'deepcode.command.v3', type: 'message.submit', commandId: 'command:upload', sessionId: 'session:upload', text: content });
   assert.equal(seen.length, 2);
+});
+
+test('GUI submits an image-only message and keeps its bound attachment', async t => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:image-only-gui';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const image = { referenceId: 'reference:screen', workspaceId: 'workspace:screen', logicalPath: 'screen.png',
+    displayName: 'screen.png', kind: 'file', mediaType: 'image/png', byteLength: 8 };
+  const requests = [], commands = [];
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    requests.push(request);
+    yield providerEvent(request.requestId, 'text.delta', { text: 'Image received.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel(), fakeRunPreparation().port, 'image-only-gui');
+  t.after(() => actor.dispose());
+  installGuiFetch(t, async (url, init) => {
+    if (url.pathname.endsWith('/filesystem-references/resolve')) return Response.json({ ok: true, data: [image] });
+    if (url.pathname.endsWith('/commands')) {
+      const command = JSON.parse(init.body); commands.push(command);
+      return Response.json({ ok: true, data: await actor.submit(command) });
+    }
+    if (url.pathname.endsWith('/projection')) return Response.json({ ok: true, data: await actor.snapshot() });
+    if (url.pathname.endsWith('/catalog')) return Response.json({ ok: true, data: { projects: [], sessions: [] } });
+    if (url.pathname.endsWith('/plugins')) return Response.json({ ok: true, data: { revision: 'plugins:images', plugins: [] } });
+    throw new Error(`unexpected_gui_request:${url.pathname}`);
+  });
+  const store = await loadGuiModelStore(t);
+  store.setState({ sessionId, projection: await actor.snapshot(), selectedProfileId: 'profile:test', profiles: [{ id: 'profile:test', enabled: true }] });
+  await store.getState().sendMessage('', [{ path: '/pictures/screen.png', kind: 'file' }]);
+  assert.equal(commands[0].text, '');
+  assert.deepEqual(commands[0].filesystemReferences, [image]);
+  const completed = await waitForProjection(actor, value => value.run?.status === 'completed');
+  assert.deepEqual(completed.messages[0].filesystemReferences, [image]);
+  assert.equal(requests[0].messages.find(message => message.images)?.images[0].workspaceId, image.workspaceId);
+  await assert.rejects(store.getState().sendMessage(''), /message_empty/);
 });
 
 test('GUI submission keeps the ordinary message separate from pasted text references', async (t) => {
@@ -2483,6 +2576,8 @@ test('collapsed tool failures retain their original errors in manual details', a
     }], language: 'zh-CN', onExpand() {}, onOpenWorkspaceResource() {} }),
   }));
   assert.equal(render().includes('path_not_directory'), false);
+  assert.doesNotMatch(render(), /失败/);
+  layout.state.set('tool-group:expanded', true);
   assert.match(render(), /失败/);
   layout.state.set('tool:activity:one:expanded', true);
   const html = render();
@@ -3146,7 +3241,7 @@ test('settled managed processes render stored output without live output', async
   const [{ ToolActivityGroup }, { ConversationVirtualRow }] = await loadGuiModules(t, [
     '/src/components/local-agent/ToolActivityDetails.tsx', '/src/components/local-agent/ConversationVirtualRow.tsx',
   ]);
-  const layout = { state: new Map([['tool:managed:expanded', true]]) };
+  const layout = { state: new Map([['tool-group:expanded', true], ['tool:managed:expanded', true]]) };
   const activity = {
     activityId: 'managed', runId: 'run:managed', callId: 'call:managed', sequence: 1,
     kind: 'tool', status: 'completed', label: 'bash', startedAt: '1',
@@ -3165,4 +3260,29 @@ test('settled managed processes render stored output without live output', async
   assert.match(html, /Build finished/);
   assert.match(html, /Build warning/);
   assert.doesNotMatch(html, /No output yet/);
+});
+
+
+test('mixed tool results keep the group neutral and retain the original failure in details', async t => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const [{ ToolActivityGroup }, { ConversationVirtualRow }] = await loadGuiModules(t, [
+    '/src/components/local-agent/ToolActivityDetails.tsx', '/src/components/local-agent/ConversationVirtualRow.tsx']);
+  const layout = { state: new Map() };
+  const activities = ['completed', 'failed'].map((status, index) => ({ activityId: String(index), runId: 'run:mix',
+    kind: 'tool', status, label: 'browser.page', tool: { operation: 'browser.page', resources: [],
+      ...(status === 'failed' ? { error: { code: 'native_browser_page_not_visible', message: 'reason=covered' } } : {}) } }));
+  const render = () => renderToStaticMarkup(createElement(ConversationVirtualRow, { rowKey: 'mixed', eager: true,
+    virtualizer: { layout: () => layout }, children: () => createElement(ToolActivityGroup, { activities, language: 'zh-CN', onExpand() {}, onOpenWorkspaceResource() {} }) }));
+  assert.doesNotMatch(render(), /失败|reason=covered/);
+  assert.match(render(), /2/);
+  layout.state.set('tool-group:expanded', true); layout.state.set('tool:1:expanded', true);
+  assert.match(render(), /reason=covered/);
+  assert.match(render(), /失败/);
+});
+
+test('browser geometry clips to the viewport rather than shifting a full-width surface', async t => {
+  const { clippedBrowserBounds } = await loadGuiModule(t, '/src/components/local-agent/nativeBrowserLayout.ts');
+  assert.deepEqual(clippedBrowserBounds({ x: -20, y: 50, width: 900, height: 600 }, 800, 620), { x: 0, y: 50, width: 800, height: 570 });
+  assert.deepEqual(clippedBrowserBounds({ x: 250, y: 120, width: 950, height: 580 }, 1200, 700), { x: 250, y: 120, width: 950, height: 580 });
 });

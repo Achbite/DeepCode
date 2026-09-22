@@ -1,3 +1,4 @@
+import { UiRegion } from '../../ui-plugins/UiRegion';
 import { MarkdownInline } from '../../components/local-agent/BufferedMarkdown';
 import React from 'react';
 import { useDisplayedConversation } from '../../components/local-agent/ConversationDisplayProvider';
@@ -27,7 +28,7 @@ const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, project
   const ended = Boolean(todoRun?.outcome);
   return (
     <aside className="deepcode-gui-context-panel">
-      <section className="deepcode-gui-task-list-card">
+      <UiRegion slot="task.panel" data={{ kind: 'tasks', todoList: projection?.todoList ?? null, run: todoRun ?? null }}><section className="deepcode-gui-task-list-card">
         <div className="deepcode-gui-task-list-card__title">
           <span>{t(language, 'deepcodeGui.tasks.title')}</span>
         </div>
@@ -54,9 +55,9 @@ const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, project
         {ended && remaining > 0 && <small className="deepcode-gui-task-list-card__note">
           {t(language, 'deepcodeGui.tasks.endedRemaining', { count: remaining })}
         </small>}
-      </section>
+      </section></UiRegion>
 
-      <section className="deepcode-gui-task-list-card deepcode-gui-output-card">
+      <UiRegion slot="artifact.panel" data={{ kind: 'artifacts', artifacts: display.artifacts, expanded: showAllArtifacts }} actions={{ setExpanded: setShowAllArtifacts }}><section className="deepcode-gui-task-list-card deepcode-gui-output-card">
         <div className="deepcode-gui-task-list-card__title">
           <span>{t(language, 'deepcodeGui.outputs.title')}</span>
         </div>
@@ -72,7 +73,7 @@ const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, project
             {t(language, showAllArtifacts ? 'deepcodeGui.outputs.showLess' : 'deepcodeGui.outputs.showAll', { count: artifacts.length })}
           </button>}
         </>}
-      </section>
+      </section></UiRegion>
     </aside>
   );
 };

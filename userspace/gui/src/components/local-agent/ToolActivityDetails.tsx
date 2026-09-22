@@ -1,3 +1,4 @@
+import { UiRegion } from '../../ui-plugins/UiRegion';
 import React, { useEffect, useState } from 'react';
 import type { ActivityProjection, AssistantDraftBlockProjection, ProviderHostedActivityProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
@@ -31,13 +32,10 @@ export const ProviderHostedDraftGroup: React.FC<ProviderHostedDraftGroupProps> =
   onExpand,
 }) => {
   const [expanded, setExpanded] = useConversationRowState('hosted-group:expanded', false);
-  const failed = blocks.some((block) => block.status === 'failed');
-  const summary = failed
-      ? t(language, 'agent.providerHosted.summary.didNotCompleteMany', { count: blocks.length })
-      : t(language, 'agent.providerHosted.summary.completedMany', { count: blocks.length });
+  const summary = t(language, 'agent.tool.summary.usedMany', { count: blocks.length });
   return (
-    <article className={`local-agent__tool-group${expanded ? ' local-agent__tool-group--expanded' : ''}${failed ? ' local-agent__tool-group--failed' : ''}`}>
-      {blocks.length > 1 && <button
+    <UiRegion slot="activity.row" data={{ kind: 'providerHosted', blocks, expanded }} actions={{ setExpanded }}><article className={`local-agent__tool-group${expanded ? ' local-agent__tool-group--expanded' : ''}`}>
+      <UiRegion slot="activity.summary" data={{ kind: 'providerHosted', blocks, expanded }} actions={{ setExpanded }}><button
         type="button"
         className="local-agent__tool-group-summary"
         aria-expanded={expanded}
@@ -53,9 +51,9 @@ export const ProviderHostedDraftGroup: React.FC<ProviderHostedDraftGroupProps> =
         <span className="local-agent__tool-group-chevron" aria-hidden="true">
           <DeepCodeShellIcon name="chevronRight" />
         </span>
-      </button>}
-      {(blocks.length === 1 || expanded) && (
-        <div className="local-agent__tool-group-items">
+      </button></UiRegion>
+      {expanded && (
+        <UiRegion slot="activity.detail" data={{ kind: 'providerHosted', blocks, expanded }} actions={{ setExpanded }}><div className="local-agent__tool-group-items">
           {blocks.map((block) => (
             <ProviderHostedEntry
               key={block.providerCallId}
@@ -65,9 +63,9 @@ export const ProviderHostedDraftGroup: React.FC<ProviderHostedDraftGroupProps> =
               onExpand={onExpand}
             />
           ))}
-        </div>
+        </div></UiRegion>
       )}
-    </article>
+    </article></UiRegion>
   );
 };
 
@@ -78,14 +76,9 @@ export const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
   onOpenWorkspaceResource,
 }) => {
   const [expanded, setExpanded] = useConversationRowState('tool-group:expanded', false);
-  const hasFailure = activities.some((activity) => (
-    ['failed', 'denied', 'rejected', 'indeterminate'].includes(activity.status)
-  ));
-  const groupStatus = toolGroupStatus(activities);
-
   return (
-    <article className={`local-agent__tool-group${expanded ? ' local-agent__tool-group--expanded' : ''}${hasFailure ? ' local-agent__tool-group--failed' : ''}`}>
-      {activities.length > 1 && <button
+    <UiRegion slot="activity.row" data={{ kind: 'activities', activities, expanded }} actions={{ setExpanded }}><article className={`local-agent__tool-group${expanded ? ' local-agent__tool-group--expanded' : ''}`}>
+      <UiRegion slot="activity.summary" data={{ kind: 'activities', activities, expanded }} actions={{ setExpanded }}><button
         type="button"
         className="local-agent__tool-group-summary"
         aria-expanded={expanded}
@@ -102,15 +95,12 @@ export const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
           />
         </span>
         <strong>{toolGroupSummary(activities, language)}</strong>
-        {groupStatus !== 'completed' && (
-          <span>{toolActivityStatus(groupStatus, language)}</span>
-        )}
         <span className="local-agent__tool-group-chevron" aria-hidden="true">
           <DeepCodeShellIcon name="chevronRight" />
         </span>
-      </button>}
-      {(activities.length === 1 || expanded) && (
-        <div className="local-agent__tool-group-items">
+      </button></UiRegion>
+      {expanded && (
+        <UiRegion slot="activity.detail" data={{ kind: 'activities', activities, expanded }} actions={{ setExpanded }}><div className="local-agent__tool-group-items">
           {activities.map((activity) => (
             <ToolActivityEntry
               activity={activity}
@@ -120,9 +110,9 @@ export const ToolActivityGroup: React.FC<ToolActivityGroupProps> = ({
               onOpenWorkspaceResource={onOpenWorkspaceResource}
             />
           ))}
-        </div>
+        </div></UiRegion>
       )}
-    </article>
+    </article></UiRegion>
   );
 };
 
@@ -224,7 +214,7 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
   }
   return (
     <div className={`local-agent__tool-entry local-agent__tool-entry--${activity.status}`}>
-      <button
+      <UiRegion slot="activity.summary"><button
         type="button"
         className="local-agent__tool-entry-heading"
         aria-expanded={expanded}
@@ -244,7 +234,7 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
         <span className="local-agent__tool-entry-chevron" aria-hidden="true">
           <DeepCodeShellIcon name="chevronRight" />
         </span>
-      </button>
+      </button></UiRegion>
       {expanded && (
         <UiPluginSlotView slot="tool.result" input={{ kind: 'tool.result', activity, toolId: tool?.operation ?? activity.label, locale: language, theme }}>
         <div className="local-agent__tool-entry-details">
@@ -306,7 +296,7 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
                   && resource.logicalPath
                 ) {
                   return (
-                    <button
+                    <UiRegion slot="activity.summary"><button
                       type="button"
                       key={key}
                       onClick={() => onOpenWorkspaceResource(
@@ -314,7 +304,7 @@ const ToolActivityEntry: React.FC<ToolActivityEntryProps> = ({
                       )}
                     >
                       {resource.label}
-                    </button>
+                    </button></UiRegion>
                   );
                 }
                 if (resource.kind === 'url' && resource.uri) {
@@ -400,19 +390,7 @@ function toolGroupSummary(
 ): string {
   const status = toolGroupStatus(activities);
   if (activities.every((activity) => activity.kind === 'providerHosted')) {
-    if (status === 'completed') {
-      return t(language, 'agent.providerHosted.summary.completedMany', {
-        count: activities.length,
-      });
-    }
-    if (['failed', 'cancelled', 'indeterminate', 'denied'].includes(status)) {
-      return t(language, 'agent.providerHosted.summary.didNotCompleteMany', {
-        count: activities.length,
-      });
-    }
-    return t(language, 'agent.providerHosted.summary.activeMany', {
-      count: activities.length,
-    });
+    return t(language, 'agent.tool.summary.usedMany', { count: activities.length });
   }
   if (status === 'active') {
     return t(language, 'agent.tool.summary.activeMany', { count: activities.length });

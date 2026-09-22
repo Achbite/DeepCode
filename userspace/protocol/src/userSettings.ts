@@ -31,6 +31,8 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   'gui.fontSize': 14,
   'gui.navigationDensity': 'comfortable',
   'gui.showContextRail': true,
+  'gui.usageWidget.enabled': true,
+  'gui.usageWidget.visibility': 'summary',
   'gui.showReasoning': false,
   'gui.defaultFileOpen': 'reader',
   'gui.sidebarOrder': '{"projects":[],"sessions":[]}',

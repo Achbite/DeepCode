@@ -1,3 +1,4 @@
+import { UiRegion } from '../../ui-plugins/UiRegion';
 import { restoredInterfaceView, useInterfaceReloadView, registerInterfaceReloadView } from '../../services/interfaceReload';
 import { createPortal } from 'react-dom';
 import { UI_ICON_ROLES } from '../../icons/registry';
@@ -136,7 +137,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
 
   return (
     <SettingsSearchTargets.Provider value={targets.current}><SettingsSearchContext.Provider value={register}><div className="settings-center">
-      {navigationTarget ? createPortal(navigation, navigationTarget) : navigation}
+      {navigationTarget ? createPortal(<UiRegion slot="settings.navigation">{navigation}</UiRegion>, navigationTarget) : <UiRegion slot="settings.navigation">{navigation}</UiRegion>}
 
       <section className="settings-body" ref={scrollRef}>
         {searching && <div className="settings-search-results">

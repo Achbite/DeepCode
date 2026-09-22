@@ -274,6 +274,8 @@ pub(crate) fn default_user_settings() -> Value {
         "gui.accentColor": "blue",
         "gui.navigationDensity": "comfortable",
         "gui.showContextRail": true,
+        "gui.usageWidget.enabled": true,
+        "gui.usageWidget.visibility": "summary",
         "gui.showReasoning": false
     })
 }
