@@ -21,6 +21,8 @@ pub struct PathOptions {
     default_path: Option<String>,
     #[serde(default)]
     filters: Vec<PathFilter>,
+    #[serde(default)]
+    multiple: bool,
 }
 
 #[derive(Deserialize)]
@@ -57,7 +59,7 @@ fn describe_selection(path: PathBuf) -> Result<PathSelection, String> {
 pub async fn deepcode_pick_path(
     window: tauri::Window,
     options: PathOptions,
-) -> Result<Option<PathSelection>, String> {
+) -> Result<Option<Vec<PathSelection>>, String> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let parent = window.clone();
     window
@@ -75,7 +77,19 @@ pub async fn deepcode_pick_path(
         receiver
             .recv()
             .map_err(|error| error.to_string())??
-            .map(describe_selection)
+            .map(|paths| {
+                let selections = paths
+                    .into_iter()
+                    .map(describe_selection)
+                    .collect::<Result<Vec<_>, _>>()?;
+                if selections.is_empty() {
+                    return Err("native_dialog_selected_path_missing".into());
+                }
+                if selections.len() > 1 && selections.iter().any(|item| item.kind == "directory") {
+                    return Err("Select multiple files or one folder.".into());
+                }
+                Ok(selections)
+            })
             .transpose()
     })
     .await

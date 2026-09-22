@@ -7,7 +7,7 @@ use std::path::PathBuf;
 pub(super) fn pick(
     parent: &tauri::Window,
     options: &PathOptions,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<Vec<PathBuf>>, String> {
     let main = MainThreadMarker::new().ok_or("native_dialog_requires_main_thread")?;
     parent.set_focus().map_err(|error| error.to_string())?;
     // NSOpenPanel natively supports files and directories in the same view.
@@ -16,7 +16,7 @@ pub(super) fn pick(
     panel.setPrompt(Some(&NSString::from_str(&options.select_label)));
     panel.setCanChooseFiles(true);
     panel.setCanChooseDirectories(true);
-    panel.setAllowsMultipleSelection(false);
+    panel.setAllowsMultipleSelection(options.multiple);
     panel.setCanCreateDirectories(false);
     if let Some(path) = &options.default_path {
         panel.setDirectoryURL(Some(&NSURL::fileURLWithPath(&NSString::from_str(path))));
@@ -34,10 +34,15 @@ pub(super) fn pick(
     match panel.runModal() {
         response if response == NSModalResponseCancel => Ok(None),
         response if response == NSModalResponseOK => panel
-            .URL()
-            .and_then(|url| url.path())
-            .map(|path| Some(PathBuf::from(path.to_string())))
-            .ok_or_else(|| "native_dialog_selected_path_missing".into()),
+            .URLs()
+            .iter()
+            .map(|url| {
+                url.path()
+                    .map(|path| PathBuf::from(path.to_string()))
+                    .ok_or_else(|| "native_dialog_selected_path_missing".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
         response => Err(format!("native_dialog_unexpected_response:{response}")),
     }
 }
