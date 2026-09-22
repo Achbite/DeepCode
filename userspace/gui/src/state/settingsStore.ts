@@ -132,6 +132,8 @@ const SETTING_DEFINITION_SCHEMAS: SettingDefinitionSchema[] = [
     group: 'gui',
     control: 'boolean',
   },
+  { key: 'gui.usageWidget.enabled', group: 'gui', control: 'boolean' },
+  { key: 'gui.usageWidget.visibility', group: 'gui', control: 'select', options: ['summary', 'collapsed', 'hidden'] },
   { key: 'agent.windows.shell', group: 'agent', control: 'select', options: ['auto', 'powershell7', 'windowsPowerShell', 'gitBash'] },
   { key: 'agent.windows.gitBashPath', group: 'agent', control: 'text' },
   {

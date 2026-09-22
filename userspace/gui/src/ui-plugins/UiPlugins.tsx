@@ -9,6 +9,8 @@ import React, {
   useState,
   useSyncExternalStore,
 } from 'react';
+import { createPortal } from 'react-dom';
+import { withBuiltinRegions } from './builtins';
 import { useSettingsStore } from '../state/settingsStore';
 import { createPluginScope, errorText, UiPluginRuntime, type UiPluginEntry } from './runtime';
 import { decodePluginSources, watchUiPlugins } from './source';
@@ -18,6 +20,7 @@ import type {
   UiPluginSlot,
   UiPluginView,
   UiPluginFile,
+  UiViewActions,
 } from './types';
 import { queryModelUsage, startModelAuth, getModelAuth, cancelModelAuth, logoutModelConnection, getModelQuota } from '../services/apiClient';
 import type { ApiResponse } from '@deepcode/protocol';
@@ -59,6 +62,7 @@ export function UiPluginsProvider({ children }: { children: React.ReactNode }) {
   const encoded = String(
     useSettingsStore((state) => state.effectiveSettings['workbench.uiPlugins']) ?? '[]',
   );
+  const usageEnabled = useSettingsStore(state => state.effectiveSettings['gui.usageWidget.enabled']) !== false;
   const runtime = useMemo(() => new UiPluginRuntime(importUiModule, insertStyle), []);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
@@ -78,14 +82,14 @@ export function UiPluginsProvider({ children }: { children: React.ReactNode }) {
     setConnectionError(null);
     try {
       const sources = decodePluginSources(encoded);
-      void runtime.select(sources).catch((error) => setConnectionError(errorText(error)));
+      void runtime.select([...sources, { path: 'builtin:regions', enabled: true }, { path: 'builtin:usage', enabled: usageEnabled }]).catch((error) => setConnectionError(errorText(error)));
       if (sources.length === 0) {
-        latestFiles.current = [];
-        void runtime.replace([]).catch((error) => setConnectionError(errorText(error)));
+        latestFiles.current = withBuiltinRegions([], usageEnabled);
+        void runtime.replace(latestFiles.current).catch((error) => setConnectionError(errorText(error)));
       } else {
         void watchUiPlugins(sources, controller.signal, (files) => {
-          latestFiles.current = files;
-          void runtime.replace(files).catch((error: unknown) => {
+          latestFiles.current = withBuiltinRegions(files, usageEnabled);
+          void runtime.replace(latestFiles.current).catch((error: unknown) => {
             if (!controller.signal.aborted) setConnectionError(errorText(error));
           });
         }).catch((error: unknown) => {
@@ -97,7 +101,7 @@ export function UiPluginsProvider({ children }: { children: React.ReactNode }) {
       void runtime.dispose().catch((error) => setConnectionError(errorText(error)));
     }
     return () => controller.abort();
-  }, [encoded, revision, runtime]);
+  }, [encoded, revision, runtime, usageEnabled]);
   useEffect(
     () => () => {
       void runtime.dispose().catch(console.error);
@@ -133,12 +137,16 @@ export function UiPluginSlotView({
   children,
   pluginPath,
   onConnectionChanged,
+  regions,
+  actions,
 }: {
   slot: Exclude<UiPluginSlot, 'theme'>;
   input: UiPluginInput;
   children: React.ReactNode;
   pluginPath?: string;
   onConnectionChanged?(): Promise<void>;
+  regions?: Record<string, React.ReactNode>;
+  actions?: UiViewActions;
 }) {
   const context = useContext(Context);
   const { entries } = useUiPlugins();
@@ -154,6 +162,13 @@ export function UiPluginSlotView({
   const connectionChanged = useRef(onConnectionChanged); connectionChanged.current = onConnectionChanged;
   const latestInput = useRef(input);
   latestInput.current = input;
+  const liveActions = useRef(actions); liveActions.current = actions;
+  const names = Object.keys(regions ?? {}).join('|');
+  const regionHosts = useMemo(() => Object.fromEntries(context && typeof document !== 'undefined' && names ? names.split('|').map(name => {
+    const host = document.createElement('div'); host.style.display = 'contents'; host.dataset.uiRegion = name;
+    return [name, host];
+  }) : []), [names]);
+  const portals = Object.entries(regions ?? {}).flatMap(([name, child]) => regionHosts[name] ? [createPortal(child, regionHosts[name], name)] : []);
   const positions = useRef<Array<{ element: HTMLElement; top: number; left: number }>>([]);
 
   useLayoutEffect(() => {
@@ -168,9 +183,27 @@ export function UiPluginSlotView({
       const requireFlow = (id: string) => { if (!authFlows.has(id)) throw new Error('Auth flow is outside this view scope.'); };
       const viewScope = {
         ...scope,
-        ...(slot.startsWith('settings.') && entry.manifest?.capabilities?.includes('usage.read') ? {
+        ...((slot.startsWith('settings.') || slot === 'usage.widget') && entry.manifest?.capabilities?.includes('usage.read') ? {
           usage: { query: async (query: import('@deepcode/protocol').UsageQuery, signal: AbortSignal) => result(await queryModelUsage(query, AbortSignal.any([scope.signal, signal]))) },
         } : {}),
+        ...(slot === 'usage.widget' && entry.manifest?.capabilities?.includes('quota.read') ? {
+          quota: { read: async (signal: AbortSignal) => {
+            const current = latestInput.current;
+            if (current.kind !== 'usage.widget' || !current.connection) throw new Error('No connection selected.');
+            return result(await getModelQuota(current.connection.id, AbortSignal.any([scope.signal, signal])));
+          } },
+        } : {}),
+        actions: Object.fromEntries(Object.keys(liveActions.current ?? {}).map(name => [name, (...args: unknown[]) => {
+          if (scope.signal.aborted) throw new Error('View disposed.');
+          const action = liveActions.current?.[name as keyof UiViewActions] as ((...args: unknown[]) => unknown) | undefined;
+          if (!action) throw new Error('View action unavailable.');
+          return action(...args);
+        }])),
+        regions: { mount: (name: string, target: HTMLElement) => {
+          const host = regionHosts[name];
+          if (!host || (target !== root && !root.contains(target))) throw new Error('Invalid UI region mount.');
+          target.append(host);
+        } },
         ...(slot === 'settings.connection.detail' && value.kind === 'settings.connection' && entry.manifest?.capabilities?.includes('connection.auth') ? {
           connection: {
             startLogin: async (method: 'browser' | 'deviceCode') => {
@@ -190,6 +223,7 @@ export function UiPluginSlotView({
           },
         } : {}),
       };
+      scope.onDispose(() => { Object.values(regionHosts).forEach(host => host.remove()); });
       const view = renderer(root, value, viewScope);
       if (!view || typeof view.update !== 'function' || typeof view.dispose !== 'function')
         throw new Error('UI renderer must return update and dispose functions.');
@@ -221,7 +255,7 @@ export function UiPluginSlotView({
         .finally(detach);
       root.replaceChildren();
     };
-  }, [entry?.generation, renderer, context?.runtime]);
+  }, [entry?.generation, renderer, context?.runtime, regionHosts]);
 
   useLayoutEffect(() => {
     if (!mounted.current || !entry || !context) return;
@@ -232,27 +266,27 @@ export function UiPluginSlotView({
     }
   }, [input, entry, context?.runtime]);
 
-  if (!entry) return <>{children}</>;
+  if (!entry) return <>{children}{Object.values(regions ?? {})}</>;
   if (entry.status === 'error')
     return (
-      <div role="alert" className="ui-plugin-error">
+      <><div role="alert" className="ui-plugin-error">
         <strong>{entry.manifest?.name}</strong>
         <pre>{entry.error}</pre>
-      </div>
+      </div>{portals}</>
     );
   if (entry.status === 'loading')
     return (
-      <div className="ui-plugin-loading" role="status">
+      <><div className="ui-plugin-loading" role="status">
         {input.locale === 'zh-CN' ? '正在更新展示插件…' : 'Updating display plugin…'}
-      </div>
+      </div>{portals}</>
     );
   return (
-    <div
+    <><div
       className="ui-plugin-view"
       data-ui-plugin={entry.manifest?.id}
       data-ui-generation={entry.generation}
       ref={container}
-    />
+    />{portals}</>
   );
 }
 

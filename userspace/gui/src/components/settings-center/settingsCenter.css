@@ -3,7 +3,7 @@
   height: 100%;
   min-height: 0;
   min-width: 0;
-  background: var(--bg-app);
+  background: var(--dc-surface);
   color: var(--text-main);
 }
 
@@ -1682,7 +1682,7 @@
 @media (max-width: 860px) { .settings-palette__fields { grid-template-columns: minmax(0, 1fr); } }
 
 /* Reviewed settings hierarchy: spacing between groups, no per-row rules. */
-.settings-body { padding: 34px 44px 56px; background: var(--dc-background); }
+.settings-body { padding: 34px 44px 56px; background: var(--dc-surface); }
 .settings-body > .settings-page { max-width: 850px; }
 .settings-title { font-size: calc(24px * var(--dc-ui-font-scale, 1)); letter-spacing: -.5px; margin-bottom: 30px; }
 .settings-group { margin-bottom: 32px; }

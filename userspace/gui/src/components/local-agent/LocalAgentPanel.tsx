@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import { UiRegion } from '../../ui-plugins/UiRegion';
+import React, { useEffect, useLayoutEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { normalizeUiLanguage, t } from '../../i18n';
 import { useLocalAgentStore } from '../../state/localAgentStore';
@@ -18,12 +19,19 @@ import { ReaderControls, ResourcePreview, useResourcePreview } from './ResourceP
 import { ArtifactLinks } from './ArtifactLinks';
 import './localAgentPanel.css';
 
+export interface ConversationReaderLayout {
+  visible: boolean;
+  expanded: boolean;
+  conversationBounds: HTMLElement | null;
+}
+
 interface LocalAgentPanelProps {
   mode?: 'panel' | 'workbench';
   headerTarget?: HTMLElement | null;
+  onReaderLayoutChange?: (layout: ConversationReaderLayout) => void;
 }
 
-const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', headerTarget }) => {
+const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', headerTarget, onReaderLayoutChange }) => {
   const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
   const showReasoning = effectiveSettings['gui.showReasoning'] === true;
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
@@ -89,10 +97,14 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
   const composer = useAgentComposer(language, viewport.setLatestFollowMode);
   const resourcePreview = useResourcePreview(sessionId);
   const [readerHeader, setReaderHeader] = useState<HTMLDivElement | null>(null);
+  const [conversationBounds, setConversationBounds] = useState<HTMLDivElement | null>(null);
   const readerLayout = { '--reader-width': `${resourcePreview.width}%` } as React.CSSProperties;
+  useLayoutEffect(() => {
+    onReaderLayoutChange?.({ visible: resourcePreview.visible, expanded: resourcePreview.expanded, conversationBounds });
+  }, [onReaderLayoutChange, resourcePreview.visible, resourcePreview.expanded, conversationBounds]);
 
   const header = (
-      <header className={`local-agent__header${resourcePreview.visible ? ' local-agent__header--reading' : ''}${resourcePreview.expanded ? ' local-agent__header--expanded' : ''}`} style={readerLayout}>
+      <UiRegion slot="conversation.header"><header className={`local-agent__header${resourcePreview.visible ? ' local-agent__header--reading' : ''}${resourcePreview.expanded ? ' local-agent__header--expanded' : ''}`} style={readerLayout}>
         <div className="local-agent__header-conversation">
         <div className="local-agent__heading">
           <span className="local-agent__heading-mark"><DeepCodeShellIcon name="session" /></span>
@@ -108,7 +120,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
           <ReaderControls language={language} preview={resourcePreview} disabled={!sessionId} />
           </div>
         </div>
-      </header>
+      </header></UiRegion>
   );
 
   return (
@@ -160,15 +172,18 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
         language={language}
         composer={composer}
         uiActionError={uiActionError}
+        onDismissUiActionError={() => setUiActionError(null)}
       />
       <ResourcePreview language={language} preview={resourcePreview} tabsTarget={readerHeader} onReview={composer.appendBrowserReview} />
+      {onReaderLayoutChange && <div ref={setConversationBounds} className="local-agent__conversation-overlay-bounds" aria-hidden="true" />}
       {composer.attachmentDialogOpen && (
         <ProjectFolderDialog
           language={language}
           selectionMode="messageAttachment"
+            onSelectMany={paths => void composer.selectMessageAttachments(paths)}
           onCancel={() => composer.setAttachmentDialogOpen(false)}
           onSelect={(absolutePath, type) => {
-            void composer.selectMessageAttachment(absolutePath, type);
+            void composer.selectMessageAttachments([{ path: absolutePath, kind: type }]);
           }}
         />
       )}

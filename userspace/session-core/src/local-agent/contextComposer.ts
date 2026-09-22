@@ -1,4 +1,5 @@
 import { advanceTodoList } from './todoState.js';
+import { appendInputFileBindings } from './workspaceBindings.js';
 import type {
   ContextCompositionMessage,
   ContextCompositionReceipt,
@@ -237,6 +238,7 @@ export function messagesFromJournal(
   const retainedRunInputId = runInputMessageEvent(events, runId)?.payload.messageId;
   const runs = events.filter((event): event is Extract<SessionEvent, { type: 'run.started' }> => event.type === 'run.started');
   const runForInput = new Map(runs.map((event) => [event.payload.inputMessageId, event]));
+  const bindingsByRun = new Map(runs.map(event => [event.runId, event.payload.workspaceBindings]));
   const checkpoint = [...events]
     .reverse()
     .find((event): event is Extract<SessionEvent, { type: 'context.compacted' }> => (
@@ -253,6 +255,21 @@ export function messagesFromJournal(
   let todoList: TodoListProjection | null = null;
   for (const event of events) {
     todoList = advanceTodoList(todoList, event);
+    let messageBindings = workspaceBindings;
+    let changedBindings = false;
+    if (event.type === 'message.committed') {
+      const inputRun = runForInput.get(event.payload.messageId);
+      const ownerRunId = inputRun?.runId ?? event.runId;
+      const before = inputRun?.payload.workspaceBindings
+        ?? (ownerRunId ? bindingsByRun.get(ownerRunId) : undefined) ?? workspaceBindings;
+      messageBindings = event.payload.role === 'user'
+        ? appendInputFileBindings(before, event.payload.filesystemReferences) : before;
+      const previousRun = inputRun ? runs[runs.indexOf(inputRun) - 1] : undefined;
+      const previous = inputRun
+        ? (previousRun ? bindingsByRun.get(previousRun.runId) : undefined) : before;
+      changedBindings = previous !== undefined && JSON.stringify(previous) !== JSON.stringify(messageBindings);
+      if (ownerRunId) bindingsByRun.set(ownerRunId, [...messageBindings]);
+    }
     if (
       checkpoint
       && event.sequence <= checkpoint.payload.coveredThroughSequence
@@ -266,12 +283,9 @@ export function messagesFromJournal(
       const reasoning = event.payload.role === 'assistant'
         ? providerReasoning(completedTurns.get(event.payload.providerRequestId), event.payload.providerRequestId)
         : {};
-      const inputRun = runForInput.get(event.payload.messageId);
-      const messageBindings = inputRun?.payload.workspaceBindings ?? workspaceBindings;
-      const previousRun = inputRun ? runs[runs.indexOf(inputRun) - 1] : undefined;
-      if (inputRun && previousRun && JSON.stringify(inputRun.payload.workspaceBindings) !== JSON.stringify(previousRun.payload.workspaceBindings)) {
+      if (changedBindings) {
         messages.push({
-          contributionId: `workspace-snapshot:${inputRun.runId}`, contributionKind: 'workspaceBindings',
+          contributionId: `workspace-snapshot:${event.payload.messageId}`, contributionKind: 'workspaceBindings',
           label: '本轮目录与资源引用', message: { role: 'system',
             content: `Current Session workspace bindings (logical handles only; supersedes earlier binding snapshots): ${JSON.stringify(providerWorkspaceBindings(messageBindings))}` },
         });

@@ -376,6 +376,107 @@ impl LocalAgentJournal {
             .collect())
     }
 
+    /// Resource identities frozen in one Provider request, checked against admitted file inputs.
+    pub(crate) fn provider_workspace_binding_ids(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        provider_request_id: &str,
+    ) -> Result<Vec<String>, LocalAgentStoreError> {
+        let mut expected = self.run_workspace_binding_ids(session_id, run_id)?;
+        let connection = self.lock()?;
+        let (sequence, encoded): (i64, String) = connection
+            .query_row(
+                "SELECT sequence, payload_json FROM session_events
+             WHERE session_id=?1 AND run_id=?2 AND event_type='context.composed'
+             AND json_extract(payload_json, '$.providerRequestId')=?3",
+                params![session_id, run_id, provider_request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sql_error("session_request_workspace_read_failed"))?
+            .ok_or_else(|| {
+                LocalAgentStoreError::new(
+                    "session_request_workspace_missing",
+                    "Provider 请求缺少已提交的资源视图。",
+                )
+            })?;
+        let mut statement = connection
+            .prepare(
+                "SELECT payload_json FROM session_events WHERE session_id=?1 AND run_id=?2
+             AND event_type='message.committed' AND sequence<?3
+             AND json_extract(payload_json, '$.role')='user' ORDER BY sequence",
+            )
+            .map_err(sql_error("session_input_resources_read_failed"))?;
+        let inputs = statement
+            .query_map(params![session_id, run_id, sequence], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sql_error("session_input_resources_read_failed"))?;
+        for input in inputs {
+            let input = decode_json(
+                &input.map_err(sql_error("session_input_resources_read_failed"))?,
+                "session_input_resources_invalid",
+            )?;
+            if let Some(references) = input["filesystemReferences"].as_array() {
+                for reference in references
+                    .iter()
+                    .filter(|reference| reference["kind"] == "file")
+                {
+                    let id = required_string(reference, "workspaceId")?.to_string();
+                    if !expected.contains(&id) {
+                        expected.push(id);
+                    }
+                }
+            }
+        }
+        let receipt = decode_json(&encoded, "session_request_workspace_invalid")?;
+        let bindings = receipt["workspaceBindings"].as_array().ok_or_else(|| {
+            LocalAgentStoreError::new("session_request_workspace_invalid", "请求资源视图无效。")
+        })?;
+        let actual = bindings
+            .iter()
+            .map(|binding| required_string(binding, "itemId").map(str::to_owned))
+            .collect::<Result<Vec<_>, _>>()?;
+        if actual != expected {
+            return Err(LocalAgentStoreError::new(
+                "session_request_workspace_mismatch",
+                "请求资源视图与项目目录及已接纳的文件快照不一致。",
+            ));
+        }
+        Ok(actual)
+    }
+
+    /// The original run scope and each committed request scope remain valid independently.
+    pub(crate) fn has_workspace_binding_view(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        bindings: &[String],
+    ) -> Result<bool, LocalAgentStoreError> {
+        if self.run_workspace_binding_ids(session_id, run_id)? == bindings {
+            return Ok(true);
+        }
+        let request_ids = {
+            let connection = self.lock()?;
+            let mut statement = connection.prepare(
+                "SELECT json_extract(payload_json, '$.providerRequestId') FROM session_events
+                 WHERE session_id=?1 AND run_id=?2 AND event_type='context.composed' ORDER BY sequence DESC",
+            ).map_err(sql_error("session_request_workspace_read_failed"))?;
+            let rows = statement
+                .query_map(params![session_id, run_id], |row| row.get::<_, String>(0))
+                .map_err(sql_error("session_request_workspace_read_failed"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(sql_error("session_request_workspace_read_failed"))?
+        };
+        for request_id in request_ids {
+            if self.provider_workspace_binding_ids(session_id, run_id, &request_id)? == bindings {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn run_provider_runtime(
         &self,
         session_id: &str,
@@ -4679,6 +4780,69 @@ mod tests {
             }}
         })).expect("persist the rejected input without an execution record");
         assert_eq!(event["type"], "tool.input-rejected");
+    }
+
+    #[test]
+    fn request_resource_views_include_only_consumed_files_and_keep_old_views() {
+        let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
+        journal
+            .create_session("session:loop", "Resources", &json!([]), None)
+            .unwrap();
+        append_model_settings_and_rejected_call(&journal);
+        let mut receipt = journal
+            .read_events("session:loop", 0)
+            .unwrap()
+            .into_iter()
+            .find(|event| event["type"] == "context.composed")
+            .unwrap()["payload"]
+            .clone();
+        let reference = json!({"referenceId":"reference:image", "workspaceId":"workspace:image", "logicalPath":"screen.png",
+            "displayName":"screen.png", "kind":"file", "mediaType":"image/png", "byteLength":8});
+        journal.append(&json!({"type":"input.queued", "sessionId":"session:loop", "runId":"run:loop",
+            "payload":{"commandId":"command:image", "messageId":"message:image", "text":"", "filesystemReferences":[reference]}})).unwrap();
+        assert_eq!(
+            journal
+                .provider_workspace_binding_ids("session:loop", "run:loop", "provider-request:loop")
+                .unwrap(),
+            Vec::<String>::new()
+        );
+        assert!(!journal
+            .has_workspace_binding_view("session:loop", "run:loop", &["workspace:image".into()])
+            .unwrap());
+        journal.append(&json!({"type":"message.committed", "sessionId":"session:loop", "runId":"run:loop",
+            "payload":{"messageId":"message:image", "role":"user", "content":"", "filesystemReferences":[reference]}})).unwrap();
+        receipt["providerRequestId"] = json!("provider-request:image");
+        receipt["workspaceBindings"] = json!([{"itemId":"workspace:image","label":"screen.png"}]);
+        journal.append(&json!({"type":"context.composed", "sessionId":"session:loop", "runId":"run:loop", "payload":receipt})).unwrap();
+        assert_eq!(
+            journal
+                .provider_workspace_binding_ids(
+                    "session:loop",
+                    "run:loop",
+                    "provider-request:image"
+                )
+                .unwrap(),
+            vec!["workspace:image"]
+        );
+        assert!(journal
+            .has_workspace_binding_view("session:loop", "run:loop", &["workspace:image".into()])
+            .unwrap());
+        assert!(journal
+            .has_workspace_binding_view("session:loop", "run:loop", &[])
+            .unwrap());
+        assert_eq!(
+            journal
+                .provider_workspace_binding_ids("session:loop", "run:loop", "provider-request:loop")
+                .unwrap(),
+            Vec::<String>::new()
+        );
+        assert!(!journal
+            .has_workspace_binding_view(
+                "session:loop",
+                "run:loop",
+                &["workspace:other-project".into()]
+            )
+            .unwrap());
     }
 
     fn settings_commit(command_id: &str) -> Value {

@@ -57,6 +57,43 @@ export function bindLocalTarget(target: LocalTarget, roots: { workspaceId: strin
   }
   return null;
 }
+export interface ResolvedLocalTarget extends SourcePosition {
+  workspaceId: string;
+  logicalPath: string;
+  path: string;
+}
+
+/** Probe exact bound paths; absence is not a transport or permission failure. */
+export async function resolveLocalTargets(
+  target: LocalTarget,
+  roots: { workspaceId: string; root: string }[],
+  resolve: (workspaceId: string, logicalPath: string) => Promise<{ path: string; kind: 'file' | 'directory' }>,
+): Promise<ResolvedLocalTarget[]> {
+  const candidates = target.absolute ? [bindLocalTarget(target, roots)] : roots.map(root =>
+    bindLocalTarget({ ...target, absolute: true, path: `${root.root}/${target.path}` }, roots));
+  const seen = new Set<string>();
+  const matches = new Map<string, ResolvedLocalTarget>();
+  const missing: string[] = [];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const key = JSON.stringify([candidate.workspaceId, candidate.logicalPath]);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      const resolved = await resolve(candidate.workspaceId, candidate.logicalPath);
+      const path = normalizedPath(resolved.path);
+      const identity = /^[A-Za-z]:/.test(path) ? path.toLowerCase() : path;
+      if (!matches.has(identity)) matches.set(identity, { ...candidate, path: resolved.path });
+    } catch (error) {
+      if (typeof error !== 'object' || error === null || !('code' in error)
+        || !['host_inspection_path_not_found', 'conversation_resource_not_found'].includes(String(error.code))) throw error;
+      missing.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  if (!matches.size) throw new Error(missing.length ? missing.join('\n') : `No bound workspace contains: ${target.path}`);
+  return [...matches.values()];
+}
+
 function label(path: string): string {
   return (
     path

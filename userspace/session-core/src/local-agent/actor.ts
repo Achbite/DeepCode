@@ -427,9 +427,10 @@ export class SessionActor {
       if (!runtime) throw new Error('run_runtime_snapshot_missing');
       let incompatible: string | undefined;
       if (command.filesystemReferences?.some((reference) => (
-        !run.workspaceBindings.some((binding) => binding.workspaceId === reference.workspaceId)
+        reference.kind === 'directory'
+        && !run.workspaceBindings.some((binding) => binding.workspaceId === reference.workspaceId)
       ))) {
-        incompatible = '当前运行的目录绑定已固定，无法在排队消息中新增目录。';
+        incompatible = '当前运行的项目目录已固定；可追加文件附件，新增项目目录请在下一轮使用。';
       } else if (
         command.profileId !== undefined && command.profileId !== runtime.provider.profileId
         || command.reasoningEffortOverride !== undefined

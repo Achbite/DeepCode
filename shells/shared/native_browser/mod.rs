@@ -36,6 +36,18 @@ struct Page {
     session_id: Option<String>,
     service_id: Option<String>,
     kind: String,
+    surface: SurfaceState,
+}
+
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SurfaceState {
+    generation: u64,
+    sequence: u64,
+    activation_id: u64,
+    activation_ack: u64,
+    reason: String,
+    bounds: Option<[f64; 4]>,
 }
 
 impl Page {
@@ -221,21 +233,59 @@ fn publish(app: &tauri::AppHandle, page: &Page) {
     let _ = app.emit_to("main", "deepcode:browser-page", page);
 }
 
-async fn activate(app: tauri::AppHandle, page: Page) -> Result<Value, String> {
+async fn activate(app: tauri::AppHandle, mut page: Page) -> Result<Value, String> {
+    let activation_id = PAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    {
+        let state = app.state::<NativeBrowser>();
+        let mut pages = state
+            .pages
+            .lock()
+            .map_err(|_| "native_browser_state_unavailable")?;
+        let current = pages
+            .get_mut(&page.preview_id)
+            .ok_or("native_browser_page_closed")?;
+        current.surface.activation_id = activation_id;
+        current.surface.reason = "mounting".into();
+        page = current.clone();
+    }
     app.emit_to("main", "deepcode:browser-activate", &page)
         .map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<NativeBrowser>();
-        let pages = state.pages.lock().map_err(|_| "native_browser_state_unavailable")?;
-        let (pages, _) = state.page_changed.wait_timeout_while(pages, Duration::from_secs(5), |pages| {
-            pages.get(&page.preview_id).is_some_and(|page| !page.visible)
-        }).map_err(|_| "native_browser_state_unavailable")?;
-        let page = pages.get(&page.preview_id).ok_or_else(|| format!("native_browser_page_closed: {}", page.preview_id))?;
-        if !page.visible {
-            return Err(format!("native_browser_page_not_visible: {}; select this session and close any dialog covering the Reader", page.preview_id));
+        let pages = state
+            .pages
+            .lock()
+            .map_err(|_| "native_browser_state_unavailable")?;
+        let (pages, _) = state
+            .page_changed
+            .wait_timeout_while(pages, Duration::from_secs(5), |pages| {
+                pages
+                    .get(&page.preview_id)
+                    .is_some_and(|page| page.surface.activation_ack < activation_id)
+            })
+            .map_err(|_| "native_browser_state_unavailable")?;
+        let page = pages
+            .get(&page.preview_id)
+            .ok_or_else(|| format!("native_browser_page_closed: {}", page.preview_id))?;
+        if page.surface.activation_ack < activation_id
+            || !page.visible
+            || page.surface.reason != "visible"
+        {
+            return Err(format!(
+                "native_browser_page_not_visible: {}; reason={}; session={}",
+                page.preview_id,
+                if page.surface.activation_ack < activation_id {
+                    "surfaceNotMounted"
+                } else {
+                    &page.surface.reason
+                },
+                page.session_id.as_deref().unwrap_or("")
+            ));
         }
         serde_json::to_value(page).map_err(|error| error.to_string())
-    }).await.map_err(|error| error.to_string())?
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn page_url(input: &Value) -> Result<tauri::Url, String> {
@@ -366,6 +416,7 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
             session_id,
             service_id,
             kind: kind.into(),
+            surface: SurfaceState::default(),
         };
         app.state::<NativeBrowser>()
             .pages
@@ -485,6 +536,42 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
             )
             .await;
         }
+        "bindSurface" => {
+            if tool_request {
+                return Err("Browser surfaces are owned by the GUI Host.".into());
+            }
+            let state = app.state::<NativeBrowser>();
+            let mut pages = state
+                .pages
+                .lock()
+                .map_err(|_| "native_browser_state_unavailable")?;
+            let current = pages.get_mut(id).ok_or("native_browser_page_closed")?;
+            current.surface.generation += 1;
+            current.surface.sequence = 0;
+            current.surface.reason = "mounting".into();
+            return serde_json::to_value(current).map_err(|error| error.to_string());
+        }
+        "activationResult" => {
+            if tool_request {
+                return Err("Browser activation replies are owned by the GUI Host.".into());
+            }
+            let state = app.state::<NativeBrowser>();
+            let mut pages = state
+                .pages
+                .lock()
+                .map_err(|_| "native_browser_state_unavailable")?;
+            let current = pages.get_mut(id).ok_or("native_browser_page_closed")?;
+            if input["activationId"].as_u64() == Some(current.surface.activation_id) {
+                let reason = string(&input, "reason")?;
+                if reason != "sessionNotSelected" {
+                    return Err("Invalid activation result.".into());
+                }
+                current.surface.activation_ack = current.surface.activation_id;
+                current.surface.reason = reason.into();
+                state.page_changed.notify_all();
+            }
+            return serde_json::to_value(current).map_err(|error| error.to_string());
+        }
         "status" => {
             return serde_json::to_value(page).map_err(|error| error.to_string());
         }
@@ -516,7 +603,32 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
             view.reload().map_err(|error| error.to_string())?;
         }
         "layout" => {
+            if tool_request {
+                return Err("Browser layout is owned by the GUI Host.".into());
+            }
+            let state = app.state::<NativeBrowser>();
+            let mut pages = state
+                .pages
+                .lock()
+                .map_err(|_| "native_browser_state_unavailable")?;
+            let current = pages.get_mut(id).ok_or("native_browser_page_closed")?;
+            let generation = input["surfaceGeneration"]
+                .as_u64()
+                .ok_or("surfaceGeneration is required")?;
+            let sequence = input["sequence"].as_u64().ok_or("sequence is required")?;
+            if generation != current.surface.generation || sequence <= current.surface.sequence {
+                return serde_json::to_value(current).map_err(|error| error.to_string());
+            }
             let visible = input["visible"].as_bool().ok_or("visible is required")?;
+            let reason = if visible {
+                "visible"
+            } else {
+                let reason = string(&input, "reason")?;
+                if !matches!(reason, "inactive" | "covered" | "emptyBounds" | "unmounted") {
+                    return Err("Invalid visibility reason.".into());
+                }
+                reason
+            };
             if visible {
                 let coordinate = |field: &str| {
                     input[field]
@@ -539,20 +651,21 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
                 })
                 .map_err(|error| error.to_string())?;
                 view.show().map_err(|error| error.to_string())?;
+                current.surface.bounds = Some([x, y, width, height]);
             } else {
                 view.hide().map_err(|error| error.to_string())?;
             }
-            app.state::<NativeBrowser>()
-                .pages
-                .lock()
-                .map_err(|_| "native_browser_state_unavailable")?
-                .get_mut(id)
-                .ok_or("native_browser_page_closed")?
-                .visible = visible;
-            app.state::<NativeBrowser>().page_changed.notify_all();
-        }
-        "focus" => {
-            view.set_focus().map_err(|error| error.to_string())?;
+            current.visible = visible;
+            current.surface.sequence = sequence;
+            current.surface.reason = reason.into();
+            // Inactive/unmount messages can arrive while the selected Reader is mounting.
+            // Only the active surface or an explicit session rejection settles activation.
+            if matches!(reason, "visible" | "covered" | "emptyBounds")
+                && input["activationId"].as_u64() == Some(current.surface.activation_id)
+            {
+                current.surface.activation_ack = current.surface.activation_id;
+            }
+            state.page_changed.notify_all();
         }
         "act" => {
             let operation = string(&input, "operation")?;
@@ -583,7 +696,15 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
                 ));
             }
             page.url = view.url().map_err(|error| error.to_string())?.to_string();
+            // A capture belongs to one acknowledged surface geometry.
+            let geometry = (page.surface.generation, page.surface.sequence);
             let capture = capture(view).await?;
+            let current = page_state(&app, id)?;
+            if !current.visible
+                || geometry != (current.surface.generation, current.surface.sequence)
+            {
+                return Err(format!("native_browser_layout_changed: {id}"));
+            }
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|error| error.to_string())?
@@ -729,6 +850,7 @@ mod tests {
             service_owner: "file".into(),
             status: "ready".into(),
             visible: false,
+            surface: SurfaceState::default(),
         };
         assert!(
             page.matches_target(&page.session_id, &page.url, &None, "page"),

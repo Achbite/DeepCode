@@ -1,3 +1,4 @@
+import { measureBrowserSurface } from './nativeBrowserLayout';
 import { t } from '../../i18n';
 import { useUiLanguage } from '../../useUiLanguage';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -32,7 +33,7 @@ export function NativeBrowserPreview({
   const callbacks = useRef({ onClose, onReady, onReview });
   callbacks.current = { onClose, onReady, onReview };
   const surface = useRef<HTMLDivElement>(null);
-  const owner = useRef<{ binding: NativeHostBinding; page: NativePage } | null>(
+  const owner = useRef<{ binding: NativeHostBinding; page: NativePage; sequence: number; layoutKey?: string; pending?: Promise<NativePage> } | null>(
     null,
   );
   const language = useUiLanguage();
@@ -74,19 +75,18 @@ export function NativeBrowserPreview({
   const updateLayout = useCallback(async () => {
     const current = owner.current;
     if (!surface.current || !current) return null;
-    const rect = surface.current.getBoundingClientRect();
-    const overlay = Boolean(document.querySelector(
-      'dialog[open], [role="dialog"][aria-modal="true"], .deepcode-local-agent-overlay, .settings-center-overlay, details[data-native-overlay][open], [data-native-overlay]:not(details)',
-    ));
-    return nativeBrowserCommand<NativePage>(current.binding, {
-      action: 'layout',
-      previewId: current.page.previewId,
-      visible: active && !overlay && rect.width > 0 && rect.height > 0,
-      x: Math.max(0, rect.x),
-      y: Math.max(0, rect.y),
-      width: rect.width,
-      height: rect.height,
-    });
+    const layout = measureBrowserSurface(surface.current, active);
+    const key = JSON.stringify([layout, current.page.surface.activationId]);
+    if (current.layoutKey === key && current.pending) return current.pending;
+    current.layoutKey = key;
+    const input = { action: 'layout', previewId: current.page.previewId, ...layout,
+      surfaceGeneration: current.page.surface.generation, sequence: ++current.sequence,
+      activationId: current.page.surface.activationId };
+    const next = nativeBrowserCommand<NativePage>(current.binding, input);
+    current.pending = next;
+    try { return await next; }
+    catch (error) { if (current.pending === next) current.layoutKey = undefined; throw error; }
+
   }, [active]);
   useEffect(() => {
     let ended = false;
@@ -96,10 +96,13 @@ export function NativeBrowserPreview({
       binding.sessionId = sessionId;
       const page = await nativeBrowserCommand<NativePage>(
         binding,
-        { action: 'status', previewId },
+        { action: 'bindSurface', previewId },
       );
-      if (ended) return;
-      owner.current = { binding, page };
+      if (ended) {
+        await nativeBrowserCommand(binding, { action: 'layout', previewId, visible: false, reason: 'unmounted', surfaceGeneration: page.surface.generation, sequence: 1 });
+        return;
+      }
+      owner.current = { binding, page, sequence: 0 };
       setPage(page);
       setUrl(page.url);
       callbacks.current.onReady(page, binding);
@@ -115,7 +118,7 @@ export function NativeBrowserPreview({
         void nativeBrowserCommand(current.binding, {
           action: 'layout',
           previewId: current.page.previewId,
-          visible: false,
+          visible: false, reason: 'unmounted', surfaceGeneration: current.page.surface.generation, sequence: ++current.sequence,
         }).catch(console.error);
     };
   }, [sessionId, previewId]);
@@ -124,7 +127,7 @@ export function NativeBrowserPreview({
     let unlisten: (() => void) | undefined;
     void listenNativePages((next) => {
       if (ended || next.previewId !== owner.current?.page.previewId) return;
-      owner.current.page = next;
+      owner.current.page = { ...next, surface: { ...next.surface, generation: owner.current.page.surface.generation } };
       setPage(next);
       setUrl(next.url);
       if (next.status === 'closed') {
@@ -162,8 +165,15 @@ export function NativeBrowserPreview({
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['open', 'aria-modal', 'class'],
+      attributeFilter: ['open', 'aria-modal', 'class', 'hidden', 'style'],
     });
+    const activate = (event: Event) => {
+      const next = (event as CustomEvent<NativePage>).detail;
+      if (next.previewId !== owner.current?.page.previewId) return;
+      owner.current.page.surface.activationId = next.surface.activationId;
+      layout();
+    };
+    window.addEventListener('deepcode:browser-layout', activate);
     window.addEventListener('resize', layout);
     window.addEventListener('scroll', layout, true);
     layout();
@@ -172,6 +182,7 @@ export function NativeBrowserPreview({
       cancelAnimationFrame(scheduled);
       resize.disconnect();
       mutations.disconnect();
+      window.removeEventListener('deepcode:browser-layout', activate);
       window.removeEventListener('resize', layout);
       window.removeEventListener('scroll', layout, true);
     };

@@ -15,6 +15,23 @@ use std::{
 };
 
 const SLOTS: &[&str] = &[
+    "workbench.layout",
+    "navigation",
+    "conversation.header",
+    "activity.row",
+    "activity.summary",
+    "activity.detail",
+    "composer.layout",
+    "composer.model",
+    "composer.attachments",
+    "composer.actions",
+    "task.panel",
+    "artifact.panel",
+    "reader.layout",
+    "reader.toolbar",
+    "reader.tree",
+    "settings.navigation",
+    "usage.widget",
     "message.plain",
     "message.markdown",
     "document.html",
@@ -159,7 +176,7 @@ fn read_module(root: &Path) -> Result<(Manifest, String), String> {
         || manifest
             .capabilities
             .iter()
-            .any(|c| !matches!(c.as_str(), "usage.read" | "connection.auth"))
+            .any(|c| !matches!(c.as_str(), "usage.read" | "quota.read" | "connection.auth"))
         || (manifest.capabilities.iter().any(|c| c == "connection.auth")
             && !manifest
                 .slots

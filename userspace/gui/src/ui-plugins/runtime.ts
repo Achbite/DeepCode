@@ -168,7 +168,7 @@ export class UiPluginRuntime {
             other.path !== file.path &&
             other.enabled &&
             other.manifest?.slots.some((slot) => file.manifest?.slots.includes(slot)
-              && !slot.startsWith('settings.')
+              && !['settings.models.overview', 'settings.connection.detail', 'settings.usage.panel'].includes(slot)
               && (slot !== 'tool.result' || other.manifest?.toolId === file.manifest?.toolId)),
         );
         const error = duplicate
@@ -232,6 +232,7 @@ export class UiPluginRuntime {
       let registering = true;
       const context: UiPluginContext = {
         ...scope,
+        slots: plugin.file.manifest.slots,
         register: (slot, renderer) => {
           if (
             !registering ||

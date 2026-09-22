@@ -1,29 +1,32 @@
 import ModalDialog from '../shared/ModalDialog';
 import { useEffect, useRef, useState } from 'react';
 import { t, type UiLanguage } from '../../i18n';
-import { pickNativePath, type NativePathOptions, type NativePathSelection } from '../../services/runtimeAdapter';
+import { pickNativePaths, type NativePathOptions, type NativePathSelection } from '../../services/runtimeAdapter';
 import './workspaceOpenDialog.css';
 
 interface NativePathDialogProps extends NativePathOptions {
   language: UiLanguage;
   onSelect: (path: string, kind: 'file' | 'directory') => void;
+  onSelectMany?: (paths: NativePathSelection[]) => void;
   onCancel: () => void;
 }
 
 /** One OS dialog per mounted selection, including React Strict Mode effects. */
 export default function NativePathDialog(props: NativePathDialogProps) {
-  const request = useRef<Promise<NativePathSelection | null> | null>(null);
+  const request = useRef<Promise<NativePathSelection[] | null> | null>(null);
   const callbacks = useRef(props);
   callbacks.current = props;
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
-    request.current ??= pickNativePath(props);
+    request.current ??= pickNativePaths(props);
     void request.current.then((selection) => {
       if (!active) return;
       if (selection === null) callbacks.current.onCancel();
-      else callbacks.current.onSelect(selection.path, selection.kind);
+      else if (callbacks.current.onSelectMany) callbacks.current.onSelectMany(selection);
+      else if (selection.length === 1) callbacks.current.onSelect(selection[0].path, selection[0].kind);
+      else throw new Error('native_path_selection_count_invalid');
     }).catch((reason: unknown) => {
       if (active) setError(reason instanceof Error ? reason.message : String(reason));
     });

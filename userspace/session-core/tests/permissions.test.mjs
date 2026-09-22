@@ -34,10 +34,15 @@ test('approval review reuses compacted context and retains the current input and
     { type: 'message.committed', runId, payload: { messageId: 'message:guidance', role: 'user', content: 'Use the existing build directory.' } },
   ].map((event, index) => ({ schemaVersion: 'deepcode.session-event.v5', eventId: `event:${index + 1}`, sessionId,
     sequence: index + 1, occurredAt: '2026-09-20T00:00:00.000Z', ...event }));
-  const snapshot = { events, state: { ...emptySessionState(sessionId), workspaceBindings: [workspaceBinding] } };
+  const attachment = { workspaceId: 'workspace:review-attachment', displayName: 'review-notes.md' };
+  const snapshot = { events, state: { ...emptySessionState(sessionId), workspaceBindings: [workspaceBinding],
+    run: { runId, workspaceBindings: [workspaceBinding, attachment] } } };
   const approval = { approvalId: 'approval:review-context', runId, callId: 'call:build',
     preview: { summary: 'Run make check', effects: ['process'], logicalTargets: ['.'], authorizationContext: context } };
-  const { request } = prepareApprovalReview(snapshot, runtime, approval, 'provider:review-context');
+  const { request, receipt } = prepareApprovalReview(snapshot, runtime, approval, 'provider:review-context');
+  assert.deepEqual(request.workspaceBindings, [workspaceBinding, attachment]);
+  assert.deepEqual(receipt.workspaceBindings, request.workspaceBindings.map(binding => ({ itemId: binding.workspaceId, label: binding.displayName })));
+  assert.throws(() => prepareApprovalReview(snapshot, runtime, { ...approval, runId: 'run:other' }, 'provider:wrong'), /approval_review_run_mismatch/);
   const input = JSON.parse(request.messages[1].content);
   assert.deepEqual(input.taskContext, [
     { role: 'system', content: 'Keep project changes within the approved scope.' },

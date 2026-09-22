@@ -3,9 +3,10 @@ import { loadInterfaceModule } from '../../services/interfaceUpdates';
 import React, { lazy, Suspense, useEffect, useState } from 'react';
 import type { UiLanguage } from '../../i18n';
 import { MarkdownContent } from './BufferedMarkdown';
-import type { DocumentFormat } from './documentResources';
+import { readDocumentText, type DocumentFormat } from './documentResources';
 import './documentPreview.css';
 import { UiPluginSlotView, useDisplayTheme } from '../../ui-plugins/UiPlugins';
+import SourceFileView from './SourceFileView';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 
 const PdfDocumentPreview = lazy(() => loadInterfaceModule(() => import('./PdfDocumentPreview')));
@@ -22,7 +23,7 @@ export function DocumentPreview({ blob, format, filename, language, readingKey, 
     setError(null); setShowSource(false);
     const url = URL.createObjectURL(blob);
     setDownload(url);
-    if (format !== 'pdf' && format !== 'image') void blob.text().then((text) => { if (active) setSource({ blob, text }); })
+    if (format !== 'pdf' && format !== 'image') void readDocumentText(blob).then((text) => { if (active) setSource({ blob, text }); })
       .catch((reason: unknown) => { if (active) setError(reason instanceof Error ? reason.message : String(reason)); });
     return () => { active = false; URL.revokeObjectURL(url); };
   }, [blob, format]);
@@ -44,7 +45,7 @@ export function DocumentPreview({ blob, format, filename, language, readingKey, 
       </div>
     </div>
     {error ? <p role="alert" className="local-agent__resource-error">{error}</p>
-      : showSource ? (content === null ? loading : <pre className="document-preview__source">{content}</pre>)
+      : showSource ? (content === null ? loading : <SourceFileView content={content} filename={filename} viewKey={`${readingKey ?? filename}:source`} wrap />)
         : format === 'image' ? <img className="document-preview__image" src={download || undefined} alt={filename} /> : <UiPluginSlotView slot={`document.${format}`} input={{ kind: 'document', blob, format, filename, locale: language, theme }}>
           {format === 'pdf' ? <InterfaceLoadBoundary><Suspense fallback={loading}><PdfDocumentPreview blob={blob} language={language} readingKey={readingKey} /></Suspense></InterfaceLoadBoundary>
             : content === null ? loading

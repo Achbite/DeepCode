@@ -88,5 +88,27 @@
       "inputMultiplier": 2,
       "outputMultiplier": 1.5
     }
+  },
+  {
+    "model": "deepseek-flash",
+    "adapterId": "deepseek",
+    "input": 0.3,
+    "cacheRead": 0.006,
+    "cacheWrite": null,
+    "output": 1.2,
+    "source": "https://api-docs.deepseek.com/quick_start/pricing/",
+    "effectiveFrom": "2026-09-10",
+    "longContext": null
+  },
+  {
+    "model": "deepseek-v4-pro",
+    "adapterId": "deepseek",
+    "input": 1.32,
+    "cacheRead": 0.044,
+    "cacheWrite": null,
+    "output": 3.96,
+    "source": "https://api-docs.deepseek.com/quick_start/pricing/",
+    "effectiveFrom": "2026-08-16",
+    "longContext": null
   }
 ]

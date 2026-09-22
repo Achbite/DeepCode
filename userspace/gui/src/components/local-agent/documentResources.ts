@@ -16,3 +16,11 @@ export function workspaceResourceLink(href: string): { workspaceId: string; logi
     return workspaceId && logicalPath ? { workspaceId, logicalPath } : null;
   } catch { return null; }
 }
+
+export async function readDocumentText(blob: Blob): Promise<string> {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const encoding = bytes[0] === 0xff && bytes[1] === 0xfe ? 'utf-16le' : bytes[0] === 0xfe && bytes[1] === 0xff ? 'utf-16be' : 'utf-8';
+  const content = new TextDecoder(encoding, { fatal: true }).decode(bytes);
+  if (content.includes('\0')) throw new Error('file_encoding_unsupported: 当前文件不是支持的文本文件。');
+  return content;
+}

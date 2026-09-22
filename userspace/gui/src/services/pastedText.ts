@@ -3,10 +3,13 @@ export interface PastedTextInput {
   text: string;
 }
 
-export const PASTED_TEXT_THRESHOLD = 32 * 1024;
+export const PASTED_TEXT_THRESHOLD = 2_000;
+export const PASTED_TEXT_LINE_THRESHOLD = 20;
 
 export function isLongPastedText(text: string): boolean {
-  return new TextEncoder().encode(text).byteLength > PASTED_TEXT_THRESHOLD;
+  // This is a composer presentation threshold, not an upload size limit.
+  return text.length >= PASTED_TEXT_THRESHOLD
+    || text.split(/\r\n|\r|\n/u).length >= PASTED_TEXT_LINE_THRESHOLD;
 }
 
 export function pastedTextTitle(text: string): string {

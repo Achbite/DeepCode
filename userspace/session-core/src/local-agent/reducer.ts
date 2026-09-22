@@ -1,5 +1,6 @@
 import { isManagedProcessSnapshot, isSessionAuthorizationScope } from '@deepcode/protocol';
 import { advanceTodoList } from './todoState.js';
+import { appendInputFileBindings } from './workspaceBindings.js';
 import { providerTextStreamId } from './streamIdentity.js';
 import { activeConversationEvents } from './conversationHistory.js';
 import type {
@@ -332,6 +333,12 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
             providerRequestId: event.payload.providerRequestId,
           });
         } else {
+          if (event.payload.role === 'user' && event.runId && event.payload.filesystemReferences?.length) {
+            assertRunningRun(next, event.runId, 'input_resources_run_not_active');
+            next.run = { ...next.run!, workspaceBindings: appendInputFileBindings(
+              next.run!.workspaceBindings, event.payload.filesystemReferences,
+            ) };
+          }
           next.messages.push({
             ...common,
             role: event.payload.role,

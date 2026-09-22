@@ -542,6 +542,10 @@
     "agent.attachment.removeDirectoryIndex": "移除目录索引 {name}",
     "agent.attachment.removePendingDirectory": "从本条消息移除目录",
     "agent.attachment.deferred": "目录索引变化从下一轮生效；当前运行继续使用启动时冻结的目录集合。",
+    "agent.error.dismiss": "关闭提示",
+    "agent.link.chooseTarget": "选择要打开的位置",
+    "agent.link.multipleTargets": "多个目录中存在此路径，请选择目标。",
+    "agent.link.unableToOpen": "无法打开此位置。",
     "agent.attachment.menu": "添加",
     "agent.attachment.filesAndFolders": "文件和文件夹",
     "agent.attachment.pickerTitle": "选择文件和文件夹",
@@ -1179,6 +1183,19 @@
     "gui.showReasoning": {
       "label": "推理详情",
       "description": "允许点击推理状态查看模型提供的推理文本。默认关闭，仅影响显示，不改变模型推理强度。"
+    },
+    "gui.usageWidget.enabled": {
+      "label": "用量浮窗",
+      "description": "显示当前连接的费用或额度。"
+    },
+    "gui.usageWidget.visibility": {
+      "label": "浮窗显示",
+      "description": "选择浮窗的显示方式。",
+      "options": {
+        "summary": "摘要",
+        "collapsed": "收起",
+        "hidden": "隐藏"
+      }
     },
     "gui.showContextRail": {
       "label": "显示上下文栏",

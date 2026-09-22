@@ -1,4 +1,5 @@
-import { parseLocalTarget, bindLocalTarget, type SourcePosition } from './resourceLinks';
+import { parseLocalTarget, bindLocalTarget, resolveLocalTargets, type ResolvedLocalTarget, type SourcePosition } from './resourceLinks';
+import { ResourceLinkChoices } from './ResourceLinkChoices';
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { MessageFeedback, SessionProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
@@ -81,6 +82,8 @@ export function ConversationTranscript({
   const setMessageFeedback = useLocalAgentStore((state) => state.setMessageFeedback);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [pathMenu, setPathMenu] = useState<{ path: string; x: number; y: number } | null>(null);
+  const linkRequest = useRef(0);
+  const [linkChoices, setLinkChoices] = useState<{ sessionId: string; request: number; targets: ResolvedLocalTarget[] } | null>(null);
   const layouts = useRef(new ConversationLayoutCache());
   const currentSessionRef = useRef({ sessionId: projection?.sessionId });
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -88,6 +91,8 @@ export function ConversationTranscript({
   useLayoutEffect(() => {
     setCopiedMessageId(null);
     setPathMenu(null);
+    setLinkChoices(null);
+    linkRequest.current += 1;
     return () => clearTimeout(copyTimerRef.current);
   }, [projection?.sessionId]);
   useEffect(() => {
@@ -156,18 +161,30 @@ export function ConversationTranscript({
     const localTarget=parseLocalTarget(href);
     if(localTarget&&projection) {
       event.preventDefault();
-      const requestedView=currentSessionRef.current;
-      void (async()=>{
-        const candidates=await Promise.all(projection.workspaceBindings.map(async binding=>({workspaceId:binding.workspaceId,root:(await host.resolveResource(projection.sessionId,binding.workspaceId,'.')).path})));
-        const bound=bindLocalTarget(localTarget,candidates);
-        if(currentSessionRef.current!==requestedView)return;
-        if(bound) await openWorkspaceResource(bound.workspaceId,bound.logicalPath,localTarget);
-        else {
-          if(!host.locatePath)throw new Error('Manual file location requires the desktop Host.');
-          await host.locatePath(localTarget.absolute ? localTarget.path : `${candidates[0].root}/${localTarget.path}`);
+      const requestedView = currentSessionRef.current;
+      const request = ++linkRequest.current;
+      const current = () => currentSessionRef.current === requestedView && linkRequest.current === request;
+      setLinkChoices(null);
+      void (async () => {
+        const ids = [...new Set([...projection.workspaceBindings.map(binding => binding.workspaceId),
+          ...projection.messages.flatMap(message => message.filesystemReferences.map(reference => reference.workspaceId))])];
+        const roots = await Promise.all(ids.map(async workspaceId => ({ workspaceId,
+          root: (await host.resolveResource(projection.sessionId, workspaceId, '.')).path })));
+        if (!current()) return;
+        if (localTarget.absolute && !bindLocalTarget(localTarget, roots)) {
+          if (!host.locatePath) throw new Error('Manual file location requires the desktop Host.');
+          await host.locatePath(localTarget.path);
+        } else {
+          const targets = await resolveLocalTargets(localTarget, roots,
+            (workspaceId, path) => host.resolveResource(projection.sessionId, workspaceId, path));
+          if (!current()) return;
+          if (targets.length > 1) setLinkChoices({ sessionId: projection.sessionId, request, targets });
+          else await openWorkspaceResource(targets[0].workspaceId, targets[0].logicalPath, targets[0]);
         }
-        if(currentSessionRef.current===requestedView)setUiActionError(null);
-      })().catch(reason=>{if(currentSessionRef.current===requestedView)setUiActionError(`${language === 'zh-CN' ? '无法打开此位置。' : 'Unable to open this location.'}\n${localTarget.path}\n${reason instanceof Error ? reason.message : String(reason)}`);});
+        if (current()) setUiActionError(null);
+      })().catch(reason => {
+        if (current()) setUiActionError(`${t(language, 'agent.link.unableToOpen')}\n${localTarget.path}\n${reason instanceof Error ? reason.message : String(reason)}`);
+      });
       return;
     }
     if (!/^https?:\/\//i.test(href)) return;
@@ -310,6 +327,18 @@ export function ConversationTranscript({
 
   return (
     <>
+    {linkChoices && linkChoices.sessionId === projection?.sessionId && <ResourceLinkChoices
+      language={language} targets={linkChoices.targets} onClose={() => setLinkChoices(null)}
+      onSelect={target => {
+        const selection = linkChoices;
+        const requestedView = currentSessionRef.current;
+        setLinkChoices(null);
+        if (selection.request !== linkRequest.current) return;
+        void openWorkspaceResource(target.workspaceId, target.logicalPath, target).catch(reason => {
+          if (currentSessionRef.current === requestedView && linkRequest.current === selection.request)
+            setUiActionError(`${t(language, 'agent.link.unableToOpen')}\n${target.path}\n${reason instanceof Error ? reason.message : String(reason)}`);
+        });
+      }} />}
     <ConversationNavigation key={sessionKey} entries={navigation} viewport={viewport} language={language}
       onNavigate={(entry) => viewport.scrollToAnchor(entry.key)} />
     <div

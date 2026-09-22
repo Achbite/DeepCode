@@ -638,15 +638,11 @@
 
 .local-agent__tool-group {
   width: min(420px, calc(100% - 8px));
-  margin: -7px 0 12px 2px;
+  margin: 0 0 12px 2px;
   border: 0;
   background: transparent;
   color: var(--dc-muted);
   font-size: var(--dc-font-micro);
-}
-
-.local-agent__tool-group--failed {
-  color: var(--dc-danger);
 }
 
 .local-agent__tool-group--expanded {
@@ -2243,6 +2239,17 @@
 }
 .local-agent__path-menu button { color: inherit; background: transparent; border: 0; padding: 8px 16px; cursor: pointer; }
 .local-agent__error pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.local-agent__error--dismissible { display: flex; align-items: flex-start; gap: 12px; }
+.local-agent__error-content { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.local-agent__error-close { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 28px; width: 28px; height: 28px; border: 0; border-radius: 6px; background: transparent; color: inherit; cursor: pointer; }
+.local-agent__error-close:hover { background: color-mix(in srgb, currentColor 10%, transparent); }
+.local-agent__error-close:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+.local-agent__link-choices { width: min(600px, calc(100vw - 48px)); padding: 20px; }
+.local-agent__link-choices header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.local-agent__link-choices h2 { margin: 0; font-size: 16px; }
+.local-agent__link-choices ul { list-style: none; padding: 0; max-height: 50vh; overflow: auto; }
+.local-agent__link-choices li button { width: 100%; padding: 10px; text-align: left; overflow-wrap: anywhere; cursor: pointer; }
+.local-agent__link-choices li + li { margin-top: 8px; }
 
 .local-agent__error-details { overflow-wrap:anywhere; font-size:12px; line-height:1.6; }
 .local-agent__error-details summary { cursor:pointer; }
@@ -2271,3 +2278,8 @@
 .local-agent__file-access { margin: 0; min-width: 0; }
 .local-agent__file-access dd { margin: 0.3rem 0 0.65rem; }
 .local-agent__file-access code, .local-agent__permission-grants code { display: block; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+
+.deepcode-session-model__menu--combined { width: min(340px, calc(100vw - 32px)); }
+.deepcode-session-model__efforts { display:flex; gap:4px; padding:6px; }
+.deepcode-session-model__efforts button { justify-content:center; flex:1; }
+.deepcode-session-model__efforts button[aria-checked=true] { background:var(--dc-surface-hover); color:var(--dc-accent); }

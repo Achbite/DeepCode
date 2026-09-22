@@ -59,6 +59,7 @@
 }
 
 .deepcode-gui-shell {
+  position: relative;
   grid-column: 2;
   grid-row: 2;
   display: grid;
@@ -68,6 +69,9 @@
   grid-template-rows: minmax(0, 1fr);
   background: var(--dc-surface);
 }
+
+.deepcode-gui-usage-boundary { position: absolute; inset: 0 auto auto 0; z-index: 30; pointer-events: none; }
+.deepcode-gui-usage-boundary > .ui-plugin-view { position: absolute; inset: 0; pointer-events: none; }
 
 .deepcode-gui-shell--no-context,
 .deepcode-gui-shell:has(.local-agent--reading) { grid-template-columns: minmax(0, 1fr); }
