@@ -67,7 +67,6 @@ export function useAgentComposer(
   const respondPlan = useLocalAgentStore((state) => state.respondPlan);
   const cancelRun = useLocalAgentStore((state) => state.cancelRun);
   const saveModelChoice = useLocalAgentStore(state => state.selectModel);
-  const [confirmedChoice, setConfirmedChoice] = useState<string | null>(null);
   const selectProfile = useLocalAgentStore((state) => state.selectProfile);
   const selectReasoningEffort = useLocalAgentStore((state) => state.selectReasoningEffort);
   const reasoningEffortOverride = useLocalAgentStore((state) => state.reasoningEffortOverride);
@@ -483,12 +482,15 @@ export function useAgentComposer(
     response: Extract<PlanResponse, { kind: 'confirm' | 'cancel' }>,
   ) => {
     if (!pendingPlan || submitting) return;
+    // Resume at the user's confirmation, not after the asynchronous reply:
+    // scrolling up while the command is pending must still detach the viewport.
+    if (response.kind === 'confirm') setLatestFollowMode(true);
     try {
       await respondPlan(response);
     } catch {
       // The store preserves the authoritative command error for the shared error panel.
     }
-  }, [pendingPlan, respondPlan, submitting]);
+  }, [pendingPlan, respondPlan, setLatestFollowMode, submitting]);
 
   const selectMessageAttachments = async (
     selections: { path: string; kind: 'directory' | 'file' }[],
@@ -584,12 +586,13 @@ export function useAgentComposer(
   const editPastedText = (inputId: string, text: string) => setPastedTexts((current) => current.map((item) => (
     item.inputId === inputId ? { ...item, inputId: nextPanelId('paste'), text } : item
   )));
-  const choiceKey = JSON.stringify([conversationKey, selectedProfileId, reasoningEffortOverride]);
-  const modelSelectionConfirmed = confirmedChoice === choiceKey || Boolean(projection?.modelSettings
-    && projection.modelSettings.profileId === selectedProfileId
-    && (reasoningEffortOverride || profiles.find(profile => profile.id === selectedProfileId)?.thinking === 'disabled'));
+  const selectedProfile = profiles.find(profile => profile.id === selectedProfileId);
+  // A persisted choice is already usable; opening a new conversation does not
+  // require another click. Missing effort still requires an explicit selection.
+  const modelSelectionConfirmed = Boolean(selectedProfile?.enabled
+    && (selectedProfile.thinking === 'disabled' || reasoningEffortOverride));
   const selectModel = async (profileId: string, effort: import('@deepcode/protocol').LlmReasoningEffort | null) => {
-    if (await saveModelChoice(profileId, effort)) setConfirmedChoice(JSON.stringify([conversationKey, profileId, effort]));
+    await saveModelChoice(profileId, effort);
   };
   const canSend = !loading && !submitting && (!editingMessage || canEditMessage) && (textDecision
     ? Boolean(draft.trim()) && (!pendingInteraction || pendingInteraction.allowFreeform)

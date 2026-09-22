@@ -29,8 +29,9 @@ export default function SessionModelSelector({ language, profiles, connections =
   const selected = profiles.find(profile => profile.id === selectedProfileId);
   const candidate = profiles.find(profile => profile.id === candidateId);
   const title = (selected?.name ?? selectedProfileId ?? (chinese ? '选择模型' : 'Choose model')) + (selectedProfileId && !selected?.enabled ? ` · ${t(language, selected ? 'agent.profile.disabled' : 'agent.profile.missing')}` : '');
-  const effortLabel = !confirmed ? (chinese ? '选择强度' : 'Choose level') : selected?.thinking === 'disabled'
-    ? (chinese ? '不适用' : 'Not applicable') : reasoningEffortOverride ? t(language, `settings.llm.effort.${reasoningEffortOverride}`) : '';
+  const effortLabel = selected?.thinking === 'disabled'
+    ? (chinese ? '不适用' : 'Not applicable')
+    : reasoningEffortOverride ? t(language, `settings.llm.effort.${reasoningEffortOverride}`) : (chinese ? '选择强度' : 'Choose level');
   const close = () => { setOpen(false); triggerRef.current?.focus({ preventScroll: true }); };
   useEffect(() => {
     if (!open) return;
@@ -39,9 +40,9 @@ export default function SessionModelSelector({ language, profiles, connections =
     document.addEventListener('pointerdown', outside);
     return () => document.removeEventListener('pointerdown', outside);
   }, [open]);
-  const choose = async (effort: LlmReasoningEffort | null) => {
-    if (!candidate?.enabled || busy) return;
-    await onSelect(candidate.id, effort); close();
+  const choose = async (effort: LlmReasoningEffort | null, profile = candidate) => {
+    if (!profile?.enabled || busy) return;
+    await onSelect(profile.id, effort); close();
   };
   return <div ref={rootRef} className="deepcode-session-model">
     <ContextUsageControl language={language} contextUsage={contextUsage} contextCompositions={contextCompositions}
@@ -71,7 +72,12 @@ export default function SessionModelSelector({ language, profiles, connections =
             <div className="deepcode-session-model__menu-title">{connection.name}</div>
             {profiles.filter(profile => profile.enabled && profile.connectionId === connection.id).map(profile => <button
               key={profile.id} type="button" role="menuitemradio" aria-checked={candidateId === profile.id} disabled={busy}
-              onClick={() => setCandidateId(profile.id)}><span>{profile.name}</span>{candidateId === profile.id && <DeepCodeShellIcon name="check" />}</button>)}
+              onClick={() => {
+                setCandidateId(profile.id);
+                if (profile.id !== selectedProfileId && (profile.thinking === 'disabled' || profile.reasoningEffort)) {
+                  void choose(profile.thinking === 'disabled' ? null : profile.reasoningEffort!, profile);
+                }
+              }}><span>{profile.name}</span>{candidateId === profile.id && <DeepCodeShellIcon name="check" />}</button>)}
           </React.Fragment>)}
         </div>
         <div className="deepcode-session-model__menu-divider" role="separator" />

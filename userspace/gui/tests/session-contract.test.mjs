@@ -1263,6 +1263,144 @@ test('GUI model settings remember effort per model across new conversations and 
   assert.equal(reopened.getState().reasoningEffortOverride, null);
 });
 
+test('combined model selection persists effort per model and new drafts inherit it', async (t) => {
+  let profiles = [
+    { id: 'profile:one', name: 'One', enabled: true, thinking: 'enabled' },
+    { id: 'profile:two', name: 'Two', enabled: true, thinking: 'enabled' },
+    { id: 'profile:off', name: 'Off', enabled: true, thinking: 'disabled' },
+  ];
+  let failSave = false;
+  installGuiFetch(t, async (url, init) => {
+    assert.equal(url.pathname, '/api/llm/profiles');
+    if (init.method === 'PATCH') {
+      if (failSave) return Response.json({ ok: false, error: 'fixture_preference_save_failed' });
+      const { profile } = JSON.parse(init.body);
+      profiles = profiles.map(item => item.id === profile.id ? profile : item);
+    }
+    return Response.json({ ok: true, data: { profiles, defaultProfileId: 'profile:one' } });
+  });
+  const store = await loadGuiModelStore(t);
+  await store.getState().refreshProfiles();
+  assert.equal(await store.getState().selectModel('profile:one', 'high'), true);
+  assert.equal(profiles[0].reasoningEffort, 'high');
+  store.getState().startNewSession();
+  assert.equal(store.getState().selectedProfileId, 'profile:one');
+  assert.equal(store.getState().reasoningEffortOverride, 'high');
+  assert.equal(await store.getState().selectModel('profile:two', 'low'), true);
+  store.getState().startNewSession('project:another');
+  assert.equal(store.getState().reasoningEffortOverride, 'high');
+  await store.getState().selectProfile('profile:two');
+  assert.equal(store.getState().reasoningEffortOverride, 'low');
+  const reopened = await loadGuiModelStore(t);
+  await reopened.getState().refreshProfiles();
+  assert.equal(reopened.getState().reasoningEffortOverride, 'high');
+  assert.equal(await reopened.getState().selectModel('profile:one', null), false);
+  assert.equal(reopened.getState().reasoningEffortOverride, 'high');
+  failSave = true;
+  assert.equal(await reopened.getState().selectModel('profile:one', 'max'), false);
+  assert.match(reopened.getState().error, /fixture_preference_save_failed/);
+  assert.equal(profiles[0].reasoningEffort, 'high');
+  assert.equal(reopened.getState().reasoningEffortOverride, 'high');
+  assert.equal(reopened.getState().modelSettingsBusy, false);
+  failSave = false;
+  assert.equal(await reopened.getState().selectModel('profile:off', null), true);
+  assert.equal(reopened.getState().reasoningEffortOverride, null);
+});
+
+test('composer accepts inherited effort and never enables a new run with a blank level', async (t) => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const [{ useLocalAgentStore: store }, { useAgentComposer }, { default: Selector }] = await loadGuiModules(t, [
+    '/src/state/localAgentStore.ts', '/src/components/local-agent/useAgentComposer.ts',
+    '/src/components/local-agent/SessionModelSelector.tsx',
+  ]);
+  const previousStorage = globalThis.sessionStorage;
+  globalThis.sessionStorage = { getItem: () => JSON.stringify({ draft: 'Continue', pastedTexts: [], filesystemPaths: [], pluginSelections: [] }) };
+  t.after(() => { if (previousStorage === undefined) delete globalThis.sessionStorage; else globalThis.sessionStorage = previousStorage; });
+  const profiles = [
+    { id: 'profile:one', name: 'One', enabled: true, thinking: 'enabled', reasoningEffort: 'high' },
+    { id: 'profile:two', name: 'Two', enabled: true, thinking: 'enabled' },
+    { id: 'profile:off', name: 'Off', enabled: true, thinking: 'disabled' },
+  ];
+  store.setState({ profiles, defaultProfileId: 'profile:one' });
+  store.getState().startNewSession();
+  let composer;
+  function Probe() { composer = useAgentComposer('zh-CN', () => {}); return null; }
+  const render = () => {
+    // Zustand's server snapshot is captured by its internal API.
+    Object.assign(store.getInitialState(), store.getState());
+    renderToStaticMarkup(createElement(Probe));
+    return renderToStaticMarkup(createElement(Selector, { language: 'zh-CN', profiles,
+      selectedProfileId: composer.selectedProfileId, reasoningEffortOverride: composer.reasoningEffortOverride,
+      contextUsage: null, contextCompositions: [], confirmed: composer.modelSelectionConfirmed, onSelect: composer.selectModel }));
+  };
+  assert.match(render(), /One · 高/);
+  assert.equal(composer.canSend, true, 'inherited settings need no per-conversation confirmation');
+  store.getState().startNewSession('project:another');
+  render();
+  assert.equal(composer.canSend, true);
+  store.setState({ selectedProfileId: 'profile:two', reasoningEffortOverride: null,
+    sessionId: 'session:existing', projection: { plans: [], modelSettings: { profileId: 'profile:two', reasoningEffortOverride: null } } });
+  assert.match(render(), /Two · 选择强度/);
+  assert.equal(composer.canSend, false, 'a saved Session binding with no effort is not an explicit level');
+  store.setState({ selectedProfileId: 'profile:off', reasoningEffortOverride: null });
+  assert.match(render(), /Off · 不适用/);
+  assert.equal(composer.canSend, true);
+  const label = renderToStaticMarkup(createElement(Selector, { language: 'en-US', profiles,
+    selectedProfileId: 'profile:two', reasoningEffortOverride: null, confirmed: true,
+    contextUsage: null, contextCompositions: [], onSelect: async () => {} }));
+  assert.match(label, /Two · Choose level/, 'even an inconsistent caller cannot render a blank level');
+});
+
+test('plan confirmation resumes the real viewport once and does not lock it during the reply', async (t) => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const [{ useLocalAgentStore: store }, { useAgentComposer }, { useConversationViewport }] = await loadGuiModules(t, [
+    '/src/state/localAgentStore.ts', '/src/components/local-agent/useAgentComposer.ts',
+    '/src/components/local-agent/useConversationViewport.ts',
+  ]);
+  const previousWindow = globalThis.window, previousStorage = globalThis.sessionStorage;
+  const frames = new Map(); let frameId = 0;
+  globalThis.window = { requestAnimationFrame(fn) { frames.set(++frameId, fn); return frameId; }, cancelAnimationFrame(id) { frames.delete(id); } };
+  globalThis.sessionStorage = { getItem: () => null };
+  t.after(() => {
+    if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow;
+    if (previousStorage === undefined) delete globalThis.sessionStorage; else globalThis.sessionStorage = previousStorage;
+  });
+  const flush = () => { const pending = [...frames.values()]; frames.clear(); pending.forEach(fn => fn()); };
+  let release;
+  const reply = new Promise(resolve => { release = resolve; });
+  const projection = { sessionId: 'session:confirm', plans: [], pendingPlan: { planId: 'plan:confirm', revision: 1 } };
+  store.setState({ sessionId: projection.sessionId, projection, respondPlan: async () => reply });
+  Object.assign(store.getInitialState(), store.getState());
+  let composer, viewport;
+  function Probe() {
+    viewport = useConversationViewport({ sessionId: projection.sessionId, loading: false, projection,
+      presentationLayoutKey: '', assistantDraftLayoutKey: '', timelineExtentKey: '' });
+    composer = useAgentComposer('zh-CN', viewport.setLatestFollowMode);
+    return null;
+  }
+  renderToStaticMarkup(createElement(Probe));
+  const body = { scrollTop: 600, scrollHeight: 1600, clientHeight: 500,
+    querySelectorAll: () => [], getBoundingClientRect: () => ({ top: 0 }) };
+  viewport.bodyRef.current = body;
+  viewport.setLatestFollowMode(false);
+  const confirmation = composer.submitPlanDecision({ kind: 'confirm' });
+  viewport.preserveReadingPosition(); flush();
+  assert.equal(body.scrollTop, 1100, 'confirmation resumes from a detached history position before the reply');
+  viewport.bodyHandlers.onWheel({ target: body, deltaY: -200 });
+  body.scrollTop = 900;
+  viewport.bodyHandlers.onScroll({ target: body, currentTarget: body });
+  release(); await confirmation;
+  body.scrollHeight += 300;
+  viewport.preserveReadingPosition(); flush();
+  assert.equal(body.scrollTop, 900, 'a late reply and further output do not override subsequent reader intent');
+  await composer.submitPlanDecision({ kind: 'cancel' });
+  body.scrollHeight += 100;
+  viewport.preserveReadingPosition(); flush();
+  assert.equal(body.scrollTop, 900, 'cancel does not force latest');
+});
+
 test('starting a draft during initialization preserves navigation and still loads usable model configuration', async (t) => {
   let releaseCatalog;
   const catalogReady = new Promise((resolve) => { releaseCatalog = resolve; });
