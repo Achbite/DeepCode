@@ -58,7 +58,12 @@ export function ComposerPermissionControl({ language, composer }: { language: Ui
   const close = () => { setPermissionMenuOpen(false); permissionControlRef.current?.querySelector('button')?.focus(); };
   const change = async (key: string, value: string) => {
     setBusy(true);
-    try { if (sessionId) await setPermissions({ [key]: value }); else await patchDefault(key, value); setPage(null); }
+    try {
+      if (sessionId) await setPermissions({ [key]: value });
+      // Keep the current Session control and the shared preference in sync.
+      const activation = await patchDefault(key, value);
+      if (activation !== null) setPage(null);
+    }
     catch { /* Stores expose the original command error. */ }
     finally { setBusy(false); }
   };
