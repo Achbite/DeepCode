@@ -270,6 +270,28 @@ impl LocalAgentRuntime {
             })?
         };
         let provider_runtime = provider_binding.snapshot().clone();
+        let approval_reviewer_binding = if let Some(previous) = &previous {
+            previous.approval_reviewer_binding.clone()
+        } else {
+            let selected = settings["agent.approvalReview.profileId"]
+                .as_str()
+                .filter(|id| !id.is_empty());
+            let binding = match selected {
+                Some(profile_id) => ProviderRuntimeRegistry::prepare(&gui, Some(profile_id), None),
+                None => Ok(provider_binding.clone()),
+            }
+            .and_then(|binding| {
+                binding.approval_reviewer(
+                    settings["agent.approvalReview.reasoningEffort"]
+                        .as_str()
+                        .filter(|effort| !effort.is_empty()),
+                )
+            })
+            .map_err(|message| {
+                RunPreparationError::new("approval_reviewer_prepare_failed", message)
+            })?;
+            binding
+        };
         if let Some(previous) = &previous {
             plugin_selection.retain_prepared(&previous.plugin_selection);
         }
@@ -345,6 +367,25 @@ impl LocalAgentRuntime {
             &provider_runtime.profile_id,
         );
         executor_config.file_read_roots = plugin_selection.file_read_roots();
+        #[cfg(target_os = "macos")]
+        if let Some(commands) = environment["commandPaths"].as_object() {
+            for (name, path) in commands {
+                let target = std::fs::canonicalize(path.as_str().ok_or_else(|| {
+                    RunPreparationError::new(
+                        "host_command_path_invalid",
+                        format!("Invalid path for {name}"),
+                    )
+                })?)
+                .map_err(|error| {
+                    RunPreparationError::new(
+                        "host_command_path_failed",
+                        format!("Resolve {name}: {error}"),
+                    )
+                })?;
+                // PATH can contain executable symlinks into a separate toolchain directory.
+                executor_config.file_read_roots.push(target);
+            }
+        }
         let permissions = LocalAgentPermissionPolicy::from_settings(settings)
             .map_err(RunPreparationError::from)?;
         let web_search = prepare_web_search_binding(
@@ -426,6 +467,26 @@ impl LocalAgentRuntime {
                 message,
             ));
         }
+        if let Err(message) = self.provider_runtimes.bind(
+            &request.session_id,
+            &request.run_id,
+            approval_reviewer_binding.clone(),
+        ) {
+            let _ = self.kernel.release_catalog(ReleaseToolCatalogRequest::new(
+                &request.session_id,
+                &request.run_id,
+                &kernel_catalog_snapshot_ref,
+            ));
+            if previous.is_none() {
+                let _ = self
+                    .provider_runtimes
+                    .release(&request.session_id, &request.run_id);
+            }
+            return Err(RunPreparationError::new(
+                "approval_reviewer_bind_failed",
+                message,
+            ));
+        }
         plugin_config["extensionGenerationRef"] = json!(extension_generation_ref.clone());
         let selected_plugins = crate::local_agent_plugins::selected_plugin_snapshot(
             &plugin_selection,
@@ -437,6 +498,7 @@ impl LocalAgentRuntime {
             "sessionId": request.session_id,
             "runId": request.run_id,
             "provider": provider_runtime,
+            "approvalReviewer": approval_reviewer_binding.snapshot(),
             "webSearch": web_search,
             "extensionGenerationRef": plugin_config["extensionGenerationRef"],
             "kernelCatalogSnapshotRef": catalog["kernelCatalogSnapshotRef"],
@@ -459,6 +521,7 @@ impl LocalAgentRuntime {
                 requested_plugin_identity,
                 response: response.clone(),
                 provider_binding,
+                approval_reviewer_binding,
                 plugin_selection,
                 mcp,
             });
@@ -570,6 +633,7 @@ struct PreparedRunRecord {
     executor_config: deepcode_kernel_runtime::executors::KernelExecutorConfig,
     secrets: crate::DaemonSecretProvider,
     provider_binding: crate::local_agent_provider_runtime::ProviderRuntimeBinding,
+    approval_reviewer_binding: crate::local_agent_provider_runtime::ProviderRuntimeBinding,
     plugin_selection: crate::local_agent_plugins::ResolvedPluginSelection,
     mcp: crate::local_agent_mcp::McpRuntime,
     kernel_catalog_snapshot_ref: String,
@@ -1041,11 +1105,11 @@ pub(crate) async fn local_agent_provider_stream(
             return local_provider_error(&request_id, error.code, &error.message);
         }
     }
-    let frozen_provider_runtime = match state
-        .local_agent
-        .journal
-        .run_provider_runtime(&body.session_id, &body.run_id)
-    {
+    let frozen_provider_runtime = match state.local_agent.journal.run_provider_runtime(
+        &body.session_id,
+        &body.run_id,
+        &body.purpose,
+    ) {
         Ok(runtime) => runtime,
         Err(error) => {
             return local_provider_error(&request_id, error.code, &error.message);

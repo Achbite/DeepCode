@@ -27,8 +27,11 @@ class Provider(fixture.MockProviderHandler):
             if not body.get('tools'):
                 state.reviews += 1
                 require(state.mode == 'review', 'Review ran without user delegation')
+                require(body['model'] == 'mock-reviewer', 'The selected approval model was not used')
+                require(body.get('reasoning_effort') == 'xhigh', 'The independent reviewer reasoning setting was not used')
                 review = json.loads(body['messages'][-1]['content'])
-                require(review['preview']['authorizationContext']['command'] == COMMAND, 'Review did not receive the actual command')
+                require(review['operation']['arguments']['command'] == COMMAND, 'Review did not receive the actual command')
+                require(review['grant'] == 'thisCallOnly', 'Review changed the permission lifetime')
                 self._send_text(json.dumps({'decision': 'allow', 'reason': 'The user requested this exact file operation in the delegated environment.'}))
                 return
             ordinal, names, results = state.inspect(body)
@@ -60,6 +63,13 @@ def check_mode(mode):
         daemon = fixture.OwnedDaemon(root / 'config')
         try:
             fixture.write_configuration(daemon.config_root, f'http://127.0.0.1:{server.server_port}/v1', {})
+            settings_root = daemon.config_root / 'config/user/local/settings'
+            profiles_path = settings_root / 'llm-profiles.json'
+            profiles = json.loads(profiles_path.read_text())
+            reviewer = dict(profiles['profiles'][0], id='e2e-reviewer', name='Approval reviewer', model='mock-reviewer', thinking='enabled', reasoningEffort='high')
+            profiles['profiles'].append(reviewer)
+            profiles_path.write_text(json.dumps(profiles))
+            (settings_root / 'user-settings.json').write_text(json.dumps({'agent.approvalReview.profileId': 'e2e-reviewer', 'agent.approvalReview.reasoningEffort': 'xhigh'}))
             daemon.start()
             session = fixture.create_session(daemon, workspace)['sessionId']
             fixture.cli(daemon, session, '/permissions ' + json.dumps({
@@ -78,14 +88,14 @@ def check_mode(mode):
             require((workspace / 'approved.txt').read_text() == 'approved\napproved\n', 'Actual command did not run exactly twice')
             done = fixture.projection(daemon, session)
             require(done['run']['status'] == 'completed' and not done['shellAuthorizations'], 'Run grant remained active after settlement')
-            require(state.reviews == (1 if mode == 'review' else 0), f'Unexpected reviewer count: {state.reviews}')
+            require(state.reviews == (2 if mode == 'review' else 0), f'Unexpected reviewer count: {state.reviews}')
             daemon.shutdown()
             with fixture.sqlite_read_only(daemon.config_root / 'data/agent-runtime/session.sqlite3') as database:
                 events = [(kind, json.loads(payload)) for kind, payload in database.execute(
                     'SELECT event_type,payload_json FROM session_events WHERE session_id=? ORDER BY sequence', (session,))]
             decisions = [payload for kind, payload in events if kind == 'approval.resolved']
             if mode == 'review':
-                require(len(decisions) == 1 and decisions[0]['source'] == 'agent' and decisions[0]['authorizationScope'] == 'runHostShell', 'Delegation did not preserve the exact offered task scope')
+                require(len(decisions) == 2 and all(decision['source'] == 'agent' and 'authorizationScope' not in decision for decision in decisions), 'Delegation did not remain limited to each call')
             elif mode == 'ask':
                 require(len(decisions) == 1 and decisions[0]['source'] == 'user' and decisions[0]['authorizationScope'] == 'runCommand', 'Exact run grant was not reused')
             else:
