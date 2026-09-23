@@ -110,7 +110,7 @@ function Preview() {
             <div ref={viewport.messageEndRef} />
           </div>
         </div>
-        {!viewport.followingLatest && <button className="local-agent__jump-latest" aria-label="前往最新消息" onClick={viewport.scrollToLatest}>↓</button>}
+        {viewport.showJumpToLatest && <button className="local-agent__jump-latest" aria-label="前往最新消息" onClick={viewport.scrollToLatest}>↓</button>}
       </div>
       <ConversationComposer composer={composer} language="zh-CN" uiActionError={null} onDismissUiActionError={() => {}} onEditBrowserReview={() => {}} />
     </main></div>

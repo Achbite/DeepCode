@@ -93,7 +93,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
     assistantDraftLayoutKey,
     timelineExtentKey,
   });
-  const { bodyRef, bodyHandlers, followingLatest, scrollToLatest } = viewport;
+  const { bodyRef, bodyHandlers, showJumpToLatest, scrollToLatest } = viewport;
   const composer = useAgentComposer(language, viewport.setLatestFollowMode);
   const resourcePreview = useResourcePreview(sessionId);
   const [readerHeader, setReaderHeader] = useState<HTMLDivElement | null>(null);
@@ -161,7 +161,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
           <ArtifactLinks artifacts={display.artifacts} onOpen={resourcePreview.openWorkspaceResource} />
         </details>}
       </div>
-      {!followingLatest && hasConversationContent && (
+      {showJumpToLatest && hasConversationContent && (
           <button
             type="button"
             className="local-agent__jump-latest"
