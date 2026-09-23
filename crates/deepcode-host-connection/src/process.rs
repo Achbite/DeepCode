@@ -69,9 +69,9 @@ pub fn terminate_owned_process_tree(process: &mut OwnedHostProcess) {
 pub fn terminate_owned_process_tree_checked(process: &mut OwnedHostProcess) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        signal_owned_process_group(process.process_group_id, libc::SIGTERM)?;
+        signal_owned_process_group(process, libc::SIGTERM)?;
         if !wait_for_owned_process_group_exit(process, 20) {
-            signal_owned_process_group(process.process_group_id, libc::SIGKILL)?;
+            signal_owned_process_group(process, libc::SIGKILL)?;
         }
     }
     #[cfg(windows)]
@@ -83,17 +83,50 @@ pub fn terminate_owned_process_tree_checked(process: &mut OwnedHostProcess) -> s
 
 #[cfg(unix)]
 fn signal_owned_process_group(
-    process_group_id: libc::pid_t,
+    process: &mut OwnedHostProcess,
     signal: libc::c_int,
 ) -> std::io::Result<()> {
-    if unsafe { libc::kill(-process_group_id, signal) } == 0 {
+    // A group containing only an unreaped child returns EPERM on macOS.
+    process.child.try_wait()?;
+    if unsafe { libc::kill(-process.process_group_id, signal) } == 0 {
         return Ok(());
     }
     let error = std::io::Error::last_os_error();
     if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
+        return Ok(());
+    }
+    // The child can exit between the nonblocking wait and the signal.
+    process.child.try_wait()?;
+    if owned_process_group_exists(process.process_group_id) {
         Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stopping_an_exited_owned_child_reaps_its_process_group() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let mut process = spawn_owned_host_process(&mut command).unwrap();
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+        // Observe exit without reaping, just as an unattended service can exit.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                process.child.id() as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+        terminate_owned_process_tree_checked(&mut process).unwrap();
+        assert_eq!(process.child.wait().unwrap().code(), Some(0));
+        assert!(!owned_process_group_exists(process.process_group_id));
     }
 }
 

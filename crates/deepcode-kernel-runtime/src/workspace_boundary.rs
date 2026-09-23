@@ -1,3 +1,4 @@
+use crate::file_access::canonicalize_with_missing_tail;
 use deepcode_kernel_abi::{KernelError, KernelResult};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -15,7 +16,19 @@ impl WorkspaceBoundary {
     pub fn resolve_read(&self, relative_path: &str) -> KernelResult<PathBuf> {
         let target = self.lexical_target(relative_path)?;
         let canonical_root = self.canonical_root()?;
-        let canonical_target = canonicalize_with_missing_tail(&target)?;
+        let canonical_target = canonicalize_with_missing_tail(&target).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                KernelError::InvalidCommand(format!(
+                    "workspace target {} is unavailable: {error}",
+                    target.display()
+                ))
+            } else {
+                KernelError::Other(format!(
+                    "resolve workspace target {}: {error}",
+                    target.display()
+                ))
+            }
+        })?;
         ensure_within_root(&canonical_root, &canonical_target, relative_path)?;
         Ok(canonical_target)
     }
@@ -88,43 +101,6 @@ impl WorkspaceBoundary {
                 self.root.display()
             ))
         })
-    }
-}
-
-fn canonicalize_with_missing_tail(path: &Path) -> KernelResult<PathBuf> {
-    let mut existing = path;
-    let mut missing = Vec::new();
-    loop {
-        match existing.canonicalize() {
-            Ok(mut canonical) => {
-                for component in missing.iter().rev() {
-                    canonical.push(component);
-                }
-                return Ok(canonical);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let Some(name) = existing.file_name() else {
-                    return Err(KernelError::InvalidCommand(format!(
-                        "workspace target {} is unavailable: {error}",
-                        path.display()
-                    )));
-                };
-                missing.push(name.to_os_string());
-                let Some(parent) = existing.parent() else {
-                    return Err(KernelError::InvalidCommand(format!(
-                        "workspace target {} is unavailable: {error}",
-                        path.display()
-                    )));
-                };
-                existing = parent;
-            }
-            Err(error) => {
-                return Err(KernelError::Other(format!(
-                    "resolve workspace target {}: {error}",
-                    path.display()
-                )));
-            }
-        }
     }
 }
 

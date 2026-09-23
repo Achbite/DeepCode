@@ -12,6 +12,7 @@ import os
 import sqlite3
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 
@@ -20,6 +21,7 @@ fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
 require = fixture.require
 WINDOWS = os.name == 'nt'
+MACOS = sys.platform == 'darwin'
 SHELL = 'powershell' if WINDOWS else 'bash'
 
 
@@ -38,8 +40,11 @@ class Provider(fixture.MockProviderHandler):
             def shell(call, command, **extra):
                 return (call, names['bash'], {'command': command, **extra})
             if ordinal == 1:
+                read_command = "set -e; printf 'workspace-cli 中文\\n'; git branch --show-current; node --version; cat README.txt"
+                if MACOS:
+                    read_command += "; /usr/bin/git --version; /usr/bin/xcrun --find git"
                 self._send_tool_calls([
-                    shell('read', command("printf 'workspace-cli 中文\\n'; git branch --show-current; node --version; cat README.txt", "Write-Output 'workspace-cli 中文'; whoami; node --version; Get-ChildItem -Force; Get-Content -LiteralPath README.txt -Encoding UTF8")),
+                    shell('read', command(read_command, "Write-Output 'workspace-cli 中文'; whoami; node --version; Get-ChildItem -Force; Get-Content -LiteralPath README.txt -Encoding UTF8")),
                 ])
             elif ordinal == 2:
                 require(results['read']['outcome'] == 'completed', results['read'])
@@ -47,6 +52,12 @@ class Provider(fixture.MockProviderHandler):
                 require('workspace-read-ok' in results['read']['output']['stdout'], 'Workspace file was not read')
                 if WINDOWS:
                     require('deepcode_' in results['read']['output']['stdout'].lower(), 'Shell did not run under the dedicated account')
+                else:
+                    require('workspace-test' in results['read']['output']['stdout'], 'Git did not read the workspace branch')
+                if MACOS:
+                    require('git version ' in results['read']['output']['stdout'], 'System Git did not execute')
+                    require(any(line.endswith('/usr/bin/git') for line in results['read']['output']['stdout'].splitlines()), 'xcrun did not resolve the active Git tool')
+                    require(not results['read']['output']['stderr'], results['read']['output']['stderr'])
                 self._send_tool_calls([('plan', names['plan'], {
                     'title': 'Generate an output file', 'summary': 'Write only within build, then verify command results.',
                     'steps': [{'stepId': 'generate', 'title': 'Generate and verify', 'details': 'Exercise the workspace Shell.', 'verification': ['Output exists; unrelated paths remain unchanged.']}],

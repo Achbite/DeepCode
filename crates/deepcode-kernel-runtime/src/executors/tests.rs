@@ -424,7 +424,7 @@ fn bash_executes_in_the_bound_workspace_and_reports_environment() {
     assert_eq!(result.output["environment"]["terminal"], false);
     assert_eq!(
         result.output["environment"]["pathSource"],
-        "hostPlusStandardDeveloperPaths"
+        "preparedRunEnvironment"
     );
     assert_eq!(
         result.output["environment"]["writeScope"],

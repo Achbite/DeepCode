@@ -6,3 +6,6 @@
 ; dyld opens the root directory when starting a process; descendants stay restricted.
 (allow file-read-data (literal "/"))
 (allow file-write* (literal "/dev/null"))
+; Apple Bash 3.2 ignores TMPDIR for heredocs and checks /tmp with access(W_OK).
+(allow file-read-metadata file-write-data (literal "/tmp") (literal "/private/tmp"))
+(allow file-read* file-write* (regex #"^/tmp/sh-thd-[0-9]+$") (regex #"^/private/tmp/sh-thd-[0-9]+$"))
