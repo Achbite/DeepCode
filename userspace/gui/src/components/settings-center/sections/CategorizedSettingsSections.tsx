@@ -32,6 +32,7 @@ const INTERFACE_KEYS = [
   'gui.showContextRail',
   'gui.usageWidget.enabled',
   'gui.usageWidget.visibility',
+  'gui.usageWidget.currency',
   'gui.showReasoning',
 ] as const;
 const AGENT_INSTRUCTION_KEYS = ['agent.systemPrompt'] as const;

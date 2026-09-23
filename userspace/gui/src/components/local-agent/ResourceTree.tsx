@@ -7,6 +7,7 @@ import { useLocalAgentStore } from '../../state/localAgentStore';
 import type { UiLanguage } from '../../i18n';
 import type { ReaderTarget } from './readerState';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
+import { UiRegion } from '../../ui-plugins/UiRegion';
 
 type Node = { name: string; parentId?: string; entry?: ResourceEntry; children?: ResourceEntry[]; error?: string };
 
@@ -167,7 +168,29 @@ export function ResourceTree({ sessionId, language, openTarget, visible, activeT
     }).catch(error => { if (!controller.signal.aborted) setWatchError(String(error)); });
     return () => controller.abort();
   }, [sessionId, watchKey, tree, resources, visible]);
+  const displayedItem = (id: string) => {
+    const item = displayed.find(item => item.getId() === id);
+    if (!item) throw new Error('resource_tree_item_unavailable');
+    return item;
+  };
   return <aside className="resource-tree" hidden={!visible} aria-label={chinese ? '文件树' : 'File tree'}>
+    <UiRegion slot="reader.tree" data={{ kind: 'resourceTree', visible, filter, showRuntime, watchError,
+      selectedId: selected ?? null, items: displayed.map(item => {
+        const data = item.getItemData();
+        return { id: item.getId(), parentId: data.parentId, name: data.name,
+          kind: data.entry?.kind ?? (item.isFolder() ? 'directory' : 'unavailable'),
+          depth: item.getItemMeta().level, expanded: item.isExpanded(), selected: item.getId() === selected,
+          ...(data.error ? { error: data.error } : {}),
+        };
+      }),
+    }} actions={{ setTreeFilter: setFilter, setTreeRuntimeVisible: setShowRuntime,
+      setTreeItemExpanded: (id, expanded) => {
+        const item = displayedItem(id);
+        if (!item.isFolder()) throw new Error('resource_tree_item_not_directory');
+        if (expanded) item.expand(); else item.collapse();
+      },
+      openTreeItem: id => open(displayedItem(id).getItemData().entry),
+    }}>
     <label className="resource-tree__filter"><DeepCodeShellIcon name="search" /><input value={filter} onChange={event => setFilter(event.target.value)} placeholder={chinese ? '筛选已加载文件…' : 'Filter loaded files…'} aria-label={chinese ? '筛选文件' : 'Filter files'} /></label>
     {watchError && <p className="local-agent__resource-error" role="alert">{watchError}</p>}
     <div className="resource-tree__items" {...tree.getContainerProps(chinese ? '文件' : 'Files')}>
@@ -182,5 +205,6 @@ export function ResourceTree({ sessionId, language, openTarget, visible, activeT
       })}
     </div>
     <label className="resource-tree__runtime"><input type="checkbox" checked={showRuntime} onChange={event => setShowRuntime(event.target.checked)} />{chinese ? '显示运行环境文件' : 'Show runtime files'}</label>
+    </UiRegion>
   </aside>;
 }

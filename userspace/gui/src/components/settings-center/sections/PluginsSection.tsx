@@ -1,6 +1,7 @@
 import { localizePlugin } from '../../../pluginLocalization';
 import { useUiLanguage } from '../../../useUiLanguage';
 import { useSettingsSearchEntries } from '../settingsSearch';
+import { useInterfaceReloadGuard } from '../../../services/interfaceReload';
 import ModalDialog from '../../shared/ModalDialog';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { PluginCatalogItem } from '@deepcode/protocol';
@@ -585,6 +586,7 @@ function PluginConnectionForm({
 }) {
   const language = useUiLanguage();
   const [draft, setDraft] = useState(source);
+  useInterfaceReloadGuard(JSON.stringify(draft) !== JSON.stringify(source), draft.name?.trim() || t(language, 'settings.plugins.addConnection'), busy);
   return (
     <form
       className="plugin-connection"

@@ -1,6 +1,7 @@
 import React, { useId, useState } from 'react';
 import type { ApiResponse, UsageQuery, UsageTotals } from '@deepcode/protocol';
 import { normalizeUiLanguage } from '../../../i18n';
+import { formatUsageCost, useUsageCostDisplay } from '../../../ui-plugins/usageCost';
 import { useSettingsStore } from '../../../state/settingsStore';
 
 export function useModelLanguage() {
@@ -29,11 +30,14 @@ export function periodQuery(days: number, connectionId?: string, now = new Date(
   return { from: +from, to: +to, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     granularity: days === 1 ? 'hour' : 'day', ...(connectionId ? { connectionId } : {}) };
 }
-export function money(value: number | null | undefined) {
-  return value == null ? '—' : new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: value < .01 ? 4 : 2 }).format(value);
+export function useMoneyFormatter() {
+  const display = useUsageCostDisplay();
+  const { language } = useModelLanguage();
+  return (value: number | null | undefined) => formatUsageCost(value, display, language);
 }
 export function Cost({ totals }: { totals?: UsageTotals }) {
   const { text } = useModelLanguage();
+  const money = useMoneyFormatter();
   const partial = totals && totals.pricedCalls < totals.calls;
   return <span>{money(totals?.estimatedCost)}{partial && totals.estimatedCost !== null && <Hint label="*">{text('仅汇总已取得用量和官方价格的部分，未计价项不记作零。', 'Only reported, priced usage is included. Unknown charges are not zero.')}</Hint>}</span>;
 }

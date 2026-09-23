@@ -30,7 +30,8 @@ export function planOperationDetail(operation: PlanOperation, language: UiLangua
     return `${t(language, 'agent.tool.shell.command')} · ${t(language, 'agent.tool.shell.writeScope')}: ${paths}${operation.command ? `\n${operation.command}` : ''}${operation.terminal ? ` · ${t(language, 'agent.plan.interactiveTerminal')}` : ''}`;
   }
   const label = operation.operation === 'fs.delete' ? (chinese ? '删除' : 'Delete')
-    : operation.operation === 'fs.write' ? (chinese ? '写入' : 'Write') : (chinese ? '编辑' : 'Edit');
+    : operation.operation === 'fs.write' ? (chinese ? '写入' : 'Write')
+      : operation.operation === 'document.render' ? (chinese ? '生成文档' : 'Render document') : (chinese ? '编辑' : 'Edit');
   const directory = operation.targetKind === 'directoryTree'
     ? operation.operation === 'fs.delete' ? (chinese ? '（删除目录树）' : ' (delete directory tree)')
       : (chinese ? '（目录内文件，含新建）' : ' (descendant files, including new files)') : '';

@@ -21,7 +21,7 @@ export function nativeNavigationInput(address: string): { url: string } | { file
 }
 export function hasNativeBrowser(): boolean {
   return typeof window !== 'undefined' && Boolean(window.__TAURI__?.core?.invoke)
-    && !window.__DEEPCODE_SELF_PREVIEW__
+    && !window.__DEEPCODE_BROWSER_PREVIEW__
     && document.documentElement.dataset.product === 'deepcode-gui';
 }
 
@@ -29,6 +29,35 @@ export async function listenNativePages(listener:(page:NativePage)=>void):Promis
   if (!hasNativeBrowser()) return ()=>{};
   if (!window.__TAURI__?.event) throw new Error('Native browser page events are unavailable.');
   return window.__TAURI__.event.listen<NativePage>('deepcode:browser-page',({payload})=>listener(payload));
+}
+
+/** Subscribe before listing so page changes during the snapshot are retained. */
+export async function watchNativePages(binding: NativeHostBinding, listener: (pages: NativePage[]) => void): Promise<() => void> {
+  const pages = new Map<string, NativePage>();
+  const pending = new Map<string, NativePage>();
+  let initialized = false;
+  const apply = (page: NativePage) => {
+    if (page.status === 'closed') pages.delete(page.previewId);
+    else pages.set(page.previewId, page);
+  };
+  const unlisten = await listenNativePages(page => {
+    if (page.hostInstanceId !== binding.hostInstanceId || page.sessionId !== binding.sessionId) return;
+    if (!initialized) { pending.set(page.previewId, page); return; }
+    apply(page);
+    listener([...pages.values()]);
+  });
+  try {
+    const snapshot = await nativeBrowserCommand<{ pages: NativePage[] }>(binding, { action: 'list' });
+    for (const page of snapshot.pages) apply(page);
+    for (const page of pending.values()) apply(page);
+    pending.clear();
+    initialized = true;
+    listener([...pages.values()]);
+    return unlisten;
+  } catch (error) {
+    unlisten();
+    throw error;
+  }
 }
 export async function listenNativeActivation(listener: (page: NativePage) => void): Promise<() => void> {
   if (!hasNativeBrowser()) return () => {};

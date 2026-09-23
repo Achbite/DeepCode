@@ -1,8 +1,11 @@
+import { modelReasoningEfforts, type UserSettings } from '@deepcode/protocol';
+import { t } from '../../../i18n';
 import { useInterfaceReloadGuard } from '../../../services/interfaceReload';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ConnectionSummary, ConnectionsResult, LlmProviderProfile, LlmProfilesResult, ModelConnection, ProviderAdapterDescriptor, UsageReport } from '@deepcode/protocol';
 import { getLlmProfiles, getModelConnections, patchModelConnections, queryModelUsage } from '../../../services/apiClient';
 import { useLocalAgentStore } from '../../../state/localAgentStore';
+import { useSettingsStore } from '../../../state/settingsStore';
 import { useSettingsSearchEntries } from '../settingsSearch';
 import { AgentSettingsSection } from './CategorizedSettingsSections';
 import ModelEditor from '../model-services/ModelEditor';
@@ -14,6 +17,58 @@ import '../model-services/modelServices.css';
 
 type Page = { kind: 'list' } | { kind: 'usage'; connectionId?: string } | { kind: 'web' } |
   { kind: 'connection'; id: string } | { kind: 'new'; mode: 'metered' | 'subscription' };
+
+function ApprovalReviewerModel({ profiles, connections }: { profiles: LlmProviderProfile[]; connections: ModelConnection[] }) {
+  const { language } = useModelLanguage();
+  const selected = useSettingsStore(state => String(state.effectiveSettings['agent.approvalReview.profileId'] ?? ''));
+  const effort = useSettingsStore(state => String(state.effectiveSettings['agent.approvalReview.reasoningEffort'] ?? ''));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const conversationModel = useLocalAgentStore(state => state.selectedProfileId);
+  const profile = profiles.find(profile => profile.id === (selected || conversationModel));
+  const available = profiles.filter(profile => profile.enabled);
+  const efforts = modelReasoningEfforts(profile);
+  const unsupportedEffort = !!effort && (profile?.thinking === 'disabled' || !efforts.some(value => value === effort));
+  const save = async (patches: UserSettings) => {
+    setSaving(true); setError('');
+    try {
+      const activation = await useSettingsStore.getState().patchUserSettingsBatch(patches);
+      if (!activation) setError(useSettingsStore.getState().errorMessage ?? t(language, 'settings.common.saveFailed'));
+    } catch (error) { setError(message(error)); }
+    finally { setSaving(false); }
+  };
+  return <details className="model-editor model-divider">
+    <summary><strong>{t(language, 'settings.approvalReview.title')}</strong>
+      <span>{selected ? profile?.name ?? t(language, 'settings.approvalReview.unavailable') : t(language, 'settings.approvalReview.conversationModel')}
+        {effort ? ` · ${t(language, `settings.llm.effort.${effort}`)}` : ''}</span></summary>
+    <div className="model-form-grid model-reviewer-settings">
+      <label>{t(language, 'settings.approvalReview.providerModel')}
+        <select value={selected} disabled={saving} onChange={event => {
+          const next = profiles.find(profile => profile.id === (event.target.value || conversationModel));
+          void save({ 'agent.approvalReview.profileId': event.target.value,
+            ...(next?.thinking === 'disabled' || effort && !modelReasoningEfforts(next).some(value => value === effort)
+              ? { 'agent.approvalReview.reasoningEffort': '' } : {}) });
+        }}>
+          <option value="">{t(language, 'settings.approvalReview.useConversationModel')}</option>
+          {selected && !available.some(profile => profile.id === selected) && <option value={selected}>{selected}</option>}
+          {connections.map(connection => <optgroup key={connection.id} label={connection.name}>
+            {available.filter(profile => profile.connectionId === connection.id).map(profile => <option key={profile.id} value={profile.id}>{profile.name} · {profile.model}</option>)}
+          </optgroup>)}
+        </select>
+      </label>
+      <label>{t(language, 'settings.llm.reasoningEffort')}
+        <select value={effort} disabled={saving} onChange={event => void save({ 'agent.approvalReview.reasoningEffort': event.target.value })}>
+          <option value="">{profile?.thinking === 'disabled' ? t(language, 'agent.profile.thinkingDisabled') : t(language, 'settings.approvalReview.inheritEffort')}</option>
+          {effort && !efforts.some(value => value === effort) && <option value={effort} disabled>{t(language, `settings.llm.effort.${effort}`)}</option>}
+          {efforts.map(value => <option key={value} value={value} disabled={profile?.thinking === 'disabled'}>{t(language, `settings.llm.effort.${value}`)}</option>)}
+        </select>
+      </label>
+      {unsupportedEffort && <p className="model-wide" role="alert">{t(language, 'settings.approvalReview.effortUnavailable')}</p>}
+      <p className="model-wide">{t(language, 'settings.approvalReview.description')}</p>
+      {error && <div className="settings-error model-wide" role="alert">{error}</div>}
+    </div>
+  </details>;
+}
 function newModel(connection: ModelConnection, adapter: ProviderAdapterDescriptor): LlmProviderProfile {
   return { ...(adapter.models[0] ?? { name: '', model: '', kind: adapter.protocols[0], providerFlavor: 'openai', enabled: true, contextWindowTokens: 128000, maxOutputTokens: 16000 }), id: `model:${crypto.randomUUID()}`, connectionId: connection.id };
 }
@@ -134,6 +189,7 @@ export default function LlmSection({ active = true }: { active?: boolean }) {
     {page.kind === 'list' && <>
       <div className="model-heading"><h2>{text('模型与服务', 'Models & services')}</h2><div className="model-add"><button ref={addButton} className="model-primary" aria-expanded={showAdd} onClick={() => setShowAdd(v => !v)}>{text('添加连接', 'Add connection')} +</button>{showAdd && <div className="model-add-menu"><button onClick={() => { setPage({ kind: 'new', mode: 'metered' }); setShowAdd(false); }}>{text('API 连接', 'API connection')}</button><button onClick={() => { setPage({ kind: 'new', mode: 'subscription' }); setShowAdd(false); }}>Coding Plan</button></div>}</div></div>
       <div className="model-actions model-subheading"><span>{text('最近使用', 'Last used')} · {profiles?.profiles.find(p => p.id === profiles.defaultProfileId)?.name ?? '—'}</span><button className="model-push" onClick={() => setPage({ kind: 'usage' })}>{text('用量统计', 'Usage')} ↗</button></div>
+      {profiles && <ApprovalReviewerModel profiles={profiles.profiles} connections={profiles.connections} />}
       {catalog && (['metered', 'subscription'] as const).map(mode => {
         const list = catalog.connections.filter(c => c.billingMode === mode);
         return <section className="model-connection-group" key={mode}><div className="model-heading"><h3>{mode === 'metered' ? text('API 连接', 'API connections') : 'Coding Plan'}</h3><span>{text('近 30 天', 'Last 30 days')}{mode === 'metered' && <Hint>{text('显示已记录请求的 API 费用估算，非服务方账单。', 'Estimated cost of recorded requests; not a provider invoice.')}</Hint>}</span></div>

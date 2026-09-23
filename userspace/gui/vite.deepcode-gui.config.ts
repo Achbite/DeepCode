@@ -79,6 +79,8 @@ export default defineConfig(({ command }) => {
       host: process.env.DEEPCODE_GUI_BIND_HOST ?? '127.0.0.1',
       port: devPort,
       strictPort: true,
+      // macOS container mounts do not reliably forward filesystem watch events.
+      watch: { usePolling: true, interval: 300 },
       proxy: {
         '/api': proxyOptions,
         '/ws': { ...proxyOptions, ws: true },

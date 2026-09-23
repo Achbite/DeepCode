@@ -170,75 +170,89 @@ export function UiPluginSlotView({
   }) : []), [names]);
   const portals = Object.entries(regions ?? {}).flatMap(([name, child]) => regionHosts[name] ? [createPortal(child, regionHosts[name], name)] : []);
   const positions = useRef<Array<{ element: HTMLElement; top: number; left: number }>>([]);
+  const retiredView = useRef<Promise<void>>(Promise.resolve());
 
   useLayoutEffect(() => {
     const root = container.current;
     if (!root || !entry || !renderer || !context) return;
     const scope = createPluginScope(insertStyle, (error) => context.runtime.report(entry, error));
-    const detach = context.runtime.attachView(entry, () => scope.dispose());
-    try {
-      const value = latestInput.current;
-      const authFlows = new Set<string>();
-      scope.onDispose(async () => { await Promise.all([...authFlows].map(async id => { result(await cancelModelAuth(id)); })); authFlows.clear(); });
-      const requireFlow = (id: string) => { if (!authFlows.has(id)) throw new Error('Auth flow is outside this view scope.'); };
-      const viewScope = {
-        ...scope,
-        ...((slot.startsWith('settings.') || slot === 'usage.widget') && entry.manifest?.capabilities?.includes('usage.read') ? {
-          usage: { query: async (query: import('@deepcode/protocol').UsageQuery, signal: AbortSignal) => result(await queryModelUsage(query, AbortSignal.any([scope.signal, signal]))) },
-        } : {}),
-        ...(slot === 'usage.widget' && entry.manifest?.capabilities?.includes('quota.read') ? {
-          quota: { read: async (signal: AbortSignal) => {
-            const current = latestInput.current;
-            if (current.kind !== 'usage.widget' || !current.connection) throw new Error('No connection selected.');
-            return result(await getModelQuota(current.connection.id, AbortSignal.any([scope.signal, signal])));
+    const previousView = retiredView.current;
+    let disposal: Promise<void> | undefined;
+    const dispose = () => {
+      scope.abort();
+      if (!disposal) retiredView.current = disposal = previousView.then(() => scope.dispose());
+      return disposal;
+    };
+    const detach = context.runtime.attachView(entry, dispose);
+    const mount = async () => {
+      // StrictMode and hot updates must finish the old view's effects before reusing its container.
+      await previousView;
+      if (scope.signal.aborted) return;
+      try {
+        const value = latestInput.current;
+        const authFlows = new Set<string>();
+        scope.onDispose(async () => { await Promise.all([...authFlows].map(async id => { result(await cancelModelAuth(id)); })); authFlows.clear(); });
+        const requireFlow = (id: string) => { if (!authFlows.has(id)) throw new Error('Auth flow is outside this view scope.'); };
+        const viewScope = {
+          ...scope,
+          ...((slot.startsWith('settings.') || slot === 'usage.widget') && entry.manifest?.capabilities?.includes('usage.read') ? {
+            usage: { query: async (query: import('@deepcode/protocol').UsageQuery, signal: AbortSignal) => result(await queryModelUsage(query, AbortSignal.any([scope.signal, signal]))) },
+          } : {}),
+          ...(slot === 'usage.widget' && entry.manifest?.capabilities?.includes('quota.read') ? {
+            quota: { read: async (signal: AbortSignal) => {
+              const current = latestInput.current;
+              if (current.kind !== 'usage.widget' || !current.connection) throw new Error('No connection selected.');
+              return result(await getModelQuota(current.connection.id, AbortSignal.any([scope.signal, signal])));
+            } },
+          } : {}),
+          actions: Object.fromEntries(Object.keys(liveActions.current ?? {}).map(name => [name, (...args: unknown[]) => {
+            if (scope.signal.aborted) throw new Error('View disposed.');
+            const action = liveActions.current?.[name as keyof UiViewActions] as ((...args: unknown[]) => unknown) | undefined;
+            if (!action) throw new Error('View action unavailable.');
+            return action(...args);
+          }])),
+          regions: { mount: (name: string, target: HTMLElement) => {
+            const host = regionHosts[name];
+            if (!host || (target !== root && !root.contains(target))) throw new Error('Invalid UI region mount.');
+            target.append(host);
           } },
-        } : {}),
-        actions: Object.fromEntries(Object.keys(liveActions.current ?? {}).map(name => [name, (...args: unknown[]) => {
-          if (scope.signal.aborted) throw new Error('View disposed.');
-          const action = liveActions.current?.[name as keyof UiViewActions] as ((...args: unknown[]) => unknown) | undefined;
-          if (!action) throw new Error('View action unavailable.');
-          return action(...args);
-        }])),
-        regions: { mount: (name: string, target: HTMLElement) => {
-          const host = regionHosts[name];
-          if (!host || (target !== root && !root.contains(target))) throw new Error('Invalid UI region mount.');
-          target.append(host);
-        } },
-        ...(slot === 'settings.connection.detail' && value.kind === 'settings.connection' && entry.manifest?.capabilities?.includes('connection.auth') ? {
-          connection: {
-            startLogin: async (method: 'browser' | 'deviceCode') => {
-              if (scope.signal.aborted) throw new Error('View disposed.');
-              const flow = result(await startModelAuth(value.connection.id, method));
-              if (scope.signal.aborted) { result(await cancelModelAuth(flow.id)); throw new Error('View disposed.'); }
-              authFlows.add(flow.id); return flow;
+          ...(slot === 'settings.connection.detail' && value.kind === 'settings.connection' && entry.manifest?.capabilities?.includes('connection.auth') ? {
+            connection: {
+              startLogin: async (method: 'browser' | 'deviceCode') => {
+                if (scope.signal.aborted) throw new Error('View disposed.');
+                const flow = result(await startModelAuth(value.connection.id, method));
+                if (scope.signal.aborted) { result(await cancelModelAuth(flow.id)); throw new Error('View disposed.'); }
+                authFlows.add(flow.id); return flow;
+              },
+              readLogin: async (id: string, signal: AbortSignal) => {
+                requireFlow(id); const flow = result(await getModelAuth(id, AbortSignal.any([scope.signal, signal])));
+                if (flow.status !== 'pending') { authFlows.delete(id); if (flow.status === 'complete') await connectionChanged.current?.(); }
+                return flow;
+              },
+              cancelLogin: async (id: string) => { requireFlow(id); const flow = result(await cancelModelAuth(id)); authFlows.delete(id); return flow; },
+              logout: async () => { if (scope.signal.aborted) throw new Error('View disposed.'); result(await logoutModelConnection(value.connection.id)); await connectionChanged.current?.(); },
+              readQuota: async (signal: AbortSignal) => result(await getModelQuota(value.connection.id, AbortSignal.any([scope.signal, signal]))),
             },
-            readLogin: async (id: string, signal: AbortSignal) => {
-              requireFlow(id); const flow = result(await getModelAuth(id, AbortSignal.any([scope.signal, signal])));
-              if (flow.status !== 'pending') { authFlows.delete(id); if (flow.status === 'complete') await connectionChanged.current?.(); }
-              return flow;
-            },
-            cancelLogin: async (id: string) => { requireFlow(id); const flow = result(await cancelModelAuth(id)); authFlows.delete(id); return flow; },
-            logout: async () => { if (scope.signal.aborted) throw new Error('View disposed.'); result(await logoutModelConnection(value.connection.id)); await connectionChanged.current?.(); },
-            readQuota: async (signal: AbortSignal) => result(await getModelQuota(value.connection.id, AbortSignal.any([scope.signal, signal]))),
-          },
-        } : {}),
-      };
-      scope.onDispose(() => { Object.values(regionHosts).forEach(host => host.remove()); });
-      const view = renderer(root, value, viewScope);
-      if (!view || typeof view.update !== 'function' || typeof view.dispose !== 'function')
-        throw new Error('UI renderer must return update and dispose functions.');
-      mounted.current = view;
-      scope.onDispose(() => view.dispose());
-      for (const position of positions.current) {
-        position.element.scrollTop = position.top;
-        position.element.scrollLeft = position.left;
+          } : {}),
+        };
+        scope.onDispose(() => { Object.values(regionHosts).forEach(host => host.remove()); });
+        const view = renderer(root, value, viewScope);
+        if (!view || typeof view.update !== 'function' || typeof view.dispose !== 'function')
+          throw new Error('UI renderer must return update and dispose functions.');
+        mounted.current = view;
+        scope.onDispose(() => view.dispose());
+        for (const position of positions.current) {
+          position.element.scrollTop = position.top;
+          position.element.scrollLeft = position.left;
+        }
+        positions.current = [];
+      } catch (error) {
+        void dispose().catch(console.error).finally(detach);
+        root.replaceChildren();
+        context.runtime.report(entry, error);
       }
-      positions.current = [];
-    } catch (error) {
-      void scope.dispose().catch(console.error).finally(detach);
-      root.replaceChildren();
-      context.runtime.report(entry, error);
-    }
+    };
+    void mount().catch(error => context.runtime.report(entry, error));
     return () => {
       positions.current = [];
       for (let element = root.parentElement; element; element = element.parentElement) {
@@ -249,8 +263,7 @@ export function UiPluginSlotView({
           positions.current.push({ element, top: element.scrollTop, left: element.scrollLeft });
       }
       mounted.current = null;
-      void scope
-        .dispose()
+      void dispose()
         .catch((error) => context.runtime.report(entry, error))
         .finally(detach);
       root.replaceChildren();

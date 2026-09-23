@@ -1,3 +1,4 @@
+import { modelReasoningEfforts } from '@deepcode/protocol';
 import React, { useEffect, useId, useRef, useState } from 'react';
 import type { ContextCompositionProjection, ContextUsageProjection, LlmProviderProfile, ModelConnection, LlmReasoningEffort } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
@@ -83,7 +84,7 @@ export default function SessionModelSelector({ language, profiles, connections =
         <div className="deepcode-session-model__menu-divider" role="separator" />
         {candidate?.thinking === 'disabled' ? <button type="button" role="menuitem" disabled={busy} onClick={() => void choose(null)}>{chinese ? '使用此模型' : 'Use this model'}</button>
           : <><div className="deepcode-session-model__menu-title">{t(language, 'settings.llm.reasoningEffort')}</div>
-            <div className="deepcode-session-model__efforts">{(['low', 'medium', 'high', 'max'] as const).filter(effort => candidate?.providerFlavor !== 'deepseek' || effort !== 'medium').map(effort => <button
+            <div className="deepcode-session-model__efforts">{modelReasoningEfforts(candidate).map(effort => <button
               key={effort} type="button" role="menuitemradio" aria-checked={confirmed && candidateId === selectedProfileId && reasoningEffortOverride === effort}
               disabled={busy || !candidate?.enabled} onClick={() => void choose(effort)}>{t(language, `settings.llm.effort.${effort}`)}</button>)}</div></>}
       </div>}

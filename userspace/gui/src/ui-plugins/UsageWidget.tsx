@@ -3,15 +3,18 @@ import type { ConversationReaderLayout } from '../components/local-agent/LocalAg
 import { useLocalAgentStore } from '../state/localAgentStore';
 import { useSettingsStore } from '../state/settingsStore';
 import { UiPluginSlotView, useDisplayTheme } from './UiPlugins';
+import { UsageWidgetSettings } from './UsageWidgetSettings';
+import { normalizeUiLanguage } from '../i18n';
+import { usageWidgetLabels } from './usageWidgetLabels';
+import { useUsageCostDisplay } from './usageCost';
 
-export function UsageWidget({ readerLayout, hidden, onOpenSettings }: {
+export function UsageWidget({ readerLayout, hidden }: {
   readerLayout: ConversationReaderLayout;
   hidden: boolean;
-  onOpenSettings(): void;
 }) {
   const enabled = useSettingsStore(state => state.effectiveSettings['gui.usageWidget.enabled']) !== false;
   const visibility = useSettingsStore(state => state.effectiveSettings['gui.usageWidget.visibility']);
-  const locale = String(useSettingsStore(state => state.effectiveSettings['workbench.language']) ?? 'zh-CN');
+  const locale = normalizeUiLanguage(useSettingsStore(state => state.effectiveSettings['workbench.language']));
   const profile = useLocalAgentStore(state => state.profiles.find(profile => profile.id === state.selectedProfileId));
   const connection = useLocalAgentStore(state => state.connections.find(connection => connection.id === profile?.connectionId)) ?? null;
   const revision = useLocalAgentStore(state => state.projection?.tokenUsageHistory.length ?? 0);
@@ -20,6 +23,8 @@ export function UsageWidget({ readerLayout, hidden, onOpenSettings }: {
   const [readerVisibility, setReaderVisibility] = useState<'summary' | 'collapsed'>('collapsed');
   const boundary = useRef<HTMLDivElement>(null);
   const theme = useDisplayTheme();
+  const costDisplay = useUsageCostDisplay();
+  const [settingsOpen, setSettingsOpen] = useState(false);
   useLayoutEffect(() => {
     setReaderVisibility('collapsed');
     setExpanded(false);
@@ -50,12 +55,13 @@ export function UsageWidget({ readerLayout, hidden, onOpenSettings }: {
     : readerLayout.visible ? readerVisibility : visibility === 'collapsed' ? 'collapsed' : 'summary';
   return <div ref={boundary} className="deepcode-gui-usage-boundary" hidden={concealed}>
     <UiPluginSlotView slot="usage.widget" input={{ kind: 'usage.widget', connection, modelId: profile?.model ?? null,
-      visibility: displayVisibility, expanded, revision, locale, theme }}
+      visibility: displayVisibility, expanded, revision, locale, theme, costDisplay, labels: usageWidgetLabels(locale) }}
       actions={{ setExpanded, setUsageVisibility: value => {
         if (value !== 'summary') setExpanded(false);
         // Opening Reader is a temporary disclosure change, not a saved preference.
         if (readerLayout.visible && value !== 'hidden') setReaderVisibility(value);
         else void patch('gui.usageWidget.visibility', value);
-      }, openUsageSettings: onOpenSettings }}>{null}</UiPluginSlotView>
+      }, openUsageSettings: () => setSettingsOpen(true) }}>{null}</UiPluginSlotView>
+    {settingsOpen && <UsageWidgetSettings onClose={() => setSettingsOpen(false)} />}
   </div>;
 }

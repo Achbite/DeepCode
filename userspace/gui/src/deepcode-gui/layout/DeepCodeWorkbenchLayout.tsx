@@ -346,7 +346,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
           <DeepCodeConversationShell headerTarget={sessionHeader} onReaderLayoutChange={setReaderLayout} />
           {showContextRail && <DeepCodeTaskPanel language={language} projection={projection} />}
         </div>
-        <UsageWidget readerLayout={readerLayout} hidden={settingsOpen} onOpenSettings={() => setSettingsOpen(true)} />
+        <UsageWidget readerLayout={readerLayout} hidden={settingsOpen} />
       </div></>,
       }} />
 
