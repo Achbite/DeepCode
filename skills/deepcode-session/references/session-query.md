@@ -13,6 +13,8 @@ Use the complete `sessionId`, such as `session:...`. The default view is `summar
 
 `before` is an exclusive backward cursor. Pass `nextBefore` to the next read; null means there are no earlier matching events. `limit` ranges from 1 to 50. Text excerpts report `truncated` and their original `totalBytes`. An excerpt is not the complete text and cannot establish that omitted content does not exist. `recordId` is for the tools view; `providerRequestId` selects context or reasoning. Queries cover only the current configuration root.
 
+For the current installation, use the `runtimeExecutables.cli` path in the run's execution context when present. Otherwise locate `deepcode-cli` on the prepared PATH and verify the result. Do not guess an application bundle name or treat an absent PATH entry as proof that the CLI is not installed. Reading or executing an installation path still uses the ordinary execution-permission flow.
+
 The CLI uses the same read-only interface and returns JSON:
 
 ```sh

@@ -2,6 +2,8 @@
 
 Settings → Models and services groups **API connections** and **Coding Plans**. A connection owns its endpoint and credential reference; model profiles point to it and retain independent model and context settings. Connection details open directly into configuration. Saving one model leaves the others intact. The model last used for a submitted task remains the default for new conversations. Reasoning effort is chosen in the conversation selector and remembered per model; new conversations inherit that choice. A running request keeps its captured connection/model configuration.
 
+The execution approval model has separate provider/model and reasoning selections. Leaving the model blank uses the conversation model; leaving reasoning blank uses that model's captured effort. The review runs with independent, compact context and the selected model's configured output budget. Saved changes apply to the next run. It reviews execution access, not Plan confirmations or user questions. The standard effort choices are low, medium, high, xhigh and max; provider-specific choices follow the adapter's supported settings.
+
 Coding Plan is a service category. The first adapter is OpenAI Codex. DeepCode implements browser PKCE and device-code authentication through the Host, independent of an installed Codex CLI. Credentials stay in the existing local secret store. The GUI receives account labels and flow state; cancelling or leaving authentication releases the flow. Logout removes that connection's credential and cancels its login. Requests use the subscription's dedicated Responses transport, while API keys use the API connection's endpoint.
 
 Quota is a timestamped response from the provider, not an estimate from local tokens. Its windows retain the supplied reset time and used percentage. A failed refresh displays its error. Subscription fees and subscription usage are not counted as metered API cost.
@@ -13,6 +15,8 @@ The default interval is **the last 30 days**, including today and the previous 2
 The Host indexes physical Provider calls with connection, model, Session, run and attempt attribution. Repeated stream observations update one call, including usage reported before interruption. Missing usage and unrecognized prices remain unavailable or partial. The report includes its recording start; earlier dates are not fabricated as zero consumption. This is a reporting index, not another Session journal or reducer.
 
 The first price catalog covers the reviewed OpenAI API models. Each call keeps the applicable official price snapshot, returned model, service tier and long-context rule. The current source is [OpenAI API pricing](https://developers.openai.com/api/docs/pricing). Unknown cache-write usage does not silently become zero. The display is an estimate of model tokens and excludes additional provider tool charges, taxes and subscription fees. Other adapters expose tokens and calls until they have a verified price adapter.
+
+The usage widget and cost details share a display currency preference. USD is the default; CNY estimates use a fixed rate of 1 USD = 7 CNY. The context menu opens a small widget settings dialog. Original usage records remain in USD.
 
 Session cost details are optional via `settings.usage.panel` and the read-only usage port. Core Session token/context indicators remain available. See [UI plugins](ui-plugins.md).
 
