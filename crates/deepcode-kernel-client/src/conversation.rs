@@ -50,8 +50,16 @@ pub struct ErrorDiagnostics {
     pub is_body: Option<bool>,
     pub stop_reason: Option<String>,
     pub archive_path: Option<String>,
+    pub provider_error: Option<ProviderErrorDetails>,
     #[serde(default)]
     pub secondary: Vec<DiagnosticSecondary>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderErrorDetails {
+    pub code: Option<String>,
+    pub r#type: Option<String>,
+    pub retry_directive: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -832,13 +840,12 @@ impl SessionProjection {
         Ok(())
     }
 
-    pub fn last_assistant_text(&self, after_message_count: usize) -> Option<&str> {
+    pub fn last_assistant_message(&self, after_message_count: usize) -> Option<&ProjectionMessage> {
         self.messages
             .iter()
             .skip(after_message_count)
             .rev()
             .find(|message| message.role == "assistant")
-            .map(|message| message.content.as_str())
     }
 }
 
@@ -1138,6 +1145,7 @@ pub struct ProjectionMessage {
     pub provider_request_id: Option<String>,
     pub role: String,
     pub content: String,
+    pub source_references: Option<SourceReferences>,
     pub filesystem_references: Vec<FilesystemReference>,
     pub plugin_selections: Vec<PluginSelectionInput>,
     pub feedback: Option<String>,
@@ -1254,8 +1262,23 @@ pub struct NarrativeProjection {
     pub run_id: String,
     pub provider_request_id: String,
     pub content: String,
+    pub source_references: Option<SourceReferences>,
     pub sequence: u64,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SourceReferences {
+    pub citations: Vec<SourceCitation>,
+    pub unresolved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SourceCitation {
+    pub url: String,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1297,7 +1320,7 @@ pub struct SessionModelSettings {
 }
 
 fn is_reasoning_effort(value: &str) -> bool {
-    matches!(value, "low" | "medium" | "high" | "max")
+    matches!(value, "low" | "medium" | "high" | "xhigh" | "max")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1416,7 +1439,17 @@ pub struct InteractionProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct EffectOperation {
+    pub tool_name: String,
+    pub arguments: serde_json::Map<String, Value>,
+    pub workspace_root: Option<String>,
+    pub execution_scope: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EffectPreview {
+    pub operation: Option<EffectOperation>,
     pub summary: String,
     pub effects: Vec<String>,
     pub logical_targets: Vec<String>,
@@ -1447,6 +1480,13 @@ pub struct ApprovalProjection {
     pub preview: EffectPreview,
     pub sequence: u64,
     pub created_at: String,
+}
+
+impl ApprovalProjection {
+    pub fn is_model_reviewing(&self, run: Option<&RunProjection>) -> bool {
+        self.preview.approval_reviewer.as_deref() == Some("agent")
+            && run.is_some_and(|run| run.run_id == self.run_id && run.status == "running")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -3001,6 +3041,22 @@ impl FileChangeContent {
 #[cfg(test)]
 mod provider_diagnostic_tests {
     use super::*;
+    #[test]
+    fn upstream_service_details_reach_rust_shells() {
+        let error: ConversationError = serde_json::from_value(json!({
+            "code":"provider_error", "message":"Try again later.",
+            "diagnostics":{"source":"providerTransport", "phase":"response",
+                "category":"provider", "retryable":false, "causes":[],
+                "providerError":{"code":"server_is_overloaded", "type":"service_unavailable_error",
+                    "retryDirective":"NO_MORE_RETRY"}},
+        }))
+        .unwrap();
+        let details = error.diagnostics.unwrap().provider_error.unwrap();
+        assert_eq!(details.code.as_deref(), Some("server_is_overloaded"));
+        assert_eq!(details.r#type.as_deref(), Some("service_unavailable_error"));
+        assert_eq!(details.retry_directive.as_deref(), Some("NO_MORE_RETRY"));
+    }
+
     #[test]
     fn optional_transport_details_preserve_old_errors_and_new_attempts() {
         let old: ConversationError = serde_json::from_value(

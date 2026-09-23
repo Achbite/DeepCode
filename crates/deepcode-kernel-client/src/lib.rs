@@ -28,14 +28,15 @@ pub use conversation::{
     ContextCompositionMessage, ContextCompositionMessageBlock,
     ContextCompositionPartitionProjection, ContextCompositionProjection, ContextCompositionTool,
     ContextUsageProjection, ConversationError, ConversationResourceReadRequest,
-    ConversationResourceReadResult, CreateConversationSessionRequest, EffectPreview,
-    ExecutionPlanStep, FileChangeContent, FilesystemReference, FilesystemReferencePathInput,
-    InteractionOption, InteractionProjection, NarrativeProjection, PendingPlanProjection,
-    PlanOperation, PlanPreviewProjection, PlanProjection, PlanRef, PlanWritePath,
-    PluginCatalogItem, PluginCatalogProjection, PluginSelectionInput, ProjectionMessage,
-    QueuedInputProjection, ResolveConversationFilesystemReferencesRequest, RunProjection,
-    SessionDisplayProjection, SessionProjection, SessionTimelineItem, TodoItem, TodoListProjection,
-    TokenUsageProjection, TokenUsageRoundProjection, ToolOutputProjection, WorkspaceBindingDisplay,
+    ConversationResourceReadResult, CreateConversationSessionRequest, EffectOperation,
+    EffectPreview, ExecutionPlanStep, FileChangeContent, FilesystemReference,
+    FilesystemReferencePathInput, InteractionOption, InteractionProjection, NarrativeProjection,
+    PendingPlanProjection, PlanOperation, PlanPreviewProjection, PlanProjection, PlanRef,
+    PlanWritePath, PluginCatalogItem, PluginCatalogProjection, PluginSelectionInput,
+    ProjectionMessage, QueuedInputProjection, ResolveConversationFilesystemReferencesRequest,
+    RunProjection, SessionDisplayProjection, SessionProjection, SessionTimelineItem,
+    SourceCitation, SourceReferences, TodoItem, TodoListProjection, TokenUsageProjection,
+    TokenUsageRoundProjection, ToolOutputProjection, WorkspaceBindingDisplay,
     AUTHORIZATION_OPTIONS, CONVERSATION_COMMAND_VERSION, SESSION_PROJECTION_VERSION,
 };
 
@@ -302,7 +303,11 @@ impl HttpKernelClient {
                     .json::<Value>()
                     .await?;
                 let saved: Value = decode_api_data(value)?;
-                command[field] = saved["text"].clone();
+                command[field] = if field == "task" {
+                    json!("请依据本条消息的粘贴文本聚焦上下文。")
+                } else {
+                    saved["text"].clone()
+                };
                 let mut references = command["filesystemReferences"]
                     .as_array()
                     .cloned()
