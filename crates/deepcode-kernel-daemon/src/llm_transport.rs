@@ -328,15 +328,22 @@ fn responses_request_body(
     if profile.connection.adapter_id == "openai-codex" {
         let instructions = messages
             .iter()
-            .filter(|m| m.role == "system")
+            .take_while(|m| m.role == "system")
             .map(|m| m.content.as_str())
             .collect::<Vec<_>>()
             .join("\n\n");
         body["instructions"] = json!(instructions);
-        body["input"]
-            .as_array_mut()
-            .expect("Responses input")
-            .retain(|v| v["role"] != "system");
+        let input = body["input"].as_array_mut().expect("Responses input");
+        let prefix_len = input
+            .iter()
+            .take_while(|item| item["role"] == "system")
+            .count();
+        input.drain(..prefix_len);
+        for item in input {
+            if item["role"] == "system" {
+                item["role"] = json!("developer");
+            }
+        }
         body["store"] = json!(false);
         body["include"] = json!(["reasoning.encrypted_content"]);
         body.as_object_mut().unwrap().remove("max_output_tokens");
@@ -408,14 +415,7 @@ fn responses_input(
                         "Responses tool 消息缺少 providerCallId。",
                     )
                 })?;
-            let output = if message.image_data.is_empty() {
-                json!(content)
-            } else {
-                let mut parts = vec![json!({"type":"input_text","text":content})];
-                parts.extend(message.image_data.iter().map(|image| json!({"type":"input_image","image_url":image.data_url(),"detail":"auto"})));
-                json!(parts)
-            };
-            input.push(json!({"type":"function_call_output","call_id":call_id,"output":output}));
+            input.push(json!({"type":"function_call_output","call_id":call_id,"output":content}));
             continue;
         }
         if !content.is_empty() || !message.image_data.is_empty() {
@@ -2355,29 +2355,84 @@ mod tests {
     }
 
     #[test]
-    fn tool_observations_send_real_image_parts_in_the_call_output() {
-        let mut message: LocalProviderMessage = serde_json::from_value(json!({"role":"tool","content":"observed","toolCallId":"call:observe","providerCallId":"provider-observe"})).unwrap();
+    fn codex_continuation_preserves_instructions_and_appends_later_system_context() {
+        let mut profile = test_profile("responses");
+        profile.connection.adapter_id = "openai-codex".into();
+        let initial = provider_input(json!({"messages":[
+            {"role":"system","content":"Stable instructions."},
+            {"role":"user","content":"Inspect the design."}
+        ],"tools":[],"hostedTools":[]}));
+        let first = responses_request_body(&profile, &initial.messages, &[], &[], true).unwrap();
+        let continued = provider_input(json!({"messages":[
+            {"role":"system","content":"Stable instructions."},
+            {"role":"user","content":"Inspect the design."},
+            {"role":"assistant","content":"The design has a sidebar."},
+            {"role":"system","content":"New input workspace: screenshot B."},
+            {"role":"user","content":"Compare this new screenshot."}
+        ],"tools":[],"hostedTools":[]}));
+        let next = responses_request_body(&profile, &continued.messages, &[], &[], true).unwrap();
+        assert_eq!(next["instructions"], first["instructions"]);
+        assert_eq!(next["input"][0], first["input"][0]);
+        assert_eq!(next["input"][2]["role"], "developer");
+        assert_eq!(
+            next["input"][2]["content"][0]["text"],
+            "New input workspace: screenshot B."
+        );
+        assert_eq!(
+            next["input"][3]["content"][0]["text"],
+            "Compare this new screenshot."
+        );
+    }
+
+    #[test]
+    fn tool_observations_keep_call_results_and_send_pixels_as_separate_visual_input() {
+        let call: LocalProviderMessage = serde_json::from_value(json!({"role":"assistant","content":"","toolCalls":[{"callId":"call:observe","providerCallId":"provider-observe","name":"browser.observe","input":{}}]})).unwrap();
+        let result: LocalProviderMessage = serde_json::from_value(json!({"role":"tool","content":"observed","toolCallId":"call:observe","providerCallId":"provider-observe"})).unwrap();
+        let mut message: LocalProviderMessage = serde_json::from_value(
+            json!({"role":"user","content":"Current visual inputs: screenshot"}),
+        )
+        .unwrap();
         message
             .image_data
             .push(crate::local_agent_api::LocalProviderImage {
                 media_type: "image/png".into(),
                 base64: "aW1hZ2U=".into(),
             });
-        let messages = vec![message];
+        let messages = vec![call, result, message];
         let profile = test_profile("responses");
         let result = responses_request_body(&profile, &messages, &[], &[], false).unwrap();
-        assert_eq!(result["input"][0]["type"], "function_call_output");
+        assert_eq!(result["input"][0]["type"], "function_call");
         assert_eq!(result["input"][0]["call_id"], "provider-observe");
-        assert_eq!(result["input"][0]["output"][0]["text"], "observed");
+        assert_eq!(result["input"][1]["type"], "function_call_output");
+        assert_eq!(result["input"][1]["call_id"], "provider-observe");
+        assert_eq!(result["input"][1]["output"], "observed");
+        assert_eq!(result["input"][2]["role"], "user");
         assert_eq!(
-            result["input"][0]["output"][1]["image_url"],
+            result["input"][2]["content"][1]["image_url"],
             "data:image/png;base64,aW1hZ2U="
         );
         let result = anthropic_stream_request_body(&profile, &messages, &[]).unwrap();
-        assert_eq!(result["messages"][0]["content"][0]["type"], "tool_result");
         assert_eq!(
-            result["messages"][0]["content"][0]["content"][1]["source"]["data"],
+            result["messages"][0]["content"][0]["id"],
+            "provider-observe"
+        );
+        assert_eq!(result["messages"][1]["content"][0]["type"], "tool_result");
+        assert_eq!(
+            result["messages"][1]["content"][0]["tool_use_id"],
+            "provider-observe"
+        );
+        assert_eq!(result["messages"][1]["content"][0]["content"], "observed");
+        assert_eq!(
+            result["messages"][2]["content"][1]["source"]["data"],
             "aW1hZ2U="
+        );
+        let result = openai_compatible_request_body(&profile, &messages, &[], false);
+        assert_eq!(result["messages"][1]["role"], "tool");
+        assert_eq!(result["messages"][1]["tool_call_id"], "provider-observe");
+        assert_eq!(result["messages"][1]["content"], "observed");
+        assert_eq!(
+            result["messages"][2]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
         );
     }
 

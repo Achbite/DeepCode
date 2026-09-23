@@ -10,8 +10,11 @@ Use the complete `sessionId`, such as `session:...`. The default view is `summar
 | plans | Plan and Todo events | before, limit |
 | context | Input structure and per-request usage | providerRequestId, before, limit |
 | reasoning | Recorded reasoning pages, when available | providerRequestId, offset, limit |
+| images | Archived image references | imageIds, before, limit |
 
 `before` is an exclusive backward cursor. Pass `nextBefore` to the next read; null means there are no earlier matching events. `limit` ranges from 1 to 50. Text excerpts report `truncated` and their original `totalBytes`. An excerpt is not the complete text and cannot establish that omitted content does not exist. `recordId` is for the tools view; `providerRequestId` selects context or reasoning. Queries cover only the current configuration root.
+
+For images, omit `imageIds` to list references without loading pixels. To inspect earlier pictures in the current conversation, call `session.read` with `view: "images"` and up to eight exact `referenceId` or `artifactId` values in `imageIds`. Include both images for a visual comparison. The next Agent request includes the selected pixels; `imageIds: []` releases them. Do not combine `imageIds` with pagination. Image-list pages keep images from the same source message together. Historical references remain readable after their pixels leave the current input.
 
 For the current installation, use the `runtimeExecutables.cli` path in the run's execution context when present. Otherwise locate `deepcode-cli` on the prepared PATH and verify the result. Do not guess an application bundle name or treat an absent PATH entry as proof that the CLI is not installed. Reading or executing an installation path still uses the ordinary execution-permission flow.
 

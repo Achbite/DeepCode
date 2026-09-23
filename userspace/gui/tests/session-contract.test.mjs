@@ -3425,8 +3425,11 @@ test('image attachments reach the Provider as bound visual inputs without embedd
     logicalPath:'picture.png',displayName:'picture.png',kind:'file',mediaType:'image/png',byteLength:100 }];
   await actor.submit(command);
   const projection = await waitForProjection(actor, value => value.run?.status === 'completed');
-  assert.deepEqual(request.messages.find(item => item.role === 'user').images,
+  assert.equal(request.messages.find(item => item.role === 'user').images, undefined);
+  assert.match(request.messages.find(item => item.role === 'user').content, /reference:image/);
+  assert.deepEqual(request.messages.at(-1).images,
     [{workspaceId:workspaceBinding.workspaceId,logicalPath:'picture.png',mediaType:'image/png'}]);
+  assert.match(request.messages.at(-1).content, /Current visual inputs/);
   assert.deepEqual(projection.messages[0].filesystemReferences, command.filesystemReferences);
 });
 

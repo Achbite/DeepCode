@@ -742,7 +742,7 @@ pub(crate) struct LocalProviderMessage {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) images: Vec<LocalProviderImageReference>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) tool_images: Vec<String>,
+    pub(crate) tool_images: Vec<LocalProviderToolImageReference>,
     #[serde(skip)]
     pub(crate) image_data: Vec<LocalProviderImage>,
     pub(crate) reasoning_content: Option<String>,
@@ -760,6 +760,13 @@ pub(crate) struct LocalProviderImageReference {
     pub(crate) workspace_id: String,
     pub(crate) logical_path: String,
     pub(crate) media_type: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct LocalProviderToolImageReference {
+    pub(crate) call_id: String,
+    pub(crate) artifact_id: String,
 }
 
 #[derive(Debug)]
@@ -1197,14 +1204,6 @@ pub(crate) async fn local_agent_provider_stream(
         tools: body.tools,
         hosted_tools: body.hosted_tools,
     };
-    if runtime.profile().kind == "openaiCompatible"
-        && request_envelope
-            .messages
-            .iter()
-            .any(|message| !message.tool_images.is_empty())
-    {
-        return local_provider_error(&request_id, "provider_tool_images_unsupported", "当前 Chat Completions 协议不支持工具结果图片，请使用 Responses 或 Anthropic 视觉模型。");
-    }
     if let Err(error) = crate::conversation_api::resolve_provider_images(
         &state,
         &body.session_id,

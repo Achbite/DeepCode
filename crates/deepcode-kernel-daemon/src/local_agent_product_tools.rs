@@ -98,11 +98,12 @@ impl ProductTools {
                     "limit":{"type":"integer","minimum":1,"maximum":50}
                 }
             })),
-            ("session.read", "Read persisted DeepCode conversation facts without resuming the session. Query directly; no prior Skill read is required. Start with summary; use messages, tools, plans or context for details. before is an exclusive event-sequence cursor; nextBefore continues older items. Excerpts report truncation. A session ID is required.".into(), json!({
+            ("session.read", "Read persisted DeepCode conversation facts without resuming the session. Query directly; no prior Skill read is required. Start with summary; use messages, tools, plans or context for details. view=images lists archived image references. To inspect images from the current session, pass imageIds with exact referenceId/artifactId values; their pixels enter the next visual input. Include all images needed for comparison. imageIds=[] releases current images. before is an exclusive event-sequence cursor; nextBefore continues older items. Excerpts report truncation. A session ID is required.".into(), json!({
                 "type":"object", "additionalProperties":false, "required":["sessionId"],
                 "properties": {
                     "sessionId":{"type":"string","description":"Exact complete ID from the user or DeepCode. Preserve it verbatim, including prefixes such as session:."},
-                    "view":{"type":"string","enum":["summary","messages","tools","plans","context","reasoning"]},
+                    "view":{"type":"string","enum":["summary","messages","tools","plans","context","reasoning","images"]},
+                    "imageIds":{"type":"array","maxItems":8,"uniqueItems":true,"items":{"type":"string","minLength":1},"description":"Requires view=images. Exact current-session image references to inspect together. Omit to list references; [] releases pixels. Do not combine with before or limit."},
                     "before":{"type":"integer","minimum":1},
                     "limit":{"type":"integer","minimum":1,"maximum":50},
                     "recordId":{"type":"string","description":"Exact ToolRecord ID; requires view=tools."},

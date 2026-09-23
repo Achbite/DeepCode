@@ -1348,7 +1348,8 @@ export interface ConversationPort {
 
 export interface ConversationReadQuery {
   sessionId: string;
-  view?: 'summary' | 'messages' | 'tools' | 'plans' | 'context' | 'reasoning';
+  view?: 'summary' | 'messages' | 'tools' | 'plans' | 'context' | 'reasoning' | 'images';
+  imageIds?: string[];
   offset?: number;
   before?: number;
   limit?: number;
@@ -1369,8 +1370,8 @@ export interface ConversationReadResult {
 export interface ModelMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
-  /** Immutable user attachments; the Host resolves bytes only at the Provider transport boundary. */
-  toolImages?: readonly string[];
+  /** Immutable sources; Kernel resolves bytes at the Provider transport boundary. */
+  toolImages?: readonly { callId: string; artifactId: string }[];
   images?: readonly { workspaceId: string; logicalPath: string; mediaType: string }[];
   reasoningContent?: string;
   reasoningSignature?: string;

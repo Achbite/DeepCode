@@ -434,24 +434,22 @@ pub(crate) fn resolve_provider_images(
             if !image_input {
                 return Err("当前模型未声明图片输入能力，请使用视觉模型查看工具截图。".into());
             }
-            if message.role != "tool" {
-                return Err("工具截图必须属于工具结果。".into());
+            if message.role != "user" {
+                return Err("工具截图必须作为当前视觉输入提供。".into());
             }
-            let call_id = message
-                .tool_call_id
-                .as_deref()
-                .ok_or("工具截图缺少 callId。")?;
-            let record = state
-                .local_agent
-                .kernel
-                .read_record(call_id)
-                .map_err(|error| error.message)?
-                .ok_or("工具记录不存在。")?;
-            if record["sessionId"].as_str() != Some(session_id) || record["outcome"] != "completed"
-            {
-                return Err("截图必须来自当前会话已完成的工具记录。".into());
-            }
-            for id in &message.tool_images {
+            for image in &message.tool_images {
+                let record = state
+                    .local_agent
+                    .kernel
+                    .read_record(&image.call_id)
+                    .map_err(|error| error.message)?
+                    .ok_or("工具记录不存在。")?;
+                if record["sessionId"].as_str() != Some(session_id)
+                    || record["outcome"] != "completed"
+                {
+                    return Err("截图必须来自当前会话已完成的工具记录。".into());
+                }
+                let id = &image.artifact_id;
                 let declared = record["output"]["modelImages"]
                     .as_array()
                     .is_some_and(|images| images.iter().any(|image| image["artifactId"] == *id));
