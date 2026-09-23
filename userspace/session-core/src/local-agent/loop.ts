@@ -1,5 +1,4 @@
-import { isShellAuthorizationScope } from '@deepcode/protocol';
-import { permissionSettings } from '@deepcode/protocol';
+import { permissionSettings, providerRuntimeForPurpose } from '@deepcode/protocol';
 import { permissionInstructionText } from './skillPlugins.js';
 import { prepareApprovalReview, decodeApprovalReview } from './approvalReview.js';
 import { withProviderAttempts } from './providerAttempts.js';
@@ -250,7 +249,7 @@ export async function runAgentLoop(
         snapshot.state.sessionId,
         runId,
         interrupted,
-        runRuntimeSnapshot(snapshot, runId).provider.providerRuntimeRef,
+        providerRuntimeForPurpose(runRuntimeSnapshot(snapshot, runId), interrupted.purpose).providerRuntimeRef,
         settlement,
       ),
       {
@@ -269,7 +268,7 @@ export async function runAgentLoop(
       if (existing) {
         await commitToolRecord(
           existing,
-          expectedToolRecordIdentity(snapshot, runtime, requestEvent),
+          expectedToolRecordIdentity(snapshot, requestEvent),
           commit,
         );
       }
@@ -323,7 +322,7 @@ export async function runAgentLoop(
         if (existing) {
           await commitToolRecord(
             existing,
-            expectedToolRecordIdentity(snapshot, runtime, requestEvent),
+            expectedToolRecordIdentity(snapshot, requestEvent),
             commit,
           );
           continue;
@@ -360,7 +359,7 @@ export async function runAgentLoop(
           throw new LoopFailure('kernel_call_identity_mismatch', 'Kernel 返回了其他工具调用的结果。');
         }
         if (reply.status === 'inputRejected') {
-          assertToolRecordIdentity(reply.rejection, expectedToolRecordIdentity(snapshot, runtime, requestEvent));
+          assertToolRecordIdentity(reply.rejection, expectedToolRecordIdentity(snapshot, requestEvent));
           await commit({
             type: 'tool.input-rejected',
             sessionId: snapshot.state.sessionId,
@@ -376,13 +375,13 @@ export async function runAgentLoop(
             callId: requestEvent.callId, payload: { approvalId, preview: reply.preview } });
           if (reply.preview.approvalReviewer === 'agent'
             && runRuntimeSnapshot(snapshot, runId).permissions['agent.permissions.shell'] === 'review') {
-            const scope = reply.preview.authorizationScope;
-            const reviewScope = isShellAuthorizationScope(scope) && reply.preview.authorizationScopes?.includes(scope) ? scope : undefined;
             const baseline = JSON.stringify(snapshot.state.permissionOverrides);
-            const review = prepareApprovalReview(snapshot, runRuntimeSnapshot(snapshot, runId), snapshot.state.pendingApproval!, deps.nextId('provider-request'));
-            await commit({ type: 'context.composed', sessionId: snapshot.state.sessionId, runId, payload: review.receipt });
+            const reviewRequestId = deps.nextId('provider-request');
+            let review: ReturnType<typeof prepareApprovalReview> | undefined;
             let verdict: ReturnType<typeof decodeApprovalReview>;
             try {
+              review = prepareApprovalReview(snapshot, runRuntimeSnapshot(snapshot, runId), snapshot.state.pendingApproval!, reviewRequestId);
+              await commit({ type: 'context.composed', sessionId: snapshot.state.sessionId, runId, payload: review.receipt });
               const result = await consumeTextProvider(review.request, deps, signal);
               await commit([providerTurnSettledEvent(snapshot.state.sessionId, runId, result.completion),
                 ...(result.contextUsage ? [{ type: 'context.updated' as const, sessionId: snapshot.state.sessionId, runId, payload: result.contextUsage }] : [])]);
@@ -390,7 +389,7 @@ export async function runAgentLoop(
             } catch (error) {
               if (signal.aborted) throw error;
               const fact = errorFact(error);
-              if (!snapshot.state.providerTurns[review.request.requestId]) await commit({ type: 'provider.turn.settled',
+              if (review && !snapshot.state.providerTurns[review.request.requestId]) await commit({ type: 'provider.turn.settled',
                 sessionId: snapshot.state.sessionId, runId, payload: { providerRequestId: review.request.requestId,
                   purpose: 'approvalReview', providerRuntimeRef: review.request.providerRuntimeRef, outcome: 'failed', error: fact } });
               verdict = { decision: 'ask', reason: `自动审查未完成：${fact.code}：${fact.message}` };
@@ -399,11 +398,10 @@ export async function runAgentLoop(
               const changed = JSON.stringify(current.state.permissionOverrides) !== baseline;
               const decision = changed ? { decision: 'ask' as const, reason: '审查期间权限设置已更改，正在重新检查。' } : verdict;
               const events: NewSessionEvent[] = [{ type: 'approval.reviewed', sessionId: current.state.sessionId, runId,
-                callId: requestEvent.callId, payload: { approvalId, providerRequestId: review.request.requestId, ...decision } }];
+                callId: requestEvent.callId, payload: { approvalId, providerRequestId: reviewRequestId, ...decision } }];
               if (decision.decision !== 'ask') events.push({ type: 'approval.resolved', sessionId: current.state.sessionId, runId,
                 callId: requestEvent.callId, payload: { approvalId, commandId: deps.nextId('agent-decision'),
-                  authorityId: deps.nextId('authority'), decision: decision.decision, source: 'agent', reason: decision.reason,
-                  ...(decision.decision === 'allow' && reviewScope ? { authorizationScope: reviewScope } : {}) } });
+                  authorityId: deps.nextId('authority'), decision: decision.decision, source: 'agent', reason: decision.reason } });
               return events;
             });
             if (JSON.stringify(snapshot.state.permissionOverrides) !== baseline || !snapshot.state.pendingApproval) continue nextTurn;
@@ -414,7 +412,7 @@ export async function runAgentLoop(
         }
         await commitToolRecord(
           reply.record,
-          expectedToolRecordIdentity(snapshot, runtime, requestEvent),
+          expectedToolRecordIdentity(snapshot, requestEvent),
           commit,
         );
       }
@@ -696,7 +694,7 @@ export async function runAgentLoop(
                 snapshot.state.sessionId,
                 runId,
                 pendingProvider,
-                runRuntimeSnapshot(snapshot, runId).provider.providerRuntimeRef,
+                providerRuntimeForPurpose(runRuntimeSnapshot(snapshot, runId), pendingProvider.purpose).providerRuntimeRef,
                 { outcome: 'failed', error: failure },
               )]
             : []),
@@ -728,7 +726,7 @@ export async function runAgentLoop(
           snapshot.state.sessionId,
           runId,
           unknownTurn,
-          runRuntimeSnapshot(snapshot, runId).provider.providerRuntimeRef,
+          providerRuntimeForPurpose(runRuntimeSnapshot(snapshot, runId), unknownTurn.purpose).providerRuntimeRef,
           settlement,
         ),
         {
@@ -1898,11 +1896,7 @@ async function cancelRun(
     if (reply.status !== 'notFound') {
       await commitToolRecord(
         reply.record,
-        expectedToolRecordIdentity(
-          snapshot,
-          runRuntimeSnapshot(snapshot, command.runId),
-          current,
-        ),
+        expectedToolRecordIdentity(snapshot, current),
         commit,
       );
       if (reply.record.outcome === 'indeterminate') indeterminate = reply.record.error;
@@ -2010,10 +2004,9 @@ async function commitToolRecord(
 
 function expectedToolRecordIdentity(
   snapshot: LoopSnapshot,
-  runtime: RunRuntimeSnapshot,
   requestEvent: Extract<SessionEvent, { type: 'tool.requested' }>,
 ): ExpectedToolRecordIdentity {
-  runtime = runtimeForToolRequest(snapshot, requestEvent);
+  const runtime = runtimeForToolRequest(snapshot, requestEvent);
   return {
     sessionId: snapshot.state.sessionId,
     runId: requestEvent.runId,
@@ -2068,7 +2061,7 @@ export async function terminalToolEvents(
     }
     if (record) {
       assertToolRecordIdentity(record, expectedToolRecordIdentity(
-        snapshot, runRuntimeSnapshot(snapshot, runId), request,
+        snapshot, request,
       ));
       events.push({
         type: 'tool.completed', sessionId: snapshot.state.sessionId, runId,

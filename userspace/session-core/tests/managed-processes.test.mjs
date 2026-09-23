@@ -6,7 +6,7 @@ import { actorWith, createSession, fakeRunPreparation, emptyKernel, workspaceBin
   providerEvent, messageCommand, waitForProjection, completedExecutionReply, readEvents } from './local-agent-fixtures.mjs';
 
 const processTool = { toolBindingRef: 'binding:process', name: 'process', description: 'Manage a command',
-  origin: 'extension', pluginUri: 'plugin://processes@builtin', pluginInstanceRef: 'instance:process',
+  origin: 'extension', pluginUri: 'plugin://processes@builtin',
   availability: 'callable', possibleEffects: ['process'],
   inputSchema: {type: 'object', required: ['action'], properties: {action: {type: 'string'}, input: {type: 'object'}}} };
 
@@ -69,7 +69,7 @@ for (const stop of [false, true]) test(`managed command ${stop ? 'stops with the
   await delay(50);
   assert.equal(calls, 2, 'waiting for a process does not keep requesting the model');
   assert.equal((await actor.snapshot()).messages.some(m => m.content === 'Premature answer.'), false);
-  if (stop) await actor.submit({type:'run.cancel', commandId:'command:stop', sessionId, runId:active.run.runId});
+  if (stop) await actor.submit({schemaVersion:'deepcode.command.v3', type:'run.cancel', commandId:'command:stop', sessionId, runId:active.run.runId});
   else finish('completed');
   const final = await waitForProjection(actor, p => ['completed','cancelled'].includes(p.run?.status));
   const activity = final.activities.find(a => a.tool?.process);
@@ -84,4 +84,36 @@ for (const stop of [false, true]) test(`managed command ${stop ? 'stops with the
   const updates = (await readEvents(journal,sessionId)).filter(e => e.type === 'process.updated');
   assert.equal(updates.filter(e => e.payload.job.status !== 'active').length,1);
   assert.equal(preparation.released.length,1);
+});
+
+
+test('Actor disposal releases its composition when managed process closure fails and preserves both errors', async t => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:dispose-process-failure';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const closeError = new Error('Managed process closure failed.');
+  const compositionError = new Error('Composition disposal failed.');
+  let compositionDisposals = 0, disposed = false;
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    yield providerEvent(request.requestId, 'tool.call', { callId: 'native:question', name: 'interaction_request',
+      input: { kind: 'question', prompt: 'Choose the next action.', allowFreeform: true } });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel({ async readProcesses(request, signal) {
+    if (request.cancel) throw closeError;
+    if (request.waitMs && !signal.aborted) await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+    return [];
+  } }), fakeRunPreparation({ tools: [processTool], contextWindowTokens: 20000 }).port,
+  'dispose-process-failure', () => { compositionDisposals++; throw compositionError; });
+  t.after(async () => { if (!disposed) await actor.dispose(); });
+  const message = messageCommand(sessionId, 'command:start', 'Ask before the next step.');
+  message.pluginSelections = [{ selectionId: 'selection:processes', uri: 'plugin://processes@builtin', label: 'Processes' }];
+  await actor.submit(message);
+  await waitForProjection(actor, projection => projection.run?.status === 'waiting');
+  disposed = true;
+  await assert.rejects(actor.dispose(), error => {
+    assert.ok(error instanceof AggregateError);
+    assert.equal(error.message, 'session_actor_dispose_failed');
+    assert.deepEqual(error.errors, [closeError, compositionError]);
+    return true;
+  });
+  assert.equal(compositionDisposals, 1);
 });

@@ -1,5 +1,6 @@
+import { isLlmReasoningEffort } from '@deepcode/protocol';
 import { ManagedProcesses } from './managedProcesses.js';
-import { validatePermissionPatches } from '@deepcode/protocol';
+import { validatePermissionPatches, providerRuntimeForPurpose } from '@deepcode/protocol';
 import { confirmationFacts } from './planStage.js';
 import { admitSessionEvents } from './admission.js';
 import { failureSnapshotEvent } from './failureSnapshot.js';
@@ -141,6 +142,10 @@ export class SessionActor {
     }
     try {
       await this.closeProcesses();
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
       await this.#composition.dispose();
     } catch (error) {
       errors.push(error);
@@ -1003,6 +1008,7 @@ export class SessionActor {
     }
     const restored = prepared.runtimeSnapshot;
     if (restored.provider.providerRuntimeRef !== runtime.provider.providerRuntimeRef
+      || providerRuntimeForPurpose(restored, 'approvalReview').providerRuntimeRef !== providerRuntimeForPurpose(runtime, 'approvalReview').providerRuntimeRef
       || restored.kernelCatalogSnapshotRef !== runtime.kernelCatalogSnapshotRef
       || restored.extensionGenerationRef !== runtime.extensionGenerationRef) {
       const mismatch = new Error('run_runtime_recovery_identity_mismatch');
@@ -1030,7 +1036,7 @@ export class SessionActor {
     };
     await this.appendLifecycleEvents([
       ...(pending ? [providerTurnTerminalEvent(this.sessionId, runId, pending,
-        before.state.runRuntimeSnapshots[runId]!.provider.providerRuntimeRef, outcome)] : []), {
+        providerRuntimeForPurpose(before.state.runRuntimeSnapshots[runId]!, pending.purpose).providerRuntimeRef, outcome)] : []), {
       type: 'run.finishing',
       sessionId: this.sessionId,
       runId,
@@ -1385,7 +1391,7 @@ function validProfileId(value: string): boolean {
 }
 
 function validReasoningOverride(value: unknown): boolean {
-  return value === null || typeof value === 'string' && ['low', 'medium', 'high', 'max'].includes(value);
+  return value === null || isLlmReasoningEffort(value);
 }
 
 function validateFilesystemReferences(

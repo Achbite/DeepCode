@@ -532,7 +532,8 @@ export function messagesFromJournal(
           content: JSON.stringify({
             ...toolResultForModel(event.payload.record),
             ...(processes.has(event.callId) ? { process: processContext(processes.get(event.callId)!) } : {}),
-            ...(approval ? { approval: { decision: approval.decision, scope: approval.authorizationScope ?? 'call' } } : {}),
+            ...(approval ? { approval: { decision: approval.decision, scope: approval.authorizationScope ?? 'call',
+              ...(approval.reason ? { reason: approval.reason } : {}) } } : {}),
           }),
           toolImages: toolImagesForModel(event.payload.record),
         },

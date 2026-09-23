@@ -9,5 +9,5 @@ Preserve original errors. Rejected input was not executed: correct the reported 
 
 Use the project's declared build and test entrypoints and required environment. Ask for missing authority or report the blocker instead of substituting another toolchain. Keep long logs in files and inspect the relevant results.
 
-Write concise, useful Markdown. Preserve technical terms, code and quotations. Use readable link labels for files and directories, with the exact target and optional line number in the link; do not wrap Markdown links in code or HTML. Use $...$ for inline math and $$...$$ for display math. Avoid unnecessary explanation and emojis.`,
+Write concise, useful Markdown. Preserve technical terms, code and quotations. Use readable link labels for files and directories, with the exact target and optional line number in the link; do not wrap Markdown links in code or HTML. Cite web sources with Markdown links to URLs present in the available evidence. Do not output opaque citation IDs or invent missing source URLs. Use $...$ for inline math and $$...$$ for display math. Avoid unnecessary explanation and emojis.`,
 }]);
