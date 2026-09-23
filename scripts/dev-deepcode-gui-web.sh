@@ -56,6 +56,9 @@ cleanup() {
   stop_owned_process "$VITE_PID"
   stop_owned_process "$HOST_PID"
   stop_owned_process "$DAEMON_PID"
+  if [ -n "${DEEPCODE_DEV_CONTROL:-}" ] && [ -d "$DEEPCODE_DEV_CONTROL" ]; then
+    rm -f -- "$DEEPCODE_DEV_CONTROL/pid"
+  fi
   if [ "$RUNTIME_ROOT_OWNED" = "1" ] && [ -n "$RUNTIME_ROOT" ]; then
     case "$RUNTIME_ROOT" in
       "${TMPDIR:-/tmp}"/deepcode-gui-web.*) rm -rf -- "$RUNTIME_ROOT" ;;
@@ -90,6 +93,12 @@ wait_for_health() {
 }
 
 trap cleanup EXIT INT TERM
+
+if [ -n "${DEEPCODE_DEV_CONTROL:-}" ]; then
+  [ -d "$DEEPCODE_DEV_CONTROL" ] || fail "Development service owner is no longer active"
+  printf '%s\n' "$$" > "$DEEPCODE_DEV_CONTROL/pid"
+  [ ! -f "$DEEPCODE_DEV_CONTROL/cancel" ] || exit 0
+fi
 
 [ "$HOST" = "127.0.0.1" ] || [ "$HOST" = "localhost" ] || [ "$HOST" = "::1" ] \
   || fail "Web 开发 Host 只能监听 loopback"
