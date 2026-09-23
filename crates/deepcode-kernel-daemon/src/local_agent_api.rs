@@ -270,6 +270,28 @@ impl LocalAgentRuntime {
             })?
         };
         let provider_runtime = provider_binding.snapshot().clone();
+        let approval_reviewer_binding = if let Some(previous) = &previous {
+            previous.approval_reviewer_binding.clone()
+        } else {
+            let selected = settings["agent.approvalReview.profileId"]
+                .as_str()
+                .filter(|id| !id.is_empty());
+            let binding = match selected {
+                Some(profile_id) => ProviderRuntimeRegistry::prepare(&gui, Some(profile_id), None),
+                None => Ok(provider_binding.clone()),
+            }
+            .and_then(|binding| {
+                binding.approval_reviewer(
+                    settings["agent.approvalReview.reasoningEffort"]
+                        .as_str()
+                        .filter(|effort| !effort.is_empty()),
+                )
+            })
+            .map_err(|message| {
+                RunPreparationError::new("approval_reviewer_prepare_failed", message)
+            })?;
+            binding
+        };
         if let Some(previous) = &previous {
             plugin_selection.retain_prepared(&previous.plugin_selection);
         }
@@ -345,6 +367,25 @@ impl LocalAgentRuntime {
             &provider_runtime.profile_id,
         );
         executor_config.file_read_roots = plugin_selection.file_read_roots();
+        #[cfg(target_os = "macos")]
+        if let Some(commands) = environment["commandPaths"].as_object() {
+            for (name, path) in commands {
+                let target = std::fs::canonicalize(path.as_str().ok_or_else(|| {
+                    RunPreparationError::new(
+                        "host_command_path_invalid",
+                        format!("Invalid path for {name}"),
+                    )
+                })?)
+                .map_err(|error| {
+                    RunPreparationError::new(
+                        "host_command_path_failed",
+                        format!("Resolve {name}: {error}"),
+                    )
+                })?;
+                // PATH can contain executable symlinks into a separate toolchain directory.
+                executor_config.file_read_roots.push(target);
+            }
+        }
         let permissions = LocalAgentPermissionPolicy::from_settings(settings)
             .map_err(RunPreparationError::from)?;
         let web_search = prepare_web_search_binding(
@@ -426,6 +467,26 @@ impl LocalAgentRuntime {
                 message,
             ));
         }
+        if let Err(message) = self.provider_runtimes.bind(
+            &request.session_id,
+            &request.run_id,
+            approval_reviewer_binding.clone(),
+        ) {
+            let _ = self.kernel.release_catalog(ReleaseToolCatalogRequest::new(
+                &request.session_id,
+                &request.run_id,
+                &kernel_catalog_snapshot_ref,
+            ));
+            if previous.is_none() {
+                let _ = self
+                    .provider_runtimes
+                    .release(&request.session_id, &request.run_id);
+            }
+            return Err(RunPreparationError::new(
+                "approval_reviewer_bind_failed",
+                message,
+            ));
+        }
         plugin_config["extensionGenerationRef"] = json!(extension_generation_ref.clone());
         let selected_plugins = crate::local_agent_plugins::selected_plugin_snapshot(
             &plugin_selection,
@@ -437,6 +498,7 @@ impl LocalAgentRuntime {
             "sessionId": request.session_id,
             "runId": request.run_id,
             "provider": provider_runtime,
+            "approvalReviewer": approval_reviewer_binding.snapshot(),
             "webSearch": web_search,
             "extensionGenerationRef": plugin_config["extensionGenerationRef"],
             "kernelCatalogSnapshotRef": catalog["kernelCatalogSnapshotRef"],
@@ -459,6 +521,7 @@ impl LocalAgentRuntime {
                 requested_plugin_identity,
                 response: response.clone(),
                 provider_binding,
+                approval_reviewer_binding,
                 plugin_selection,
                 mcp,
             });
@@ -570,6 +633,7 @@ struct PreparedRunRecord {
     executor_config: deepcode_kernel_runtime::executors::KernelExecutorConfig,
     secrets: crate::DaemonSecretProvider,
     provider_binding: crate::local_agent_provider_runtime::ProviderRuntimeBinding,
+    approval_reviewer_binding: crate::local_agent_provider_runtime::ProviderRuntimeBinding,
     plugin_selection: crate::local_agent_plugins::ResolvedPluginSelection,
     mcp: crate::local_agent_mcp::McpRuntime,
     kernel_catalog_snapshot_ref: String,
@@ -678,7 +742,7 @@ pub(crate) struct LocalProviderMessage {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) images: Vec<LocalProviderImageReference>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) tool_images: Vec<String>,
+    pub(crate) tool_images: Vec<LocalProviderToolImageReference>,
     #[serde(skip)]
     pub(crate) image_data: Vec<LocalProviderImage>,
     pub(crate) reasoning_content: Option<String>,
@@ -696,6 +760,13 @@ pub(crate) struct LocalProviderImageReference {
     pub(crate) workspace_id: String,
     pub(crate) logical_path: String,
     pub(crate) media_type: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct LocalProviderToolImageReference {
+    pub(crate) call_id: String,
+    pub(crate) artifact_id: String,
 }
 
 #[derive(Debug)]
@@ -1041,11 +1112,11 @@ pub(crate) async fn local_agent_provider_stream(
             return local_provider_error(&request_id, error.code, &error.message);
         }
     }
-    let frozen_provider_runtime = match state
-        .local_agent
-        .journal
-        .run_provider_runtime(&body.session_id, &body.run_id)
-    {
+    let frozen_provider_runtime = match state.local_agent.journal.run_provider_runtime(
+        &body.session_id,
+        &body.run_id,
+        &body.purpose,
+    ) {
         Ok(runtime) => runtime,
         Err(error) => {
             return local_provider_error(&request_id, error.code, &error.message);
@@ -1133,14 +1204,6 @@ pub(crate) async fn local_agent_provider_stream(
         tools: body.tools,
         hosted_tools: body.hosted_tools,
     };
-    if runtime.profile().kind == "openaiCompatible"
-        && request_envelope
-            .messages
-            .iter()
-            .any(|message| !message.tool_images.is_empty())
-    {
-        return local_provider_error(&request_id, "provider_tool_images_unsupported", "当前 Chat Completions 协议不支持工具结果图片，请使用 Responses 或 Anthropic 视觉模型。");
-    }
     if let Err(error) = crate::conversation_api::resolve_provider_images(
         &state,
         &body.session_id,

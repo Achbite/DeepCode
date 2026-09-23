@@ -98,11 +98,12 @@ impl ProductTools {
                     "limit":{"type":"integer","minimum":1,"maximum":50}
                 }
             })),
-            ("session.read", "Read persisted DeepCode conversation facts without resuming the session. Query directly; no prior Skill read is required. Start with summary; use messages, tools, plans or context for details. before is an exclusive event-sequence cursor; nextBefore continues older items. Excerpts report truncation. A session ID is required.".into(), json!({
+            ("session.read", "Read persisted DeepCode conversation facts without resuming the session. Query directly; no prior Skill read is required. Start with summary; use messages, tools, plans or context for details. view=images lists archived image references. To inspect images from the current session, pass imageIds with exact referenceId/artifactId values; their pixels enter the next visual input. Include all images needed for comparison. imageIds=[] releases current images. before is an exclusive event-sequence cursor; nextBefore continues older items. Excerpts report truncation. A session ID is required.".into(), json!({
                 "type":"object", "additionalProperties":false, "required":["sessionId"],
                 "properties": {
                     "sessionId":{"type":"string","description":"Exact complete ID from the user or DeepCode. Preserve it verbatim, including prefixes such as session:."},
-                    "view":{"type":"string","enum":["summary","messages","tools","plans","context","reasoning"]},
+                    "view":{"type":"string","enum":["summary","messages","tools","plans","context","reasoning","images"]},
+                    "imageIds":{"type":"array","maxItems":8,"uniqueItems":true,"items":{"type":"string","minLength":1},"description":"Requires view=images. Exact current-session image references to inspect together. Omit to list references; [] releases pixels. Do not combine with before or limit."},
                     "before":{"type":"integer","minimum":1},
                     "limit":{"type":"integer","minimum":1,"maximum":50},
                     "recordId":{"type":"string","description":"Exact ToolRecord ID; requires view=tools."},
@@ -161,6 +162,34 @@ const SKILLS: &[ProductSkill] = &[
             (
                 "references/windows-environment.md",
                 include_str!("../../../skills/deepcode-product/references/windows-environment.md"),
+            ),
+        ],
+    },
+    ProductSkill {
+        id: "deepcode-iteration",
+        entry: include_str!("../../../skills/deepcode-iteration/SKILL.md"),
+        references: &[
+            (
+                "references/implementation-map.md",
+                include_str!("../../../skills/deepcode-iteration/references/implementation-map.md"),
+            ),
+            (
+                "references/update-modes.md",
+                include_str!("../../../skills/deepcode-iteration/references/update-modes.md"),
+            ),
+        ],
+    },
+    ProductSkill {
+        id: "deepcode-release-audit",
+        entry: include_str!("../../../skills/deepcode-release-audit/SKILL.md"),
+        references: &[
+            (
+                "references/simplification.md",
+                include_str!("../../../skills/deepcode-release-audit/references/simplification.md"),
+            ),
+            (
+                "references/product-docs.md",
+                include_str!("../../../skills/deepcode-release-audit/references/product-docs.md"),
             ),
         ],
     },
@@ -318,7 +347,7 @@ mod tests {
         assert!(tools
             .call("doc.read", json!({"name":"../../private.md"}))
             .is_err());
-        assert_eq!(bundled_skill_settings().len(), 3);
+        assert_eq!(bundled_skill_settings().len(), 5);
         assert!(tools
             .call("doc.read", json!({"name":"ui-plugins.md"}))
             .unwrap()["content"]
@@ -340,5 +369,63 @@ mod tests {
             assert_eq!(resource["path"], path);
             assert!(!resource["content"].as_str().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn development_skills_are_discoverable_read_only_references() {
+        let tools = test_product_tools();
+        let definitions = ProductTools::definitions();
+        let (_, _, schema) = definitions
+            .iter()
+            .find(|(name, _, _)| *name == "skill.read")
+            .unwrap();
+        let names = schema["properties"]["name"]["enum"].as_array().unwrap();
+        let catalog = crate::local_agent_plugins::plugin_catalog_projection(&json!({})).unwrap();
+        for (name, references) in [
+            (
+                "deepcode-iteration",
+                [
+                    "references/implementation-map.md",
+                    "references/update-modes.md",
+                ],
+            ),
+            (
+                "deepcode-release-audit",
+                ["references/simplification.md", "references/product-docs.md"],
+            ),
+        ] {
+            assert!(names.contains(&json!(name)));
+            let uri = format!("plugin://{name}@builtin");
+            let entry = catalog["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|plugin| plugin["uri"] == uri)
+                .unwrap();
+            assert_eq!(entry["source"], "builtin");
+            assert_eq!(entry["contributionKind"], "skill");
+            assert_eq!(entry["category"], "reference");
+            assert_eq!(entry["discovery"], "searchOnly");
+            assert_eq!(entry["enabled"], true);
+            assert_eq!(entry["available"], true);
+            assert_eq!(
+                entry["reference"],
+                json!({"toolName":"skill.read", "name":name})
+            );
+            let skill = tools.call("skill.read", json!({"name":name})).unwrap();
+            assert_eq!(skill["name"], name);
+            assert_eq!(skill["path"], "SKILL.md");
+            assert!(!skill["content"].as_str().unwrap().is_empty());
+            for path in references {
+                let resource = tools
+                    .call("skill.read", json!({"name":name, "path":path}))
+                    .unwrap();
+                assert_eq!(resource["path"], path);
+                assert!(!resource["content"].as_str().unwrap().is_empty());
+            }
+        }
+        assert!(tools.computer_use_instance.is_none());
+        assert!(tools.container_instance.is_none());
+        assert!(tools.process_instance.is_none());
     }
 }

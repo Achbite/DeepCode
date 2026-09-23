@@ -233,6 +233,37 @@ fn publish(app: &tauri::AppHandle, page: &Page) {
     let _ = app.emit_to("main", "deepcode:browser-page", page);
 }
 
+/// Navigation belongs to the native page, independently of the selected Reader.
+async fn ready_page(app: tauri::AppHandle, preview_id: String) -> Result<Page, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<NativeBrowser>();
+        let pages = state
+            .pages
+            .lock()
+            .map_err(|_| "native_browser_state_unavailable")?;
+        let (pages, _) = state
+            .page_changed
+            .wait_timeout_while(pages, Duration::from_secs(15), |pages| {
+                pages
+                    .get(&preview_id)
+                    .is_some_and(|page| page.status == "loading")
+            })
+            .map_err(|_| "native_browser_state_unavailable")?;
+        let page = pages
+            .get(&preview_id)
+            .ok_or_else(|| format!("native_browser_page_closed: {preview_id}"))?;
+        if page.status != "ready" {
+            return Err(format!(
+                "native_browser_navigation_not_ready: {preview_id}; status={}; url={}",
+                page.status, page.url
+            ));
+        }
+        Ok(page.clone())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 async fn activate(app: tauri::AppHandle, mut page: Page) -> Result<Value, String> {
     let activation_id = PAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     {
@@ -339,6 +370,12 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
             json!({"binding":binding,"ready":true,"captureAvailable":cfg!(target_os="macos")}),
         );
     }
+    if action == "refreshInterface" {
+        let view = app
+            .get_webview(&binding.window_label)
+            .ok_or("native_browser_window_closed")?;
+        return eval(view, "(()=>{if(!window.__DEEPCODE_INTERFACE__)throw Error('Interface refresh is unavailable in this document');return window.__DEEPCODE_INTERFACE__.refresh()})()".into()).await;
+    }
     if action == "list" {
         let pages = app
             .state::<NativeBrowser>()
@@ -390,11 +427,12 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
             .cloned();
         if let Some(page) = existing {
             drop(opening);
-            return if tool_request {
-                activate(app.clone(), page).await
+            let page = if tool_request {
+                ready_page(app.clone(), page.preview_id).await?
             } else {
-                serde_json::to_value(page).map_err(|error| error.to_string())
+                page
             };
+            return serde_json::to_value(page).map_err(|error| error.to_string());
         }
         let id = format!("preview-{}", PAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed));
         let page = Page {
@@ -435,6 +473,7 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
                     .ok_or("native_browser_window_closed")?;
                 let mut builder =
                     tauri::webview::WebviewBuilder::new(&id_for_create, WebviewUrl::External(url))
+                        .initialization_script("window.__DEEPCODE_BROWSER_PREVIEW__ = true;")
                         .data_directory(
                             app_for_create
                                 .state::<NativeBrowser>()
@@ -454,6 +493,7 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
                                     }
                                     .into();
                                     publish(app, page);
+                                    state.page_changed.notify_all();
                                 }
                             };
                         });
@@ -467,7 +507,7 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
                     .add_child(
                         builder,
                         tauri::LogicalPosition::new(0.0, 0.0),
-                        tauri::LogicalSize::new(1.0, 1.0),
+                        tauri::LogicalSize::new(1280.0, 800.0),
                     )
                     .map_err(|error| error.to_string())?;
                 view.hide().map_err(|error| error.to_string())?;
@@ -494,7 +534,8 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
         publish(&app, &page);
         drop(opening);
         if tool_request {
-            return activate(app.clone(), page).await;
+            return serde_json::to_value(ready_page(app.clone(), id).await?)
+                .map_err(|error| error.to_string());
         }
         return serde_json::to_value(page).map_err(|error| error.to_string());
     }
@@ -504,6 +545,9 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
         return Err("native_browser_page_session_mismatch".into());
     }
     let view = app.get_webview(id).ok_or("native_browser_page_closed")?;
+    if matches!(action, "act" | "capture" | "reviewStart") {
+        page = ready_page(app.clone(), id.to_string()).await?;
+    }
     match action {
         "activate" => return activate(app.clone(), page).await,
         "reviewStart" => {
@@ -574,6 +618,9 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
         }
         "status" => {
             return serde_json::to_value(page).map_err(|error| error.to_string());
+        }
+        "focus" => {
+            view.set_focus().map_err(|error| error.to_string())?;
         }
         "navigate" => {
             if page.kind == "deepcode" {
@@ -669,40 +716,23 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
         }
         "act" => {
             let operation = string(&input, "operation")?;
-            let selector = serde_json::to_string(input.get("selector").unwrap_or(&Value::Null))
-                .map_err(|error| error.to_string())?;
-            let text = serde_json::to_string(input.get("text").unwrap_or(&Value::Null))
-                .map_err(|error| error.to_string())?;
             let code = match operation {
-                "click" => format!("const e=document.querySelector({selector});if(!e)throw Error('Element not found');e.click();return {{clicked:true}};"),
-                "type" => format!("const e=document.querySelector({selector});if(!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement))throw Error('Element is not a text input');e.focus();const p=e instanceof HTMLInputElement?HTMLInputElement.prototype:HTMLTextAreaElement.prototype;Object.getOwnPropertyDescriptor(p,'value').set.call(e,{text});e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return {{typed:true}};"),
-                "scroll" => format!("window.scrollBy({x},{y});return {{x:scrollX,y:scrollY}};",x=input["x"].as_f64().unwrap_or(0.0),y=input["y"].as_f64().unwrap_or(0.0)),
+                "click" | "type" | "scroll" => {
+                    format!("return ({})({input});", include_str!("act.js"))
+                }
                 "inspect" => include_str!("observe.js").into(),
                 _ => return Err("Unsupported browser operation.".into()),
             };
-            let result = eval(view, format!("(()=>{{try{{const data=(()=>{{{code}}})();return {{ok:true,data}}}}catch(e){{return {{ok:false,message:String(e)}}}}}})()")).await?;
-            if result["ok"].as_bool() != Some(true) {
-                return Err(result["message"]
-                    .as_str()
-                    .unwrap_or("Browser operation failed.")
-                    .into());
-            }
-            return Ok(json!({"page":page,"result":result["data"]}));
+            let result = eval(view, format!("(()=>{{{code}}})()")).await?;
+            return Ok(json!({"page":page,"result":result}));
         }
         "capture" => {
-            if !page.visible {
-                return Err(format!(
-                    "Cannot capture a hidden page; activate previewId {id} first."
-                ));
-            }
             page.url = view.url().map_err(|error| error.to_string())?.to_string();
             // A capture belongs to one acknowledged surface geometry.
             let geometry = (page.surface.generation, page.surface.sequence);
             let capture = capture(view).await?;
             let current = page_state(&app, id)?;
-            if !current.visible
-                || geometry != (current.surface.generation, current.surface.sequence)
-            {
+            if geometry != (current.surface.generation, current.surface.sequence) {
                 return Err(format!("native_browser_layout_changed: {id}"));
             }
             let stamp = SystemTime::now()
@@ -752,7 +782,11 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
     }
     // Page-load callbacks own navigation state. A layout/focus request must not
     // restore an older cloned URL or status after one of those callbacks.
-    let page = page_state(&app, id)?;
+    let page = if tool_request && matches!(action, "reload" | "navigate") {
+        ready_page(app.clone(), id.to_string()).await?
+    } else {
+        page_state(&app, id)?
+    };
     if action != "layout" {
         publish(&app, &page);
     }
@@ -760,6 +794,8 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
 }
 
 async fn eval(view: tauri::Webview, script: String) -> Result<Value, String> {
+    let preview_id = view.label().to_string();
+    let script = format!("(()=>{{try{{return {{ok:true,data:({script})}}}}catch(error){{return {{ok:false,message:String(error)}}}}}})()");
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     view.eval_with_callback(script, move |value| {
         let _ = tx.send(value);
@@ -769,8 +805,18 @@ async fn eval(view: tauri::Webview, script: String) -> Result<Value, String> {
         tauri::async_runtime::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(10)))
             .await
             .map_err(|error| error.to_string())?
-            .map_err(|error| error.to_string())?;
-    serde_json::from_str(&value).map_err(|error| format!("Browser evaluation: {error}"))
+            .map_err(|error| format!("native_browser_evaluation_failed: {preview_id}; {error}"))?;
+    let result: Value =
+        serde_json::from_str(&value).map_err(|error| format!("Browser evaluation: {error}"))?;
+    if result["ok"] != true {
+        return Err(format!(
+            "native_browser_evaluation_failed: {preview_id}; {}",
+            result["message"]
+                .as_str()
+                .unwrap_or("Invalid browser evaluation response")
+        ));
+    }
+    Ok(result["data"].clone())
 }
 
 struct Capture {

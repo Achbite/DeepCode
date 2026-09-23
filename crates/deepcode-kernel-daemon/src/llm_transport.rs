@@ -328,15 +328,22 @@ fn responses_request_body(
     if profile.connection.adapter_id == "openai-codex" {
         let instructions = messages
             .iter()
-            .filter(|m| m.role == "system")
+            .take_while(|m| m.role == "system")
             .map(|m| m.content.as_str())
             .collect::<Vec<_>>()
             .join("\n\n");
         body["instructions"] = json!(instructions);
-        body["input"]
-            .as_array_mut()
-            .expect("Responses input")
-            .retain(|v| v["role"] != "system");
+        let input = body["input"].as_array_mut().expect("Responses input");
+        let prefix_len = input
+            .iter()
+            .take_while(|item| item["role"] == "system")
+            .count();
+        input.drain(..prefix_len);
+        for item in input {
+            if item["role"] == "system" {
+                item["role"] = json!("developer");
+            }
+        }
         body["store"] = json!(false);
         body["include"] = json!(["reasoning.encrypted_content"]);
         body.as_object_mut().unwrap().remove("max_output_tokens");
@@ -408,14 +415,7 @@ fn responses_input(
                         "Responses tool 消息缺少 providerCallId。",
                     )
                 })?;
-            let output = if message.image_data.is_empty() {
-                json!(content)
-            } else {
-                let mut parts = vec![json!({"type":"input_text","text":content})];
-                parts.extend(message.image_data.iter().map(|image| json!({"type":"input_image","image_url":image.data_url(),"detail":"auto"})));
-                json!(parts)
-            };
-            input.push(json!({"type":"function_call_output","call_id":call_id,"output":output}));
+            input.push(json!({"type":"function_call_output","call_id":call_id,"output":content}));
             continue;
         }
         if !content.is_empty() || !message.image_data.is_empty() {
@@ -1016,16 +1016,13 @@ pub(crate) fn local_agent_provider_stream_response(
         let prepared = match prepare_provider_request(&profile, &request_envelope) {
             Ok(prepared) => prepared,
             Err(error) => {
-                let (packet, archive_failed) = archived_provider_event(
+                let (packet, _) = archived_provider_event(
                     &mut archive,
                     &request_id, provider_attempt_id.as_deref(),
                     "failed",
                     json!({ "code": error.code, "message": error.safe_message() }),
                 );
                 yield Ok::<Bytes, Infallible>(Bytes::from(packet));
-                if archive_failed {
-                    return;
-                }
                 return;
             }
         };
@@ -1051,16 +1048,13 @@ pub(crate) fn local_agent_provider_stream_response(
         let request = match build_provider_request(&client, &profile, &prepared) {
             Ok(request) => request,
             Err(error) => {
-                let (packet, archive_failed) = archived_provider_event(
+                let (packet, _) = archived_provider_event(
                     &mut archive,
                     &request_id, provider_attempt_id.as_deref(),
                     "failed",
                     json!({ "code": error.code, "message": error.safe_message() }),
                 );
                 yield Ok::<Bytes, Infallible>(Bytes::from(packet));
-                if archive_failed {
-                    return;
-                }
                 return;
             }
         };
@@ -1075,16 +1069,13 @@ pub(crate) fn local_agent_provider_stream_response(
         let mut response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
-                let (packet, archive_failed) = archived_provider_event(
+                let (packet, _) = archived_provider_event(
                     &mut archive,
                     &request_id, provider_attempt_id.as_deref(),
                     "failed",
                     crate::provider_transport::network_failure(error, "send", profile.api_key.as_deref()),
                 );
                 yield Ok::<Bytes, Infallible>(Bytes::from(packet));
-                if archive_failed {
-                    return;
-                }
                 return;
             }
         };
@@ -1099,8 +1090,8 @@ pub(crate) fn local_agent_provider_stream_response(
             }
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let (message, body_error) = match provider_http_error_message(&mut response, status, &mut archive, profile.api_key.as_deref()).await {
-                Ok(message) => message,
+            let failure = match read_provider_http_failure(&mut response, status, &mut archive, profile.api_key.as_deref()).await {
+                Ok(failure) => failure,
                 Err(error) => {
                     yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(
                         &request_id, provider_attempt_id.as_deref(),
@@ -1112,17 +1103,13 @@ pub(crate) fn local_agent_provider_stream_response(
                     return;
                 }
             };
-            let (packet, archive_failed) = archived_provider_event(
+            let (packet, _) = archived_provider_event(
                 &mut archive,
                 &request_id, provider_attempt_id.as_deref(),
                 "failed",
-                { let mut failure = json!({"code":"provider_http_failed", "message":crate::provider_transport::safe_detail(&message, profile.api_key.as_deref())});
-                  if let Some(error) = body_error { failure["diagnostics"] = error["diagnostics"].clone(); failure["diagnostics"]["retryable"] = json!(false); } failure },
+                failure,
             );
             yield Ok::<Bytes, Infallible>(Bytes::from(packet));
-            if archive_failed {
-                return;
-            }
             return;
         }
         let mut framer = ProviderEnvelopeFramer::new(kind);
@@ -1141,16 +1128,13 @@ pub(crate) fn local_agent_provider_stream_response(
                     match framer.push(&chunk) {
                         Ok(payloads) => (payloads, false),
                         Err(error) => {
-                            let (packet, archive_failed) = archived_provider_event(
+                            let (packet, _) = archived_provider_event(
                                 &mut archive,
                                 &request_id, provider_attempt_id.as_deref(),
                                 "failed",
                                 json!({ "code": error.code, "message": error.safe_message() }),
                             );
                             yield Ok::<Bytes, Infallible>(Bytes::from(packet));
-                            if archive_failed {
-                                return;
-                            }
                             return;
                         }
                     }
@@ -1158,30 +1142,24 @@ pub(crate) fn local_agent_provider_stream_response(
                 Ok(None) => match framer.finish() {
                     Ok(payloads) => (payloads, true),
                     Err(error) => {
-                        let (packet, archive_failed) = archived_provider_event(
+                        let (packet, _) = archived_provider_event(
                             &mut archive,
                             &request_id, provider_attempt_id.as_deref(),
                             "failed",
                             json!({ "code": error.code, "message": error.safe_message() }),
                         );
                         yield Ok::<Bytes, Infallible>(Bytes::from(packet));
-                        if archive_failed {
-                            return;
-                        }
                         return;
                     }
                 },
                 Err(error) => {
-                    let (packet, archive_failed) = archived_provider_event(
+                    let (packet, _) = archived_provider_event(
                         &mut archive,
                         &request_id, provider_attempt_id.as_deref(),
                         "failed",
                         crate::provider_transport::network_failure(error, "responseBody", profile.api_key.as_deref()),
                     );
                     yield Ok::<Bytes, Infallible>(Bytes::from(packet));
-                    if archive_failed {
-                        return;
-                    }
                     return;
                 }
             };
@@ -1189,16 +1167,13 @@ pub(crate) fn local_agent_provider_stream_response(
                 let emissions = match accumulator.ingest_payload(&payload) {
                     Ok(emissions) => emissions,
                     Err(error) => {
-                        let (packet, archive_failed) = archived_provider_event(
+                        let (packet, _) = archived_provider_event(
                             &mut archive,
                             &request_id, provider_attempt_id.as_deref(),
                             "failed",
-                            json!({ "code": error.code, "message": error.message }),
+                            error.into_failure(profile.api_key.as_deref()),
                         );
                         yield Ok::<Bytes, Infallible>(Bytes::from(packet));
-                        if archive_failed {
-                            return;
-                        }
                         return;
                     }
                 };
@@ -1259,7 +1234,7 @@ pub(crate) fn local_agent_provider_stream_response(
                             let Some(output_index) =
                                 emission.event.get("output_index").and_then(Value::as_i64)
                             else {
-                                let (packet, archive_failed) = archived_provider_event(
+                                let (packet, _) = archived_provider_event(
                                     &mut archive,
                                     &request_id, provider_attempt_id.as_deref(),
                                     "failed",
@@ -1269,13 +1244,10 @@ pub(crate) fn local_agent_provider_stream_response(
                                     }),
                                 );
                                 yield Ok::<Bytes, Infallible>(Bytes::from(packet));
-                                if archive_failed {
-                                    return;
-                                }
                                 return;
                             };
                             let Some(item) = emission.event.get("item") else {
-                                let (packet, archive_failed) = archived_provider_event(
+                                let (packet, _) = archived_provider_event(
                                     &mut archive,
                                     &request_id, provider_attempt_id.as_deref(),
                                     "failed",
@@ -1285,15 +1257,12 @@ pub(crate) fn local_agent_provider_stream_response(
                                     }),
                                 );
                                 yield Ok::<Bytes, Infallible>(Bytes::from(packet));
-                                if archive_failed {
-                                    return;
-                                }
                                 return;
                             };
                             if item.get("type").and_then(Value::as_str) == Some("web_search_call")
                                 && !prepared.hosted_web_search_enabled
                             {
-                                let (packet, archive_failed) = archived_provider_event(
+                                let (packet, _) = archived_provider_event(
                                     &mut archive,
                                     &request_id, provider_attempt_id.as_deref(),
                                     "failed",
@@ -1303,9 +1272,6 @@ pub(crate) fn local_agent_provider_stream_response(
                                     }),
                                 );
                                 yield Ok::<Bytes, Infallible>(Bytes::from(packet));
-                                if archive_failed {
-                                    return;
-                                }
                                 return;
                             }
                             let (packet, archive_failed) = archived_provider_event(
@@ -1333,21 +1299,18 @@ pub(crate) fn local_agent_provider_stream_response(
         let result = match accumulator.finalize_for_request(&request_id) {
             Ok(result) => result,
             Err(error) => {
-                let (packet, archive_failed) = archived_provider_event(
+                let (packet, _) = archived_provider_event(
                     &mut archive,
                     &request_id, provider_attempt_id.as_deref(),
                     "failed",
-                    json!({ "code": error.code, "message": error.message }),
+                    error.into_failure(profile.api_key.as_deref()),
                 );
                 yield Ok::<Bytes, Infallible>(Bytes::from(packet));
-                if archive_failed {
-                    return;
-                }
                 return;
             }
         };
         if !prepared.hosted_web_search_enabled && !result.output.hosted_web_search_calls.is_empty() {
-            let (packet, archive_failed) = archived_provider_event(
+            let (packet, _) = archived_provider_event(
                 &mut archive,
                 &request_id, provider_attempt_id.as_deref(),
                 "failed",
@@ -1357,9 +1320,6 @@ pub(crate) fn local_agent_provider_stream_response(
                 }),
             );
             yield Ok::<Bytes, Infallible>(Bytes::from(packet));
-            if archive_failed {
-                return;
-            }
             return;
         }
         if result.completion.provider_kind != ProviderStreamKind::Responses
@@ -1445,12 +1405,9 @@ pub(crate) fn local_agent_provider_stream_response(
                 }
             }
         }
-        let (packet, archive_failed) =
+        let (packet, _) =
             archived_provider_event(&mut archive, &request_id, provider_attempt_id.as_deref(), "completed", completed_data);
         yield Ok::<Bytes, Infallible>(Bytes::from(packet));
-        if archive_failed {
-            return;
-        }
     };
     Response::builder()
         .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
@@ -1520,12 +1477,17 @@ fn archived_provider_event(
     }
 }
 
-async fn provider_http_error_message(
+async fn read_provider_http_failure(
     response: &mut reqwest::Response,
     status: u16,
     archive: &mut deepcode_kernel_runtime::execution_archive::ExecutionArchive,
     secret: Option<&str>,
-) -> std::io::Result<(String, Option<Value>)> {
+) -> std::io::Result<Value> {
+    let retry_directive = response
+        .headers()
+        .get("x-retry-metadata")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let mut body = Vec::new();
     let mut body_error = None;
     while body.len() < PROVIDER_ERROR_BODY_LIMIT {
@@ -1553,31 +1515,55 @@ async fn provider_http_error_message(
             "limitReached": body.len() == PROVIDER_ERROR_BODY_LIMIT,
         }),
     )?;
-    Ok((
-        match provider_http_error_detail(&body) {
-            Some(detail) => format!("Provider 返回 HTTP {status}：{detail}"),
-            None => format!("Provider 返回 HTTP {status}。"),
-        },
-        body_error,
-    ))
+    let mut failure = provider_http_failure(status, &body, retry_directive.as_deref(), secret);
+    if let Some(error) = body_error {
+        failure["diagnostics"]["causes"] = error["diagnostics"]["causes"].clone();
+        failure = crate::provider_transport::secondary_failure(
+            failure,
+            error["code"].as_str().expect("network failure code"),
+            error["message"]
+                .as_str()
+                .expect("network failure message")
+                .to_owned(),
+        );
+    }
+    Ok(failure)
 }
 
-fn provider_http_error_detail(body: &[u8]) -> Option<String> {
-    let value = serde_json::from_slice::<Value>(body).ok()?;
-    let message = value
-        .pointer("/error/message")
-        .or_else(|| value.get("message"))
-        .and_then(Value::as_str)?
-        .trim();
-    if message.is_empty() {
-        return None;
-    }
-    Some(
-        message
-            .chars()
-            .filter(|character| !character.is_control() || character.is_whitespace())
-            .take(PROVIDER_ERROR_MESSAGE_LIMIT)
-            .collect(),
+fn provider_http_failure(
+    status: u16,
+    body: &[u8],
+    retry_directive: Option<&str>,
+    secret: Option<&str>,
+) -> Value {
+    let value = serde_json::from_slice::<Value>(body).ok();
+    let error = value.as_ref().map(|value| {
+        value
+            .get("error")
+            .filter(|error| !error.is_null())
+            .unwrap_or(value)
+    });
+    let detail = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .map(|message| {
+            message
+                .chars()
+                .filter(|character| !character.is_control() || character.is_whitespace())
+                .take(PROVIDER_ERROR_MESSAGE_LIMIT)
+                .collect::<String>()
+        });
+    let message = match detail {
+        Some(detail) => format!("Provider 返回 HTTP {status}：{detail}"),
+        None => format!("Provider 返回 HTTP {status}。"),
+    };
+    crate::provider_transport::upstream_failure(
+        "provider_http_failed",
+        &message,
+        error.unwrap_or(&Value::Null),
+        retry_directive,
+        secret,
     )
 }
 
@@ -1685,6 +1671,32 @@ pub(crate) fn split_system_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_http_errors_keep_details_and_header_directives_without_retrying() {
+        let body = br#"{"error":{"code":"server_is_overloaded","type":"service_unavailable_error","message":"Try again later.","headers":{"x-retry-metadata":"BODY_DIRECTIVE"}}}"#;
+        let failure = provider_http_failure(503, body, Some("NO_MORE_RETRY"), None);
+        assert_eq!(
+            failure["message"],
+            "Provider 返回 HTTP 503：Try again later."
+        );
+        assert_eq!(failure["diagnostics"]["category"], "provider");
+        assert_eq!(failure["diagnostics"]["retryable"], false);
+        assert_eq!(
+            failure["diagnostics"]["providerError"],
+            json!({
+                "code":"server_is_overloaded", "type":"service_unavailable_error",
+                "retryDirective":"NO_MORE_RETRY",
+            })
+        );
+        assert!(crate::provider_transport::valid_diagnostics(
+            &failure["diagnostics"]
+        ));
+        let failure = provider_http_failure(502, b"upstream unavailable", None, None);
+        assert_eq!(failure["message"], "Provider 返回 HTTP 502。");
+        assert_eq!(failure["diagnostics"]["category"], "provider");
+        assert!(failure["diagnostics"].get("providerError").is_none());
+    }
 
     async fn failed_loopback_probe(base_url: String) -> ProviderTransportError {
         let mut profile = test_profile("openaiCompatible");
@@ -2343,29 +2355,84 @@ mod tests {
     }
 
     #[test]
-    fn tool_observations_send_real_image_parts_in_the_call_output() {
-        let mut message: LocalProviderMessage = serde_json::from_value(json!({"role":"tool","content":"observed","toolCallId":"call:observe","providerCallId":"provider-observe"})).unwrap();
+    fn codex_continuation_preserves_instructions_and_appends_later_system_context() {
+        let mut profile = test_profile("responses");
+        profile.connection.adapter_id = "openai-codex".into();
+        let initial = provider_input(json!({"messages":[
+            {"role":"system","content":"Stable instructions."},
+            {"role":"user","content":"Inspect the design."}
+        ],"tools":[],"hostedTools":[]}));
+        let first = responses_request_body(&profile, &initial.messages, &[], &[], true).unwrap();
+        let continued = provider_input(json!({"messages":[
+            {"role":"system","content":"Stable instructions."},
+            {"role":"user","content":"Inspect the design."},
+            {"role":"assistant","content":"The design has a sidebar."},
+            {"role":"system","content":"New input workspace: screenshot B."},
+            {"role":"user","content":"Compare this new screenshot."}
+        ],"tools":[],"hostedTools":[]}));
+        let next = responses_request_body(&profile, &continued.messages, &[], &[], true).unwrap();
+        assert_eq!(next["instructions"], first["instructions"]);
+        assert_eq!(next["input"][0], first["input"][0]);
+        assert_eq!(next["input"][2]["role"], "developer");
+        assert_eq!(
+            next["input"][2]["content"][0]["text"],
+            "New input workspace: screenshot B."
+        );
+        assert_eq!(
+            next["input"][3]["content"][0]["text"],
+            "Compare this new screenshot."
+        );
+    }
+
+    #[test]
+    fn tool_observations_keep_call_results_and_send_pixels_as_separate_visual_input() {
+        let call: LocalProviderMessage = serde_json::from_value(json!({"role":"assistant","content":"","toolCalls":[{"callId":"call:observe","providerCallId":"provider-observe","name":"browser.observe","input":{}}]})).unwrap();
+        let result: LocalProviderMessage = serde_json::from_value(json!({"role":"tool","content":"observed","toolCallId":"call:observe","providerCallId":"provider-observe"})).unwrap();
+        let mut message: LocalProviderMessage = serde_json::from_value(
+            json!({"role":"user","content":"Current visual inputs: screenshot"}),
+        )
+        .unwrap();
         message
             .image_data
             .push(crate::local_agent_api::LocalProviderImage {
                 media_type: "image/png".into(),
                 base64: "aW1hZ2U=".into(),
             });
-        let messages = vec![message];
+        let messages = vec![call, result, message];
         let profile = test_profile("responses");
         let result = responses_request_body(&profile, &messages, &[], &[], false).unwrap();
-        assert_eq!(result["input"][0]["type"], "function_call_output");
+        assert_eq!(result["input"][0]["type"], "function_call");
         assert_eq!(result["input"][0]["call_id"], "provider-observe");
-        assert_eq!(result["input"][0]["output"][0]["text"], "observed");
+        assert_eq!(result["input"][1]["type"], "function_call_output");
+        assert_eq!(result["input"][1]["call_id"], "provider-observe");
+        assert_eq!(result["input"][1]["output"], "observed");
+        assert_eq!(result["input"][2]["role"], "user");
         assert_eq!(
-            result["input"][0]["output"][1]["image_url"],
+            result["input"][2]["content"][1]["image_url"],
             "data:image/png;base64,aW1hZ2U="
         );
         let result = anthropic_stream_request_body(&profile, &messages, &[]).unwrap();
-        assert_eq!(result["messages"][0]["content"][0]["type"], "tool_result");
         assert_eq!(
-            result["messages"][0]["content"][0]["content"][1]["source"]["data"],
+            result["messages"][0]["content"][0]["id"],
+            "provider-observe"
+        );
+        assert_eq!(result["messages"][1]["content"][0]["type"], "tool_result");
+        assert_eq!(
+            result["messages"][1]["content"][0]["tool_use_id"],
+            "provider-observe"
+        );
+        assert_eq!(result["messages"][1]["content"][0]["content"], "observed");
+        assert_eq!(
+            result["messages"][2]["content"][1]["source"]["data"],
             "aW1hZ2U="
+        );
+        let result = openai_compatible_request_body(&profile, &messages, &[], false);
+        assert_eq!(result["messages"][1]["role"], "tool");
+        assert_eq!(result["messages"][1]["tool_call_id"], "provider-observe");
+        assert_eq!(result["messages"][1]["content"], "observed");
+        assert_eq!(
+            result["messages"][2]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
         );
     }
 

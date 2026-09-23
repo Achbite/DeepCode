@@ -5,7 +5,7 @@ import { t, type UiLanguage } from '../../i18n';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import SessionModelSelector from './SessionModelSelector';
 import TotalCacheUsage from './TotalCacheUsage';
-import { ComposerDecisionPanels } from './ComposerDecisionPanels';
+import { ComposerDecisionPanels, ComposerQuestionPrompt } from './ComposerDecisionPanels';
 import { ComposerPermissionControl } from './ComposerPermissionControl';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import type { AgentComposer } from './useAgentComposer';
@@ -130,7 +130,18 @@ export function ConversationComposer({
   return (
     <UiRegion slot="composer.layout" data={regionData} actions={regionActions}><footer className={`local-agent__composer-shell${pendingPlan || pendingInteraction || pendingApproval
       ? ' local-agent__composer-shell--decision'
-      : ''}`}>
+      : ''}`} onKeyDown={(event) => {
+          if (composer.editingMessage && event.key === 'Escape' && !event.repeat
+            && !event.nativeEvent.isComposing && !event.defaultPrevented) {
+            event.preventDefault();
+            composer.cancelMessageEdit();
+          }
+          if (pendingPlan && event.target !== textareaRef.current && event.key === 'Escape'
+            && !event.repeat && !event.nativeEvent.isComposing && !event.defaultPrevented) {
+            event.preventDefault();
+            void composer.submitPlanDecision({ kind: 'cancel' });
+          }
+        }}>
       {error && <DismissibleError language={language} onDismiss={composer.clearError}>{error}</DismissibleError>}
       {attachmentError && <DismissibleError language={language} onDismiss={composer.clearAttachmentError}>{attachmentError}</DismissibleError>}
       {uiActionError && <DismissibleError language={language} onDismiss={onDismissUiActionError}>{uiActionError.includes('\n')
@@ -153,20 +164,9 @@ export function ConversationComposer({
           : (language === 'zh-CN' ? '未加入本轮' : 'Not applied to this run')}</strong>
         <span>{input.text}{input.filesystemReferences.length ? ` · ${input.filesystemReferences.map((item) => item.displayName).join(', ')}` : ''}</span>
       </div>)}
+      <ComposerQuestionPrompt language={language} composer={composer} />
       <div
         className={`local-agent__composer local-agent__composer--${inputMode}`}
-        onKeyDown={(event) => {
-          if (composer.editingMessage && event.key === 'Escape' && !event.repeat
-            && !event.nativeEvent.isComposing && !event.defaultPrevented) {
-            event.preventDefault();
-            composer.cancelMessageEdit();
-          }
-          if (pendingPlan && event.target !== textareaRef.current && event.key === 'Escape'
-            && !event.repeat && !event.nativeEvent.isComposing && !event.defaultPrevented) {
-            event.preventDefault();
-            void composer.submitPlanDecision({ kind: 'cancel' });
-          }
-        }}
         onMouseDown={(event) => {
           const target = event.target as HTMLElement;
           if (target.closest('button, input, select, textarea, label, a, [role="button"], .local-agent__interaction-panel, .local-agent__decision')) return;

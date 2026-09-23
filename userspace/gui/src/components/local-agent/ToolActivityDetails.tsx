@@ -384,22 +384,25 @@ function ToolElapsed({ startedAt, language }: { startedAt: string; language: UiL
   return <span>{language === 'zh-CN' ? `${seconds} 秒` : `${seconds}s`}</span>;
 }
 
-function toolGroupSummary(
+export function toolGroupSummary(
   activities: ActivityProjection[],
   language: UiLanguage,
 ): string {
   const status = toolGroupStatus(activities);
-  if (activities.every((activity) => activity.kind === 'providerHosted')) {
-    return t(language, 'agent.tool.summary.usedMany', { count: activities.length });
-  }
-  if (status === 'active') {
-    return t(language, 'agent.tool.summary.activeMany', { count: activities.length });
-  }
-  if (status === 'requested') {
-    return t(language, 'agent.tool.summary.requestedMany', { count: activities.length });
-  }
-  if (status === 'waiting') {
-    return t(language, 'agent.tool.summary.waitingMany', { count: activities.length });
+  if (!activities.every(activity => activity.status === 'completed')) {
+    if (!activities.some(activity => ['requested', 'active', 'waiting'].includes(activity.status))) {
+      return t(language, 'agent.tool.summary.count', { count: activities.length });
+    }
+    const counts = new Map<ActivityProjection['status'], number>();
+    for (const activity of activities) counts.set(activity.status, (counts.get(activity.status) ?? 0) + 1);
+    if (counts.size === 1 && ['active', 'requested', 'waiting'].includes(status)) {
+      return t(language, `agent.tool.summary.${status}Many`, { count: activities.length });
+    }
+    return [t(language, 'agent.tool.summary.count', { count: activities.length }),
+      ...Array.from(counts, ([state, count]) => t(language, 'agent.tool.summary.statusCount', {
+        status: ['requested', 'active', 'waiting', 'completed'].includes(state)
+          ? toolActivityStatus(state, language) : t(language, 'agent.tool.summary.ended'), count,
+      }))].join(' · ');
   }
   if (status === 'completed') {
     const hasShell = activities.some((activity) => (
@@ -418,13 +421,16 @@ function toolGroupSummary(
   return t(language, 'agent.tool.summary.usedMany', { count: activities.length });
 }
 
-function toolActivitySummary(activity: ActivityProjection, language: UiLanguage): string {
+export function toolActivitySummary(activity: ActivityProjection, language: UiLanguage): string {
   if (activity.kind === 'providerHosted' && activity.providerHosted) {
     return providerHostedSummary(activity.providerHosted, activity.status, language);
   }
   const operation = activity.tool?.operation ?? activity.label;
   const target = activity.tool?.resources[0]?.label;
   const command = activity.tool?.shell?.command;
+  if (activity.status === 'requested' || activity.status === 'waiting') {
+    return t(language, `agent.tool.summary.${activity.status}One`, { operation: command ?? operation });
+  }
   if (activity.status === 'completed') {
     if ((operation === 'bash' || operation === 'powershell') && command) {
       return t(language, 'agent.tool.activity.ranCommand', { command });

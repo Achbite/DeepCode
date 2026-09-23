@@ -37,45 +37,34 @@ export function ContextUsageControl({
   onToggle,
 }: ContextUsageControlProps) {
   const [hoverContextKey, setHoverContextKey] = useState<ContextFocusKey | null>(null);
-  const contextPercent = contextUsage
+  const displayedUsage = contextUsage;
+  const contextPercent = displayedUsage
     ? percentOf(
-        contextUsage.inputTokens + contextUsage.outputTokens,
-        contextUsage.contextWindowTokens,
+        displayedUsage.inputTokens + displayedUsage.outputTokens,
+        displayedUsage.contextWindowTokens,
       )
     : null;
   const contextLabel = contextPercent === null
     ? t(language, 'common.notAvailable')
     : `${Math.round(contextPercent)}%`;
-  const contextTitle = contextUsage
+  const contextTitle = displayedUsage
     ? t(language, 'agent.context.windowUsage', {
-        used: formatTokens(contextUsage.inputTokens + contextUsage.outputTokens, language),
-        capacity: formatTokens(contextUsage.contextWindowTokens, language),
+        used: formatTokens(displayedUsage.inputTokens + displayedUsage.outputTokens, language),
+        capacity: formatTokens(displayedUsage.contextWindowTokens, language),
       })
     : t(language, 'common.notAvailable');
-  const contextReceipt = useMemo(() => {
-    if (contextUsage) {
-      for (let index = contextCompositions.length - 1; index >= 0; index -= 1) {
-        if (
-          contextCompositions[index].providerRequestId === contextUsage.providerRequestId
-        ) {
-          return contextCompositions[index];
-        }
-      }
-      return null;
-    }
-    return contextCompositions.at(-1) ?? null;
-  }, [contextCompositions, contextUsage]);
+  const contextReceipt = contextCompositions.find(receipt => receipt.providerRequestId === contextUsage?.providerRequestId) ?? null;
   const capacityMetrics = useMemo(
-    () => buildCapacityMetrics(contextUsage, language),
-    [contextUsage, language],
+    () => buildCapacityMetrics(displayedUsage, language),
+    [displayedUsage, language],
   );
   const requestSections = useMemo(
     () => buildRequestSections(contextReceipt, language),
     [contextReceipt, language],
   );
   const compositionSegments = useMemo(
-    () => buildCompositionSegments(contextUsage, capacityMetrics, requestSections),
-    [capacityMetrics, contextUsage, requestSections],
+    () => buildCompositionSegments(displayedUsage, capacityMetrics, requestSections),
+    [capacityMetrics, displayedUsage, requestSections],
   );
   const focusedContextKey = hoverContextKey;
   const activeContextKey = focusedContextKey ?? 'input';
@@ -102,8 +91,8 @@ export function ContextUsageControl({
   const activeMetric = [...capacityMetrics, ...requestSections]
     .find((metric) => metric.key === activeContextKey)
     ?? capacityMetrics[0];
-  const cache = lastCallInputCacheMetric(contextUsage);
-  const hasContextFacts = Boolean(contextUsage || contextReceipt);
+  const cache = lastCallInputCacheMetric(displayedUsage);
+  const hasContextFacts = Boolean(displayedUsage || contextReceipt);
 
   useEffect(() => {
     if (!contextOpen) return undefined;
@@ -208,7 +197,7 @@ export function ContextUsageControl({
             </div>
 
             <div className="deepcode-session-model__composition-stage">
-              {contextUsage ? (
+              {displayedUsage ? (
                 <button
                   type="button"
                   className={[

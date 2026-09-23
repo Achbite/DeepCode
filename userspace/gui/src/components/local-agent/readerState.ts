@@ -2,12 +2,40 @@ import type { ChangedFile } from './fileChangeSummary';
 import { resourceKey, type ResourceReference } from '../../services/conversationResources';
 import type { ArtifactProjection } from '@deepcode/protocol';
 import type { SourcePosition } from './resourceLinks';
+import type { NativePage } from '../../services/nativeBrowser';
 export type ReaderTarget = ({ kind: 'workspace'; workspaceId: string; logicalPath: string } & SourcePosition)
   | { kind: 'resource'; resource: ResourceReference; name: string }
   | { kind: 'diff'; file: ChangedFile }
   | { kind: 'file'; path: string }
   | { kind: 'artifact'; artifact: ArtifactProjection }
   | { kind: 'browser'; previewId?: string; url?: string; filePath?: string; selfPreview?: boolean };
+export type ResolvedReaderTarget = Exclude<ReaderTarget, { kind: 'browser' }>
+  | (Extract<ReaderTarget, { kind: 'browser' }> & { previewId: string });
+export type ReaderTab = { id: string; target: ResolvedReaderTarget; page?: NativePage };
+export interface ReaderViewState {
+  sessionId: string | null;
+  tabs: ReaderTab[];
+  activeId: string | null;
+  visible: boolean;
+  expanded: boolean;
+}
+
+export function reconcileReaderPages(state: ReaderViewState, pages: NativePage[], savedSelection?: ReaderTarget | null): ReaderViewState {
+  const available = new Map(pages.filter(page => page.sessionId === state.sessionId && page.status !== 'closed').map(page => [page.previewId, page]));
+  const tabs = state.tabs.flatMap(tab => {
+    if (tab.target.kind !== 'browser') return [tab];
+    const page = available.get(tab.target.previewId);
+    if (!page) return [];
+    available.delete(page.previewId);
+    return [{ ...tab, page }];
+  });
+  for (const page of available.values()) {
+    const target: ResolvedReaderTarget = { kind: 'browser', previewId: page.previewId };
+    tabs.push({ id: readerTargetKey(target), target, page });
+  }
+  const selected = state.activeId ?? (state.tabs.length === 0 && savedSelection ? readerTargetKey(savedSelection) : null);
+  return { ...state, tabs, activeId: tabs.some(tab => tab.id === selected) ? selected : null };
+}
 export const READER_OPEN_EVENT = 'deepcode:reader-open';
 export function requestReader(sessionId: string, target: ReaderTarget): void {
   window.dispatchEvent(new CustomEvent(READER_OPEN_EVENT, {detail: {sessionId, target}}));

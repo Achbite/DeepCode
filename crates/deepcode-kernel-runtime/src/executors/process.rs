@@ -891,6 +891,7 @@ fn prepare_shell_command(
                 workspace_mode,
                 writable_targets,
                 files,
+                Some(&macos_user_temporary_directory()?),
             )?
             .into(),
             shell.executable.as_os_str().into(),
@@ -954,6 +955,7 @@ fn macos_workspace_profile(
     workspace_mode: &str,
     writable_targets: Option<&[WorkspaceWriteTarget]>,
     files: &crate::file_access::FileAccessScope,
+    system_temporary: Option<&Path>,
 ) -> KernelResult<String> {
     let escaped_workspace = macos_sandbox_path(workspace_root, "workspace")?;
     let escaped_temporary = macos_sandbox_path(temporary_root, "temporary directory")?;
@@ -1048,6 +1050,27 @@ fn macos_workspace_profile(
         };
         rules.push_str(&format!("\n(deny file-write* {filter})"));
     }
+    if let Some(directory) = system_temporary {
+        // xcrun locates its cache through confstr, independently of TMPDIR.
+        // It owns these shared toolchain cache files; other host scratch stays
+        // inaccessible and is never cleaned up by an Agent command lifecycle.
+        for path in crate::file_access::macos_path_spellings(directory) {
+            for ancestor in path.ancestors() {
+                let escaped = macos_sandbox_path(ancestor, "toolchain cache ancestor")?;
+                rules.push_str(&format!(
+                    "\n(allow file-read-metadata (literal \"{escaped}\"))"
+                ));
+            }
+            let pattern = macos_xcrun_cache_pattern(&path)?;
+            // SBPL regex literals preserve regex escapes; ordinary string
+            // escaping would turn an escaped path character into a backslash.
+            let escaped = pattern.replace('"', "\\\"");
+            let cache = macos_sandbox_path(&path.join("xcrun_db"), "toolchain cache")?;
+            rules.push_str(&format!(
+                "\n(allow file-read* file-write* (literal \"{cache}\") (regex #\"{escaped}\"))"
+            ));
+        }
+    }
     let base = include_str!("macos_workspace.sbpl").replace(
         "(deny network*)",
         if files.network_access {
@@ -1058,6 +1081,43 @@ fn macos_workspace_profile(
     );
     Ok(format!(
         "{base}{workspace_write_rule}{rules}\n(allow file-read* file-write* (subpath \"{escaped_temporary}\"))\n(deny mach-lookup (global-name \"{process_scope_id}\"))"
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_user_temporary_directory() -> KernelResult<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let size = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, std::ptr::null_mut(), 0) };
+    if size == 0 {
+        return Err(KernelError::Other(format!(
+            "Read macOS user temporary directory: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut buffer = vec![0u8; size];
+    let written = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buffer.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size || buffer.last() != Some(&0) {
+        return Err(KernelError::Other(
+            "macOS user temporary directory changed during lookup".into(),
+        ));
+    }
+    let path = Path::new(std::ffi::OsStr::from_bytes(&buffer[..size - 1]));
+    crate::file_access::resolve_path(path)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_xcrun_cache_pattern(directory: &Path) -> KernelResult<String> {
+    macos_sandbox_path(directory, "toolchain cache directory")?;
+    let directory = directory.to_str().expect("validated UTF-8 path");
+    Ok(format!(
+        "^{}/xcrun_db-[^/]+$",
+        regex::escape(directory.trim_end_matches('/'))
     ))
 }
 
@@ -1158,6 +1218,7 @@ mod plan_scope_tests {
             "write",
             Some(&targets),
             &crate::file_access::FileAccessScope::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -1172,6 +1233,7 @@ mod plan_scope_tests {
             "read",
             Some(&targets),
             &crate::file_access::FileAccessScope::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -1189,6 +1251,46 @@ mod plan_scope_tests {
             !read.contains("USER_TEMP_DIR"),
             "shared host temp is not an Agent resource"
         );
+    }
+
+    #[test]
+    fn macos_toolchain_dependencies_preserve_absent_probes_and_limit_cache_access() {
+        let files = crate::file_access::FileAccessScope {
+            read: crate::file_access::macos_system_read_paths(),
+            ..Default::default()
+        };
+        let directory = Path::new("/private/var/folders/test/user/T");
+        let policy = macos_workspace_profile(
+            Path::new("/fixture/workspace"),
+            Path::new("/fixture/private-temp"),
+            "scope-test",
+            "read",
+            None,
+            &files,
+            Some(directory),
+        )
+        .unwrap();
+        for path in [
+            "/etc/gitconfig",
+            "/private/etc/gitconfig",
+            "/var/select/developer_dir",
+            "/private/var/select/developer_dir",
+        ] {
+            assert!(policy.contains(&format!("(allow file-read* (literal \"{path}\"))")));
+        }
+        let matcher = regex::Regex::new(&macos_xcrun_cache_pattern(directory).unwrap()).unwrap();
+        assert!(policy.contains("(literal \"/private/var/folders/test/user/T/xcrun_db\")"));
+        assert!(matcher.is_match("/private/var/folders/test/user/T/xcrun_db-7rNZgfpy"));
+        assert!(!matcher.is_match("/private/var/folders/test/user/T/other-file"));
+        assert!(!matcher.is_match("/private/var/folders/test/user/T/nested/xcrun_db"));
+        assert!(!matcher.is_match("/private/var/folders/test/user/T/xcrun_db-child/nested"));
+        assert!(policy.contains("^/var/folders/test/user/T/xcrun_db"));
+        assert!(!policy.contains(
+            "(allow file-read* file-write* (subpath \"/private/var/folders/test/user/T\"))"
+        ));
+        assert!(policy.contains("(regex #\"^/private/tmp/sh-thd-[0-9]+$\")"));
+        assert!(!policy.contains("(subpath \"/private/tmp\")"));
+        assert!(!policy.contains("(subpath \"/tmp\")"));
     }
 }
 

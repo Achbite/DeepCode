@@ -5,7 +5,14 @@ export type LlmProviderKind =
   | 'ollama';
 
 export type LlmProviderFlavor = 'openai' | 'deepseek' | 'zhipu' | 'moonshot';
-export type LlmReasoningEffort = 'low' | 'medium' | 'high' | 'max';
+export const LLM_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type LlmReasoningEffort = typeof LLM_REASONING_EFFORTS[number];
+export function isLlmReasoningEffort(value: unknown): value is LlmReasoningEffort {
+  return typeof value === 'string' && LLM_REASONING_EFFORTS.some(effort => effort === value);
+}
+export function modelReasoningEfforts(profile?: Pick<LlmProviderProfile, 'providerFlavor'>): readonly LlmReasoningEffort[] {
+  return profile?.providerFlavor === 'deepseek' ? ['low', 'high', 'max'] : LLM_REASONING_EFFORTS;
+}
 export type LlmThinkingMode = 'enabled' | 'disabled';
 export type LlmHostedWebSearch = 'web_search';
 

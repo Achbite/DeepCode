@@ -834,9 +834,12 @@ async fn wait_for_projection(
             }
             if is_terminal_run_status(&run.status) {
                 if plain && run.status == "completed" {
-                    if let Some(text) = projection.last_assistant_text(before.messages.len()) {
-                        println!("{text}");
-                    }
+                    render::render_final_message(
+                        &mut io::stdout().lock(),
+                        &projection,
+                        before.messages.len(),
+                    )
+                    .map_err(|error| error.to_string())?;
                 } else if !plain {
                     let mut stdout = io::stdout().lock();
                     output
@@ -935,7 +938,12 @@ async fn run_chat(
             return Ok(
                 if projection.pending_plan.is_some()
                     || projection.pending_interaction.is_some()
-                    || projection.pending_approval.is_some()
+                    || projection
+                        .pending_approval
+                        .as_ref()
+                        .is_some_and(|approval| {
+                            !approval.is_model_reviewing(projection.run.as_ref())
+                        })
                 {
                     Outcome::ActionRequired
                 } else {
@@ -1244,6 +1252,108 @@ ask/chat 支持重复使用 --plugin 指定插件；Agent 也可按任务发现�
 mod tests {
     use super::*;
     use crate::conversation_input::fixtures::{pending_decisions, waiting_projection};
+
+    #[tokio::test]
+    async fn long_focus_upload_preserves_the_task_and_existing_references() {
+        use deepcode_kernel_client::KernelClientConfig;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = HttpKernelClient::new(
+            KernelClientConfig::new(format!("http://{}", listener.local_addr().unwrap()))
+                .with_host_shell_token(format!("dchost_{}", "01".repeat(32))),
+        )
+        .unwrap();
+        let task = "完整保留中文任务🙂\n".repeat(2000);
+        assert!(task.len() > 32 * 1024);
+        let existing = json!({
+            "referenceId":"reference:existing", "workspaceId":"workspace:existing",
+            "logicalPath":"notes.txt", "displayName":"notes.txt", "kind":"file",
+            "mediaType":"text/plain", "byteLength":12,
+        });
+        let uploaded = json!({
+            "referenceId":"reference:uploaded", "workspaceId":"workspace:uploaded",
+            "logicalPath":"user-input.txt", "displayName":"完整任务", "kind":"file",
+            "mediaType":"text/plain", "byteLength":task.len(), "source":"pastedText",
+        });
+        let mut command = deepcode_kernel_client::focus_command(
+            "session:focus",
+            "command:focus",
+            &task,
+            None,
+            &[],
+            "",
+            &[],
+        );
+        command["filesystemReferences"] = json!([existing.clone()]);
+        let server = async {
+            for operation in ["input-resources/command:focus", "commands"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let (start, length) = loop {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        assert!(headers.starts_with(&format!(
+                            "POST /api/conversation/sessions/session:focus/{operation} HTTP/1.1"
+                        )));
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        break (end + 4, length);
+                    }
+                };
+                while request.len() < start + length {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let body = &request[start..start + length];
+                let response = if operation != "commands" {
+                    assert_eq!(body, task.as_bytes(), "upload keeps the complete original task");
+                    json!({"ok":true, "data":{"text":"", "reference":uploaded}})
+                } else {
+                    let submitted: Value = serde_json::from_slice(body).unwrap();
+                    assert_eq!(submitted["type"], "context.focus");
+                    assert_eq!(submitted["commandId"], "command:focus");
+                    assert_eq!(submitted["sessionId"], "session:focus");
+                    assert_eq!(submitted["filesystemReferences"], json!([existing, uploaded]));
+                    let accepted = submitted["task"].as_str().is_some_and(|task| !task.trim().is_empty());
+                    json!({"ok":true, "data":{
+                        "schemaVersion":"deepcode.command-reply.v3", "commandId":"command:focus",
+                        "sessionId":"session:focus", "revision":1,
+                        "status":if accepted { "accepted" } else { "rejected" },
+                        "error":if accepted { Value::Null } else {
+                            json!({"code":"conversation_command_invalid", "message":"Focus task must not be empty."})
+                        },
+                    }})
+                }.to_string();
+                socket.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len(),
+                ).as_bytes()).await.unwrap();
+            }
+        };
+        let (_, reply) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                server,
+                client.submit_conversation_command("session:focus", &command)
+            )
+        })
+        .await
+        .expect("owned upload and command exchange finishes");
+        let reply = reply.unwrap();
+        assert_eq!(reply.status, "accepted");
+        assert!(reply.error.is_none());
+    }
 
     #[test]
     fn pending_plain_input_queues_while_explicit_reply_keeps_decision_semantics() {

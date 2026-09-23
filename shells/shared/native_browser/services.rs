@@ -68,23 +68,8 @@ pub(super) fn execute(
         if !matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")) {
             return Err("An owned development service requires a loopback URL.".into());
         }
-        use std::net::ToSocketAddrs;
-        let host = url
-            .host_str()
-            .ok_or("Development URL has no host.")?
-            .trim_matches(['[', ']']);
-        let port = url
-            .port_or_known_default()
-            .ok_or("Development URL has no port.")?;
-        let addresses = (host, port)
-            .to_socket_addrs()
-            .map_err(|error| error.to_string())?;
-        if addresses.into_iter().any(|address| {
-            std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(150))
-                .is_ok()
-        }) {
-            return Err("The development URL is already in use. Connect to it as an external service, or choose the project's available port.".into());
-        }
+        // The project command owns listener admission. A Docker port forward can
+        // accept TCP before any server exists, so a connection cannot prove an owner.
         let args = input["args"]
             .as_array()
             .ok_or("args must be an array of strings")?

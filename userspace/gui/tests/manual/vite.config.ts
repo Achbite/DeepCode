@@ -6,7 +6,10 @@ export default defineConfig({
   base: './', plugins: [react()],
   build: { outDir: '../../.task-artifacts/manual-preview', emptyOutDir: true,
     rollupOptions: { input: {
+      approvalModel: fileURLToPath(new URL('./approval-model.html', import.meta.url)),
       composer: fileURLToPath(new URL('./composer.html', import.meta.url)),
+      followModel: fileURLToPath(new URL('./follow-model.html', import.meta.url)),
+      usageWidget: fileURLToPath(new URL('./usage-widget.html', import.meta.url)),
       viewport: fileURLToPath(new URL('./viewport.html', import.meta.url)),
       messages: fileURLToPath(new URL('./messages.html', import.meta.url)),
     } } },

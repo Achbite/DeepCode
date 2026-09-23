@@ -83,7 +83,7 @@ function Preview() {
     </nav>
     <main className="local-agent fixture-main"><div className="local-agent__viewport"><div className="local-agent__body" ref={viewport.bodyRef} {...viewport.bodyHandlers}>
       <ConversationTranscript language={language} loading={false} projection={projection} activeProject={undefined}
-        hasConversationContent completedRuns={new Set(['run:first', 'run:second'])} artifacts={[]} onDisplayed={() => {}}
+        hasConversationContent displaySettledRunIds={new Set(['run:first', 'run:second'])} artifacts={[]} onDisplayed={() => {}}
         conversationItems={items} draftItems={[]} presentation={presentation} viewport={viewport}
         openWorkspaceResource={async () => {}} setUiActionError={setError} canEditMessage={composer.canEditMessage} onEditMessage={composer.beginMessageEdit} />
     </div></div><ConversationComposer language={language} composer={composer} uiActionError={error} /></main>

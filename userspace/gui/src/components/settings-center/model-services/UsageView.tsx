@@ -2,11 +2,12 @@ import { useEffect, useMemo, useState } from 'react';
 import type { ConnectionSummary, UsageQuery, UsageReport, UsageBucket } from '@deepcode/protocol';
 import { queryModelUsage } from '../../../services/apiClient';
 import { UiSettingsContributions, useDisplayTheme } from '../../../ui-plugins/UiPlugins';
-import { Cost, data, Hint, message, money, periodQuery, useModelLanguage } from './shared';
+import { Cost, data, Hint, message, useMoneyFormatter, periodQuery, useModelLanguage } from './shared';
 
 export default function UsageView({ connections, initialConnection }: { connections: ConnectionSummary[]; initialConnection?: string }) {
   const { text, language } = useModelLanguage();
   const theme = useDisplayTheme();
+  const money = useMoneyFormatter();
   const [connectionId, setConnectionId] = useState(initialConnection ?? '');
   const [days, setDays] = useState(30);
   const [day, setDay] = useState<UsageBucket | null>(null);

@@ -370,6 +370,9 @@ test('document Plan scope and completed artifacts pass through Session to the GU
   await actor.submit(messageCommand(sessionId, 'command:document-start', 'Render a report.'));
   const waiting = await waitForProjection(actor, (value) => value.pendingPlan !== null);
   assert.equal(waiting.pendingPlan.mutationManifest[0].operation, 'document.render');
+  const { planOperationDetail } = await loadGuiModule(t, '/src/components/local-agent/planReview.ts');
+  assert.equal(planOperationDetail(waiting.pendingPlan.mutationManifest[0], 'zh-CN'), '生成文档 · 报告.pdf');
+  assert.equal(planOperationDetail(waiting.pendingPlan.mutationManifest[0], 'en-US'), 'Render document · 报告.pdf');
   await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'plan.respond', commandId: 'command:document-confirm', sessionId,
     runId: waiting.run.runId, planId: waiting.pendingPlan.planId, revision: waiting.pendingPlan.revision, response: { kind: 'confirm' } });
   const completed = await waitForProjection(actor, (value) => value.run?.status === 'completed');
@@ -830,7 +833,7 @@ test('last-call, per-run, and Session cache rates use their own input token tota
   }), null);
 });
 
-test('compaction owns last-call usage and an unreported next call clears it without losing Session totals', async (t) => {
+test('compaction preserves Agent usage and an unreported Agent call clears it without losing Session totals', async (t) => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:cache-latest';
   await createSession(journal, sessionId, [workspaceBinding]);
@@ -874,13 +877,13 @@ test('compaction owns last-call usage and an unreported next call clears it with
     value.run?.status === 'running' && callCount === 3
   ));
   assert.deepEqual(requests.map((request) => request.purpose), ['agent', 'contextCompaction', 'agent']);
-  assert.equal(waiting.contextUsage.providerRequestId, requests[1].requestId);
-  assert.equal(lastCallInputCacheMetric(waiting.contextUsage).hitPercent, 10);
+  assert.equal(waiting.contextUsage.providerRequestId, requests[0].requestId);
+  assert.equal(lastCallInputCacheMetric(waiting.contextUsage).hitPercent, 75);
   const compactedReceipt = waiting.contextCompositions.find((receipt) => (
     receipt.providerRequestId === waiting.contextUsage.providerRequestId
   ));
-  assert.equal(compactedReceipt.purpose, 'contextCompaction');
-  assert.equal(compactedReceipt.partitions.reduce((sum, part) => sum + part.estimatedInputTokens, 0), 200);
+  assert.equal(compactedReceipt.purpose, 'agent');
+  assert.equal(compactedReceipt.partitions.reduce((sum, part) => sum + part.estimatedInputTokens, 0), 100);
   assert.deepEqual(await decodeGuiProjection(waiting), waiting);
   releaseLastCall();
   const completed = await waitForProjection(actor, (value) => value.run?.status === 'completed');
@@ -1263,6 +1266,144 @@ test('GUI model settings remember effort per model across new conversations and 
   assert.equal(reopened.getState().reasoningEffortOverride, null);
 });
 
+test('combined model selection persists effort per model and new drafts inherit it', async (t) => {
+  let profiles = [
+    { id: 'profile:one', name: 'One', enabled: true, thinking: 'enabled' },
+    { id: 'profile:two', name: 'Two', enabled: true, thinking: 'enabled' },
+    { id: 'profile:off', name: 'Off', enabled: true, thinking: 'disabled' },
+  ];
+  let failSave = false;
+  installGuiFetch(t, async (url, init) => {
+    assert.equal(url.pathname, '/api/llm/profiles');
+    if (init.method === 'PATCH') {
+      if (failSave) return Response.json({ ok: false, error: 'fixture_preference_save_failed' });
+      const { profile } = JSON.parse(init.body);
+      profiles = profiles.map(item => item.id === profile.id ? profile : item);
+    }
+    return Response.json({ ok: true, data: { profiles, defaultProfileId: 'profile:one' } });
+  });
+  const store = await loadGuiModelStore(t);
+  await store.getState().refreshProfiles();
+  assert.equal(await store.getState().selectModel('profile:one', 'high'), true);
+  assert.equal(profiles[0].reasoningEffort, 'high');
+  store.getState().startNewSession();
+  assert.equal(store.getState().selectedProfileId, 'profile:one');
+  assert.equal(store.getState().reasoningEffortOverride, 'high');
+  assert.equal(await store.getState().selectModel('profile:two', 'low'), true);
+  store.getState().startNewSession('project:another');
+  assert.equal(store.getState().reasoningEffortOverride, 'high');
+  await store.getState().selectProfile('profile:two');
+  assert.equal(store.getState().reasoningEffortOverride, 'low');
+  const reopened = await loadGuiModelStore(t);
+  await reopened.getState().refreshProfiles();
+  assert.equal(reopened.getState().reasoningEffortOverride, 'high');
+  assert.equal(await reopened.getState().selectModel('profile:one', null), false);
+  assert.equal(reopened.getState().reasoningEffortOverride, 'high');
+  failSave = true;
+  assert.equal(await reopened.getState().selectModel('profile:one', 'max'), false);
+  assert.match(reopened.getState().error, /fixture_preference_save_failed/);
+  assert.equal(profiles[0].reasoningEffort, 'high');
+  assert.equal(reopened.getState().reasoningEffortOverride, 'high');
+  assert.equal(reopened.getState().modelSettingsBusy, false);
+  failSave = false;
+  assert.equal(await reopened.getState().selectModel('profile:off', null), true);
+  assert.equal(reopened.getState().reasoningEffortOverride, null);
+});
+
+test('composer accepts inherited effort and never enables a new run with a blank level', async (t) => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const [{ useLocalAgentStore: store }, { useAgentComposer }, { default: Selector }] = await loadGuiModules(t, [
+    '/src/state/localAgentStore.ts', '/src/components/local-agent/useAgentComposer.ts',
+    '/src/components/local-agent/SessionModelSelector.tsx',
+  ]);
+  const previousStorage = globalThis.sessionStorage;
+  globalThis.sessionStorage = { getItem: () => JSON.stringify({ draft: 'Continue', pastedTexts: [], filesystemPaths: [], pluginSelections: [] }) };
+  t.after(() => { if (previousStorage === undefined) delete globalThis.sessionStorage; else globalThis.sessionStorage = previousStorage; });
+  const profiles = [
+    { id: 'profile:one', name: 'One', enabled: true, thinking: 'enabled', reasoningEffort: 'high' },
+    { id: 'profile:two', name: 'Two', enabled: true, thinking: 'enabled' },
+    { id: 'profile:off', name: 'Off', enabled: true, thinking: 'disabled' },
+  ];
+  store.setState({ profiles, defaultProfileId: 'profile:one' });
+  store.getState().startNewSession();
+  let composer;
+  function Probe() { composer = useAgentComposer('zh-CN', () => {}); return null; }
+  const render = () => {
+    // Zustand's server snapshot is captured by its internal API.
+    Object.assign(store.getInitialState(), store.getState());
+    renderToStaticMarkup(createElement(Probe));
+    return renderToStaticMarkup(createElement(Selector, { language: 'zh-CN', profiles,
+      selectedProfileId: composer.selectedProfileId, reasoningEffortOverride: composer.reasoningEffortOverride,
+      contextUsage: null, contextCompositions: [], confirmed: composer.modelSelectionConfirmed, onSelect: composer.selectModel }));
+  };
+  assert.match(render(), /One · 高/);
+  assert.equal(composer.canSend, true, 'inherited settings need no per-conversation confirmation');
+  store.getState().startNewSession('project:another');
+  render();
+  assert.equal(composer.canSend, true);
+  store.setState({ selectedProfileId: 'profile:two', reasoningEffortOverride: null,
+    sessionId: 'session:existing', projection: { plans: [], modelSettings: { profileId: 'profile:two', reasoningEffortOverride: null } } });
+  assert.match(render(), /Two · 选择强度/);
+  assert.equal(composer.canSend, false, 'a saved Session binding with no effort is not an explicit level');
+  store.setState({ selectedProfileId: 'profile:off', reasoningEffortOverride: null });
+  assert.match(render(), /Off · 不适用/);
+  assert.equal(composer.canSend, true);
+  const label = renderToStaticMarkup(createElement(Selector, { language: 'en-US', profiles,
+    selectedProfileId: 'profile:two', reasoningEffortOverride: null, confirmed: true,
+    contextUsage: null, contextCompositions: [], onSelect: async () => {} }));
+  assert.match(label, /Two · Choose level/, 'even an inconsistent caller cannot render a blank level');
+});
+
+test('plan confirmation resumes the real viewport once and does not lock it during the reply', async (t) => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const [{ useLocalAgentStore: store }, { useAgentComposer }, { useConversationViewport }] = await loadGuiModules(t, [
+    '/src/state/localAgentStore.ts', '/src/components/local-agent/useAgentComposer.ts',
+    '/src/components/local-agent/useConversationViewport.ts',
+  ]);
+  const previousWindow = globalThis.window, previousStorage = globalThis.sessionStorage;
+  const frames = new Map(); let frameId = 0;
+  globalThis.window = { requestAnimationFrame(fn) { frames.set(++frameId, fn); return frameId; }, cancelAnimationFrame(id) { frames.delete(id); } };
+  globalThis.sessionStorage = { getItem: () => null };
+  t.after(() => {
+    if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow;
+    if (previousStorage === undefined) delete globalThis.sessionStorage; else globalThis.sessionStorage = previousStorage;
+  });
+  const flush = () => { const pending = [...frames.values()]; frames.clear(); pending.forEach(fn => fn()); };
+  let release;
+  const reply = new Promise(resolve => { release = resolve; });
+  const projection = { sessionId: 'session:confirm', plans: [], pendingPlan: { planId: 'plan:confirm', revision: 1 } };
+  store.setState({ sessionId: projection.sessionId, projection, respondPlan: async () => reply });
+  Object.assign(store.getInitialState(), store.getState());
+  let composer, viewport;
+  function Probe() {
+    viewport = useConversationViewport({ sessionId: projection.sessionId, loading: false, projection,
+      presentationLayoutKey: '', assistantDraftLayoutKey: '', timelineExtentKey: '' });
+    composer = useAgentComposer('zh-CN', viewport.setLatestFollowMode);
+    return null;
+  }
+  renderToStaticMarkup(createElement(Probe));
+  const body = { scrollTop: 600, scrollHeight: 1600, clientHeight: 500,
+    querySelectorAll: () => [], getBoundingClientRect: () => ({ top: 0 }) };
+  viewport.bodyRef.current = body;
+  viewport.setLatestFollowMode(false);
+  const confirmation = composer.submitPlanDecision({ kind: 'confirm' });
+  viewport.preserveReadingPosition(); flush();
+  assert.equal(body.scrollTop, 1100, 'confirmation resumes from a detached history position before the reply');
+  viewport.bodyHandlers.onWheel({ target: body, deltaY: -200 });
+  body.scrollTop = 900;
+  viewport.bodyHandlers.onScroll({ target: body, currentTarget: body });
+  release(); await confirmation;
+  body.scrollHeight += 300;
+  viewport.preserveReadingPosition(); flush();
+  assert.equal(body.scrollTop, 900, 'a late reply and further output do not override subsequent reader intent');
+  await composer.submitPlanDecision({ kind: 'cancel' });
+  body.scrollHeight += 100;
+  viewport.preserveReadingPosition(); flush();
+  assert.equal(body.scrollTop, 900, 'cancel does not force latest');
+});
+
 test('starting a draft during initialization preserves navigation and still loads usable model configuration', async (t) => {
   let releaseCatalog;
   const catalogReady = new Promise((resolve) => { releaseCatalog = resolve; });
@@ -1637,7 +1778,7 @@ test('Plan documents and previews render Markdown entities, code names and verif
   const { default: PlanCard, PlanCardContent } = await loadGuiModule(t, '/src/components/local-agent/PlanCard.tsx');
   const { PlanPreviewCard, PlanPreviewContent } = await loadGuiModule(t, '/src/components/local-agent/PlanPreviewCard.tsx');
   const { MarkdownInline } = await loadGuiModule(t, '/src/components/local-agent/BufferedMarkdown.tsx');
-  const { ComposerDecisionPanels } = await loadGuiModule(t, '/src/components/local-agent/ComposerDecisionPanels.tsx');
+  const { ComposerDecisionPanels, ComposerQuestionPrompt } = await loadGuiModule(t, '/src/components/local-agent/ComposerDecisionPanels.tsx');
   const [{ InteractionReplyQuote }, { ConversationVirtualRow }, { ConversationLayoutCache, ConversationVirtualizer }] = await loadGuiModules(t, [
     '/src/components/local-agent/ConversationTranscript.tsx',
     '/src/components/local-agent/ConversationVirtualRow.tsx',
@@ -1692,14 +1833,15 @@ test('Plan documents and previews render Markdown entities, code names and verif
   const collapsed = renderToStaticMarkup(createElement(PlanCard, { plan: { ...plan, status: 'confirmed' }, active: true, language: 'zh-CN' }));
   assert.equal(collapsed.includes('&amp;lt;'), false);
   assert.ok(collapsed.includes('aria-expanded="false"'));
-  const initialDecision = renderToStaticMarkup(createElement(ComposerDecisionPanels, { language: 'zh-CN', composer: {
+  const Decision = props => createElement('div', null, createElement(ComposerQuestionPrompt, props), createElement(ComposerDecisionPanels, props));
+  const initialDecision = renderToStaticMarkup(createElement(Decision, { language: 'zh-CN', composer: {
     pendingPlan: plan, pendingScopeAddition: null, submitting: false,
   } }));
   assert.ok(initialDecision.includes('ObjectPool&lt;T,N&gt;'));
   assert.ok(initialDecision.includes('确认执行'));
   assert.equal(initialDecision.includes('互斥访问'), false, 'the complete Plan body belongs only to its document card');
   const prompt = '保留 **容器环境** 吗？\n\n- 保留 `Dockerfile`\n- 删除演示产物';
-  const question = renderToStaticMarkup(createElement(ComposerDecisionPanels, { language: 'zh-CN', composer: {
+  const question = renderToStaticMarkup(createElement(Decision, { language: 'zh-CN', composer: {
     pendingInteraction: { prompt, allowFreeform: true, options: [{ id: 'keep', label: '**保留**环境', description: '保留 `Makefile`，参见[说明](https://example.com)。' }] },
     textareaRef: { current: null }, draft: '',
     submitting: true,
@@ -2605,13 +2747,13 @@ test('GUI consumes Session-normalized tool errors and record-local detail failur
     if (++executions === 1) {
       reply.record.outcome = 'denied';
       delete reply.record.output;
-      reply.record.error = { code: 'plan_scope_required', message: 'Original refusal.', operation: 'fs.delete', targets: ['logs'] };
+      reply.record.error = { code: 'plan_scope_required', message: 'Original refusal.' };
     }
     return reply;
   } }), fakeRunPreparation({ tools: [{
     toolBindingRef: 'tool-binding:read:g1', name: 'fs.read', description: 'Read a file.',
     inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } },
-    possibleEffects: ['read'], availability: 'callable', origin: 'coreBuiltin',
+    possibleEffects: ['workspaceRead'], availability: 'callable', origin: 'coreBuiltin',
   }] }).port, 'projection-details');
   t.after(() => actor.dispose());
   await actor.submit(messageCommand(sessionId, 'command:projection-details', 'Inspect files.'));
@@ -2966,6 +3108,40 @@ test('UI update detection compares entry resources and retains the original load
   assert.equal(notifications, 1);
 });
 
+test('interface refresh preserves view state and leaves unsaved settings for the user', async (t) => {
+  const previous = { window: globalThis.window, sessionStorage: globalThis.sessionStorage };
+  const saved = new Map();
+  const scheduled = [];
+  let reloads = 0;
+  globalThis.sessionStorage = { getItem: key => saved.get(key) ?? null, removeItem: key => saved.delete(key), setItem: (key, value) => saved.set(key, value) };
+  globalThis.window = { setTimeout: callback => scheduled.push(callback), location: { reload: () => reloads++ } };
+  t.after(() => {
+    for (const key of Object.keys(previous)) {
+      if (previous[key] === undefined) delete globalThis[key]; else globalThis[key] = previous[key];
+    }
+  });
+  const { refreshInterface, registerInterfaceReloadGuard, registerInterfaceReloadView } = await loadGuiModule(t, '/src/services/interfaceReload.ts');
+  let guard = { label: 'External tool connection', busy: false };
+  const releaseGuard = registerInterfaceReloadGuard(() => guard);
+  const importGuard = { label: 'Import theme', busy: false };
+  const releaseImport = registerInterfaceReloadGuard(() => importGuard);
+  const releaseView = registerInterfaceReloadView('reader', () => ({ previewId: 'preview-7', scroll: 42 }));
+  t.after(() => { releaseGuard(); releaseImport(); releaseView(); });
+  assert.deepEqual(refreshInterface(), { status: 'needsUser', guards: [guard, importGuard] });
+  guard = { ...guard, busy: true };
+  assert.deepEqual(refreshInterface(), { status: 'needsUser', guards: [guard, importGuard] });
+  releaseImport();
+  assert.deepEqual(refreshInterface(), { status: 'needsUser', guards: [guard] });
+  assert.equal(saved.size, 0);
+  assert.equal(scheduled.length, 0);
+  releaseGuard();
+  assert.deepEqual(refreshInterface(), { status: 'scheduled', guards: [] });
+  assert.deepEqual(JSON.parse(saved.get('deepcode:interface-reload')), { reader: { previewId: 'preview-7', scroll: 42 } });
+  assert.equal(reloads, 0);
+  scheduled.shift()();
+  assert.equal(reloads, 1);
+});
+
 test('custom light and dark palettes persist through the shared settings owner and reset independently', async (t) => {
   const [{ useSettingsStore }, palette] = await loadGuiModules(t, ['/src/state/settingsStore.ts', '/src/theme/palette.ts']);
   let persisted = { 'gui.colorTheme': 'system', 'gui.accentColor': 'purple' };
@@ -3137,6 +3313,89 @@ test('startup opens a new draft even when history exists, and status failure doe
 });
 
 
+test('usage widget dismisses details on outside pointerdown without closing on internal actions', async (t) => {
+  const { default: plugin } = await import('../src/ui-plugins/builtinUsage.mjs');
+  const { usageWidgetLabels } = await loadGuiModule(t, '/src/ui-plugins/usageWidgetLabels.ts');
+  class Element {
+    children = []; dataset = {}; hidden = false; attrs = {}; clientWidth = 800; clientHeight = 600;
+    style = { setProperty() {} };
+    append(...children) { for (const child of children) { child.parentElement = this; this.children.push(child); } }
+    replaceChildren() { this.children = []; }
+    setAttribute(key, value) { this.attrs[key] = value; }
+    addEventListener() {}
+    contains(target) { return this === target || this.children.some(child => child.contains(target)); }
+    querySelectorAll(selector) {
+      const classes = selector.split(',').map(value => value.slice(1));
+      return this.children.flatMap(child => [...(classes.includes(child.className) ? [child] : []), ...child.querySelectorAll(selector)]);
+    }
+    getBoundingClientRect() { return { left: 0, top: 0, width: 200, height: 80 }; }
+    remove() { this.parentElement.children = this.parentElement.children.filter(child => child !== this); }
+  }
+  const listeners = new Map();
+  let view, disposed = false;
+  const old = { document: globalThis.document, window: globalThis.window, ResizeObserver: globalThis.ResizeObserver };
+  globalThis.document = {
+    createElement: () => new Element(),
+    addEventListener(type, listener, capture = false) { listeners.set(type, { listener, capture }); },
+    removeEventListener(type, listener, capture = false) {
+      assert.deepEqual(listeners.get(type), { listener, capture }); listeners.delete(type);
+    },
+  };
+  globalThis.window = { addEventListener() {}, removeEventListener() {} };
+  globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+  t.after(() => {
+    try { if (view && !disposed) view.dispose(); }
+    finally { for (const [key, value] of Object.entries(old)) { if (value === undefined) delete globalThis[key]; else globalThis[key] = value; } }
+  });
+  let mount;
+  plugin.apply({ addStyle() {}, register(slot, renderer) { assert.equal(slot, 'usage.widget'); mount = renderer; } });
+  const container = new Element(), changes = [];
+  let input = { visibility: 'summary', expanded: true, locale: 'zh-CN', revision: 0, modelId: 'codex',
+    labels: usageWidgetLabels('zh-CN'), costDisplay: { currency: 'USD', usdRate: 1 },
+    connection: { id: 'connection:quota', name: 'Codex', billingMode: 'subscription' } };
+  let reads = 0;
+  view = mount(container, input, { signal: new AbortController().signal,
+    quota: { async read() { reads++; return { windows: [{ label: 'Codex', usedPercent: 21, windowDurationSeconds: 300 }] }; } },
+    actions: { setExpanded(value) { changes.push(value); input = { ...input, expanded: value }; view.update(input); },
+      setUsageVisibility() { assert.fail('outside dismissal must not hide the summary or change its preference'); } },
+  });
+  await Promise.resolve();
+  const root = container.children[0];
+  const pointer = target => listeners.get('pointerdown').listener({ target });
+  assert.equal(listeners.get('pointerdown').capture, true, 'dismissal also observes outside controls that stop bubbling');
+  assert.equal(root.querySelectorAll('.dc-usage__details').length, 1);
+  let detail = root.querySelectorAll('.dc-usage__details')[0];
+  pointer(detail);
+  assert.deepEqual(changes, [], 'inside details are not an outside click');
+  const refresh = detail.children.find(child => child.textContent === '刷新');
+  pointer(refresh); refresh.onclick(); await Promise.resolve();
+  assert.equal(reads, 2);
+  assert.equal(root.querySelectorAll('.dc-usage__details').length, 1, 'refresh keeps the details open');
+  input = { ...input, locale: 'en-US', labels: usageWidgetLabels('en-US') }; view.update(input);
+  assert.ok(root.querySelectorAll('.dc-usage__details')[0].children.some(child => child.textContent === 'Refresh'));
+  assert.equal(root.querySelectorAll('.dc-usage__details')[0].children.some(child => child.textContent === '刷新'), false);
+  assert.equal(reads, 2, 'language changes redraw without another quota request');
+  pointer(new Element());
+  assert.deepEqual(changes, [false]);
+  assert.equal(root.querySelectorAll('.dc-usage__details').length, 0);
+  assert.equal(root.querySelectorAll('.dc-usage__summary').length, 1, 'outside click restores the summary card');
+  pointer(new Element());
+  assert.deepEqual(changes, [false], 'collapsed details do not emit repeated updates');
+  root.querySelectorAll('.dc-usage__body')[0].onclick();
+  assert.equal(root.querySelectorAll('.dc-usage__details').length, 1, 'the card can be reopened');
+  root.oncontextmenu({ preventDefault() {} });
+  assert.equal(root.querySelectorAll('.dc-usage__menu').length, 1);
+  pointer(new Element());
+  assert.equal(root.querySelectorAll('.dc-usage__menu').length, 0);
+  assert.equal(root.querySelectorAll('.dc-usage__details').length, 0, 'closing an outside menu does not expose stale expanded details');
+  root.querySelectorAll('.dc-usage__body')[0].onclick();
+  listeners.get('keydown').listener({ key: 'Escape' });
+  assert.equal(root.querySelectorAll('.dc-usage__details').length, 0);
+  view.dispose(); disposed = true;
+  assert.equal(listeners.size, 0, 'capture listeners and existing drag listeners are all removed');
+  assert.equal(container.children.length, 0);
+});
+
 test('settings contributions compose while tool renderers match their declared operation', async (t) => {
   const { UiPluginRuntime } = await loadGuiModule(t, '/src/ui-plugins/runtime.ts');
   const runtime = new UiPluginRuntime(async source => ({ apply(ctx) {
@@ -3166,8 +3425,11 @@ test('image attachments reach the Provider as bound visual inputs without embedd
     logicalPath:'picture.png',displayName:'picture.png',kind:'file',mediaType:'image/png',byteLength:100 }];
   await actor.submit(command);
   const projection = await waitForProjection(actor, value => value.run?.status === 'completed');
-  assert.deepEqual(request.messages.find(item => item.role === 'user').images,
+  assert.equal(request.messages.find(item => item.role === 'user').images, undefined);
+  assert.match(request.messages.find(item => item.role === 'user').content, /reference:image/);
+  assert.deepEqual(request.messages.at(-1).images,
     [{workspaceId:workspaceBinding.workspaceId,logicalPath:'picture.png',mediaType:'image/png'}]);
+  assert.match(request.messages.at(-1).content, /Current visual inputs/);
   assert.deepEqual(projection.messages[0].filesystemReferences, command.filesystemReferences);
 });
 
@@ -3285,4 +3547,239 @@ test('browser geometry clips to the viewport rather than shifting a full-width s
   const { clippedBrowserBounds } = await loadGuiModule(t, '/src/components/local-agent/nativeBrowserLayout.ts');
   assert.deepEqual(clippedBrowserBounds({ x: -20, y: 50, width: 900, height: 600 }, 800, 620), { x: 0, y: 50, width: 800, height: 570 });
   assert.deepEqual(clippedBrowserBounds({ x: 250, y: 120, width: 950, height: 580 }, 1200, 700), { x: 250, y: 120, width: 950, height: 580 });
+});
+
+test('browser page subscription retains updates during the initial snapshot and releases its listener', async t => {
+  const previousWindow = globalThis.window, previousDocument = globalThis.document;
+  t.after(() => { globalThis.window = previousWindow; globalThis.document = previousDocument; });
+  let receive, resolveList, unsubscribed = 0;
+  const snapshots = [], commands = [];
+  globalThis.document = { documentElement: { dataset: { product: 'deepcode-gui' } } };
+  globalThis.window = { __TAURI__: {
+    core: { invoke: async (command, input) => {
+      commands.push({ command, input });
+      assert.ok(receive, 'events must be subscribed before requesting the snapshot');
+      return new Promise(resolve => { resolveList = resolve; });
+    } },
+    event: { listen: async (_, listener) => { receive = listener; return () => { unsubscribed++; receive = null; }; } },
+  } };
+  const { watchNativePages } = await loadGuiModule(t, '/src/services/nativeBrowser.ts');
+  const binding = { hostInstanceId: 'host:reader', windowLabel: 'main', sessionId: 'session:reader' };
+  const page = (previewId, status = 'ready') => ({ ...binding, previewId, status, url: 'file:///preview.html' });
+  const ready = watchNativePages(binding, pages => snapshots.push(pages));
+  await waitUntil(() => Boolean(resolveList));
+  receive({ payload: page('closed', 'closed') });
+  receive({ payload: page('new', 'loading') });
+  receive({ payload: { ...page('foreign'), sessionId: 'session:other' } });
+  resolveList({ pages: [page('closed'), page('original')] });
+  const dispose = await ready;
+  t.after(() => { if (receive) dispose(); });
+  assert.deepEqual(snapshots.at(-1).map(page => [page.previewId, page.status]), [['original', 'ready'], ['new', 'loading']]);
+  receive({ payload: page('new') });
+  assert.equal(snapshots.at(-1).find(page => page.previewId === 'new').status, 'ready');
+  receive({ payload: page('original', 'closed') });
+  assert.deepEqual(snapshots.at(-1).map(page => page.previewId), ['new']);
+  assert.deepEqual(commands[0], { command: 'deepcode_browser_command', input: { binding, input: { action: 'list' } } });
+  dispose();
+  assert.equal(unsubscribed, 1);
+  assert.equal(receive, null);
+});
+
+test('Reader discovers Agent pages while preserving manual selection and panel state', async t => {
+  const { reconcileReaderPages } = await loadGuiModule(t, '/src/components/local-agent/readerState.ts');
+  const page = previewId => ({ previewId, sessionId: 'session:reader', status: 'ready', url: `file:///${previewId}.html` });
+  const file = { id: 'file:source', target: { kind: 'file', path: '/source.ts' } };
+  const initial = { sessionId: 'session:reader', tabs: [file], activeId: file.id, visible: false, expanded: false };
+  const discovered = reconcileReaderPages(initial, [page('preview-1'), { ...page('other'), sessionId: 'session:other' }]);
+  assert.deepEqual(discovered.tabs.map(tab => tab.id), ['file:source', 'browser:preview-1']);
+  assert.equal(discovered.activeId, file.id);
+  assert.equal(discovered.visible, false);
+  const selected = { ...discovered, activeId: 'browser:preview-1', visible: true, expanded: true };
+  const updated = reconcileReaderPages(selected, [page('preview-1'), page('preview-20')]);
+  assert.equal(updated.activeId, 'browser:preview-1');
+  assert.equal(updated.expanded, true);
+  assert.deepEqual(updated.tabs.map(tab => tab.id), ['file:source', 'browser:preview-1', 'browser:preview-20']);
+  const closed = reconcileReaderPages(updated, [page('preview-20')]);
+  assert.equal(closed.activeId, null, 'a closed page is not silently replaced by another one');
+  const empty = { ...initial, tabs: [], activeId: null };
+  assert.equal(reconcileReaderPages(empty, [page('preview-20')], { kind: 'browser', previewId: 'preview-20' }).activeId, 'browser:preview-20');
+  assert.equal(reconcileReaderPages(empty, [page('preview-20')], { kind: 'browser', previewId: 'closed' }).activeId, null);
+});
+
+test('queued tools and permission review never claim that execution has started', async (t) => {
+  const [{ toolActivitySummary, toolGroupSummary }, { ApprovalActivity }, { ApprovalOperationDetails }] = await loadGuiModules(t, [
+    '/src/components/local-agent/ToolActivityDetails.tsx', '/src/components/local-agent/ApprovalActivity.tsx',
+    '/src/components/local-agent/ApprovalOperationDetails.tsx',
+  ]);
+  const tool = { activityId: 'tool:queued', kind: 'tool', status: 'requested', label: 'bash', runId: 'run:test', sequence: 1,
+    tool: { operation: 'bash', resources: [], shell: { command: 'git status', cwd: '/project', executionScope: 'workspace', terminal: false } } };
+  assert.match(toolActivitySummary(tool, 'zh-CN'), /已请求/);
+  assert.doesNotMatch(toolActivitySummary(tool, 'zh-CN'), /正在运行|已运行/);
+  assert.match(toolActivitySummary({ ...tool, status: 'waiting' }, 'zh-CN'), /等待中/);
+  assert.match(toolActivitySummary({ ...tool, status: 'active' }, 'zh-CN'), /正在运行/);
+  const mixed = toolGroupSummary([{ ...tool, status: 'active' }, tool, tool, tool], 'zh-CN');
+  assert.match(mixed, /4 个工具/);
+  assert.match(mixed, /调用中 1/);
+  assert.match(mixed, /已请求 3/);
+  assert.doesNotMatch(mixed, /正在调用 4/);
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const renderApproval = reviewing => renderToStaticMarkup(createElement(ApprovalActivity, {
+    activity: { ...tool, kind: 'approval', status: 'waiting' }, pending: true, reviewing, language: 'zh-CN', onExpand() {},
+  }));
+  assert.match(renderApproval(true), /模型正在审查权限/);
+  assert.match(renderApproval(false), /等待你决定/);
+  const details = renderToStaticMarkup(createElement(ApprovalOperationDetails, { language: 'zh-CN', preview: {
+    summary: 'Inspect git status', effects: ['shell'], logicalTargets: ['workspace'],
+    operation: { toolName: 'bash', arguments: { command: 'git status' }, workspaceRoot: '/project', executionScope: 'workspace' },
+  } }));
+  assert.match(details, /git status/);
+  assert.match(details, /\/project/);
+  assert.match(details, /workspace/);
+});
+
+test('failure details count retries within each model request and retain source links', async (t) => {
+  const [{ groupProviderAttempts, RunFailureDetails }, { SourceReferences }] = await loadGuiModules(t, [
+    '/src/components/local-agent/RunFailureDetails.tsx', '/src/components/local-agent/SourceReferences.tsx',
+  ]);
+  const attempts = Array.from({ length: 6 }, (_, index) => ({ providerRequestId: `request:${index}`, providerAttemptId: `attempt:${index}`,
+    attempt: 1, purpose: index === 2 ? 'approvalReview' : 'agent', phase: index === 5 ? 'failed' : 'completed' }));
+  assert.equal(groupProviderAttempts(attempts).length, 6);
+  assert.equal(groupProviderAttempts(attempts).reduce((sum, group) => sum + group.retries, 0), 0);
+  const repeated = [...attempts, { ...attempts[5], providerAttemptId: 'attempt:retry', attempt: 2 }];
+  assert.equal(groupProviderAttempts(repeated).at(-1).retries, 1);
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const error = { code: 'provider_failed', message: 'Original upstream message' };
+  const html = renderToStaticMarkup(createElement(RunFailureDetails, { language: 'zh-CN', onError() {}, projection: {
+    sessionId: 'session:failure', run: { runId: 'run:test', status: 'failed' }, terminalError: error, providerAttempts: attempts,
+    failureSnapshot: { revision: 1, phase: 'provider', error, providerRequestId: 'request:5', providerAttemptIds: attempts.map(a => a.providerAttemptId), toolRecordIds: [], pendingCallIds: [] },
+  } }));
+  assert.match(html, /6 个模型请求，发送 6 次/);
+  assert.match(html, /权限审查/);
+  assert.doesNotMatch(html, /重试 6 次/);
+  const source = renderToStaticMarkup(createElement(SourceReferences, { language: 'zh-CN', references: {
+    citations: [{ title: 'Actual documentation', url: 'https://example.test/docs' }], unresolved: true,
+  } }));
+  assert.match(source, /href="https:\/\/example.test\/docs"/);
+  assert.match(source, /Actual documentation/);
+  assert.match(source, /部分引用来源未返回/);
+});
+
+test('workbench control examples use region data and Host actions while retaining Reader content', async t => {
+  const { default: plugin } = await import('../../../ui-plugins/workbench-controls/index.mjs');
+  class Element {
+    children = []; style = {}; attributes = {};
+    append(...children) { for (const child of children) { child.parentElement = this; this.children.push(child); } }
+    replaceChildren(...children) { this.children = []; this.append(...children); }
+    setAttribute(name, value) { this.attributes[name] = value; }
+    remove() { this.parentElement.children = this.parentElement.children.filter(child => child !== this); }
+  }
+  const oldDocument = globalThis.document;
+  globalThis.document = { createElement() { return new Element(); } };
+  const views = [], mounts = new Map(), calls = [];
+  t.after(() => {
+    for (const view of views) view.dispose();
+    if (oldDocument === undefined) delete globalThis.document; else globalThis.document = oldDocument;
+  });
+  plugin.apply({ addStyle() {}, register(slot, mount) { mounts.set(slot, mount); } });
+  const input = data => ({ kind: 'region', data, locale: 'en-US' });
+  const readerContent = new Element();
+  const header = new Element();
+  views.push(mounts.get('conversation.header')(header, input({ kind: 'conversationHeader', title: 'Current conversation',
+    project: { id: 'project:one', title: 'Project' }, reader: { canOpen: true, visible: false } }), {
+    regions: { mount(name, target) { assert.equal(name, 'reader'); target.append(readerContent); } },
+    actions: { toggleReader() { calls.push('reader'); } },
+  }));
+  assert.equal(header.children[0].children[0].textContent, 'Current conversation');
+  header.children[0].children[1].onclick();
+  assert.equal(header.children[1], readerContent);
+  views[0].update(input({ kind: 'conversationHeader', title: 'Renamed', project: null, reader: { canOpen: false, visible: true } }));
+  assert.equal(header.children[0].children[0].textContent, 'Renamed');
+  assert.equal(header.children[0].children[1].disabled, true);
+  assert.equal(header.children[1], readerContent, 'updates retain the existing Reader portal target');
+
+  const navigation = new Element();
+  const navigationData = { kind: 'settingsNavigation', pages: [{ id: 'gui', label: 'Appearance' }, { id: 'agent', label: 'Agent' }], activePage: 'gui', searchQuery: '' };
+  views.push(mounts.get('settings.navigation')(navigation, input(navigationData), { actions: {
+    selectSettingsPage(id) { calls.push(['page', id]); }, setSettingsSearch(query) { calls.push(['search', query]); },
+  } }));
+  const [search, pages] = navigation.children[0].children;
+  pages.children[1].onclick(); search.value = 'model'; search.oninput();
+  views[1].update(input({ ...navigationData, searchQuery: 'model' }));
+  assert.equal(navigation.children[0].children[0], search, 'search keeps its input node through owner updates');
+  assert.equal(pages.children[0].attributes['aria-current'], undefined);
+
+  const tree = new Element();
+  views.push(mounts.get('reader.tree')(tree, input({ kind: 'resourceTree', filter: '', showRuntime: false, watchError: 'Original watch failure', items: [
+    { id: 'directory:one', name: 'src', kind: 'directory', depth: 0, expanded: false, selected: false },
+    { id: 'file:one', name: 'app.ts', kind: 'file', depth: 1, expanded: false, selected: true },
+    { id: 'unavailable:one', name: 'Unavailable', kind: 'unavailable', depth: 1, error: 'Original read failure' },
+  ] }), { actions: {
+    setTreeFilter(value) { calls.push(['filter', value]); }, setTreeRuntimeVisible(value) { calls.push(['runtime', value]); },
+    setTreeItemExpanded(id, value) { calls.push(['expand', id, value]); }, openTreeItem(id) { calls.push(['open', id]); },
+  } }));
+  const [filter, error, items, runtimeLabel] = tree.children[0].children;
+  assert.equal(error.textContent, 'Original watch failure');
+  items.children[0].onclick(); items.children[1].onclick();
+  assert.equal(items.children[2].disabled, true);
+  assert.equal(items.children[2].title, 'Original read failure');
+  filter.value = 'app'; filter.oninput();
+  runtimeLabel.children[0].checked = true; runtimeLabel.children[0].onchange();
+  assert.deepEqual(calls, ['reader', ['page', 'agent'], ['search', 'model'], ['expand', 'directory:one', true],
+    ['open', 'file:one'], ['filter', 'app'], ['runtime', true]]);
+  for (const view of views.splice(0)) view.dispose();
+  assert.deepEqual(header.children, [readerContent], 'scope owns the preserved Reader region');
+  assert.equal(navigation.children.length, 0); assert.equal(tree.children.length, 0);
+});
+
+test('the context indicator renders shared Agent usage on each fresh mount', async (t) => {
+  const { ContextUsageControl } = await loadGuiModule(t, '/src/components/local-agent/ContextUsageControl.tsx');
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const props = { language: 'zh-CN', contextUsage: {
+    providerRequestId: 'provider-request:agent', providerRuntimeRef: 'provider-runtime:main',
+    runId: 'run:one', sequence: 1, updatedAt: '2026-09-23T00:00:00.000Z',
+    inputTokens: 156863, outputTokens: 40, contextWindowTokens: 1000000,
+  }, contextCompositions: [], contextOpen: false, setContextOpen() {}, rootRef: { current: null }, onToggle() {} };
+  const first = renderToStaticMarkup(createElement(ContextUsageControl, props));
+  assert.match(first, /16%/);
+  assert.equal(renderToStaticMarkup(createElement(ContextUsageControl, props)), first);
+  const unavailable = renderToStaticMarkup(createElement(ContextUsageControl, { ...props, contextUsage: null }));
+  assert.doesNotMatch(unavailable, /16%/);
+});
+
+test('usage costs follow the saved display currency while unpriced usage stays unknown', async (t) => {
+  const [{ Cost }, { useSettingsStore }] = await loadGuiModules(t, [
+    '/src/components/settings-center/model-services/shared.tsx', '/src/state/settingsStore.ts',
+  ]);
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const previous = { ...useSettingsStore.getInitialState() };
+  t.after(() => { Object.assign(useSettingsStore.getInitialState(), previous); useSettingsStore.setState(previous, true); });
+  const totals = { calls: 1, pricedCalls: 1, estimatedCost: 2 };
+  const render = () => renderToStaticMarkup(createElement(Cost, { totals }));
+  const setCurrency = currency => {
+    const effectiveSettings = { ...previous.effectiveSettings, 'workbench.language': 'en-US', 'gui.usageWidget.currency': currency };
+    Object.assign(useSettingsStore.getInitialState(), { effectiveSettings });
+    useSettingsStore.setState({ effectiveSettings });
+  };
+  setCurrency('USD'); assert.ok(render().includes('$2.00'));
+  setCurrency('CNY'); assert.ok(render().includes('14.00'));
+  assert.equal(totals.estimatedCost, 2, 'currency selection cannot rewrite recorded USD cost');
+  const unknown = renderToStaticMarkup(createElement(Cost, { totals: { calls: 1, pricedCalls: 0, estimatedCost: null } }));
+  assert.ok(unknown.includes('—')); assert.equal(unknown.includes('0.00'), false);
+});
+
+test('approval operation details include file access while automated review is pending', async (t) => {
+  const { ApprovalOperationDetails } = await loadGuiModule(t, '/src/components/local-agent/ApprovalOperationDetails.tsx');
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const html = renderToStaticMarkup(createElement(ApprovalOperationDetails, { language: 'en-US', preview: {
+    summary: 'Inspect container availability', approvalReviewer: 'agent', effects: ['shell'], logicalTargets: ['host'],
+    operation: { toolName: 'bash', workspaceRoot: '/workspace', executionScope: 'host', arguments: { command: 'docker ps' } },
+    fileAccess: { read: ['/Applications/DeepCode.app'], write: [] },
+  } }));
+  for (const fact of ['docker ps', '/workspace', 'host', '/Applications/DeepCode.app']) assert.ok(html.includes(fact));
+  assert.equal(html.includes('<button'), false, 'facts alone cannot approve an operation');
 });

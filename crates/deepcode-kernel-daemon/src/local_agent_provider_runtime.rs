@@ -36,6 +36,19 @@ impl ProviderRuntimeBinding {
     pub(crate) fn profile(&self) -> ResolvedLlmProfile {
         self.profile.clone()
     }
+
+    pub(crate) fn approval_reviewer(&self, effort: Option<&str>) -> Result<Self, String> {
+        let mut binding = self.clone();
+        if let Some(effort) = effort {
+            binding.profile = with_reasoning_override(binding.profile, Some(effort))?;
+            binding.snapshot.reasoning_effort = Some(effort.to_string());
+            binding.snapshot.reasoning_effort_override = Some(effort.to_string());
+        }
+        binding.snapshot.provider_runtime_ref = crate::utils::new_runtime_ref("provider-runtime")?;
+        binding.snapshot.hosted_web_search = "none";
+        binding.profile.hosted_web_search = None;
+        Ok(binding)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -58,7 +71,7 @@ impl ProviderRuntimeRegistry {
         run_id: &str,
         binding: ProviderRuntimeBinding,
     ) -> Result<(), String> {
-        let key = ProviderRunKey::new(session_id, run_id);
+        let key = ProviderRunKey::new(session_id, run_id, &binding.snapshot.provider_runtime_ref);
         let mut bindings = self.lock()?;
         if let Some(existing) = bindings.get(&key) {
             if existing.snapshot.provider_runtime_ref != binding.snapshot.provider_runtime_ref
@@ -87,7 +100,7 @@ impl ProviderRuntimeRegistry {
         {
             return Err("Provider runtime identity 无效。".to_string());
         }
-        let key = ProviderRunKey::new(session_id, run_id);
+        let key = ProviderRunKey::new(session_id, run_id, provider_runtime_ref);
         if let Some(binding) = self.lock()?.get(&key).cloned() {
             if binding.snapshot.provider_runtime_ref != provider_runtime_ref
                 || binding.snapshot.profile_id != profile_id
@@ -103,8 +116,8 @@ impl ProviderRuntimeRegistry {
     }
 
     pub(crate) fn release(&self, session_id: &str, run_id: &str) -> Result<(), String> {
-        let key = ProviderRunKey::new(session_id, run_id);
-        self.lock()?.remove(&key);
+        self.lock()?
+            .retain(|key, _| key.session_id != session_id || key.run_id != run_id);
         Ok(())
     }
 
@@ -127,13 +140,15 @@ impl ProviderRuntimeRegistry {
 struct ProviderRunKey {
     session_id: String,
     run_id: String,
+    provider_runtime_ref: String,
 }
 
 impl ProviderRunKey {
-    fn new(session_id: &str, run_id: &str) -> Self {
+    fn new(session_id: &str, run_id: &str, provider_runtime_ref: &str) -> Self {
         Self {
             session_id: session_id.to_string(),
             run_id: run_id.to_string(),
+            provider_runtime_ref: provider_runtime_ref.to_string(),
         }
     }
 }
@@ -209,7 +224,7 @@ fn with_reasoning_override(
     effort: Option<&str>,
 ) -> Result<ResolvedLlmProfile, String> {
     if let Some(effort) = effort {
-        if !matches!(effort, "low" | "medium" | "high" | "max") {
+        if !matches!(effort, "low" | "medium" | "high" | "xhigh" | "max") {
             return Err("对话推理强度无效。".to_string());
         }
         if profile.thinking.as_deref() == Some("disabled") {
@@ -224,10 +239,8 @@ fn with_reasoning_override(
 mod tests {
     use super::*;
 
-    #[test]
-    fn session_override_reaches_the_provider_body_without_mutating_the_profile_or_enabling_thinking(
-    ) {
-        let configured = ResolvedLlmProfile {
+    fn configured_profile() -> ResolvedLlmProfile {
+        ResolvedLlmProfile {
             connection: crate::model_connections::ModelConnection {
                 id: "connection:test".into(),
                 name: "Test".into(),
@@ -250,7 +263,92 @@ mod tests {
             thinking: Some("enabled".into()),
             hosted_web_search: None,
             api_key: None,
+        }
+    }
+
+    #[test]
+    fn reviewer_binding_is_independent_and_released_with_its_run() {
+        let profile = configured_profile();
+        let main = ProviderRuntimeBinding {
+            snapshot: ProviderRuntimeSnapshot {
+                provider_runtime_ref: "provider-runtime:main".into(),
+                profile_id: "profile:main".into(),
+                reasoning_effort: profile.reasoning_effort.clone(),
+                reasoning_effort_override: None,
+                thinking: profile.thinking.clone(),
+                context_window_tokens: 4096,
+                max_output_tokens: 2048,
+                api_surface: "responses",
+                hosted_web_search: "web_search",
+            },
+            profile,
         };
+        let reviewer = main.approval_reviewer(Some("low")).unwrap();
+        assert_ne!(
+            reviewer.snapshot.provider_runtime_ref,
+            main.snapshot.provider_runtime_ref
+        );
+        assert_eq!(
+            reviewer.snapshot.max_output_tokens,
+            main.snapshot.max_output_tokens
+        );
+        assert_eq!(
+            reviewer.profile.max_output_tokens,
+            main.profile.max_output_tokens
+        );
+        assert_eq!(reviewer.snapshot.hosted_web_search, "none");
+        assert_eq!(reviewer.profile.hosted_web_search, None);
+        assert_eq!(reviewer.profile.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(
+            reviewer.snapshot.reasoning_effort_override.as_deref(),
+            Some("low")
+        );
+        assert_eq!(main.profile.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(
+            main.approval_reviewer(None)
+                .unwrap()
+                .profile
+                .reasoning_effort
+                .as_deref(),
+            Some("max")
+        );
+        assert_eq!(main.snapshot.max_output_tokens, 2048);
+        let registry = ProviderRuntimeRegistry::default();
+        registry
+            .bind("session:model", "run:model", main.clone())
+            .unwrap();
+        registry
+            .bind("session:model", "run:model", reviewer.clone())
+            .unwrap();
+        for binding in [&main, &reviewer] {
+            assert!(registry
+                .resolve(
+                    "session:model",
+                    "run:model",
+                    &binding.snapshot.provider_runtime_ref,
+                    &binding.snapshot.profile_id,
+                    binding.snapshot.reasoning_effort_override.as_deref()
+                )
+                .is_ok());
+        }
+        registry.release("session:model", "run:model").unwrap();
+        for binding in [&main, &reviewer] {
+            assert!(registry
+                .resolve(
+                    "session:model",
+                    "run:model",
+                    &binding.snapshot.provider_runtime_ref,
+                    &binding.snapshot.profile_id,
+                    binding.snapshot.reasoning_effort_override.as_deref()
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn session_override_reaches_the_provider_body_without_mutating_the_profile_or_enabling_thinking(
+    ) {
+        let configured = configured_profile();
         let effective = with_reasoning_override(configured.clone(), Some("low")).unwrap();
         let body = crate::llm_transport::openai_compatible_request_body(
             &effective,
@@ -259,6 +357,14 @@ mod tests {
             true,
         );
         assert_eq!(body["reasoning_effort"], "low");
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            let effective = with_reasoning_override(configured.clone(), Some(effort)).unwrap();
+            assert_eq!(
+                crate::llm_transport::openai_compatible_request_body(&effective, &[], &[], true)
+                    ["reasoning_effort"],
+                effort
+            );
+        }
         assert_eq!(configured.reasoning_effort.as_deref(), Some("max"));
         assert_eq!(
             with_reasoning_override(configured.clone(), None)
@@ -267,7 +373,7 @@ mod tests {
                 .as_deref(),
             Some("max")
         );
-        assert!(with_reasoning_override(configured.clone(), Some("xhigh")).is_err());
+        assert!(with_reasoning_override(configured.clone(), Some("invalid")).is_err());
         let mut disabled = configured;
         disabled.thinking = Some("disabled".into());
         assert!(with_reasoning_override(disabled.clone(), Some("low")).is_err());

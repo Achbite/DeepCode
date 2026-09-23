@@ -75,7 +75,7 @@ def main():
         print(f'UI update failed: {error}', file=sys.stderr)
         return 1
     if args.package:
-        print('Close and reopen the GUI window to load this complete UI bundle.')
+        print('Reload the GUI interface (Cmd/Ctrl+Shift+R or browser.page refreshInterface) to load this UI bundle.')
     return 0
 
 

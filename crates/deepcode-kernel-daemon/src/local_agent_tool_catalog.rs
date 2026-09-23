@@ -767,15 +767,32 @@ impl PreparedCatalogBinding {
                 }
             };
             match (self.tool_name(), action) {
-                ("browser.page", "openSelf" | "list" | "status" | "activate" | "close") => {
-                    return Ok(CatalogEffectScope::LocalRead)
-                }
+                (
+                    "browser.page",
+                    "openSelf" | "list" | "status" | "activate" | "close" | "refreshInterface",
+                ) => return Ok(CatalogEffectScope::LocalRead),
                 ("browser.page", "reload") => {
                     let page = crate::browser_tools::call(
                         host,
                         &json!({"action":"status","previewId":input["previewId"]}),
                     )
-                    .map_err(|error| ToolCatalogError::new("native_browser_failed", error))?;
+                    .map_err(|message| {
+                        let input_issues = (message == "native_browser_page_closed"
+                            || message.starts_with("native_browser_page_closed:"))
+                        .then(|| {
+                            vec![ToolInputIssue::new(
+                                "$.previewId",
+                                "pageClosed",
+                                "The page is closed. List the current pages and select an open previewId.",
+                                None,
+                            )]
+                        });
+                        ToolCatalogError {
+                            code: "native_browser_failed",
+                            message,
+                            input_issues,
+                        }
+                    })?;
                     let url = page["url"].as_str().ok_or_else(|| {
                         ToolCatalogError::new(
                             "native_browser_page_invalid",
@@ -1250,6 +1267,7 @@ fn browser_targets(name: &str, input: &Value) -> Result<Vec<String>, ToolCatalog
             | "reload"
             | "act"
             | "close"
+            | "refreshInterface"
     ) {
         return Err(ToolCatalogError::new(
             "tool_input_invalid",
@@ -1263,13 +1281,32 @@ fn browser_targets(name: &str, input: &Value) -> Result<Vec<String>, ToolCatalog
             text("url")?;
         }
     }
-    if !matches!(action, "open" | "openSelf" | "list") {
+    if !matches!(action, "open" | "openSelf" | "list" | "refreshInterface") {
         text("previewId")?;
     }
     if action == "act" {
         let operation = text("operation")?;
-        if matches!(operation, "click" | "type") {
+        if !matches!(operation, "inspect" | "click" | "type" | "scroll") {
+            return Err(ToolCatalogError::new(
+                "tool_input_invalid",
+                "Unsupported browser operation.",
+            ));
+        }
+        if operation == "type" || (operation == "click" && input["selector"].is_string()) {
             text("selector")?;
+        }
+        for axis in ["x", "y"] {
+            let required = operation == "click" && !input["selector"].is_string();
+            if (required || input.get(axis).is_some())
+                && !input[axis].as_f64().is_some_and(|value| {
+                    value.is_finite() && (operation != "click" || value >= 0.0)
+                })
+            {
+                return Err(ToolCatalogError::new(
+                    "tool_input_invalid",
+                    format!("{axis} must be a finite viewport coordinate"),
+                ));
+            }
         }
         if operation == "type" && !input["text"].is_string() {
             return Err(ToolCatalogError::new(
@@ -1351,6 +1388,26 @@ fn validate_ref(field: &str, value: &str) -> Result<(), ToolCatalogError> {
 mod tests {
     use super::*;
     use deepcode_kernel_runtime::executors::EmptySecretProvider;
+
+    #[test]
+    fn browser_targets_support_coordinates_and_guarded_interface_refresh() {
+        for input in [
+            json!({"action":"act","previewId":"preview-1","operation":"click","x":12,"y":20}),
+            json!({"action":"act","previewId":"preview-1","operation":"click","selector":"#save"}),
+            json!({"action":"act","previewId":"preview-1","operation":"scroll","selector":"#panel","y":-40}),
+            json!({"action":"refreshInterface"}),
+        ] {
+            assert!(browser_targets("browser.page", &input).is_ok(), "{input}");
+        }
+        for input in [
+            json!({"action":"act","previewId":"preview-1","operation":"click","x":12}),
+            json!({"action":"act","previewId":"preview-1","operation":"click","x":-1,"y":20}),
+            json!({"action":"act","previewId":"preview-1","operation":"type","text":"hello"}),
+            json!({"action":"act","previewId":"preview-1","operation":"unknown"}),
+        ] {
+            assert!(browser_targets("browser.page", &input).is_err(), "{input}");
+        }
+    }
 
     #[test]
     fn default_builtin_provider_exposes_the_registered_basic_tools_and_blocks_web_search() {

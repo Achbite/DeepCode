@@ -393,7 +393,7 @@ const store = create<LocalAgentState>((set, get) => ({
   selectModel: async (profileId, reasoningEffortOverride) => {
     const profile = get().profiles.find(profile => profile.id === profileId && profile.enabled);
     if (!profile || (profile.thinking !== 'disabled' && !reasoningEffortOverride)) return false;
-    return saveModelSettings(set, get, { profileId, reasoningEffortOverride });
+    return saveModelSettings(set, get, { profileId, reasoningEffortOverride }, true);
   },
 
   selectProfile: async (profileId) => {

@@ -15,4 +15,6 @@ For product behavior and configuration, use `doc.read` with `name="operations.md
 
 For UI display plugins and hot replacement, read `doc.read` with `name="ui-plugins.md"`. Write against the documented display slots and lifecycle; adding files does not activate a plugin. The user selects the plugin folder in Settings. Do not expose or replace the Agent Loop or underlying tools through a display plugin.
 
+For developing DeepCode itself, read `deepcode-iteration` through `skill.read` when its workflow is relevant. For requested release preparation, code simplification or README/product documentation synchronization, read `deepcode-release-audit`. These Skills guide the requested work; reading them does not approve execution, confirm a Plan or authorize publication.
+
 For Windows shell selection, missing developer tools and platform differences, read [references/windows-environment.md](references/windows-environment.md).

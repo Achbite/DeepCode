@@ -65,7 +65,7 @@ impl CliRenderState {
                 self.finish_text(out)?;
                 writeln!(
                     out,
-                    "网络连接中断，等待第 {}/5 次尝试。",
+                    "请求未完成，等待同一请求的第 {} 次发送。",
                     attempt.attempt + 1
                 )?;
                 self.retry_attempt = Some(attempt.provider_attempt_id.clone());
@@ -138,6 +138,7 @@ impl CliRenderState {
                         writeln!(out, "{}: {}", message.role, message.content)?;
                     }
                     render_attachments(out, message)?;
+                    render_source_references(out, message.source_references.as_ref())?;
                 }
                 SessionTimelineItem::Narrative {
                     narrative_id,
@@ -154,6 +155,7 @@ impl CliRenderState {
                         .expect("validated Session timeline narrative reference");
                     self.write_text(out, stream_id, &narrative.content)?;
                     self.finish_text(out)?;
+                    render_source_references(out, narrative.source_references.as_ref())?;
                 }
                 SessionTimelineItem::Plan {
                     plan_id, revision, ..
@@ -325,8 +327,11 @@ impl CliRenderState {
             )?;
         }
         if let Some(approval) = projection.pending_approval.as_ref() {
-            render_approval(out, approval)?;
-            writeln!(out, "继续：使用上面的 /reply 选项。")?;
+            let reviewing = approval.is_model_reviewing(projection.run.as_ref());
+            render_approval(out, approval, reviewing)?;
+            if !reviewing {
+                writeln!(out, "继续：使用上面的 /reply 选项。")?;
+            }
         }
         out.flush()
     }
@@ -753,11 +758,67 @@ pub(crate) fn render_attachments(
     Ok(())
 }
 
+pub(crate) fn render_final_message(
+    out: &mut impl Write,
+    projection: &SessionProjection,
+    after_message_count: usize,
+) -> io::Result<()> {
+    if let Some(message) = projection.last_assistant_message(after_message_count) {
+        writeln!(out, "{}", message.content)?;
+        render_source_references(out, message.source_references.as_ref())?;
+    }
+    Ok(())
+}
+
+fn render_source_references(
+    out: &mut impl Write,
+    references: Option<&deepcode_kernel_client::SourceReferences>,
+) -> io::Result<()> {
+    if let Some(references) = references {
+        for citation in &references.citations {
+            writeln!(
+                out,
+                "- [{}](<{}>)",
+                citation.title.replace('[', "\\[").replace(']', "\\]"),
+                citation.url
+            )?;
+        }
+        if references.unresolved {
+            writeln!(out, "部分引用来源未返回")?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn render_approval(
     out: &mut impl Write,
     approval: &ApprovalProjection,
+    reviewing: bool,
 ) -> io::Result<()> {
-    writeln!(out, "需要你批准：{}", approval.preview.summary)?;
+    writeln!(
+        out,
+        "{}：{}",
+        if reviewing {
+            "模型正在审查执行权限"
+        } else {
+            "需要你批准"
+        },
+        approval.preview.summary
+    )?;
+    if let Some(operation) = &approval.preview.operation {
+        writeln!(out, "操作：{}", operation.tool_name)?;
+        if let Some(root) = &operation.workspace_root {
+            writeln!(out, "工作目录：{root}")?;
+        }
+        if let Some(scope) = &operation.execution_scope {
+            writeln!(out, "执行范围：{scope}")?;
+        }
+        writeln!(
+            out,
+            "参数：{}",
+            serde_json::to_string_pretty(&operation.arguments)?
+        )?;
+    }
     if approval.preview.authorization_scope.as_deref() == Some("sessionBrowser") {
         writeln!(out, "允许后，当前对话内的浏览器页面操作无需重复确认。")?;
     }
@@ -766,19 +827,21 @@ pub(crate) fn render_approval(
             writeln!(out, "审查结果：{reason}")?;
         }
     }
-    writeln!(out, "/reply 1 允许一次 · /reply 2 拒绝")?;
-    for (scope, input) in deepcode_kernel_client::AUTHORIZATION_OPTIONS {
-        if approval
-            .preview
-            .authorization_scopes
-            .as_ref()
-            .is_some_and(|scopes| scopes.iter().any(|value| value == scope))
-        {
-            writeln!(
-                out,
-                "/reply {input} {}",
-                crate::i18n::Language::ZhCn.text(&format!("agent.permission.scope.{scope}"))
-            )?;
+    if !reviewing {
+        writeln!(out, "/reply 1 允许一次 · /reply 2 拒绝")?;
+        for (scope, input) in deepcode_kernel_client::AUTHORIZATION_OPTIONS {
+            if approval
+                .preview
+                .authorization_scopes
+                .as_ref()
+                .is_some_and(|scopes| scopes.iter().any(|value| value == scope))
+            {
+                writeln!(
+                    out,
+                    "/reply {input} {}",
+                    crate::i18n::Language::ZhCn.text(&format!("agent.permission.scope.{scope}"))
+                )?;
+            }
         }
     }
     if let Some(files) = &approval.preview.file_access {
@@ -876,7 +939,7 @@ pub(crate) fn render_terminal_error(
         if let Some(snapshot) = &projection.failure_snapshot {
             writeln!(
                 out,
-                "  已记录失败状态：revision {} · {} 次 Provider 尝试",
+                "  已记录失败状态：revision {} · {} 次 Provider 发送",
                 snapshot.revision,
                 snapshot.provider_attempt_ids.len()
             )?;
@@ -902,6 +965,53 @@ mod tests {
                 "cacheReadInputTokens":0,"cacheMissInputTokens":0,"cacheAvailable":false,"cacheComplete":false},
             "run": {"runId":"run:test","profileId":"profile:test","workspaceBindings":[],"status":"running"}
         })).unwrap()
+    }
+
+    #[test]
+    fn approval_review_keeps_the_exact_operation_without_requesting_human_input() {
+        let mut p = projection();
+        let approval: ApprovalProjection = serde_json::from_value(json!({
+            "approvalId":"approval:test", "runId":"run:test", "callId":"call:test", "sequence":2,"createdAt":"now",
+            "preview":{"summary":"Inspect project", "effects":["process"],"logicalTargets":["."],"approvalReviewer":"agent",
+                "operation":{"toolName":"bash","arguments":{"command":"git status"},"workspaceRoot":"/project","executionScope":"workspace"},
+                "fileAccess":{"read":["/references"],"write":[]}, "review":{"decision":"ask","reason":"Please confirm the scope"}}
+        })).unwrap();
+        assert_eq!(
+            approval.preview.operation.as_ref().unwrap().arguments["command"],
+            "git status"
+        );
+        assert!(approval.is_model_reviewing(p.run.as_ref()));
+        let mut out = Vec::new();
+        render_approval(&mut out, &approval, true).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("模型正在审查执行权限"));
+        assert!(
+            text.contains("git status")
+                && text.contains("/project")
+                && text.contains("/references")
+        );
+        assert!(!text.contains("/reply") && !text.contains("需要你批准"));
+        p.run.as_mut().unwrap().status = "waiting".into();
+        assert!(!approval.is_model_reviewing(p.run.as_ref()));
+        let mut out = Vec::new();
+        render_approval(&mut out, &approval, false).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains("/reply 1"));
+    }
+
+    #[test]
+    fn source_references_are_append_only_links_with_missing_source_notice() {
+        let references = serde_json::from_value(json!({"citations":[{"url":"https://example.test/docs","title":"Reference"}],"unresolved":true})).unwrap();
+        let mut out = b"Original text with source marker\n".to_vec();
+        render_source_references(&mut out, Some(&references)).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("Original text with source marker\n"));
+        assert!(text.contains("[Reference](<https://example.test/docs>)"));
+        assert!(text.contains("部分引用来源未返回"));
+        let mut projection = projection();
+        projection.messages.push(serde_json::from_value(json!({"messageId":"message:sources", "role":"assistant", "content":"Original text with source marker", "sequence":1, "createdAt":"now", "filesystemReferences":[], "pluginSelections":[], "sourceReferences":{"citations":[{"url":"https://example.test/docs","title":"Reference"}],"unresolved":true}})).unwrap());
+        let mut plain = Vec::new();
+        render_final_message(&mut plain, &projection, 0).unwrap();
+        assert_eq!(String::from_utf8(plain).unwrap(), text);
     }
 
     fn plan(revision: u64, status: &str, sequence: u64) -> Value {

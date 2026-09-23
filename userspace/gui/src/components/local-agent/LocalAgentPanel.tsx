@@ -93,7 +93,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
     assistantDraftLayoutKey,
     timelineExtentKey,
   });
-  const { bodyRef, bodyHandlers, followingLatest, scrollToLatest } = viewport;
+  const { bodyRef, bodyHandlers, showJumpToLatest, scrollToLatest } = viewport;
   const composer = useAgentComposer(language, viewport.setLatestFollowMode);
   const resourcePreview = useResourcePreview(sessionId);
   const [readerHeader, setReaderHeader] = useState<HTMLDivElement | null>(null);
@@ -104,8 +104,17 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
   }, [onReaderLayoutChange, resourcePreview.visible, resourcePreview.expanded, conversationBounds]);
 
   const header = (
-      <UiRegion slot="conversation.header"><header className={`local-agent__header${resourcePreview.visible ? ' local-agent__header--reading' : ''}${resourcePreview.expanded ? ' local-agent__header--expanded' : ''}`} style={readerLayout}>
-        <div className="local-agent__header-conversation">
+      <header className={`local-agent__header${resourcePreview.visible ? ' local-agent__header--reading' : ''}${resourcePreview.expanded ? ' local-agent__header--expanded' : ''}`} style={readerLayout}>
+        <UiRegion slot="conversation.header" data={{
+          kind: 'conversationHeader', sessionId, title,
+          project: activeProject ? { id: activeProject.id, title: activeProject.title } : null,
+          reader: { visible: resourcePreview.visible, expanded: resourcePreview.expanded,
+            treeVisible: resourcePreview.treeVisible, canOpen: !!sessionId },
+        }} actions={{
+          toggleReader: () => { if (sessionId) resourcePreview.toggle(); },
+          toggleReaderExpanded: () => { if (resourcePreview.visible) resourcePreview.expand(); },
+          toggleTree: resourcePreview.toggleTree,
+        }} regions={{ heading: <div className="local-agent__header-conversation">
         <div className="local-agent__heading">
           <span className="local-agent__heading-mark"><DeepCodeShellIcon name="session" /></span>
           <div>
@@ -113,14 +122,13 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
             {!headerTarget && activeProject && <span>{activeProject.title}</span>}
           </div>
         </div>
-        </div>
-        <div className="local-agent__header-preview">
+        </div>, reader: <div className="local-agent__header-preview">
           {resourcePreview.visible && <div className="reader-header-tabs" ref={setReaderHeader} />}
           <div className="local-agent__header-actions">
           <ReaderControls language={language} preview={resourcePreview} disabled={!sessionId} />
           </div>
-        </div>
-      </header></UiRegion>
+        </div> }} />
+      </header>
   );
 
   return (
@@ -153,7 +161,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
           <ArtifactLinks artifacts={display.artifacts} onOpen={resourcePreview.openWorkspaceResource} />
         </details>}
       </div>
-      {!followingLatest && hasConversationContent && (
+      {showJumpToLatest && hasConversationContent && (
           <button
             type="button"
             className="local-agent__jump-latest"

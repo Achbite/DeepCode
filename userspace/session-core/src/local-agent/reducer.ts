@@ -1,8 +1,9 @@
-import { isManagedProcessSnapshot, isSessionAuthorizationScope } from '@deepcode/protocol';
+import { isManagedProcessSnapshot, isSessionAuthorizationScope, providerRuntimeForPurpose } from '@deepcode/protocol';
 import { advanceTodoList } from './todoState.js';
 import { appendInputFileBindings } from './workspaceBindings.js';
 import { providerTextStreamId } from './streamIdentity.js';
 import { activeConversationEvents } from './conversationHistory.js';
+import { projectSourceReferences } from './sourceReferences.js';
 import type {
   ActivityProjection,
   ManagedProcessSnapshot,
@@ -764,7 +765,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       next.tokenUsageHistory = { ...next.tokenUsageHistory };
       assertRunningRun(next, event.runId, 'provider_turn_run_not_active');
       const runtime = requiredRunRuntimeSnapshot(next, event.runId);
-      if (event.payload.providerRuntimeRef !== runtime.provider.providerRuntimeRef) {
+      if (event.payload.providerRuntimeRef !== providerRuntimeForPurpose(runtime, event.payload.purpose).providerRuntimeRef) {
         throw new Error('provider_turn_runtime_identity_mismatch');
       }
       const receipt = next.contextCompositions.find((candidate) => (
@@ -925,8 +926,8 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       const runUsage = next.tokenUsageHistory[event.runId];
       if (!runUsage) throw new Error('token_usage_run_missing');
       next.tokenUsageHistory[event.runId] = withProviderCompletion(runUsage);
-      // The last settled call owns this slot, even when it reports no usage.
-      next.contextUsage = null;
+      // Auxiliary calls retain their own receipts and billing totals.
+      if (settlement.purpose === 'agent') next.contextUsage = null;
       break;
     }
     case 'context.updated': {
@@ -935,11 +936,11 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       next.tokenUsageHistory = { ...next.tokenUsageHistory };
       assertRunningRun(next, event.runId, 'provider_usage_run_not_active');
       const providerRequestId = event.payload.providerRequestId;
-      requiredProviderTurn(next, event.runId, providerRequestId);
-      const runtime = requiredRunRuntimeSnapshot(next, event.runId);
+      const turn = requiredProviderTurn(next, event.runId, providerRequestId);
+      const provider = providerRuntimeForPurpose(requiredRunRuntimeSnapshot(next, event.runId), turn.purpose);
       if (
-        event.payload.providerRuntimeRef !== runtime.provider.providerRuntimeRef
-        || event.payload.contextWindowTokens !== runtime.provider.contextWindowTokens
+        event.payload.providerRuntimeRef !== provider.providerRuntimeRef
+        || event.payload.contextWindowTokens !== provider.contextWindowTokens
       ) {
         throw new Error('provider_usage_runtime_identity_mismatch');
       }
@@ -969,7 +970,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         ...receipt,
         partitions: estimatePartitionTokens(receipt.partitions, event.payload.inputTokens),
       };
-      next.contextUsage = {
+      if (turn.purpose === 'agent') next.contextUsage = {
         ...event.payload,
         providerRequestId,
         runId: event.runId,
@@ -1128,6 +1129,15 @@ export function recoverSession(sessionId: string, events: readonly SessionEvent[
   return { ...state, revision: events.at(-1)?.sequence ?? 0 };
 }
 
+function sourceReferenceProjection(state: SessionState, content: string, requestId: string, referenceId: string) {
+  const block = state.providerTurns[requestId]?.orderedOutputBlocks?.find(candidate => (
+    candidate.kind === 'finalMessage' && candidate.messageId === referenceId
+    || candidate.kind === 'narrative' && candidate.narrativeId === referenceId
+  ));
+  const sourceReferences = projectSourceReferences(content, block?.item);
+  return sourceReferences ? { sourceReferences } : {};
+}
+
 export function projectSession(
   state: SessionState,
   assistantDraft: AssistantDraftProjection | null = null,
@@ -1155,6 +1165,7 @@ export function projectSession(
     sessionDirectoryIndexes: state.sessionDirectoryIndexes.map((binding) => ({ ...binding })),
     messages: state.messages.map((message) => ({
       ...message,
+      ...(message.role === 'assistant' ? sourceReferenceProjection(state, message.content, message.providerRequestId, message.messageId) : {}),
       ...(message.replyToInteraction ? { replyToInteraction: { ...message.replyToInteraction } } : {}),
       filesystemReferences: message.filesystemReferences.map((reference) => ({ ...reference })),
       pluginSelections: message.pluginSelections.map((selection) => ({ ...selection })),
@@ -1165,7 +1176,8 @@ export function projectSession(
       pluginSelections: input.pluginSelections.map((selection) => ({ ...selection })),
       status: state.tokenUsageHistory[input.runId]?.outcome ? 'notApplied' : 'queued',
     })),
-    narratives: state.narratives.map((narrative) => ({ ...narrative })),
+    narratives: state.narratives.map((narrative) => ({ ...narrative,
+      ...sourceReferenceProjection(state, narrative.content, narrative.providerRequestId, narrative.narrativeId) })),
     timeline: projectTimeline(state),
     assistantDraft: assistantDraft ? structuredClone(assistantDraft) : null,
     pendingInteraction: cloneInteraction(state.pendingInteraction),
@@ -1175,8 +1187,7 @@ export function projectSession(
     pendingPlan: state.pendingPlan ? clonePlanProjection(state.pendingPlan) : null,
     todoList: cloneTodoList(state.todoList),
     contextUsage: state.contextUsage ? { ...state.contextUsage } : null,
-    // The ball displays the last settled call; also expose a pending call's
-    // composition before usage arrives. Historical receipts remain in the journal.
+    // Keep the latest Agent usage receipt and the pending call composition.
     contextCompositions: state.contextCompositions.filter((receipt, index) => (
       receipt.providerRequestId === state.contextUsage?.providerRequestId
       || index === state.contextCompositions.length - 1
@@ -1240,6 +1251,7 @@ function cloneRunRuntimeSnapshot(snapshot: RunRuntimeSnapshot): RunRuntimeSnapsh
     ...snapshot,
     environment: structuredClone(snapshot.environment),
     provider: { ...snapshot.provider },
+    ...(snapshot.approvalReviewer ? { approvalReviewer: { ...snapshot.approvalReviewer } } : {}),
     webSearch: { ...snapshot.webSearch },
     instructions: snapshot.instructions.map((instruction) => ({ ...instruction })),
     tools: snapshot.tools.map((tool) => ({

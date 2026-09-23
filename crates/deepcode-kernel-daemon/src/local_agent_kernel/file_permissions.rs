@@ -140,7 +140,6 @@ impl LocalAgentKernel {
             &request.session_id,
             &request.run_id,
             &prepared.file_environment(),
-            prepared.permissions.shell == ShellApprovalMode::Review,
         )? {
             let mut resources: RequestedFiles = serde_json::from_value(grant).map_err(|error| {
                 LocalAgentKernelError::new("file_authority_invalid", error.to_string())

@@ -282,6 +282,7 @@ export function NativeBrowserPreview({
         >
           <DeepCodeShellIcon name="refresh" />
         </button>
+        {page?.status === 'loading' && <small role="status">{t(language, 'reader.loading')}</small>}
         {reviewing ? <div className="native-browser-review-controls" onKeyDown={event => { if (event.key === 'Escape') { event.preventDefault(); setReviewing(false); } }}>
           <span title={t(language, 'reader.annotation.hint')}>{t(language, 'reader.annotation.gesture')}</span>
           <kbd>esc</kbd><button type="button" aria-label={t(language, 'reader.annotation.exit')} onClick={() => setReviewing(false)}><DeepCodeShellIcon name="close" size={14} /></button>

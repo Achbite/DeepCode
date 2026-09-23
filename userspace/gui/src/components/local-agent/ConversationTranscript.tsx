@@ -13,6 +13,7 @@ import { FileChanges, roundChangeActivities } from './FileChanges';
 import { ReasoningHistory } from './ReasoningDetails';
 import { PlanPreviewCard } from './PlanPreviewCard';
 import ProviderStageStatus from './ProviderStageStatus';
+import { SourceReferences } from './SourceReferences';
 import { BufferedMarkdown, MarkdownContent, MarkdownInline } from './BufferedMarkdown';
 import PlanCard from './PlanCard';
 import { ToolActivityGroup, ProviderHostedDraftGroup } from './ToolActivityDetails';
@@ -217,6 +218,7 @@ export function ConversationTranscript({
                   : presentation.content(`message:${item.value.messageId}:content`)}
               </div>
             )}
+            <SourceReferences references={item.value.sourceReferences} language={language} />
             {item.value.filesystemReferences.length > 0 && (
               <div className="local-agent__message-attachments">
                 {item.value.filesystemReferences.map((reference) => (
@@ -254,6 +256,7 @@ export function ConversationTranscript({
               item.value.content,
               presentation.content(`narrative:${item.value.narrativeId}`),
             )}
+            <SourceReferences references={item.value.sourceReferences} language={language} />
           </div>
         </article>
       ) : item.type === 'plan' ? (
@@ -269,6 +272,7 @@ export function ConversationTranscript({
       ) : item.type === 'approval' ? (
         <ApprovalActivity activity={item.value} language={language}
           pending={projection?.pendingApproval?.callId === item.value.callId}
+          reviewing={projection?.pendingApproval?.preview.approvalReviewer === 'agent' && projection?.run?.status === 'running'}
           onExpand={() => setLatestFollowMode(false)} />
       ) : (
         <ToolActivityGroup

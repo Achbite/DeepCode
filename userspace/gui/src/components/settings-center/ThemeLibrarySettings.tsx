@@ -7,6 +7,7 @@ import { THEME_LIBRARY_SETTING, applyThemePalette, builtinThemes, decodeThemeLib
 import ModalDialog from '../shared/ModalDialog';
 import ThemePicker, { ThemeBadge } from './ThemePicker';
 import { useSettingsSearchEntries, useSettingsSearchTarget } from './settingsSearch';
+import { useInterfaceReloadGuard } from '../../services/interfaceReload';
 
 export default function ThemeLibrarySettings({ language }: { language: UiLanguage }) {
   const settings = useSettingsStore((state) => state.effectiveSettings);
@@ -16,6 +17,7 @@ export default function ThemeLibrarySettings({ language }: { language: UiLanguag
   const [notice, setNotice] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
   const [text, setText] = useState('');
+  useInterfaceReloadGuard(importing && text.trim().length > 0, t(language, 'settings.themes.importTitle'), busy);
   const file = useRef<HTMLInputElement>(null);
   const target = useSettingsSearchTarget(THEME_LIBRARY_SETTING);
   useSettingsSearchEntries('themes', [{ id: THEME_LIBRARY_SETTING, category: 'gui', title: t(language, 'settings.themes.title'), keywords: '主题 导入 浅色 深色 theme import presets Catppuccin Gruvbox Nord' }]);

@@ -9,6 +9,7 @@ const file = (name, mediaType) => ({ referenceId: `reference:${name}`, workspace
 const readTool = { toolBindingRef: 'binding:read', name: 'fs.read', description: 'Read a file.',
   inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
   possibleEffects: ['workspaceRead'], availability: 'callable', origin: 'coreBuiltin' };
+const history = request => request.messages.filter(message => !message.images?.length && !message.toolImages?.length);
 
 test('queued file snapshots join the next request without changing in-flight or historical bindings', async t => {
   const journal = new InMemoryCommandJournal(), sessionId = 'session:queued-files';
@@ -29,13 +30,15 @@ test('queued file snapshots join the next request without changing in-flight or 
       assert.deepEqual(request.messages.slice(0, requests[0].messages.length), requests[0].messages);
       const screenshot = request.messages.find(message => message.images?.length);
       assert.deepEqual(screenshot.images, [{ workspaceId: image.workspaceId, logicalPath: image.logicalPath, mediaType: image.mediaType }]);
-      assert.match(screenshot.content, /"workspace":"workspace2"/);
+      assert.match(screenshot.content, /"imageId":"reference:screen.png"/);
+      assert.ok(history(request).some(message => message.content.includes('"workspace":"workspace2"')));
       yield providerEvent(request.requestId, 'tool.call', { callId: 'native:new', name: 'fs_read', input: { workspace: 'workspace3', path: text.logicalPath } });
     } else {
       const calls = request.messages.flatMap(message => message.toolCalls ?? []);
       const inputs = calls.map(call => typeof call.input === 'string' ? JSON.parse(call.input) : call.input);
       assert.deepEqual(inputs.map(input => input.workspace), ['primary', 'workspace3']);
-      assert.deepEqual(request.messages.slice(0, requests[1].messages.length), requests[1].messages);
+      assert.deepEqual(history(request).slice(0, history(requests[1]).length), history(requests[1]));
+      assert.equal(request.messages.filter(message => message.images?.length).length, turn === 3 ? 1 : 0);
       yield providerEvent(request.requestId, 'text.delta', { text: 'Read the supplied screenshot and notes.' });
     }
     yield providerEvent(request.requestId, 'completed', {});

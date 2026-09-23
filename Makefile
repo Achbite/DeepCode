@@ -234,7 +234,7 @@ native-gui:
 	@bash ./build.sh --stage native-gui
 
 dev-deepcode-gui: _ensure_container
-	@docker exec -it -w "$(WORKDIR_IN_CTNR)" $(NETWORK_ENV_ARGS) -e DEEPCODE_GUI_BIND_HOST=0.0.0.0 -e DEEPCODE_GUI_DEV_PORT=$(DEEPCODE_CONTAINER_PORT) -e DEEPCODE_HOST_PORT=31247 -e DEEPCODE_DAEMON_PORT=31248 $(CONTAINER_NAME) bash scripts/dev-deepcode-gui-web.sh
+	@bash scripts/dev-deepcode-gui-host.sh "$(CONTAINER_NAME)" "$(WORKDIR_IN_CTNR)" "$(DEEPCODE_CONTAINER_PORT)" $(NETWORK_ENV_ARGS)
 
 # ---- reset-dev / clean：只操作固定命名的单仓开发资源 ----
 reset-dev:

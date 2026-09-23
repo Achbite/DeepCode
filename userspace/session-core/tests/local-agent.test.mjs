@@ -695,8 +695,10 @@ test('new runs refresh execution facts while restart and compaction retain each 
   const sessionId = 'session:environment';
   await createSession(journal, sessionId);
   let observed = { ...runtimeSnapshot('environment:fixture').environment,
-    os: 'linux', arch: 'aarch64', locale: 'zh-CN', responseLanguage: 'zh-CN', userShell: '/bin/bash' };
+    os: 'linux', arch: 'aarch64', locale: 'zh-CN', responseLanguage: 'zh-CN', userShell: '/bin/bash',
+    runtimeExecutables: { kernel: '/opt/deepcode/deepcode-kernel', cli: '/opt/deepcode/deepcode-cli' } };
   const saved = environmentInstruction(observed);
+  assert.deepEqual(JSON.parse(saved.text.split('\n')[1]).runtimeExecutables, observed.runtimeExecutables);
   const preparation = fakeRunPreparation();
   const port = {
     ...preparation.port,
@@ -944,7 +946,7 @@ test('Responses output items preserve narrative, hosted activity, and final-mess
     role: 'assistant',
     phase: 'final_answer',
     status: 'completed',
-    content: [{ type: 'output_text', text: 'The current release is recorded in the cited result.' }],
+    content: [{ type: 'output_text', text: 'The current release is recorded in the cited result.', annotations: [{ type: 'url_citation', url: 'https://example.com/compiler-release', title: 'Compiler release', start_index: 0, end_index: 50 }] }],
   }];
   const preparation = fakeRunPreparation({
     apiSurface: 'responses',
@@ -1058,6 +1060,9 @@ test('Responses output items preserve narrative, hosted activity, and final-mess
     block.kind === 'providerHosted' ? [block.activityId] : []
   )));
   const finalMessageId = orderedBlocks.find((block) => block.kind === 'finalMessage').messageId;
+  assert.deepEqual(firstProjection.messages.find(message => message.messageId === finalMessageId).sourceReferences, {
+    citations: [{ url: 'https://example.com/compiler-release', title: 'Compiler release' }], unresolved: false,
+  });
   const orderedTimelineKinds = firstProjection.timeline.flatMap((item) => {
     if (item.kind === 'narrative' && narrativeIds.has(item.narrativeId)) return ['narrative'];
     if (
@@ -1391,7 +1396,6 @@ for (const [field, label, identity, error] of [
     const sessionId = `session:${identity}`, runId = `run:${identity}`, messageId = `message:${identity}`;
     await createSession(journal, sessionId, [workspaceBinding]);
     const runtime = runtimeSnapshot(runId);
-    delete runtime[field];
     await journal.append({ type: 'message.committed', sessionId, payload: {
       messageId, role: 'user', content: 'Verify the current runtime snapshot contract.',
     } });
@@ -1399,6 +1403,7 @@ for (const [field, label, identity, error] of [
       inputMessageId: messageId, workspaceBindings: [workspaceBinding], runtimeSnapshot: runtime,
     } });
     const events = await readEvents(journal, sessionId);
+    delete events.find(event => event.type === 'run.started').payload.runtimeSnapshot[field];
     assert.throws(() => loopSnapshot(sessionId, events), error);
   });
 }
@@ -4881,6 +4886,30 @@ test('protocol failures and cancellation never enter a network retry loop', asyn
   }
 });
 
+
+test('an upstream service error retains its directive and ends without a network retry', async (t) => {
+  const { isLocalAgentErrorValue } = await import('@deepcode/protocol');
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:service-unavailable';
+  await createSession(journal, sessionId);
+  const failure = { code: 'provider_error', message: 'Our servers are currently overloaded. Please try again later.', diagnostics: {
+    source: 'providerTransport', phase: 'response', category: 'provider', retryable: false, causes: [],
+    providerError: { code: 'server_is_overloaded', type: 'service_unavailable_error', retryDirective: 'NO_MORE_RETRY' },
+  } };
+  assert.equal(isLocalAgentErrorValue(failure), true);
+  let sends = 0;
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    sends++;
+    yield providerEvent(request.requestId, 'failed', failure);
+  } }, emptyKernel(), fakeRunPreparation().port, 'service-unavailable');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:service-unavailable', 'Continue the task.'));
+  const result = await waitForProjection(actor, (value) => value.run?.status === 'failed');
+  assert.equal(sends, 1);
+  assert.deepEqual(result.failureSnapshot.error, failure);
+  const events = await readEvents(journal, sessionId);
+  assert.equal(events.some((event) => event.type === 'provider.attempt.updated' && event.payload.phase === 'retryWaiting'), false);
+  assert.equal(events.some((event) => event.type === 'tool.requested'), false);
+});
 
 test('a Kernel input rejection can request confirmation and resume the same run', async (t) => {
   const journal = new InMemoryCommandJournal(), sessionId = 'session:input-confirmation';

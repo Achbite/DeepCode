@@ -127,9 +127,7 @@ function admitEvent(snapshot: LoopSnapshot, event: NewSessionEvent): void {
         if (permissions['agent.permissions.shell'] !== 'review'
           || state.pendingApproval?.preview.approvalReviewer !== 'agent'
           || state.pendingApproval?.preview.review?.decision !== event.payload.decision
-          || (event.payload.authorizationScope && (event.payload.decision !== 'allow'
-            || event.payload.authorizationScope !== state.pendingApproval?.preview.authorizationScope
-            || !state.pendingApproval.preview.authorizationScopes?.includes(event.payload.authorizationScope)))) throw new Error('approval_delegation_missing');
+          || event.payload.authorizationScope !== undefined) throw new Error('approval_delegation_missing');
       }
       break;
     case 'plan.superseded':

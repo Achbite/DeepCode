@@ -1,5 +1,8 @@
 import type { ConversationProject, ConversationSessionSummary, SessionProjection, AssistantDraftBlockProjection, LlmProviderProfile, LlmReasoningEffort, ModelConnection, ActivityProjection, ConnectionSummary, ProviderAdapterDescriptor, UsageQuery, UsageReport, AuthFlow, QuotaSnapshot } from '@deepcode/protocol';
 
+import type { UsageWidgetLabels } from './usageWidgetLabels';
+import type { UsageCostDisplay } from './usageCost';
+
 export interface UsageReadPort {
   query(query: UsageQuery, signal: AbortSignal): Promise<UsageReport>;
 }
@@ -22,6 +25,11 @@ export type UiRegionData =
   | { kind: 'artifacts'; artifacts: SessionProjection['artifacts']; expanded: boolean }
   | { kind: 'composer'; draft: string; canSend: boolean; canStop: boolean; attachments: readonly { path: string; kind: 'file' | 'directory' }[] }
   | { kind: 'reader'; tabs: readonly { id: string; title: string }[]; activeId: string | null; visible: boolean; expanded: boolean; treeVisible: boolean }
+  | { kind: 'conversationHeader'; sessionId: string | null; title: string; project: { id: string; title: string } | null;
+      reader: { visible: boolean; expanded: boolean; treeVisible: boolean; canOpen: boolean } }
+  | { kind: 'settingsNavigation'; pages: readonly { id: string; label: string; icon: string }[]; activePage: string; searchQuery: string }
+  | { kind: 'resourceTree'; visible: boolean; filter: string; showRuntime: boolean; watchError: string; selectedId: string | null;
+      items: readonly { id: string; parentId?: string; name: string; kind: 'directory' | 'file' | 'unavailable'; depth: number; expanded: boolean; selected: boolean; error?: string }[] }
   | { kind: 'navigation'; projects: readonly ConversationProject[]; sessions: readonly ConversationSessionSummary[]; activeSessionId: string | null; busy: boolean };
 export interface UiViewActions {
   selectModel?(profileId: string, effort: import('@deepcode/protocol').LlmReasoningEffort | null): Promise<void>;
@@ -32,9 +40,16 @@ export interface UiViewActions {
   stopRun?(): Promise<void>;
   activateSession?(sessionId: string): Promise<void>;
   selectReaderTab?(tabId: string): void;
+  toggleReader?(): void;
   toggleReaderExpanded?(): void;
   setExpanded?(expanded: boolean): void;
   toggleTree?(): void;
+  selectSettingsPage?(pageId: string): void;
+  setSettingsSearch?(query: string): void;
+  setTreeFilter?(filter: string): void;
+  setTreeRuntimeVisible?(visible: boolean): void;
+  setTreeItemExpanded?(itemId: string, expanded: boolean): void;
+  openTreeItem?(itemId: string): void;
   setUsageVisibility?(value: 'summary' | 'collapsed' | 'hidden'): void;
   openUsageSettings?(): void;
 }
@@ -73,7 +88,7 @@ export interface UiPluginFile extends UiPluginSource {
 }
 export type UiPluginInput = Readonly<
   | { kind: 'region'; slot: UiRegionSlot; regionNames: readonly string[]; data?: Readonly<UiRegionData>; locale: string; theme: string }
-  | { kind: 'usage.widget'; connection: ModelConnection | null; modelId: string | null; visibility: 'summary' | 'collapsed' | 'hidden'; expanded: boolean; revision: number; locale: string; theme: string }
+  | { kind: 'usage.widget'; labels: UsageWidgetLabels; costDisplay: UsageCostDisplay; connection: ModelConnection | null; modelId: string | null; visibility: 'summary' | 'collapsed' | 'hidden'; expanded: boolean; revision: number; locale: string; theme: string }
   | { kind: 'composer.model'; profiles: readonly LlmProviderProfile[]; connections: readonly ModelConnection[]; selectedProfileId: string | null; reasoningEffort: LlmReasoningEffort | null; confirmed: boolean; busy: boolean; locale: string; theme: string }
   | { kind: 'settings.models'; connections: readonly ConnectionSummary[]; adapters: readonly ProviderAdapterDescriptor[]; locale: string; theme: string }
   | { kind: 'settings.connection'; connection: ConnectionSummary; locale: string; theme: string }

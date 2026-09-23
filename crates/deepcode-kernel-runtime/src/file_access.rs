@@ -39,6 +39,16 @@ pub fn resolve_path(path: &Path) -> KernelResult<PathBuf> {
             "File access requires an absolute path.".into(),
         ));
     }
+    canonicalize_with_missing_tail(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            KernelError::InvalidCommand(format!("Cannot resolve {}", path.display()))
+        } else {
+            KernelError::Other(format!("Resolve {}: {error}", path.display()))
+        }
+    })
+}
+
+pub(crate) fn canonicalize_with_missing_tail(path: &Path) -> std::io::Result<PathBuf> {
     let mut existing = path;
     let mut tail = Vec::new();
     loop {
@@ -50,20 +60,13 @@ pub fn resolve_path(path: &Path) -> KernelResult<PathBuf> {
                 return Ok(resolved);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let name = existing.file_name().ok_or_else(|| {
-                    KernelError::InvalidCommand(format!("Cannot resolve {}", path.display()))
-                })?;
+                let (Some(name), Some(parent)) = (existing.file_name(), existing.parent()) else {
+                    return Err(error);
+                };
                 tail.push(name.to_os_string());
-                existing = existing.parent().ok_or_else(|| {
-                    KernelError::InvalidCommand("File path has no parent.".into())
-                })?;
+                existing = parent;
             }
-            Err(error) => {
-                return Err(KernelError::Other(format!(
-                    "Resolve {}: {error}",
-                    path.display()
-                )))
-            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -105,24 +108,7 @@ pub fn git_metadata(root: &Path) -> KernelResult<Vec<PathBuf>> {
 /// Platform files needed to start ordinary command-line tools, excluding user data.
 pub fn system_read_paths() -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
-    let paths = [
-        "/System",
-        "/usr",
-        "/bin",
-        "/sbin",
-        "/Library/Apple",
-        "/Library/Developer",
-        "/private/etc/passwd",
-        "/private/etc/group",
-        "/private/etc/localtime",
-        "/private/etc/ssl/cert.pem",
-        "/private/etc/ssl/openssl.cnf",
-        "/private/etc/hosts",
-        "/private/etc/resolv.conf",
-        "/private/etc/services",
-        "/private/var/db/dyld",
-        "/dev",
-    ];
+    return macos_system_read_paths();
     #[cfg(target_os = "linux")]
     let paths = [
         "/usr",
@@ -144,9 +130,57 @@ pub fn system_read_paths() -> Vec<PathBuf> {
     ];
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let paths: [&str; 0] = [];
+    #[cfg(not(target_os = "macos"))]
     paths
         .into_iter()
         .map(PathBuf::from)
         .filter(|path| path.exists())
         .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn macos_system_read_paths() -> Vec<PathBuf> {
+    [
+        "/System",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/Library/Apple",
+        "/Library/Developer",
+        "/private/etc/passwd",
+        "/private/etc/group",
+        "/private/etc/gitconfig",
+        "/private/etc/localtime",
+        "/private/etc/ssl/cert.pem",
+        "/private/etc/ssl/openssl.cnf",
+        "/private/etc/hosts",
+        "/private/etc/resolv.conf",
+        "/private/etc/services",
+        "/private/var/db/dyld",
+        "/private/var/select",
+        "/private/var/select/developer_dir",
+        "/dev",
+    ]
+    .into_iter()
+    .flat_map(|path| macos_path_spellings(Path::new(path)))
+    // Missing system files are legitimate probes: return ENOENT rather than
+    // rejecting the read before the tool can apply its normal missing-file logic.
+    .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn macos_path_spellings(path: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![path.to_path_buf()];
+    for (canonical, alias) in [
+        ("/private/etc", "/etc"),
+        ("/private/var", "/var"),
+        ("/private/tmp", "/tmp"),
+    ] {
+        if let Ok(suffix) = path.strip_prefix(canonical) {
+            paths.push(Path::new(alias).join(suffix));
+        } else if let Ok(suffix) = path.strip_prefix(alias) {
+            paths.push(Path::new(canonical).join(suffix));
+        }
+    }
+    paths
 }

@@ -1,6 +1,6 @@
 //! Run-owned processes. The Session consumes snapshots; this module never calls a model.
 use deepcode_kernel_runtime::executors::{
-    KernelCancellationToken, KernelProgressSink, KernelToolExecutionResult,
+    KernelCancellationToken, KernelProgressSink, KernelToolExecutionResult, KernelToolProgress,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -144,16 +144,7 @@ impl Jobs {
         let output_jobs = self.clone();
         let output_id = id.clone();
         let progress = KernelProgressSink::new(move |event| {
-            let Ok(mut event) = serde_json::to_value(event) else {
-                return;
-            };
-            if event["type"] != "output" {
-                return;
-            }
-            let Some(stream) = event["stream"].as_str().map(str::to_owned) else {
-                return;
-            };
-            let Ok(bytes) = serde_json::from_value::<Vec<u8>>(event["bytes"].take()) else {
+            let KernelToolProgress::Output { stream, bytes, .. } = event else {
                 return;
             };
             let mut entries = output_jobs.0.entries.lock().expect("process registry");

@@ -9,12 +9,11 @@ pub(crate) struct KernelToolRegistration {
     pub(crate) descriptor: ToolDescriptor,
     pub(crate) kind: KernelToolKind,
     pub(crate) usage_guidelines: &'static [&'static str],
-    tool_id: &'static str,
 }
 
 impl KernelToolRegistration {
     pub(crate) fn tool_id(&self) -> &'static str {
-        self.tool_id
+        self.kind.as_str()
     }
 }
 
@@ -71,7 +70,6 @@ fn register_tool(spec: ToolSpec) -> KernelToolRegistration {
         },
         kind: spec.tool,
         usage_guidelines,
-        tool_id,
     }
 }
 

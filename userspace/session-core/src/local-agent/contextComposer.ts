@@ -38,6 +38,7 @@ import {
   sessionControlToolDefinitions,
 } from './sessionControls.js';
 import { renderActiveToolGuidance } from './toolPromptContributions.js';
+import { visualContextInstruction, visualContextMessages } from './visualContext.js';
 
 export interface PreparedProviderRequest {
   request: ProviderRequest;
@@ -149,7 +150,10 @@ export async function buildAgentProviderRequest(input: {
         : 'Current Session workspace bindings: []. Workspace-scoped filesystem and Bash tools are unavailable for this run.',
     },
   });
-  const selected = [...instructions, ...journalMessages];
+  const imageReader = toolCodec.wireByCanonical.get('session.read');
+  if (imageReader) instructions.push({ contributionId: 'session:images', contributionKind: 'sessionControls',
+    label: 'Image context', message: { role: 'system', content: visualContextInstruction(input.sessionId, imageReader) } });
+  const selected = [...instructions, ...journalMessages, ...visualContextMessages(input.events, input.runId)];
   assertContextContributions(selected);
   const journalCodecsByCallId = providerMessageCodecsByCallId(input.events);
   const providerSelected = selected.map<ContextMessageContribution>((contribution) => ({
@@ -297,8 +301,6 @@ export function messagesFromJournal(
         message: {
           role: event.payload.role,
           content: messageContentForModel(event.payload, messageBindings),
-          ...(event.payload.role === 'user' && event.payload.filesystemReferences?.some(isImageReference)
-            ? { images: event.payload.filesystemReferences.filter(isImageReference).map(reference => ({ workspaceId: reference.workspaceId, logicalPath: reference.logicalPath, mediaType: reference.mediaType })) } : {}),
           ...reasoning,
         },
       });
@@ -532,9 +534,9 @@ export function messagesFromJournal(
           content: JSON.stringify({
             ...toolResultForModel(event.payload.record),
             ...(processes.has(event.callId) ? { process: processContext(processes.get(event.callId)!) } : {}),
-            ...(approval ? { approval: { decision: approval.decision, scope: approval.authorizationScope ?? 'call' } } : {}),
+            ...(approval ? { approval: { decision: approval.decision, scope: approval.authorizationScope ?? 'call',
+              ...(approval.reason ? { reason: approval.reason } : {}) } } : {}),
           }),
-          toolImages: toolImagesForModel(event.payload.record),
         },
       });
     } else if (event.type === 'provider.turn.settled' && event.payload.outcome === 'completed') {
@@ -1072,10 +1074,6 @@ const CONTEXT_MESSAGE_KINDS: readonly ContextCompositionMessage['contributionKin
   'contextProviders',
 ];
 
-function isImageReference(reference: import('@deepcode/protocol').FilesystemReference): reference is Extract<import('@deepcode/protocol').FilesystemReference, { kind: 'file' }> {
-  return reference.kind === 'file' && ['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(reference.mediaType);
-}
-
 function messageContentForModel(
   payload: Extract<SessionEvent, { type: 'message.committed' }>['payload'],
   workspaceBindings: readonly WorkspaceBindingDisplay[],
@@ -1090,7 +1088,7 @@ function messageContentForModel(
       binding.workspaceId,
       index === 0 ? 'primary' : `workspace${index + 1}`,
     ]));
-    sections.push(`Filesystem references attached to this message. PNG, JPEG, WebP and GIF attachments are included as image inputs in this user message; inspect their visual content directly. Other file contents require the relevant read tool. Input snapshots are read-only. Use the listed DeepCode-managed session working directory for editable copies and preview drafts; they persist across turns until the session is deleted:\n${JSON.stringify(
+    sections.push(`Filesystem references attached to this message. Images are identified by referenceId; consult Current visual inputs for the pixels included in this request. Other file contents require the relevant read tool. Input snapshots are read-only. Use the listed DeepCode-managed session working directory for editable copies and preview drafts; they persist across turns until the session is deleted:\n${JSON.stringify(
       payload.filesystemReferences.map((reference) => ({
         referenceId: reference.referenceId,
         workspace: workspaceHandleById.get(reference.workspaceId) ?? 'unavailable',
@@ -1133,15 +1131,6 @@ function toolResultForModel(record: ToolExecutionRecord): Record<string, unknown
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-}
-
-function toolImagesForModel(record: ToolExecutionRecord): string[] | undefined {
-  if (record.outcome !== 'completed' || !isRecord(record.output) || record.output.modelImages === undefined) return undefined;
-  if (!Array.isArray(record.output.modelImages)) throw new Error('Tool modelImages must be an array');
-  return record.output.modelImages.map(image => {
-    if (!isRecord(image) || typeof image.artifactId !== 'string') throw new Error('Tool image artifactId is required');
-    return image.artifactId;
-  });
 }
 
 function processContext(job: import('@deepcode/protocol').ManagedProcessSnapshot): unknown {

@@ -1,0 +1,92 @@
+import type { ModelMessage, SessionEvent } from '@deepcode/protocol';
+import type { ContextMessageContribution } from './plugins.js';
+
+type ImageReference = {
+  imageId: string;
+  label: string;
+  sequence: number;
+} & (
+  | { image: NonNullable<ModelMessage['images']>[number]; toolImage?: never }
+  | { image?: never; toolImage: NonNullable<ModelMessage['toolImages']>[number] }
+);
+
+export function eventImages(event: SessionEvent): ImageReference[] {
+  if (event.type === 'message.committed' && event.payload.role === 'user') {
+    return (event.payload.filesystemReferences ?? []).flatMap(reference => (
+      reference.kind === 'file' && ['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(reference.mediaType)
+        ? [{ imageId: reference.referenceId, label: reference.displayName, sequence: event.sequence,
+          image: { workspaceId: reference.workspaceId, logicalPath: reference.logicalPath, mediaType: reference.mediaType } }]
+        : []
+    ));
+  }
+  if (event.type !== 'tool.completed' || event.payload.record.outcome !== 'completed') return [];
+  const output = event.payload.record.output;
+  if (!output || typeof output !== 'object' || Array.isArray(output) || !('modelImages' in output)) return [];
+  if (!Array.isArray(output.modelImages)) throw new Error('Tool modelImages must be an array');
+  return output.modelImages.map(image => {
+    if (!image || typeof image !== 'object' || Array.isArray(image) || typeof image.artifactId !== 'string') {
+      throw new Error('Tool image artifactId is required');
+    }
+    return { imageId: image.artifactId, label: image.artifactId, sequence: event.sequence,
+      toolImage: { callId: event.callId, artifactId: image.artifactId } };
+  });
+}
+
+export function imageCatalog(events: readonly SessionEvent[]): Map<string, ImageReference> {
+  return new Map(events.flatMap(event => eventImages(event).map(image => [image.imageId, image] as const)));
+}
+
+export function readImageReferences(events: readonly SessionEvent[], imageIds: readonly string[]): ImageReference[] {
+  const catalog = imageCatalog(events);
+  return imageIds.map(id => {
+    const image = catalog.get(id);
+    if (!image) throw new Error(`session_image_not_found: ${id}`);
+    return image;
+  });
+}
+
+export function visualContextInstruction(sessionId: string, readerName: string): string {
+  return `Historical image references contain no pixels. The final Current visual inputs messages identify the images attached to this request. Use ${readerName} with view=images, sessionId=${sessionId} and imageIds to reopen exact references or compare images; do not infer omitted visual details. User attachments remain during this run; fresh tool observations replace the preceding batch. Release unneeded pixels with imageIds=[].`;
+}
+
+/** Selection is replayed from existing input and tool facts; retries reuse the prepared request. */
+export function visualContextMessages(events: readonly SessionEvent[], runId: string): ContextMessageContribution[] {
+  const input = events.find(event => event.type === 'run.started' && event.runId === runId);
+  const inputMessageId = input?.type === 'run.started' ? input.payload.inputMessageId : undefined;
+  let attachments: ImageReference[] = [];
+  let observations: ImageReference[] = [];
+  let nextObservationBatch = true;
+  for (const event of events) {
+    const currentInput = event.type === 'message.committed' && event.payload.messageId === inputMessageId;
+    if (!currentInput && (!('runId' in event) || event.runId !== runId)) continue;
+    if (event.type === 'context.composed' && event.payload.purpose === 'agent') nextObservationBatch = true;
+    if (event.type === 'message.committed' && event.payload.role === 'user') {
+      attachments.push(...eventImages(event));
+    } else if (event.type === 'tool.completed' && event.payload.record.outcome === 'completed') {
+      const record = event.payload.record;
+      if (record.toolName === 'session.read' && record.input.view === 'images' && record.input.sessionId === event.sessionId && Array.isArray(record.input.imageIds)) {
+        attachments = [];
+        observations = readImageReferences(events, record.input.imageIds as string[]);
+        nextObservationBatch = true;
+      } else {
+        const images = eventImages(event);
+        if (images.length) {
+          if (nextObservationBatch) observations = [];
+          observations.push(...images);
+          nextObservationBatch = false;
+        }
+      }
+    }
+  }
+  const selected = new Map([...attachments, ...observations].map(image => [image.imageId, image]));
+  return [...selected.values()].map(image => ({
+    contributionId: `visual-input:${image.imageId}`,
+    contributionKind: 'contextProviders',
+    label: image.label,
+    message: {
+      role: 'user',
+      content: `Current visual inputs: ${JSON.stringify({ imageId: image.imageId, label: image.label })}`,
+      ...(image.image ? { images: [image.image] } : { toolImages: [image.toolImage] }),
+    },
+  }));
+}
