@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(windows)]
+mod windows_workspace;
 use crate::shell_environment::{prepare_script_arguments, ShellProgram};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::ffi::OsString;
@@ -250,7 +252,43 @@ fn invoke_shell_in_temp(
                 .env("XDG_CONFIG_HOME", home.join("config"))
                 .env("XDG_CACHE_HOME", home.join("cache"))
                 .env("GIT_OPTIONAL_LOCKS", "0");
+            #[cfg(windows)]
+            {
+                for directory in [home.join("AppData/Roaming"), home.join("AppData/Local")] {
+                    fs::create_dir_all(directory).map_err(|error| {
+                        KernelError::Other(format!("Create Agent application data: {error}"))
+                    })?;
+                }
+                process
+                    .env("USERPROFILE", home)
+                    .env("APPDATA", home.join("AppData/Roaming"))
+                    .env("LOCALAPPDATA", home.join("AppData/Local"));
+            }
         }
+        #[cfg(windows)]
+        let mut result = if execution_scope == "workspace" {
+            windows_workspace::execute(
+                invocation.id,
+                process,
+                timeout_seconds,
+                tool_name,
+                &context,
+                &workspace_root,
+                &workspace_mode,
+                temporary,
+                terminal_stdin.as_deref(),
+            )?
+        } else {
+            execute_cli_command(
+                invocation.id,
+                process,
+                timeout_seconds,
+                tool_name,
+                &context,
+                None,
+            )?
+        };
+        #[cfg(not(windows))]
         let mut result = execute_cli_command(
             invocation.id,
             process,
@@ -928,8 +966,12 @@ fn prepare_shell_command(
             workspace_root,
             workspace_mode,
         );
-        return Err(crate::workspace_sandbox::unavailable(&shell.tool,
-            "Strict file read isolation is not available in this Windows backend. Select a supported execution environment, or explicitly request Host permission."));
+        // This prepared command is consumed only by windows_workspace::execute;
+        // it must never be spawned directly for the workspace scope.
+        Ok(PreparedShellCommand {
+            program: shell.executable.clone(),
+            arguments: args.iter().map(OsString::from).collect(),
+        })
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
@@ -1386,6 +1428,8 @@ fn spawn_output_reader(
                     thread::sleep(PROCESS_POLL_INTERVAL);
                     continue;
                 }
+                #[cfg(windows)]
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => break,
                 #[cfg(unix)]
                 Err(error) if _pty && error.raw_os_error() == Some(libc::EIO) => break,
                 Err(error) => return Err(error),
@@ -2016,18 +2060,43 @@ pub fn execute_cli_command(
     let stdout_result = join_output_reader(stdout_reader, "stdout");
     let stderr_result = join_output_reader(stderr_reader, "stderr");
 
-    let (mut stdout, mut stderr) = match combine_shell_results(stdout_result, stderr_result) {
+    let (stdout, stderr) = match combine_shell_results(stdout_result, stderr_result) {
         Ok(streams) => streams,
         Err(error) => return shell_cleanup_failure(wait_result, error),
     };
     let (status, timed_out, cancelled) = wait_result?;
+    complete_shell_output(
+        invocation_id,
+        tool_name,
+        timeout_seconds,
+        started,
+        status.code(),
+        timed_out,
+        cancelled,
+        archive,
+        stdout,
+        stderr,
+    )
+}
+
+fn complete_shell_output(
+    invocation_id: String,
+    tool_name: &str,
+    timeout_seconds: Option<u64>,
+    started: Instant,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    cancelled: bool,
+    archive: ShellOutputArchive,
+    mut stdout: CapturedOutput,
+    mut stderr: CapturedOutput,
+) -> KernelResult<KernelToolExecutionResult> {
     bound_combined_output(&mut stdout, &mut stderr, BASH_OUTPUT_LIMIT_BYTES);
     bound_output_lines(&mut stdout, &mut stderr);
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let captured_bytes = stdout.bytes.len().saturating_add(stderr.bytes.len());
     let truncated = stdout.truncated || stderr.truncated;
-    let exit_code = status.code();
-    let success = !timed_out && !cancelled && status.success();
+    let success = !timed_out && !cancelled && exit_code == Some(0);
 
     let mut output = serde_json::json!({
         "stdout": String::from_utf8_lossy(&stdout.bytes),

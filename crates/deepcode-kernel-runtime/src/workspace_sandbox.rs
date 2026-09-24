@@ -1,18 +1,20 @@
 //! Platform implementations of the existing workspace Shell policy.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, test))]
 use deepcode_kernel_abi::KernelError;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows, test))]
 use deepcode_kernel_abi::KernelResult;
 use serde::{Deserialize, Serialize};
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 use std::path::Path;
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, test))]
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
 #[cfg(windows)]
 pub mod windows;
+#[cfg(any(windows, test))]
+mod windows_policy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,7 +42,7 @@ pub fn probe() -> SandboxStatus {
     }
     #[cfg(windows)]
     {
-        SandboxStatus::observed("windows-restricted-token", Err("This backend restricts writes but does not provide strict file read isolation. Use WSL or explicitly authorize Host execution.".into()))
+        windows::probe()
     }
     #[cfg(target_os = "macos")]
     {
@@ -78,7 +80,7 @@ pub(crate) fn unavailable(tool: &str, message: impl Into<String>) -> KernelError
 
 /// Directory grants may create the authorized output directory. File grants do
 /// not implicitly authorize creating or renaming entries in their parent.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows, test))]
 pub(crate) fn writable_paths(
     root: &Path,
     mode: &str,

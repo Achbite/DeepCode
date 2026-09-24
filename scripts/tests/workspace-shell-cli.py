@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused CLI/Plan/workspace Shell check on macOS, Linux or initialized Windows.
+"""Focused CLI/Plan/workspace Shell check on macOS, Linux or LPAC-capable Windows.
 
 Uses the existing local-agent fixture only for deterministic Provider input and
 owned Host lifecycle. Commands, Plan confirmation and outputs use the real CLI.
@@ -44,16 +44,13 @@ class Provider(fixture.MockProviderHandler):
                 if MACOS:
                     read_command += "; /usr/bin/git --version; /usr/bin/xcrun --find git"
                 self._send_tool_calls([
-                    shell('read', command(read_command, "Write-Output 'workspace-cli 中文'; whoami; node --version; Get-ChildItem -Force; Get-Content -LiteralPath README.txt -Encoding UTF8")),
+                    shell('read', command(read_command, "$ErrorActionPreference = 'Stop'; Write-Output 'workspace-cli 中文'; git branch --show-current; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; node --version; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Get-ChildItem -Force; Get-Content -LiteralPath README.txt -Encoding UTF8")),
                 ])
             elif ordinal == 2:
                 require(results['read']['outcome'] == 'completed', results['read'])
                 require('workspace-cli 中文' in results['read']['output']['stdout'], 'Unicode output missing')
                 require('workspace-read-ok' in results['read']['output']['stdout'], 'Workspace file was not read')
-                if WINDOWS:
-                    require('deepcode_' in results['read']['output']['stdout'].lower(), 'Shell did not run under the dedicated account')
-                else:
-                    require('workspace-test' in results['read']['output']['stdout'], 'Git did not read the workspace branch')
+                require('workspace-test' in results['read']['output']['stdout'], 'Git did not read the workspace branch')
                 if MACOS:
                     require('git version ' in results['read']['output']['stdout'], 'System Git did not execute')
                     require(any(line.endswith('/usr/bin/git') for line in results['read']['output']['stdout'].splitlines()), 'xcrun did not resolve the active Git tool')
@@ -71,10 +68,16 @@ class Provider(fixture.MockProviderHandler):
                 require(results['write']['outcome'] == 'completed', results['write'])
                 require(results['readonly']['outcome'] == 'failed', results['readonly'])
                 require(results['readonly']['output']['exitCode'] != 0, 'Unapproved workspace path was writable')
-                self._send_tool_calls([shell('outside', command("printf unexpected > ../outside.txt", "$ErrorActionPreference = 'Stop'; Set-Content ../outside.txt unexpected"))])
+                self._send_tool_calls([
+                    shell('outside', command("printf unexpected > ../outside.txt", "$ErrorActionPreference = 'Stop'; Set-Content ../outside.txt unexpected")),
+                    shell('outside_read', command("cat ../private.txt", "$ErrorActionPreference = 'Stop'; Get-Content ../private.txt")),
+                ])
             elif ordinal == 5:
                 require(results['outside']['outcome'] == 'failed', results['outside'])
                 require(results['outside']['output']['exitCode'] != 0, 'Outside write reported success')
+                require(results['outside_read']['outcome'] == 'failed', results['outside_read'])
+                require(results['outside_read']['output']['exitCode'] != 0, 'Unapproved outside file was readable')
+                require('outside-private-data' not in results['outside_read']['output']['stdout'], 'Outside contents were exposed')
                 self._send_tool_calls([
                     shell('nonzero', command("printf 'expected-failure\\n'; exit 7", "Write-Output 'expected-failure'; exit 7")),
                     shell('pty', command('read -r value; printf "PTY:%s\\n" "$value"; test -t 0', "$value = [Console]::ReadLine(); Write-Output \"PTY:$value\"; if ([Console]::IsInputRedirected) { exit 9 }"), terminal={'stdin': 'hello-terminal\n'}),
@@ -103,12 +106,15 @@ class Provider(fixture.MockProviderHandler):
 def main():
     status = json.loads(subprocess.check_output([str(fixture.DAEMON_BINARY), '--workspace-sandbox-status'], text=True, encoding='utf-8'))
     require(status['available'], f'Unsupported runtime environment: {status}')
+    if WINDOWS:
+        require(status['backend'] == 'windows-lpac', f'LPAC launch/token check did not run: {status}')
     # OS scratch is deliberately writable by macOS tools. Exercise project
     # boundaries outside that grant, while retaining disposable fixture ownership.
     scratch = fixture.ROOT / '.build-cache'
     scratch.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='workspace-shell-', dir=scratch) as directory:
         root = Path(directory); workspace = root / 'workspace'; workspace.mkdir()
+        (root / 'private.txt').write_text('outside-private-data', encoding='utf-8')
         (workspace / 'README.txt').write_text('workspace-read-ok\n', encoding='utf-8')
         subprocess.run(['git', 'init', '-q', '-b', 'workspace-test', str(workspace)], check=True)
         state = fixture.ProviderState(workspace)
@@ -142,7 +148,7 @@ def main():
                 runtime = json.loads(database.execute("select payload_json from session_events where event_type='run.started' order by sequence limit 1").fetchone()[0])['runtimeSnapshot']
                 print('[workspace-shell-cli] selected environment:', json.dumps(runtime['environment']['shell']))
             daemon.shutdown()
-            print('[workspace-shell-cli] PASS: read-only Shell without approval, confirmed directory grant, unapproved workspace path rejection, Unicode write, outside write rejection, exit 7, real PTY, offline policy, timeout, final settlement and owned Host shutdown; 7 fixture Provider requests.')
+            print('[workspace-shell-cli] PASS: read-only Shell without approval, confirmed directory grant, unapproved workspace path rejection, Unicode write, outside read/write rejection, exit 7, real PTY, offline policy, timeout, final settlement and owned Host shutdown; 7 fixture Provider requests.')
         except BaseException:
             print(daemon.log_tail())
             store = daemon.config_root / 'data/agent-runtime/session.sqlite3'

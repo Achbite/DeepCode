@@ -70,16 +70,6 @@ pub(crate) use workspace_api::*;
 
 #[tokio::main]
 async fn main() {
-    #[cfg(windows)]
-    if let Some(result) = deepcode_kernel_runtime::workspace_sandbox::windows::entrypoint() {
-        match result {
-            Ok(code) => std::process::exit(code),
-            Err(error) => {
-                eprintln!("{error}");
-                std::process::exit(1);
-            }
-        }
-    }
     if std::env::args().nth(1).as_deref() == Some("--kernel-tool-worker") {
         if let Err(error) = kernel_tool_worker::run() {
             eprintln!("{error}");
@@ -89,11 +79,6 @@ async fn main() {
     }
     let user_directories =
         deepcode_host_connection::UserDirectories::resolve().expect("解析 DeepCode 用户目录");
-    #[cfg(windows)]
-    std::env::set_var(
-        "DEEPCODE_SANDBOX_STATE_PATH",
-        user_directories.data_dir.join("workspace-sandbox.json"),
-    );
     #[cfg(windows)]
     if std::env::args().nth(1).as_deref() == Some("--workspace-sandbox-init") {
         if let Err(error) = deepcode_kernel_runtime::workspace_sandbox::windows::request_setup() {

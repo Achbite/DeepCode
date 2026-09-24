@@ -12,7 +12,7 @@ export default function WorkspaceSandboxSettings({ chinese }: { chinese: boolean
     setPending(true); setError(null);
     try {
       const result = await initializeWorkspaceSandbox();
-      if (!result.ok) throw new Error(result.message || result.error || 'Sandbox setup failed');
+      if (!result.ok) throw new Error(result.message || result.error || 'Sandbox support check failed');
       await reload();
     } catch (error) { setError(String(error)); }
     finally { setPending(false); }
@@ -25,9 +25,9 @@ export default function WorkspaceSandboxSettings({ chinese }: { chinese: boolean
           <div className="settings-field__label">{sandbox?.available ? (chinese ? '可用' : 'Available') : (chinese ? '尚不可用' : 'Unavailable')}{sandbox?.backend ? ` · ${sandbox.backend}` : ''}</div>
           {sandbox?.reason && <p className="settings-field__description">{sandbox.reason}</p>}
         </div>
-        {environment?.os === 'windows' && !sandbox?.available && <button className="settings-button" disabled={pending} onClick={() => void initialize()}>{pending ? (chinese ? '正在初始化…' : 'Initializing…') : (chinese ? '初始化 Windows 支持' : 'Initialize Windows support')}</button>}
+        {environment?.os === 'windows' && !sandbox?.available && <button className="settings-button" disabled={pending} onClick={() => void initialize()}>{pending ? (chinese ? '正在检查…' : 'Checking…') : (chinese ? '检查 Windows 支持' : 'Check Windows support')}</button>}
       </div>
-      {environment?.os === 'windows' && !sandbox?.available && <p className="settings-field__description">{chinese ? 'Windows 将请求管理员确认，创建本地执行账户和网络规则。日常工具以受限账户运行；初始化后从下一次运行生效。' : 'Windows asks for administrator confirmation to create a local execution account and network rules. Ordinary tools run under the restricted account; initialization applies to subsequent runs.'}</p>}
+      {environment?.os === 'windows' && !sandbox?.available && <p className="settings-field__description">{chinese ? 'Windows 使用系统隔离能力限制工作区命令的文件访问。检查失败时会显示具体原因。' : 'Windows uses system isolation to restrict file access for workspace commands. If the check fails, its reason is shown here.'}</p>}
       {error && <p className="settings-error" role="alert">{error}</p>}
     </div>
   </section>;
