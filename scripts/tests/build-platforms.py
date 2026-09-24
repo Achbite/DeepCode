@@ -295,20 +295,48 @@ class PublicationTests(unittest.TestCase):
 class InstallerTests(unittest.TestCase):
     def test_macos_payload_installs_cli_against_the_same_app_resources(self):
         with tempfile.TemporaryDirectory(prefix='deepcode-pkg-') as directory:
-            root = Path(directory)
+            root = Path(directory) / 'fixture with spaces'
+            root.mkdir()
             stage = root / 'stage'
-            write(stage, 'DeepCode-GUI.app/Contents/MacOS/deepcode-cli', b'CLI')
+            stub = b"""#!/bin/sh
+exec "$DEEPCODE_TEST_PYTHON" -c 'import json,os,sys; print(json.dumps({"argv":sys.argv[1:],"runtime":os.environ.get("DEEPCODE_RUNTIME_DIR"),"kernel":os.environ.get("DEEPCODE_KERNEL_BIN"),"user":os.environ.get("DEEPCODE_USER_ROOT")})); sys.exit(23)' "$@"
+"""
+            write(stage, 'DeepCode-GUI.app/Contents/MacOS/deepcode-cli', stub)
+            (stage / 'DeepCode-GUI.app/Contents/MacOS/deepcode-cli').chmod(0o755)
             write(stage, 'DeepCode-GUI.app/Contents/Resources/session-core/dist/index.js', b'Session')
             def inspect(command, **kwargs):
+                self.assertEqual(command[0], 'pkgbuild')
                 payload = Path(command[command.index('--root') + 1])
-                self.assertEqual((payload / 'Applications/DeepCode-GUI.app/Contents/MacOS/deepcode-cli').read_bytes(), b'CLI')
+                app = payload / 'Applications/DeepCode-GUI.app'
+                self.assertEqual((app / 'Contents/MacOS/deepcode-cli').read_bytes(), stub)
                 launcher = (payload / 'usr/local/bin/deepcode').read_text()
-                self.assertIn('DEEPCODE_RUNTIME_DIR="$APP_DIR/Resources"', launcher)
-                self.assertNotIn('DEEPCODE_USER_ROOT=', launcher)
-                self.assertIn('exec "$APP_DIR/MacOS/deepcode-cli" "$@"', launcher)
+                # Only relocate the declared installation root; execute the remaining launcher unchanged.
+                install_root = '/Applications/DeepCode-GUI.app'
+                self.assertIn(install_root, launcher, 'Cannot safely relocate the installer fixture')
+                relocated = root / 'deepcode'
+                relocated.write_text(launcher.replace(install_root, str(app)))
+                arguments = ['--session', 'session:launcher', 'argument with spaces', 'literal "$HOME"', '']
+                for user_root in (None, str(root / 'independent user data')):
+                    environment = {**os.environ, 'DEEPCODE_TEST_PYTHON': sys.executable,
+                                   'DEEPCODE_RUNTIME_DIR': 'stale-runtime', 'DEEPCODE_KERNEL_BIN': 'stale-kernel'}
+                    environment.pop('DEEPCODE_USER_ROOT', None)
+                    if user_root is not None:
+                        environment['DEEPCODE_USER_ROOT'] = user_root
+                    launched = subprocess.run(['sh', str(relocated), *arguments], env=environment,
+                                              capture_output=True, text=True, timeout=10)
+                    self.assertEqual(launched.returncode, 23, launched.stdout + launched.stderr)
+                    observed = json.loads(launched.stdout)
+                    self.assertEqual(observed['argv'], arguments)
+                    self.assertEqual(observed['runtime'], str(app / 'Contents/Resources'))
+                    self.assertEqual(observed['kernel'], str(app / 'Contents/MacOS/deepcode-kernel'))
+                    self.assertEqual(observed['user'], user_root)
                 self.assertFalse((payload / 'Users').exists())
-            with patch.object(installers.subprocess, 'run', side_effect=inspect):
+                return subprocess.CompletedProcess(command, 0)
+            # Patch only the packager's module reference, so the launcher uses real subprocess.run.
+            with patch.object(installers, 'subprocess') as packager:
+                packager.run.side_effect = inspect
                 installers.macos(stage, root / 'DeepCode.pkg', '0.6.2')
+                packager.run.assert_called_once()
 
     def test_windows_setup_compiles_from_current_runtime(self):
         with tempfile.TemporaryDirectory(prefix='deepcode-nsis-') as directory:

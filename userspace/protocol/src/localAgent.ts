@@ -1570,6 +1570,8 @@ export interface RunRuntimeSnapshot {
   provider: ProviderRuntimeSnapshot;
   /** Frozen execution-permission reviewer, independent of the conversation request. */
   approvalReviewer?: ProviderRuntimeSnapshot;
+  /** Frozen preparation failure, reported only when this run needs delegated review. */
+  approvalReviewerError?: LocalAgentError;
   webSearch: WebSearchBinding;
   instructions: { id: string; text: string }[];
   tools: PreparedToolDescriptor[];

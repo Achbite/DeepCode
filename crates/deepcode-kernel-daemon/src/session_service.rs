@@ -16,6 +16,9 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_STDERR_RECEIPT_BYTES: usize = 16 * 1024;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+// Kernel cancellation can spend 30 seconds completing physical cleanup before
+// Session can settle the run and acknowledge shutdown.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionServiceError {
@@ -238,7 +241,7 @@ impl SessionServiceProcess {
     }
 
     pub(crate) fn shutdown(&self) -> Result<(), SessionServiceError> {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         let receiver = {
             let mut process = self.process.lock().map_err(|_| transport_lock_error())?;
             if process.stopped {

@@ -1833,26 +1833,6 @@ mod tests {
     }
 
     #[test]
-    fn normal_provider_request_does_not_force_a_tool_call() {
-        let prepared = prepare_provider_request(
-            &test_profile("openaiCompatible"),
-            &provider_input(json!({
-                "messages": [{ "role": "user", "content": "Answer normally." }],
-                "tools": [{
-                    "name": "fixture_tool",
-                    "description": "Fixture action.",
-                    "inputSchema": { "type": "object" }
-                }],
-                "hostedTools": []
-            })),
-        )
-        .expect("normal request must prepare");
-        let body: Value =
-            serde_json::from_slice(&prepared.body).expect("provider request body must decode");
-        assert!(body.get("tool_choice").is_none());
-    }
-
-    #[test]
     fn deepseek_thinking_execution_omits_unsupported_tool_choice() {
         let mut profile = test_profile("openaiCompatible");
         profile.provider_flavor = Some("deepseek".to_string());

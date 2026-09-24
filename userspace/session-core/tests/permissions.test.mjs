@@ -73,6 +73,47 @@ test('approval review retains original user constraints without main-model summa
   assert.throws(() => prepareApprovalReview(longInput, runtime, approval, 'provider:oversized'), /approval_review_context_too_large/);
 });
 
+test('review preserves corrections from the preceding and confirmed Plan source runs without selecting other runs', () => {
+  const sessionId = 'session:review-history', runId = 'run:current';
+  const runtime = runtimeSnapshot(runId);
+  const events = [];
+  const addRun = (id, input, guidance) => {
+    events.push(
+      { type: 'message.committed', payload: { messageId: `message:${id}`, role: 'user', content: input } },
+      { type: 'run.started', runId: `run:${id}`, payload: { inputMessageId: `message:${id}` } },
+      { type: 'message.committed', runId: `run:${id}`, payload: { messageId: `guidance:${id}`, role: 'user', content: guidance } },
+    );
+  };
+  addRun('plan', 'Inspect the available data and prepare a report.', 'Use only public data in this Plan.');
+  addRun('unrelated', 'An unrelated earlier task.', 'Unrelated earlier details. '.repeat(1000));
+  addRun('previous', 'Prepare the report.', 'Do not access /private/customer.csv.');
+  addRun('current', 'Continue the report.', 'Keep the report in the existing draft.');
+  const plan = { planId: 'plan:report', revision: 1, runId: 'run:plan', title: 'Prepare a report',
+    summary: 'Inspect the data.', mutationManifest: [] };
+  const snapshot = { events: events.map((event, index) => ({ schemaVersion: 'deepcode.session-event.v5',
+    sessionId, eventId: `event:${index + 1}`, sequence: index + 1, occurredAt: '2026-09-24T00:00:00.000Z', ...event })),
+    state: { ...emptySessionState(sessionId), run: { runId, workspaceBindings: [workspaceBinding] },
+      plans: [plan], activePlanRef: { planId: plan.planId, revision: plan.revision } } };
+  const approval = { approvalId: 'approval:history', runId, callId: 'call:read', preview: {
+    summary: 'Read report data', effects: ['process'], logicalTargets: ['.'],
+    operation: { toolName: 'bash', arguments: { command: 'cat /private/customer.csv' } } } };
+  const before = structuredClone(snapshot);
+  const packet = JSON.parse(prepareApprovalReview(snapshot, runtime, approval, 'provider:history').request.messages[1].content);
+  assert.deepEqual(packet.userMessages, [
+    { messageId: 'message:plan', content: 'Inspect the available data and prepare a report.' },
+    { messageId: 'guidance:plan', content: 'Use only public data in this Plan.' },
+    { messageId: 'message:previous', content: 'Prepare the report.' },
+    { messageId: 'guidance:previous', content: 'Do not access /private/customer.csv.' },
+    { messageId: 'message:current', content: 'Continue the report.' },
+    { messageId: 'guidance:current', content: 'Keep the report in the existing draft.' },
+  ]);
+  assert.equal(packet.plan.confirmed, true);
+  assert.deepEqual(snapshot, before);
+  const oversized = structuredClone(snapshot);
+  oversized.events.find(event => event.payload.messageId === 'guidance:plan').payload.content = 'Required Plan restriction. '.repeat(1000);
+  assert.throws(() => prepareApprovalReview(oversized, runtime, approval, 'provider:oversized-history'), /approval_review_context_too_large/);
+});
+
 test('review reasons survive canonical permission metadata removal without changing the operation', () => {
   const runId = 'run:reason', callId = 'call:reason';
   const operation = { toolName: 'bash', arguments: { command: 'ls /Applications' }, executionScope: 'workspace', workspaceRoot: '/workspace' };
@@ -215,6 +256,59 @@ for (const mode of ['ask', 'review', 'allow']) test(`Shell ${mode} has a distinc
   else if (mode === 'allow') assert.equal(resolved, undefined);
 });
 
+for (const needsReview of [false, true]) test(`a frozen reviewer configuration error affects only an actual review: ${needsReview}`, async t => {
+  const journal = new InMemoryCommandJournal(), sessionId = `session:review-config-${needsReview}`;
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const originalError = { code: 'approval_reviewer_configuration_invalid', message: 'The selected reviewer model is unavailable.',
+    diagnostics: { source: 'kernel', phase: 'prepare', category: 'input', retryable: false, causes: [{ message: 'Reviewer profile does not exist.' }] } };
+  const preparation = fakeRunPreparation({ tools: [shell], permissions: { 'agent.permissions.shell': 'review' } });
+  const prepare = preparation.port.prepare;
+  preparation.port.prepare = async request => {
+    const prepared = await prepare(request);
+    prepared.runtimeSnapshot.approvalReviewerError = originalError;
+    return prepared;
+  };
+  const requests = [];
+  let executions = 0;
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    requests.push(request);
+    assert.equal(request.purpose, 'agent', 'invalid reviewer configuration must not use a replacement Provider');
+    if (needsReview) yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:review-config', name: 'bash',
+      input: { workspace: 'primary', command: 'make check' } });
+    else yield providerEvent(request.requestId, 'assistant.message', { messageId: 'message:ordinary', content: 'A normal answer.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel({ async execute(request) {
+    if (request.nonWorkspaceAuthority) { executions++; return shellReply(request); }
+    return { schemaVersion: 'deepcode.kernel-reply', type: 'tool.execution', requestId: request.requestId, callId: request.callId,
+      status: 'approvalRequired', preview: { summary: 'Run make check', effects: ['process'], logicalTargets: ['.'],
+        approvalReviewer: 'agent', authorizationContext: context } };
+  } }), preparation.port, 'review-config');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:review-config', needsReview ? 'Run make check.' : 'Answer without tools.'));
+  const state = await waitForProjection(actor, value => value.run?.status === (needsReview ? 'waiting' : 'completed'));
+  assert.equal(requests.length, 1);
+  assert.equal(executions, 0);
+  const events = await readEvents(journal, sessionId);
+  assert.equal(events.some(event => event.type === 'approval.resolved'), false);
+  assert.equal(events.some(event => event.type === 'context.composed' && event.payload.purpose === 'approvalReview'), false);
+  if (needsReview) {
+    assert.equal(state.pendingApproval.preview.review.decision, 'ask');
+    assert.ok(state.pendingApproval.preview.review.reason.includes(originalError.code));
+    assert.ok(state.pendingApproval.preview.review.reason.includes(originalError.message));
+    const snapshot = { state: { ...emptySessionState(sessionId), run: state.run }, events: [] };
+    assert.throws(() => prepareApprovalReview(snapshot, { ...runtimeSnapshot(state.run.runId), approvalReviewerError: originalError },
+      state.pendingApproval, 'provider:invalid-config'), error => {
+        assert.equal(error.code, originalError.code);
+        assert.equal(error.message, originalError.message);
+        assert.deepEqual(error.diagnostics, originalError.diagnostics);
+        return true;
+      });
+  } else {
+    assert.equal(state.messages.at(-1).content, 'A normal answer.');
+    assert.equal(preparation.released.length, 1);
+  }
+});
+
 test('cancelling an independent reviewer settles its own request and never executes the command', async t => {
   const journal = new InMemoryCommandJournal(), sessionId = 'session:cancel-review';
   await createSession(journal, sessionId, [workspaceBinding]);
@@ -277,7 +371,9 @@ test('delegated Plan confirmation records Agent authority without waiting for a 
   assert.equal(events.some(event => event.type === 'run.waiting' && event.payload.reason === 'plan'), false);
 });
 
-for (const result of ['not JSON', '{"decision":"ask","reason":"Script contents are unknown."}']) test(`unresolved review retains a user decision: ${result}`, async t => {
+for (const result of ['not JSON', '{"decision":"ask","reason":"Script contents are unknown."}',
+  ...['allow', 'deny', 'ask'].map(decision => JSON.stringify({ decision: [decision], reason: 'Malformed decision type.' })),
+]) test(`unresolved review retains a user decision: ${result}`, async t => {
   const journal = new InMemoryCommandJournal(), sessionId = 'session:review-uncertain';
   await createSession(journal, sessionId, [workspaceBinding]);
   let executions = 0;

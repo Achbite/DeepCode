@@ -1252,6 +1252,7 @@ function cloneRunRuntimeSnapshot(snapshot: RunRuntimeSnapshot): RunRuntimeSnapsh
     environment: structuredClone(snapshot.environment),
     provider: { ...snapshot.provider },
     ...(snapshot.approvalReviewer ? { approvalReviewer: { ...snapshot.approvalReviewer } } : {}),
+    ...(snapshot.approvalReviewerError ? { approvalReviewerError: structuredClone(snapshot.approvalReviewerError) } : {}),
     webSearch: { ...snapshot.webSearch },
     instructions: snapshot.instructions.map((instruction) => ({ ...instruction })),
     tools: snapshot.tools.map((tool) => ({

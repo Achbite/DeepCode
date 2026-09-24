@@ -3685,6 +3685,12 @@ fn run_provider_runtime_from_connection(
     })?;
     let provider = validate_run_runtime_snapshot(runtime_snapshot)?;
     if purpose == "approvalReview" {
+        if let Some(error) = runtime_snapshot.get("approvalReviewerError") {
+            return Err(LocalAgentStoreError::new(
+                "approval_reviewer_prepare_failed",
+                required_string(error, "message")?,
+            ));
+        }
         if let Some(reviewer) = runtime_snapshot.get("approvalReviewer") {
             return validate_provider_runtime_snapshot(reviewer);
         }
@@ -3711,7 +3717,7 @@ fn validate_run_runtime_snapshot(
             "environment",
             "permissions",
         ],
-        &["approvalReviewer"],
+        &["approvalReviewer", "approvalReviewerError"],
     )?;
     validate_permission_patches(&value["permissions"])?;
     let run_runtime_snapshot_ref = required_string(value, "runRuntimeSnapshotRef")?;
@@ -3735,6 +3741,15 @@ fn validate_run_runtime_snapshot(
     }
 
     let mut runtime = validate_provider_runtime_snapshot(&value["provider"])?;
+    if let Some(error) = value.get("approvalReviewerError") {
+        validate_local_agent_error(error)?;
+        if value.get("approvalReviewer").is_some() {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "审批模型绑定与准备失败不能同时存在。",
+            ));
+        }
+    }
     if let Some(reviewer) = value.get("approvalReviewer") {
         let reviewer = validate_provider_runtime_snapshot(reviewer)?;
         if reviewer.provider_runtime_ref == runtime.provider_runtime_ref
@@ -4648,6 +4663,36 @@ mod tests {
         assert_eq!(reviewer.web_search_owner, "unavailable");
         runtime["approvalReviewer"]["providerRuntimeRef"] =
             runtime["provider"]["providerRuntimeRef"].clone();
+        assert!(validate_run_runtime_snapshot(&runtime).is_err());
+    }
+
+    #[test]
+    fn unavailable_reviewer_preserves_the_error_without_blocking_the_conversation() {
+        let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
+        journal
+            .create_session("session:review-error", "Review error", &json!([]), None)
+            .unwrap();
+        let mut runtime = runtime_snapshot();
+        let error = json!({"code":"approval_reviewer_prepare_failed", "message":"Missing selected review profile"});
+        runtime["approvalReviewerError"] = error.clone();
+        journal.append(&json!({"type":"run.started", "sessionId":"session:review-error", "runId":"run:review-error",
+            "payload":{"inputMessageId":"message:review-error","workspaceBindings":[],"runtimeSnapshot":runtime}})).unwrap();
+        assert_eq!(
+            journal
+                .run_provider_runtime("session:review-error", "run:review-error", "agent")
+                .unwrap()
+                .profile_id,
+            "profile:test"
+        );
+        let failure = journal
+            .run_provider_runtime("session:review-error", "run:review-error", "approvalReview")
+            .err()
+            .unwrap();
+        assert_eq!(failure.code, error["code"].as_str().unwrap());
+        assert_eq!(failure.message, error["message"].as_str().unwrap());
+        runtime["approvalReviewer"] = runtime["provider"].clone();
+        runtime["approvalReviewer"]["providerRuntimeRef"] =
+            json!("provider-runtime:separate-review");
         assert!(validate_run_runtime_snapshot(&runtime).is_err());
     }
 

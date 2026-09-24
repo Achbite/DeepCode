@@ -67,8 +67,6 @@ export function useAgentComposer(
   const respondPlan = useLocalAgentStore((state) => state.respondPlan);
   const cancelRun = useLocalAgentStore((state) => state.cancelRun);
   const saveModelChoice = useLocalAgentStore(state => state.selectModel);
-  const selectProfile = useLocalAgentStore((state) => state.selectProfile);
-  const selectReasoningEffort = useLocalAgentStore((state) => state.selectReasoningEffort);
   const reasoningEffortOverride = useLocalAgentStore((state) => state.reasoningEffortOverride);
   const modelSettingsBusy = useLocalAgentStore((state) => state.modelSettingsBusy);
   const [initialComposer] = useState(()=>readComposerDraft(composerStateKey));
@@ -635,8 +633,6 @@ export function useAgentComposer(
     cancelRun,
     selectModel,
     modelSelectionConfirmed,
-    selectProfile,
-    selectReasoningEffort,
     appendBrowserReview,
     removeBrowserReview,
     draft,

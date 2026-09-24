@@ -8,10 +8,11 @@ use windows_sys::Win32::{
     Foundation::*,
     Security::{Authorization::*, *},
     Storage::FileSystem::*,
-    System::Threading::*,
+    System::{SystemServices::SECURITY_DESCRIPTOR_REVISION, Threading::*},
 };
 
 const READ: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+const TRAVERSE: u32 = FILE_TRAVERSE | FILE_READ_ATTRIBUTES;
 // FILE_DELETE_CHILD would allow deletion of a protected .git through its parent.
 const WRITE: u32 =
     FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | DELETE;
@@ -19,7 +20,7 @@ const DENY_WRITE: u32 = WRITE | FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER;
 
 pub(super) struct Grants {
     sid: Local,
-    paths: Vec<(PathBuf, Handle)>,
+    paths: Vec<(PathBuf, Handle, bool)>,
 }
 
 impl Grants {
@@ -30,8 +31,9 @@ impl Grants {
         })
     }
 
-    pub(super) fn apply(&mut self, grants: &[Grant]) -> Result<(), String> {
+    pub(super) fn apply(&mut self, grants: &[Grant], token: HANDLE) -> Result<(), String> {
         let _lock = AclLock::acquire()?;
+        let runtime = RuntimeAccess::new(token)?;
         for grant in grants {
             let metadata = match std::fs::metadata(&grant.path) {
                 Ok(metadata) => metadata,
@@ -48,9 +50,17 @@ impl Grants {
                     ))
                 }
             };
-            // Windows system directories already expose the runtime to LPAC. A
-            // normal user's Everyone/Users/AAP access is never sufficient here.
-            if grant.access == Access::Read && has_lpac_read(&grant.path)? {
+            let mask = match grant.access {
+                Access::Read => READ,
+                Access::Traverse => TRAVERSE,
+                Access::Write => READ | WRITE,
+                Access::DenyWrite => DENY_WRITE,
+            };
+            // A normal user's Everyone/Users/AAP access is not proof of LPAC
+            // access. Query the suspended child, including its package claims.
+            if matches!(grant.access, Access::Read | Access::Traverse)
+                && runtime.can_access(&grant.path, mask)?
+            {
                 continue;
             }
             let handle = unsafe {
@@ -73,18 +83,14 @@ impl Grants {
             let handle = Handle(handle);
             // Register before SetSecurityInfo: propagation can partially change
             // descendants before reporting an error, so cleanup must still run.
-            self.paths.push((grant.path.clone(), handle));
-            let mask = match grant.access {
-                Access::Read => READ,
-                Access::Write => READ | WRITE,
-                Access::DenyWrite => DENY_WRITE,
-            };
+            self.paths
+                .push((grant.path.clone(), handle, grant.access != Access::Traverse));
             let mode = if grant.access == Access::DenyWrite {
                 DENY_ACCESS
             } else {
                 GRANT_ACCESS
             };
-            let inherit = if metadata.is_dir() {
+            let inherit = if metadata.is_dir() && grant.access != Access::Traverse {
                 SUB_CONTAINERS_AND_OBJECTS_INHERIT
             } else {
                 NO_INHERITANCE
@@ -95,6 +101,7 @@ impl Grants {
                 mode,
                 mask,
                 inherit,
+                grant.access != Access::Traverse,
             )
             .map_err(|error| format!("Grant sandbox path {}: {error}", grant.path.display()))?;
         }
@@ -109,9 +116,16 @@ impl Grants {
         let mut failures = Vec::new();
         // Parent first: removal propagates inherited ACEs before child cleanup.
         self.paths
-            .sort_by_key(|(path, _)| path.components().count());
-        self.paths.retain(|(path, handle)| {
-            match edit(handle.0, self.sid.0, REVOKE_ACCESS, 0, NO_INHERITANCE) {
+            .sort_by_key(|(path, _, _)| path.components().count());
+        self.paths.retain(|(path, handle, propagate)| {
+            match edit(
+                handle.0,
+                self.sid.0,
+                REVOKE_ACCESS,
+                0,
+                NO_INHERITANCE,
+                *propagate,
+            ) {
                 Ok(()) => false,
                 Err(error) => {
                     failures.push(format!("{}: {error}", path.display()));
@@ -150,6 +164,7 @@ fn edit(
     mode: ACCESS_MODE,
     mask: u32,
     inheritance: u32,
+    propagate: bool,
 ) -> Result<(), String> {
     let (mut descriptor, mut acl) = (null_mut(), null_mut());
     let result = unsafe {
@@ -184,6 +199,9 @@ fn edit(
         SetEntriesInAclW(1, &entry, acl, &mut updated)
     })?;
     let _updated = Local(updated.cast());
+    if !propagate {
+        return set_directory_metadata_dacl(handle, updated);
+    }
     code("Apply invocation ACL", unsafe {
         SetSecurityInfo(
             handle,
@@ -197,39 +215,101 @@ fn edit(
     })
 }
 
-fn has_lpac_read(path: &std::path::Path) -> Result<bool, String> {
-    let (mut descriptor, mut acl) = (null_mut(), null_mut());
-    code("Read runtime path DACL", unsafe {
-        GetNamedSecurityInfoW(
-            wide(path).as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            &mut acl,
-            null_mut(),
-            &mut descriptor,
-        )
-    })?;
-    let _descriptor = Local(descriptor);
-    if acl.is_null() {
-        return Err(format!("Sandbox path {} has no DACL", path.display()));
+// SetSecurityInfo propagates every existing inheritable ACE, even when the new
+// ACE is not inheritable. Set only this directory's DACL through the native
+// handle API, preserving inherited entries and the current protection state.
+// MAXIMUM_ALLOWED handles also suppress propagation, but request DELETE access
+// and conflict with ordinary open working-directory handles.
+fn set_directory_metadata_dacl(handle: HANDLE, acl: *mut ACL) -> Result<(), String> {
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtSetSecurityObject(
+            handle: HANDLE,
+            information: u32,
+            descriptor: PSECURITY_DESCRIPTOR,
+        ) -> i32;
     }
-    let restricted_apps = sid("S-1-15-2-2")?;
-    let mut rights = 0;
-    code("Check LPAC runtime read access", unsafe {
-        GetEffectiveRightsFromAclW(acl, &trustee(restricted_apps.0), &mut rights)
-    })?;
-    let mapping = GENERIC_MAPPING {
-        GenericRead: FILE_GENERIC_READ,
-        GenericWrite: FILE_GENERIC_WRITE,
-        GenericExecute: FILE_GENERIC_EXECUTE,
-        GenericAll: FILE_ALL_ACCESS,
-    };
-    unsafe {
-        MapGenericMask(&mut rights, &mapping);
+    let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    let pointer = (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast();
+    if unsafe { InitializeSecurityDescriptor(pointer, SECURITY_DESCRIPTOR_REVISION) } == 0
+        || unsafe { SetSecurityDescriptorDacl(pointer, 1, acl, 0) } == 0
+    {
+        return Err(error("Build ancestor metadata DACL"));
     }
-    Ok(rights & READ == READ)
+    let status = unsafe { NtSetSecurityObject(handle, DACL_SECURITY_INFORMATION, pointer) };
+    if status < 0 {
+        Err(format!(
+            "Apply ancestor metadata DACL: NTSTATUS {status:#x}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+// Use the real child token: Store runtime access also depends on package claims.
+// AccessCheck preserves LPAC restrictions and handles inherited deny ACEs that
+// GetEffectiveRightsFromAcl rejects as ERROR_INVALID_ACL. Never impersonate the
+// child on the worker thread while changing ACLs.
+struct RuntimeAccess(Handle);
+
+impl RuntimeAccess {
+    fn new(token: HANDLE) -> Result<Self, String> {
+        let mut impersonation = null_mut();
+        if unsafe { DuplicateToken(token, SecurityIdentification, &mut impersonation) } == 0 {
+            return Err(error("Duplicate LPAC token for runtime access checks"));
+        }
+        Ok(Self(Handle(impersonation)))
+    }
+
+    fn can_access(&self, path: &std::path::Path, mask: u32) -> Result<bool, String> {
+        self.check(path, mask)
+            .map_err(|error| format!("Check LPAC runtime read access {}: {error}", path.display()))
+    }
+
+    fn check(&self, path: &std::path::Path, mask: u32) -> Result<bool, String> {
+        let (mut descriptor, mut acl) = (null_mut(), null_mut());
+        code("Read runtime path DACL", unsafe {
+            GetNamedSecurityInfoW(
+                wide(path).as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut acl,
+                null_mut(),
+                &mut descriptor,
+            )
+        })?;
+        let _descriptor = Local(descriptor);
+        if acl.is_null() {
+            return Err("The path has no discretionary access control list".into());
+        }
+        let mapping = GENERIC_MAPPING {
+            GenericRead: FILE_GENERIC_READ,
+            GenericWrite: FILE_GENERIC_WRITE,
+            GenericExecute: FILE_GENERIC_EXECUTE,
+            GenericAll: FILE_ALL_ACCESS,
+        };
+        let mut privileges: PRIVILEGE_SET = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of_val(&privileges) as u32;
+        let (mut rights, mut allowed) = (0, 0);
+        if unsafe {
+            AccessCheck(
+                descriptor,
+                self.0 .0,
+                mask,
+                &mapping,
+                &mut privileges,
+                &mut length,
+                &mut rights,
+                &mut allowed,
+            )
+        } == 0
+        {
+            return Err(error("Evaluate runtime read access"));
+        }
+        Ok(allowed != 0 && rights & mask == mask)
+    }
 }
 
 // Kernel tool workers are separate processes. Serialize DACL read/modify/write
@@ -289,18 +369,8 @@ mod tests {
         let mut first = Grants::new(&identity).unwrap();
         let mut second = Grants::new(&other).unwrap();
         let path = root.canonicalize().unwrap();
-        first
-            .apply(&[Grant {
-                path: path.clone(),
-                access: Access::Write,
-            }])
-            .unwrap();
-        second
-            .apply(&[Grant {
-                path: path.clone(),
-                access: Access::Read,
-            }])
-            .unwrap();
+        apply(&mut first, &first_profile, &path, Access::Write);
+        apply(&mut second, &second_profile, &path, Access::Read);
         assert!(contains_sid(&path, first.sid.0));
         first.cleanup().unwrap();
         assert!(!contains_sid(&path, first.sid.0));
@@ -308,6 +378,34 @@ mod tests {
         second.cleanup().unwrap();
         assert!(!contains_sid(&path, second.sid.0));
     }
+    fn apply(
+        grants: &mut Grants,
+        profile: &super::super::profile::Profile,
+        path: &std::path::Path,
+        access: Access,
+    ) {
+        let system = std::env::var_os("SystemRoot").unwrap();
+        let directory = PathBuf::from(&system).join("System32");
+        let mut command = std::process::Command::new(directory.join("cmd.exe"));
+        command
+            .args(["/d", "/c", "exit", "0"])
+            .current_dir(directory)
+            .env_clear()
+            .env("SystemRoot", system)
+            .env("LOCALAPPDATA", std::env::var_os("LOCALAPPDATA").unwrap());
+        let mut child = super::super::runner::spawn(&command, false, profile, |token| {
+            grants.apply(
+                &[Grant {
+                    path: path.to_path_buf(),
+                    access,
+                }],
+                token,
+            )
+        })
+        .unwrap();
+        child.stop().unwrap();
+    }
+
     fn contains_sid(path: &std::path::Path, sid: PSID) -> bool {
         let (mut descriptor, mut acl) = (null_mut(), null_mut());
         code("Read test DACL", unsafe {

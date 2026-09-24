@@ -82,8 +82,6 @@ export interface LocalAgentState {
   startNewSession(projectId?: string | null): void;
   activateSession(sessionId: string): Promise<void>;
   selectModel(profileId: string, effort: LlmReasoningEffort | null): Promise<boolean>;
-  selectProfile(profileId: string): Promise<void>;
-  selectReasoningEffort(effort: LlmReasoningEffort | null): Promise<void>;
   refresh(): Promise<void>;
   sendMessage(
     text: string,
@@ -393,20 +391,7 @@ const store = create<LocalAgentState>((set, get) => ({
   selectModel: async (profileId, reasoningEffortOverride) => {
     const profile = get().profiles.find(profile => profile.id === profileId && profile.enabled);
     if (!profile || (profile.thinking !== 'disabled' && !reasoningEffortOverride)) return false;
-    return saveModelSettings(set, get, { profileId, reasoningEffortOverride }, true);
-  },
-
-  selectProfile: async (profileId) => {
-    if (!get().profiles.some((profile) => profile.id === profileId && profile.enabled)) return;
-    if (get().selectedProfileId === profileId) return;
-    await saveModelSettings(set, get, { profileId,
-      reasoningEffortOverride: get().profiles.find(profile => profile.id === profileId)?.reasoningEffort ?? null });
-  },
-
-  selectReasoningEffort: async (reasoningEffortOverride) => {
-    const { selectedProfileId, profiles } = get();
-    if (!selectedProfileId || profiles.find((profile) => profile.id === selectedProfileId)?.thinking === 'disabled') return;
-    await saveModelSettings(set, get, { profileId: selectedProfileId, reasoningEffortOverride }, true);
+    return saveModelSettings(set, get, { profileId, reasoningEffortOverride });
   },
 
   refresh: async () => {
@@ -940,7 +925,7 @@ function projectModelSettings(projection: SessionProjection | null): Partial<Loc
   } : {};
 }
 
-async function saveModelSettings(set: StoreSet, get: StoreGet, settings: SessionModelSettings, rememberEffort = false): Promise<boolean> {
+async function saveModelSettings(set: StoreSet, get: StoreGet, settings: SessionModelSettings): Promise<boolean> {
   if (get().modelSettingsBusy) return false;
   const sessionId = get().sessionId;
   const settingsGeneration = generation;
@@ -952,14 +937,12 @@ async function saveModelSettings(set: StoreSet, get: StoreGet, settings: Session
         sessionId, commandId: nextId('command'), settings,
       });
     }
-    if (rememberEffort) {
-      const profile = get().profiles.find(item => item.id === settings.profileId);
-      if (!profile) throw new Error('llm_profile_unavailable');
-      const remembered = { ...profile, reasoningEffort: settings.reasoningEffortOverride ?? undefined };
-      const saved = await patchLlmProfiles({ profile: remembered });
-      if (!saved.ok) throw new Error(saved.message ?? saved.error ?? 'reasoning_preference_save_failed');
-      set(state => ({ profiles: state.profiles.map(item => item.id === profile.id ? remembered : item) }));
-    }
+    const profile = get().profiles.find(item => item.id === settings.profileId);
+    if (!profile) throw new Error('llm_profile_unavailable');
+    const remembered = { ...profile, reasoningEffort: settings.reasoningEffortOverride ?? undefined };
+    const saved = await patchLlmProfiles({ profile: remembered });
+    if (!saved.ok) throw new Error(saved.message ?? saved.error ?? 'reasoning_preference_save_failed');
+    set(state => ({ profiles: state.profiles.map(item => item.id === profile.id ? remembered : item) }));
     if (!sessionId && generation === settingsGeneration && !get().sessionId) {
       set({ selectedProfileId: settings.profileId, reasoningEffortOverride: settings.reasoningEffortOverride,
         error: null, errorSource: null });

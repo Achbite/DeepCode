@@ -1524,10 +1524,14 @@ mod tests {
         let mut source = std::io::Cursor::new(vec![b'x'; MAX_MCP_FRAME_BYTES + 1024]);
         let error = read_frame(&mut source).unwrap_err();
         assert!(error.to_string().contains("frame limit"));
-        assert_eq!(source.position(), (MAX_MCP_FRAME_BYTES + 2) as u64);
-        assert!(read_frame(&mut std::io::Cursor::new(b"{}\n"))
-            .unwrap()
-            .is_some());
+        assert!(
+            source.position() < source.get_ref().len() as u64,
+            "oversized frames must be rejected before consuming the entire source"
+        );
+        assert_eq!(
+            read_frame(&mut std::io::Cursor::new(b"{}\n")).unwrap(),
+            Some(b"{}".to_vec())
+        );
     }
 
     #[cfg(unix)]

@@ -82,11 +82,21 @@ test('image reference pages preserve whole source events and explicit selection 
   assert.throws(() => decodeConversationReadQuery({ sessionId, view: 'images', imageIds: ['a'], before: 3 }), /conversation_read_invalid/);
 });
 
-test('a retry retains identical visual input and does not mark an attempted image as consumed', async () => {
+test('retry preserves selected attachment and observation images in the request and replay', async () => {
+  const { events, append } = history();
+  append('message.committed', { role: 'user', messageId: 'input', filesystemReferences: [file('attachment')] }, { runId: undefined });
+  append('run.started', { inputMessageId: 'input' });
+  observe(append, 'observation');
+  choose(append, ['attachment', 'observation']);
+  const selected = visualContextMessages(events, runId);
+  assert.deepEqual(ids(selected), ['attachment', 'observation']);
   const requests = [], facts = [];
   const request = { requestId: 'request:images', sessionId, runId, purpose: 'agent',
-    messages: [{ role: 'user', content: 'Current visual inputs', images: [{ workspaceId: 'input:images', logicalPath: 'a.png', mediaType: 'image/png' }] }] };
-  await withProviderAttempts(request, { nextId: kind => `${kind}:${facts.length}`, commit: async event => { facts.push(event); }, updateAssistantDraft() {} },
+    messages: selected.map(contribution => contribution.message) };
+  append('context.composed', { purpose: 'agent' });
+  await withProviderAttempts(request, { nextId: kind => `${kind}:${facts.length}`, commit: async event => {
+    facts.push(event); append(event.type, event.payload);
+  }, updateAssistantDraft() {} },
     new AbortController().signal, async (attempt, completed) => {
       requests.push(structuredClone(attempt));
       if (requests.length === 1) throw new ProviderReportedFailure('provider_network_failed', 'Connection interrupted',
@@ -95,5 +105,10 @@ test('a retry retains identical visual input and does not mark an attempted imag
     });
   assert.equal(requests.length, 2);
   assert.deepEqual(requests[1].messages, requests[0].messages);
+  assert.deepEqual(requests[1].messages.flatMap(message => message.images ?? []),
+    [{ workspaceId: 'input:images', logicalPath: 'attachment.png', mediaType: 'image/png' }]);
+  assert.deepEqual(requests[1].messages.flatMap(message => message.toolImages ?? []),
+    [{ callId: 'call:observation', artifactId: 'observation' }]);
+  assert.deepEqual(visualContextMessages(events, runId), selected, 'attempt lifecycle events must not consume the selected images');
   assert.equal(facts.at(-1).payload.phase, 'completed');
 });
