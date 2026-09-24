@@ -1,6 +1,6 @@
 # DeepCode
 
-**0.6.2** · [中文](README.zh-CN.md)
+**0.6.3** · [中文](README.zh-CN.md)
 
 DeepCode is a local-first coding agent with a desktop GUI, a CLI for scripts, and an interactive terminal UI. All three share conversations, tool records, model connections, and permissions.
 

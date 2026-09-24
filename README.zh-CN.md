@@ -1,6 +1,6 @@
 # DeepCode
 
-**0.6.2** · [English](README.md)
+**0.6.3** · [English](README.md)
 
 DeepCode 是优先在本机工作的编程 Agent，提供桌面 GUI、用于脚本的 CLI 和交互式 TUI。三种入口共享对话、工具记录、模型连接和权限设置。
 
