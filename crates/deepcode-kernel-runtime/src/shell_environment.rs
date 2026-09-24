@@ -109,7 +109,7 @@ pub fn find_powershell7() -> Option<PathBuf> {
 }
 
 /// Store app execution aliases belong to the interactive user and cannot be
-/// launched by the dedicated workspace account. Other WindowsApps packages may
+/// launched as an ordinary executable inside LPAC. Other WindowsApps packages may
 /// contain ordinary executables, so only exclude PowerShell aliases/packages.
 pub fn powershell_path_is_compatible(path: &Path) -> bool {
     if !cfg!(windows) {
