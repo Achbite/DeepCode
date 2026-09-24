@@ -1,3 +1,4 @@
+import { isLlmReasoningEffort } from '@deepcode/protocol';
 import { isManagedProcessSnapshot, type ManagedProcessSnapshot, type ProcessReadRequest } from '@deepcode/protocol';
 import { isLocalAgentErrorValue } from '@deepcode/protocol';
 import type {
@@ -375,7 +376,7 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
       'pluginConfig',
       'selectedPlugins',
       'environment',
-    ])) throw new Error('run_runtime_prepared_invalid');
+    ], ['approvalReviewer', 'approvalReviewerError'])) throw new Error('run_runtime_prepared_invalid');
     if (
       value.schemaVersion !== LOCAL_AGENT_PROTOCOL_VERSION
       || value.type !== 'run.runtime.prepared'
@@ -391,6 +392,13 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
     };
     try {
       const provider = decodeProviderRuntime(value.provider);
+      const approvalReviewer = value.approvalReviewer === undefined
+        ? undefined : decodeProviderRuntime(value.approvalReviewer);
+      const approvalReviewerError = value.approvalReviewerError;
+      if (approvalReviewerError !== undefined
+        && (approvalReviewer !== undefined || !isLocalAgentErrorValue(approvalReviewerError))) {
+        throw new Error('run_runtime_approval_reviewer_error_invalid');
+      }
       if (provider.reasoningEffortOverride !== request.reasoningEffortOverride) {
         throw new Error('run_runtime_reasoning_override_mismatch');
       }
@@ -433,6 +441,8 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
           extensionGenerationRef: value.extensionGenerationRef,
           kernelCatalogSnapshotRef: value.kernelCatalogSnapshotRef,
           provider,
+          ...(approvalReviewer ? { approvalReviewer } : {}),
+          ...(approvalReviewerError ? { approvalReviewerError: structuredClone(approvalReviewerError) } : {}),
           webSearch,
           environment: value.environment as JsonObject,
           permissions: pluginConfig.permissions,
@@ -492,7 +502,7 @@ function decodeProviderRuntime(value: unknown): ProviderRuntimeSnapshot {
       .includes(String(value.apiSurface))
     || value.hostedWebSearch !== 'none' && value.hostedWebSearch !== 'web_search'
     || value.hostedWebSearch === 'web_search' && value.apiSurface !== 'responses'
-    || [value.reasoningEffort, value.reasoningEffortOverride].some((effort) => effort !== undefined && !['low', 'medium', 'high', 'max'].includes(String(effort)))
+    || [value.reasoningEffort, value.reasoningEffortOverride].some((effort) => effort !== undefined && !isLlmReasoningEffort(effort))
     || value.thinking !== undefined && !['enabled', 'disabled'].includes(String(value.thinking))
     || value.reasoningEffortOverride !== undefined && (value.reasoningEffort !== value.reasoningEffortOverride || value.thinking === 'disabled')
   ) throw new Error('provider_runtime_snapshot_invalid');

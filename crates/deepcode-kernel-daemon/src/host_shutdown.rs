@@ -82,13 +82,31 @@ pub(crate) async fn host_shutdown(
 
 pub(crate) async fn shutdown_owned_host_resources(state: &AppState) -> bool {
     let session_service = state.session_service.clone();
-    let session_cleanup_ok = tokio::task::spawn_blocking(move || session_service.shutdown())
-        .await
-        .is_ok_and(|result| result.is_ok());
+    let session_cleanup_ok =
+        match tokio::task::spawn_blocking(move || session_service.shutdown()).await {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                eprintln!("Session shutdown failed: {}: {}", error.code, error.message);
+                false
+            }
+            Err(error) => {
+                eprintln!("Session shutdown task failed: {error}");
+                false
+            }
+        };
     let local_agent = state.local_agent.clone();
-    let plugin_cleanup_ok = tokio::task::spawn_blocking(move || local_agent.shutdown_plugins())
-        .await
-        .is_ok_and(|result| result.is_ok());
+    let plugin_cleanup_ok =
+        match tokio::task::spawn_blocking(move || local_agent.shutdown_plugins()).await {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                eprintln!("Kernel shutdown failed: {error}");
+                false
+            }
+            Err(error) => {
+                eprintln!("Kernel shutdown task failed: {error}");
+                false
+            }
+        };
     session_cleanup_ok && plugin_cleanup_ok
 }
 

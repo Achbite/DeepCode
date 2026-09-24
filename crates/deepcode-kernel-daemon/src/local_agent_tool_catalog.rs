@@ -193,8 +193,12 @@ impl ToolProvider for ProductToolProvider {
             self.0.browser_binding.as_ref(),
             self.0.computer_use_instance.as_ref(),
         ) {
-            let status = crate::browser_tools::call(binding, &json!({"action":"hostStatus"}));
+            let status = crate::browser_tools::host_status(binding);
             for (name, description, input_schema) in crate::browser_tools::definitions() {
+                let available = status
+                    .as_ref()
+                    .map_err(String::as_str)
+                    .and_then(|status| status.check_tool(name));
                 tools.push(PendingToolContribution {
                     origin: "extension",
                     provider_ref: "deepcode:computer-use".into(),
@@ -202,7 +206,7 @@ impl ToolProvider for ProductToolProvider {
                     plugin_instance_ref: Some(instance.clone()),
                     contribution_ref: format!("deepcode:browser/{name}"),
                     name: name.into(),
-                    description: match &status {
+                    description: match available {
                         Ok(_) => description.into(),
                         Err(reason) => format!("{description} Currently unavailable: {reason}"),
                     },
@@ -213,7 +217,7 @@ impl ToolProvider for ProductToolProvider {
                         "browser.capture" => CatalogEffectScope::WorkspaceMutation,
                         _ => CatalogEffectScope::External,
                     },
-                    availability: if status.is_ok() {
+                    availability: if available.is_ok() {
                         ToolAvailability::Callable
                     } else {
                         ToolAvailability::Blocked
@@ -767,15 +771,32 @@ impl PreparedCatalogBinding {
                 }
             };
             match (self.tool_name(), action) {
-                ("browser.page", "openSelf" | "list" | "status" | "activate" | "close") => {
-                    return Ok(CatalogEffectScope::LocalRead)
-                }
+                (
+                    "browser.page",
+                    "openSelf" | "list" | "status" | "activate" | "close" | "refreshInterface",
+                ) => return Ok(CatalogEffectScope::LocalRead),
                 ("browser.page", "reload") => {
                     let page = crate::browser_tools::call(
                         host,
                         &json!({"action":"status","previewId":input["previewId"]}),
                     )
-                    .map_err(|error| ToolCatalogError::new("native_browser_failed", error))?;
+                    .map_err(|message| {
+                        let input_issues = (message == "native_browser_page_closed"
+                            || message.starts_with("native_browser_page_closed:"))
+                        .then(|| {
+                            vec![ToolInputIssue::new(
+                                "$.previewId",
+                                "pageClosed",
+                                "The page is closed. List the current pages and select an open previewId.",
+                                None,
+                            )]
+                        });
+                        ToolCatalogError {
+                            code: "native_browser_failed",
+                            message,
+                            input_issues,
+                        }
+                    })?;
                     let url = page["url"].as_str().ok_or_else(|| {
                         ToolCatalogError::new(
                             "native_browser_page_invalid",
@@ -1250,6 +1271,7 @@ fn browser_targets(name: &str, input: &Value) -> Result<Vec<String>, ToolCatalog
             | "reload"
             | "act"
             | "close"
+            | "refreshInterface"
     ) {
         return Err(ToolCatalogError::new(
             "tool_input_invalid",
@@ -1263,13 +1285,32 @@ fn browser_targets(name: &str, input: &Value) -> Result<Vec<String>, ToolCatalog
             text("url")?;
         }
     }
-    if !matches!(action, "open" | "openSelf" | "list") {
+    if !matches!(action, "open" | "openSelf" | "list" | "refreshInterface") {
         text("previewId")?;
     }
     if action == "act" {
         let operation = text("operation")?;
-        if matches!(operation, "click" | "type") {
+        if !matches!(operation, "inspect" | "click" | "type" | "scroll") {
+            return Err(ToolCatalogError::new(
+                "tool_input_invalid",
+                "Unsupported browser operation.",
+            ));
+        }
+        if operation == "type" || (operation == "click" && input["selector"].is_string()) {
             text("selector")?;
+        }
+        for axis in ["x", "y"] {
+            let required = operation == "click" && !input["selector"].is_string();
+            if (required || input.get(axis).is_some())
+                && !input[axis].as_f64().is_some_and(|value| {
+                    value.is_finite() && (operation != "click" || value >= 0.0)
+                })
+            {
+                return Err(ToolCatalogError::new(
+                    "tool_input_invalid",
+                    format!("{axis} must be a finite viewport coordinate"),
+                ));
+            }
         }
         if operation == "type" && !input["text"].is_string() {
             return Err(ToolCatalogError::new(
@@ -1351,6 +1392,133 @@ fn validate_ref(field: &str, value: &str) -> Result<(), ToolCatalogError> {
 mod tests {
     use super::*;
     use deepcode_kernel_runtime::executors::EmptySecretProvider;
+
+    #[tokio::test]
+    async fn browser_catalog_respects_each_reported_host_capability() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        for (case, capture, computer) in [(1, false, false), (2, true, true), (3, true, false)] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let host_id = format!("dcinstance_{case:064x}");
+            let token = format!("dchost_{case:064x}");
+            let registration = json!({
+                "hostInstanceId": host_id, "endpoint": address.to_string(),
+                "callbackToken": token, "remove": false,
+            });
+            let server = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                // Registration and catalog installation each query the same Host.
+                for _ in 0..2 {
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < deadline, "Host request timed out");
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("Host accept: {error}"),
+                        }
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut request = String::new();
+                    BufReader::new(&stream).read_line(&mut request).unwrap();
+                    let request: Value = serde_json::from_str(&request).unwrap();
+                    assert_eq!(request["input"]["action"], "hostStatus");
+                    assert_eq!(request["token"], token);
+                    writeln!(
+                        stream,
+                        "{}",
+                        json!({"ok":true,"data":{
+                            "binding":request["binding"], "ready":true,
+                            "captureAvailable":capture, "computerControlAvailable":computer,
+                        }})
+                    )
+                    .unwrap();
+                }
+            });
+            let registered = crate::browser_tools::register(axum::Json(
+                serde_json::from_value(registration.clone()).unwrap(),
+            ))
+            .await;
+            let mut product = crate::local_agent_product_tools::test_product_tools();
+            let config = Arc::get_mut(&mut product).unwrap();
+            config.browser_binding = Some(json!({"hostInstanceId":host_id,"windowLabel":"main"}));
+            config.computer_use_instance = Some(format!("plugin-instance:computer-use-{case}"));
+            let catalog = ToolCatalogSnapshot::from_providers(
+                "extension-generation:browser-capabilities",
+                vec![Box::new(ProductToolProvider(product))],
+            );
+            let mut removal = registration;
+            removal["remove"] = json!(true);
+            let removed = crate::browser_tools::register(axum::Json(
+                serde_json::from_value(removal).unwrap(),
+            ))
+            .await;
+            server.join().unwrap();
+            assert_eq!(registered.0["ok"], true);
+            assert_eq!(removed.0["ok"], true);
+            let catalog = catalog.unwrap();
+            let view = catalog.provider_view();
+            for (name, expected) in [
+                ("browser.open", true),
+                ("browser.page", true),
+                ("browser.service", true),
+                ("browser.observe", capture),
+                ("browser.capture", capture),
+                ("computer.control", computer),
+            ] {
+                let tool = view
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|tool| tool["name"] == name)
+                    .unwrap();
+                assert_eq!(
+                    tool["availability"],
+                    if expected { "callable" } else { "blocked" },
+                    "{name}"
+                );
+                assert_eq!(
+                    tool["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Currently unavailable:"),
+                    !expected,
+                    "{name}"
+                );
+            }
+            catalog.dispose().unwrap();
+        }
+    }
+
+    #[test]
+    fn browser_targets_support_coordinates_and_guarded_interface_refresh() {
+        for input in [
+            json!({"action":"act","previewId":"preview-1","operation":"click","x":12,"y":20}),
+            json!({"action":"act","previewId":"preview-1","operation":"click","selector":"#save"}),
+            json!({"action":"act","previewId":"preview-1","operation":"scroll","selector":"#panel","y":-40}),
+            json!({"action":"refreshInterface"}),
+        ] {
+            assert!(browser_targets("browser.page", &input).is_ok(), "{input}");
+        }
+        for input in [
+            json!({"action":"act","previewId":"preview-1","operation":"click","x":12}),
+            json!({"action":"act","previewId":"preview-1","operation":"click","x":-1,"y":20}),
+            json!({"action":"act","previewId":"preview-1","operation":"type","text":"hello"}),
+            json!({"action":"act","previewId":"preview-1","operation":"unknown"}),
+        ] {
+            assert!(browser_targets("browser.page", &input).is_err(), "{input}");
+        }
+    }
 
     #[test]
     fn default_builtin_provider_exposes_the_registered_basic_tools_and_blocks_web_search() {

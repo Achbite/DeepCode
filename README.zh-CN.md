@@ -1,6 +1,6 @@
 # DeepCode
 
-**0.6.2** · [English](README.md)
+**0.6.3** · [English](README.md)
 
 DeepCode 是优先在本机工作的编程 Agent，提供桌面 GUI、用于脚本的 CLI 和交互式 TUI。三种入口共享对话、工具记录、模型连接和权限设置。
 
@@ -72,7 +72,7 @@ make ui-update UI_PACKAGE=bin/macos-arm64
 
 - <strong>处理项目任务：</strong> 读取和修改文件、搜索代码、执行 Bash 或 PowerShell、检查 diff。工作区访问和外部操作遵循配置的权限策略。
 - <strong>查看任务进度：</strong> 任务面板展示 Agent 维护的阶段列表和状态，同类工作可以合并为一个阶段。阶段进度与工具结果、Plan 审批分别呈现。
-- <strong>预览并持续修改：</strong> 通过截图和页面交互检查内置浏览器，选取元素或区域批注，在同一对话中继续修改。原始附件保持只读，可编辑副本可以放在 DeepCode 管理的会话目录中。
+- <strong>预览并持续修改：</strong> 检查内置浏览器的 DOM 并与页面交互，选取元素或区域批注，在同一对话中继续修改。原生视口截图目前需要 macOS；Windows 和 Linux 保留 DOM 检查及批注元数据。原始附件保持只读，可编辑副本可以放在 DeepCode 管理的会话目录中。
 - <strong>使用模型服务：</strong> API 连接与订阅服务分别配置和查看用量。Provider 返回的 Token、缓存计数与上下文估算分开呈现。
 - <strong>扩展工具与界面：</strong> 通过 Skill、CLI 工具、MCP 和 UI 插件扩展能力。Agent 可以发现并激活可用插件，用户也可以显式引用。外部电脑控制目前支持 macOS，每次调用需要额外授权。
 - <strong>生成与阅读文档：</strong> 生成 HTML、Markdown、PDF 产物。文件阅读器展示文本源码和 PDF，HTML 页面可在内置浏览器中打开。PDF 阅读使用内置 Web 阅读器，PDF 生成需要安装[文档运行环境](skills/deepcode-documents/SKILL.md)。

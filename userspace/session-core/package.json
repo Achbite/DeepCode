@@ -1,6 +1,6 @@
 {
   "name": "@deepcode/session-core",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -28,6 +28,7 @@
   },
   "devDependencies": {
     "@types/node": "22.19.19",
+    "ajv": "^8",
     "typescript": "^5.7.0"
   }
 }

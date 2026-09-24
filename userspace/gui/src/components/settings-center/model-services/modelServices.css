@@ -95,3 +95,5 @@
 .model-connection-group > .model-heading { margin-top: 18px; }
 .model-form-grid label { min-width: 0; color: var(--dc-muted); }
 .model-form-grid :is(input, select) { color: var(--dc-foreground); background: var(--dc-surface-raised); }
+
+.model-reviewer-settings { padding: 0 16px 16px; }

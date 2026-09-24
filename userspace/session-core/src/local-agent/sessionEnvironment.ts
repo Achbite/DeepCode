@@ -19,7 +19,7 @@ export function environmentInstruction(value: unknown): RunRuntimeSnapshot['inst
       throw new Error('session_environment_invalid');
     }
   }
-  const fields = ['os', 'arch', 'locale', 'responseLanguage', 'userShell', 'configuration', 'executionTarget', 'shellAvailable', 'shell', 'developerCommands', 'commandPaths', 'executionPath', 'workspaceShellSupported', 'workspaceSandbox', 'hostBinding'];
+  const fields = ['os', 'arch', 'locale', 'responseLanguage', 'userShell', 'configuration', 'executionTarget', 'shellAvailable', 'shell', 'developerCommands', 'commandPaths', 'runtimeExecutables', 'executionPath', 'workspaceShellSupported', 'workspaceSandbox', 'hostBinding'];
   if (data.executionPath !== undefined && typeof data.executionPath !== 'string') throw new Error('session_environment_invalid');
   if (data.commandPaths !== undefined && (!data.commandPaths || typeof data.commandPaths !== 'object'
     || Array.isArray(data.commandPaths) || Object.values(data.commandPaths).some((path) => typeof path !== 'string'))) {
@@ -29,6 +29,12 @@ export function environmentInstruction(value: unknown): RunRuntimeSnapshot['inst
     const binding = data.hostBinding as Record<string, unknown> | null;
     if (!binding || typeof binding.hostInstanceId !== 'string' || !binding.hostInstanceId
       || typeof binding.windowLabel !== 'string' || !binding.windowLabel) throw new Error('session_host_binding_invalid');
+  }
+  if (data.runtimeExecutables !== undefined) {
+    const executables = data.runtimeExecutables;
+    if (!executables || typeof executables !== 'object' || Array.isArray(executables)
+      || !('kernel' in executables) || Object.keys(executables).some(key => !['kernel', 'cli'].includes(key))
+      || Object.values(executables).some(path => typeof path !== 'string' || !path)) throw new Error('session_environment_invalid');
   }
   if (Object.keys(data).some((key) => !fields.includes(key))
     || ['os', 'arch'].some((key) => typeof data[key] !== 'string' || !data[key])
@@ -44,6 +50,7 @@ export function environmentInstruction(value: unknown): RunRuntimeSnapshot['inst
       userShell: data.userShell,
       ...(data.executionPath !== undefined ? { executionPath: data.executionPath } : {}),
       ...(data.hostBinding ? { hostBinding: data.hostBinding } : {}),
+      ...(data.runtimeExecutables ? { runtimeExecutables: data.runtimeExecutables } : {}),
       ...(data.executionTarget ? { executionTarget: data.executionTarget, shell: data.shell, shellAvailable: data.shellAvailable, ...(data.commandPaths ? { commandPaths: data.commandPaths } : { developerCommands: data.developerCommands }), workspaceShellSupported: data.workspaceShellSupported, ...(data.workspaceSandbox ? { workspaceSandbox: data.workspaceSandbox } : {}) } : {}),
     })}\nThese tool-execution facts are fixed for this run. Project build requirements come from project files. commandPaths lists commands found on executionPath, not all installed software. Workspace scope is sandboxed; authorized host calls use the same target, shell and prepared PATH outside that sandbox. Command-not-found describes this PATH; denied access or an unreachable socket does not prove a service is stopped. Check the needed scope and report the actual result. Service readiness is unprobed.\nUse ${data.responseLanguage ?? "the user's language"} for all user-facing text, including progress updates, unless the user explicitly requests another language.`,
   };

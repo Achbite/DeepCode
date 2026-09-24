@@ -43,6 +43,7 @@ fn setting_activates_at_next_run(key: &str) -> bool {
         || key.starts_with("agent.web.search.")
         || key.starts_with("agent.documents.")
         || key == "agent.systemPrompt"
+        || key.starts_with("agent.approvalReview.")
         || key.starts_with("agent.permissions.")
         || key.starts_with("agent.windows.")
         || key == "agent.environmentRevision"
@@ -246,6 +247,8 @@ pub(crate) fn default_user_settings() -> Value {
         "workbench.styleTokenOverrides": "{}",
         "workbench.uiPlugins": "[]",
         "agent.systemPrompt": "",
+        "agent.approvalReview.profileId": "",
+        "agent.approvalReview.reasoningEffort": "",
         "agent.responseLanguage": "auto",
         "agent.windows.shell": "auto",
         "agent.windows.gitBashPath": "",
@@ -274,12 +277,41 @@ pub(crate) fn default_user_settings() -> Value {
         "gui.accentColor": "blue",
         "gui.navigationDensity": "comfortable",
         "gui.showContextRail": true,
+        "gui.usageWidget.enabled": true,
+        "gui.usageWidget.visibility": "summary",
+        "gui.usageWidget.currency": "USD",
         "gui.showReasoning": false
     })
 }
 
 pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), String> {
-    crate::command_denylist::CommandDenylist::from_settings(settings)?;
+    if settings
+        .get("gui.usageWidget.currency")
+        .is_some_and(|value| !matches!(value.as_str(), Some("USD" | "CNY")))
+    {
+        return Err("gui.usageWidget.currency 必须是 USD 或 CNY。".into());
+    }
+    if settings
+        .get("agent.approvalReview.profileId")
+        .is_some_and(|value| {
+            value.as_str().is_none_or(|id| {
+                id.trim() != id || id.len() > 128 || id.chars().any(char::is_control)
+            })
+        })
+    {
+        return Err("agent.approvalReview.profileId 必须是有效模型 ID 或空字符串。".into());
+    }
+    if settings
+        .get("agent.approvalReview.reasoningEffort")
+        .is_some_and(|value| {
+            !matches!(
+                value.as_str(),
+                Some("" | "low" | "medium" | "high" | "xhigh" | "max")
+            )
+        })
+    {
+        return Err("审批推理强度必须是 low、medium、high、xhigh、max 或空字符串。".into());
+    }
     crate::local_agent_kernel::LocalAgentPermissionPolicy::from_settings(settings)
         .map_err(|error| error.message)?;
     if settings
@@ -317,19 +349,6 @@ pub(crate) fn validate_agent_runtime_settings(settings: &Value) -> Result<(), St
             .ok_or_else(|| "agent.systemPrompt 必须是字符串。".to_string())?;
         if prompt.len() > 64 * 1024 {
             return Err("agent.systemPrompt 超过 65536 字节上限。".to_string());
-        }
-    }
-    for key in [
-        "agent.permissions.networkRead",
-        "agent.permissions.external",
-    ] {
-        if let Some(value) = settings.get(key) {
-            let Some(value) = value.as_str() else {
-                return Err(format!("{key} 必须是 allow、ask 或 deny。"));
-            };
-            if !matches!(value, "allow" | "ask" | "deny") {
-                return Err(format!("{key} 必须是 allow、ask 或 deny。"));
-            }
         }
     }
     if let Some(value) = settings.get("agent.permissions.workspaceMutation") {

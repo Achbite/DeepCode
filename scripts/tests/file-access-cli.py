@@ -3,6 +3,7 @@
 import http.server
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shlex
 import tempfile
@@ -14,6 +15,18 @@ spec = importlib.util.spec_from_file_location('support', Path(__file__).with_nam
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
 require = fixture.require
+WINDOWS = os.name == 'nt'
+
+
+def powershell_quote(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def child_read_command(path):
+    if WINDOWS:
+        script = "process.stdout.write(require('fs').readFileSync(process.argv[1], 'utf8'))"
+        return "$ErrorActionPreference = 'Stop'; & node -e " + powershell_quote(script) + " " + powershell_quote(path) + "; exit $LASTEXITCODE"
+    return 'sh -c ' + shlex.quote(f'cat {shlex.quote(str(path))}')
 
 
 class Provider(fixture.MockProviderHandler):
@@ -31,10 +44,10 @@ class Provider(fixture.MockProviderHandler):
             elif ordinal == 2:
                 require(results['read-external']['outcome'] == 'completed', results['read-external'])
                 self._send_tool_calls([
-                    ('shell-same-file', names['bash'], {'command': f'cat {shlex.quote(str(state.external))}'}),
-                    ('shell-sibling', names['bash'], {'command': 'sh -c ' + shlex.quote(f'cat {shlex.quote(str(state.sibling))}')}),
-                    ('git-denied', names['bash'], {'command': "printf changed > .git/HEAD"}),
-                    ('private-temp', names['bash'], {'command': 'printf temp > "$TMPDIR/owned"; cat "$TMPDIR/owned"; printf ":%s\\n" "$HOME"'}),
+                    ('shell-same-file', names['bash'], {'command': child_read_command(state.external)}),
+                    ('shell-sibling', names['bash'], {'command': child_read_command(state.sibling)}),
+                    ('git-denied', names['bash'], {'command': "$ErrorActionPreference = 'Stop'; Set-Content -LiteralPath .git/HEAD -Value changed" if WINDOWS else "printf changed > .git/HEAD"}),
+                    ('private-temp', names['bash'], {'command': "$ErrorActionPreference = 'Stop'; $owned = Join-Path $env:TMPDIR 'owned'; [IO.File]::WriteAllText($owned, 'temp'); [Console]::Write([IO.File]::ReadAllText($owned) + ':' + $env:HOME)" if WINDOWS else 'printf temp > "$TMPDIR/owned"; cat "$TMPDIR/owned"; printf ":%s\\n" "$HOME"'}),
                 ])
             elif ordinal == 3:
                 require(results['shell-same-file']['outcome'] == 'completed', results['shell-same-file'])
@@ -42,6 +55,8 @@ class Provider(fixture.MockProviderHandler):
                 for call in ('shell-sibling', 'git-denied'):
                     require(results[call]['outcome'] == 'failed' and results[call]['output']['exitCode'] != 0, results[call])
                 require(results['private-temp']['outcome'] == 'completed', results['private-temp'])
+                temporary_output = results['private-temp']['output']['stdout']
+                require(temporary_output.startswith('temp:') and temporary_output[5:].strip(), results['private-temp'])
                 self._send_tool_calls([('external-write', names['write'], {
                     'path': str(state.external), 'content': 'updated',
                 })])
@@ -96,7 +111,10 @@ def check_resource_tree(daemon, session, workspace):
 
 
 def main():
-    with tempfile.TemporaryDirectory(prefix='deepcode-file-access-') as directory:
+    # Keep external-file boundaries outside the OS temporary paths permitted by macOS.
+    scratch = fixture.ROOT / '.build-cache'
+    scratch.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='deepcode-file-access-', dir=scratch) as directory:
         root = Path(directory)
         workspace = root / 'project'
         workspace.mkdir()
@@ -115,18 +133,21 @@ def main():
         try:
             fixture.write_configuration(daemon.config_root, f'http://127.0.0.1:{server.server_port}/v1', {
                 'agent.permissions.workspaceMutation': 'allow',
+                **({'agent.windows.shell': 'auto'} if WINDOWS else {}),
             })
             daemon.start()
             session = fixture.create_session(daemon, workspace)['sessionId']
             fixture.cli(daemon, session, 'Read the selected external file and check the file boundary.', expected=5)
             check_resource_tree(daemon, session, workspace)
             pending = fixture.projection(daemon, session)['pendingApproval']
-            require(pending['preview']['fileAccess'] == {'read': [str(external)], 'write': []}, pending)
-            fixture.cli(daemon, session, '/reply 5', expected=5)
+            access = pending['preview']['fileAccess']
+            require(len(access['read']) == 1 and external.samefile(access['read'][0]) and access['write'] == [], pending)
+            fixture.cli(daemon, session, '/reply 5', expected=5, run_timeout_seconds=120 if WINDOWS else 15)
             state.assert_healthy()
             require(external.read_text() == 'external-ok', 'Read grant allowed a write')
             pending = fixture.projection(daemon, session)['pendingApproval']
-            require(pending['preview']['fileAccess']['write'] == [str(external)], pending)
+            write_targets = pending['preview']['fileAccess']['write']
+            require(len(write_targets) == 1 and external.samefile(write_targets[0]), pending)
             fixture.cli(daemon, session, '/reply 1', expected=5)
             require((workspace / '.git/HEAD').read_text() == 'ref: refs/heads/main\n', 'Git metadata changed without approval')
             pending = fixture.projection(daemon, session)['pendingApproval']
@@ -147,7 +168,7 @@ def main():
             edited = next(activity['tool'] for activity in fixture.projection(daemon, session)['activities'] if activity.get('tool', {}).get('fileChanges'))
             change = {'recordId': edited['recordId'], 'index': 0}
             recorded = {'change': change, 'logicalPath': '', 'format': 'path'}
-            require(fixture.api_json(daemon.base_url, base + 'read', token=daemon.token, method='POST', body=recorded)['path'] == str(external.resolve()), 'Diff did not resolve its associated file')
+            require(external.samefile(fixture.api_json(daemon.base_url, base + 'read', token=daemon.token, method='POST', body=recorded)['path']), 'Diff did not resolve its associated file')
             denied = fixture.api_envelope(daemon.base_url, base + 'read', token=daemon.token, method='POST', body={**selected, 'logicalPath': '../sibling.txt'})
             require(not denied['ok'], 'Single-file grant exposed parent directory')
             fixture.cli(daemon, session, 'Read the conversation resource again.')
@@ -172,11 +193,13 @@ def main():
                 print(json.dumps(fixture.projection(daemon, session), ensure_ascii=False), flush=True)
             raise
         finally:
-            daemon.close()
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=3)
-            require(not thread.is_alive(), 'Provider fixture did not exit')
+            try:
+                daemon.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=3)
+                require(not thread.is_alive(), 'Provider fixture did not exit')
 
 
 if __name__ == '__main__':

@@ -218,7 +218,9 @@ pub(crate) fn plugin_catalog_projection(settings: &Value) -> Result<Value, Strin
                 PluginCatalogEntry::Loaded(source)
                     if matches!(
                         source.contribution,
-                        PluginContribution::Host | PluginContribution::Container
+                        PluginContribution::Host
+                            | PluginContribution::Container
+                            | PluginContribution::Process
                     ) =>
                 {
                     "host"
@@ -246,11 +248,7 @@ pub(crate) fn plugin_catalog_projection(settings: &Value) -> Result<Value, Strin
             "source":"builtin","category":if functional {"functional"} else {"reference"},"contributionKind":"skill","discovery":if functional {"default"} else {"searchOnly"},
             "activationMediaTypes":[],"enabled":true,"available":true,"reference":{"toolName":"skill.read","name":id}}));
     }
-    for name in [
-        "operations.md",
-        "execution-environments.md",
-        "ui-plugins.md",
-    ] {
+    for name in crate::local_agent_product_tools::bundled_doc_names() {
         plugins.push(json!({"uri":format!("plugin://doc-{name}@builtin"),"displayName":name,"shortDescription":"DeepCode product documentation",
             "source":"builtin","category":"reference","contributionKind":"skill","discovery":"searchOnly","activationMediaTypes":[],"enabled":true,"available":true,"reference":{"toolName":"doc.read","name":name}}));
     }
@@ -261,12 +259,12 @@ pub(crate) fn search_plugins(settings: &Value, query: &str, limit: usize) -> Res
     let (revision, sources, _) = plugin_catalog(settings)?;
     let words = query.to_lowercase();
     let mut matches = Vec::new();
-    for source in sources.values() {
-        let item = source.public();
-        let capabilities = match source {
-            PluginCatalogEntry::Loaded(source) => source.capability_summary.as_str(),
-            _ => "",
+    for source in sources.into_values() {
+        let capabilities = match &source {
+            PluginCatalogEntry::Loaded(source) => source.capability_summary.clone(),
+            _ => String::new(),
         };
+        let item = source.into_public();
         let searchable = format!(
             "{} {} {} {capabilities}",
             item.uri, item.display_name, item.short_description
@@ -868,6 +866,21 @@ mod tests {
 
     #[test]
     fn computer_plugin_has_selected_identity_and_honors_disabled_setting() {
+        let catalog = plugin_catalog_projection(&json!({})).unwrap();
+        for uri in [
+            "plugin://computer-use@builtin",
+            "plugin://containers@builtin",
+            "plugin://processes@builtin",
+        ] {
+            let item = catalog["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|plugin| plugin["uri"] == uri)
+                .unwrap();
+            assert_eq!(item["contributionKind"], "host", "{uri}");
+            assert_eq!(item["source"], "builtin", "{uri}");
+        }
         let mut selections = vec![PluginSelectionInput {
             selection_id: "selection:computer".into(),
             uri: "plugin://computer-use@builtin".into(),
@@ -946,6 +959,17 @@ mod tests {
             .find(|plugin| plugin["displayName"] == "Good Skill")
             .unwrap();
         assert_eq!(good["available"], true);
+        let found = search_plugins(&settings, "Good Skill selected document", 10).unwrap();
+        assert_eq!(found["total"], 1);
+        for key in [
+            "uri",
+            "displayName",
+            "shortDescription",
+            "enabled",
+            "available",
+        ] {
+            assert_eq!(found["plugins"][0][key], good[key]);
+        }
         let selection = |plugin: &Value| PluginSelectionInput {
             selection_id: "selection:test".into(),
             uri: plugin["uri"].as_str().unwrap().into(),
@@ -965,6 +989,10 @@ mod tests {
             .as_str()
             .unwrap()
             .contains(&original_error));
+        let found = search_plugins(&settings, bad["uri"].as_str().unwrap(), 10).unwrap();
+        assert_eq!(found["total"], 1);
+        assert_eq!(found["plugins"][0]["available"], false);
+        assert_eq!(found["plugins"][0]["error"], bad["error"]);
         let rejected =
             resolve_plugin_selection(&settings, &mut vec![selection(bad)], false).unwrap_err();
         assert!(rejected.contains(&original_error));

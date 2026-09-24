@@ -127,18 +127,11 @@ fn anthropic_assistant_message(
 }
 
 fn append_anthropic_tool_result(messages: &mut Vec<Value>, message: &LocalProviderMessage) {
-    let content = if message.image_data.is_empty() {
-        json!(message.content)
-    } else {
-        let mut parts = vec![json!({"type":"text","text":message.content})];
-        parts.extend(message.image_data.iter().map(|image| json!({"type":"image","source":{"type":"base64","media_type":image.media_type,"data":image.base64}})));
-        json!(parts)
-    };
     let block = json!({
         "type": "tool_result",
         "tool_use_id": message.provider_call_id.as_deref()
             .expect("validated tool message has providerCallId"),
-        "content": content
+        "content": message.content
     });
     if let Some(content) = messages
         .last_mut()

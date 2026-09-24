@@ -6,6 +6,8 @@
 
 Settings > Tool permissions > Command denylist stores one command per line. Rules match command names and argument prefixes before Shell approval or execution, including when other permissions allow execution. The default rule blocks recursive forced root removal with `rm`; ordinary project cleanup is unaffected. An explicitly empty list disables these rules. Changes apply to the next run. This is syntactic matching, not script evaluation.
 
+Delegated execution approval reviews additional access and execution requests through a separate model request. Select its model in Settings > Models and services; leave the selection empty to use the current run's model with an independent review context. The reviewer receives original task instructions, confirmed Plan scope when present, the exact prepared operation and the requested access. Necessary host environment checks can be approved without another user confirmation. Its decision applies only to that call. An uncertain or failed review asks the user; explicit command rules and human-only controls remain effective. This setting does not approve Plans, choose engineering routes or answer the Agent's questions for the user.
+
 Tasks follow the execution environment specified by the user and project instructions. A task requiring a container uses that container for its commands. Interactive input belongs to its individual tool invocation. One invocation does not permanently change the shell or working directory of later calls.
 
 Tool results retain success, failure and denial facts. Read a denial and the current Plan scope before correcting arguments or scope; do not repeat an unchanged rejected call. Reports distinguish executed, passed, not executed and unsupported-environment results. A progress label does not change these execution facts.
@@ -34,9 +36,17 @@ The local Provider stream has no body idle timeout or total duration limit. User
 
 When attempts are exhausted, the run stops and the Session journal records a failure-state index into its existing messages, attempts, tool records and plan. This is not a second execution history or an automatic rollback. Users can continue the original Session, or start another Session that reads the source with `session.read`. Reading history requires neither Provider calls nor the historical runtime. Process termination or unavailable storage can prevent a final snapshot; errors from snapshot persistence or cleanup remain secondary to the original failure. Cancellation is shown as an unfinished generation and does not mark pending Todo entries complete.
 
-Input cache hit rate is cached input tokens divided by total input tokens. The context indicator refers to the last settled request, while the session-wide cache indicator aggregates the entire session. Settings provide token details. Different ratios across these scopes are not by themselves a calculation error.
+Input cache hit rate is cached input tokens divided by total input tokens. The context indicator shows the last settled Agent request. Permission reviews and context compaction do not replace that reading. The session-wide cache indicator includes all requests. Settings provide token details. Different ratios across these scopes are not by themselves a calculation error.
 
 The model, task identity and execution settings remain fixed during a run. Saved plugin registration, permission, search, document and environment settings activate on the next run. Content changes to a Skill or CLI plugin already selected for the run are read before the next model request; existing calls keep their prepared content. User plugin mentions and Agent-requested plugin activation are independent inputs. Use `plugin.search` to discover installed capabilities and `plugin.activate` to load enabled plugins for this run; user mentions are optional. Both paths prepare tools before the next model request. Loading does not install plugins, enable disabled plugins or grant permission for their effects. Each request records its tool definitions, instructions, aliases and Kernel catalog binding. Earlier requests, pending approvals and in-flight calls keep their original bindings. Registration alone does not expose an optional plugin. A preparation failure retains its reason and is not reported as an applied selection. Tool results, Skill text and new messages append to history. Do not rewrite historical facts, reduce reasoning effort, hide errors or fabricate usage to claim improved cache efficiency.
+
+## Attachments, file links and notices
+
+A message may contain only file attachments. During a running task, newly attached images and other immutable file snapshots join the same run after the current model request and its tools settle. They enter the next request without changing the model, project directories, earlier resource handles or write permissions. Images still require a model with image-input capability. Project-directory changes continue to apply to the next run.
+
+Local links retain their line and column. Relative links are resolved against the conversation's bound directories by checking the exact target, not by searching the project. A unique target opens directly; multiple targets require an explicit choice. Missing paths and read failures retain their diagnostics. Absolute links keep their existing resource binding.
+
+Command, attachment and file-opening notices above the composer have a dismiss button. Dismissing a notice leaves the draft, queued messages, pending decisions, task status and recorded failures unchanged. A subsequent failed operation can display a new notice.
 
 ## Settings and extensions
 
@@ -67,9 +77,13 @@ Different changes become available at different boundaries:
 | Enabled UI plugin's compiled entry module or manifest | The Host watches the selected files and replaces that plugin in the open GUI. TypeScript sources must first be compiled to the declared JavaScript entry. |
 | Content of a Skill or CLI plugin already selected for a run | Prepared before the next model request. Earlier requests, pending approvals and running calls keep their original content and bindings. |
 | Saved model, permission, plugin registration or execution environment settings | The next run; the active run retains its captured configuration. |
-| Rebuilt GUI resources copied into an existing package | Reload the interface with Cmd+Shift+R on macOS or Ctrl+Shift+R elsewhere. |
+| Rebuilt GUI resources copied into an existing package | Reload the interface with Cmd+Shift+R on macOS or Ctrl+Shift+R elsewhere, or invoke `browser.page` with `action: refreshInterface`. |
 | Session, Kernel, native application or bundled guidance changes | Build and install the corresponding service/package, then restart the affected processes. Editing source files alone does not update them. |
 
 UI plugins use the supported display inputs and ports described in the [UI plugin API and example](ui-plugins.md). Disabling a plugin releases its views and styles; conversation drafts and history remain available. The same request and run boundaries apply to GUI, CLI and TUI; display plugins affect only the GUI.
+
+Browser previews created in the current conversation appear in the Reader's tabs as they become available. Open Browser and Preview, select a page and use Refresh to reload that page while the Agent is running or after it stops. New pages leave your selected tab and panel visibility unchanged. A closed page is removed; selecting another page remains your choice. Switching conversations and returning restores the selected page if it is still open.
+
+For source development, `make dev-deepcode-gui` starts the Docker development service. Open its URL in the internal browser and retain the same preview while editing source; Vite applies hot updates. `openSelf` opens packaged resources. Refreshing a page loads its current file or server content; it does not build edited source. The refresh interface returns `scheduled` when a reload is queued or `needsUser` when unsaved settings or an active save require attention. It preserves view state and does not approve discarding user changes.
 
 Before replacing a complete application package, finish or cancel active tasks and close its clients. If a persistent Host was started with `deepcode-cli start-host`, stop it with `deepcode-cli stop-host` before replacing the program. Reopen DeepCode after installation. User configuration, conversation history and artifacts remain in their separate user directories.

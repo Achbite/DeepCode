@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+mod windows;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShellProgram {
@@ -97,7 +100,7 @@ fn executable_file(path: &Path) -> bool {
 
 pub fn find_powershell7() -> Option<PathBuf> {
     command_candidates("pwsh")
-        .find(|path| executable_file(path) && powershell_path_is_compatible(path))
+        .find_map(|path| resolve_powershell_path(&path))
         .or_else(|| {
             if !cfg!(windows) {
                 return None;
@@ -108,22 +111,33 @@ pub fn find_powershell7() -> Option<PathBuf> {
         })
 }
 
-/// Store app execution aliases belong to the interactive user and cannot be
-/// launched by the dedicated workspace account. Other WindowsApps packages may
-/// contain ordinary executables, so only exclude PowerShell aliases/packages.
-pub fn powershell_path_is_compatible(path: &Path) -> bool {
-    if !cfg!(windows) {
-        return true;
+/// Resolve a Store alias to the registered image before freezing the environment.
+fn resolve_powershell_path(path: &Path) -> Option<PathBuf> {
+    if !executable_file(path)
+        || (cfg!(windows)
+            && !path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("exe")))
+    {
+        return None;
     }
-    path.extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
-        && !is_store_powershell_path(path)
-        && !path
-            .canonicalize()
-            .ok()
-            .is_some_and(|path| is_store_powershell_path(&path))
+    #[cfg(windows)]
+    if is_store_powershell_path(path)
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name.eq_ignore_ascii_case("WindowsApps"))
+    {
+        // A Windows PowerShell request must not resolve to PowerShell 7.
+        return path
+            .file_name()
+            .filter(|name| name.eq_ignore_ascii_case("pwsh.exe"))
+            .and_then(|_| windows::registered_powershell());
+    }
+    Some(path.to_path_buf())
 }
 
+#[cfg(any(windows, test))]
 fn is_store_powershell_path(path: &Path) -> bool {
     path.as_os_str()
         .to_string_lossy()
@@ -139,12 +153,17 @@ fn is_store_powershell_path(path: &Path) -> bool {
         })
 }
 
+#[cfg(windows)]
+pub fn windows_runtime_read_roots(executable: &Path) -> Vec<PathBuf> {
+    windows::runtime_read_roots(executable)
+}
+
 pub fn find_windows_powershell() -> Option<PathBuf> {
     if !cfg!(windows) {
         return None;
     }
     command_candidates("powershell")
-        .find(|path| executable_file(path) && powershell_path_is_compatible(path))
+        .find_map(|path| resolve_powershell_path(&path))
         .or_else(|| {
             let path = PathBuf::from(std::env::var_os("SystemRoot")?)
                 .join("System32/WindowsPowerShell/v1.0/powershell.exe");
@@ -174,23 +193,6 @@ fn git_bash() -> Option<PathBuf> {
         .find(|p| executable_file(p))
 }
 
-pub fn script_arguments(program: &ShellProgram, script: &str) -> Vec<String> {
-    if program.tool == "powershell" {
-        use base64::Engine;
-        let script = format!("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n$OutputEncoding = [Console]::OutputEncoding\n{script}");
-        let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-        vec![
-            "-NoLogo".into(),
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-EncodedCommand".into(),
-            base64::engine::general_purpose::STANDARD.encode(bytes),
-        ]
-    } else {
-        vec!["-c".into(), script.into()]
-    }
-}
-
 /// Windows has a short process command-line limit. User scripts are passed as a
 /// UTF-8 BOM file so long scripts, Unicode and multiline quoting remain intact.
 pub(crate) fn prepare_script_arguments(
@@ -199,7 +201,7 @@ pub(crate) fn prepare_script_arguments(
     temporary: &Path,
 ) -> KernelResult<Vec<String>> {
     if program.tool != "powershell" {
-        return Ok(script_arguments(program, script));
+        return Ok(vec!["-c".into(), script.into()]);
     }
     use std::io::Write;
     let path = temporary.join("command.ps1");
@@ -247,18 +249,49 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn powershell_path_candidates_continue_after_store_aliases() {
-        let candidates = [
-            PathBuf::from(r"C:\Users\user\AppData\Local\Microsoft\WindowsApps\pwsh.exe"),
-            PathBuf::from(r"C:\tools\pwsh.cmd"),
-            PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"),
-        ];
-        assert_eq!(
-            candidates
-                .iter()
-                .find(|path| powershell_path_is_compatible(path)),
-            Some(&candidates[2])
+    fn registered_store_powershell_matches_the_os_package_registration() {
+        use std::os::windows::process::CommandExt;
+
+        // The install precondition must not depend on the discovery being tested.
+        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let output = std::process::Command::new(
+            system.join("System32/WindowsPowerShell/v1.0/powershell.exe"),
+        )
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$ErrorActionPreference = 'Stop'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ConvertTo-Json -Compress -InputObject @(Get-AppxPackage -Name Microsoft.PowerShell | ForEach-Object { Join-Path $_.InstallLocation 'pwsh.exe' })",
+        ])
+        .output()
+        .expect("query the current user's OS package registrations");
+        assert!(
+            output.status.success(),
+            "OS package query failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
+        let installed: Vec<PathBuf> =
+            serde_json::from_slice(&output.stdout).expect("OS package paths must be JSON");
+        let registered = windows::registered_powershell();
+        if installed.is_empty() {
+            assert!(registered.is_none());
+            eprintln!("Not applicable: no Microsoft.PowerShell Store package is registered for this user.");
+            return;
+        }
+        let registered = registered.expect("installed Store PowerShell must be discoverable");
+        assert!(registered.is_file());
+        let image = registered.canonicalize().unwrap();
+        assert!(installed
+            .iter()
+            .any(|path| path.canonicalize().is_ok_and(|path| path == image)));
+        let alias = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap())
+            .join("Microsoft/WindowsApps/pwsh.exe");
+        assert_ne!(registered, alias);
+        if alias.is_file() {
+            assert_eq!(resolve_powershell_path(&alias), Some(registered));
+        }
     }
     #[test]
     fn long_powershell_scripts_use_a_scoped_file_without_changing_user_text() {
@@ -267,10 +300,8 @@ mod tests {
             executable: "pwsh.exe".into(),
             dialect: "powershell7".into(),
         };
-        let text = format!(
-            "{}\nWrite-Output 'Unicode: 中文'; exit 7",
-            "# A long script\n".repeat(5000)
-        );
+        let script = "$p = 'C:\\资料 文件\\a.txt'\nWrite-Output \"$p `\"quoted`\"\"\nexit 7";
+        let text = format!("{}\n{script}", "# A long script\n".repeat(5000));
         let temporary =
             std::env::temp_dir().join(format!("deepcode-script-test-{}", std::process::id()));
         std::fs::create_dir(&temporary).unwrap();
@@ -284,38 +315,6 @@ mod tests {
         assert_eq!(arguments[5], "-File");
         std::fs::remove_dir_all(&temporary).unwrap();
         assert!(!path.exists());
-    }
-    #[test]
-    fn powershell_transports_multiline_unicode_without_windows_argument_requoting() {
-        use base64::Engine;
-        let script = "$p = 'C:\\资料 文件\\a.txt'\nWrite-Output \"$p `\"quoted`\"\"\nexit 7";
-        let program = ShellProgram {
-            tool: "powershell".into(),
-            executable: "pwsh.exe".into(),
-            dialect: "powershell7".into(),
-        };
-        let arguments = script_arguments(&program, script);
-        assert_eq!(
-            &arguments[..4],
-            [
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-EncodedCommand"
-            ]
-        );
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&arguments[4])
-            .unwrap();
-        let text = String::from_utf16(
-            &bytes
-                .chunks_exact(2)
-                .map(|v| u16::from_le_bytes([v[0], v[1]]))
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-        assert!(text.ends_with(script));
-        assert!(text.starts_with("[Console]::OutputEncoding"));
     }
 }
 

@@ -1,3 +1,4 @@
+import { UiRegion } from '../../ui-plugins/UiRegion';
 import { restoredInterfaceView, useInterfaceReloadView, registerInterfaceReloadView } from '../../services/interfaceReload';
 import { createPortal } from 'react-dom';
 import { UI_ICON_ROLES } from '../../icons/registry';
@@ -105,7 +106,14 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
   };
 
   const navigation = (
-    <nav className="settings-nav" aria-label={t(language, 'settings.title')}>
+    <UiRegion slot="settings.navigation" data={{ kind: 'settingsNavigation',
+      pages: items.map(item => ({ id: item.key, label: item.label, icon: item.icon })),
+      activePage: activeKey, searchQuery,
+    }} actions={{ setSettingsSearch: setSearchQuery, selectSettingsPage: id => {
+      const item = items.find(item => item.key === id);
+      if (!item) throw new Error('settings_page_unavailable');
+      navigate(item.key);
+    } }}><nav className="settings-nav" aria-label={t(language, 'settings.title')}>
         <div className="settings-nav__title">{t(language, 'settings.title')}</div>
         <label className="settings-search" aria-label={t(language, 'settings.search.placeholder')}>
           <span>{t(language, 'settings.search.label')}</span>
@@ -131,7 +139,7 @@ const SettingsCenter: React.FC<SettingsCenterProps> = ({
             </button>
           ))}
         </div>
-      </nav>
+      </nav></UiRegion>
   );
 
   return (

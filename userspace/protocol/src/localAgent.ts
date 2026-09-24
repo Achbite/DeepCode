@@ -28,6 +28,7 @@ export interface ErrorDiagnostics {
   isBody?: boolean;
   stopReason?: string;
   archivePath?: string;
+  providerError?: { code?: string; type?: string; retryDirective?: string };
   secondary?: Array<{ code: string; message: string }>;
 }
 
@@ -630,6 +631,8 @@ export interface ShellAuthorizationProjection {
 
 export interface EffectPreview {
   approvalReviewer?: 'user' | 'agent';
+  /** Exact Kernel-prepared operation; the agent's reason is not execution authority. */
+  operation?: { toolName: string; arguments: JsonObject; workspaceRoot?: string; executionScope?: string };
   authorizationScopes?: ShellAuthorizationScope[];
   fileAccess?: { read: string[]; write: string[] };
   review?: { decision: 'allow' | 'deny' | 'ask'; reason: string };
@@ -959,9 +962,15 @@ export type NewSessionEvent = SessionEvent extends infer Event
     : never
   : never;
 
+export interface SourceReferences {
+  citations: Array<{ url: string; title: string }>;
+  unresolved: boolean;
+}
+
 interface ProjectionMessageBase {
   messageId: string;
   content: string;
+  sourceReferences?: SourceReferences;
   filesystemReferences: FilesystemReference[];
   pluginSelections: PluginSelectionInput[];
   guidanceReferences?: GuidanceReference[];
@@ -990,6 +999,7 @@ export interface NarrativeProjection {
   runId: string;
   providerRequestId: string;
   content: string;
+  sourceReferences?: SourceReferences;
   sequence: number;
   createdAt: string;
 }
@@ -1315,7 +1325,7 @@ export interface SessionProjection {
   pendingPlan: PendingPlanProjection | null;
   todoList: TodoListProjection | null;
   contextUsage: ContextUsageProjection | null;
-  /** Latest settled input and latest in-flight composition; history is read on demand. */
+  /** Composition for the displayed Agent usage plus the latest composition; history is read on demand. */
   contextCompositions: ContextCompositionProjection[];
   tokenUsage: TokenUsageProjection;
   tokenUsageHistory: TokenUsageRoundProjection[];
@@ -1338,7 +1348,8 @@ export interface ConversationPort {
 
 export interface ConversationReadQuery {
   sessionId: string;
-  view?: 'summary' | 'messages' | 'tools' | 'plans' | 'context' | 'reasoning';
+  view?: 'summary' | 'messages' | 'tools' | 'plans' | 'context' | 'reasoning' | 'images';
+  imageIds?: string[];
   offset?: number;
   before?: number;
   limit?: number;
@@ -1359,8 +1370,8 @@ export interface ConversationReadResult {
 export interface ModelMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
-  /** Immutable user attachments; the Host resolves bytes only at the Provider transport boundary. */
-  toolImages?: readonly string[];
+  /** Immutable sources; Kernel resolves bytes at the Provider transport boundary. */
+  toolImages?: readonly { callId: string; artifactId: string }[];
   images?: readonly { workspaceId: string; logicalPath: string; mediaType: string }[];
   reasoningContent?: string;
   reasoningSignature?: string;
@@ -1557,12 +1568,21 @@ export interface RunRuntimeSnapshot {
   extensionGenerationRef: string;
   kernelCatalogSnapshotRef: string;
   provider: ProviderRuntimeSnapshot;
+  /** Frozen execution-permission reviewer, independent of the conversation request. */
+  approvalReviewer?: ProviderRuntimeSnapshot;
+  /** Frozen preparation failure, reported only when this run needs delegated review. */
+  approvalReviewerError?: LocalAgentError;
   webSearch: WebSearchBinding;
   instructions: { id: string; text: string }[];
   tools: PreparedToolDescriptor[];
   toolPromptContributions: PreparedToolPromptContribution[];
   providerToolAliases: ProviderToolAlias[];
   selectedPlugins: SelectedPluginSnapshot;
+}
+
+export function providerRuntimeForPurpose(runtime: RunRuntimeSnapshot,
+  purpose: ProviderRequest['purpose']): ProviderRuntimeSnapshot {
+  return purpose === 'approvalReview' ? runtime.approvalReviewer ?? runtime.provider : runtime.provider;
 }
 
 /** Immutable tool contribution view; Provider and workspace settings remain run-owned. */

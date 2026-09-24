@@ -45,8 +45,7 @@ struct RuntimeLocations {
 
 static RUNTIME_LOCATIONS: OnceLock<RuntimeLocations> = OnceLock::new();
 
-fn initialize_runtime_locations(app: &tauri::App) -> std::io::Result<()> {
-    let _ = app;
+fn initialize_runtime_locations() -> std::io::Result<()> {
     let executable_dir = current_exe_dir()
         .ok_or_else(|| std::io::Error::other("executable directory is unavailable"))?;
     let resources = deepcode_host_connection::runtime_root(&executable_dir);
@@ -311,7 +310,7 @@ fn main() {
             handler(invoke)
         })
         .setup(|app| {
-            initialize_runtime_locations(app)?;
+            initialize_runtime_locations()?;
             let target = resolve_launch_target();
             let mut host_tokens = HostConnectionTokens::resolve()?;
             let registration = Arc::clone(&host_tokens.browser_registration);
@@ -700,7 +699,7 @@ fn host_bootstrap_script(
         "schemaVersion":"deepcode.host-ui-bootstrap", "host":target.host, "port":target.port.to_string(),
         "uiToken":host_tokens.ui_token(), "windowChrome":if cfg!(target_os="macos") && !preview {"nativeOverlay"} else {"custom"}
     });
-    format!("Object.defineProperty(window,'__DEEPCODE_HOST_BOOT__',{{value:Object.freeze({bootstrap}),writable:false,configurable:true}});window.__DEEPCODE_SELF_PREVIEW__={preview};")
+    format!("Object.defineProperty(window,'__DEEPCODE_HOST_BOOT__',{{value:Object.freeze({bootstrap}),writable:false,configurable:true}});")
 }
 
 fn trusted_app_navigation(url: &tauri::Url) -> bool {

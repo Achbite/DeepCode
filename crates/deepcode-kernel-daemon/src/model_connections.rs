@@ -244,7 +244,7 @@ pub(crate) fn adapter_descriptors() -> Value {
     json!([
         {"id":"openai","name":"OpenAI","billingModes":["metered"],"authMethods":["apiKey"],"protocols":["responses","openaiCompatible"],"defaultBaseUrl":"https://api.openai.com/v1","models":[astra],"pricing":true,"quota":false,"source":"builtin"},
         {"id":"openai-codex","name":"OpenAI · Codex","billingModes":["subscription"],"authMethods":["browser","deviceCode"],"protocols":["responses"],"defaultBaseUrl":"https://chatgpt.com/backend-api/codex","models":[astra],"pricing":false,"quota":true,"source":"builtin"},
-        {"id":"deepseek","name":"DeepSeek","billingModes":["metered"],"authMethods":["apiKey"],"protocols":["responses","openaiCompatible","anthropic"],"defaultBaseUrl":"https://api.deepseek.com","models":[deepseek],"pricing":false,"quota":false,"source":"builtin"},
+        {"id":"deepseek","name":"DeepSeek","billingModes":["metered"],"authMethods":["apiKey"],"protocols":["responses","openaiCompatible","anthropic"],"defaultBaseUrl":"https://api.deepseek.com","models":[deepseek],"pricing":true,"quota":false,"source":"builtin"},
         {"id":"zhipu","name":"GLM API","billingModes":["metered"],"authMethods":["apiKey"],"protocols":["openaiCompatible"],"defaultBaseUrl":"https://open.bigmodel.cn/api/paas/v4","models":[model("GLM 5.3","glm-5.3","openaiCompatible","zhipu",1_000_000,131_072)],"pricing":false,"quota":false,"source":"builtin"},
         {"id":"moonshot","name":"Kimi","billingModes":["metered"],"authMethods":["apiKey"],"protocols":["openaiCompatible"],"defaultBaseUrl":"https://api.moonshot.ai/v1","models":[model("Kimi K3","kimi-k3","openaiCompatible","moonshot",1_000_000,32768)],"pricing":false,"quota":false,"source":"builtin"},
         {"id":"custom","name":"自定义 API","billingModes":["metered"],"authMethods":["apiKey"],"protocols":["responses","openaiCompatible","anthropic"],"defaultBaseUrl":"https://api.openai.com/v1","models":[custom_astra],"pricing":false,"quota":false,"source":"builtin"},
@@ -476,7 +476,11 @@ mod tests {
                 }
             }
         }
-        let root = std::env::temp_dir().join(crate::new_runtime_ref("search-choice-test").unwrap());
+        let root = std::env::temp_dir().join(
+            crate::new_runtime_ref("search-choice-test")
+                .unwrap()
+                .replace(':', "-"),
+        );
         let mut gui = GuiState::open_at(&root).unwrap();
         let edit: Edit = serde_json::from_value(json!({"connection":{
             "id":"search", "name":"Search", "adapterId":"openai", "billingMode":"metered",
@@ -497,7 +501,11 @@ mod tests {
 
     #[test]
     fn changing_one_connection_keeps_other_credentials_and_models() {
-        let root = std::env::temp_dir().join(crate::new_runtime_ref("connection-test").unwrap());
+        let root = std::env::temp_dir().join(
+            crate::new_runtime_ref("connection-test")
+                .unwrap()
+                .replace(':', "-"),
+        );
         let mut gui = GuiState::open_at(&root).unwrap();
         for id in ["a", "b"] {
             let edit:Edit=serde_json::from_value(json!({"connection":{"id":id,"name":id,"adapterId":"openai","billingMode":"metered","baseUrl":"https://api.openai.com/v1","credentialKind":"apiKey"},"apiKey":format!("key-{id}")})).unwrap();

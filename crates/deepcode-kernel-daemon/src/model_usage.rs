@@ -136,7 +136,14 @@ impl UsageStore {
             adapter_id: profile.connection.adapter_id.clone(),
             official_endpoint: reqwest::Url::parse(&profile.connection.base_url)
                 .ok()
-                .is_some_and(|url| url.host_str() == Some("api.openai.com")),
+                .is_some_and(|url| {
+                    url.scheme() == "https"
+                        && match profile.connection.adapter_id.as_str() {
+                            "openai" => url.host_str() == Some("api.openai.com"),
+                            "deepseek" => url.host_str() == Some("api.deepseek.com"),
+                            _ => false,
+                        }
+                }),
             price_catalog: prices(),
             observed: None,
         })
@@ -155,7 +162,7 @@ impl UsageStore {
                     record.started_at as i64,
                     record.connection_id,
                     record.session_id,
-                    record.actual_model,
+                    record.requested_model,
                     json
                 ],
             )
@@ -246,7 +253,8 @@ impl UsageCall {
                         price.adapter_id == self.adapter_id
                             && Some(&price.model) == observed.model.as_ref()
                     })
-                    .cloned();
+                    .cloned()
+                    .map(|price| price_at_request_start(price, self.record.started_at));
                 if let Some(price) = &self.record.price {
                     let (cost, complete) = estimate(price, &observed);
                     self.record.estimated_cost = cost;
@@ -260,6 +268,23 @@ impl UsageCall {
     }
 }
 
+// The local estimate uses the physical request start, in UTC. Each call stores
+// the actual rates selected here, so later price edits do not reprice history.
+fn price_at_request_start(mut price: ModelPrice, started_at: u64) -> ModelPrice {
+    if price.adapter_id == "deepseek" {
+        let time = DateTime::<Utc>::from_timestamp_millis(started_at as i64)
+            .expect("recorded request timestamp");
+        let weekday = time.weekday().num_days_from_monday() < 5;
+        let peak = weekday && ((1..4).contains(&time.hour()) || (6..10).contains(&time.hour()));
+        if !peak {
+            price.input *= 0.5;
+            price.cache_read *= 0.5;
+            price.output *= 0.5;
+        }
+    }
+    price
+}
+
 /// Pure calculation. Unknown cache-write usage never becomes zero or ordinary input.
 fn estimate(price: &ModelPrice, observed: &ObservedUsage) -> (Option<f64>, bool) {
     let Some(usage) = observed.usage else {
@@ -267,7 +292,7 @@ fn estimate(price: &ModelPrice, observed: &ObservedUsage) -> (Option<f64>, bool)
     };
     let multiplier = match observed.service_tier.as_deref() {
         None | Some("default" | "standard") => 1.0,
-        Some("flex") => 0.5,
+        Some("flex") if price.adapter_id == "openai" => 0.5,
         Some("fast" | "priority")
             if price.model.starts_with("gpt-6-") || price.model.starts_with("gpt-5.6-") =>
         {
@@ -408,6 +433,38 @@ pub(crate) async fn catalog() -> Json<ApiResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deepseek_local_estimate_uses_request_time_and_preserves_missing_usage() {
+        let price = prices()
+            .into_iter()
+            .find(|price| price.model == "deepseek-flash")
+            .unwrap();
+        let at = |time: &str| {
+            DateTime::parse_from_rfc3339(time)
+                .unwrap()
+                .timestamp_millis() as u64
+        };
+        let peak = price_at_request_start(price.clone(), at("2026-09-22T01:00:00Z"));
+        let off_peak = price_at_request_start(price.clone(), at("2026-09-22T04:00:00Z"));
+        let weekend = price_at_request_start(price, at("2026-09-20T01:00:00Z"));
+        assert_eq!(
+            (peak.input, peak.cache_read, peak.output),
+            (0.3, 0.006, 1.2)
+        );
+        assert_eq!(
+            (off_peak.input, off_peak.cache_read, off_peak.output),
+            (0.15, 0.003, 0.6)
+        );
+        assert_eq!(weekend.input, off_peak.input);
+        let missing = ObservedUsage {
+            usage: None,
+            model: Some("deepseek-flash".into()),
+            service_tier: None,
+            cache_write_tokens: None,
+        };
+        assert_eq!(estimate(&peak, &missing), (None, false));
+    }
+
     #[test]
     fn price_requires_reported_cache_counts_and_retains_partial_costs() {
         let price = prices()

@@ -265,6 +265,11 @@ fn resource_roots(
             error,
         ));
     }
+    let project = projection["sessionId"]
+        .as_str()
+        .and_then(|id| gui.conversation_catalog.session(id))
+        .and_then(|session| session.project_id.as_deref())
+        .and_then(|id| gui.conversation_catalog.project(id));
     let mut roots = Vec::new();
     for workspace in &gui.conversation_catalog.workspaces {
         if !projection_references_workspace(projection, &workspace.workspace_id) {
@@ -283,8 +288,14 @@ fn resource_roots(
         );
         entry.category = Some(if workspace.session_workdir {
             "session"
-        } else {
+        } else if workspace.owner_session_id.is_some() {
+            "attachment"
+        } else if project
+            .is_none_or(|project| project.workspace_ids.contains(&workspace.workspace_id))
+        {
             "project"
+        } else {
+            "reference"
         });
         roots.push(entry);
     }

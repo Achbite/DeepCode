@@ -304,16 +304,19 @@ impl McpRuntime {
         let mut instances = BTreeMap::new();
         for (_, server) in servers_by_id {
             let (client, definitions) = if server.setting.transport == "cli" {
-                let definitions = match &server.contract {
-                    McpServerContract::FirstParty(tools) => tools
-                        .iter()
-                        .map(|tool| RemoteToolDefinition {
-                            name: tool.remote_name.clone(),
-                            description: Some(tool.description.clone()),
-                            input_schema: tool.input_schema.clone(),
-                        })
-                        .collect(),
-                    McpServerContract::LocalCli(tools) => tools.clone(),
+                let (definitions, args) = match &server.contract {
+                    McpServerContract::FirstParty(tools) => (
+                        tools
+                            .iter()
+                            .map(|tool| RemoteToolDefinition {
+                                name: tool.remote_name.clone(),
+                                description: Some(tool.description.clone()),
+                                input_schema: tool.input_schema.clone(),
+                            })
+                            .collect(),
+                        split_args(&server.setting.args)?,
+                    ),
+                    McpServerContract::LocalCli { tools, args } => (tools.clone(), args.clone()),
                     McpServerContract::External => {
                         return Err(McpRuntimeError::new(
                             "cli_manifest_missing",
@@ -324,7 +327,7 @@ impl McpRuntime {
                 (
                     ToolClient::Cli(CliClient {
                         command: server.setting.command.clone(),
-                        args: split_args(&server.setting.args)?,
+                        args,
                         entry: server.cli_entry.clone(),
                     }),
                     definitions,
@@ -399,7 +402,10 @@ pub(crate) struct McpServerSource {
 #[derive(Debug, Clone)]
 enum McpServerContract {
     External,
-    LocalCli(Vec<RemoteToolDefinition>),
+    LocalCli {
+        tools: Vec<RemoteToolDefinition>,
+        args: Vec<String>,
+    },
     FirstParty(Vec<FirstPartyToolDescriptor>),
 }
 
@@ -576,7 +582,7 @@ fn tool_contract(
     definition: &RemoteToolDefinition,
 ) -> Result<McpToolContract, McpRuntimeError> {
     match &server.contract {
-        McpServerContract::External | McpServerContract::LocalCli(_) => Ok(McpToolContract {
+        McpServerContract::External | McpServerContract::LocalCli { .. } => Ok(McpToolContract {
             public_name: if server.setting.transport == "cli" {
                 format!("{}.{}", server.setting.id, definition.name)
             } else {
@@ -737,7 +743,10 @@ fn local_cli_source(source: LocalPluginSource) -> McpServerSource {
             enabled: source.enabled,
             error: None,
         },
-        contract: McpServerContract::LocalCli(vec![]),
+        contract: McpServerContract::LocalCli {
+            tools: vec![],
+            args: vec![],
+        },
         cli_entry: None,
     };
     let loaded = (|| -> Result<(), String> {
@@ -796,14 +805,11 @@ fn local_cli_source(source: LocalPluginSource) -> McpServerSource {
             .collect();
         result.setting.name = manifest.name;
         result.setting.command = manifest.command;
-        result.setting.args = manifest
-            .args
-            .iter()
-            .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
-            .collect::<Vec<_>>()
-            .join(" ");
         result.cli_entry = Some((manifest.entry, bytes));
-        result.contract = McpServerContract::LocalCli(manifest.tools);
+        result.contract = McpServerContract::LocalCli {
+            tools: manifest.tools,
+            args: manifest.args,
+        };
         Ok(())
     })();
     if let Err(message) = loaded {
@@ -1518,10 +1524,14 @@ mod tests {
         let mut source = std::io::Cursor::new(vec![b'x'; MAX_MCP_FRAME_BYTES + 1024]);
         let error = read_frame(&mut source).unwrap_err();
         assert!(error.to_string().contains("frame limit"));
-        assert_eq!(source.position(), (MAX_MCP_FRAME_BYTES + 2) as u64);
-        assert!(read_frame(&mut std::io::Cursor::new(b"{}\n"))
-            .unwrap()
-            .is_some());
+        assert!(
+            source.position() < source.get_ref().len() as u64,
+            "oversized frames must be rejected before consuming the entire source"
+        );
+        assert_eq!(
+            read_frame(&mut std::io::Cursor::new(b"{}\n")).unwrap(),
+            Some(b"{}".to_vec())
+        );
     }
 
     #[cfg(unix)]
@@ -1708,9 +1718,17 @@ for line in sys.stdin:
             std::process::id()
         )));
         std::fs::create_dir(&root.0).unwrap();
-        std::fs::write(root.0.join("deepcode-tool.json"),serde_json::to_vec(&json!({"id":"sample","name":"Sample","description":"Report implementation","command":"python3","entry":"main.py","tools":[{"name":"version","description":"Read implementation","inputSchema":{"type":"object"}}]})).unwrap()).unwrap();
+        let args = json!([
+            "",
+            "two words",
+            "single'quote",
+            "double\"quote",
+            "back\\slash",
+            ""
+        ]);
+        std::fs::write(root.0.join("deepcode-tool.json"),serde_json::to_vec(&json!({"id":"sample","name":"Sample","description":"Report implementation","command":"python3","entry":"main.py","args":args,"tools":[{"name":"version","description":"Read implementation","inputSchema":{"type":"object"}}]})).unwrap()).unwrap();
         let write = |version: &str| {
-            std::fs::write(root.0.join("main.py"),format!("import json,sys\njson.load(sys.stdin)\njson.dump({{\"version\":\"{version}\"}},sys.stdout)\n")).unwrap()
+            std::fs::write(root.0.join("main.py"),format!("import json,sys\njson.load(sys.stdin)\njson.dump({{\"version\":\"{version}\",\"args\":sys.argv[1:]}},sys.stdout)\n")).unwrap()
         };
         write("first");
         let settings = json!({"plugins.sources":serde_json::to_string(&json!([{"id":"sample","path":root.0,"enabled":true}])).unwrap()});
@@ -1754,6 +1772,8 @@ for line in sys.stdin:
         assert!(old.failure.is_none() && new.failure.is_none());
         assert_eq!(old.output["version"], "first");
         assert_eq!(new.output["version"], "second");
+        assert_eq!(old.output["args"], args);
+        assert_eq!(new.output["args"], args);
         assert!(matches!(
             second.tools().next().unwrap().instance.client,
             ToolClient::Cli(_)

@@ -4,6 +4,7 @@ import type {
 import { reasoningReadItem } from './reasoningRead.js';
 import { recoverSession } from './reducer.js';
 import { activeConversationEvents } from './conversationHistory.js';
+import { imageCatalog, readImageReferences } from './visualContext.js';
 
 const encoder = new TextEncoder();
 const MAX_PAGE_BYTES = 48 * 1024;
@@ -11,9 +12,12 @@ const MAX_PAGE_BYTES = 48 * 1024;
 export function decodeConversationReadQuery(value: unknown): ConversationReadQuery {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('conversation_read_invalid');
   const query = value as Record<string, unknown>;
-  if (Object.keys(query).some((key) => !['sessionId', 'view', 'before', 'limit', 'recordId', 'providerRequestId', 'offset'].includes(key))
+  if (Object.keys(query).some((key) => !['sessionId', 'view', 'before', 'limit', 'recordId', 'providerRequestId', 'offset', 'imageIds'].includes(key))
     || !identifier(query.sessionId)
-    || (query.view !== undefined && (typeof query.view !== 'string' || !['summary', 'messages', 'tools', 'plans', 'context', 'reasoning'].includes(query.view)))
+    || (query.view !== undefined && (typeof query.view !== 'string' || !['summary', 'messages', 'tools', 'plans', 'context', 'reasoning', 'images'].includes(query.view)))
+    || (query.imageIds !== undefined && (query.view !== 'images' || !Array.isArray(query.imageIds)
+      || query.imageIds.length > 8 || query.imageIds.some(id => !identifier(id))
+      || new Set(query.imageIds).size !== query.imageIds.length || query.before !== undefined || query.limit !== undefined))
     || (query.before !== undefined && (!Number.isSafeInteger(query.before) || Number(query.before) < 1))
     || (query.limit !== undefined && (!Number.isInteger(query.limit) || Number(query.limit) < 1 || Number(query.limit) > 50))
     || (query.recordId !== undefined && (!identifier(query.recordId) || query.view !== 'tools'))
@@ -43,6 +47,17 @@ export async function readConversation(journal: CommandJournalPort, query: Conve
   const result: ConversationReadResult = {
     sessionId: query.sessionId, revision: journalEvents.at(-1)!.sequence, view, items: [], nextBefore: null,
   };
+  if (view === 'images') {
+    const images = query.imageIds !== undefined ? readImageReferences(events, query.imageIds)
+      : [...imageCatalog(events).values()].filter(image => image.sequence < (query.before ?? Infinity))
+        .sort((left, right) => left.sequence - right.sequence);
+    // Keep all images from the boundary event so a sequence cursor cannot skip its siblings.
+    const boundary = images[Math.max(0, images.length - (query.limit ?? 10))]?.sequence;
+    const selected = query.imageIds !== undefined ? images : images.filter(image => image.sequence >= boundary);
+    result.items = selected.map(({ imageId, label, sequence }) => ({ imageId, label, sequence }));
+    if (selected.length < images.length) result.nextBefore = selected[0].sequence;
+    return result;
+  }
   if (view === 'summary') {
     const state = recoverSession(query.sessionId, journalEvents);
     const lastUser = state.messages.findLast((message) => message.role === 'user');

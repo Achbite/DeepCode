@@ -44,6 +44,7 @@ impl ProviderStreamKind {
 pub(crate) struct ProviderStreamError {
     pub(crate) code: &'static str,
     pub(crate) message: String,
+    reported_error: Option<Value>,
 }
 
 impl ProviderStreamError {
@@ -51,6 +52,37 @@ impl ProviderStreamError {
         Self {
             code,
             message: message.into(),
+            reported_error: None,
+        }
+    }
+
+    fn reported(code: &'static str, error: &Value) -> Self {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| error.as_str())
+            .filter(|message| !message.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| error.to_string());
+        Self {
+            code,
+            message,
+            reported_error: Some(error.clone()),
+        }
+    }
+
+    pub(crate) fn into_failure(self, secret: Option<&str>) -> Value {
+        match self.reported_error {
+            Some(error) => crate::provider_transport::upstream_failure(
+                self.code,
+                &self.message,
+                &error,
+                None,
+                secret,
+            ),
+            None => {
+                json!({"code":self.code, "message":crate::provider_transport::safe_detail(&self.message, secret)})
+            }
         }
     }
 }
@@ -408,11 +440,8 @@ impl ProviderStreamAccumulator {
         }
         let value = parse_json(payload)?;
         self.observe_metadata(&value)?;
-        if let Some(error) = value.get("error") {
-            return Err(ProviderStreamError::new(
-                "provider_error",
-                error.to_string(),
-            ));
+        if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+            return Err(ProviderStreamError::reported("provider_error", error));
         }
         if let Some(usage) = value.get("usage") {
             set_token_count(
@@ -497,15 +526,13 @@ impl ProviderStreamAccumulator {
     ) -> Result<Vec<ProviderEmission>, ProviderStreamError> {
         let value = parse_json(payload)?;
         self.observe_metadata(&value)?;
-        if let Some(error) = value.get("error") {
-            return Err(ProviderStreamError::new(
-                "provider_error",
-                error.to_string(),
-            ));
+        if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+            return Err(ProviderStreamError::reported("provider_error", error));
         }
         let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
         let mut emissions = Vec::new();
         match event_type {
+            "error" => return Err(ProviderStreamError::reported("provider_error", &value)),
             "response.output_text.delta" => {
                 if let Some(text) = value.get("delta").and_then(Value::as_str) {
                     let index = required_output_index(
@@ -727,14 +754,24 @@ impl ProviderStreamAccumulator {
                 self.source_done = true;
             }
             "response.failed" | "response.incomplete" => {
-                let detail = value
-                    .pointer("/response/error/message")
-                    .or_else(|| value.pointer("/response/incomplete_details/reason"))
+                let error = value
+                    .pointer("/response/error")
+                    .filter(|error| !error.is_null());
+                if let Some(error) = error {
+                    return Err(ProviderStreamError::reported(
+                        "provider_response_failed",
+                        error,
+                    ));
+                }
+                let reason = value
+                    .pointer("/response/incomplete_details/reason")
                     .and_then(Value::as_str)
                     .unwrap_or(event_type);
-                return Err(ProviderStreamError::new(
+                return Err(ProviderStreamError::reported(
                     "provider_response_failed",
-                    format!("Responses 请求未完成：{detail}"),
+                    &json!({
+                        "type": event_type, "message": format!("Responses 请求未完成：{reason}"),
+                    }),
                 ));
             }
             _ => {}
@@ -844,9 +881,9 @@ impl ProviderStreamAccumulator {
             }
             "message_stop" => self.source_done = true,
             "error" => {
-                return Err(ProviderStreamError::new(
+                return Err(ProviderStreamError::reported(
                     "provider_error",
-                    value.get("error").unwrap_or(&value).to_string(),
+                    value.get("error").unwrap_or(&value),
                 ));
             }
             _ => {}
@@ -860,11 +897,8 @@ impl ProviderStreamAccumulator {
     ) -> Result<Vec<ProviderEmission>, ProviderStreamError> {
         let value = parse_json(payload)?;
         self.observe_metadata(&value)?;
-        if let Some(error) = value.get("error") {
-            return Err(ProviderStreamError::new(
-                "provider_error",
-                error.to_string(),
-            ));
+        if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+            return Err(ProviderStreamError::reported("provider_error", error));
         }
         let mut emissions = Vec::new();
         let message = value.get("message").unwrap_or(&Value::Null);
@@ -1219,6 +1253,69 @@ pub(crate) fn sse_json_event(event: &str, value: Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_stream_failures_preserve_details_without_becoming_protocol_errors() {
+        let reported = json!({
+            "code":"server_is_overloaded", "type":"service_unavailable_error",
+            "message":"Our servers are currently overloaded. Please try again later.",
+            "headers":{"x-retry-metadata":"NO_MORE_RETRY", "authorization":"not-public"},
+        });
+        for payload in [
+            json!({"type":"error", "error":reported}),
+            json!({"type":"response.failed", "response":{"error":reported}}),
+        ] {
+            let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Responses);
+            let failure = parser
+                .ingest_payload(payload.to_string().as_bytes())
+                .unwrap_err()
+                .into_failure(None);
+            assert_eq!(failure["message"], reported["message"]);
+            assert_eq!(failure["diagnostics"]["category"], "provider");
+            assert_eq!(failure["diagnostics"]["retryable"], false);
+            assert_eq!(
+                failure["diagnostics"]["providerError"],
+                json!({
+                    "code":"server_is_overloaded", "type":"service_unavailable_error",
+                    "retryDirective":"NO_MORE_RETRY",
+                })
+            );
+            assert!(crate::provider_transport::valid_diagnostics(
+                &failure["diagnostics"]
+            ));
+            assert!(!failure.to_string().contains("not-public"));
+        }
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Responses);
+        let failure = parser
+            .ingest_payload(br#"{"type":"error","code":"server_error","message":"Unavailable"}"#)
+            .unwrap_err()
+            .into_failure(None);
+        assert_eq!(
+            failure["diagnostics"]["providerError"]["code"],
+            "server_error"
+        );
+        assert_eq!(failure["message"], "Unavailable");
+
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Responses);
+        let failure = parser.ingest_payload(br#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#)
+            .unwrap_err().into_failure(None);
+        assert_eq!(failure["diagnostics"]["category"], "provider");
+        assert!(failure["message"]
+            .as_str()
+            .unwrap()
+            .contains("max_output_tokens"));
+
+        let mut parser = ProviderStreamAccumulator::new(ProviderStreamKind::Responses);
+        let failure = parser
+            .ingest_payload(b"invalid json")
+            .unwrap_err()
+            .into_failure(None);
+        assert_eq!(failure["code"], "provider_stream_json_invalid");
+        assert!(
+            failure.get("diagnostics").is_none(),
+            "transport owns local protocol diagnostics"
+        );
+    }
 
     #[test]
     fn truncated_chat_and_anthropic_turns_cannot_finalize_even_with_complete_tool_json() {

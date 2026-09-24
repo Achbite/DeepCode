@@ -1,3 +1,5 @@
+import { modelReasoningEfforts } from '@deepcode/protocol';
+import { t } from '../../../i18n';
 import { useInterfaceReloadGuard } from '../../../services/interfaceReload';
 import { useState } from 'react';
 import type { LlmProviderProfile, ProviderAdapterDescriptor } from '@deepcode/protocol';
@@ -8,7 +10,7 @@ export default function ModelEditor({ profile, adapter, defaultId, onSaved, onRe
   profile: LlmProviderProfile; adapter: ProviderAdapterDescriptor; defaultId?: string;
   onSaved(): Promise<void>; onRemove?(): void;
 }) {
-  const { text } = useModelLanguage();
+  const { text, language } = useModelLanguage();
   const [draft, setDraft] = useState(profile);
   const [busy, setBusy] = useState(false);
   const [feedback, setFeedback] = useState('');
@@ -33,7 +35,8 @@ export default function ModelEditor({ profile, adapter, defaultId, onSaved, onRe
           <label>{text('图片输入', 'Image input')}<select value={draft.imageInput === undefined ? '' : String(draft.imageInput)} onChange={e => set('imageInput', e.target.value === '' ? undefined : e.target.value === 'true')}><option value="">{text('模型预设', 'Model preset')}</option><option value="true">{text('支持', 'Supported')}</option><option value="false">{text('不支持', 'Unsupported')}</option></select></label>
         </div>
         <details className="model-advanced"><summary>{text('更多参数', 'More options')}</summary><div className="model-form-grid">
-          <label>Thinking<select value={draft.thinking ?? ''} onChange={e => set('thinking', (e.target.value || undefined) as LlmProviderProfile['thinking'])}><option value="">{text('服务默认', 'Service default')}</option><option value="enabled">{text('启用', 'Enabled')}</option><option value="disabled">{text('关闭', 'Disabled')}</option></select></label>
+          <label>Thinking<select value={draft.thinking ?? ''} onChange={e => set('thinking', (e.target.value || undefined) as LlmProviderProfile['thinking'])}><option value="">{t(language, 'settings.llm.serviceDefault')}</option><option value="enabled">{text('启用', 'Enabled')}</option><option value="disabled">{text('关闭', 'Disabled')}</option></select></label>
+          <label>{t(language, 'settings.llm.reasoningEffort')}<select value={draft.reasoningEffort ?? ''} disabled={draft.thinking === 'disabled'} onChange={e => set('reasoningEffort', (e.target.value || undefined) as LlmProviderProfile['reasoningEffort'])}><option value="">{t(language, 'settings.llm.serviceDefault')}</option>{modelReasoningEfforts(draft).map(value => <option key={value} value={value}>{t(language, `settings.llm.effort.${value}`)}</option>)}</select></label>
           <label>Temperature<input type="number" step="0.1" min="0" max="2" value={draft.temperature ?? ''} onChange={e => set('temperature', e.target.value === '' ? undefined : e.target.valueAsNumber)} /></label>
           {adapter.id === 'custom' && <label>{text('协议行为', 'Protocol behavior')}<select value={draft.providerFlavor} onChange={e => set('providerFlavor', e.target.value as LlmProviderProfile['providerFlavor'])}>{['openai','deepseek','zhipu','moonshot'].map(v => <option key={v}>{v}</option>)}</select></label>}
         </div></details>

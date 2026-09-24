@@ -14,6 +14,19 @@ const shell = { toolBindingRef: 'binding:shell', name: 'bash', description: 'Run
 const context = { workspaceId: workspaceBinding.workspaceId, workspaceRoot: '/workspace', command: 'make check',
   cwd: '/workspace', environment: { shell: '/bin/bash', executionScope: 'host' }, terminal: null, workspaceMode: 'write', toolName: 'bash' };
 
+function reviewerPreparation(options) {
+  const preparation = fakeRunPreparation(options);
+  const prepare = preparation.port.prepare;
+  preparation.port.prepare = async request => {
+    const prepared = await prepare(request);
+    prepared.runtimeSnapshot.approvalReviewer = { ...prepared.runtimeSnapshot.provider,
+      providerRuntimeRef: 'provider-runtime:reviewer', profileId: 'profile:reviewer',
+      contextWindowTokens: 8192, maxOutputTokens: 1024, hostedWebSearch: 'none' };
+    return prepared;
+  };
+  return preparation;
+}
+
 test('runtime read roots use shared defaults and validate their setting shape', () => {
   assert.deepEqual(DEFAULT_USER_SETTINGS['agent.permissions.runtimeReadRoots'], []);
   assert.deepEqual(permissionSettings({})['agent.permissions.runtimeReadRoots'], []);
@@ -23,7 +36,7 @@ test('runtime read roots use shared defaults and validate their setting shape', 
   assert.throws(() => validatePermissionPatches({ 'agent.permissions.commandDenylist': [''] }), /command_denylist_invalid/);
 });
 
-test('approval review reuses compacted context and retains the current input and later guidance', () => {
+test('approval review retains original user constraints without main-model summaries', () => {
   const sessionId = 'session:review-context', runId = 'run:review-context';
   const runtime = runtimeSnapshot(runId);
   const events = [
@@ -34,18 +47,92 @@ test('approval review reuses compacted context and retains the current input and
     { type: 'message.committed', runId, payload: { messageId: 'message:guidance', role: 'user', content: 'Use the existing build directory.' } },
   ].map((event, index) => ({ schemaVersion: 'deepcode.session-event.v5', eventId: `event:${index + 1}`, sessionId,
     sequence: index + 1, occurredAt: '2026-09-20T00:00:00.000Z', ...event }));
-  const snapshot = { events, state: { ...emptySessionState(sessionId), workspaceBindings: [workspaceBinding] } };
+  const attachment = { workspaceId: 'workspace:review-attachment', displayName: 'review-notes.md' };
+  const snapshot = { events, state: { ...emptySessionState(sessionId), workspaceBindings: [workspaceBinding],
+    run: { runId, workspaceBindings: [workspaceBinding, attachment] } } };
   const approval = { approvalId: 'approval:review-context', runId, callId: 'call:build',
     preview: { summary: 'Run make check', effects: ['process'], logicalTargets: ['.'], authorizationContext: context } };
-  const { request } = prepareApprovalReview(snapshot, runtime, approval, 'provider:review-context');
+  const { request, receipt } = prepareApprovalReview(snapshot, runtime, approval, 'provider:review-context');
+  assert.deepEqual(request.workspaceBindings, [workspaceBinding, attachment]);
+  assert.deepEqual(receipt.workspaceBindings, request.workspaceBindings.map(binding => ({ itemId: binding.workspaceId, label: binding.displayName })));
+  assert.throws(() => prepareApprovalReview(snapshot, runtime, { ...approval, runId: 'run:other' }, 'provider:wrong'), /approval_review_run_mismatch/);
   const input = JSON.parse(request.messages[1].content);
-  assert.deepEqual(input.taskContext, [
-    { role: 'system', content: 'Keep project changes within the approved scope.' },
-    { role: 'user', content: 'Run make check.' },
-    { role: 'user', content: 'Use the existing build directory.' },
+  assert.deepEqual(input.userMessages, [
+    { messageId: 'message:current', content: 'Run make check.' },
+    { messageId: 'message:guidance', content: 'Use the existing build directory.' },
   ]);
   assert.deepEqual(request.tools, []);
-  assert.deepEqual(input.preview, approval.preview);
+  assert.deepEqual(input.operation, context);
+  assert.equal(input.grant, 'thisCallOnly');
+  assert.equal(request.messages[1].content.includes('Keep project changes within the approved scope.'), false);
+  const longInput = structuredClone(snapshot);
+  longInput.events[0].payload.content = 'Unrelated previous context. '.repeat(1000);
+  const bounded = prepareApprovalReview(longInput, runtime, approval, 'provider:bounded');
+  assert.equal(bounded.request.messages[1].content.includes('Unrelated previous context.'), false);
+  longInput.events[1].payload.content = 'Important user constraints. '.repeat(1000);
+  assert.throws(() => prepareApprovalReview(longInput, runtime, approval, 'provider:oversized'), /approval_review_context_too_large/);
+});
+
+test('review preserves corrections from the preceding and confirmed Plan source runs without selecting other runs', () => {
+  const sessionId = 'session:review-history', runId = 'run:current';
+  const runtime = runtimeSnapshot(runId);
+  const events = [];
+  const addRun = (id, input, guidance) => {
+    events.push(
+      { type: 'message.committed', payload: { messageId: `message:${id}`, role: 'user', content: input } },
+      { type: 'run.started', runId: `run:${id}`, payload: { inputMessageId: `message:${id}` } },
+      { type: 'message.committed', runId: `run:${id}`, payload: { messageId: `guidance:${id}`, role: 'user', content: guidance } },
+    );
+  };
+  addRun('plan', 'Inspect the available data and prepare a report.', 'Use only public data in this Plan.');
+  addRun('unrelated', 'An unrelated earlier task.', 'Unrelated earlier details. '.repeat(1000));
+  addRun('previous', 'Prepare the report.', 'Do not access /private/customer.csv.');
+  addRun('current', 'Continue the report.', 'Keep the report in the existing draft.');
+  const plan = { planId: 'plan:report', revision: 1, runId: 'run:plan', title: 'Prepare a report',
+    summary: 'Inspect the data.', mutationManifest: [] };
+  const snapshot = { events: events.map((event, index) => ({ schemaVersion: 'deepcode.session-event.v5',
+    sessionId, eventId: `event:${index + 1}`, sequence: index + 1, occurredAt: '2026-09-24T00:00:00.000Z', ...event })),
+    state: { ...emptySessionState(sessionId), run: { runId, workspaceBindings: [workspaceBinding] },
+      plans: [plan], activePlanRef: { planId: plan.planId, revision: plan.revision } } };
+  const approval = { approvalId: 'approval:history', runId, callId: 'call:read', preview: {
+    summary: 'Read report data', effects: ['process'], logicalTargets: ['.'],
+    operation: { toolName: 'bash', arguments: { command: 'cat /private/customer.csv' } } } };
+  const before = structuredClone(snapshot);
+  const packet = JSON.parse(prepareApprovalReview(snapshot, runtime, approval, 'provider:history').request.messages[1].content);
+  assert.deepEqual(packet.userMessages, [
+    { messageId: 'message:plan', content: 'Inspect the available data and prepare a report.' },
+    { messageId: 'guidance:plan', content: 'Use only public data in this Plan.' },
+    { messageId: 'message:previous', content: 'Prepare the report.' },
+    { messageId: 'guidance:previous', content: 'Do not access /private/customer.csv.' },
+    { messageId: 'message:current', content: 'Continue the report.' },
+    { messageId: 'guidance:current', content: 'Keep the report in the existing draft.' },
+  ]);
+  assert.equal(packet.plan.confirmed, true);
+  assert.deepEqual(snapshot, before);
+  const oversized = structuredClone(snapshot);
+  oversized.events.find(event => event.payload.messageId === 'guidance:plan').payload.content = 'Required Plan restriction. '.repeat(1000);
+  assert.throws(() => prepareApprovalReview(oversized, runtime, approval, 'provider:oversized-history'), /approval_review_context_too_large/);
+});
+
+test('review reasons survive canonical permission metadata removal without changing the operation', () => {
+  const runId = 'run:reason', callId = 'call:reason';
+  const operation = { toolName: 'bash', arguments: { command: 'ls /Applications' }, executionScope: 'workspace', workspaceRoot: '/workspace' };
+  const original = { command: 'ls /Applications', requestNetworkPermission: 'Inspect the task service.',
+    requestFileAccess: { read: ['/Applications'], reason: 'Locate the installed application.' },
+    requestHostPermission: 'Inspect the host environment.' };
+  const snapshot = { state: { ...emptySessionState('session:reason'), run: { runId, workspaceBindings: [workspaceBinding] } },
+    events: [{ type: 'tool.requested', runId, callId, payload: { toolName: 'bash', input: original } }] };
+  const approval = { approvalId: 'approval:reason', runId, callId, preview: {
+    summary: 'Read application metadata', effects: ['process'], logicalTargets: ['.'], operation,
+    fileAccess: { read: ['/Applications'], write: [] }, authorizationContext: context } };
+  const { request } = prepareApprovalReview(snapshot, runtimeSnapshot(runId), approval, 'provider:reason');
+  const packet = JSON.parse(request.messages[1].content);
+  assert.deepEqual(packet.requestReason, { host: original.requestHostPermission, network: original.requestNetworkPermission,
+    files: original.requestFileAccess.reason });
+  assert.deepEqual(packet.operation, operation);
+  assert.deepEqual(packet.requestedAccess.fileAccess, approval.preview.fileAccess);
+  assert.equal(packet.grant, 'thisCallOnly');
+  assert.deepEqual(request.tools, []);
 });
 
 test('file resources preserve external targets without assigning a workspace logical path', () => {
@@ -115,22 +202,33 @@ for (const mode of ['ask', 'review', 'allow']) test(`Shell ${mode} has a distinc
   const journal = new InMemoryCommandJournal(), sessionId = `session:permissions-${mode}`;
   await createSession(journal, sessionId, [workspaceBinding]);
   let agentTurns = 0, reviews = 0, executions = 0;
-  const preparation = fakeRunPreparation({ tools: [shell], permissions: { 'agent.permissions.shell': mode, 'agent.permissions.shellAccess': 'full' } });
+  const preparation = reviewerPreparation({ tools: [shell], permissions: { 'agent.permissions.shell': mode, 'agent.permissions.shellAccess': 'full' } });
   const actor = actorWith(journal, sessionId, { async *stream(request) {
     if (request.purpose === 'approvalReview') {
       reviews++;
       assert.deepEqual(request.tools, []); assert.deepEqual(request.hostedTools, []);
       assert.equal(request.responseConstraint, 'answerOnly');
+      assert.equal(request.providerRuntimeRef, 'provider-runtime:reviewer');
+      assert.equal(request.profileId, 'profile:reviewer');
       assert.match(request.messages[1].content, /make check/);
       yield providerEvent(request.requestId, 'assistant.message', { content: '{"decision":"allow","reason":"The user requested this test in the delegated environment."}' });
     } else if (++agentTurns === 1) yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:build', name: 'bash', input: { workspace: 'primary', command: 'make check' } });
     else yield providerEvent(request.requestId, 'assistant.message', { messageId: 'message:done', content: 'Finished.' });
-    yield providerEvent(request.requestId, 'completed', {});
+    yield providerEvent(request.requestId, 'completed', request.purpose === 'approvalReview'
+      ? { usage: { inputTokens: 120, outputTokens: 24, contextWindowTokens: 8192 } }
+      : { usage: { inputTokens: agentTurns * 1000, outputTokens: agentTurns * 10, contextWindowTokens: 4096 } });
   } }, emptyKernel({ async execute(request) {
     if (mode !== 'allow' && !request.nonWorkspaceAuthority) return { schemaVersion: 'deepcode.kernel-reply', type: 'tool.execution', requestId: request.requestId,
       callId: request.callId, status: 'approvalRequired', preview: { summary: 'Run make check', effects: ['process'], logicalTargets: ['.'],
         authorizationScope: 'runCommand', authorizationScopes: ['runCommand', 'runHostShell'], authorizationContext: context,
         approvalReviewer: mode === 'review' ? 'agent' : 'user' } };
+    if (mode === 'review') {
+      const afterReview = await actor.snapshot();
+      assert.equal(afterReview.contextUsage.inputTokens, 1000);
+      const replayed = projectSession(loopSnapshot(sessionId, await readEvents(journal, sessionId)).state);
+      assert.deepEqual(replayed.contextUsage, afterReview.contextUsage);
+      assert.equal(replayed.contextCompositions.find(receipt => receipt.providerRequestId === replayed.contextUsage.providerRequestId).purpose, 'agent');
+    }
     executions++; return shellReply(request);
   } }), preparation.port, `permission-${mode}`);
   t.after(() => actor.dispose());
@@ -147,8 +245,109 @@ for (const mode of ['ask', 'review', 'allow']) test(`Shell ${mode} has a distinc
   assert.deepEqual(completed.shellAuthorizations, []);
   const events = await readEvents(journal, sessionId);
   const resolved = events.find(event => event.type === 'approval.resolved');
-  if (mode === 'review') { assert.equal(resolved.payload.source, 'agent'); assert.equal(resolved.payload.authorizationScope, 'runCommand'); }
+  if (mode === 'review') {
+    assert.equal(resolved.payload.source, 'agent'); assert.equal(resolved.payload.authorizationScope, undefined);
+    const usage = events.find(event => event.type === 'context.updated' && event.payload.providerRuntimeRef === 'provider-runtime:reviewer');
+    assert.ok(usage);
+    assert.equal(completed.tokenUsage.inputTokens, 3120);
+    assert.equal(completed.contextUsage.inputTokens, 2000);
+    assert.equal(completed.tokenUsage.outputTokens, 54);
+  }
   else if (mode === 'allow') assert.equal(resolved, undefined);
+});
+
+for (const needsReview of [false, true]) test(`a frozen reviewer configuration error affects only an actual review: ${needsReview}`, async t => {
+  const journal = new InMemoryCommandJournal(), sessionId = `session:review-config-${needsReview}`;
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const originalError = { code: 'approval_reviewer_configuration_invalid', message: 'The selected reviewer model is unavailable.',
+    diagnostics: { source: 'kernel', phase: 'prepare', category: 'input', retryable: false, causes: [{ message: 'Reviewer profile does not exist.' }] } };
+  const preparation = fakeRunPreparation({ tools: [shell], permissions: { 'agent.permissions.shell': 'review' } });
+  const prepare = preparation.port.prepare;
+  preparation.port.prepare = async request => {
+    const prepared = await prepare(request);
+    prepared.runtimeSnapshot.approvalReviewerError = originalError;
+    return prepared;
+  };
+  const requests = [];
+  let executions = 0;
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    requests.push(request);
+    assert.equal(request.purpose, 'agent', 'invalid reviewer configuration must not use a replacement Provider');
+    if (needsReview) yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:review-config', name: 'bash',
+      input: { workspace: 'primary', command: 'make check' } });
+    else yield providerEvent(request.requestId, 'assistant.message', { messageId: 'message:ordinary', content: 'A normal answer.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel({ async execute(request) {
+    if (request.nonWorkspaceAuthority) { executions++; return shellReply(request); }
+    return { schemaVersion: 'deepcode.kernel-reply', type: 'tool.execution', requestId: request.requestId, callId: request.callId,
+      status: 'approvalRequired', preview: { summary: 'Run make check', effects: ['process'], logicalTargets: ['.'],
+        approvalReviewer: 'agent', authorizationContext: context } };
+  } }), preparation.port, 'review-config');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:review-config', needsReview ? 'Run make check.' : 'Answer without tools.'));
+  const state = await waitForProjection(actor, value => value.run?.status === (needsReview ? 'waiting' : 'completed'));
+  assert.equal(requests.length, 1);
+  assert.equal(executions, 0);
+  const events = await readEvents(journal, sessionId);
+  assert.equal(events.some(event => event.type === 'approval.resolved'), false);
+  assert.equal(events.some(event => event.type === 'context.composed' && event.payload.purpose === 'approvalReview'), false);
+  if (needsReview) {
+    assert.equal(state.pendingApproval.preview.review.decision, 'ask');
+    assert.ok(state.pendingApproval.preview.review.reason.includes(originalError.code));
+    assert.ok(state.pendingApproval.preview.review.reason.includes(originalError.message));
+    const snapshot = { state: { ...emptySessionState(sessionId), run: state.run }, events: [] };
+    assert.throws(() => prepareApprovalReview(snapshot, { ...runtimeSnapshot(state.run.runId), approvalReviewerError: originalError },
+      state.pendingApproval, 'provider:invalid-config'), error => {
+        assert.equal(error.code, originalError.code);
+        assert.equal(error.message, originalError.message);
+        assert.deepEqual(error.diagnostics, originalError.diagnostics);
+        return true;
+      });
+  } else {
+    assert.equal(state.messages.at(-1).content, 'A normal answer.');
+    assert.equal(preparation.released.length, 1);
+  }
+});
+
+test('cancelling an independent reviewer settles its own request and never executes the command', async t => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:cancel-review';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  let startedReview;
+  const started = new Promise(resolve => { startedReview = resolve; });
+  const preparation = reviewerPreparation({ tools: [shell], permissions: { 'agent.permissions.shell': 'review' } });
+  let executions = 0;
+  const actor = actorWith(journal, sessionId, { async *stream(request, signal) {
+    if (request.purpose === 'approvalReview') {
+      startedReview();
+      await new Promise((resolve, reject) => {
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+      return;
+    }
+    yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:cancelled-build', name: 'bash', input: { workspace: 'primary', command: 'make check' } });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel({ async execute(request) {
+    if (request.nonWorkspaceAuthority) { executions++; return shellReply(request); }
+    return { schemaVersion: 'deepcode.kernel-reply', type: 'tool.execution', requestId: request.requestId, callId: request.callId,
+      status: 'approvalRequired', preview: { summary: 'Run make check', effects: ['process'], logicalTargets: ['.'],
+        approvalReviewer: 'agent', authorizationContext: context } };
+  } }), preparation.port, 'cancel-review');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:start', 'Run make check.'));
+  await started;
+  const running = await actor.snapshot();
+  await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'run.cancel', sessionId,
+    commandId: 'command:cancel-review', runId: running.run.runId });
+  const stopped = await waitForProjection(actor, state => state.run?.status === 'indeterminate');
+  assert.equal(stopped.pendingApproval, null);
+  assert.equal(executions, 0);
+  const events = await readEvents(journal, sessionId);
+  const review = events.find(event => event.type === 'provider.turn.settled' && event.payload.purpose === 'approvalReview');
+  assert.equal(review.payload.providerRuntimeRef, 'provider-runtime:reviewer');
+  assert.equal(review.payload.outcome, 'indeterminate');
+  assert.equal(events.some(event => event.type === 'approval.resolved'), false);
+  assert.equal(preparation.released.length, 1);
 });
 
 test('delegated Plan confirmation records Agent authority without waiting for a user', async t => {
@@ -172,11 +371,13 @@ test('delegated Plan confirmation records Agent authority without waiting for a 
   assert.equal(events.some(event => event.type === 'run.waiting' && event.payload.reason === 'plan'), false);
 });
 
-for (const result of ['not JSON', '{"decision":"ask","reason":"Script contents are unknown."}']) test(`unresolved review retains a user decision: ${result}`, async t => {
+for (const result of ['not JSON', '{"decision":"ask","reason":"Script contents are unknown."}',
+  ...['allow', 'deny', 'ask'].map(decision => JSON.stringify({ decision: [decision], reason: 'Malformed decision type.' })),
+]) test(`unresolved review retains a user decision: ${result}`, async t => {
   const journal = new InMemoryCommandJournal(), sessionId = 'session:review-uncertain';
   await createSession(journal, sessionId, [workspaceBinding]);
   let executions = 0;
-  const prep = fakeRunPreparation({ tools: [shell], permissions: { 'agent.permissions.shell': 'review', 'agent.permissions.shellAccess': 'full' } });
+  const prep = reviewerPreparation({ tools: [shell], permissions: { 'agent.permissions.shell': 'review', 'agent.permissions.shellAccess': 'full' } });
   const actor = actorWith(journal, sessionId, { async *stream(request) {
     if (request.purpose === 'approvalReview') yield providerEvent(request.requestId, 'assistant.message', { content: result });
     else yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:script', name: 'bash', input: { workspace: 'primary', command: 'make check' } });
@@ -213,7 +414,7 @@ for (const nextMode of ['ask', 'allow']) test(`changing Shell to ${nextMode} dur
   const started = new Promise(resolve => { startReview = resolve; });
   const released = new Promise(resolve => { releaseReview = resolve; });
   let turns = 0, reviews = 0, executions = 0;
-  const preparation = fakeRunPreparation({ tools: [shell], permissions: { 'agent.permissions.shell': 'review', 'agent.permissions.shellAccess': 'full' } });
+  const preparation = reviewerPreparation({ tools: [shell], permissions: { 'agent.permissions.shell': 'review', 'agent.permissions.shellAccess': 'full' } });
   const actor = actorWith(journal, sessionId, { async *stream(request) {
     if (request.purpose === 'approvalReview') {
       reviews++; startReview(); await released;

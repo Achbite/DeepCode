@@ -86,6 +86,47 @@ pub(crate) fn network_failure(error: reqwest::Error, phase: &str, secret: Option
     })
 }
 
+/// A well-formed upstream failure is not a local protocol or network failure.
+/// Session retains its existing network-only retry policy.
+pub(crate) fn upstream_failure(
+    code: &str,
+    message: &str,
+    error: &Value,
+    retry_directive: Option<&str>,
+    secret: Option<&str>,
+) -> Value {
+    let mut details = serde_json::Map::new();
+    for (key, value) in [
+        ("code", error.get("code").and_then(Value::as_str)),
+        ("type", error.get("type").and_then(Value::as_str)),
+        (
+            "retryDirective",
+            retry_directive.or_else(|| {
+                error
+                    .pointer("/headers/x-retry-metadata")
+                    .and_then(Value::as_str)
+            }),
+        ),
+    ] {
+        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+            let value = safe_detail(value, secret);
+            if !value.trim().is_empty() {
+                details.insert(key.into(), json!(value));
+            }
+        }
+    }
+    let mut failure = json!({
+        "code": code,
+        "message": safe_detail(message, secret),
+        "diagnostics": {"source":"providerTransport", "phase":"response",
+            "category":"provider", "retryable":false, "causes":[]},
+    });
+    if !details.is_empty() {
+        failure["diagnostics"]["providerError"] = Value::Object(details);
+    }
+    failure
+}
+
 pub(crate) fn secondary_failure(mut primary: Value, code: &str, message: String) -> Value {
     if !primary["diagnostics"].is_object() {
         primary["diagnostics"] = json!({"source":"providerTransport", "phase":"archive",
@@ -124,6 +165,7 @@ pub(crate) fn valid_diagnostics(value: &Value) -> bool {
             "isBody",
             "stopReason",
             "archivePath",
+            "providerError",
             "secondary",
         ]
         .contains(&key.as_str())
@@ -137,6 +179,14 @@ pub(crate) fn valid_diagnostics(value: &Value) -> bool {
         && ["stopReason", "archivePath"]
             .iter()
             .all(|key| value.get(key).is_none_or(text))
+        && value.get("providerError").is_none_or(|details| {
+            details.as_object().is_some_and(|details| {
+                !details.is_empty()
+                    && details.iter().all(|(key, value)| {
+                        ["code", "type", "retryDirective"].contains(&key.as_str()) && text(value)
+                    })
+            })
+        })
         && value["causes"].as_array().is_some_and(|causes| {
             causes.len() <= 16
                 && causes.iter().all(|cause| {

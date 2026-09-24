@@ -770,18 +770,11 @@ impl LocalAgentKernel {
         match admission {
             Admission::ApprovalRequired => {
                 let mut preview = prepared.preview(&prepared.operation);
-                if is_shell_tool(&prepared.operation)
-                    || prepared.binding.container_adapter().is_some()
-                {
-                    preview["approvalReviewer"] = json!(if prepared.permissions.shell
-                        == ShellApprovalMode::Review
-                        && prepared.command_rule() != Some("ask")
-                    {
-                        "agent"
-                    } else {
-                        "user"
-                    });
-                }
+                preview["approvalReviewer"] = json!(if prepared.agent_can_review() {
+                    "agent"
+                } else {
+                    "user"
+                });
                 Ok(json!({
                 "schemaVersion": KERNEL_REPLY_VERSION,
                 "type": "tool.execution",
@@ -1066,13 +1059,14 @@ impl LocalAgentKernel {
         &self,
         request: &LocalToolExecutionRequest,
     ) -> Result<(), LocalAgentKernelError> {
-        let committed = self
-            .journal
-            .run_workspace_binding_ids(&request.session_id, &request.run_id)?;
-        if committed != request.workspace_bindings {
+        if !self.journal.has_workspace_binding_view(
+            &request.session_id,
+            &request.run_id,
+            &request.workspace_bindings,
+        )? {
             return Err(LocalAgentKernelError::new(
                 "session_workspace_snapshot_mismatch",
-                "Kernel 请求的 workspaceBindings 与当前 run 冻结快照不一致。",
+                "Kernel 请求的 workspaceBindings 不属于当前 run 已提交的资源视图。",
             ));
         }
         Ok(())
@@ -1416,12 +1410,9 @@ impl LocalAgentKernel {
 
         if is_shell_tool(&prepared.operation) && !prepared.is_host_process() {
             for scope in ["runNetwork", "sessionNetwork"] {
-                if let Some(authority) = self.execution_authority(
-                    request,
-                    &prepared,
-                    scope,
-                    &prepared.file_environment(),
-                )? {
+                if let Some(authority) =
+                    self.execution_authority(request, scope, &prepared.file_environment())?
+                {
                     prepared.network_authority = Some(authority);
                     break;
                 }
@@ -1577,9 +1568,7 @@ impl LocalAgentKernel {
             }
             if input.action == "exec" {
                 for scope in ["runContainer", "sessionContainer"] {
-                    if let Some(authority) =
-                        self.execution_authority(request, prepared, scope, target)?
-                    {
+                    if let Some(authority) = self.execution_authority(request, scope, target)? {
                         return Ok(Admission::Allowed(authority));
                     }
                 }
@@ -1686,17 +1675,15 @@ impl LocalAgentKernel {
     fn execution_authority(
         &self,
         request: &LocalToolExecutionRequest,
-        prepared: &PreparedEffect,
         scope: &str,
         context: &Value,
     ) -> Result<Option<Value>, LocalAgentKernelError> {
-        Ok(self
-            .journal
-            .execution_authority(&request.session_id, &request.run_id, scope, context)?
-            .filter(|authority| {
-                authority["source"] != "agent"
-                    || prepared.permissions.shell == ShellApprovalMode::Review
-            }))
+        Ok(self.journal.execution_authority(
+            &request.session_id,
+            &request.run_id,
+            scope,
+            context,
+        )?)
     }
 
     fn admit_shell(
@@ -1765,7 +1752,7 @@ impl LocalAgentKernel {
             } else {
                 context.clone()
             };
-            if let Some(authority) = self.execution_authority(request, prepared, scope, &binding)? {
+            if let Some(authority) = self.execution_authority(request, scope, &binding)? {
                 return Ok(Admission::Allowed(
                     json!({"decision":"allow","source":"composite","workspaceAuthority":workspace,"externalAuthority":authority}),
                 ));
@@ -1837,10 +1824,7 @@ impl LocalAgentKernel {
                 return Ok(None);
             }
             if source == "agent"
-                && (!(is_shell_tool(&prepared.operation)
-                    || prepared.binding.container_adapter().is_some())
-                    || prepared.permissions.shell != ShellApprovalMode::Review
-                    || prepared.command_rule().is_some_and(|rule| rule != "allow")
+                && (!prepared.agent_can_review()
                     || !self.journal.approval_has_review(
                         &request.session_id,
                         &authority.authority_id,
@@ -2315,6 +2299,12 @@ struct PreparedEffect {
 }
 
 impl PreparedEffect {
+    fn agent_can_review(&self) -> bool {
+        self.permissions.shell == ShellApprovalMode::Review
+            && self.operation != "computer.control"
+            && self.command_rule().is_none_or(|rule| rule == "allow")
+    }
+
     fn is_host_process(&self) -> bool {
         self.process_execution_scope.as_deref() == Some("host")
             || (self.binding.is_browser_service()
@@ -2359,7 +2349,17 @@ impl PreparedEffect {
             "summary": effect_summary(tool_name, &self.logical_targets, &self.canonical_invocation["arguments"]),
             "effects": process_effect_names(self),
             "logicalTargets": self.logical_targets,
+            "operation": {
+                "toolName": self.operation,
+                "arguments": self.canonical_invocation["arguments"],
+            },
         });
+        if let Some(root) = &self.workspace_root {
+            preview["operation"]["workspaceRoot"] = json!(root);
+        }
+        if let Some(scope) = &self.process_execution_scope {
+            preview["operation"]["executionScope"] = json!(scope);
+        }
         if self.binding.is_browser_page() {
             preview["authorizationScope"] = json!("sessionBrowser");
         }
@@ -3620,6 +3620,26 @@ mod attempt_control_tests {
             "The Agent cannot mint a reusable Host grant"
         );
         request.call_id = "call:reject".into();
+        let environment = effect.file_environment();
+        let user_files = json!({"read":["/tmp/user-approved.txt"]});
+        for (source, files) in [
+            ("agent", json!({"read":["/tmp/agent-approved.txt"]})),
+            ("user", user_files.clone()),
+        ] {
+            let approval_id = format!("approval:{source}-files");
+            kernel.journal.append(&json!({"type":"approval.requested","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+                "payload":{"approvalId":approval_id,"preview":{"authorizationScopes":["runFiles"],"authorizationContext":{"fileEnvironment":environment,"fileAccess":files}}}})).unwrap();
+            kernel.journal.append(&json!({"type":"approval.resolved","sessionId":request.session_id,"runId":request.run_id,"callId":request.call_id,
+                "payload":{"approvalId":approval_id,"commandId":format!("decision:{source}-files"),"decision":"allow","source":source,"authorityId":format!("authority:{source}-files"),"authorizationScope":"runFiles"}})).unwrap();
+        }
+        assert_eq!(
+            kernel
+                .journal
+                .file_authorizations(&request.session_id, &request.run_id, &environment)
+                .unwrap(),
+            vec![user_files],
+            "Only a user-granted file scope can be reused"
+        );
         kernel.journal.append(&json!({"type":"session.permissions.updated","sessionId":request.session_id,
             "payload":{"commandId":"command:delegate","patches":{"agent.permissions.shell":"review","agent.permissions.shellAccess":"full"}}})).unwrap();
         let reply = kernel.execute(request.clone()).unwrap();
@@ -3932,7 +3952,7 @@ mod attempt_control_tests {
             request.run_id = "run:next".into();
             assert_eq!(
                 kernel
-                    .execution_authority(&request, &second, scope, &second.file_environment())
+                    .execution_authority(&request, scope, &second.file_environment())
                     .unwrap()
                     .is_some(),
                 across_tasks
@@ -3940,7 +3960,7 @@ mod attempt_control_tests {
             kernel.journal.append(&json!({"type":"approval.revoked","sessionId":request.session_id,"runId":"run:reject",
                 "payload":{"commandId":"command:revoke-network","authorityId":"authority:network"}})).unwrap();
             assert!(kernel
-                .execution_authority(&request, &second, scope, &second.file_environment())
+                .execution_authority(&request, scope, &second.file_environment())
                 .unwrap()
                 .is_none());
         }
@@ -4230,9 +4250,26 @@ mod attempt_control_tests {
                     .unwrap();
                 let message: Value = serde_json::from_str(&line).unwrap();
                 let closed = message["input"]["previewId"] == "preview-closed";
+                let page_status = message["input"]["action"] == "status";
+                let host_status = message["input"]["action"] == "hostStatus";
                 incoming.lock().unwrap().push(message);
                 if closed {
                     stream.write_all(b"{\"ok\":false,\"message\":\"native_browser_page_closed: preview-closed\"}\n").unwrap();
+                } else if host_status {
+                    writeln!(
+                        stream,
+                        "{}",
+                        json!({"ok":true,"data":{
+                            "ready":true,"captureAvailable":true,"computerControlAvailable":true,
+                        }})
+                    )
+                    .unwrap();
+                } else if page_status {
+                    stream
+                        .write_all(
+                            b"{\"ok\":true,\"data\":{\"url\":\"file:///tmp/preview.html\"}}\n",
+                        )
+                        .unwrap();
                 } else {
                     stream.write_all(b"{\"ok\":true,\"data\":{}}\n").unwrap();
                 }
@@ -4303,7 +4340,7 @@ mod attempt_control_tests {
                 .iter()
                 .map(|call| call["input"]["action"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["activate", "act", "capture"]
+            ["act", "capture"]
         );
         assert!(calls
             .iter()
@@ -4324,6 +4361,32 @@ mod attempt_control_tests {
             before + 1,
             "a closed page stops the operation without selecting another page"
         );
+        let mut reload = request.clone();
+        reload.request_id = "request:reload-closed".into();
+        reload.call_id = "call:reload-closed".into();
+        reload.attempt_id = "attempt:reload-closed".into();
+        reload.input = json!({"action":"reload","previewId":"preview-closed"});
+        let before = received.lock().unwrap().len();
+        let rejected = kernel.execute(reload.clone()).unwrap();
+        assert_eq!(rejected["status"], "inputRejected");
+        assert_eq!(
+            rejected["rejection"]["error"]["code"],
+            "native_browser_failed"
+        );
+        assert_eq!(rejected["rejection"]["error"]["message"], error);
+        assert_eq!(
+            rejected["rejection"]["error"]["issues"][0]["path"],
+            "$.previewId"
+        );
+        assert!(kernel.records.read(&reload.call_id).unwrap().is_none());
+        let calls = received.lock().unwrap()[before..].to_vec();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["input"]["action"], "status");
+        reload.request_id = "request:reload-open".into();
+        reload.call_id = "call:reload-open".into();
+        reload.attempt_id = "attempt:reload-open".into();
+        reload.input["previewId"] = json!("preview-1");
+        assert_eq!(kernel.execute(reload).unwrap()["status"], "completed");
         struct SnapshotRoot(PathBuf);
         impl WorkspaceResolverPort for SnapshotRoot {
             fn resolve(&self, _: &str) -> Result<ResolvedWorkspace, LocalAgentKernelError> {
@@ -4372,6 +4435,13 @@ mod attempt_control_tests {
             .into();
         request.input = json!({"action":"start","directory":"/tmp","command":"node","args":[],"url":"http://127.0.0.1:3000"});
         let service = kernel.prepare_tool(&request).unwrap();
+        let mut delegated_service = service.clone();
+        delegated_service.permissions.shell = ShellApprovalMode::Review;
+        assert!(delegated_service.agent_can_review());
+        assert_eq!(
+            service.preview("browser.service")["operation"]["arguments"]["command"],
+            "node"
+        );
         assert!(matches!(
             kernel.admit(&request, &service).unwrap(),
             Admission::ApprovalRequired
@@ -4415,6 +4485,9 @@ mod attempt_control_tests {
             .into();
         request.input = json!({"action":"listApps"});
         let computer = kernel.prepare_tool(&request).unwrap();
+        let mut delegated_computer = computer.clone();
+        delegated_computer.permissions.shell = ShellApprovalMode::Review;
+        assert!(!delegated_computer.agent_can_review());
         assert!(matches!(
             kernel.admit(&request, &computer).unwrap(),
             Admission::ApprovalRequired
@@ -4553,11 +4626,39 @@ mod attempt_control_tests {
         std::fs::create_dir(&root).unwrap();
         let workspace = Arc::new(TestWorkspace(root));
         std::fs::write(workspace.0.join("README.md"), "source text").unwrap();
+        let missing_target = workspace.0.join("missing/nested/result.txt");
+        let expected = workspace
+            .0
+            .canonicalize()
+            .unwrap()
+            .join("missing/nested/result.txt");
+        assert_eq!(
+            deepcode_kernel_runtime::file_access::resolve_path(&missing_target).unwrap(),
+            expected
+        );
+        assert_eq!(
+            deepcode_kernel_runtime::workspace_boundary::WorkspaceBoundary::new(&workspace.0)
+                .resolve_read("missing/nested/result.txt")
+                .unwrap(),
+            expected
+        );
+        assert!(!workspace.0.join("missing").exists());
         let original_error = workspace
             .0
             .join("README.md/child")
             .canonicalize()
             .unwrap_err();
+        let absolute_error = deepcode_kernel_runtime::file_access::resolve_path(
+            &workspace.0.join("README.md/child"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            absolute_error,
+            deepcode_kernel_abi::KernelError::Other(_)
+        ));
+        assert!(absolute_error
+            .to_string()
+            .contains(&original_error.to_string()));
         let (kernel, request, _) = kernel_with_request(
             workspace.clone(),
             "fs.read",

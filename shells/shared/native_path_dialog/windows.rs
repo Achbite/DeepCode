@@ -11,13 +11,14 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Shell::{
     Common::COMDLG_FILTERSPEC, FileOpenDialog, IFileDialog, IFileDialogControlEvents,
     IFileDialogControlEvents_Impl, IFileDialogCustomize, IFileDialogEvents, IFileDialogEvents_Impl,
-    IFileOpenDialog, IShellItem, SHCreateItemFromParsingName, CDCS_ENABLED, CDCS_VISIBLE,
-    FDEOR_DEFAULT, FDESVR_DEFAULT, FDE_OVERWRITE_RESPONSE, FDE_SHAREVIOLATION_RESPONSE,
-    FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, SIGDN_FILESYSPATH,
+    IFileOpenDialog, IShellItem, IShellItemArray, SHCreateItemFromParsingName, CDCS_ENABLED,
+    CDCS_VISIBLE, FDEOR_DEFAULT, FDESVR_DEFAULT, FDE_OVERWRITE_RESPONSE,
+    FDE_SHAREVIOLATION_RESPONSE, FOS_ALLOWMULTISELECT, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST,
+    SIGDN_FILESYSPATH,
 };
 
 const SELECT_ITEM: u32 = 1;
-type Selection = Rc<RefCell<Option<windows::core::Result<PathBuf>>>>;
+type Selection = Rc<RefCell<Option<windows::core::Result<Vec<PathBuf>>>>>;
 
 struct ComApartment;
 impl Drop for ComApartment {
@@ -32,6 +33,14 @@ fn item_path(item: &IShellItem) -> windows::core::Result<PathBuf> {
         let value = path.to_string();
         CoTaskMemFree(Some(path.0.cast()));
         Ok(PathBuf::from(value?))
+    }
+}
+
+fn item_paths(items: &IShellItemArray) -> windows::core::Result<Vec<PathBuf>> {
+    unsafe {
+        (0..items.GetCount()?)
+            .map(|index| item_path(&items.GetItemAt(index)?))
+            .collect()
     }
 }
 
@@ -108,7 +117,7 @@ impl IFileDialogControlEvents_Impl for SelectionEvents_Impl {
             unsafe {
                 let result = (|| {
                     let items = dialog.GetSelectedItems()?;
-                    item_path(&items.GetItemAt(0)?)
+                    item_paths(&items)
                 })();
                 *self.selection.borrow_mut() = Some(result);
                 // Close does not publish GetResult; keep the actual selection above.
@@ -145,17 +154,20 @@ impl IFileDialogControlEvents_Impl for SelectionEvents_Impl {
 pub(super) fn pick(
     parent: &tauri::Window,
     options: &PathOptions,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<Vec<PathBuf>>, String> {
     unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
         .ok()
         .map_err(|error| error.to_string())?;
     let _apartment = ComApartment;
     let hwnd = parent.hwnd().map_err(|error| error.to_string())?;
-    let run = || -> windows::core::Result<Option<PathBuf>> {
+    let run = || -> windows::core::Result<Option<Vec<PathBuf>>> {
         unsafe {
             let dialog: IFileOpenDialog =
                 CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
             dialog.SetOptions(dialog.GetOptions()? | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST)?;
+            if options.multiple {
+                dialog.SetOptions(dialog.GetOptions()? | FOS_ALLOWMULTISELECT)?;
+            }
             dialog.SetTitle(&HSTRING::from(&options.title))?;
             if let Some(path) = &options.default_path {
                 let folder: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(path), None)?;
@@ -212,7 +224,7 @@ pub(super) fn pick(
                 return result.map(Some);
             }
             // The standard Open action (or double-click) confirmed a file.
-            item_path(&dialog.GetResult()?).map(Some)
+            item_paths(&dialog.GetResults()?).map(Some)
         }
     };
     run().map_err(|error| error.to_string())

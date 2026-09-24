@@ -98,11 +98,12 @@ impl ProductTools {
                     "limit":{"type":"integer","minimum":1,"maximum":50}
                 }
             })),
-            ("session.read", "Read persisted DeepCode conversation facts without resuming the session. Query directly; no prior Skill read is required. Start with summary; use messages, tools, plans or context for details. before is an exclusive event-sequence cursor; nextBefore continues older items. Excerpts report truncation. A session ID is required.".into(), json!({
+            ("session.read", "Read persisted DeepCode conversation facts without resuming the session. Query directly; no prior Skill read is required. Start with summary; use messages, tools, plans or context for details. view=images lists archived image references. To inspect images from the current session, pass imageIds with exact referenceId/artifactId values; their pixels enter the next visual input. Include all images needed for comparison. imageIds=[] releases current images. before is an exclusive event-sequence cursor; nextBefore continues older items. Excerpts report truncation. A session ID is required.".into(), json!({
                 "type":"object", "additionalProperties":false, "required":["sessionId"],
                 "properties": {
                     "sessionId":{"type":"string","description":"Exact complete ID from the user or DeepCode. Preserve it verbatim, including prefixes such as session:."},
-                    "view":{"type":"string","enum":["summary","messages","tools","plans","context","reasoning"]},
+                    "view":{"type":"string","enum":["summary","messages","tools","plans","context","reasoning","images"]},
+                    "imageIds":{"type":"array","maxItems":8,"uniqueItems":true,"items":{"type":"string","minLength":1},"description":"Requires view=images. Exact current-session image references to inspect together. Omit to list references; [] releases pixels. Do not combine with before or limit."},
                     "before":{"type":"integer","minimum":1},
                     "limit":{"type":"integer","minimum":1,"maximum":50},
                     "recordId":{"type":"string","description":"Exact ToolRecord ID; requires view=tools."},
@@ -118,9 +119,9 @@ impl ProductTools {
                     "path":{"type":"string","description":"SKILL.md or a reference path linked by that Skill."}
                 }
             })),
-            ("doc.read", "Read bundled DeepCode product documentation in English Markdown. Docs explain product behavior, configuration and known limitations; Skills describe task workflows. Available documents: operations.md, execution-environments.md, ui-plugins.md.".into(), json!({
+            ("doc.read", format!("Read bundled DeepCode product documentation in English Markdown. Docs explain product behavior, configuration and known limitations; Skills describe task workflows. Available documents: {}.", bundled_doc_names().collect::<Vec<_>>().join(", ")), json!({
                 "type":"object", "additionalProperties":false, "required":["name"],
-                "properties":{"name":{"type":"string","enum":["operations.md","execution-environments.md","ui-plugins.md"]}}
+                "properties":{"name":{"type":"string","enum":bundled_doc_names().collect::<Vec<_>>()}}
             })),
         ]
     }
@@ -165,6 +166,34 @@ const SKILLS: &[ProductSkill] = &[
         ],
     },
     ProductSkill {
+        id: "deepcode-iteration",
+        entry: include_str!("../../../skills/deepcode-iteration/SKILL.md"),
+        references: &[
+            (
+                "references/implementation-map.md",
+                include_str!("../../../skills/deepcode-iteration/references/implementation-map.md"),
+            ),
+            (
+                "references/update-modes.md",
+                include_str!("../../../skills/deepcode-iteration/references/update-modes.md"),
+            ),
+        ],
+    },
+    ProductSkill {
+        id: "deepcode-release-audit",
+        entry: include_str!("../../../skills/deepcode-release-audit/SKILL.md"),
+        references: &[
+            (
+                "references/simplification.md",
+                include_str!("../../../skills/deepcode-release-audit/references/simplification.md"),
+            ),
+            (
+                "references/product-docs.md",
+                include_str!("../../../skills/deepcode-release-audit/references/product-docs.md"),
+            ),
+        ],
+    },
+    ProductSkill {
         id: "deepcode-documents",
         entry: include_str!("../../../skills/deepcode-documents/SKILL.md"),
         references: &[
@@ -201,7 +230,15 @@ const DOCS: &[(&str, &str)] = &[
         "execution-environments.md",
         include_str!("../../../docs/product/execution-environments.md"),
     ),
+    (
+        "model-services.md",
+        include_str!("../../../docs/product/model-services.md"),
+    ),
 ];
+
+pub(crate) fn bundled_doc_names() -> impl Iterator<Item = &'static str> {
+    DOCS.iter().map(|(name, _)| *name)
+}
 
 fn read_doc(input: Value) -> Result<Value, SessionServiceError> {
     #[derive(serde::Deserialize)]
@@ -282,6 +319,42 @@ pub(crate) fn test_product_tools() -> Arc<ProductTools> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_product_docs_are_discoverable_and_readable() {
+        let tools = test_product_tools();
+        let definitions = ProductTools::definitions();
+        let (_, description, schema) = definitions
+            .iter()
+            .find(|(name, _, _)| *name == "doc.read")
+            .unwrap();
+        let names = schema["properties"]["name"]["enum"].as_array().unwrap();
+        assert!(names.contains(&json!("model-services.md")));
+        let catalog = crate::local_agent_plugins::plugin_catalog_projection(&json!({})).unwrap();
+        for name in names {
+            assert!(description.contains(name.as_str().unwrap()));
+            let reference = json!({"toolName":"doc.read", "name":name});
+            let item = catalog["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["reference"] == reference)
+                .unwrap();
+            assert_eq!(item["category"], "reference");
+            assert_eq!(item["discovery"], "searchOnly");
+            assert_eq!(item["available"], true);
+            let doc = tools.call("doc.read", json!({"name":name})).unwrap();
+            assert_eq!(doc["name"], *name);
+            assert_eq!(doc["mediaType"], "text/markdown");
+            assert!(doc["content"].as_str().unwrap().starts_with("# "));
+        }
+        let model_doc = tools
+            .call("doc.read", json!({"name":"model-services.md"}))
+            .unwrap();
+        assert!(model_doc["content"].as_str().unwrap().contains("## Usage"));
+        assert!(tools.computer_use_instance.is_none());
+    }
+
     #[test]
     fn plugin_search_discovers_capabilities_without_loading_tools() {
         let tools = test_product_tools();
@@ -318,7 +391,6 @@ mod tests {
         assert!(tools
             .call("doc.read", json!({"name":"../../private.md"}))
             .is_err());
-        assert_eq!(bundled_skill_settings().len(), 3);
         assert!(tools
             .call("doc.read", json!({"name":"ui-plugins.md"}))
             .unwrap()["content"]
@@ -340,5 +412,63 @@ mod tests {
             assert_eq!(resource["path"], path);
             assert!(!resource["content"].as_str().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn development_skills_are_discoverable_read_only_references() {
+        let tools = test_product_tools();
+        let definitions = ProductTools::definitions();
+        let (_, _, schema) = definitions
+            .iter()
+            .find(|(name, _, _)| *name == "skill.read")
+            .unwrap();
+        let names = schema["properties"]["name"]["enum"].as_array().unwrap();
+        let catalog = crate::local_agent_plugins::plugin_catalog_projection(&json!({})).unwrap();
+        for (name, references) in [
+            (
+                "deepcode-iteration",
+                [
+                    "references/implementation-map.md",
+                    "references/update-modes.md",
+                ],
+            ),
+            (
+                "deepcode-release-audit",
+                ["references/simplification.md", "references/product-docs.md"],
+            ),
+        ] {
+            assert!(names.contains(&json!(name)));
+            let uri = format!("plugin://{name}@builtin");
+            let entry = catalog["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|plugin| plugin["uri"] == uri)
+                .unwrap();
+            assert_eq!(entry["source"], "builtin");
+            assert_eq!(entry["contributionKind"], "skill");
+            assert_eq!(entry["category"], "reference");
+            assert_eq!(entry["discovery"], "searchOnly");
+            assert_eq!(entry["enabled"], true);
+            assert_eq!(entry["available"], true);
+            assert_eq!(
+                entry["reference"],
+                json!({"toolName":"skill.read", "name":name})
+            );
+            let skill = tools.call("skill.read", json!({"name":name})).unwrap();
+            assert_eq!(skill["name"], name);
+            assert_eq!(skill["path"], "SKILL.md");
+            assert!(!skill["content"].as_str().unwrap().is_empty());
+            for path in references {
+                let resource = tools
+                    .call("skill.read", json!({"name":name, "path":path}))
+                    .unwrap();
+                assert_eq!(resource["path"], path);
+                assert!(!resource["content"].as_str().unwrap().is_empty());
+            }
+        }
+        assert!(tools.computer_use_instance.is_none());
+        assert!(tools.container_instance.is_none());
+        assert!(tools.process_instance.is_none());
     }
 }

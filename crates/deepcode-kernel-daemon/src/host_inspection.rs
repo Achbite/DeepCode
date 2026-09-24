@@ -110,7 +110,11 @@ pub(crate) fn resolve_workspace_read_path(
     }
     let target = root.join(path).canonicalize().map_err(|error| {
         host_error(
-            "host_inspection_path_unavailable",
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "host_inspection_path_not_found"
+            } else {
+                "host_inspection_path_unavailable"
+            },
             format!("canonicalize {}: {error}", root.join(path).display()),
         )
     })?;

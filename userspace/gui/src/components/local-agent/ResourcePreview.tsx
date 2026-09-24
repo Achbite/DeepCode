@@ -1,3 +1,5 @@
+import { readDocumentText } from './documentResources';
+import { UiRegion } from '../../ui-plugins/UiRegion';
 import { ResourceTree } from './ResourceTree';
 import { FileChangePreview } from './FileChanges';
 import { resourceKey, type ResourceReference } from '../../services/conversationResources';
@@ -16,7 +18,7 @@ import {
   type ConversationResourceReadResult,
 } from '../../services/localAgentApi';
 import { documentFormat, type DocumentFormat } from './documentResources';
-import { READER_OPEN_EVENT, readViewState, saveViewState, type ReaderTarget, readerTargetKey as targetKey } from './readerState';
+import { READER_OPEN_EVENT, readViewState, saveViewState, reconcileReaderPages, type ReaderViewState, type ReaderTab, type ResolvedReaderTarget, type ReaderTarget, readerTargetKey as targetKey } from './readerState';
 import { NativeBrowserPreview } from './NativeBrowserPreview';
 import {
   hasNativeBrowser,
@@ -24,6 +26,7 @@ import {
   nativeBrowserCommand,
   nativeHostBinding,
   nativeNavigationInput,
+  watchNativePages,
   type NativeHostBinding,
   type NativePage,
 } from '../../services/nativeBrowser';
@@ -36,9 +39,6 @@ const DocumentPreview = lazy(() =>
   loadInterfaceModule(() => import('./DocumentPreview').then((module) => ({ default: module.DocumentPreview }))),
 );
 const SourceFileView = lazy(() => loadInterfaceModule(() => import('./SourceFileView')));
-type ResolvedReaderTarget = Exclude<ReaderTarget, { kind: 'browser' }>
-  | (Extract<ReaderTarget, { kind: 'browser' }> & { previewId: string });
-type ReaderTab = { id: string; target: ResolvedReaderTarget; page?: NativePage };
 type DocumentState =
   | { status: 'loading' }
   | { status: 'document'; blob: Blob; format: DocumentFormat | 'image' }
@@ -82,13 +82,7 @@ function tabName(tab: ReaderTab, language: UiLanguage): string {
 /** View state owns open tabs; a collapsed panel keeps their content and native pages mounted. */
 export function useResourcePreview(sessionId: string | null) {
   const host = useConversationHost();
-  const [state, setState] = useState<{
-    sessionId: string | null;
-    tabs: ReaderTab[];
-    activeId: string | null;
-    visible: boolean;
-    expanded: boolean;
-  }>({ sessionId, tabs: [], activeId: null, visible: false, expanded: false });
+  const [state, setState] = useState<ReaderViewState>({ sessionId, tabs: [], activeId: null, visible: false, expanded: false });
   useInterfaceReloadView('reader', { ...state, tabs: state.tabs.map(tab => tab.page ? { ...tab, target: { kind: 'browser', previewId: tab.page.previewId } } : tab) });
   const [treeVisible, setTreeVisible] = useState(() => readViewState('file-tree', true));
   const [width, setWidth] = useState(() => readViewState('panel-width', 55));
@@ -167,23 +161,39 @@ export function useResourcePreview(sessionId: string | null) {
   useEffect(() => {
     if (!sessionId || !hasNativeBrowser()) return;
     let ended = false;
-    let unlisten: (() => void) | undefined;
-    void listenNativeActivation((page) => {
-      if (ended || page.sessionId !== sessionId) return;
-      openTarget({ kind: 'browser', previewId: page.previewId });
-    })
-      .then((dispose) => {
-        if (ended) dispose();
-        else unlisten = dispose;
-      })
-      .catch((reason) => {
-        if (!ended) setError(String(reason));
+    let dispose: (() => void) | undefined;
+    let savedSelection = readViewState<ReaderTarget | null>(sessionId + ':selection', null);
+    void (async () => {
+      const binding = await nativeHostBinding();
+      if (ended || !binding) return;
+      dispose = await watchNativePages({ ...binding, sessionId }, pages => {
+        if (ended) return;
+        const selection = savedSelection;
+        savedSelection = null;
+        setState(current => current.sessionId === sessionId ? reconcileReaderPages(current, pages, selection) : current);
       });
-    return () => {
-      ended = true;
-      unlisten?.();
-    };
-  }, [sessionId, openTarget]);
+      if (ended) dispose();
+    })().catch(reason => { if (!ended) setError(String(reason)); });
+    return () => { ended = true; dispose?.(); };
+  }, [sessionId]);
+  const activationTarget = useRef(openTarget); activationTarget.current = openTarget;
+  useEffect(() => {
+    if (!hasNativeBrowser()) return;
+    let ended = false;
+    let unlisten: (() => void) | undefined;
+    void listenNativeActivation(page => {
+      if (ended) return;
+      if (page.sessionId !== currentSession.current) {
+        void nativeBrowserCommand(page, { action: 'activationResult', previewId: page.previewId,
+          activationId: page.surface.activationId, reason: 'sessionNotSelected' }).catch(reason => setError(String(reason)));
+        return;
+      }
+      activationTarget.current({ kind: 'browser', previewId: page.previewId });
+      window.dispatchEvent(new CustomEvent('deepcode:browser-layout', { detail: page }));
+    }).then(dispose => { if (ended) dispose(); else unlisten = dispose; })
+      .catch(reason => { if (!ended) setError(String(reason)); });
+    return () => { ended = true; unlisten?.(); };
+  }, []);
   const openWorkspaceResource = async (workspaceId: string, logicalPath: string, position?: SourcePosition) => {
     if (!sessionId) return;
     const resource = await host.resolveResource(sessionId, workspaceId, logicalPath);
@@ -289,6 +299,10 @@ export function ResourcePreview({
   onReview?: (annotation: BrowserAnnotation, previewId: string, screenshot?: string) => void;
 }) {
   const chinese = language === 'zh-CN';
+  const readerData = { kind: 'reader' as const, tabs: preview.tabs.map(tab => ({ id: tab.id, title: tabName(tab, language) })),
+    activeId: preview.activeId, visible: preview.visible, expanded: preview.expanded, treeVisible: preview.treeVisible };
+  const readerActions = { toggleTree: preview.toggleTree, toggleReaderExpanded: preview.expand,
+    selectReaderTab: (id: string) => { if (preview.tabs.some(tab => tab.id === id)) preview.selectTab(id); } };
   const tabsId = useId();
   const resizeHandle = useRef<HTMLDivElement | null>(null);
   const resizePointer = useRef<number | null>(null);
@@ -410,8 +424,8 @@ export function ResourcePreview({
             {preview.error}
           </p>
         )}
-        <ReaderFileHeader sessionId={preview.sessionId} target={preview.tabs.find(tab => tab.id === preview.activeId)?.target} language={language} treeVisible={preview.treeVisible} />
-        <div className="reader-workspace">
+        <UiRegion slot="reader.toolbar" data={readerData} actions={readerActions}><ReaderFileHeader sessionId={preview.sessionId} target={preview.tabs.find(tab => tab.id === preview.activeId)?.target} language={language} treeVisible={preview.treeVisible} /></UiRegion>
+        <div className="reader-workspace"><UiRegion slot="reader.layout" data={readerData} actions={readerActions}>
         <div className="reader-panes">
           {preview.tabs.map((tab, index) => (
             <div
@@ -448,14 +462,14 @@ export function ResourcePreview({
           ))}
           {preview.activeId === null && preview.sessionId && (
             <ReaderStart
-              sessionId={preview.sessionId}
               language={language}
               openTarget={preview.openTarget}
+              pages={preview.tabs.flatMap(tab => tab.page ? [tab.page] : [])}
             />
           )}
         </div>
-        {preview.visible && preview.treeVisible && preview.sessionId && <ResourceTree key={preview.sessionId} sessionId={preview.sessionId} language={language} openTarget={preview.openTarget} />}
-        </div>
+        {preview.sessionId && <ResourceTree key={preview.sessionId} sessionId={preview.sessionId} visible={preview.visible && preview.treeVisible} activeTarget={preview.tabs.find(tab => tab.id === preview.activeId)?.target} language={language} openTarget={preview.openTarget} />}
+        </UiRegion></div>
       </aside>
     </>
   );
@@ -482,38 +496,20 @@ export function ReaderControls({ language, preview, disabled }: {
 }
 
 function ReaderStart({
-  sessionId,
   language,
   openTarget,
+  pages,
 }: {
-  sessionId: string;
   language: UiLanguage;
   openTarget(target: ReaderTarget): void;
+  pages: NativePage[];
 }) {
   const addressId = useId();
   const browserButton = useRef<HTMLButtonElement>(null);
   const [enteringAddress, setEnteringAddress] = useState(false);
   const [url, setUrl] = useState(''),
-    [pages, setPages] = useState<NativePage[]>([]),
     [error, setError] = useState<string | null>(null),
     [choosing, setChoosing] = useState<'file' | 'browser' | null>(null);
-  useEffect(() => {
-    let active = true;
-    void (async () => {
-      const binding = await nativeHostBinding();
-      if (!binding) return;
-      const result = await nativeBrowserCommand<{ pages: NativePage[] }>(
-        { ...binding, sessionId },
-        { action: 'list' },
-      );
-      if (active) setPages(result.pages.filter((page) => page.status !== 'closed' && page.kind !== 'deepcode'));
-    })().catch((reason) => {
-      if (active) setError(String(reason));
-    });
-    return () => {
-      active = false;
-    };
-  }, [sessionId]);
   return (
     <div className="reader-start">
       {hasNativeBrowser() ? (
@@ -665,12 +661,12 @@ function ReaderDocument({
       if (target.kind === 'file') {
         if (!host.readLocalFile) throw new Error('Local file reading requires the desktop Host.');
         const blob = await host.readLocalFile(target.path);
-        if (/\.pdf$/i.test(path)) {
+        if (documentFormat(path)) {
           const header = await blob.slice(0, 5).text();
-          if (header !== '%PDF-') throw new Error('当前文件不是 PDF 文档。');
-          if (!controller.signal.aborted) setState({ status: 'document', blob, format: 'pdf' });
+          if (documentFormat(path) === 'pdf' && header !== '%PDF-') throw new Error('当前文件不是 PDF 文档。');
+          if (!controller.signal.aborted) setState({ status: 'document', blob, format: documentFormat(path)! });
         } else {
-          const content = await readLiteralText(blob);
+          const content = await readDocumentText(blob);
           if (!controller.signal.aborted) setState({ status: 'source', content });
         }
         return;
@@ -687,8 +683,8 @@ function ReaderDocument({
               : a.contentType === 'text/markdown'
                 ? 'markdown'
                 : null;
-        if (format === 'markdown' || format === 'html' || a.contentType.startsWith('text/') || a.contentType === 'application/json') {
-          const content = await readLiteralText(blob);
+        if (!format && (a.contentType.startsWith('text/') || a.contentType === 'application/json')) {
+          const content = await readDocumentText(blob);
           if (!controller.signal.aborted) setState({ status: 'source', content });
           return;
         }
@@ -700,7 +696,7 @@ function ReaderDocument({
       if (startByte === undefined && /\.(png|jpe?g|gif|webp|svg|bmp)$/i.test(path)) {
         const blob = await host.resources.readResourceBlob(sessionId, reference!, 'image', controller.signal);
         if (!controller.signal.aborted) setState({ status: 'document', blob, format: 'image' });
-      } else if (format === 'pdf') {
+      } else if (format) {
         const blob = await host.resources.readResourceBlob(sessionId, reference!, 'document', controller.signal);
         if (!controller.signal.aborted) setState({ status: 'document', blob, format });
       } else {
@@ -888,12 +884,4 @@ function ReaderFileHeader({ sessionId, target, language, treeVisible }: {
     </div>
     {error && <p role="alert" className="local-agent__resource-error">{error}</p>}
   </>;
-}
-
-async function readLiteralText(blob: Blob): Promise<string> {
-  const bytes = new Uint8Array(await blob.arrayBuffer());
-  const encoding = bytes[0] === 0xff && bytes[1] === 0xfe ? 'utf-16le' : bytes[0] === 0xfe && bytes[1] === 0xff ? 'utf-16be' : 'utf-8';
-  const content = new TextDecoder(encoding, { fatal: true }).decode(bytes);
-  if (content.includes('\0')) throw new Error('file_encoding_unsupported: 当前文件不是支持的文本文件。');
-  return content;
 }

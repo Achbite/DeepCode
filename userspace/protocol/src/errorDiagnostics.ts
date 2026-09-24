@@ -6,12 +6,15 @@ const text = (value: unknown): value is string => typeof value === 'string' && B
 export function isErrorDiagnostics(value: unknown): value is ErrorDiagnostics {
   if (!object(value) || !['source', 'phase', 'category'].every((key) => text(value[key]))
     || typeof value.retryable !== 'boolean' || !Array.isArray(value.causes) || value.causes.length > 16) return false;
-  if (Object.keys(value).some((key) => !['source', 'phase', 'category', 'retryable', 'causes', 'isConnect', 'isTimeout', 'isBody', 'stopReason', 'archivePath', 'secondary'].includes(key))) return false;
+  if (Object.keys(value).some((key) => !['source', 'phase', 'category', 'retryable', 'causes', 'isConnect', 'isTimeout', 'isBody', 'stopReason', 'archivePath', 'providerError', 'secondary'].includes(key))) return false;
   return value.causes.every((cause) => object(cause) && text(cause.message)
     && Object.keys(cause).every((key) => ['message', 'kind', 'osCode'].includes(key))
     && (cause.kind === undefined || text(cause.kind)) && (cause.osCode === undefined || Number.isSafeInteger(cause.osCode)))
     && ['isConnect', 'isTimeout', 'isBody'].every((key) => value[key] === undefined || typeof value[key] === 'boolean')
     && ['stopReason', 'archivePath'].every((key) => value[key] === undefined || text(value[key]))
+    && (value.providerError === undefined || object(value.providerError)
+      && Object.keys(value.providerError).length > 0
+      && Object.entries(value.providerError).every(([key, entry]) => ['code', 'type', 'retryDirective'].includes(key) && text(entry)))
     && (value.secondary === undefined || Array.isArray(value.secondary) && value.secondary.length <= 16
       && value.secondary.every((entry) => object(entry) && Object.keys(entry).length === 2 && text(entry.code) && text(entry.message)));
 }

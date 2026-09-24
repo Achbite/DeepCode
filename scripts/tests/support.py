@@ -136,11 +136,11 @@ class OwnedDaemon:
             token=self.token,
             method="POST",
             body={"expectedIdentity": self.identity},
-            timeout=15,
+            timeout=90,
         )
         require(isinstance(receipt, dict), "shutdown receipt 不是对象")
         require(receipt.get("accepted") is True, "Daemon 未接受 shutdown")
-        require(receipt.get("cleanupComplete") is True, "Daemon 资源未完整清理")
+        require(receipt.get("cleanupComplete") is True, f"Daemon 资源未完整清理：{receipt}")
         require(receipt.get("identity") == self.identity, "shutdown identity 漂移")
         try:
             code = self.process.wait(timeout=10)
@@ -171,8 +171,14 @@ class OwnedDaemon:
                 self.process.wait(timeout=3)
 
     def close(self) -> None:
-        self.terminate_group()
-        self.log_file.close()
+        try:
+            if self.identity is not None and self.process is not None and self.process.poll() is None:
+                self.shutdown()
+        finally:
+            try:
+                self.terminate_group()
+            finally:
+                self.log_file.close()
 
     def log_tail(self) -> str:
         self.log_file.flush()
@@ -421,11 +427,13 @@ class ProviderState:
         return ordinal, names, results
 
 
-def cli(daemon: Any, session_id: str, text: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
+def cli(daemon: Any, session_id: str, text: str, expected: int = 0, *, run_timeout_seconds: int = 15) -> subprocess.CompletedProcess[str]:
+    environment = shell_environment(daemon)
+    environment["DEEPCODE_CLI_RUN_TIMEOUT_MS"] = str(run_timeout_seconds * 1000)
     result = subprocess.run([
         str(CLI_BINARY), "--api", daemon.base_url, "--no-auto-start-kernel",
         "--session", session_id, "--plain", "ask", text,
-    ], cwd=ROOT, env=shell_environment(daemon), capture_output=True, text=True, timeout=45)
+    ], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=run_timeout_seconds + 30)
     require(result.returncode == expected, f"CLI 退出 {result.returncode}，预期 {expected}\n{result.stdout}\n{result.stderr}")
     return result
 

@@ -1,3 +1,4 @@
+import { UiRegion } from '../../ui-plugins/UiRegion';
 import React, { useEffect, useRef } from 'react';
 import type { PlanOperation, PlanProjection, WorkspaceBindingDisplay } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
@@ -43,7 +44,7 @@ const PlanCard: React.FC<PlanCardProps> = ({
   const addition = planScopeAddition(previousPlan, plan);
   const stepCount = t(language, 'agent.plan.stepCount', { count: plan.steps.length });
 
-  if (addition) return <article ref={cardRef} className="local-agent__tool-entry">
+  if (addition) return <UiRegion slot="activity.row" actions={{ setExpanded: toggle }}><article ref={cardRef} className="local-agent__tool-entry">
     <button type="button" className="local-agent__tool-entry-heading" aria-expanded={expanded}
       onClick={() => toggle(!expanded)}>
       <DeepCodeShellIcon name="compose" />
@@ -52,7 +53,7 @@ const PlanCard: React.FC<PlanCardProps> = ({
       <span className="local-agent__tool-entry-chevron" aria-hidden="true"><DeepCodeShellIcon name="chevronRight" /></span>
     </button>
     {expanded && <PlanCardContent plan={plan} previousPlan={previousPlan} workspaceBindings={workspaceBindings} language={language} />}
-  </article>;
+  </article></UiRegion>;
 
   return (
     <article ref={cardRef} className={`local-agent__plan-card local-agent__plan-card--${plan.status}`}>

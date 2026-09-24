@@ -11,8 +11,10 @@ A Plan describes intended changes, scope and validation. Once confirmed, command
 
 Use Todo for multi-step work when it helps. Keep phases few and meaningful, merging related work; choose a count suited to the task. `todo.update` replaces the complete ordered list of descriptions and statuses without requiring a Plan or ToolRecord IDs. Skip trivial or unchanged updates. Progress neither grants tool permission nor gates the final answer; retain the actual status of unfinished or blocked work.
 
-For product behavior and configuration, use `doc.read` with `name="operations.md"` or `name="execution-environments.md"`. Product docs are English Markdown and are separate from this workflow Skill.
+For product behavior and configuration, use `doc.read` with `name="operations.md"` or `name="execution-environments.md"`. Use `name="model-services.md"` for connections, models, Coding Plans, image input and usage pricing. Product docs are English Markdown and are separate from this workflow Skill.
 
 For UI display plugins and hot replacement, read `doc.read` with `name="ui-plugins.md"`. Write against the documented display slots and lifecycle; adding files does not activate a plugin. The user selects the plugin folder in Settings. Do not expose or replace the Agent Loop or underlying tools through a display plugin.
+
+For developing DeepCode itself, read `deepcode-iteration` through `skill.read` when its workflow is relevant. For requested release preparation, code simplification or README/product documentation synchronization, read `deepcode-release-audit`. These Skills guide the requested work; reading them does not approve execution, confirm a Plan or authorize publication.
 
 For Windows shell selection, missing developer tools and platform differences, read [references/windows-environment.md](references/windows-environment.md).

@@ -376,15 +376,117 @@ impl LocalAgentJournal {
             .collect())
     }
 
+    /// Resource identities frozen in one Provider request, checked against admitted file inputs.
+    pub(crate) fn provider_workspace_binding_ids(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        provider_request_id: &str,
+    ) -> Result<Vec<String>, LocalAgentStoreError> {
+        let mut expected = self.run_workspace_binding_ids(session_id, run_id)?;
+        let connection = self.lock()?;
+        let (sequence, encoded): (i64, String) = connection
+            .query_row(
+                "SELECT sequence, payload_json FROM session_events
+             WHERE session_id=?1 AND run_id=?2 AND event_type='context.composed'
+             AND json_extract(payload_json, '$.providerRequestId')=?3",
+                params![session_id, run_id, provider_request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sql_error("session_request_workspace_read_failed"))?
+            .ok_or_else(|| {
+                LocalAgentStoreError::new(
+                    "session_request_workspace_missing",
+                    "Provider 请求缺少已提交的资源视图。",
+                )
+            })?;
+        let mut statement = connection
+            .prepare(
+                "SELECT payload_json FROM session_events WHERE session_id=?1 AND run_id=?2
+             AND event_type='message.committed' AND sequence<?3
+             AND json_extract(payload_json, '$.role')='user' ORDER BY sequence",
+            )
+            .map_err(sql_error("session_input_resources_read_failed"))?;
+        let inputs = statement
+            .query_map(params![session_id, run_id, sequence], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sql_error("session_input_resources_read_failed"))?;
+        for input in inputs {
+            let input = decode_json(
+                &input.map_err(sql_error("session_input_resources_read_failed"))?,
+                "session_input_resources_invalid",
+            )?;
+            if let Some(references) = input["filesystemReferences"].as_array() {
+                for reference in references
+                    .iter()
+                    .filter(|reference| reference["kind"] == "file")
+                {
+                    let id = required_string(reference, "workspaceId")?.to_string();
+                    if !expected.contains(&id) {
+                        expected.push(id);
+                    }
+                }
+            }
+        }
+        let receipt = decode_json(&encoded, "session_request_workspace_invalid")?;
+        let bindings = receipt["workspaceBindings"].as_array().ok_or_else(|| {
+            LocalAgentStoreError::new("session_request_workspace_invalid", "请求资源视图无效。")
+        })?;
+        let actual = bindings
+            .iter()
+            .map(|binding| required_string(binding, "itemId").map(str::to_owned))
+            .collect::<Result<Vec<_>, _>>()?;
+        if actual != expected {
+            return Err(LocalAgentStoreError::new(
+                "session_request_workspace_mismatch",
+                "请求资源视图与项目目录及已接纳的文件快照不一致。",
+            ));
+        }
+        Ok(actual)
+    }
+
+    /// The original run scope and each committed request scope remain valid independently.
+    pub(crate) fn has_workspace_binding_view(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        bindings: &[String],
+    ) -> Result<bool, LocalAgentStoreError> {
+        if self.run_workspace_binding_ids(session_id, run_id)? == bindings {
+            return Ok(true);
+        }
+        let request_ids = {
+            let connection = self.lock()?;
+            let mut statement = connection.prepare(
+                "SELECT json_extract(payload_json, '$.providerRequestId') FROM session_events
+                 WHERE session_id=?1 AND run_id=?2 AND event_type='context.composed' ORDER BY sequence DESC",
+            ).map_err(sql_error("session_request_workspace_read_failed"))?;
+            let rows = statement
+                .query_map(params![session_id, run_id], |row| row.get::<_, String>(0))
+                .map_err(sql_error("session_request_workspace_read_failed"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(sql_error("session_request_workspace_read_failed"))?
+        };
+        for request_id in request_ids {
+            if self.provider_workspace_binding_ids(session_id, run_id, &request_id)? == bindings {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn run_provider_runtime(
         &self,
         session_id: &str,
         run_id: &str,
+        purpose: &str,
     ) -> Result<RunProviderRuntime, LocalAgentStoreError> {
         validate_id("sessionId", session_id)?;
         validate_id("runId", run_id)?;
         let connection = self.lock()?;
-        run_provider_runtime_from_connection(&connection, session_id, run_id)
+        run_provider_runtime_from_connection(&connection, session_id, run_id, purpose)
     }
 
     pub(crate) fn run_is_settled(
@@ -591,15 +693,14 @@ impl LocalAgentJournal {
         session_id: &str,
         run_id: &str,
         environment: &Value,
-        allow_delegated: bool,
     ) -> Result<Vec<Value>, LocalAgentStoreError> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT requested.payload_json, resolved.payload_json FROM session_events resolved
+            "SELECT requested.payload_json FROM session_events resolved
              JOIN session_events requested ON requested.session_id=resolved.session_id AND requested.run_id=resolved.run_id AND requested.call_id=resolved.call_id
                AND requested.event_type='approval.requested' AND json_extract(requested.payload_json,'$.approvalId')=json_extract(resolved.payload_json,'$.approvalId')
              WHERE resolved.session_id=?1 AND resolved.event_type='approval.resolved'
-               AND json_extract(resolved.payload_json,'$.decision')='allow' AND (json_extract(resolved.payload_json,'$.source')='user' OR (?3=1 AND json_extract(resolved.payload_json,'$.source')='agent'))
+               AND json_extract(resolved.payload_json,'$.decision')='allow' AND json_extract(resolved.payload_json,'$.source')='user'
                AND (json_extract(resolved.payload_json,'$.authorizationScope')='sessionFiles'
                  OR (resolved.run_id=?2 AND json_extract(resolved.payload_json,'$.authorizationScope')='runFiles'))
                AND EXISTS (SELECT 1 FROM json_each(json_extract(requested.payload_json,'$.preview.authorizationScopes')) scope
@@ -608,28 +709,12 @@ impl LocalAgentJournal {
                    AND json_extract(revoked.payload_json,'$.authorityId')=json_extract(resolved.payload_json,'$.authorityId'))"
         ).map_err(sql_error("file_authority_read_failed"))?;
         let rows = statement
-            .query_map(params![session_id, run_id, allow_delegated], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
+            .query_map(params![session_id, run_id], |row| row.get::<_, String>(0))
             .map_err(sql_error("file_authority_read_failed"))?;
         let mut grants = Vec::new();
-        let entries = rows
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(sql_error("file_authority_read_failed"))?;
-        drop(statement);
-        drop(connection);
-        for (requested, resolved) in entries {
+        for row in rows {
+            let requested = row.map_err(sql_error("file_authority_read_failed"))?;
             let requested = decode_json(&requested, "file_authority_corrupt")?;
-            let resolved = decode_json(&resolved, "file_authority_corrupt")?;
-            if resolved["source"] == "agent"
-                && !self.approval_has_review(
-                    session_id,
-                    required_string(&resolved, "authorityId")?,
-                    "allow",
-                )?
-            {
-                continue;
-            }
             let context = &requested["preview"]["authorizationContext"];
             if context["fileEnvironment"] == *environment {
                 grants.push(context["fileAccess"].clone());
@@ -692,7 +777,7 @@ impl LocalAgentJournal {
             JOIN session_events requested ON requested.session_id=review.session_id AND requested.run_id=review.run_id AND requested.call_id=review.call_id AND requested.sequence<review.sequence AND requested.event_type='approval.requested' AND json_extract(requested.payload_json, '$.approvalId')=json_extract(review.payload_json, '$.approvalId')
             JOIN session_events provider ON provider.session_id=review.session_id AND provider.run_id=review.run_id AND provider.sequence<review.sequence AND provider.event_type='provider.turn.settled' AND json_extract(provider.payload_json, '$.providerRequestId')=json_extract(review.payload_json, '$.providerRequestId')
             WHERE resolved.session_id=?1 AND resolved.event_type='approval.resolved' AND json_extract(resolved.payload_json, '$.authorityId')=?2
-              AND (json_extract(resolved.payload_json, '$.authorizationScope') IS NULL OR (json_extract(resolved.payload_json, '$.authorizationScope')=json_extract(requested.payload_json, '$.preview.authorizationScope') AND EXISTS (SELECT 1 FROM json_each(json_extract(requested.payload_json,'$.preview.authorizationScopes')) scope WHERE scope.value=json_extract(resolved.payload_json,'$.authorizationScope'))))
+              AND json_extract(resolved.payload_json, '$.authorizationScope') IS NULL
               AND json_extract(requested.payload_json, '$.preview.approvalReviewer')='agent'
               AND json_extract(review.payload_json, '$.decision')=?3 AND json_extract(provider.payload_json, '$.purpose')='approvalReview' AND json_extract(provider.payload_json, '$.outcome')='completed')",
             params![session_id, authority_id, decision], |row| row.get(0)).map_err(sql_error("approval_review_read_failed"))
@@ -708,7 +793,7 @@ impl LocalAgentJournal {
             params![session_id, authority_id], |row| row.get(0)).map_err(sql_error("approval_authority_fact_read_failed"))
     }
 
-    /// Reuse the committed scope in its task or session, against the prepared environment.
+    /// Reuse a user-granted scope in its task or session, against the prepared environment.
     pub(crate) fn execution_authority(
         &self,
         session_id: &str,
@@ -726,6 +811,7 @@ impl LocalAgentJournal {
                AND requested.event_type='approval.requested'
                AND json_extract(requested.payload_json, '$.approvalId')=json_extract(resolved.payload_json, '$.approvalId')
              WHERE resolved.session_id=?1 AND (resolved.run_id=?2 OR ?4=1) AND resolved.event_type='approval.resolved'
+               AND COALESCE(json_extract(resolved.payload_json, '$.source'), 'user')='user'
                AND json_extract(resolved.payload_json, '$.authorizationScope')=?3
                AND NOT EXISTS (SELECT 1 FROM session_events revoked WHERE revoked.session_id=resolved.session_id AND revoked.run_id=resolved.run_id AND revoked.event_type='approval.revoked' AND json_extract(revoked.payload_json, '$.authorityId')=json_extract(resolved.payload_json, '$.authorityId'))
                AND NOT EXISTS (SELECT 1 FROM session_events changed, json_each(json_extract(changed.payload_json, '$.patches')) patch WHERE changed.session_id=resolved.session_id AND changed.sequence>resolved.sequence AND changed.event_type='session.permissions.updated' AND patch.key IN ('agent.permissions.shell', 'agent.permissions.shellAccess', 'agent.permissions.commandRules', 'agent.permissions.commandDenylist', 'agent.permissions.networkRead'))
@@ -740,12 +826,8 @@ impl LocalAgentJournal {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(sql_error("run_authority_fact_read_failed"))?;
-        let entries = rows
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(sql_error("run_authority_fact_read_failed"))?;
-        drop(statement);
-        drop(connection);
-        for (resolved, requested) in entries {
+        for row in rows {
+            let (resolved, requested) = row.map_err(sql_error("run_authority_fact_read_failed"))?;
             let resolved = decode_json(&resolved, "run_authority_fact_corrupt")?;
             let requested = decode_json(&requested, "run_authority_fact_corrupt")?;
             let offered = requested["preview"]["authorizationScopes"]
@@ -765,15 +847,9 @@ impl LocalAgentJournal {
             if matches!(scope, "runContainer" | "sessionContainer") {
                 binding = binding["container"].clone();
             }
-            let reviewed = resolved["source"] != "agent"
-                || self.approval_has_review(
-                    session_id,
-                    required_string(&resolved, "authorityId")?,
-                    "allow",
-                )?;
-            if offered && reviewed && binding == *context && resolved["decision"] == "allow" {
+            if offered && binding == *context && resolved["decision"] == "allow" {
                 return Ok(Some(
-                    json!({"decision":"allow", "source":resolved.get("source").and_then(Value::as_str).unwrap_or("user"), "authorityId":required_string(&resolved, "authorityId")?, "authorizationScope":scope}),
+                    json!({"decision":"allow", "source":"user", "authorityId":required_string(&resolved, "authorityId")?, "authorizationScope":scope}),
                 ));
             }
         }
@@ -2498,12 +2574,17 @@ fn validate_feedback(value: &Value) -> Result<(), LocalAgentStoreError> {
 }
 
 fn validate_reasoning_override(value: &Value) -> Result<(), LocalAgentStoreError> {
-    if value.is_null() || matches!(value.as_str(), Some("low" | "medium" | "high" | "max")) {
+    if value.is_null()
+        || matches!(
+            value.as_str(),
+            Some("low" | "medium" | "high" | "xhigh" | "max")
+        )
+    {
         return Ok(());
     }
     Err(LocalAgentStoreError::new(
         "session_model_settings_invalid",
-        "推理强度必须是 low、medium、high、max 或 null。",
+        "推理强度必须是 low、medium、high、xhigh、max 或 null。",
     ))
 }
 
@@ -3562,6 +3643,7 @@ fn run_provider_runtime_from_connection(
     connection: &Connection,
     session_id: &str,
     run_id: &str,
+    purpose: &str,
 ) -> Result<RunProviderRuntime, LocalAgentStoreError> {
     let mut statement = connection
         .prepare(
@@ -3601,7 +3683,19 @@ fn run_provider_runtime_from_connection(
             "run.started 缺少 runtimeSnapshot。",
         )
     })?;
-    validate_run_runtime_snapshot(runtime_snapshot)
+    let provider = validate_run_runtime_snapshot(runtime_snapshot)?;
+    if purpose == "approvalReview" {
+        if let Some(error) = runtime_snapshot.get("approvalReviewerError") {
+            return Err(LocalAgentStoreError::new(
+                "approval_reviewer_prepare_failed",
+                required_string(error, "message")?,
+            ));
+        }
+        if let Some(reviewer) = runtime_snapshot.get("approvalReviewer") {
+            return validate_provider_runtime_snapshot(reviewer);
+        }
+    }
+    Ok(provider)
 }
 
 fn validate_run_runtime_snapshot(
@@ -3623,7 +3717,7 @@ fn validate_run_runtime_snapshot(
             "environment",
             "permissions",
         ],
-        &[],
+        &["approvalReviewer", "approvalReviewerError"],
     )?;
     validate_permission_patches(&value["permissions"])?;
     let run_runtime_snapshot_ref = required_string(value, "runRuntimeSnapshotRef")?;
@@ -3646,82 +3740,26 @@ fn validate_run_runtime_snapshot(
         ));
     }
 
-    let provider = value.get("provider").ok_or_else(|| {
-        LocalAgentStoreError::new("session_event_invalid", "runtimeSnapshot 缺少 provider。")
-    })?;
-    exact_object(
-        provider,
-        &[
-            "providerRuntimeRef",
-            "profileId",
-            "contextWindowTokens",
-            "maxOutputTokens",
-            "apiSurface",
-            "hostedWebSearch",
-        ],
-        &["reasoningEffort", "reasoningEffortOverride", "thinking"],
-    )?;
-    let provider_runtime_ref = required_string(provider, "providerRuntimeRef")?;
-    let profile_id = required_string(provider, "profileId")?;
-    validate_runtime_identity("providerRuntimeRef", provider_runtime_ref)?;
-    validate_runtime_identity("profileId", profile_id)?;
-    let context_window_tokens = required_u64(provider, "contextWindowTokens")?;
-    let max_output_tokens = required_u64(provider, "maxOutputTokens")?;
-    let api_surface = required_string(provider, "apiSurface")?;
-    let hosted_web_search = required_string(provider, "hostedWebSearch")?;
-    for field in ["reasoningEffort", "reasoningEffortOverride"] {
-        if let Some(effort) = provider.get(field) {
-            if effort.is_null() {
-                return Err(LocalAgentStoreError::new(
-                    "session_event_invalid",
-                    "冻结的推理强度不能为 null。",
-                ));
-            }
-            validate_reasoning_override(effort)?;
-        }
-    }
-    if let Some(thinking) = provider.get("thinking") {
-        if !matches!(thinking.as_str(), Some("enabled" | "disabled")) {
+    let mut runtime = validate_provider_runtime_snapshot(&value["provider"])?;
+    if let Some(error) = value.get("approvalReviewerError") {
+        validate_local_agent_error(error)?;
+        if value.get("approvalReviewer").is_some() {
             return Err(LocalAgentStoreError::new(
                 "session_event_invalid",
-                "冻结的推理模式无效。",
+                "审批模型绑定与准备失败不能同时存在。",
             ));
         }
     }
-    if provider.get("reasoningEffortOverride").is_some()
-        && (provider["reasoningEffortOverride"] != provider["reasoningEffort"]
-            || provider["thinking"] == "disabled")
-    {
-        return Err(LocalAgentStoreError::new(
-            "session_event_invalid",
-            "推理强度覆盖与冻结的 Provider 配置不一致。",
-        ));
-    }
-    if !matches!(
-        api_surface,
-        "chatCompletions" | "responses" | "anthropicMessages" | "ollamaChat"
-    ) || !matches!(hosted_web_search, "none" | "web_search")
-        || hosted_web_search == "web_search" && api_surface != "responses"
-    {
-        return Err(LocalAgentStoreError::new(
-            "session_event_invalid",
-            "runtimeSnapshot Provider API surface 或 hosted search capability 无效。",
-        ));
-    }
-    let max_output_tokens = u32::try_from(max_output_tokens).map_err(|_| {
-        LocalAgentStoreError::new(
-            "session_event_invalid",
-            "runtimeSnapshot maxOutputTokens 超出 Provider 预算范围。",
-        )
-    })?;
-    if context_window_tokens == 0
-        || max_output_tokens == 0
-        || u64::from(max_output_tokens) >= context_window_tokens
-    {
-        return Err(LocalAgentStoreError::new(
-            "session_event_invalid",
-            "runtimeSnapshot 要求正数预算且 maxOutputTokens 小于 contextWindowTokens。",
-        ));
+    if let Some(reviewer) = value.get("approvalReviewer") {
+        let reviewer = validate_provider_runtime_snapshot(reviewer)?;
+        if reviewer.provider_runtime_ref == runtime.provider_runtime_ref
+            || reviewer.hosted_web_search != "none"
+        {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "审批模型必须使用独立且不含 hosted tools 的 Provider runtime。",
+            ));
+        }
     }
 
     let instructions = value
@@ -4070,8 +4108,8 @@ fn validate_run_runtime_snapshot(
         "providerHosted" => {
             exact_object(web_search, &["owner", "providerToolType"], &[])?;
             if required_string(web_search, "providerToolType")? != "web_search"
-                || api_surface != "responses"
-                || hosted_web_search != "web_search"
+                || runtime.api_surface != "responses"
+                || runtime.hosted_web_search != "web_search"
                 || kernel_search_callable
             {
                 return Err(LocalAgentStoreError::new(
@@ -4184,6 +4222,88 @@ fn validate_run_runtime_snapshot(
         ));
     }
 
+    runtime.web_search_owner = web_search_owner.to_string();
+    Ok(runtime)
+}
+
+fn validate_provider_runtime_snapshot(
+    provider: &Value,
+) -> Result<RunProviderRuntime, LocalAgentStoreError> {
+    exact_object(
+        provider,
+        &[
+            "providerRuntimeRef",
+            "profileId",
+            "contextWindowTokens",
+            "maxOutputTokens",
+            "apiSurface",
+            "hostedWebSearch",
+        ],
+        &["reasoningEffort", "reasoningEffortOverride", "thinking"],
+    )?;
+    let provider_runtime_ref = required_string(provider, "providerRuntimeRef")?;
+    let profile_id = required_string(provider, "profileId")?;
+    validate_runtime_identity("providerRuntimeRef", provider_runtime_ref)?;
+    validate_runtime_identity("profileId", profile_id)?;
+    let context_window_tokens = required_u64(provider, "contextWindowTokens")?;
+    let max_output_tokens = required_u64(provider, "maxOutputTokens")?;
+    let api_surface = required_string(provider, "apiSurface")?;
+    let hosted_web_search = required_string(provider, "hostedWebSearch")?;
+    for field in ["reasoningEffort", "reasoningEffortOverride"] {
+        if let Some(effort) = provider.get(field) {
+            if effort.is_null() {
+                return Err(LocalAgentStoreError::new(
+                    "session_event_invalid",
+                    "冻结的推理强度不能为 null。",
+                ));
+            }
+            validate_reasoning_override(effort)?;
+        }
+    }
+    if let Some(thinking) = provider.get("thinking") {
+        if !matches!(thinking.as_str(), Some("enabled" | "disabled")) {
+            return Err(LocalAgentStoreError::new(
+                "session_event_invalid",
+                "冻结的推理模式无效。",
+            ));
+        }
+    }
+    if provider.get("reasoningEffortOverride").is_some()
+        && (provider["reasoningEffortOverride"] != provider["reasoningEffort"]
+            || provider["thinking"] == "disabled")
+    {
+        return Err(LocalAgentStoreError::new(
+            "session_event_invalid",
+            "推理强度覆盖与冻结的 Provider 配置不一致。",
+        ));
+    }
+    if !matches!(
+        api_surface,
+        "chatCompletions" | "responses" | "anthropicMessages" | "ollamaChat"
+    ) || !matches!(hosted_web_search, "none" | "web_search")
+        || hosted_web_search == "web_search" && api_surface != "responses"
+    {
+        return Err(LocalAgentStoreError::new(
+            "session_event_invalid",
+            "runtimeSnapshot Provider API surface 或 hosted search capability 无效。",
+        ));
+    }
+    let max_output_tokens = u32::try_from(max_output_tokens).map_err(|_| {
+        LocalAgentStoreError::new(
+            "session_event_invalid",
+            "runtimeSnapshot maxOutputTokens 超出 Provider 预算范围。",
+        )
+    })?;
+    if context_window_tokens == 0
+        || max_output_tokens == 0
+        || u64::from(max_output_tokens) >= context_window_tokens
+    {
+        return Err(LocalAgentStoreError::new(
+            "session_event_invalid",
+            "runtimeSnapshot 要求正数预算且 maxOutputTokens 小于 contextWindowTokens。",
+        ));
+    }
+
     Ok(RunProviderRuntime {
         reasoning_effort_override: provider
             .get("reasoningEffortOverride")
@@ -4195,7 +4315,7 @@ fn validate_run_runtime_snapshot(
         max_output_tokens,
         api_surface: api_surface.to_string(),
         hosted_web_search: hosted_web_search.to_string(),
-        web_search_owner: web_search_owner.to_string(),
+        web_search_owner: "unavailable".to_string(),
     })
 }
 
@@ -4515,6 +4635,68 @@ mod tests {
     }
 
     #[test]
+    fn approval_review_uses_its_frozen_model_without_changing_the_conversation_model() {
+        let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
+        journal
+            .create_session("session:review", "Review", &json!([]), None)
+            .unwrap();
+        let mut runtime = runtime_snapshot();
+        runtime["approvalReviewer"] = json!({
+            "providerRuntimeRef": "provider-runtime:review",
+            "profileId": "profile:review",
+            "contextWindowTokens": 4096,
+            "maxOutputTokens": 1024,
+            "apiSurface": "anthropicMessages",
+            "hostedWebSearch": "none"
+        });
+        journal.append(&json!({"type":"run.started", "sessionId":"session:review", "runId":"run:review",
+            "payload":{"inputMessageId":"message:review","workspaceBindings":[],"runtimeSnapshot":runtime}})).unwrap();
+        let conversation = journal
+            .run_provider_runtime("session:review", "run:review", "agent")
+            .unwrap();
+        let reviewer = journal
+            .run_provider_runtime("session:review", "run:review", "approvalReview")
+            .unwrap();
+        assert_eq!(conversation.profile_id, "profile:test");
+        assert_eq!(reviewer.profile_id, "profile:review");
+        assert_eq!(reviewer.max_output_tokens, 1024);
+        assert_eq!(reviewer.web_search_owner, "unavailable");
+        runtime["approvalReviewer"]["providerRuntimeRef"] =
+            runtime["provider"]["providerRuntimeRef"].clone();
+        assert!(validate_run_runtime_snapshot(&runtime).is_err());
+    }
+
+    #[test]
+    fn unavailable_reviewer_preserves_the_error_without_blocking_the_conversation() {
+        let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
+        journal
+            .create_session("session:review-error", "Review error", &json!([]), None)
+            .unwrap();
+        let mut runtime = runtime_snapshot();
+        let error = json!({"code":"approval_reviewer_prepare_failed", "message":"Missing selected review profile"});
+        runtime["approvalReviewerError"] = error.clone();
+        journal.append(&json!({"type":"run.started", "sessionId":"session:review-error", "runId":"run:review-error",
+            "payload":{"inputMessageId":"message:review-error","workspaceBindings":[],"runtimeSnapshot":runtime}})).unwrap();
+        assert_eq!(
+            journal
+                .run_provider_runtime("session:review-error", "run:review-error", "agent")
+                .unwrap()
+                .profile_id,
+            "profile:test"
+        );
+        let failure = journal
+            .run_provider_runtime("session:review-error", "run:review-error", "approvalReview")
+            .err()
+            .unwrap();
+        assert_eq!(failure.code, error["code"].as_str().unwrap());
+        assert_eq!(failure.message, error["message"].as_str().unwrap());
+        runtime["approvalReviewer"] = runtime["provider"].clone();
+        runtime["approvalReviewer"]["providerRuntimeRef"] =
+            json!("provider-runtime:separate-review");
+        assert!(validate_run_runtime_snapshot(&runtime).is_err());
+    }
+
+    #[test]
     fn plan_authority_lasts_through_todo_updates_and_expires_on_run_finishing() {
         let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
         journal
@@ -4679,6 +4861,69 @@ mod tests {
             }}
         })).expect("persist the rejected input without an execution record");
         assert_eq!(event["type"], "tool.input-rejected");
+    }
+
+    #[test]
+    fn request_resource_views_include_only_consumed_files_and_keep_old_views() {
+        let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
+        journal
+            .create_session("session:loop", "Resources", &json!([]), None)
+            .unwrap();
+        append_model_settings_and_rejected_call(&journal);
+        let mut receipt = journal
+            .read_events("session:loop", 0)
+            .unwrap()
+            .into_iter()
+            .find(|event| event["type"] == "context.composed")
+            .unwrap()["payload"]
+            .clone();
+        let reference = json!({"referenceId":"reference:image", "workspaceId":"workspace:image", "logicalPath":"screen.png",
+            "displayName":"screen.png", "kind":"file", "mediaType":"image/png", "byteLength":8});
+        journal.append(&json!({"type":"input.queued", "sessionId":"session:loop", "runId":"run:loop",
+            "payload":{"commandId":"command:image", "messageId":"message:image", "text":"", "filesystemReferences":[reference]}})).unwrap();
+        assert_eq!(
+            journal
+                .provider_workspace_binding_ids("session:loop", "run:loop", "provider-request:loop")
+                .unwrap(),
+            Vec::<String>::new()
+        );
+        assert!(!journal
+            .has_workspace_binding_view("session:loop", "run:loop", &["workspace:image".into()])
+            .unwrap());
+        journal.append(&json!({"type":"message.committed", "sessionId":"session:loop", "runId":"run:loop",
+            "payload":{"messageId":"message:image", "role":"user", "content":"", "filesystemReferences":[reference]}})).unwrap();
+        receipt["providerRequestId"] = json!("provider-request:image");
+        receipt["workspaceBindings"] = json!([{"itemId":"workspace:image","label":"screen.png"}]);
+        journal.append(&json!({"type":"context.composed", "sessionId":"session:loop", "runId":"run:loop", "payload":receipt})).unwrap();
+        assert_eq!(
+            journal
+                .provider_workspace_binding_ids(
+                    "session:loop",
+                    "run:loop",
+                    "provider-request:image"
+                )
+                .unwrap(),
+            vec!["workspace:image"]
+        );
+        assert!(journal
+            .has_workspace_binding_view("session:loop", "run:loop", &["workspace:image".into()])
+            .unwrap());
+        assert!(journal
+            .has_workspace_binding_view("session:loop", "run:loop", &[])
+            .unwrap());
+        assert_eq!(
+            journal
+                .provider_workspace_binding_ids("session:loop", "run:loop", "provider-request:loop")
+                .unwrap(),
+            Vec::<String>::new()
+        );
+        assert!(!journal
+            .has_workspace_binding_view(
+                "session:loop",
+                "run:loop",
+                &["workspace:other-project".into()]
+            )
+            .unwrap());
     }
 
     fn settings_commit(command_id: &str) -> Value {

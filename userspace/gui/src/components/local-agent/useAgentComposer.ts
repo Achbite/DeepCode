@@ -58,6 +58,7 @@ export function useAgentComposer(
   const submitting = useLocalAgentStore((state) => state.submitting);
   const catalogBusy = useLocalAgentStore((state) => state.catalogBusy);
   const error = useLocalAgentStore((state) => state.error);
+  const clearError = useLocalAgentStore((state) => state.clearError);
   const sendMessage = useLocalAgentStore((state) => state.sendMessage);
   const editMessage = useLocalAgentStore((state) => state.editMessage);
   const focusContext = useLocalAgentStore((state) => state.focusContext);
@@ -65,8 +66,7 @@ export function useAgentComposer(
   const respondApproval = useLocalAgentStore((state) => state.respondApproval);
   const respondPlan = useLocalAgentStore((state) => state.respondPlan);
   const cancelRun = useLocalAgentStore((state) => state.cancelRun);
-  const selectProfile = useLocalAgentStore((state) => state.selectProfile);
-  const selectReasoningEffort = useLocalAgentStore((state) => state.selectReasoningEffort);
+  const saveModelChoice = useLocalAgentStore(state => state.selectModel);
   const reasoningEffortOverride = useLocalAgentStore((state) => state.reasoningEffortOverride);
   const modelSettingsBusy = useLocalAgentStore((state) => state.modelSettingsBusy);
   const [initialComposer] = useState(()=>readComposerDraft(composerStateKey));
@@ -480,23 +480,28 @@ export function useAgentComposer(
     response: Extract<PlanResponse, { kind: 'confirm' | 'cancel' }>,
   ) => {
     if (!pendingPlan || submitting) return;
+    // Resume at the user's confirmation, not after the asynchronous reply:
+    // scrolling up while the command is pending must still detach the viewport.
+    if (response.kind === 'confirm') setLatestFollowMode(true);
     try {
       await respondPlan(response);
     } catch {
       // The store preserves the authoritative command error for the shared error panel.
     }
-  }, [pendingPlan, respondPlan, submitting]);
+  }, [pendingPlan, respondPlan, setLatestFollowMode, submitting]);
 
-  const selectMessageAttachment = async (
-    absolutePath: string,
-    type: 'directory' | 'file',
+  const selectMessageAttachments = async (
+    selections: { path: string; kind: 'directory' | 'file' }[],
   ) => {
     setAttachmentDialogOpen(false);
     try {
-      if (pendingFilesystemPaths.length + pastedTexts.length >= 8) {
+      const unique = selections.filter((item, index) => selections.findIndex(other => other.path === item.path && other.kind === item.kind) === index);
+      if (unique.length > 1 && unique.some(item => item.kind === 'directory')) throw new Error(language === 'zh-CN' ? '请选择多个文件或一个文件夹。' : 'Select multiple files or one folder.');
+      const additions = unique.filter(item => !pendingFilesystemPaths.some(current => current.path === item.path && current.kind === item.kind));
+      if (pendingFilesystemPaths.length + pastedTexts.length + additions.length > 8) {
         throw new Error(t(language, 'agent.attachment.error.maxFiles'));
       }
-      if (type === 'file' && mediaTypeForPath(absolutePath) === 'application/pdf') {
+      if (additions.some(item => item.kind === 'file' && mediaTypeForPath(item.path) === 'application/pdf')) {
         const matches = pluginCatalog.plugins.filter((plugin) => (
           plugin.activationMediaTypes.includes('application/pdf')
         ));
@@ -523,13 +528,7 @@ export function useAgentComposer(
             : `${current}${current && !/\s$/u.test(current) ? ' ' : ''}${mention} `;
         });
       }
-      setPendingFilesystemPaths((current) => (
-        current.some((candidate) => (
-          candidate.path === absolutePath && candidate.kind === type
-        ))
-          ? current
-          : [...current, { path: absolutePath, kind: type }]
-      ));
+      setPendingFilesystemPaths(current => [...current, ...additions.filter(item => !current.some(other => other.path === item.path && other.kind === item.kind))]);
       setAttachmentError(null);
     } catch (selectionError) {
       setAttachmentError(selectionError instanceof Error
@@ -585,12 +584,20 @@ export function useAgentComposer(
   const editPastedText = (inputId: string, text: string) => setPastedTexts((current) => current.map((item) => (
     item.inputId === inputId ? { ...item, inputId: nextPanelId('paste'), text } : item
   )));
+  const selectedProfile = profiles.find(profile => profile.id === selectedProfileId);
+  // A persisted choice is already usable; opening a new conversation does not
+  // require another click. Missing effort still requires an explicit selection.
+  const modelSelectionConfirmed = Boolean(selectedProfile?.enabled
+    && (selectedProfile.thinking === 'disabled' || reasoningEffortOverride));
+  const selectModel = async (profileId: string, effort: import('@deepcode/protocol').LlmReasoningEffort | null) => {
+    await saveModelChoice(profileId, effort);
+  };
   const canSend = !loading && !submitting && (!editingMessage || canEditMessage) && (textDecision
     ? Boolean(draft.trim()) && (!pendingInteraction || pendingInteraction.allowFreeform)
-    : Boolean(draft.trim() || pastedTexts.length || editingMessage?.message.filesystemReferences.length)
+    : Boolean(draft.trim() || pastedTexts.length || pendingFilesystemPaths.length || editingMessage?.message.filesystemReferences.length)
       && !modelSettingsBusy && !catalogBusy
-      && Boolean(canCancel || profiles.some((profile) => profile.id === selectedProfileId && profile.enabled)));
-  const showStopAction = canCancel && !textDecision && !draft.trim() && !pastedTexts.length;
+      && Boolean(canCancel || (modelSelectionConfirmed && profiles.some((profile) => profile.id === selectedProfileId && profile.enabled))));
+  const showStopAction = canCancel && !textDecision && !draft.trim() && !pastedTexts.length && !pendingFilesystemPaths.length;
   const canRestoreFailedDraft = composerStateIsEmpty(currentComposerStateRef.current);
   const restoreFailedDraft = (index: number) => {
     const saved = failedDrafts[composerStateKey]?.[index];
@@ -615,6 +622,7 @@ export function useAgentComposer(
     submitting,
     catalogBusy,
     error,
+    clearError,
     profiles,
     selectedProfileId,
     reasoningEffortOverride,
@@ -623,8 +631,8 @@ export function useAgentComposer(
     respondApproval,
     respondPlan,
     cancelRun,
-    selectProfile,
-    selectReasoningEffort,
+    selectModel,
+    modelSelectionConfirmed,
     appendBrowserReview,
     removeBrowserReview,
     draft,
@@ -641,6 +649,7 @@ export function useAgentComposer(
     pluginActiveIndex,
     setPluginActiveIndex,
     attachmentError,
+    clearAttachmentError: () => setAttachmentError(null),
     attachmentMenuOpen,
     setAttachmentMenuOpen,
     attachmentDialogOpen,
@@ -668,7 +677,7 @@ export function useAgentComposer(
     openPluginPicker,
     insertFocusCommand,
     submitDraft,
-    selectMessageAttachment,
+    selectMessageAttachments,
     canSend,
     showStopAction,
     failedDrafts: failedDrafts[composerStateKey] ?? [],

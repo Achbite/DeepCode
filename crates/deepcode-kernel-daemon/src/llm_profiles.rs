@@ -182,11 +182,13 @@ pub(crate) fn validate_llm_profile(profile: &Value) -> Result<(), String> {
     {
         return Err("temperature 必须是有限数值。".into());
     }
-    if profile
-        .get("reasoningEffort")
-        .is_some_and(|value| !matches!(value.as_str(), Some("low" | "medium" | "high" | "max")))
-    {
-        return Err("reasoningEffort 必须是 low、medium、high 或 max。".into());
+    if profile.get("reasoningEffort").is_some_and(|value| {
+        !matches!(
+            value.as_str(),
+            Some("low" | "medium" | "high" | "xhigh" | "max")
+        )
+    }) {
+        return Err("reasoningEffort 必须是 low、medium、high、xhigh 或 max。".into());
     }
     if profile
         .get("thinking")

@@ -1,3 +1,4 @@
+import { isLlmReasoningEffort } from '@deepcode/protocol';
 import { isShellAuthorizationScope } from '@deepcode/protocol';
 import { stableCoreInstructions } from './local-agent/coreInstructions.js';
 import type { ConversationCommand } from '@deepcode/protocol';
@@ -281,7 +282,7 @@ function decodeCommand(value: unknown): ConversationCommand {
 }
 
 function validReasoningOverride(value: unknown): boolean {
-  return value === null || typeof value === 'string' && ['low', 'medium', 'high', 'max'].includes(value);
+  return value === null || isLlmReasoningEffort(value);
 }
 
 function hasExactKeys(

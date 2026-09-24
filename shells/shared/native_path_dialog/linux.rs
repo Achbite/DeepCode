@@ -6,7 +6,7 @@ use std::path::PathBuf;
 pub(super) fn pick(
     parent: &tauri::Window,
     options: &PathOptions,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<Vec<PathBuf>>, String> {
     let parent = parent.gtk_window().map_err(|error| error.to_string())?;
     // A custom response accepts the highlighted item, including a directory.
     // GTK's built-in Accept response instead navigates into a selected folder.
@@ -18,7 +18,7 @@ pub(super) fn pick(
         (&options.select_label, select),
     ]);
     dialog.set_modal(true);
-    dialog.set_select_multiple(false);
+    dialog.set_select_multiple(options.multiple);
     dialog.set_local_only(true);
     dialog.set_default_response(select);
     dialog.set_response_sensitive(select, false);
@@ -38,10 +38,7 @@ pub(super) fn pick(
     }
     let response = dialog.run();
     let result = if response == select {
-        dialog
-            .filename()
-            .map(Some)
-            .ok_or_else(|| "native_dialog_selected_path_missing".into())
+        Ok(Some(dialog.filenames()))
     } else {
         Ok(None)
     };

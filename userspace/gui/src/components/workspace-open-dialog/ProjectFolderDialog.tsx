@@ -3,7 +3,7 @@ import ModalDialog from '../shared/ModalDialog';
 import React, { useEffect, useMemo, useState } from 'react';
 import type { BrowseEntry, BrowsePathResult, InitialLocation } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
-import { browsePath, getInitialLocations, hasNativePathPicker, type NativePathOptions } from '../../services/runtimeAdapter';
+import { browsePath, getInitialLocations, hasNativePathPicker, type NativePathOptions, type NativePathSelection } from '../../services/runtimeAdapter';
 import NativePathDialog from './NativePathDialog';
 import './workspaceOpenDialog.css';
 
@@ -11,6 +11,7 @@ interface ProjectFolderDialogProps {
   language: UiLanguage;
   onCancel: () => void;
   onSelect: (absolutePath: string, type: BrowseEntry['type']) => void;
+  onSelectMany?: (paths: NativePathSelection[]) => void;
   selectionMode?: 'directory' | 'file' | 'path' | 'messageAttachment';
   title?: string;
   filters?: NativePathOptions['filters'];
@@ -20,6 +21,7 @@ const BrowserProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
   language,
   onCancel,
   onSelect,
+  onSelectMany,
   selectionMode = 'directory',
   title,
   filters,
@@ -28,6 +30,7 @@ const BrowserProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
   const [browseResult, setBrowseResult] = useState<BrowsePathResult | null>(null);
   const [addressInput, setAddressInput] = useState('');
   const [selectedEntry, setSelectedEntry] = useState<BrowseEntry | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<BrowseEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showHidden, setShowHidden] = useState(false);
@@ -36,6 +39,7 @@ const BrowserProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
     setLoading(true);
     setError(null);
     setSelectedEntry(null);
+    setSelectedFiles([]);
     const result = await browsePath(absolutePath);
     if (result.ok && result.data) {
       setBrowseResult(result.data);
@@ -175,17 +179,32 @@ const BrowserProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
                 {entries.map((entry) => (
                   <li
                     key={entry.absolutePath}
-                    className={`ws-open-dialog__entry${selectedEntry?.absolutePath === entry.absolutePath ? ' ws-open-dialog__entry--selected' : ''}`}
-                    onClick={() => setSelectedEntry(entry)}
+                    className={`ws-open-dialog__entry${selectedEntry?.absolutePath === entry.absolutePath || selectedFiles.some(file => file.absolutePath === entry.absolutePath) ? ' ws-open-dialog__entry--selected' : ''}`}
+                    onClick={(event) => {
+                      if (isAttachmentSelection && entry.type === 'file') {
+                        setSelectedEntry(null);
+                        setSelectedFiles(current => event.metaKey || event.ctrlKey
+                          ? current.some(file => file.absolutePath === entry.absolutePath)
+                            ? current.filter(file => file.absolutePath !== entry.absolutePath) : [...current, entry]
+                          : [entry]);
+                      } else { setSelectedFiles([]); setSelectedEntry(entry); }
+                    }}
                     onDoubleClick={() => {
                       if (entry.type === 'directory') {
                         void navigateTo(entry.absolutePath);
                       } else if (allowsFiles) {
-                        onSelect(entry.absolutePath, entry.type);
+                        onSelectMany ? onSelectMany([{ path: entry.absolutePath, kind: entry.type }]) : onSelect(entry.absolutePath, entry.type);
                       }
                     }}
                     title={entry.absolutePath}
                   >
+                    {isAttachmentSelection && entry.type === 'file' && <input type="checkbox"
+                      aria-label={entry.name} checked={selectedFiles.some(file => file.absolutePath === entry.absolutePath)}
+                      onClick={event => event.stopPropagation()} onChange={() => {
+                        setSelectedEntry(null);
+                        setSelectedFiles(current => current.some(file => file.absolutePath === entry.absolutePath)
+                          ? current.filter(file => file.absolutePath !== entry.absolutePath) : [...current, entry]);
+                      }} />}
                     <span className="ws-open-dialog__entry-icon">
                       <DeepCodeShellIcon name={entry.type === 'directory' ? 'folder' : 'file'} size={16} />
                     </span>
@@ -197,7 +216,7 @@ const BrowserProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
           </main>
         </div>
         <div className="ws-open-dialog__footer">
-          <div className="ws-open-dialog__footer-info" title={selectedPath}>{selectedPath}</div>
+          <div className="ws-open-dialog__footer-info" title={selectedPath}>{selectedFiles.length ? `${selectedFiles.length} ${language === 'zh-CN' ? '个文件' : 'files'}` : selectedPath}</div>
           <div className="ws-open-dialog__footer-actions">
             <button type="button" className="ws-open-dialog__btn" onClick={onCancel}>
               {t(language, 'workspaceDialog.cancel')}
@@ -206,7 +225,10 @@ const BrowserProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
               type="button"
               className="ws-open-dialog__btn ws-open-dialog__btn--primary"
               disabled={!selectedPath || !selectedType || (selectionMode === 'file' && selectedType !== 'file')}
-              onClick={() => selectedPath && selectedType && onSelect(selectedPath, selectedType)}
+              onClick={() => {
+                if (selectedFiles.length && onSelectMany) onSelectMany(selectedFiles.map(file => ({ path: file.absolutePath, kind: 'file' })));
+                else if (selectedPath && selectedType) onSelect(selectedPath, selectedType);
+              }}
             >
               {t(language, allowsFiles
                 ? 'agent.attachment.attachSelected'
@@ -222,11 +244,11 @@ const BrowserProjectFolderDialog: React.FC<ProjectFolderDialogProps> = ({
 export default function ProjectFolderDialog(props: ProjectFolderDialogProps) {
   if (!hasNativePathPicker()) return <BrowserProjectFolderDialog {...props} />;
   const kind = props.selectionMode === 'messageAttachment' ? 'path' : props.selectionMode ?? 'directory';
-  return <NativePathDialog language={props.language} kind={kind} filters={props.filters}
+  return <NativePathDialog language={props.language} kind={kind} filters={props.filters} multiple={props.selectionMode === 'messageAttachment'}
     selectLabel={props.selectionMode === 'messageAttachment'
       ? t(props.language, 'agent.attachment.attachSelected') : (props.language === 'zh-CN' ? '选择' : 'Select')}
     cancelLabel={t(props.language, 'workspaceDialog.cancel')}
     title={props.title ?? t(props.language, kind === 'directory'
       ? 'deepcodeGui.project.folderDialogTitle' : 'agent.attachment.pickerTitle')}
-    onSelect={props.onSelect} onCancel={props.onCancel} />;
+    onSelect={props.onSelect} onSelectMany={props.onSelectMany} onCancel={props.onCancel} />;
 }

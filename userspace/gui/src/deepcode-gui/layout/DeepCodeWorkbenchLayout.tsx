@@ -1,3 +1,6 @@
+import { UsageWidget } from '../../ui-plugins/UsageWidget';
+import type { ConversationReaderLayout } from '../../components/local-agent/LocalAgentPanel';
+import { UiRegion } from '../../ui-plugins/UiRegion';
 import ProjectEnvironmentSettings from '../../components/settings-center/sections/ProjectEnvironmentSettings';
 import { restoredInterfaceView, useInterfaceReloadView } from '../../services/interfaceReload';
 import DeepCodeNavigationBox from './DeepCodeNavigationBox';
@@ -93,6 +96,7 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const deleteSession = useLocalAgentStore((state) => state.deleteSession);
 
   const [settingsOpen, setSettingsOpen] = useState(() => restoredInterfaceView('settingsOpen', false));
+  const [readerLayout, setReaderLayout] = useState<ConversationReaderLayout>({ visible: false, expanded: false, conversationBounds: null });
   useInterfaceReloadView('settingsOpen', settingsOpen);
   useInterfaceReloadView('conversation', { sessionId: activeSessionId, draftProjectId });
   const [settingsNavigation, setSettingsNavigation] = useState<HTMLDivElement | null>(null);
@@ -294,14 +298,15 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
       onKeyDown={(event) => {
         if (settingsOpen && event.key !== 'Escape') event.stopPropagation();
       }}>
-      <DeepCodeTitlebar sessionHeaderRef={setSessionHeader} language={language} settings={settingsOpen ? <>
+      <UiRegion slot="workbench.layout" regions={{
+        titlebar: <><DeepCodeTitlebar sessionHeaderRef={setSessionHeader} language={language} settings={settingsOpen ? <>
         <strong>{t(language, 'settings.title')}</strong>
         <button type="button" ref={settingsClose} className="deepcode-local-agent-settings__close" onClick={() => setSettingsOpen(false)}>
           {t(language, 'deepcodeGui.settings.close')} <kbd>esc</kbd>
         </button>
-      </> : undefined} />
-
-      <DeepCodeNavigationBox settingsOpen={settingsOpen} settingsTargetRef={setSettingsNavigation}>
+      </> : undefined} /></>,
+        navigation: <UiRegion slot="navigation" data={{ kind: 'navigation', projects: sidebarOrder.projects, sessions: sidebarOrder.sessions, activeSessionId, busy }}
+          actions={{ activateSession: async (id: string) => { if (!busy && catalog.sessions.some(session => session.id === id)) await activateSession(id); } }}><DeepCodeNavigationBox settingsOpen={settingsOpen} settingsTargetRef={setSettingsNavigation}>
         <DeepCodeSidebar
           language={language}
           projects={sidebarOrder.projects}
@@ -332,16 +337,18 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
             setProjectMenu(null); setProjectCreateMenu(null); setSessionMenu(null); setSettingsOpen(true);
           }}
         />
-      </DeepCodeNavigationBox>
-      <div
+      </DeepCodeNavigationBox></UiRegion>,
+        main: <><div
         className={`deepcode-gui-shell${showContextRail ? '' : ' deepcode-gui-shell--no-context'}`}
         data-navigation-density={navigationDensity}
       >
         <div className="deepcode-gui-main-surfaces" inert={settingsOpen} aria-hidden={settingsOpen || undefined}>
-          <DeepCodeConversationShell headerTarget={sessionHeader} />
+          <DeepCodeConversationShell headerTarget={sessionHeader} onReaderLayoutChange={setReaderLayout} />
           {showContextRail && <DeepCodeTaskPanel language={language} projection={projection} />}
         </div>
-      </div>
+        <UsageWidget readerLayout={readerLayout} hidden={settingsOpen} />
+      </div></>,
+      }} />
 
       {projectCreateMenu && (
         <div

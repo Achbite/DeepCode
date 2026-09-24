@@ -64,6 +64,18 @@ pub(crate) fn prepare(
     .collect();
     let commands: Vec<_> = command_paths.keys().cloned().collect();
     let sandbox = deepcode_kernel_runtime::workspace_sandbox::probe();
+    let kernel_path = std::env::current_exe().map_err(|error| error.to_string())?;
+    let mut runtime_executables = json!({ "kernel": kernel_path });
+    if let Some(directory) = kernel_path.parent() {
+        let cli = directory.join(if cfg!(windows) {
+            "deepcode-cli.exe"
+        } else {
+            "deepcode-cli"
+        });
+        if cli.is_file() {
+            runtime_executables["cli"] = json!(cli);
+        }
+    }
     Ok(json!({
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
@@ -76,6 +88,7 @@ pub(crate) fn prepare(
         "shell": shell,
         "developerCommands": commands,
         "commandPaths": command_paths,
+        "runtimeExecutables": runtime_executables,
         "executionPath": execution_path.to_string_lossy(),
         "workspaceShellSupported": sandbox.available,
         "workspaceSandbox": sandbox,

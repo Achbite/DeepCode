@@ -4,21 +4,22 @@ import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import { useConversationRowState } from './ConversationVirtualRow';
 
 /** A view of the recorded request/decision; it never issues an authorization. */
-export function ApprovalActivity({ activity, pending, language, onExpand }: {
+export function ApprovalActivity({ activity, pending, reviewing, language, onExpand }: {
   activity: ActivityProjection;
   pending: boolean;
+  reviewing: boolean;
   language: UiLanguage;
   onExpand(): void;
 }) {
   const [expanded, setExpanded] = useConversationRowState(`approval:${activity.activityId}:expanded`, false);
   const status = activity.status === 'completed' ? 'accepted'
     : activity.status === 'denied' ? 'denied'
-      : pending ? 'waiting' : 'unanswered';
+      : pending ? (reviewing ? 'reviewing' : 'waiting') : 'unanswered';
   return <article className="local-agent__approval-record">
     <button type="button" className="local-agent__approval-record-heading" aria-expanded={expanded}
       onClick={() => { if (!expanded) onExpand(); setExpanded((value) => !value); }}>
       <DeepCodeShellIcon name="hand" />
-      <span>{t(language, 'agent.approval.record.requested')}</span>
+      <span>{t(language, `agent.approval.record.${pending ? status : 'requested'}`)}</span>
       <DeepCodeShellIcon name="chevronDown" className="conversation-disclosure-chevron" />
     </button>
     {expanded && <div className="local-agent__approval-record-body">

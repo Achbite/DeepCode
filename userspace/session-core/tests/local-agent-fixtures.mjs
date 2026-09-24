@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { PERMISSION_DEFAULTS } from '../../protocol/dist/index.js';
 import { SessionActor, sessionControlToolDefinitions } from '../dist/index.js';
+import { assertRuntimeContract } from './support/runtimeContract.mjs';
 
 export const workspaceBinding = {
   workspaceId: 'workspace:test',
@@ -20,7 +21,12 @@ export function actorWith(
     sessionId,
     journal,
     {
-      provider,
+      provider: {
+        async *stream(request, signal) {
+          assertRuntimeContract('ProviderRequest', request);
+          yield* provider.stream(request, signal);
+        },
+      },
       kernel,
       runPreparation,
       async dispose() { onDispose(); },
@@ -167,7 +173,8 @@ export function completedExecutionReply(request, output) {
         toolName: request.toolName,
         workspaceId: request.input.workspaceId,
         operation: request.toolName,
-        logicalTargets: [request.input.path],
+        logicalTargets: typeof request.input.path === 'string' ? [request.input.path]
+          : typeof request.input.url === 'string' ? [request.input.url] : [],
         canonicalInvocation: {
           toolName: request.toolName,
           arguments: structuredClone(request.input),
@@ -341,6 +348,7 @@ export async function waitForProjection(actor, predicate) {
   const deadline = Date.now() + 3_000;
   while (Date.now() < deadline) {
     const projection = await actor.snapshot();
+    assertRuntimeContract('SessionProjection', projection);
     if (predicate(projection)) return projection;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }

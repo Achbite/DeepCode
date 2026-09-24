@@ -117,6 +117,13 @@ fn run_label(language: Language, projection: Option<&SessionProjection>) -> Stri
         return language.text("tui.ready").into();
     };
     if run.status == "running" {
+        if projection
+            .pending_approval
+            .as_ref()
+            .is_some_and(|approval| approval.is_model_reviewing(Some(run)))
+        {
+            return language.text("agent.permission.reviewing").into();
+        }
         if let Some(attempt) = projection
             .provider_attempts
             .last()
@@ -178,9 +185,18 @@ fn decision_lines(
         return vec![];
     };
     let (title, actions, summary) = if let Some(approval) = &projection.pending_approval {
+        let reviewing = approval.is_model_reviewing(projection.run.as_ref());
         (
-            language.text("tui.authorizationDetailsHint"),
-            approval_actions(language, approval),
+            language.text(if reviewing {
+                "agent.permission.reviewing"
+            } else {
+                "tui.authorizationDetailsHint"
+            }),
+            if reviewing {
+                String::new()
+            } else {
+                approval_actions(language, approval)
+            },
             approval.preview.summary.clone(),
         )
     } else if let Some(interaction) = &projection.pending_interaction {
@@ -221,10 +237,55 @@ pub(crate) fn decision_details(
         return language.text("tui.sessionNotInitialized").into();
     };
     if let Some(approval) = &projection.pending_approval {
+        let reviewing = approval.is_model_reviewing(projection.run.as_ref());
         let mut text = language.format(
-            "tui.authorizationDetails",
+            if reviewing {
+                "tui.authorizationReviewingDetails"
+            } else {
+                "tui.authorizationDetails"
+            },
             &[format!("{}", approval.preview.summary)],
         );
+        if let Some(operation) = &approval.preview.operation {
+            text.push_str(&format!(
+                "\n{}: {}",
+                language.text("agent.tool.detail.operation"),
+                operation.tool_name
+            ));
+            if let Some(root) = &operation.workspace_root {
+                text.push_str(&format!(
+                    "\n{}: {root}",
+                    language.text("agent.tool.shell.cwd")
+                ));
+            }
+            if let Some(scope) = &operation.execution_scope {
+                text.push_str(&format!(
+                    "\n{}: {scope}",
+                    language.text("agent.approval.executionScope")
+                ));
+            }
+            text.push_str(&format!(
+                "\n{}: {}",
+                language.text("agent.approval.arguments"),
+                serde_json::to_string_pretty(&operation.arguments)
+                    .expect("operation arguments serialize")
+            ));
+        }
+        if let Some(reason) = approval
+            .preview
+            .review
+            .as_ref()
+            .and_then(|review| review["reason"].as_str())
+        {
+            text.push_str(&format!("\n{reason}"));
+        }
+        if let Some(files) = &approval.preview.file_access {
+            for access in ["read", "write"] {
+                for path in files[access].as_array().into_iter().flatten() {
+                    text.push_str(&format!("\n{access}: {}", path.as_str().unwrap_or("")));
+                }
+            }
+        }
         for target in &approval.preview.logical_targets {
             text.push_str(&format!("\n{target}"));
         }
@@ -232,7 +293,9 @@ pub(crate) fn decision_details(
             text.push_str(language.text("tui.browserAuthorizationScope"));
         }
         text.push('\n');
-        text.push_str(&approval_actions(language, approval));
+        if !reviewing {
+            text.push_str(&approval_actions(language, approval));
+        }
         return text;
     }
     if let Some(plan) = &projection.pending_plan {
@@ -689,6 +752,10 @@ impl Renderer {
                             kind_label(language, &message.role),
                             message.content
                         ));
+                        output.push_str(&source_references(
+                            language,
+                            message.source_references.as_ref(),
+                        ));
                         if !message.filesystem_references.is_empty() {
                             output.push_str(&language.format(
                                 "tui.filesystemReferences",
@@ -705,6 +772,10 @@ impl Renderer {
                         value: narrative, ..
                     } => {
                         output.push_str(&format!("{}\n", narrative.content));
+                        output.push_str(&source_references(
+                            language,
+                            narrative.source_references.as_ref(),
+                        ));
                     }
                     TimelineItem::Plan { value: plan, .. } => {
                         render_timeline_plan_plain(language, &mut output, plan);
@@ -759,32 +830,9 @@ impl Renderer {
                     }
                 }
             }
-            if let Some(approval) = projection.pending_approval.as_ref() {
-                output.push_str(&language.format(
-                    "tui.approvalRequired",
-                    &[format!("{}", approval.preview.summary)],
-                ));
-                if approval.preview.authorization_scope.as_deref() == Some("sessionBrowser") {
-                    output.push_str(language.text("tui.browserAuthorizationHint"));
-                }
-                if let Some(files) = &approval.preview.file_access {
-                    for access in ["read", "write"] {
-                        if let Some(paths) = files[access].as_array() {
-                            for path in paths {
-                                output.push_str(&format!(
-                                    "  {access}: {}\n",
-                                    path.as_str().unwrap_or("")
-                                ));
-                            }
-                        }
-                    }
-                }
-                output.push_str(&approval_actions(language, approval));
+            if projection.pending_approval.is_some() {
+                output.push_str(&decision_details(language, Some(projection)));
                 output.push('\n');
-                for target in &approval.preview.logical_targets {
-                    output.push_str(&format!("  - {target}\n"));
-                }
-                output.push_str(language.text("tui.approvalInputHint"));
             }
             for activity in projection
                 .activities
@@ -1186,6 +1234,11 @@ impl Renderer {
                         } else {
                             lines.extend(Text::raw(message.content.clone()).lines);
                         }
+                        lines.extend(crate::markdown::render(
+                            &source_references(language, message.source_references.as_ref()),
+                            area.width,
+                            Style::default(),
+                        ));
                         if !message.filesystem_references.is_empty() {
                             lines.push(Line::from(Span::styled(
                                 language.format(
@@ -1211,6 +1264,11 @@ impl Renderer {
                             &narrative.content,
                             area.width,
                             Style::default().fg(Color::Gray),
+                        ));
+                        lines.extend(crate::markdown::render(
+                            &source_references(language, narrative.source_references.as_ref()),
+                            area.width,
+                            Style::default(),
                         ));
                     }
                     TimelineItem::Plan { value: plan, .. } => {
@@ -2375,8 +2433,64 @@ fn reasoning_effort_label<'a>(language: Language, value: &'a str) -> &'a str {
         "low" => "tui.reasoning.low",
         "medium" => "tui.reasoning.medium",
         "high" => "tui.reasoning.high",
+        "xhigh" => "tui.reasoning.xhigh",
         "max" => "tui.reasoning.max",
         _ => return value,
     };
     language.text(key)
+}
+
+fn source_references(
+    language: Language,
+    references: Option<&deepcode_kernel_client::SourceReferences>,
+) -> String {
+    let mut text = String::new();
+    if let Some(references) = references {
+        for citation in &references.citations {
+            text.push_str(&format!(
+                "- [{}](<{}>)\n",
+                citation.title.replace('[', "\\[").replace(']', "\\]"),
+                citation.url
+            ));
+        }
+        if references.unresolved {
+            text.push_str(language.text("agent.sources.unresolved"));
+            text.push('\n');
+        }
+    }
+    text
+}
+
+#[cfg(test)]
+mod approval_presentation_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn model_review_and_user_decision_have_distinct_actions_and_exact_details() {
+        let mut projection: SessionProjection = serde_json::from_value(json!({
+            "schemaVersion":deepcode_kernel_client::SESSION_PROJECTION_VERSION,"sessionId":"session:test","revision":1,
+            "display":{"creationTitle":"Review"},"workspaceBindings":[],"sessionDirectoryIndexes":[],"messages":[],"queuedInputs":[],
+            "narratives":[],"timeline":[],"plans":[],"contextCompositions":[],"tokenUsageHistory":[],"activities":[],"artifacts":[],
+            "permissionOverrides":{},"effectivePermissions":null,"shellAuthorizations":[],
+            "tokenUsage":{"providerCallCount":0,"reportedCallCount":0,"inputTokens":0,"outputTokens":0,"cacheReadInputTokens":0,"cacheMissInputTokens":0,"cacheAvailable":false,"cacheComplete":false},
+            "run":{"runId":"run:test","profileId":"profile:test","workspaceBindings":[],"status":"running"},
+            "pendingApproval":{"approvalId":"approval:test","runId":"run:test","callId":"call:test","sequence":2,"createdAt":"now",
+                "preview":{"summary":"Inspect","effects":["process"],"logicalTargets":["."],"approvalReviewer":"agent",
+                    "operation":{"toolName":"bash","arguments":{"command":"git status"},"workspaceRoot":"/project","executionScope":"workspace"},
+                    "fileAccess":{"read":["/references"],"write":[]},"review":{"decision":"ask","reason":"Scope needs confirmation"}}}
+        })).unwrap();
+        let reviewing = decision_details(Language::ZhCn, Some(&projection));
+        assert!(reviewing.contains("模型正在审查"));
+        assert!(
+            reviewing.contains("git status")
+                && reviewing.contains("/project")
+                && reviewing.contains("/references")
+        );
+        assert!(reviewing.contains("Scope needs confirmation"));
+        assert!(!reviewing.contains("/reply"));
+        projection.run.as_mut().unwrap().status = "waiting".into();
+        let waiting = decision_details(Language::ZhCn, Some(&projection));
+        assert!(waiting.contains("/reply"));
+    }
 }

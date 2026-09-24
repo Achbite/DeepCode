@@ -27,20 +27,6 @@ import './styles/deepcodeDesignTokens.css';
 
 const DeepCodeWorkbenchLayout = lazy(() => import('./layout/DeepCodeWorkbenchLayout'));
 
-function afterFirstPaint(task: () => void): () => void {
-  let cancelled = false;
-  const frame = window.requestAnimationFrame(() => {
-    window.setTimeout(() => {
-      if (!cancelled) task();
-    }, 0);
-  });
-  return () => {
-    cancelled = true;
-    window.cancelAnimationFrame(frame);
-  };
-}
-
-
 const HOST_STARTUP_MESSAGE_KEYS: Readonly<Record<string, string>> = {
   host_startup_idle: 'deepcodeGui.hostStartup.idle',
   host_startup_status_unavailable: 'deepcodeGui.hostStartup.statusUnavailable',
@@ -267,12 +253,9 @@ const DeepCodeGuiApp: React.FC = () => {
         }
       }
     };
-    const cancelFirstPaint = afterFirstPaint(() => {
-      void check();
-    });
+    void check();
     return () => {
       cancelled = true;
-      cancelFirstPaint();
       if (timeout) window.clearTimeout(timeout);
     };
   }, [

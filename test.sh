@@ -7,6 +7,7 @@ cd "$ROOT_DIR"
 source "$ROOT_DIR/scripts/source-identity.sh"
 
 profile='required'
+skipped_checks=0
 if [ "${1:-}" = '--profile' ]; then
   [ "$#" -eq 2 ] || { printf '用法：%s --profile <static|required|cli|full>\n' "$0" >&2; exit 2; }
   profile="$2"
@@ -45,6 +46,7 @@ run_static() {
     git -C "$ROOT_DIR" diff --check
   else
     printf '[test] Git diff check: SKIP (Git metadata is host-owned and unavailable in this compile/test snapshot)\n'
+    skipped_checks=$((skipped_checks + 1))
   fi
 }
 
@@ -68,6 +70,23 @@ run_required() {
   pnpm --filter @deepcode/client typecheck
 }
 
+run_workspace_shell() {
+  printf '[test] Workspace Shell CLI\n'
+  local workspace_status=0
+  python3 -I -S ./scripts/tests/workspace-shell-cli.py || workspace_status=$?
+  case "$workspace_status" in
+    0) ;;
+    77)
+      skipped_checks=$((skipped_checks + 1))
+      printf '[test] Workspace Shell CLI: SKIP (sandbox UNAVAILABLE; see the reason above; isolation was not verified)\n'
+      ;;
+    *)
+      printf '[test] Workspace Shell CLI: FAIL (exit=%s)\n' "$workspace_status" >&2
+      return "$workspace_status"
+      ;;
+  esac
+}
+
 # E2E scripts consume the outputs selected here; direct calls must supply these paths.
 if [ "$profile" = cli ] || [ "$profile" = full ]; then
   test_target_dir="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
@@ -87,6 +106,7 @@ case "$profile" in
     python3 -I -S ./scripts/tests/tool-input-cli-e2e.py
     python3 -I -S ./scripts/tests/permission-delegation-cli.py
     python3 -I -S ./scripts/tests/file-access-cli.py
+    run_workspace_shell
     python3 -I -S ./scripts/tests/managed-process-cli.py
     python3 -I -S ./scripts/tests/conversation-storage.py
     ;;
@@ -99,6 +119,7 @@ case "$profile" in
     python3 -I -S ./scripts/tests/tool-input-cli-e2e.py
     python3 -I -S ./scripts/tests/permission-delegation-cli.py
     python3 -I -S ./scripts/tests/file-access-cli.py
+    run_workspace_shell
     python3 -I -S ./scripts/tests/managed-process-cli.py
     python3 -I -S ./scripts/tests/conversation-storage.py
     python3 -I -S ./scripts/tests/local-agent-e2e.py
@@ -106,4 +127,4 @@ case "$profile" in
     ;;
 esac
 
-printf '[test] 登记链路检查完成 profile=%s（不等于效果、稳定性、真实 Provider 或发布验收）\n' "$profile"
+printf '[test] 登记链路检查完成 profile=%s，入口跳过=%s（SKIP 不计通过；测试不等于效果、稳定性、真实 Provider 或发布验收）\n' "$profile" "$skipped_checks"

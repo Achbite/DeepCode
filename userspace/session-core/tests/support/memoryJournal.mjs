@@ -1,4 +1,5 @@
 import { SESSION_EVENT_VERSION } from '@deepcode/protocol';
+import { assertRuntimeContract } from './runtimeContract.mjs';
 
 /** Test storage adapter. SQLite atomicity is verified by the store tests. */
 export class InMemoryCommandJournal {
@@ -61,6 +62,7 @@ export class InMemoryCommandJournal {
     return await this.serial(async () => {
       const key = commandKey(command.sessionId, command.commandId);
       if (this.#commands.has(key)) throw new Error('command_already_recorded');
+      if (reply.status !== 'rejected') assertRuntimeContract('ConversationCommand', command);
       for (const event of events) this.appendNow(event);
       const revision = this.#events.get(command.sessionId)?.at(-1)?.sequence ?? 0;
       const admitted = { ...reply, revision };
@@ -84,6 +86,7 @@ export class InMemoryCommandJournal {
       sequence,
       occurredAt: new Date().toISOString(),
     };
+    assertRuntimeContract('SessionEvent', committed);
     events.push(committed);
     return structuredClone(committed);
   }

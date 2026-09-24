@@ -1,341 +1,66 @@
-use super::{os::*, *};
-use crate::executors::windows_job as job;
-use std::io::{Read, Write};
+use super::{finish, os::*, profile::Profile, token};
+use crate::executors::windows_job::ProcessJob;
+use std::fs::File;
 use std::os::windows::io::FromRawHandle;
+use std::process::Command;
 use std::ptr::{null, null_mut};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::{
-    Foundation::*, Security::SECURITY_ATTRIBUTES, Storage::FileSystem::*, System::Console::*,
-    System::Pipes::*, System::Threading::*,
+    Foundation::*,
+    Security::*,
+    System::{Console::*, Pipes::CreatePipe, Threading::*},
 };
 
-struct Child {
+pub(crate) struct Child {
     process: Handle,
-    job: job::ProcessJob,
+    job: ProcessJob,
+    console: Option<Console>,
+    pub(crate) stdin: Option<File>,
+    pub(crate) stdout: Option<File>,
+    pub(crate) stderr: Option<File>,
     active: bool,
 }
 impl Child {
-    fn from_info(info: PROCESS_INFORMATION) -> Result<Self, String> {
-        let process = Handle(info.hProcess);
-        let thread = Handle(info.hThread);
-        let job = match job::ProcessJob::attach_handle(process.0) {
-            Ok(job) => job,
-            Err(error) => {
-                return finish(
-                    Err(error.to_string()),
-                    terminate_suspended_process(process.0),
-                );
+    pub(crate) fn poll(&self) -> Result<Option<i32>, String> {
+        match unsafe { WaitForSingleObject(self.process.0, 0) } {
+            WAIT_TIMEOUT => Ok(None),
+            WAIT_OBJECT_0 => {
+                let mut code = 0;
+                if unsafe { GetExitCodeProcess(self.process.0, &mut code) } == 0 {
+                    return Err(error("Read sandbox exit code"));
+                }
+                Ok(Some(code as i32))
             }
-        };
-        if unsafe { ResumeThread(thread.0) } == u32::MAX {
-            let failure = error("Resume sandbox process");
-            return finish(Err(failure), terminate_suspended_process(process.0));
+            _ => Err(error("Poll sandbox process")),
         }
-        Ok(Self {
-            process,
-            job,
-            active: true,
-        })
     }
-    fn stop(&mut self) -> Result<(), String> {
+
+    pub(crate) fn stop(&mut self) -> Result<(), String> {
+        if !self.active {
+            return Ok(());
+        }
         self.job.terminate().map_err(|error| error.to_string())?;
-        if unsafe { WaitForSingleObject(self.process.0, INFINITE) } != WAIT_OBJECT_0 {
+        if unsafe { WaitForSingleObject(self.process.0, 30_000) } != WAIT_OBJECT_0 {
             return Err(error("Reap sandbox process"));
         }
+        self.job.wait_empty().map_err(|error| error.to_string())?;
         self.active = false;
         Ok(())
     }
 
-    fn poll(&self) -> Result<Option<i32>, String> {
-        let wait = unsafe { WaitForSingleObject(self.process.0, 0) };
-        if wait == WAIT_TIMEOUT {
-            return Ok(None);
-        }
-        if wait != WAIT_OBJECT_0 {
-            return Err(error("Wait for sandbox process"));
-        }
-        let mut code = 0;
-        if unsafe { GetExitCodeProcess(self.process.0, &mut code) } == 0 {
-            return Err(error("Read process exit code"));
-        }
-        Ok(Some(code as i32))
-    }
-    fn wait(&mut self) -> Result<i32, String> {
-        loop {
-            if let Some(code) = self.poll()? {
-                self.active = false;
-                return Ok(code);
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+    /// Output readers must already be running: ClosePseudoConsole drains output.
+    pub(crate) fn close_console(&mut self) {
+        self.console.take();
     }
 }
 impl Drop for Child {
     fn drop(&mut self) {
-        if self.active {
-            if let Err(error) = self.stop() {
-                eprintln!("{error}");
-            }
+        if let Err(error) = self.stop() {
+            eprintln!("{error}");
         }
     }
 }
 
-fn finish<T>(result: Result<T, String>, cleanup: Result<(), String>) -> Result<T, String> {
-    match (result, cleanup) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}")),
-    }
-}
-
-fn finish_exit_status(
-    result: Result<i32, String>,
-    subsequent: Result<(), String>,
-) -> Result<i32, String> {
-    match (result, subsequent) {
-        (Ok(code), Err(error)) => Err(format!(
-            "Shell exited with status {code}; subsequent operation failed: {error}"
-        )),
-        (result, subsequent) => finish(result, subsequent),
-    }
-}
-
-fn terminate_suspended_process(process: HANDLE) -> Result<(), String> {
-    if unsafe { TerminateProcess(process, 1) } == 0 {
-        return Err(error("Terminate suspended sandbox process"));
-    }
-    if unsafe { WaitForSingleObject(process, INFINITE) } != WAIT_OBJECT_0 {
-        return Err(error("Reap suspended sandbox process"));
-    }
-    Ok(())
-}
-
-fn as_file(handle: Handle) -> fs::File {
-    let raw = handle.0;
-    std::mem::forget(handle);
-    unsafe { fs::File::from_raw_handle(raw) }
-}
-
-/// The ordinary user starts a fixed bootstrap under the initialized account.
-/// It exchanges only this invocation's output over an account-scoped local pipe.
-pub(super) fn proxy(path: &Path) -> Result<i32, String> {
-    let state = installation()?;
-    let mut request: Request = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    request.environment = std::env::vars().collect();
-    for name in ["TEMP", "TMP", "TMPDIR"] {
-        request.environment.insert(
-            name.into(),
-            request.temporary.to_string_lossy().into_owned(),
-        );
-    }
-    fs::write(
-        path,
-        serde_json::to_vec(&request).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    let pipe_name = format!(r"\\.\pipe\deepcode-shell-{}", random_text());
-    let security = descriptor(&format!(
-        "D:(A;;GA;;;{})(A;;GA;;;{})",
-        current_user_sid()?,
-        state.account_sid
-    ))?;
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: security.0,
-        bInheritHandle: 0,
-    };
-    let raw = unsafe {
-        CreateNamedPipeW(
-            wide(&pipe_name).as_ptr(),
-            // Switching from nonblocking connection to blocking reads requires
-            // write-attribute access, which the duplex server handle includes.
-            PIPE_ACCESS_DUPLEX,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
-            1,
-            65536,
-            65536,
-            0,
-            &attributes,
-        )
-    };
-    if raw == INVALID_HANDLE_VALUE {
-        return Err(error("Create Shell output pipe"));
-    }
-    let pipe = Handle(raw);
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let command = [
-        exe.to_string_lossy().into_owned(),
-        "--workspace-sandbox-worker".into(),
-        path.to_string_lossy().into_owned(),
-        pipe_name,
-    ]
-    .iter()
-    .map(|s| quote(s))
-    .collect::<Vec<_>>()
-    .join(" ");
-    let mut command = wide(command);
-    let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
-    startup.cb = std::mem::size_of_val(&startup) as u32;
-    let password = setup::password(&state)?;
-    if unsafe {
-        CreateProcessWithLogonW(
-            wide(&state.account).as_ptr(),
-            wide(".").as_ptr(),
-            wide(&password).as_ptr(),
-            0,
-            wide(&exe).as_ptr(),
-            command.as_mut_ptr(),
-            CREATE_NO_WINDOW | CREATE_SUSPENDED,
-            null(),
-            process_path(&request.cwd).as_ptr(),
-            &startup,
-            &mut info,
-        )
-    } == 0
-    {
-        return Err(error("Start sandbox account worker"));
-    }
-    let mut child = Child::from_info(info)?;
-    let result = (|| {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let connected = unsafe { ConnectNamedPipe(pipe.0, null_mut()) };
-            let pipe_error = unsafe { GetLastError() };
-            // A fast worker may already have written its result and disconnected.
-            // Read that buffered result before inspecting its process exit status.
-            if connected != 0 || matches!(pipe_error, ERROR_PIPE_CONNECTED | ERROR_NO_DATA) {
-                break;
-            }
-            if pipe_error != ERROR_PIPE_LISTENING {
-                return Err(error("Connect Shell output pipe"));
-            }
-            if let Some(code) = child.poll()? {
-                return Err(format!(
-                    "Sandbox worker exited before connecting (exit {code})."
-                ));
-            }
-            if Instant::now() >= deadline {
-                return Err("Sandbox worker connection timed out.".into());
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let mode = PIPE_READMODE_BYTE | PIPE_WAIT;
-        if unsafe { SetNamedPipeHandleState(pipe.0, &mode, null(), null()) } == 0 {
-            return Err(error("Configure Shell output pipe"));
-        }
-        let mut reader = as_file(pipe);
-        loop {
-            let mut header = [0u8; 5];
-            reader
-                .read_exact(&mut header)
-                .map_err(|e| format!("Read sandbox output: {e}"))?;
-            let len = u32::from_le_bytes(header[1..].try_into().unwrap()) as usize;
-            let mut payload = vec![0u8; len];
-            reader.read_exact(&mut payload).map_err(|e| e.to_string())?;
-            match header[0] {
-                1 => {
-                    std::io::stdout()
-                        .write_all(&payload)
-                        .and_then(|_| std::io::stdout().flush())
-                        .map_err(|e| e.to_string())?;
-                }
-                2 => {
-                    std::io::stderr()
-                        .write_all(&payload)
-                        .and_then(|_| std::io::stderr().flush())
-                        .map_err(|e| e.to_string())?;
-                }
-                3 => return Err(String::from_utf8_lossy(&payload).into_owned()),
-                4 => {
-                    let code = i32::from_le_bytes(
-                        payload
-                            .as_slice()
-                            .try_into()
-                            .map_err(|_| "Invalid sandbox exit result")?,
-                    );
-                    return finish_exit_status(Ok(code), child.wait().map(|_| ()));
-                }
-                _ => return Err("Invalid sandbox output frame.".into()),
-            }
-        }
-    })();
-    finish_exit_status(result, child.stop())
-}
-
-type Output = Arc<Mutex<fs::File>>;
-fn send(output: &Output, kind: u8, bytes: &[u8]) -> Result<(), String> {
-    let mut writer = output.lock().map_err(|_| "Shell output lock failed")?;
-    writer
-        .write_all(&[kind])
-        .and_then(|_| writer.write_all(&(bytes.len() as u32).to_le_bytes()))
-        .and_then(|_| writer.write_all(bytes))
-        .and_then(|_| writer.flush())
-        .map_err(|e| e.to_string())
-}
-fn pump(
-    mut reader: fs::File,
-    output: Output,
-    kind: u8,
-) -> std::thread::JoinHandle<Result<(), String>> {
-    std::thread::spawn(move || {
-        let mut bytes = [0u8; 8192];
-        loop {
-            match reader.read(&mut bytes) {
-                Ok(0) => return Ok(()),
-                Ok(count) => send(&output, kind, &bytes[..count])?,
-                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-    })
-}
-
-pub(super) fn worker(path: &Path, pipe: &str) -> Result<i32, String> {
-    let raw = unsafe {
-        CreateFileW(
-            wide(pipe).as_ptr(),
-            GENERIC_WRITE,
-            0,
-            null(),
-            OPEN_EXISTING,
-            0,
-            null_mut(),
-        )
-    };
-    if raw == INVALID_HANDLE_VALUE {
-        return Err(error("Connect Shell output pipe"));
-    }
-    let output = Arc::new(Mutex::new(as_file(Handle(raw))));
-    let result = (|| {
-        let request: Request = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-        run(request, output.clone())
-    })();
-    match result {
-        Ok(code) => finish_exit_status(Ok(code), send(&output, 4, &code.to_le_bytes())),
-        Err(error) => {
-            let sent = send(&output, 3, error.as_bytes());
-            finish(Err(error), sent)
-        }
-    }
-}
-
-fn pipe() -> Result<(Handle, Handle), String> {
-    let mut read = null_mut();
-    let mut write = null_mut();
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: null_mut(),
-        bInheritHandle: 1,
-    };
-    if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
-        return Err(error("Create process pipe"));
-    }
-    Ok((Handle(read), Handle(write)))
-}
 struct Console(HPCON);
 impl Drop for Console {
     fn drop(&mut self) {
@@ -344,40 +69,43 @@ impl Drop for Console {
         }
     }
 }
+
 struct Attributes {
     _storage: Vec<usize>,
     pointer: LPPROC_THREAD_ATTRIBUTE_LIST,
 }
 impl Attributes {
-    fn console(console: HPCON) -> Result<Self, String> {
+    fn new(count: u32) -> Result<Self, String> {
         let mut size = 0;
         unsafe {
-            InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size);
+            InitializeProcThreadAttributeList(null_mut(), count, 0, &mut size);
         }
         let mut storage = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
         let pointer = storage.as_mut_ptr().cast();
-        if unsafe { InitializeProcThreadAttributeList(pointer, 1, 0, &mut size) } == 0 {
-            return Err(error("Initialize console process attributes"));
+        if unsafe { InitializeProcThreadAttributeList(pointer, count, 0, &mut size) } == 0 {
+            return Err(error("Initialize LPAC process attributes"));
         }
-        let attributes = Self {
+        Ok(Self {
             _storage: storage,
             pointer,
-        };
+        })
+    }
+    fn add(&self, key: u32, value: *const std::ffi::c_void, size: usize) -> Result<(), String> {
         if unsafe {
             UpdateProcThreadAttribute(
-                pointer,
+                self.pointer,
                 0,
-                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                console as *const _,
-                std::mem::size_of::<HPCON>(),
+                key as usize,
+                value,
+                size,
                 null_mut(),
                 null(),
             )
         } == 0
         {
-            return Err(error("Attach Shell console"));
+            return Err(error(&format!("Set LPAC process attribute {key:#x}")));
         }
-        Ok(attributes)
+        Ok(())
     }
 }
 impl Drop for Attributes {
@@ -388,39 +116,77 @@ impl Drop for Attributes {
     }
 }
 
-fn run(request: Request, output: Output) -> Result<i32, String> {
-    let mut desktop = super::desktop::PrivateDesktop::new(&request.write_sid)?;
-    let token = restricted_token(&request.write_sid)?;
+fn pipe() -> Result<(Handle, Handle), String> {
+    let (mut read, mut write) = (null_mut(), null_mut());
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: null_mut(),
+        bInheritHandle: 1,
+    };
+    if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
+        return Err(error("Create sandbox pipe"));
+    }
+    Ok((Handle(read), Handle(write)))
+}
+fn as_file(handle: Handle) -> File {
+    let raw = handle.0;
+    std::mem::forget(handle);
+    unsafe { File::from_raw_handle(raw) }
+}
+
+pub(super) fn spawn(
+    command: &Command,
+    terminal: bool,
+    profile: &Profile,
+    prepare: impl FnOnce(HANDLE) -> Result<(), String>,
+) -> Result<Child, String> {
     let (input_read, input_write) = pipe()?;
     let (output_read, output_write) = pipe()?;
-    let terminal = request.stdin.is_some();
-    let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
-    startup.StartupInfo.lpDesktop = desktop.path.as_mut_ptr();
-    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-    let mut console = None;
-    let mut attributes = None;
     let mut stderr = None;
     let mut stderr_child = None;
-    let mut flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT;
+    let mut console = None;
+    let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    let attributes = Attributes::new(3)?;
+    let security = profile.security();
+    attributes.add(
+        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+        (&security as *const SECURITY_CAPABILITIES).cast(),
+        std::mem::size_of_val(&security),
+    )?;
+    // LPAC opts out of ALL APPLICATION PACKAGES; ordinary AAP or Everyone
+    // permissions must not turn into permission to read the user's other files.
+    let opt_out: u32 = 1; // PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT
+    attributes.add(
+        PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
+        (&opt_out as *const u32).cast(),
+        std::mem::size_of_val(&opt_out),
+    )?;
+    let mut flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
+    let mut inherited = Vec::new();
     if terminal {
-        let mut hpc = 0;
+        // Prevent Windows from copying the worker's redirected std handles into
+        // the ConPTY client. Null handles are supplied by the pseudoconsole.
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        let mut raw = 0;
         let result = unsafe {
             CreatePseudoConsole(
                 COORD { X: 120, Y: 30 },
                 input_read.0,
                 output_write.0,
                 0,
-                &mut hpc,
+                &mut raw,
             )
         };
         if result < 0 {
-            return Err(format!("Create Shell console: HRESULT {result:#x}"));
+            return Err(format!("Create sandbox terminal: HRESULT {result:#x}"));
         }
-        console = Some(Console(hpc));
-        attributes = Some(Attributes::console(hpc)?);
-        startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-        startup.lpAttributeList = attributes.as_ref().unwrap().pointer;
-        flags |= EXTENDED_STARTUPINFO_PRESENT;
+        console = Some(Console(raw));
+        attributes.add(
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+            raw as *const _,
+            std::mem::size_of::<HPCON>(),
+        )?;
     } else {
         let (read, write) = pipe()?;
         stderr = Some(read);
@@ -429,101 +195,143 @@ fn run(request: Request, output: Output) -> Result<i32, String> {
         startup.StartupInfo.hStdInput = input_read.0;
         startup.StartupInfo.hStdOutput = output_write.0;
         startup.StartupInfo.hStdError = stderr_child.as_ref().unwrap().0;
+        inherited.extend([
+            input_read.0,
+            output_write.0,
+            stderr_child.as_ref().unwrap().0,
+        ]);
+        attributes.add(
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            inherited.as_ptr().cast(),
+            inherited.len() * std::mem::size_of::<HANDLE>(),
+        )?;
         flags |= CREATE_NO_WINDOW;
     }
-    // Parent pipe ends must not keep the child's stream alive after exit.
+    startup.lpAttributeList = attributes.pointer;
     for handle in [Some(&input_write), Some(&output_read), stderr.as_ref()]
         .into_iter()
         .flatten()
     {
         if unsafe { SetHandleInformation(handle.0, HANDLE_FLAG_INHERIT, 0) } == 0 {
-            return Err(error("Configure process pipe inheritance"));
+            return Err(error("Configure sandbox pipe inheritance"));
         }
     }
-    let mut command = wide(
-        std::iter::once(request.executable.to_string_lossy().into_owned())
-            .chain(request.arguments.clone())
-            .map(|s| quote(&s))
+    let mut argv = wide(
+        std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(|arg| quote(&arg.to_string_lossy()))
             .collect::<Vec<_>>()
             .join(" "),
     );
-    let mut environment = request.environment.iter().collect::<Vec<_>>();
-    environment.sort_by_key(|(key, _)| key.to_ascii_uppercase());
-    let mut environment: Vec<u16> = environment
-        .into_iter()
-        .flat_map(|(key, value)| wide(format!("{key}={value}")))
-        .collect();
+    // The caller clears inherited environment and supplies the admitted snapshot.
+    let mut entries = command
+        .get_envs()
+        .filter_map(|(key, value)| value.map(|value| (key, value)))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(key, _)| key.to_string_lossy().to_uppercase());
+    let mut environment = Vec::new();
+    for (key, value) in entries {
+        let mut entry = key.to_os_string();
+        entry.push("=");
+        entry.push(value);
+        environment.extend(wide(entry));
+    }
     environment.push(0);
+    let cwd = command
+        .get_current_dir()
+        .ok_or("Sandbox working directory is missing")?;
     let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe {
-        CreateProcessAsUserW(
-            token.0,
-            wide(&request.executable).as_ptr(),
-            command.as_mut_ptr(),
+        CreateProcessW(
+            wide(command.get_program()).as_ptr(),
+            argv.as_mut_ptr(),
             null(),
             null(),
             i32::from(!terminal),
             flags,
             environment.as_ptr().cast(),
-            process_path(&request.cwd).as_ptr(),
+            process_path(cwd).as_ptr(),
             &startup.StartupInfo,
             &mut info,
         )
     } == 0
     {
-        return Err(error("Start restricted Shell"));
+        return Err(error("Start LPAC Shell"));
     }
-    let mut child = Child::from_info(info)?;
+    let process = Handle(info.hProcess);
+    let thread = Handle(info.hThread);
+    let job = match ProcessJob::attach_handle(process.0) {
+        Ok(job) => job,
+        Err(error) => return finish(Err(error.to_string()), terminate_suspended(process.0)),
+    };
+    // A packaged executable adds package identity to the actual token. Evaluate
+    // runtime access with that token, then install invocation grants before any
+    // Shell instruction runs.
+    let prepared = token::verified(process.0).and_then(|token| prepare(token.0));
+    if let Err(error) = prepared {
+        return finish(Err(error), terminate_suspended(process.0));
+    }
+    // No instruction runs before the complete descendant lifetime is owned.
+    if unsafe { ResumeThread(thread.0) } == u32::MAX {
+        return finish(
+            Err(error("Resume LPAC Shell")),
+            terminate_suspended(process.0),
+        );
+    }
     drop(input_read);
     drop(output_write);
     drop(stderr_child);
-    drop(attributes);
-    let stdout_thread = pump(as_file(output_read), output.clone(), 1);
-    let stderr_thread = stderr.map(|read| pump(as_file(read), output, 2));
-    let mut input = as_file(input_write);
-    let input_thread = std::thread::spawn(move || {
-        if let Some(text) = request.stdin {
-            let text = if terminal {
-                text.replace("\r\n", "\n").replace('\n', "\r")
-            } else {
-                text
-            };
-            input.write_all(text.as_bytes())?;
-            input.flush()?;
-        }
-        // Closing ConPTY input signals terminal shutdown and terminates its
-        // client. Keep it owned by the join result until the Shell has exited.
-        Ok::<_, std::io::Error>(terminal.then_some(input))
-    });
-    let status = child.wait();
-    // Stop descendants before joining streams that they may still hold open.
-    let cleanup = child.stop();
-    if cleanup.is_err() {
-        return finish_exit_status(status, cleanup);
+    Ok(Child {
+        process,
+        job,
+        console,
+        stdin: Some(as_file(input_write)),
+        stdout: Some(as_file(output_read)),
+        stderr: stderr.map(as_file),
+        active: true,
+    })
+}
+
+fn terminate_suspended(process: HANDLE) -> Result<(), String> {
+    if unsafe { TerminateProcess(process, 1) } == 0 {
+        return Err(error("Terminate suspended Shell"));
     }
-    drop(child);
-    drop(console);
-    let input_result = input_thread
-        .join()
-        .map_err(|_| "Shell input writer failed".to_string())
-        .and_then(|result| {
-            result
-                .map(|_| ())
-                .map_err(|error| format!("Write Shell input: {error}"))
-        });
-    let stdout_result = stdout_thread
-        .join()
-        .map_err(|_| "Shell stdout reader failed".to_string())
-        .and_then(|result| result);
-    let stderr_result = match stderr_thread {
-        Some(reader) => reader
-            .join()
-            .map_err(|_| "Shell stderr reader failed".to_string())
-            .and_then(|result| result),
-        None => Ok(()),
-    };
-    finish_exit_status(
-        status,
-        finish(finish(input_result, stdout_result), stderr_result),
-    )
+    if unsafe { WaitForSingleObject(process, 30_000) } != WAIT_OBJECT_0 {
+        return Err(error("Reap suspended Shell"));
+    }
+    Ok(())
+}
+
+pub(super) fn probe(profile: &Profile) -> Result<(), String> {
+    let system = std::env::var_os("SystemRoot").ok_or("SystemRoot is missing")?;
+    let directory = std::path::PathBuf::from(&system).join("System32");
+    let mut command = Command::new(directory.join("cmd.exe"));
+    command
+        .args(["/d", "/c", "exit", "0"])
+        .current_dir(&directory)
+        .env_clear()
+        .env("SystemRoot", &system)
+        // CreateProcess requires LOCALAPPDATA to initialize an AppContainer even
+        // when the probe itself needs no writable files.
+        .env(
+            "LOCALAPPDATA",
+            std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is missing")?,
+        );
+    let mut child = spawn(&command, false, profile, |_| Ok(()))?;
+    child.stdin.take();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let result = (|| loop {
+        if let Some(code) = child.poll()? {
+            return if code == 0 {
+                Ok(())
+            } else {
+                Err(format!("LPAC support check exited with status {code}"))
+            };
+        }
+        if Instant::now() >= deadline {
+            return Err("LPAC support check timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    })();
+    finish(result, child.stop())
 }

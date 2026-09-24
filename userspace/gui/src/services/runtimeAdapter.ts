@@ -9,7 +9,7 @@ type TauriCoreApi = {
 declare global {
   interface Window {
     __TAURI__?: { core?: TauriCoreApi; event?: {listen<T>(name:string,listener:(event:{payload:T})=>void):Promise<()=>void>} };
-    __DEEPCODE_SELF_PREVIEW__?: boolean;
+    __DEEPCODE_BROWSER_PREVIEW__?: boolean;
   }
 }
 
@@ -39,12 +39,13 @@ export interface HostStartupStatusV1 {
 }
 
 function tauriInvoke(): TauriCoreApi['invoke'] | null {
-  if (window.__DEEPCODE_SELF_PREVIEW__) return null;
+  if (window.__DEEPCODE_BROWSER_PREVIEW__) return null;
   return window.__TAURI__?.core?.invoke ?? null;
 }
 
 export interface NativePathOptions {
   kind: 'file' | 'directory' | 'path';
+  multiple?: boolean;
   title: string;
   selectLabel?: string;
   cancelLabel?: string;
@@ -61,28 +62,34 @@ export interface NativePathSelection {
   kind: 'file' | 'directory';
 }
 
-export async function pickNativePath(options: NativePathOptions): Promise<NativePathSelection | null> {
+export async function pickNativePaths(options: NativePathOptions): Promise<NativePathSelection[] | null> {
   if (!hasNativePathPicker()) throw new Error('native_path_picker_unavailable');
   if (options.kind === 'path') {
-    return tauriInvoke()!<NativePathSelection | null>('deepcode_pick_path', { options: {
+    return tauriInvoke()!<NativePathSelection[] | null>('deepcode_pick_path', { options: {
       title: options.title,
       selectLabel: options.selectLabel ?? 'Select',
       cancelLabel: options.cancelLabel ?? 'Cancel',
       defaultPath: options.defaultPath,
       filters: options.filters ?? [],
+      multiple: options.multiple ?? false,
     } });
   }
   const { open } = await import('@tauri-apps/plugin-dialog');
-  // The OS owns path syntax (including Windows drive letters and UNC shares).
-  // Cancellation is null; errors remain errors and do not open a second picker.
-  const path = await open({
+  const paths = await open({
     title: options.title,
     directory: options.kind === 'directory',
-    multiple: false,
+    multiple: options.kind === 'file' && options.multiple === true,
     defaultPath: options.defaultPath,
     filters: options.filters,
   });
-  return path === null ? null : { path, kind: options.kind };
+  return paths === null ? null : (Array.isArray(paths) ? paths : [paths]).map(path => ({ path, kind: options.kind as 'file' | 'directory' }));
+}
+
+export async function pickNativePath(options: NativePathOptions): Promise<NativePathSelection | null> {
+  const paths = await pickNativePaths({ ...options, multiple: false });
+  if (paths === null) return null;
+  if (paths.length !== 1) throw new Error('native_path_selection_count_invalid');
+  return paths[0];
 }
 
 async function windowCommand(

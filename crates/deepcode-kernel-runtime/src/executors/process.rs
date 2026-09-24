@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(windows)]
+mod windows_workspace;
 use crate::shell_environment::{prepare_script_arguments, ShellProgram};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::ffi::OsString;
@@ -250,7 +252,43 @@ fn invoke_shell_in_temp(
                 .env("XDG_CONFIG_HOME", home.join("config"))
                 .env("XDG_CACHE_HOME", home.join("cache"))
                 .env("GIT_OPTIONAL_LOCKS", "0");
+            #[cfg(windows)]
+            {
+                for directory in [home.join("AppData/Roaming"), home.join("AppData/Local")] {
+                    fs::create_dir_all(directory).map_err(|error| {
+                        KernelError::Other(format!("Create Agent application data: {error}"))
+                    })?;
+                }
+                process
+                    .env("USERPROFILE", home)
+                    .env("APPDATA", home.join("AppData/Roaming"))
+                    .env("LOCALAPPDATA", home.join("AppData/Local"));
+            }
         }
+        #[cfg(windows)]
+        let mut result = if execution_scope == "workspace" {
+            windows_workspace::execute(
+                invocation.id,
+                process,
+                timeout_seconds,
+                tool_name,
+                &context,
+                &workspace_root,
+                &workspace_mode,
+                temporary,
+                terminal_stdin.as_deref(),
+            )?
+        } else {
+            execute_cli_command(
+                invocation.id,
+                process,
+                timeout_seconds,
+                tool_name,
+                &context,
+                None,
+            )?
+        };
+        #[cfg(not(windows))]
         let mut result = execute_cli_command(
             invocation.id,
             process,
@@ -891,6 +929,7 @@ fn prepare_shell_command(
                 workspace_mode,
                 writable_targets,
                 files,
+                Some(&macos_user_temporary_directory()?),
             )?
             .into(),
             shell.executable.as_os_str().into(),
@@ -927,8 +966,12 @@ fn prepare_shell_command(
             workspace_root,
             workspace_mode,
         );
-        return Err(crate::workspace_sandbox::unavailable(&shell.tool,
-            "Strict file read isolation is not available in this Windows backend. Select a supported execution environment, or explicitly request Host permission."));
+        // This prepared command is consumed only by windows_workspace::execute;
+        // it must never be spawned directly for the workspace scope.
+        Ok(PreparedShellCommand {
+            program: shell.executable.clone(),
+            arguments: args.iter().map(OsString::from).collect(),
+        })
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
@@ -954,6 +997,7 @@ fn macos_workspace_profile(
     workspace_mode: &str,
     writable_targets: Option<&[WorkspaceWriteTarget]>,
     files: &crate::file_access::FileAccessScope,
+    system_temporary: Option<&Path>,
 ) -> KernelResult<String> {
     let escaped_workspace = macos_sandbox_path(workspace_root, "workspace")?;
     let escaped_temporary = macos_sandbox_path(temporary_root, "temporary directory")?;
@@ -1048,6 +1092,27 @@ fn macos_workspace_profile(
         };
         rules.push_str(&format!("\n(deny file-write* {filter})"));
     }
+    if let Some(directory) = system_temporary {
+        // xcrun locates its cache through confstr, independently of TMPDIR.
+        // It owns these shared toolchain cache files; other host scratch stays
+        // inaccessible and is never cleaned up by an Agent command lifecycle.
+        for path in crate::file_access::macos_path_spellings(directory) {
+            for ancestor in path.ancestors() {
+                let escaped = macos_sandbox_path(ancestor, "toolchain cache ancestor")?;
+                rules.push_str(&format!(
+                    "\n(allow file-read-metadata (literal \"{escaped}\"))"
+                ));
+            }
+            let pattern = macos_xcrun_cache_pattern(&path)?;
+            // SBPL regex literals preserve regex escapes; ordinary string
+            // escaping would turn an escaped path character into a backslash.
+            let escaped = pattern.replace('"', "\\\"");
+            let cache = macos_sandbox_path(&path.join("xcrun_db"), "toolchain cache")?;
+            rules.push_str(&format!(
+                "\n(allow file-read* file-write* (literal \"{cache}\") (regex #\"{escaped}\"))"
+            ));
+        }
+    }
     let base = include_str!("macos_workspace.sbpl").replace(
         "(deny network*)",
         if files.network_access {
@@ -1058,6 +1123,43 @@ fn macos_workspace_profile(
     );
     Ok(format!(
         "{base}{workspace_write_rule}{rules}\n(allow file-read* file-write* (subpath \"{escaped_temporary}\"))\n(deny mach-lookup (global-name \"{process_scope_id}\"))"
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_user_temporary_directory() -> KernelResult<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let size = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, std::ptr::null_mut(), 0) };
+    if size == 0 {
+        return Err(KernelError::Other(format!(
+            "Read macOS user temporary directory: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut buffer = vec![0u8; size];
+    let written = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buffer.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size || buffer.last() != Some(&0) {
+        return Err(KernelError::Other(
+            "macOS user temporary directory changed during lookup".into(),
+        ));
+    }
+    let path = Path::new(std::ffi::OsStr::from_bytes(&buffer[..size - 1]));
+    crate::file_access::resolve_path(path)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_xcrun_cache_pattern(directory: &Path) -> KernelResult<String> {
+    macos_sandbox_path(directory, "toolchain cache directory")?;
+    let directory = directory.to_str().expect("validated UTF-8 path");
+    Ok(format!(
+        "^{}/xcrun_db-[^/]+$",
+        regex::escape(directory.trim_end_matches('/'))
     ))
 }
 
@@ -1158,6 +1260,7 @@ mod plan_scope_tests {
             "write",
             Some(&targets),
             &crate::file_access::FileAccessScope::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -1172,6 +1275,7 @@ mod plan_scope_tests {
             "read",
             Some(&targets),
             &crate::file_access::FileAccessScope::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -1189,6 +1293,46 @@ mod plan_scope_tests {
             !read.contains("USER_TEMP_DIR"),
             "shared host temp is not an Agent resource"
         );
+    }
+
+    #[test]
+    fn macos_toolchain_dependencies_preserve_absent_probes_and_limit_cache_access() {
+        let files = crate::file_access::FileAccessScope {
+            read: crate::file_access::macos_system_read_paths(),
+            ..Default::default()
+        };
+        let directory = Path::new("/private/var/folders/test/user/T");
+        let policy = macos_workspace_profile(
+            Path::new("/fixture/workspace"),
+            Path::new("/fixture/private-temp"),
+            "scope-test",
+            "read",
+            None,
+            &files,
+            Some(directory),
+        )
+        .unwrap();
+        for path in [
+            "/etc/gitconfig",
+            "/private/etc/gitconfig",
+            "/var/select/developer_dir",
+            "/private/var/select/developer_dir",
+        ] {
+            assert!(policy.contains(&format!("(allow file-read* (literal \"{path}\"))")));
+        }
+        let matcher = regex::Regex::new(&macos_xcrun_cache_pattern(directory).unwrap()).unwrap();
+        assert!(policy.contains("(literal \"/private/var/folders/test/user/T/xcrun_db\")"));
+        assert!(matcher.is_match("/private/var/folders/test/user/T/xcrun_db-7rNZgfpy"));
+        assert!(!matcher.is_match("/private/var/folders/test/user/T/other-file"));
+        assert!(!matcher.is_match("/private/var/folders/test/user/T/nested/xcrun_db"));
+        assert!(!matcher.is_match("/private/var/folders/test/user/T/xcrun_db-child/nested"));
+        assert!(policy.contains("^/var/folders/test/user/T/xcrun_db"));
+        assert!(!policy.contains(
+            "(allow file-read* file-write* (subpath \"/private/var/folders/test/user/T\"))"
+        ));
+        assert!(policy.contains("(regex #\"^/private/tmp/sh-thd-[0-9]+$\")"));
+        assert!(!policy.contains("(subpath \"/private/tmp\")"));
+        assert!(!policy.contains("(subpath \"/tmp\")"));
     }
 }
 
@@ -1284,6 +1428,8 @@ fn spawn_output_reader(
                     thread::sleep(PROCESS_POLL_INTERVAL);
                     continue;
                 }
+                #[cfg(windows)]
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => break,
                 #[cfg(unix)]
                 Err(error) if _pty && error.raw_os_error() == Some(libc::EIO) => break,
                 Err(error) => return Err(error),
@@ -1914,18 +2060,43 @@ pub fn execute_cli_command(
     let stdout_result = join_output_reader(stdout_reader, "stdout");
     let stderr_result = join_output_reader(stderr_reader, "stderr");
 
-    let (mut stdout, mut stderr) = match combine_shell_results(stdout_result, stderr_result) {
+    let (stdout, stderr) = match combine_shell_results(stdout_result, stderr_result) {
         Ok(streams) => streams,
         Err(error) => return shell_cleanup_failure(wait_result, error),
     };
     let (status, timed_out, cancelled) = wait_result?;
+    complete_shell_output(
+        invocation_id,
+        tool_name,
+        timeout_seconds,
+        started,
+        status.code(),
+        timed_out,
+        cancelled,
+        archive,
+        stdout,
+        stderr,
+    )
+}
+
+fn complete_shell_output(
+    invocation_id: String,
+    tool_name: &str,
+    timeout_seconds: Option<u64>,
+    started: Instant,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    cancelled: bool,
+    archive: ShellOutputArchive,
+    mut stdout: CapturedOutput,
+    mut stderr: CapturedOutput,
+) -> KernelResult<KernelToolExecutionResult> {
     bound_combined_output(&mut stdout, &mut stderr, BASH_OUTPUT_LIMIT_BYTES);
     bound_output_lines(&mut stdout, &mut stderr);
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let captured_bytes = stdout.bytes.len().saturating_add(stderr.bytes.len());
     let truncated = stdout.truncated || stderr.truncated;
-    let exit_code = status.code();
-    let success = !timed_out && !cancelled && status.success();
+    let success = !timed_out && !cancelled && exit_code == Some(0);
 
     let mut output = serde_json::json!({
         "stdout": String::from_utf8_lossy(&stdout.bytes),

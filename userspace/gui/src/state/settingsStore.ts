@@ -56,9 +56,7 @@ type SettingDefinitionSchema = Omit<
 interface SettingsStateData {
   environment: Record<string, unknown> | null;
   userSettings: UserSettings;
-  runtimeUserSettings: UserSettings;
   effectiveSettings: UserSettings;
-  runtimeEffectiveSettings: UserSettings;
   sources: Record<string, SettingSource>;
   overriddenKeys: string[];
   storePath: string | null;
@@ -77,7 +75,6 @@ interface SettingsActions {
     patches: Record<string, UserSettingValue>,
   ) => Promise<UserSettingsActivation | null>;
   resetUserSetting: (key: string) => Promise<UserSettingsActivation | null>;
-  getSettingSource: (key: string) => SettingSource;
 }
 
 type SettingsStore = SettingsStateData & SettingsActions;
@@ -132,6 +129,9 @@ const SETTING_DEFINITION_SCHEMAS: SettingDefinitionSchema[] = [
     group: 'gui',
     control: 'boolean',
   },
+  { key: 'gui.usageWidget.currency', group: 'gui', control: 'select', options: ['USD', 'CNY'] },
+  { key: 'gui.usageWidget.enabled', group: 'gui', control: 'boolean' },
+  { key: 'gui.usageWidget.visibility', group: 'gui', control: 'select', options: ['summary', 'collapsed', 'hidden'] },
   { key: 'agent.windows.shell', group: 'agent', control: 'select', options: ['auto', 'powershell7', 'windowsPowerShell', 'gitBash'] },
   { key: 'agent.windows.gitBashPath', group: 'agent', control: 'text' },
   {
@@ -338,18 +338,12 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
       snapshot.settings,
       overriddenKeys,
     );
-    const runtime = buildEffectiveSettings(
-      snapshot.runtimeSettings,
-      overriddenKeys,
-    );
     set({
       environment: snapshot.environment ?? null,
       userSettings: snapshot.settings,
-      runtimeUserSettings: snapshot.runtimeSettings,
       overriddenKeys,
       storePath: snapshot.storePath,
       effectiveSettings: next.effectiveSettings,
-      runtimeEffectiveSettings: runtime.effectiveSettings,
       sources: next.sources,
       loading: false,
       pendingNextRunActivation: hasPendingNextRunActivation(
@@ -407,9 +401,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
   return {
     environment: null,
     userSettings: DEFAULT_USER_SETTINGS,
-    runtimeUserSettings: DEFAULT_USER_SETTINGS,
     effectiveSettings: initialEffective.effectiveSettings,
-    runtimeEffectiveSettings: initialEffective.effectiveSettings,
     sources: initialEffective.sources,
     overriddenKeys: [],
     storePath: null,
@@ -464,6 +456,5 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
       );
     },
 
-    getSettingSource: (key) => get().sources[key] ?? 'default',
   };
 });

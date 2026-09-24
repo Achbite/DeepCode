@@ -149,7 +149,7 @@ textarea {
   :root[data-product='deepcode-gui']:has(.local-agent--reading:not(.local-agent--expanded)) { --dc-titlebar-height: 72px; }
   .deepcode-gui-titlebar .local-agent__header--reading:not(.local-agent__header--expanded) { grid-template-columns: minmax(0, 1fr); grid-template-rows: 36px 36px; }
   .deepcode-gui-titlebar .local-agent__header--reading:not(.local-agent__header--expanded) .local-agent__header-preview { grid-column: 1; }
-  .deepcode-gui-titlebar .local-agent__header--reading:not(.local-agent__header--expanded) > div { padding-block: 0; }
+  .deepcode-gui-titlebar .local-agent__header--reading:not(.local-agent__header--expanded) :is(.local-agent__header-conversation, .local-agent__header-preview) { padding-block: 0; }
   .deepcode-gui-titlebar .local-agent__header--reading::after { display: none; }
 }
 

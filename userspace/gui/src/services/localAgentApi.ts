@@ -1,3 +1,4 @@
+import { isLlmReasoningEffort } from '@deepcode/protocol';
 import { isProcessActivity } from '@deepcode/protocol';
 import { isShellAuthorizationScope } from '@deepcode/protocol';
 import { validatePermissionPatches } from '@deepcode/protocol';
@@ -674,7 +675,7 @@ function isProjectionMessage(value: unknown): boolean {
   if (!isExactRecord(value, [
     'messageId', 'role', 'content', 'filesystemReferences',
     'pluginSelections', 'feedback', 'sequence', 'createdAt',
-  ], ['runId', 'providerRequestId', 'replyToInteraction', 'guidanceReferences'])) return false;
+  ], ['runId', 'providerRequestId', 'replyToInteraction', 'guidanceReferences', 'sourceReferences'])) return false;
   const hasRunId = value.runId !== undefined;
   const hasProviderRequestId = value.providerRequestId !== undefined;
   return isIdentifier(value.messageId)
@@ -683,6 +684,7 @@ function isProjectionMessage(value: unknown): boolean {
       && isIdentifier(value.replyToInteraction.interactionId) && isNonEmptyText(value.replyToInteraction.prompt))
     && ['user', 'assistant', 'tool', 'system'].includes(String(value.role))
     && typeof value.content === 'string'
+    && (value.sourceReferences === undefined || value.role === 'assistant' && isSourceReferences(value.sourceReferences))
     && isArrayOf(value.filesystemReferences, isFilesystemReference)
     && isArrayOf(value.pluginSelections, isPluginSelection)
     && (value.feedback === null || ['up', 'down'].includes(String(value.feedback)))
@@ -729,13 +731,20 @@ function isMediaType(value: unknown): value is string {
 function isNarrative(value: unknown): boolean {
   return isExactRecord(value, [
     'narrativeId', 'runId', 'providerRequestId', 'content', 'sequence', 'createdAt',
-  ])
+  ], ['sourceReferences'])
     && isIdentifier(value.narrativeId)
     && isIdentifier(value.runId)
     && isIdentifier(value.providerRequestId)
     && isNonEmptyText(value.content)
+    && (value.sourceReferences === undefined || isSourceReferences(value.sourceReferences))
     && isNaturalNumber(value.sequence)
     && isNonEmptyText(value.createdAt);
+}
+
+function isSourceReferences(value: unknown): boolean {
+  return isExactRecord(value, ['citations', 'unresolved']) && typeof value.unresolved === 'boolean'
+    && isArrayOf(value.citations, source => isExactRecord(source, ['url', 'title'])
+      && isNonEmptyText(source.title) && typeof source.url === 'string' && /^https?:\/\//u.test(source.url));
 }
 
 function isAssistantDraft(value: unknown): boolean {
@@ -846,7 +855,11 @@ function isApproval(value: unknown): boolean {
 
 function isEffectPreview(value: unknown): boolean {
   const effects = ['localRead', 'workspaceRead', 'workspaceMutation', 'process', 'network', 'external'];
-  return isExactRecord(value, ['summary', 'effects', 'logicalTargets'], ['authorizationScope', 'authorizationContext', 'authorizationScopes', 'approvalReviewer', 'review', 'fileAccess'])
+  return isExactRecord(value, ['summary', 'effects', 'logicalTargets'], ['authorizationScope', 'authorizationContext', 'authorizationScopes', 'approvalReviewer', 'review', 'fileAccess', 'operation'])
+    && (value.operation === undefined || isExactRecord(value.operation, ['toolName', 'arguments'], ['workspaceRoot', 'executionScope'])
+      && isNonEmptyText(value.operation.toolName) && isRecord(value.operation.arguments)
+      && (value.operation.workspaceRoot === undefined || isNonEmptyText(value.operation.workspaceRoot))
+      && (value.operation.executionScope === undefined || isNonEmptyText(value.operation.executionScope)))
     && (value.authorizationScope === undefined || value.authorizationScope === 'sessionBrowser' || isShellAuthorizationScope(value.authorizationScope))
     && (!isShellAuthorizationScope(value.authorizationScope) || isRecord(value.authorizationContext))
     && (value.fileAccess === undefined || (isRecord(value.fileAccess) && isArrayOf(value.fileAccess.read, isNonEmptyText) && isArrayOf(value.fileAccess.write, isNonEmptyText)))
@@ -1269,7 +1282,7 @@ function isRun(value: unknown): boolean {
 }
 
 function isReasoningEffort(value: unknown): boolean {
-  return typeof value === 'string' && ['low', 'medium', 'high', 'max'].includes(value);
+  return isLlmReasoningEffort(value);
 }
 
 function isModelSettings(value: unknown): boolean {
