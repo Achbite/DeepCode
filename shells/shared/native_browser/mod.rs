@@ -366,9 +366,12 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
         return services::execute(&mut services, directory, session_id.as_deref(), &input);
     }
     if action == "hostStatus" {
-        return Ok(
-            json!({"binding":binding,"ready":true,"captureAvailable":cfg!(target_os="macos")}),
-        );
+        return Ok(json!({
+            "binding": binding,
+            "ready": true,
+            "captureAvailable": cfg!(target_os = "macos"),
+            "computerControlAvailable": cfg!(target_os = "macos"),
+        }));
     }
     if action == "refreshInterface" {
         let view = app

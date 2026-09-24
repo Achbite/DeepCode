@@ -14,7 +14,9 @@ The default interval is **the last 30 days**, including today and the previous 2
 
 The Host indexes physical Provider calls with connection, model, Session, run and attempt attribution. Repeated stream observations update one call, including usage reported before interruption. Missing usage and unrecognized prices remain unavailable or partial. The report includes its recording start; earlier dates are not fabricated as zero consumption. This is a reporting index, not another Session journal or reducer.
 
-The first price catalog covers the reviewed OpenAI API models. Each call keeps the applicable official price snapshot, returned model, service tier and long-context rule. The current source is [OpenAI API pricing](https://developers.openai.com/api/docs/pricing). Unknown cache-write usage does not silently become zero. The display is an estimate of model tokens and excludes additional provider tool charges, taxes and subscription fees. Other adapters expose tokens and calls until they have a verified price adapter.
+The bundled price catalog covers the configured OpenAI and DeepSeek API models at their official HTTPS endpoints. Rates and source URLs are recorded in `config/defaults/model-prices.json`. Each call keeps the applicable price snapshot, returned model, service tier and long-context rule. DeepSeek peak/off-peak rates use the physical request's start time in UTC; later price changes do not reprice recorded calls. Unknown model rates, nonofficial endpoints and adapters without a price entry remain unpriced. They still expose the tokens and calls reported by the provider.
+
+Unknown cache-write usage does not silently become zero. The display is a local estimate of model tokens, not an account invoice; it excludes additional provider tool charges, taxes and subscription fees.
 
 The usage widget and cost details share a display currency preference. USD is the default; CNY estimates use a fixed rate of 1 USD = 7 CNY. The context menu opens a small widget settings dialog. Original usage records remain in USD.
 

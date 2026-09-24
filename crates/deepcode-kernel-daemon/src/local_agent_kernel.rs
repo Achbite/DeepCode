@@ -4251,9 +4251,19 @@ mod attempt_control_tests {
                 let message: Value = serde_json::from_str(&line).unwrap();
                 let closed = message["input"]["previewId"] == "preview-closed";
                 let page_status = message["input"]["action"] == "status";
+                let host_status = message["input"]["action"] == "hostStatus";
                 incoming.lock().unwrap().push(message);
                 if closed {
                     stream.write_all(b"{\"ok\":false,\"message\":\"native_browser_page_closed: preview-closed\"}\n").unwrap();
+                } else if host_status {
+                    writeln!(
+                        stream,
+                        "{}",
+                        json!({"ok":true,"data":{
+                            "ready":true,"captureAvailable":true,"computerControlAvailable":true,
+                        }})
+                    )
+                    .unwrap();
                 } else if page_status {
                     stream
                         .write_all(

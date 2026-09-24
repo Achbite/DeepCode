@@ -86,6 +86,37 @@ pub(crate) fn call(binding: &Value, input: &Value) -> Result<Value, String> {
     exchange(&endpoint, binding, input)
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HostStatus {
+    ready: bool,
+    capture_available: bool,
+    computer_control_available: bool,
+}
+
+impl HostStatus {
+    pub(crate) fn check_tool(&self, name: &str) -> Result<(), &'static str> {
+        if !self.ready {
+            return Err("The native browser GUI Host is not ready.");
+        }
+        match name {
+            "browser.observe" | "browser.capture" if !self.capture_available => {
+                Err("Viewport capture is not available on this GUI Host. Use browser.page with action=act and operation=inspect for DOM inspection.")
+            }
+            "computer.control" if !self.computer_control_available => {
+                Err("External computer control is not available on this GUI Host.")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+pub(crate) fn host_status(binding: &Value) -> Result<HostStatus, String> {
+    let status = call(binding, &json!({"action":"hostStatus"}))?;
+    serde_json::from_value(status)
+        .map_err(|error| format!("native_browser_status_invalid: {error}"))
+}
+
 fn exchange(endpoint: &NativeEndpoint, binding: &Value, input: &Value) -> Result<Value, String> {
     let token = &endpoint.token;
     let address = endpoint

@@ -248,11 +248,7 @@ pub(crate) fn plugin_catalog_projection(settings: &Value) -> Result<Value, Strin
             "source":"builtin","category":if functional {"functional"} else {"reference"},"contributionKind":"skill","discovery":if functional {"default"} else {"searchOnly"},
             "activationMediaTypes":[],"enabled":true,"available":true,"reference":{"toolName":"skill.read","name":id}}));
     }
-    for name in [
-        "operations.md",
-        "execution-environments.md",
-        "ui-plugins.md",
-    ] {
+    for name in crate::local_agent_product_tools::bundled_doc_names() {
         plugins.push(json!({"uri":format!("plugin://doc-{name}@builtin"),"displayName":name,"shortDescription":"DeepCode product documentation",
             "source":"builtin","category":"reference","contributionKind":"skill","discovery":"searchOnly","activationMediaTypes":[],"enabled":true,"available":true,"reference":{"toolName":"doc.read","name":name}}));
     }

@@ -119,9 +119,9 @@ impl ProductTools {
                     "path":{"type":"string","description":"SKILL.md or a reference path linked by that Skill."}
                 }
             })),
-            ("doc.read", "Read bundled DeepCode product documentation in English Markdown. Docs explain product behavior, configuration and known limitations; Skills describe task workflows. Available documents: operations.md, execution-environments.md, ui-plugins.md.".into(), json!({
+            ("doc.read", format!("Read bundled DeepCode product documentation in English Markdown. Docs explain product behavior, configuration and known limitations; Skills describe task workflows. Available documents: {}.", bundled_doc_names().collect::<Vec<_>>().join(", ")), json!({
                 "type":"object", "additionalProperties":false, "required":["name"],
-                "properties":{"name":{"type":"string","enum":["operations.md","execution-environments.md","ui-plugins.md"]}}
+                "properties":{"name":{"type":"string","enum":bundled_doc_names().collect::<Vec<_>>()}}
             })),
         ]
     }
@@ -230,7 +230,15 @@ const DOCS: &[(&str, &str)] = &[
         "execution-environments.md",
         include_str!("../../../docs/product/execution-environments.md"),
     ),
+    (
+        "model-services.md",
+        include_str!("../../../docs/product/model-services.md"),
+    ),
 ];
+
+pub(crate) fn bundled_doc_names() -> impl Iterator<Item = &'static str> {
+    DOCS.iter().map(|(name, _)| *name)
+}
 
 fn read_doc(input: Value) -> Result<Value, SessionServiceError> {
     #[derive(serde::Deserialize)]
@@ -311,6 +319,42 @@ pub(crate) fn test_product_tools() -> Arc<ProductTools> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_product_docs_are_discoverable_and_readable() {
+        let tools = test_product_tools();
+        let definitions = ProductTools::definitions();
+        let (_, description, schema) = definitions
+            .iter()
+            .find(|(name, _, _)| *name == "doc.read")
+            .unwrap();
+        let names = schema["properties"]["name"]["enum"].as_array().unwrap();
+        assert!(names.contains(&json!("model-services.md")));
+        let catalog = crate::local_agent_plugins::plugin_catalog_projection(&json!({})).unwrap();
+        for name in names {
+            assert!(description.contains(name.as_str().unwrap()));
+            let reference = json!({"toolName":"doc.read", "name":name});
+            let item = catalog["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["reference"] == reference)
+                .unwrap();
+            assert_eq!(item["category"], "reference");
+            assert_eq!(item["discovery"], "searchOnly");
+            assert_eq!(item["available"], true);
+            let doc = tools.call("doc.read", json!({"name":name})).unwrap();
+            assert_eq!(doc["name"], *name);
+            assert_eq!(doc["mediaType"], "text/markdown");
+            assert!(doc["content"].as_str().unwrap().starts_with("# "));
+        }
+        let model_doc = tools
+            .call("doc.read", json!({"name":"model-services.md"}))
+            .unwrap();
+        assert!(model_doc["content"].as_str().unwrap().contains("## Usage"));
+        assert!(tools.computer_use_instance.is_none());
+    }
+
     #[test]
     fn plugin_search_discovers_capabilities_without_loading_tools() {
         let tools = test_product_tools();
