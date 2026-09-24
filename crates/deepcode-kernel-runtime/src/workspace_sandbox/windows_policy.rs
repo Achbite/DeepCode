@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Access {
     Read,
+    Traverse,
     Write,
     DenyWrite,
 }
@@ -43,8 +44,6 @@ pub(super) fn grants(
     for path in &files.read {
         add(path, Access::Read);
     }
-    // No parent-directory read grant: traversal uses Windows' normal traverse
-    // privilege, never directory listing or reading siblings of an allowed file.
     for path in super::writable_paths(root, mode, targets)? {
         add(&path, Access::Write);
     }
@@ -62,12 +61,38 @@ pub(super) fn grants(
             add(path, Access::DenyWrite);
         }
     }
+    // PowerShell resolves the casing/attributes of path ancestors. Grant only
+    // traversal and metadata on those directories, with no inheritance/listing.
+    let ancestors: Vec<_> = grants
+        .iter()
+        .filter(|grant| {
+            matches!(grant.access, Access::Read | Access::Write) && grant.path != executable
+        })
+        .flat_map(|grant| grant.path.ancestors().skip(1))
+        .filter(|path| path.is_absolute())
+        .map(Path::to_path_buf)
+        .collect();
+    for path in ancestors {
+        let grant = Grant {
+            path,
+            access: Access::Traverse,
+        };
+        if !grants.contains(&grant) {
+            grants.push(grant);
+        }
+    }
     Ok(grants)
 }
 
 pub(super) fn capabilities(network: bool) -> Vec<&'static str> {
     // Windows runtime dependencies, not access to user documents or credentials.
-    let mut names = vec!["registryRead", "lpacCom", "lpacCryptoServices"];
+    let mut names = vec![
+        "registryRead",
+        "lpacCom",
+        "lpacCryptoServices",
+        // PowerShell registers its ETW provider during startup.
+        "lpacInstrumentation",
+    ];
     if network {
         names.extend([
             "internetClient",
@@ -125,9 +150,13 @@ mod tests {
             path: workspace,
             access: Access::Write
         }));
-        assert!(!result
-            .iter()
-            .any(|grant| grant.path == root || grant.path == root.join("outside")));
+        assert!(!result.iter().any(|grant| (grant.path == root
+            || grant.path == root.join("outside"))
+            && grant.access != Access::Traverse));
+        assert!(result.contains(&Grant {
+            path: root,
+            access: Access::Traverse
+        }));
         assert!(result.iter().any(|grant| grant.access == Access::DenyWrite));
         assert!(!capabilities(false).contains(&"internetClient"));
         assert!(capabilities(true).contains(&"internetClient"));

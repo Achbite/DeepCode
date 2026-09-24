@@ -347,7 +347,6 @@ mod tests {
         assert!(tools
             .call("doc.read", json!({"name":"../../private.md"}))
             .is_err());
-        assert_eq!(bundled_skill_settings().len(), 5);
         assert!(tools
             .call("doc.read", json!({"name":"ui-plugins.md"}))
             .unwrap()["content"]

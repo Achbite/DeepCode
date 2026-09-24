@@ -1,5 +1,6 @@
-// Isolated viewport acceptance: real Composer, Markdown buffer and viewport owner.
+// Isolated viewport display check: real Composer, Markdown buffer and viewport owner.
 // Decisions update only this fixture; no daemon or Provider is contacted.
+// Passing this partial UI check does not constitute system acceptance.
 import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { ConversationComposer } from '../../src/components/local-agent/ConversationComposer';

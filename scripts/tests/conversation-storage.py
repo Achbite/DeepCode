@@ -2,8 +2,7 @@
 """Real conversation storage regression using an isolated Host and local Provider."""
 from __future__ import annotations
 
-from contextlib import closing
-import hashlib
+from contextlib import ExitStack, closing
 import http.server
 import importlib.util
 import json
@@ -84,6 +83,10 @@ def workspace_rows(config_root: Path, session_id: str):
     return {identity: (Path(path), bool(working)) for identity, path, working in rows}
 
 
+def is_descendant(path: Path, root: Path) -> bool:
+    return any(parent.samefile(root) for parent in path.resolve().parents)
+
+
 def run_storage_checks(root: Path, server, provider) -> None:
     config_root = root / "用户 数据"
     fixture.write_configuration(config_root, f"http://127.0.0.1:{server.server_port}/v1", {})
@@ -101,9 +104,9 @@ def run_storage_checks(root: Path, server, provider) -> None:
         require(len(workdirs) == 1, "First message did not create exactly one working directory")
         workdir_id, workdir = workdirs[0]
         require(workdir.is_dir(), "Registered working directory does not exist")
-        separator = "-" if os.name == "nt" else ":"
-        require(workdir.name == "sha256" + separator + hashlib.sha256(session_id.encode()).hexdigest(),
-                "Working directory naming changed unexpectedly for this platform")
+        storage_root = (config_root / "data/agent-runtime").resolve()
+        require(is_descendant(workdir, storage_root),
+                "Working directory is outside this isolated user's runtime storage")
         saved_file = workdir / "保留 内容.txt"
         saved_file.write_text("retained across restart\n", encoding="utf-8")
 
@@ -121,16 +124,37 @@ def run_storage_checks(root: Path, server, provider) -> None:
         uploaded = upload(daemon, session_id, input_id, LONG_TEXT)
         require(uploaded.get("ok") is True, f"Upload failed: {uploaded}")
         reference = uploaded["data"]["reference"]
-        key = json.dumps([session_id, input_id], ensure_ascii=False, separators=(",", ":"))
-        digest = "sha256:" + hashlib.sha256(key.encode()).hexdigest()
-        require(reference["referenceId"] == "input-" + digest, "Existing reference identity changed")
-        require(reference["workspaceId"] == "input-workspace-" + digest, "Existing workspace identity changed")
         require(upload(daemon, session_id, input_id, LONG_TEXT) == uploaded, "Identical upload was not idempotent")
         conflict = upload(daemon, session_id, input_id, "different content")
         require(conflict.get("ok") is False and "input_resource_identity_conflict" in conflict.get("message", ""),
                 "A conflicting upload did not preserve its original error")
 
-        projection = submit(daemon, provider, session_id, 2, LONG_TEXT, [*references, reference])
+        second_id = request(daemon, "/api/conversation/sessions", method="POST", body={})["sessionId"]
+        submit(daemon, provider, second_id, 2, "Create a separate working directory for this conversation.")
+        second_content = "independent session input\n"
+        second_upload = upload(daemon, second_id, input_id, second_content)
+        require(second_upload.get("ok") is True, "Another Session could not use the same inputId")
+        second_reference = second_upload["data"]["reference"]
+        require(second_reference["referenceId"] != reference["referenceId"]
+                and second_reference["workspaceId"] != reference["workspaceId"],
+                "Different Sessions share an input resource identity")
+        second_rows = workspace_rows(config_root, second_id)
+        second_workdirs = [(identity, path) for identity, (path, working) in second_rows.items() if working]
+        require(len(second_workdirs) == 1, "Second Session did not create exactly one working directory")
+        second_workdir_id, second_workdir = second_workdirs[0]
+        require(second_workdir.is_dir() and is_descendant(second_workdir, storage_root),
+                "Second working directory is outside this isolated user's runtime storage")
+        require(second_workdir_id != workdir_id, "Different Sessions share a working directory identity")
+        second_saved_file = second_workdir / saved_file.name
+        second_saved_file.write_text("second session content\n", encoding="utf-8")
+        require(saved_file.read_text(encoding="utf-8") == "retained across restart\n",
+                "Second Session overwrote the first Session's working file")
+        second_text_path = second_rows[second_reference["workspaceId"]][0] / second_reference["logicalPath"]
+        require(second_text_path.read_text(encoding="utf-8") == second_content, "Second input content changed")
+        require(upload(daemon, session_id, input_id, LONG_TEXT) == uploaded,
+                "A different Session's upload changed the original input")
+
+        projection = submit(daemon, provider, session_id, 3, LONG_TEXT, [*references, reference])
         pasted = [item for message in projection["messages"] for item in message.get("filesystemReferences", [])
                   if item.get("source") == "pastedText"]
         require(len({item["referenceId"] for item in pasted}) == 2, "Long message did not create its own text reference")
@@ -139,6 +163,14 @@ def run_storage_checks(root: Path, server, provider) -> None:
             path = rows[item["workspaceId"]][0] / item["logicalPath"]
             require(path.read_bytes() == LONG_TEXT.encode(), "Stored text bytes changed")
         owned_paths = [path for path, _ in rows.values()]
+        second_owned_paths = [path for path, _ in second_rows.values()]
+        require(rows.keys().isdisjoint(second_rows), "Session-owned workspace records overlap")
+        for first_path in owned_paths:
+            for second_path in second_owned_paths:
+                require(not first_path.samefile(second_path)
+                        and not is_descendant(first_path, second_path)
+                        and not is_descendant(second_path, first_path),
+                        "Different Sessions have overlapping owned storage")
         attachments_root = next(path for path, working in rows.values() if not working).parent
         daemon.shutdown()
 
@@ -147,7 +179,9 @@ def run_storage_checks(root: Path, server, provider) -> None:
         reopened.start()
         require(saved_file.read_text(encoding="utf-8") == "retained across restart\n", "Saved file was lost")
         require(upload(reopened, session_id, input_id, LONG_TEXT) == uploaded, "Restart changed upload identity")
-        submit(reopened, provider, session_id, 3, "Continue this same conversation.")
+        require(upload(reopened, second_id, input_id, second_content) == second_upload,
+                "Restart changed the second Session's input identity")
+        submit(reopened, provider, session_id, 4, "Continue this same conversation.")
         reopened_rows = workspace_rows(config_root, session_id)
         require(reopened_rows == rows, "Restart or next message changed registered storage")
         require(reopened_rows[workdir_id] == (workdir, True), "Working directory was not reused")
@@ -157,13 +191,22 @@ def run_storage_checks(root: Path, server, provider) -> None:
         require(not attachments_root.exists(), "Session deletion retained the attachment directory")
         require(all(not path.exists() for path in owned_paths), "Session deletion retained owned storage")
         require(source.read_text(encoding="utf-8") == "changed source\n", "Session deletion touched the source")
+        require(workspace_rows(config_root, second_id) == second_rows,
+                "Deleting one Session changed another Session's owned catalog entries")
+        require(second_saved_file.read_text(encoding="utf-8") == "second session content\n"
+                and second_text_path.read_text(encoding="utf-8") == second_content,
+                "Deleting one Session removed another Session's files")
+        request(reopened, session_path(second_id), method="DELETE")
+        require(not workspace_rows(config_root, second_id) and all(not path.exists() for path in second_owned_paths),
+                "Second Session deletion retained its owned storage")
         reopened.shutdown()
         provider.assert_healthy()
         print(f"[PASS] conversation storage ({os.name}): first message, attachment snapshot, text identities, "
-              "conflict, long message, restart, reuse and cleanup", flush=True)
+              "conflict, cross-session isolation, long message, restart, reuse and owned cleanup", flush=True)
     finally:
-        for daemon in reversed(daemons):
-            daemon.close()
+        with ExitStack() as cleanup:
+            for daemon in daemons:
+                cleanup.callback(daemon.close)
 
 
 def main() -> None:
@@ -177,8 +220,10 @@ def main() -> None:
             try:
                 run_storage_checks(root, server, provider)
             finally:
-                server.shutdown()
-                thread.join(timeout=5)
+                try:
+                    server.shutdown()
+                finally:
+                    thread.join(timeout=5)
 
 
 if __name__ == "__main__":

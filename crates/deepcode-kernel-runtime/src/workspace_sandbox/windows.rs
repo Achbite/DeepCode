@@ -10,6 +10,7 @@ mod acl;
 mod os;
 mod profile;
 mod runner;
+mod token;
 
 pub(crate) use runner::Child;
 
@@ -17,6 +18,7 @@ pub(crate) struct Sandbox {
     // ACL cleanup must precede deleting the invocation's profile.
     acl: acl::Grants,
     profile: profile::Profile,
+    grants: Vec<windows_policy::Grant>,
 }
 
 impl Sandbox {
@@ -31,23 +33,21 @@ impl Sandbox {
         let grants = windows_policy::grants(root, mode, targets, temporary, executable, files)
             .map_err(|error| error.to_string())?;
         let profile = profile::Profile::create(files.network_access)?;
-        let mut sandbox = Self {
+        Ok(Self {
             acl: acl::Grants::new(&profile.sid_string()?)?,
             profile,
-        };
-        let result = sandbox.acl.apply(&grants);
-        if let Err(error) = result {
-            return finish(Err(error), sandbox.cleanup());
-        }
-        Ok(sandbox)
+            grants,
+        })
     }
 
     pub(crate) fn spawn(
-        &self,
+        &mut self,
         command: &std::process::Command,
         terminal: bool,
     ) -> Result<Child, String> {
-        runner::spawn(command, terminal, &self.profile)
+        runner::spawn(command, terminal, &self.profile, |token| {
+            self.acl.apply(&self.grants, token)
+        })
     }
 
     pub(crate) fn cleanup(&mut self) -> Result<(), String> {

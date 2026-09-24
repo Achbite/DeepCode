@@ -270,13 +270,15 @@ impl LocalAgentRuntime {
             })?
         };
         let provider_runtime = provider_binding.snapshot().clone();
+        // Freeze reviewer failures too: ordinary turns remain usable, while a
+        // later approval request must report this error rather than switch models.
         let approval_reviewer_binding = if let Some(previous) = &previous {
             previous.approval_reviewer_binding.clone()
         } else {
             let selected = settings["agent.approvalReview.profileId"]
                 .as_str()
                 .filter(|id| !id.is_empty());
-            let binding = match selected {
+            match selected {
                 Some(profile_id) => ProviderRuntimeRegistry::prepare(&gui, Some(profile_id), None),
                 None => Ok(provider_binding.clone()),
             }
@@ -287,10 +289,6 @@ impl LocalAgentRuntime {
                         .filter(|effort| !effort.is_empty()),
                 )
             })
-            .map_err(|message| {
-                RunPreparationError::new("approval_reviewer_prepare_failed", message)
-            })?;
-            binding
         };
         if let Some(previous) = &previous {
             plugin_selection.retain_prepared(&previous.plugin_selection);
@@ -386,6 +384,22 @@ impl LocalAgentRuntime {
                 executor_config.file_read_roots.push(target);
             }
         }
+        #[cfg(windows)]
+        if environment["executionTarget"]["kind"] == "native" {
+            let command_paths = environment["commandPaths"]
+                .as_object()
+                .into_iter()
+                .flat_map(|commands| commands.values());
+            for path in command_paths.chain(std::iter::once(&environment["shell"]["executable"])) {
+                if let Some(path) = path.as_str() {
+                    executor_config.file_read_roots.extend(
+                        deepcode_kernel_runtime::shell_environment::windows_runtime_read_roots(
+                            std::path::Path::new(path),
+                        ),
+                    );
+                }
+            }
+        }
         let permissions = LocalAgentPermissionPolicy::from_settings(settings)
             .map_err(RunPreparationError::from)?;
         let web_search = prepare_web_search_binding(
@@ -467,11 +481,13 @@ impl LocalAgentRuntime {
                 message,
             ));
         }
-        if let Err(message) = self.provider_runtimes.bind(
-            &request.session_id,
-            &request.run_id,
-            approval_reviewer_binding.clone(),
-        ) {
+        if let Err(message) = approval_reviewer_binding
+            .as_ref()
+            .map_or(Ok(()), |binding| {
+                self.provider_runtimes
+                    .bind(&request.session_id, &request.run_id, binding.clone())
+            })
+        {
             let _ = self.kernel.release_catalog(ReleaseToolCatalogRequest::new(
                 &request.session_id,
                 &request.run_id,
@@ -492,13 +508,12 @@ impl LocalAgentRuntime {
             &plugin_selection,
             extension_generation_ref.as_str(),
         );
-        let response = json!({
+        let mut response = json!({
             "schemaVersion": "deepcode.local-agent",
             "type": "run.runtime.prepared",
             "sessionId": request.session_id,
             "runId": request.run_id,
             "provider": provider_runtime,
-            "approvalReviewer": approval_reviewer_binding.snapshot(),
             "webSearch": web_search,
             "extensionGenerationRef": plugin_config["extensionGenerationRef"],
             "kernelCatalogSnapshotRef": catalog["kernelCatalogSnapshotRef"],
@@ -510,6 +525,14 @@ impl LocalAgentRuntime {
             "selectedPlugins": selected_plugins,
             "environment": environment,
         });
+        match &approval_reviewer_binding {
+            Ok(binding) => response["approvalReviewer"] = json!(binding.snapshot()),
+            Err(message) => {
+                response["approvalReviewerError"] = json!({
+                    "code": "approval_reviewer_prepare_failed", "message": message,
+                })
+            }
+        }
         prepared_runs
             .entry(key)
             .or_default()
@@ -633,7 +656,8 @@ struct PreparedRunRecord {
     executor_config: deepcode_kernel_runtime::executors::KernelExecutorConfig,
     secrets: crate::DaemonSecretProvider,
     provider_binding: crate::local_agent_provider_runtime::ProviderRuntimeBinding,
-    approval_reviewer_binding: crate::local_agent_provider_runtime::ProviderRuntimeBinding,
+    approval_reviewer_binding:
+        Result<crate::local_agent_provider_runtime::ProviderRuntimeBinding, String>,
     plugin_selection: crate::local_agent_plugins::ResolvedPluginSelection,
     mcp: crate::local_agent_mcp::McpRuntime,
     kernel_catalog_snapshot_ref: String,

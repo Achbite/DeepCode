@@ -1177,7 +1177,7 @@ test('snapshot-scoped wire tool resolves to exact Kernel bindings, durable ToolR
 
 
 
-test('GUI model settings remember effort per model across new conversations and preserve acknowledged values on failure', async (t) => {
+test('Session model choices reconcile complete settings and preserve acknowledged values on command failure', async (t) => {
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:gui-settings';
   await createSession(journal, sessionId);
@@ -1190,20 +1190,15 @@ test('GUI model settings remember effort per model across new conversations and 
     { id: 'profile:two', name: 'My other model', model: 'configured-model', enabled: true, thinking: 'enabled' },
     { id: 'profile:off', name: 'No reasoning', model: 'configured-model', enabled: true, thinking: 'disabled' },
   ];
-  let defaultProfileId = profiles[0].id;
+  const defaultProfileId = profiles[0].id;
   installGuiFetch(t, async (url, init) => {
     if (url.pathname === '/api/llm/profiles') {
       if (init.method === 'PATCH') {
         const update = JSON.parse(init.body);
-        if (update.profile) {
-          assert.deepEqual(Object.keys(update), ['profile']);
-          const index = profiles.findIndex(profile => profile.id === update.profile.id);
-          assert.ok(index >= 0);
-          profiles[index] = update.profile;
-        } else {
-          assert.deepEqual(Object.keys(update), ['defaultProfileId']);
-          defaultProfileId = update.defaultProfileId;
-        }
+        assert.deepEqual(Object.keys(update), ['profile']);
+        const index = profiles.findIndex(profile => profile.id === update.profile.id);
+        assert.ok(index >= 0);
+        profiles[index] = update.profile;
       }
       return Response.json({ ok: true, data: { profiles, defaultProfileId } });
     }
@@ -1222,51 +1217,31 @@ test('GUI model settings remember effort per model across new conversations and 
   });
   const store = await loadGuiModelStore(t);
   await store.getState().refreshProfiles();
-  await store.getState().selectProfile('profile:one');
-  await store.getState().selectReasoningEffort('max');
-  assert.equal(commands, 0, 'draft preference is saved without creating a Session');
-  assert.equal(store.getState().reasoningEffortOverride, 'max');
   store.setState({ sessionId, projection: await actor.snapshot() });
-  await store.getState().selectReasoningEffort('low');
-  assert.equal(store.getState().projection.modelSettings.reasoningEffortOverride, 'low');
-  await store.getState().selectProfile('profile:two');
+  assert.equal(await store.getState().selectModel('profile:one', 'low'), true);
+  assert.equal(commands, 1, 'the complete model choice is one Session command');
+  assert.deepEqual(store.getState().projection.modelSettings, { profileId: 'profile:one', reasoningEffortOverride: 'low' });
+  assert.equal(await store.getState().selectModel('profile:two', 'medium'), true);
   assert.equal(store.getState().selectedProfileId, 'profile:two');
-  assert.equal(store.getState().reasoningEffortOverride, null);
+  assert.equal(store.getState().reasoningEffortOverride, 'medium');
   assert.equal((await actor.snapshot()).modelSettings.profileId, 'profile:two');
   assert.equal(store.getState().defaultProfileId, 'profile:one', 'selecting a model does not change the last actually used model');
   failSave = true;
-  await store.getState().selectReasoningEffort('high');
-  assert.equal(store.getState().reasoningEffortOverride, null);
+  assert.equal(await store.getState().selectModel('profile:two', 'high'), false);
+  assert.equal(store.getState().reasoningEffortOverride, 'medium');
+  assert.equal((await actor.snapshot()).modelSettings.reasoningEffortOverride, 'medium');
   assert.match(store.getState().error, /fixture_settings_save_failed/);
   assert.equal(store.getState().modelSettingsBusy, false);
   failSave = false;
-  await store.getState().selectProfile('profile:off');
-  const before = commands;
-  await store.getState().selectReasoningEffort('medium');
-  assert.equal(commands, before);
+  assert.equal(await store.getState().selectModel('profile:off', null), true);
   assert.equal(store.getState().reasoningEffortOverride, null);
   assert.equal((await actor.snapshot()).run, null);
   store.getState().startNewSession();
   assert.equal(store.getState().selectedProfileId, 'profile:one');
   assert.equal(store.getState().reasoningEffortOverride, 'low');
-  await store.getState().selectProfile('profile:two');
-  await store.getState().selectReasoningEffort('medium');
-  store.getState().startNewSession();
-  assert.equal(store.getState().selectedProfileId, 'profile:one');
-  assert.equal(store.getState().reasoningEffortOverride, 'low');
-  await store.getState().selectProfile('profile:two');
-  assert.equal(store.getState().reasoningEffortOverride, 'medium');
-  const reopened = await loadGuiModelStore(t);
-  await reopened.getState().refreshProfiles();
-  assert.equal(reopened.getState().selectedProfileId, 'profile:one');
-  assert.equal(reopened.getState().reasoningEffortOverride, 'low');
-  await reopened.getState().selectReasoningEffort(null);
-  assert.equal(profiles[0].reasoningEffort, undefined, 'service default clears the remembered explicit effort');
-  reopened.getState().startNewSession();
-  assert.equal(reopened.getState().reasoningEffortOverride, null);
 });
 
-test('combined model selection persists effort per model and new drafts inherit it', async (t) => {
+test('draft model choices remember per-model effort and preserve saved preferences on failure', async (t) => {
   let profiles = [
     { id: 'profile:one', name: 'One', enabled: true, thinking: 'enabled' },
     { id: 'profile:two', name: 'Two', enabled: true, thinking: 'enabled' },
@@ -1292,11 +1267,11 @@ test('combined model selection persists effort per model and new drafts inherit 
   assert.equal(await store.getState().selectModel('profile:two', 'low'), true);
   store.getState().startNewSession('project:another');
   assert.equal(store.getState().reasoningEffortOverride, 'high');
-  await store.getState().selectProfile('profile:two');
-  assert.equal(store.getState().reasoningEffortOverride, 'low');
+  assert.equal(store.getState().profiles.find(profile => profile.id === 'profile:two').reasoningEffort, 'low');
   const reopened = await loadGuiModelStore(t);
   await reopened.getState().refreshProfiles();
   assert.equal(reopened.getState().reasoningEffortOverride, 'high');
+  assert.equal(reopened.getState().profiles.find(profile => profile.id === 'profile:two').reasoningEffort, 'low');
   assert.equal(await reopened.getState().selectModel('profile:one', null), false);
   assert.equal(reopened.getState().reasoningEffortOverride, 'high');
   failSave = true;
@@ -2275,7 +2250,7 @@ test('polling and command reconciliation read draft snapshots in order at the sa
   ] });
   const polling = store.getState().refresh();
   await waitUntil(() => reads === 1);
-  const saving = store.getState().selectReasoningEffort('low');
+  const saving = store.getState().selectModel('profile:test', 'low');
   await waitUntil(() => commands === 1);
   assert.equal(reads, 1, 'the post-command read waits for the earlier in-flight read');
   releaseOld();
@@ -2286,7 +2261,7 @@ test('polling and command reconciliation read draft snapshots in order at the sa
   assert.equal(store.getState().projection.revision, base.revision);
   await store.getState().refresh();
   assert.equal(reads, 3, 'running drafts are read even when the status revision matches the cache');
-  const savingWhileLeaving = store.getState().selectReasoningEffort('high');
+  const savingWhileLeaving = store.getState().selectModel('profile:test', 'high');
   await waitUntil(() => commands === 2);
   store.getState().startNewSession();
   releaseCommand();

@@ -1046,7 +1046,7 @@ mod tests {
     }
 
     fn tool(p: &mut SessionProjection) {
-        p.activities.push(serde_json::from_value(json!({"activityId":"tool:one","kind":"tool","status":"running",
+        p.activities.push(serde_json::from_value(json!({"activityId":"tool:one","kind":"tool","status":"active",
             "label":"write","runId":"run:test","callId":"call:write","sequence":20,
             "tool":{"operation":"fs.write","recordId":"record:one","resources":[],"fileChanges":[{
                 "workspaceId":"workspace:test","path":"result.txt","kind":"create",
@@ -1134,7 +1134,7 @@ mod tests {
             text.matches("Plan 状态 · revision 1 · completed").count(),
             1
         );
-        assert_eq!(text.matches("工具 fs.write [running]").count(), 1);
+        assert_eq!(text.matches("工具 fs.write [active]").count(), 1);
         assert_eq!(text.matches("工具 fs.write [completed]").count(), 1);
         assert!(!text.contains("本轮修改"));
     }

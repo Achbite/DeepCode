@@ -476,7 +476,11 @@ mod tests {
                 }
             }
         }
-        let root = std::env::temp_dir().join(crate::new_runtime_ref("search-choice-test").unwrap());
+        let root = std::env::temp_dir().join(
+            crate::new_runtime_ref("search-choice-test")
+                .unwrap()
+                .replace(':', "-"),
+        );
         let mut gui = GuiState::open_at(&root).unwrap();
         let edit: Edit = serde_json::from_value(json!({"connection":{
             "id":"search", "name":"Search", "adapterId":"openai", "billingMode":"metered",
@@ -497,7 +501,11 @@ mod tests {
 
     #[test]
     fn changing_one_connection_keeps_other_credentials_and_models() {
-        let root = std::env::temp_dir().join(crate::new_runtime_ref("connection-test").unwrap());
+        let root = std::env::temp_dir().join(
+            crate::new_runtime_ref("connection-test")
+                .unwrap()
+                .replace(':', "-"),
+        );
         let mut gui = GuiState::open_at(&root).unwrap();
         for id in ["a", "b"] {
             let edit:Edit=serde_json::from_value(json!({"connection":{"id":id,"name":id,"adapterId":"openai","billingMode":"metered","baseUrl":"https://api.openai.com/v1","credentialKind":"apiKey"},"apiKey":format!("key-{id}")})).unwrap();

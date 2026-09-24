@@ -1,7 +1,7 @@
 // Real transcript/composer components; isolated facts and command capture, no Provider or user session.
 import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import type { SessionProjection } from '@deepcode/protocol';
+import { COMMAND_REPLY_VERSION, type CommandReply, type SessionProjection } from '@deepcode/protocol';
 import { emptySessionState, projectSession } from '../../../session-core/src/local-agent/reducer';
 import { ConversationTranscript } from '../../src/components/local-agent/ConversationTranscript';
 import { ConversationComposer } from '../../src/components/local-agent/ConversationComposer';
@@ -49,18 +49,19 @@ function Preview() {
   const composer = useAgentComposer(language, viewport.setLatestFollowMode);
   const items = useMemo(() => projectionItems(projection), [projection]);
   useEffect(() => { useLocalAgentStore.setState({
-    editMessage: async (messageId, text, expectedRevision) => {
+    editMessage: async (messageId, text, expectedRevision): Promise<CommandReply> => {
       setResult(JSON.stringify({ messageId, text, expectedRevision }));
       if (failEdit) { useLocalAgentStore.setState({ error: 'fixture_edit_failed' }); throw new Error('fixture_edit_failed'); }
       useLocalAgentStore.setState({ error: null });
-      return { schemaVersion: 'deepcode.command-reply.v1', status: 'accepted', commandId: 'fixture', sessionId, revision: expectedRevision + 1 } as never;
+      return { schemaVersion: COMMAND_REPLY_VERSION, status: 'accepted', commandId: 'command:fixture:edit', sessionId, revision: expectedRevision + 1 };
     },
-    respondApproval: async (decision, scope) => {
+    respondApproval: async (decision, scope): Promise<CommandReply> => {
       setResult(JSON.stringify({ decision, scope })); setMode('message');
-      useLocalAgentStore.setState({ projection: { ...projection, pendingApproval: null,
+      const revision = projection.revision + 1;
+      useLocalAgentStore.setState({ projection: { ...projection, revision, pendingApproval: null,
         activities: projection.activities.map((activity) => activity.kind === 'approval'
           ? { ...activity, status: decision === 'allow' ? 'completed' : 'denied' } : activity) } });
-      return {} as never;
+      return { schemaVersion: COMMAND_REPLY_VERSION, status: 'accepted', commandId: 'command:fixture:approval', sessionId, revision };
     },
   }); }, [failEdit, projection]);
   const changeMode = (next: string) => {

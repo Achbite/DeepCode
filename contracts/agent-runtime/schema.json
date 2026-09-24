@@ -524,6 +524,7 @@
         "kernelCatalogSnapshotRef": {"$ref": "#/$defs/Id"},
         "provider": {"$ref": "#/$defs/ProviderRuntimeSnapshot"},
         "approvalReviewer": {"$ref": "#/$defs/ProviderRuntimeSnapshot"},
+        "approvalReviewerError": {"$ref": "#/$defs/LocalAgentError"},
         "instructions": {
           "type": "array",
           "items": {
@@ -551,7 +552,8 @@
         "permissions": {"$ref": "#/$defs/PermissionSettings"},
         "environment": {"$ref": "#/$defs/JsonObject"},
         "webSearch": {"$ref": "#/$defs/WebSearchBinding"}
-      }
+      },
+      "not": {"required": ["approvalReviewer", "approvalReviewerError"]}
     },
     "ProviderRequest": {
       "type": "object",

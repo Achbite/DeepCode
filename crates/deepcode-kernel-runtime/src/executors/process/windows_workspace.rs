@@ -30,7 +30,7 @@ pub(super) fn execute(
         tool_name,
         context,
         terminal_input,
-        &sandbox,
+        &mut sandbox,
     );
     finish_shell_execution(result, sandbox.cleanup().map_err(KernelError::Other))
 }
@@ -42,7 +42,7 @@ fn run(
     tool_name: &str,
     context: &KernelToolExecutionContext,
     terminal_input: Option<&str>,
-    sandbox: &Sandbox,
+    sandbox: &mut Sandbox,
 ) -> KernelResult<KernelToolExecutionResult> {
     let archive = ShellOutputArchive::create(context)?;
     let stdout_file = archive.open("stdout")?;
@@ -202,6 +202,7 @@ mod tests {
                 .current_dir(self.0.join("workspace"))
                 .env_clear()
                 .env("SystemRoot", system)
+                .env("LOCALAPPDATA", self.0.join("home"))
                 .env("TEMP", self.0.join("scratch"))
                 .env("TMP", self.0.join("scratch"));
             execute(

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise run-owned process control through CLI, Session and real Kernel processes."""
+from contextlib import ExitStack, closing
 import http.server
 import importlib.util
 import json
@@ -40,12 +41,43 @@ def assert_stopped(job):
     require(log.is_file() and 'managed-pid:' in log.read_text(), 'Cancelled output archive missing')
     pid = int(next(line.removeprefix('managed-pid:') for line in log.read_text().splitlines()
                    if line.startswith('managed-pid:')))
-    if CONTAINER:
-        result = subprocess.run(['docker', 'exec', CONTAINER, 'sh', '-c', 'kill -0 "$1" 2>/dev/null', 'probe', str(pid)], capture_output=True, timeout=10)
+    assert_pid_stopped(pid, container=CONTAINER)
+
+
+def assert_pid_stopped(pid, *, container=None):
+    if container:
+        result = subprocess.run(['docker', 'exec', container, 'sh', '-c', 'kill -0 "$1" 2>/dev/null', 'probe', str(pid)], capture_output=True, timeout=10)
         require(result.returncode == 1, 'Cancelled process is still alive in the container')
-        result = subprocess.run(['docker', 'inspect', '--format', '{{.State.Running}}', CONTAINER], capture_output=True, text=True, timeout=10)
+        result = subprocess.run(['docker', 'inspect', '--format', '{{.State.Running}}', container], capture_output=True, text=True, timeout=10)
         require(result.returncode == 0 and result.stdout.strip() == 'true', 'Kernel stopped the externally owned container')
-    elif os.name != 'nt':
+    elif os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+
+        require(0 < pid <= 0xFFFFFFFF, f'Invalid managed process ID: {pid}')
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION; never signal or kill the PID.
+        handle = kernel.OpenProcess(0x00100000 | 0x1000, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            if error == 87:  # ERROR_INVALID_PARAMETER: the process no longer exists.
+                return
+            raise ctypes.WinError(error)
+        try:
+            status = kernel.WaitForSingleObject(handle, 0)
+            if status == 0xFFFFFFFF:  # WAIT_FAILED
+                raise ctypes.WinError(ctypes.get_last_error())
+            require(status == 0, f'Cancelled process {pid} is still alive (wait status {status})')
+        finally:
+            if not kernel.CloseHandle(handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+    else:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -174,7 +206,7 @@ def check(mode):
             require(not any(message.get('content') == 'premature-answer' for message in done['messages']),
                     'Final answer was committed before owned processes ended')
             daemon.shutdown()
-            with fixture.sqlite_read_only(daemon.config_root / 'data/agent-runtime/session.sqlite3') as database:
+            with closing(fixture.sqlite_read_only(daemon.config_root / 'data/agent-runtime/session.sqlite3')) as database:
                 events = [(kind, json.loads(payload)) for kind, payload in database.execute(
                     'SELECT event_type,payload_json FROM session_events WHERE session_id=? ORDER BY sequence', (session,))]
             jobs = [payload['job'] for kind, payload in events if kind == 'process.updated']
@@ -187,16 +219,15 @@ def check(mode):
             state.assert_healthy()
             raise
         finally:
-            if daemon.identity is not None and daemon.process.poll() is None:
-                daemon.shutdown()
-            daemon.close()
-            if client is not None and client.poll() is None:
-                client.terminate()
-                client.wait(timeout=5)
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=3)
-            require(not thread.is_alive(), 'Provider fixture did not exit')
+            with ExitStack() as cleanup:
+                cleanup.callback(lambda: require(not thread.is_alive(), 'Provider fixture did not exit'))
+                cleanup.callback(thread.join, timeout=3)
+                cleanup.callback(server.server_close)
+                cleanup.callback(server.shutdown)
+                if client is not None and client.poll() is None:
+                    cleanup.callback(client.wait, timeout=5)
+                    cleanup.callback(client.terminate)
+                cleanup.callback(daemon.close)
 
 
 if __name__ == '__main__':

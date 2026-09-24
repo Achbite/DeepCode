@@ -3,15 +3,11 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack, closing
 import http.server
 import importlib.util
 import json
 import os
-import secrets
-import shutil
-import signal
-import socket
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -21,7 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 
 spec = importlib.util.spec_from_file_location("deepcode_test_support", Path(__file__).with_name("support.py"))
@@ -53,6 +49,7 @@ class ProviderState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._requests: list[dict[str, Any]] = []
+        self._requests_by_id: dict[str, dict[str, Any]] = {}
         self._failures: list[str] = []
         self._old_wire_name: str | None = None
         self._new_wire_name: str | None = None
@@ -84,45 +81,6 @@ class ProviderState:
             for message in messages
             if isinstance(message, dict)
         )
-        guidance_messages = [
-            fixture.message_text(message.get("content"))
-            for message in messages
-            if isinstance(message, dict)
-            and message.get("role") == "system"
-            and fixture.message_text(message.get("content")).startswith("Active tool guidance:")
-        ]
-        fixture.require(len(guidance_messages) == 1, "Provider 请求没有唯一的基础工具 guidance")
-        guidance = guidance_messages[0]
-        fixture.require(
-            f"- {tools_by_name['fs.read']['wireName']}: Read bounded UTF-8 text from a workspace file."
-            in guidance,
-            "fs.read prompt snippet 未进入 Provider 请求",
-        )
-        fixture.require(
-            "instead of shell commands such as cat or sed" in guidance,
-            "fs.read 优先于 shell 文本读取的 guidance 缺失",
-        )
-        fixture.require(
-            f"- {tools_by_name['bash']['wireName']}: Run a Bash script from the bound workspace root."
-            in guidance,
-            "bash prompt snippet 未进入 Provider 请求",
-        )
-        fixture.require(
-            "Use fs.read for known UTF-8 workspace files."
-            in guidance,
-            "bash 与 fs.read 的职责边界 guidance 缺失",
-        )
-        fixture.require(
-            f"- {tools_by_name['web.fetch']['wireName']}: Read bounded text from a known HTTP or HTTPS URL."
-            in guidance,
-            "web.fetch prompt snippet 未进入 Provider 请求",
-        )
-        fixture.require(
-            "Read URLs supplied by the user or returned by search."
-            in guidance,
-            "web.fetch 与搜索的职责边界 guidance 缺失",
-        )
-        fixture.require("filesystem or Bash tools" not in joined, "附件文本仍在指示 Bash 读取")
         mcp_server_id = "fixture-old" if ordinal <= 2 else "fixture-new"
         reverse_tool = tools_by_name.get(f"mcp.{mcp_server_id}.text.reverse")
         fixture.require(isinstance(reverse_tool, dict),
@@ -141,13 +99,6 @@ class ProviderState:
                 and tool.get("pluginUri") == plugin_uri,
                 f"Provider 请求缺少精确 first-party 工具与 owner：{name}",
             )
-        fixture.require(
-            "Search GitHub repositories, code, and issues through GitHub's native API." in guidance
-            and "Search arXiv paper metadata through its native Atom API." in guidance
-            and "Read bounded page ranges from a PDF attached to the current workspace binding."
-            in guidance,
-            "first-party tool prompt contribution 未进入 Provider 请求",
-        )
         results = {
             str(message.get("tool_call_id")): fixture.message_text(message.get("content"))
             for message in messages
@@ -272,6 +223,7 @@ class ProviderState:
             )
             fixture.require(receipt.get("purpose") == "agent", "fixture Provider 请求关联到错误的 context purpose")
             self._consumed_receipts.add(request_id)
+            self._requests_by_id[request_id] = body
             self._last_receipt_sequence = sequence
 
         receipt_tools = receipt.get("tools")
@@ -320,6 +272,11 @@ class ProviderState:
     def count(self) -> int:
         with self._lock:
             return len(self._requests)
+
+    def request_for(self, request_id: str) -> dict[str, Any]:
+        with self._lock:
+            fixture.require(request_id in self._requests_by_id, f"context receipt 没有对应 Provider 请求：{request_id}")
+            return self._requests_by_id[request_id]
 
     def old_wire_name(self) -> str:
         with self._lock:
@@ -667,9 +624,28 @@ def assert_projection_flow(value: dict[str, Any]) -> None:
     fixture.require(isinstance(ratio, (int, float)) and abs(ratio - 0.4) < 1e-12, "缓存命中率分母错误")
 
 
-def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: str) -> None:
+def assert_received_tool_guidance(body: dict[str, Any], receipt: dict[str, Any], runtime: dict[str, Any]) -> None:
+    contributions = {item["canonicalToolName"]: item for item in runtime["toolPromptContributions"]}
+    required = REQUIRED_CORE_TOOLS | {"bash"} | set(FIRST_PARTY_TOOL_OWNERS)
+    fixture.require(required.issubset(contributions), "必要工具缺少生产端 tool prompt contribution")
+    aliases = {item["canonicalName"]: item["wireName"] for item in receipt["tools"]}
+    system_messages = [fixture.message_text(message.get("content")) for message in body["messages"]
+                       if isinstance(message, dict) and message.get("role") == "system"]
+    for name in required:
+        contribution = contributions[name]
+        parts = ([contribution["promptSnippet"]] if contribution.get("promptSnippet") else [])
+        parts.extend(contribution["usageGuidelines"])
+        fixture.require(parts and all(isinstance(part, str) and part.strip() for part in parts),
+                        f"必要工具的生产提示为空：{name}")
+        fixture.require(name in aliases, f"必要工具没有当前 Provider alias：{name}")
+        fixture.require(any(aliases[name] in message and all(part in message for part in parts)
+                            for message in system_messages),
+                        f"生产端工具提示未完整进入当前 Provider system 消息：{name}")
+
+
+def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: str, provider: ProviderState) -> None:
     runtime_root = config_root / "data" / "agent-runtime"
-    with fixture.sqlite_read_only(runtime_root / "session.sqlite3") as connection:
+    with closing(fixture.sqlite_read_only(runtime_root / "session.sqlite3")) as connection:
         started_rows = connection.execute(
             "SELECT run_id, payload_json FROM session_events "
             "WHERE session_id=? AND event_type='run.started' ORDER BY sequence",
@@ -684,7 +660,7 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
         ).fetchall()
     fixture.require(len(started_rows) == 2, "两轮链路没有两个 run.started runtime snapshot")
 
-    with fixture.sqlite_read_only(runtime_root / "tool-record.sqlite3") as connection:
+    with closing(fixture.sqlite_read_only(runtime_root / "tool-record.sqlite3")) as connection:
         record_rows = connection.execute(
             "SELECT run_id, call_id, record_json FROM tool_records "
             "WHERE session_id=? ORDER BY completed_at, call_id",
@@ -874,6 +850,8 @@ def assert_persisted_tool_bindings_and_release(config_root: Path, session_id: st
                 and item.get("availability") == "callable"
                 for item in provider_tools
             ), "context receipt 工具来源字段不完整")
+            assert_received_tool_guidance(provider.request_for(receipt["providerRequestId"]), receipt,
+                                          views[receipt["kernelCatalogSnapshotRef"]])
         snapshots.append(runtime)
 
     for key in (
@@ -983,8 +961,9 @@ def main() -> None:
     daemon_one: fixture.OwnedDaemon | None = None
     daemon_two: fixture.OwnedDaemon | None = None
     cli_ask: subprocess.Popen[str] | None = None
-    try:
-        with tempfile.TemporaryDirectory(prefix="deepcode-basic-loop-e2e-") as temporary:
+    with ExitStack() as storage:
+        try:
+            temporary = storage.enter_context(tempfile.TemporaryDirectory(prefix="deepcode-basic-loop-e2e-"))
             root = Path(temporary)
             config_root = root / "config-root"
             workspace_root = root / "workspace"
@@ -1121,7 +1100,7 @@ def main() -> None:
             final_revision = int(final["revision"])
 
             daemon_one.shutdown()
-            assert_persisted_tool_bindings_and_release(config_root, session_id)
+            assert_persisted_tool_bindings_and_release(config_root, session_id, provider)
 
             daemon_two = fixture.OwnedDaemon(config_root)
             daemon_two.start()
@@ -1173,22 +1152,23 @@ def main() -> None:
                 "filesystem-reference/long-input/bounded-read/shared-projection "
                 "(CLI chain verification only; not GUI, package, or release acceptance)"
             )
-    finally:
-        provider.release_first_request.set()
-        if cli_ask is not None:
-            cli_ask.terminate()
-            try:
-                cli_ask.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                cli_ask.kill()
-                cli_ask.wait(timeout=3)
-        if daemon_two is not None:
-            daemon_two.close()
-        if daemon_one is not None:
-            daemon_one.close()
-        provider_server.shutdown()
-        provider_server.server_close()
-        provider_thread.join(timeout=3)
+        finally:
+            provider.release_first_request.set()
+            with ExitStack() as cleanup:
+                cleanup.callback(provider_thread.join, timeout=3)
+                cleanup.callback(provider_server.server_close)
+                cleanup.callback(provider_server.shutdown)
+                if daemon_one is not None:
+                    cleanup.callback(daemon_one.close)
+                if daemon_two is not None:
+                    cleanup.callback(daemon_two.close)
+                if cli_ask is not None:
+                    cli_ask.terminate()
+                    try:
+                        cli_ask.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        cli_ask.kill()
+                        cli_ask.wait(timeout=3)
 
 
 if __name__ == "__main__":

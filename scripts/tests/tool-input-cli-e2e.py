@@ -3,15 +3,14 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 import base64
 import http.server
 import importlib.util
 import json
-import subprocess
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any
 
 
 spec = importlib.util.spec_from_file_location("deepcode_test_support", Path(__file__).with_name("support.py"))
@@ -258,11 +257,11 @@ def require_unexecuted_approval(daemon, projection):
     require(approval is not None and projection["run"]["status"] == "waiting"
             and projection["run"]["waitingReason"] == "approval", "调用未停在审批门禁")
     runtime = daemon.config_root / "data" / "agent-runtime"
-    with fixture.sqlite_read_only(runtime / "session.sqlite3") as connection:
+    with closing(fixture.sqlite_read_only(runtime / "session.sqlite3")) as connection:
         started = connection.execute("SELECT COUNT(*) FROM session_events WHERE session_id=? AND call_id=? AND event_type='tool.started'",
                                      (projection["sessionId"], approval["callId"])).fetchone()[0]
         require(started == 0, "用户批准前调用已进入执行边界")
-    with fixture.sqlite_read_only(runtime / "tool-record.sqlite3") as connection:
+    with closing(fixture.sqlite_read_only(runtime / "tool-record.sqlite3")) as connection:
         records = connection.execute("SELECT COUNT(*) FROM tool_records WHERE call_id=?", (approval["callId"],)).fetchone()[0]
         require(records == 0, "待批准调用不应已有执行终态")
     return approval
@@ -400,7 +399,7 @@ def main() -> None:
             verify_queued_attachments(daemon, state, root, workspace)
             daemon.shutdown()
             runtime = daemon.config_root / "data" / "agent-runtime"
-            with fixture.sqlite_read_only(runtime / "session.sqlite3") as connection:
+            with closing(fixture.sqlite_read_only(runtime / "session.sqlite3")) as connection:
                 rows = connection.execute("SELECT event_type, call_id, payload_json FROM session_events WHERE session_id IN (?,?) ORDER BY session_id, sequence", (session_id, native_session_id)).fetchall()
                 requested = {call_id for kind, call_id, _ in rows if kind == "tool.requested"}
                 terminal = {call_id for kind, call_id, _ in rows if kind in {"tool.completed", "tool.input-rejected", "tool.interrupted"}}
@@ -415,7 +414,7 @@ def main() -> None:
                 require(len(native_events) == 4, "独立说明、调用拒绝、工具调用和最终回答没有保持同一 run")
                 require(native_events[0]["orderedCallIds"] == [] and native_events[0]["orderedOutputBlocks"][0]["kind"] == "narrative", "commentary 被持久化为最终答复")
                 require(native_events[1]["orderedCallIds"] == [] and native_events[1]["orderedOutputBlocks"][0]["kind"] == "toolCallRejected", "未知工具被登记为可执行调用")
-            with fixture.sqlite_read_only(runtime / "tool-record.sqlite3") as connection:
+            with closing(fixture.sqlite_read_only(runtime / "tool-record.sqlite3")) as connection:
                 records = [json.loads(row[0]) for row in connection.execute("SELECT record_json FROM tool_records WHERE session_id=?", (session_id,))]
                 shell = next(record for record in records if record["toolName"] == "bash" and record["input"]["command"] == SCRIPT)
                 require(shell["input"]["command"] == SCRIPT, "Bash 脚本被改写")

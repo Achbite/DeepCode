@@ -1,4 +1,4 @@
-use super::{finish, os::*, profile::Profile};
+use super::{finish, os::*, profile::Profile, token};
 use crate::executors::windows_job::ProcessJob;
 use std::fs::File;
 use std::os::windows::io::FromRawHandle;
@@ -134,7 +134,12 @@ fn as_file(handle: Handle) -> File {
     unsafe { File::from_raw_handle(raw) }
 }
 
-pub(super) fn spawn(command: &Command, terminal: bool, profile: &Profile) -> Result<Child, String> {
+pub(super) fn spawn(
+    command: &Command,
+    terminal: bool,
+    profile: &Profile,
+    prepare: impl FnOnce(HANDLE) -> Result<(), String>,
+) -> Result<Child, String> {
     let (input_read, input_write) = pipe()?;
     let (output_read, output_write) = pipe()?;
     let mut stderr = None;
@@ -160,6 +165,9 @@ pub(super) fn spawn(command: &Command, terminal: bool, profile: &Profile) -> Res
     let mut flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
     let mut inherited = Vec::new();
     if terminal {
+        // Prevent Windows from copying the worker's redirected std handles into
+        // the ConPTY client. Null handles are supplied by the pseudoconsole.
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
         let mut raw = 0;
         let result = unsafe {
             CreatePseudoConsole(
@@ -256,7 +264,11 @@ pub(super) fn spawn(command: &Command, terminal: bool, profile: &Profile) -> Res
         Ok(job) => job,
         Err(error) => return finish(Err(error.to_string()), terminate_suspended(process.0)),
     };
-    if let Err(error) = verify_lpac(process.0) {
+    // A packaged executable adds package identity to the actual token. Evaluate
+    // runtime access with that token, then install invocation grants before any
+    // Shell instruction runs.
+    let prepared = token::verified(process.0).and_then(|token| prepare(token.0));
+    if let Err(error) = prepared {
         return finish(Err(error), terminate_suspended(process.0));
     }
     // No instruction runs before the complete descendant lifetime is owned.
@@ -280,34 +292,6 @@ pub(super) fn spawn(command: &Command, terminal: bool, profile: &Profile) -> Res
     })
 }
 
-fn verify_lpac(process: HANDLE) -> Result<(), String> {
-    let mut token = null_mut();
-    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
-        return Err(error("Open sandbox token"));
-    }
-    let token = Handle(token);
-    for kind in [TokenIsAppContainer, TokenIsLessPrivilegedAppContainer] {
-        let mut enabled: u32 = 0;
-        let mut length = 0;
-        if unsafe {
-            GetTokenInformation(
-                token.0,
-                kind,
-                (&mut enabled as *mut u32).cast(),
-                std::mem::size_of_val(&enabled) as u32,
-                &mut length,
-            )
-        } == 0
-        {
-            return Err(error("Verify LPAC process token"));
-        }
-        if enabled == 0 {
-            return Err("Windows did not create the requested LPAC token".into());
-        }
-    }
-    Ok(())
-}
-
 fn terminate_suspended(process: HANDLE) -> Result<(), String> {
     if unsafe { TerminateProcess(process, 1) } == 0 {
         return Err(error("Terminate suspended Shell"));
@@ -326,8 +310,14 @@ pub(super) fn probe(profile: &Profile) -> Result<(), String> {
         .args(["/d", "/c", "exit", "0"])
         .current_dir(&directory)
         .env_clear()
-        .env("SystemRoot", &system);
-    let mut child = spawn(&command, false, profile)?;
+        .env("SystemRoot", &system)
+        // CreateProcess requires LOCALAPPDATA to initialize an AppContainer even
+        // when the probe itself needs no writable files.
+        .env(
+            "LOCALAPPDATA",
+            std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is missing")?,
+        );
+    let mut child = spawn(&command, false, profile, |_| Ok(()))?;
     child.stdin.take();
     let deadline = Instant::now() + Duration::from_secs(5);
     let result = (|| loop {

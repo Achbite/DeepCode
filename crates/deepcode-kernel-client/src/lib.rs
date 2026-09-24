@@ -1,5 +1,6 @@
 use deepcode_kernel_abi::{
     is_valid_host_shell_token, HOST_SHELL_TOKEN_ENV, HOST_SHELL_TOKEN_HEADER,
+    HOST_SHUTDOWN_RECEIPT_TIMEOUT_MILLIS,
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::de::DeserializeOwned;
@@ -396,6 +397,7 @@ impl HttpKernelClient {
         let value = self
             .http
             .post(self.url("/api/host/shutdown"))
+            .timeout(Duration::from_millis(HOST_SHUTDOWN_RECEIPT_TIMEOUT_MILLIS))
             .json(&deepcode_kernel_abi::HostShutdownRequest {
                 expected_identity: identity.clone(),
             })
