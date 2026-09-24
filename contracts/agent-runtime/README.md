@@ -1,6 +1,6 @@
 # Agent Runtime 合同资产
 
-产品发布说明见[项目 README](../../README.zh-CN.md)。产品版本、制品 `build-info.json` 与下面各 owner 的 schema 版本独立维护；发布产品新版本不会自动提升数据库版本。
+产品发布说明见[项目 README](../../README.zh-CN.md)。产品版本、制品 `BUILDINFO.json` 与下面各 owner 的 schema 版本独立维护；发布产品新版本不会自动提升数据库版本。
 
 本目录只保存当前本地 Agent Runtime 的机器合同。它没有迁移脚本、兼容 alias、双读、双写、旧根 fallback，也不包含第二套 Session 或 Kernel 执行路径。
 
@@ -16,13 +16,13 @@
 
 模型 Profile 和侧边栏排序属于 Host 用户配置。模型配置错误通过设置接口保留并展示，不阻止 Host 打开有效的 Session store；运行请求仍要求可用的模型配置。GUI 排序不改变 Catalog 的项目归属或 Session 的语义事实。
 
-同一个配置根在任一时刻只有一个 daemon owner。daemon 在读取权威配置和打开三个业务 store 之前，必须持有 `runtime/agent-runtime/root-owner.lock` 的进程生命周期租约；同根的第二个 daemon 以 `config_root_already_owned` 显式失败。该文件只是由操作系统锁生命周期约束的 owner 租约，不是第四个业务事实 store，进程退出或崩溃即释放所有权。
+同一个配置根在任一时刻只有一个 daemon owner。daemon 在读取权威配置和打开三个业务 store 之前，必须持有 `<data_dir>/agent-runtime/root-owner.lock` 的进程生命周期租约；同根的第二个 daemon 以 `config_root_already_owned` 显式失败。`data_dir` 是 Host 的持久数据目录，平台路径与独立用户根规则见[用户目录](../../docs/distribution.md#用户目录)。该文件只是由操作系统锁生命周期约束的 owner 租约，不是第四个业务事实 store，进程退出或崩溃即释放所有权。
 
 Catalog 拥有可变的 Session 标题和 Project 归类。Session projection 的 `display.creationTitle` 只保存不可变的创建标题，不得作为当前标题或归类的第二权威源。Host shell 通过 projection snapshot 拉取消费 Session 事实；当前合同没有 projection subscribe/SSE 推送路径，各 shell 可以按自己的展示节奏轮询同一个 snapshot 端点。
 
 Provider 原生 `callId` 与 Session `LogicalCallId` 是两种身份。Session 在每次 Provider turn 为 call 生成独立且不复用原生值的 LogicalCallId；journal payload 以 `providerCallId` 保留 Provider 身份，顶层 `callId`、Interaction/Plan identity、Kernel request、ToolRecord 和 Session 重放使用 LogicalCallId。
 
-`message.submit.filesystemReferences` 是文件与目录共用的消息级逻辑引用。Host 将工作区外文件导入 Session 私有快照 workspace；目录保持既有实时 workspace 生命周期。Session 只持久化 `referenceId/workspaceId/logicalPath/displayName/kind` 及文件媒体元数据，并将引用 workspace 与 Session creation snapshot 合并为该消息所启动 run 的不可变 workspace binding 快照。Provider 首轮只看到逻辑 workspace handle 与逻辑路径，内容必须按需通过基础文件工具读取；Host canonical path 不进入消息合同。PDF 仍是 `kind=file`，并由声明 `application/pdf` 激活媒体类型的 Skill 插件处理。
+`message.submit.filesystemReferences` 是文件与目录共用的消息级逻辑引用。Host 将工作区外文件导入 Session 私有快照 workspace；目录保持既有实时 workspace 生命周期。Session 只持久化 `referenceId/workspaceId/logicalPath/displayName/kind` 及文件媒体元数据，并将引用 workspace 与 Session creation snapshot 合并为该消息所启动 run 的不可变 workspace binding 快照。普通文件向 Provider 提供逻辑 workspace handle 与逻辑路径，内容按需通过基础文件工具读取；当前 run 的 PNG、JPEG、WebP、GIF 附件由 Session 纳入视觉输入，在 Provider 边界解析为图片内容，要求模型支持图片输入。journal 保留图片引用，不写入 base64；Host canonical path 不进入消息合同。PDF 仍是 `kind=file`，并由声明 `application/pdf` 激活媒体类型的 Skill 插件处理。
 
 ## 打开规则
 
@@ -35,6 +35,6 @@ Provider 原生 `callId` 与 Session `LogicalCallId` 是两种身份。Session �
 
 删除 Session 是一次 Session aggregate 删除：Catalog 条目、Session archive、Session 私有目录索引关系、Session-owned 文件快照和该 Session 的 ToolRecord 一并删除。ToolRecord 不能被普通工具调用任意修改或删除；只有 Host 协调的 Session aggregate purge 可以删除它。
 
-运行时只使用 `runtime/agent-runtime/` 下的当前三个业务 store；同目录的 `root-owner.lock` 仅证明当前 daemon 的配置根所有权。旧目录和旧数据库不属于当前运行合同，不存在只读历史入口。
+Catalog、Session 与 ToolRecord 三个业务 store 位于 `<data_dir>/agent-runtime/`；同目录还保存 Host 的 Provider 用量报告索引 `provider-usage.sqlite3`，它不替代 Session journal 或 ToolRecord。`root-owner.lock` 仅证明当前 daemon 的配置根所有权。旧目录和旧数据库不属于当前运行合同，不存在只读历史入口。
 
 如果当前数据库出现找不到对应 Session 的孤立 ToolRecord，应保留原始失败并定位生命周期来源；本合同不授权用启动清理、后台扫描或 UI 行为静默删除它们。
