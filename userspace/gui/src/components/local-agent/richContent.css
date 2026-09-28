@@ -92,7 +92,7 @@ details:not([open]) > summary > .conversation-disclosure-chevron, .conversation-
 .local-agent__tool-entry-details code { display: block; }
 .conversation-plan-preview { margin: 8px 0; }
 
-.conversation-changes { position: relative; margin: 16px 0; border: 1px solid var(--dc-border); border-radius: 14px; background: var(--dc-surface); min-width: 0; }
+.conversation-changes { position: relative; margin: 16px 0; border: 1px solid var(--dc-border); border-radius: 14px; background: var(--dc-surface); min-width: 0; -webkit-user-select: none; user-select: none; }
 .local-agent .conversation-changes button { color: inherit; cursor: pointer; font: inherit; border: 0; background: transparent; }
 .local-agent .conversation-changes-heading { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; padding: 14px 16px; border-radius: 14px; }
 .conversation-changes-heading > svg { width: 20px; height: 20px; flex: none; color: var(--dc-muted); }
@@ -103,6 +103,7 @@ details:not([open]) > summary > .conversation-disclosure-chevron, .conversation-
 .conversation-change-list { padding: 6px 10px 10px; }
 .local-agent .conversation-change-file { display: flex; gap: 12px; align-items: center; width: 100%; text-align: left; padding: 9px 6px; border-radius: 6px; min-width: 0; }
 .conversation-change-file > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-change-file > span:first-child { -webkit-user-select: text; user-select: text; }
 .conversation-change-file > small { flex: none; color: var(--dc-muted); font-size: calc(11px * var(--dc-ui-font-scale, 1)); }
 .local-agent .conversation-changes .conversation-change-more { display: inline-flex; align-items: center; gap: 4px; min-height: 26px; margin: 4px 3px 0; padding: 1px 3px; border-radius: 6px; color: var(--dc-muted); font-size: calc(12px * var(--dc-ui-font-scale, 1)); font-weight: 400; line-height: 1.5; }
 .conversation-changes--compact { width: fit-content; max-width: 100%; border: 0; border-radius: 6px; margin: 8px 0; background: transparent; }
@@ -127,7 +128,7 @@ details:not([open]) > summary > .conversation-disclosure-chevron, .conversation-
 .conversation-diff-counts .is-removed { color: var(--dc-danger); }
 .conversation-change-error { display: block; padding: 6px; color: var(--dc-muted); }
 .conversation-change-error summary { cursor: pointer; font-size: calc(12px * var(--dc-ui-font-scale, 1)); }
-.conversation-change-error p { overflow-wrap: anywhere; font-size: calc(12px * var(--dc-ui-font-scale, 1)); }
+.conversation-change-error p { overflow-wrap: anywhere; font-size: calc(12px * var(--dc-ui-font-scale, 1)); -webkit-user-select: text; user-select: text; }
 .conversation-changes-heading .conversation-change-binary-count { margin: 0; font-weight: 400; }
 .conversation-diff-binary { padding: 24px; color: var(--dc-muted); font-size: var(--dc-font-body); }
 .conversation-diff-binary small { display: block; margin-top: 10px; }

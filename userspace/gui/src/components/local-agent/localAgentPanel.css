@@ -1474,6 +1474,8 @@
   background: var(--dc-surface-raised);
   color: var(--dc-foreground);
   cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .local-agent button:disabled {
@@ -1523,6 +1525,25 @@
   border-radius: 18px;
   background: var(--dc-surface-raised);
   box-shadow: var(--dc-shadow-panel);
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Composer chrome is not prose; editable fields and decision details remain selectable. */
+.local-agent__composer :is(
+  input, textarea,
+  .local-agent__decision, .local-agent__auto-review,
+  .local-agent__message-edit-notice, .local-agent__message-edit-references,
+  .local-agent__profile-notice, .local-agent__pasted-text,
+  .local-agent__attachment-name
+) {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.local-agent__composer-hint {
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .local-agent__composer--approval {
