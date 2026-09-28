@@ -627,7 +627,7 @@
     "agent.run.status.cancelled": "Cancelled",
     "agent.run.status.indeterminate": "Indeterminate",
     "tui.authorizationReviewingDetails": "Model is reviewing execution permission: {0}",
-    "agent.sources.unresolved": "Some citation sources were not returned",
+    "agent.sources.unresolved": "Some citation sources were not returned. References marked [?] cannot be opened.",
     "agent.sources.title": "Sources",
     "agent.tool.summary.count": "{count} tools",
     "agent.tool.summary.ended": "Finished",

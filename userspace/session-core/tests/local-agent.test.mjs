@@ -784,7 +784,8 @@ test('run binding exposes hosted search once and replays its Provider item uncha
     type: 'web_search_call',
     id: 'ws_1',
     status: 'completed',
-    action: { type: 'search', queries: ['current compiler release'] },
+    action: { type: 'search', queries: ['current compiler release'],
+      sources: [{ type: 'url', url: 'https://example.com/compiler-release' }] },
   }, {
     type: 'web_search_call',
     id: 'ws_2',
@@ -913,6 +914,7 @@ test('Responses output items preserve narrative, hosted activity, and final-mess
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:ordered-provider-output';
   await createSession(journal, sessionId, [workspaceBinding]);
+  const finalText = '发布说明见这里。\uE200cite\uE202turn0search0\uE201';
   const nativeItems = [{
     type: 'message',
     id: 'provider-message:search-intro',
@@ -943,7 +945,7 @@ test('Responses output items preserve narrative, hosted activity, and final-mess
     role: 'assistant',
     phase: 'final_answer',
     status: 'completed',
-    content: [{ type: 'output_text', text: 'The current release is recorded in the cited result.', annotations: [{ type: 'url_citation', url: 'https://example.com/compiler-release', title: 'Compiler release', start_index: 0, end_index: 50 }] }],
+    content: [{ type: 'output_text', text: finalText, annotations: [{ type: 'url_citation', url: 'https://example.com/compiler-release', title: 'Compiler release', start_index: 8, end_index: finalText.length }] }],
   }];
   const preparation = fakeRunPreparation({
     apiSurface: 'responses',
@@ -1015,6 +1017,7 @@ test('Responses output items preserve narrative, hosted activity, and final-mess
     finalStreamingProjection.assistantDraft.blocks.at(-1).content,
     nativeItems.at(-1).content[0].text,
   );
+  assert.equal(finalStreamingProjection.assistantDraft.blocks.at(-1).displayContent, '发布说明见这里。');
   completeFinalItem();
   const streamingProjection = await waitForProjection(actor, (value) => (
     value.assistantDraft?.blocks?.length === nativeItems.length
@@ -1057,6 +1060,9 @@ test('Responses output items preserve narrative, hosted activity, and final-mess
     block.kind === 'providerHosted' ? [block.activityId] : []
   )));
   const finalMessageId = orderedBlocks.find((block) => block.kind === 'finalMessage').messageId;
+  assert.equal(firstProjection.messages.find(message => message.messageId === finalMessageId).content, finalText);
+  assert.equal(firstProjection.messages.find(message => message.messageId === finalMessageId).displayContent,
+    '发布说明见这里。[Compiler release](<https://example.com/compiler-release>)');
   assert.deepEqual(firstProjection.messages.find(message => message.messageId === finalMessageId).sourceReferences, {
     citations: [{ url: 'https://example.com/compiler-release', title: 'Compiler release' }], unresolved: false,
   });
@@ -1104,7 +1110,7 @@ test('Responses output items preserve narrative, hosted activity, and final-mess
   );
   assert.equal(
     firstProjection.messages.find((message) => message.messageId === finalMessageId)?.content,
-    'The current release is recorded in the cited result.',
+    finalText,
   );
 
   await actor.submit(messageCommand(

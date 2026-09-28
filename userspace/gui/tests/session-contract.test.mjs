@@ -3641,6 +3641,43 @@ test('failure details count retries within each model request and retain source 
   assert.match(source, /部分引用来源未返回/);
 });
 
+test('GUI consumes Session citation display, keeps original facts, and settles on displayed text', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:gui-citations';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const raw = '网页来源。\uE200cite\uE202turn0search0\uE201 本地 [源码](/workspace/src/main.rs:42)。';
+  const native = { type: 'message', id: 'native:citations', role: 'assistant', phase: 'final_answer', status: 'completed',
+    content: [{ type: 'output_text', text: raw, annotations: [{ type: 'url_citation',
+      title: '真实网页', url: 'https://example.test/article', start_index: 5, end_index: raw.indexOf(' 本地') }] }] };
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    yield providerEvent(request.requestId, 'text.delta', { outputIndex: 0, text: raw });
+    yield providerEvent(request.requestId, 'output.item.completed', { outputIndex: 0, item: native });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel(), fakeRunPreparation({ apiSurface: 'responses' }).port, 'gui-citations');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:citations', 'Explain with sources.'));
+  const projection = await decodeGuiProjection(await waitForProjection(actor, value => value.run?.status === 'completed'));
+  const message = projection.messages.find(value => value.role === 'assistant');
+  assert.equal(message.content, raw);
+  const { projectCommittedText } = await import('../../presentation-core/dist/index.js');
+  const text = projectCommittedText(projection).get(`message:${message.messageId}:content`).text;
+  assert.equal(text, message.displayContent);
+  assert.match(text, /\[真实网页\]\(<https:\/\/example.test\/article>\)/u);
+  assert.match(text, /\[源码\]\(\/workspace\/src\/main.rs:42\)/u);
+  assert.doesNotMatch(text, /turn0search0|\uE200/u);
+  const [{ MarkdownContent }, { conversationDisplay }] = await loadGuiModules(t, [
+    '/src/components/local-agent/BufferedMarkdown.tsx', '/src/components/local-agent/conversationDisplay.ts',
+  ]);
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const html = renderToStaticMarkup(createElement(MarkdownContent, null, text));
+  assert.match(html, /href="https:\/\/example.test\/article"/u);
+  const stream = projection.timeline.find(value => value.kind === 'message' && value.messageId === message.messageId).streamId;
+  const live = new Set([message.runId]);
+  assert.equal(conversationDisplay(projection, live, new Map([[stream, raw]])).displaySettledRunIds.has(message.runId), false);
+  assert.equal(conversationDisplay(projection, live, new Map([[stream, text]])).displaySettledRunIds.has(message.runId), true);
+});
+
 test('workbench control examples use region data and Host actions while retaining Reader content', async t => {
   const { default: plugin } = await import('../../../ui-plugins/workbench-controls/index.mjs');
   class Element {

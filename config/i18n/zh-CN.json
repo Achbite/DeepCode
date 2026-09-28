@@ -627,7 +627,7 @@
     "agent.run.status.cancelled": "已取消",
     "agent.run.status.indeterminate": "结果待确认",
     "tui.authorizationReviewingDetails": "模型正在审查执行权限：{0}",
-    "agent.sources.unresolved": "部分引用来源未返回",
+    "agent.sources.unresolved": "部分引用来源未返回，标为 [?] 的引用无法打开。",
     "agent.sources.title": "来源",
     "agent.tool.summary.count": "{count} 个工具",
     "agent.tool.summary.ended": "已结束",

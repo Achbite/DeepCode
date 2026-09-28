@@ -15,7 +15,7 @@ export function conversationDisplay(
     if (message.role !== 'assistant') continue;
     const streamId = streams.get(message.messageId);
     const caughtUp = !liveRuns.has(message.runId)
-      || Boolean(streamId && displayed.get(streamId) === message.content);
+      || Boolean(streamId && displayed.get(streamId) === (message.displayContent ?? message.content));
     const ready = caughtUp && (message.runId !== current?.runId || (terminal && !projection?.assistantDraft));
     readiness.set(message.runId, ready && readiness.get(message.runId) !== false);
   }
