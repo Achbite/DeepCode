@@ -6,6 +6,7 @@ import { PALETTE_FIELDS, PALETTE_SETTING, decodePaletteOverrides, paletteColor }
 import { THEME_LIBRARY_SETTING, applyThemePalette, builtinThemes, decodeThemeLibrary, importTheme, selectedThemeId, themeOverrides, type ThemeDocument, type SavedTheme } from '../../theme/themeLibrary';
 import ModalDialog from '../shared/ModalDialog';
 import ThemePicker, { ThemeBadge } from './ThemePicker';
+import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import { useSettingsSearchEntries, useSettingsSearchTarget } from './settingsSearch';
 import { useInterfaceReloadGuard } from '../../services/interfaceReload';
 
@@ -71,8 +72,8 @@ export default function ThemeLibrarySettings({ language }: { language: UiLanguag
       setNotice(t(language, 'settings.themes.copied'));
     } catch (reason) { setError(String(reason)); }
   };
-  return <section ref={target} tabIndex={-1} className="settings-card appearance-config-box" aria-labelledby="ui-themes-heading">
-    <h3 id="ui-themes-heading" className="settings-card__title">{t(language, 'settings.themes.title')}</h3>
+  return <details className="settings-card appearance-config-box appearance-theme-library">
+    <summary ref={target} className="settings-card__title">{t(language, 'settings.themes.title')}<DeepCodeShellIcon name="chevronRight" size={14} /></summary>
     <div className="appearance-config-box__body">
       {!configError && (['light', 'dark'] as const).map((mode) => {
         const selected = selectedThemeId(allThemes, colors, mode);
@@ -118,5 +119,5 @@ export default function ThemeLibrarySettings({ language }: { language: UiLanguag
         </div>
       </div>
     </ModalDialog>}
-  </section>;
+  </details>;
 }

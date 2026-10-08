@@ -132,10 +132,10 @@ impl CliRenderState {
                         .find(|message| message.message_id == *message_id)
                         .expect("validated Session timeline message reference");
                     if let Some(stream) = stream_id {
-                        self.write_text(out, stream, &message.content)?;
+                        self.write_text(out, stream, message.display_text())?;
                         self.finish_text(out)?;
                     } else {
-                        writeln!(out, "{}: {}", message.role, message.content)?;
+                        writeln!(out, "{}: {}", message.role, message.display_text())?;
                     }
                     render_attachments(out, message)?;
                     render_source_references(out, message.source_references.as_ref())?;
@@ -153,7 +153,7 @@ impl CliRenderState {
                         .iter()
                         .find(|value| value.narrative_id == *narrative_id)
                         .expect("validated Session timeline narrative reference");
-                    self.write_text(out, stream_id, &narrative.content)?;
+                    self.write_text(out, stream_id, narrative.display_text())?;
                     self.finish_text(out)?;
                     render_source_references(out, narrative.source_references.as_ref())?;
                 }
@@ -389,7 +389,7 @@ fn committed_text<'a>(
             .messages
             .iter()
             .find(|message| message.message_id == *message_id)
-            .map(|message| (stream_id.as_deref(), message.content.as_str())),
+            .map(|message| (stream_id.as_deref(), message.display_text())),
         SessionTimelineItem::Narrative {
             narrative_id,
             stream_id,
@@ -398,7 +398,7 @@ fn committed_text<'a>(
             .narratives
             .iter()
             .find(|narrative| narrative.narrative_id == *narrative_id)
-            .map(|narrative| (Some(stream_id.as_str()), narrative.content.as_str())),
+            .map(|narrative| (Some(stream_id.as_str()), narrative.display_text())),
         _ => None,
     }
 }
@@ -764,7 +764,7 @@ pub(crate) fn render_final_message(
     after_message_count: usize,
 ) -> io::Result<()> {
     if let Some(message) = projection.last_assistant_message(after_message_count) {
-        writeln!(out, "{}", message.content)?;
+        writeln!(out, "{}", message.display_text())?;
         render_source_references(out, message.source_references.as_ref())?;
     }
     Ok(())
@@ -784,7 +784,7 @@ fn render_source_references(
             )?;
         }
         if references.unresolved {
-            writeln!(out, "部分引用来源未返回")?;
+            writeln!(out, "部分引用来源未返回，标为 [?] 的引用无法打开。")?;
         }
     }
     Ok(())
@@ -1221,6 +1221,36 @@ mod tests {
         assert_eq!(text.matches("输入 /reply 1 或 /reply 确认").count(), 1);
         assert!(text.contains("   第一行\n   第二行"));
         assert!(text.contains("Plan 状态 · revision 1 · revisionRequested"));
+    }
+
+    #[test]
+    fn citations_use_session_display_text_during_streaming_commit_and_plain_output() {
+        let mut p = projection();
+        let mut state = CliRenderState::after(&p);
+        let mut out = Vec::new();
+        let raw = "正文\u{e200}cite\u{e202}turn0search0\u{e201}结束";
+        let display = "正文[来源](<https://example.test/docs>)结束";
+        p.assistant_draft = Some(
+            serde_json::from_value(json!({
+                "runId":"run:test", "turnId":"turn:final", "blocks":[{
+                    "kind":"finalMessage", "streamId":"stream:final", "outputIndex":0,
+                    "content":raw, "displayContent":"正文"
+                }]
+            }))
+            .unwrap(),
+        );
+        state.render(&mut out, &p).unwrap();
+        assert_eq!(String::from_utf8(out.clone()).unwrap(), "正文");
+        commit(&mut p, raw);
+        p.messages.last_mut().unwrap().display_content = Some(display.into());
+        state.render(&mut out, &p).unwrap();
+        p.assistant_draft = None;
+        state.render(&mut out, &p).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), format!("{display}\n"));
+        let mut plain = Vec::new();
+        render_final_message(&mut plain, &p, 0).unwrap();
+        assert_eq!(String::from_utf8(plain).unwrap(), format!("{display}\n"));
+        assert_eq!(p.messages.last().unwrap().content, raw);
     }
 
     #[test]

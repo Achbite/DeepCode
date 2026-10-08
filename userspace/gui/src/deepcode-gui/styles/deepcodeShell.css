@@ -281,7 +281,7 @@
   display: inline-flex; align-items: center; gap: 8px; -webkit-app-region: no-drag; app-region: no-drag;
 }
 .deepcode-local-agent-settings__close:hover { background: var(--dc-surface-hover); }
-.deepcode-local-agent-settings__close kbd { font: 10px var(--dc-font-ui); color: #858d96; border: 1px solid #e1e5e9; border-radius: 4px; padding: 0 3px; }
+.deepcode-local-agent-settings__close kbd { font: 10px var(--dc-font-ui); color: var(--dc-faint); border: 1px solid var(--dc-border); border-radius: 4px; padding: 0 3px; }
 
 .deepcode-gui-sidebar-actions,
 .deepcode-gui-session-list,
@@ -534,9 +534,13 @@
   user-select: none;
 }
 
-.deepcode-gui-session-row:hover,
-.deepcode-gui-session-row--active {
+.deepcode-gui-session-row:hover {
   background: var(--dc-surface-hover);
+}
+
+.deepcode-gui-session-row--active,
+.deepcode-gui-session-row--active:hover {
+  background: var(--dc-selection, var(--dc-surface-active));
 }
 
 .deepcode-gui-session-row > button:first-child {
@@ -652,9 +656,8 @@
   gap: 0;
   padding: 16px;
   border: 1px solid var(--dc-border);
-  border-radius: 16px;
-  background: var(--dc-surface-raised);
-  box-shadow: var(--dc-shadow-small);
+  border-radius: var(--dc-radius-inner);
+  background: var(--dc-surface);
 }
 
 .deepcode-gui-task-list-card__title {
@@ -866,16 +869,13 @@
 
 .deepcode-gui-session-context-menu__title {
   padding: 5px 9px 7px;
-  border-bottom: 1px solid var(--dc-border);
   font-size: var(--dc-font-caption);
   font-weight: var(--dc-weight-semibold);
 }
 
 .deepcode-gui-session-context-menu__section {
-  margin: 5px 0;
-  padding: 5px 0;
-  border-top: 1px solid var(--dc-border);
-  border-bottom: 1px solid var(--dc-border);
+  margin: 8px 0;
+  padding: 4px 0;
 }
 
 .deepcode-gui-session-context-menu__section-title {

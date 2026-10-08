@@ -675,7 +675,7 @@ function isProjectionMessage(value: unknown): boolean {
   if (!isExactRecord(value, [
     'messageId', 'role', 'content', 'filesystemReferences',
     'pluginSelections', 'feedback', 'sequence', 'createdAt',
-  ], ['runId', 'providerRequestId', 'replyToInteraction', 'guidanceReferences', 'sourceReferences'])) return false;
+  ], ['runId', 'providerRequestId', 'replyToInteraction', 'guidanceReferences', 'sourceReferences', 'displayContent'])) return false;
   const hasRunId = value.runId !== undefined;
   const hasProviderRequestId = value.providerRequestId !== undefined;
   return isIdentifier(value.messageId)
@@ -684,6 +684,7 @@ function isProjectionMessage(value: unknown): boolean {
       && isIdentifier(value.replyToInteraction.interactionId) && isNonEmptyText(value.replyToInteraction.prompt))
     && ['user', 'assistant', 'tool', 'system'].includes(String(value.role))
     && typeof value.content === 'string'
+    && (value.displayContent === undefined || value.role === 'assistant' && typeof value.displayContent === 'string')
     && (value.sourceReferences === undefined || value.role === 'assistant' && isSourceReferences(value.sourceReferences))
     && isArrayOf(value.filesystemReferences, isFilesystemReference)
     && isArrayOf(value.pluginSelections, isPluginSelection)
@@ -731,11 +732,12 @@ function isMediaType(value: unknown): value is string {
 function isNarrative(value: unknown): boolean {
   return isExactRecord(value, [
     'narrativeId', 'runId', 'providerRequestId', 'content', 'sequence', 'createdAt',
-  ], ['sourceReferences'])
+  ], ['sourceReferences', 'displayContent'])
     && isIdentifier(value.narrativeId)
     && isIdentifier(value.runId)
     && isIdentifier(value.providerRequestId)
     && isNonEmptyText(value.content)
+    && (value.displayContent === undefined || typeof value.displayContent === 'string')
     && (value.sourceReferences === undefined || isSourceReferences(value.sourceReferences))
     && isNaturalNumber(value.sequence)
     && isNonEmptyText(value.createdAt);
@@ -797,8 +799,9 @@ function isProviderActivity(value: unknown): boolean {
 function isAssistantDraftBlock(value: unknown): value is AssistantDraftBlockProjection {
   if (!isRecord(value)) return false;
   if (value.kind === 'narrative' || value.kind === 'finalMessage' || value.kind === 'message') {
-    return isExactRecord(value, ['kind', 'content', 'streamId'], ['outputIndex'])
+    return isExactRecord(value, ['kind', 'content', 'streamId'], ['outputIndex', 'displayContent'])
       && typeof value.content === 'string' && value.content.length > 0
+      && (value.displayContent === undefined || typeof value.displayContent === 'string')
       && isStreamId(value.streamId)
       && (value.outputIndex === undefined || isNaturalNumber(value.outputIndex));
   }

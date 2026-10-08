@@ -29,6 +29,7 @@ impl UserDirectories {
                 directories = Self::isolated(&std::env::current_dir()?.join(root));
             }
         }
+        directories.log_dir = std::path::absolute(&directories.log_dir)?;
         Ok(directories)
     }
 
@@ -62,6 +63,7 @@ impl UserDirectories {
         if let Some(root) = &self.isolation_root {
             command.env("DEEPCODE_USER_ROOT", root);
         }
+        command.env("DEEPCODE_LOG_DIR", &self.log_dir);
     }
 }
 

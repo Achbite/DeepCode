@@ -4,6 +4,7 @@ import { useTree } from '@headless-tree/react';
 import { useConversationHost } from './ConversationHost';
 import { resourceKey, type ResourceEntry, type ResourceReference } from '../../services/conversationResources';
 import { useLocalAgentStore } from '../../state/localAgentStore';
+import { useSettingsStore } from '../../state/settingsStore';
 import type { UiLanguage } from '../../i18n';
 import type { ReaderTarget } from './readerState';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
@@ -15,8 +16,12 @@ export function ResourceTree({ sessionId, language, openTarget, visible, activeT
   const { resources } = useConversationHost();
   const chinese = language === 'zh-CN';
   const [filter, setFilter] = useState('');
-  const [showRuntime, setShowRuntime] = useState(false);
+  const showRuntime = useSettingsStore(state => state.effectiveSettings['gui.showRuntimeFiles'] === true);
   const [watchError, setWatchError] = useState('');
+  const setShowRuntime = async (visible: boolean) => {
+    const activation = await useSettingsStore.getState().patchUserSetting('gui.showRuntimeFiles', visible);
+    if (activation === null) setWatchError(useSettingsStore.getState().errorMessage ?? 'settings_write_failed');
+  };
   const [selected, setSelected] = useState<string>();
   const rows = useRef(new Map<string, HTMLButtonElement>());
   const nodes = useRef(new Map<string, Node>([['root', { name: chinese ? '文件' : 'Files' }]]));
@@ -204,7 +209,6 @@ export function ResourceTree({ sessionId, language, openTarget, visible, activeT
         </button>;
       })}
     </div>
-    <label className="resource-tree__runtime"><input type="checkbox" checked={showRuntime} onChange={event => setShowRuntime(event.target.checked)} />{chinese ? '显示运行环境文件' : 'Show runtime files'}</label>
     </UiRegion>
   </aside>;
 }

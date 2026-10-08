@@ -211,7 +211,7 @@ export function ConversationTranscript({
                 {item.value.role === 'assistant'
                   ? committedProviderContent(
                       item.streamId,
-                      item.value.content,
+                      item.value.displayContent ?? item.value.content,
                       presentation.content(`message:${item.value.messageId}:content`),
                     )
                   : item.value.replyToInteraction ? <MarkdownContent>{item.value.content}</MarkdownContent>
@@ -243,7 +243,7 @@ export function ConversationTranscript({
           </div>
           {(item.value.role === 'assistant' || item.value.role === 'user') && (
             <MessageActions message={item.value} language={language} copied={copiedMessageId === item.value.messageId}
-              busy={submitting} canEdit={canEditMessage} onCopy={() => void copyMessage(item.value.messageId, item.value.content)}
+              busy={submitting} canEdit={canEditMessage} onCopy={() => void copyMessage(item.value.messageId, item.value.displayContent ?? item.value.content)}
               onFeedback={(feedback) => void updateMessageFeedback(item.value.messageId, feedback)}
               onEdit={() => onEditMessage?.(item.value)} />
           )}
@@ -253,7 +253,7 @@ export function ConversationTranscript({
           <div>
             {committedProviderContent(
               item.streamId,
-              item.value.content,
+              item.value.displayContent ?? item.value.content,
               presentation.content(`narrative:${item.value.narrativeId}`),
             )}
             <SourceReferences references={item.value.sourceReferences} language={language} />
@@ -294,7 +294,7 @@ export function ConversationTranscript({
             : 'local-agent__message-content'}
           >
             <BufferedMarkdown
-              text={item.block.content}
+              text={item.block.displayContent ?? item.block.content}
               streamIdentity={item.block.streamId}
             />
           </div>

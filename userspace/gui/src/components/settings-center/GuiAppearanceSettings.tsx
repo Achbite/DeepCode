@@ -27,15 +27,6 @@ interface GuiAppearanceSettingsProps {
 }
 
 
-function sourceLabel(source: SettingSource, language: UiLanguage): string {
-  switch (source) {
-    case 'user':
-      return t(language, 'settings.source.user');
-    default:
-      return t(language, 'settings.source.default');
-  }
-}
-
 function optionLabel(definition: SettingDefinition, value: string): string {
   return definition.options?.find((option) => option.value === value)?.label ?? value;
 }
@@ -63,9 +54,6 @@ const AppearanceSettingHeader: React.FC<AppearanceSettingHeaderProps> = ({
     <div>
       <div className="settings-field__title-row">
         <span className="settings-field__label">{definition.label}</span>
-        <span className={`settings-field__source settings-field__source--${source}`}>
-          {sourceLabel(source, language)}
-        </span>
       </div>
 
     </div>
@@ -120,7 +108,6 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
 
   return (
     <>
-    <AppearanceConfiguration language={language} />
     <div className="settings-card settings-appearance">
       <h3 className="settings-card__title">{t(language, 'settings.gui.appearance')}</h3>
       <div className="settings-appearance__body">
@@ -146,9 +133,8 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
                   aria-pressed={theme === value}
                   disabled={themeDisabled}
                   key={value}
-                  onClick={() => selectTheme(value, themeDisabled)}
+                  onClick={event => { selectTheme(value, themeDisabled); if (event.detail > 0) event.currentTarget.blur(); }}
                 >
-                  <span className="settings-theme-preview" aria-hidden="true" />
                   <span className="settings-theme-label">
                     <span className="settings-selection-check" aria-hidden="true"><DeepCodeShellIcon name="check" size={14} /></span>
                     {optionLabel(themeDefinition, value)}
@@ -158,7 +144,6 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
             </div>
           </section>
         )}
-        <GuiPaletteSettings language={language} />
         {accentDefinition && (
         <section className="settings-appearance__setting">
             <AppearanceSettingHeader
@@ -180,7 +165,7 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
                   aria-pressed={accent === value}
                   disabled={accentDisabled}
                   key={value}
-                  onClick={() => selectAccent(value, accentDisabled)}
+                  onClick={event => { selectAccent(value, accentDisabled); if (event.detail > 0) event.currentTarget.blur(); }}
                 >
                   <span
                     className={`settings-accent-swatch settings-accent-swatch--${value}`}
@@ -195,6 +180,8 @@ const GuiAppearanceSettings: React.FC<GuiAppearanceSettingsProps> = ({
         )}
       </div>
     </div>
+    <AppearanceConfiguration language={language} />
+    <GuiPaletteSettings language={language} />
     </>
   );
 };

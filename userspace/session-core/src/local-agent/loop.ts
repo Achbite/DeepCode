@@ -76,6 +76,7 @@ export type LoopCommand =
   | { type: 'start'; runId: string }
   | { type: 'resume'; runId: string }
   | { type: 'recover'; runId: string }
+  | { type: 'fail'; runId: string; error: unknown }
   | { type: 'cancel'; runId: string };
 
 export type LoopResult =
@@ -263,6 +264,7 @@ export async function runAgentLoop(
   }
   let runtime = runRuntimeSnapshot(snapshot, runId);
   try {
+    if (command.type === 'fail') throw command.error;
     for (const requestEvent of pendingToolRequests(snapshot.events, runId)) {
       const existing = await deps.composition.kernel.readRecord(requestEvent.callId);
       if (existing) {
@@ -680,6 +682,8 @@ export async function runAgentLoop(
       }
     }
   } catch (error) {
+    const userCancelled = signal.aborted
+      && (signal.reason === 'user_cancelled' || signal.reason === 'user_cancelled_plan');
     const pendingProvider = uncompletedProviderComposition(snapshot, runId);
     const completedAttempt = pendingProvider && Object.values(snapshot.state.providerAttempts).some((attempt) => (
       attempt.providerRequestId === pendingProvider.providerRequestId && attempt.phase === 'completed'
@@ -715,9 +719,9 @@ export async function runAgentLoop(
         outcome: 'indeterminate',
         error: {
           code: 'provider_turn_outcome_unknown',
-          message: signal.reason === 'user_cancelled' ? '已收到取消请求，本次生成未完成；Provider 最终完成结果未知。'
+          message: userCancelled ? '已收到取消请求，本次生成未完成；Provider 最终完成结果未知。'
             : `Provider request ${unknownTurn.providerRequestId} 的完成结果不可判定；原始错误 ${cause.code}：${cause.message}`,
-          diagnostics: { source: 'session', phase: 'provider', category: signal.aborted ? 'cancelled' : 'unknown', retryable: false,
+          diagnostics: { source: 'session', phase: 'provider', category: userCancelled ? 'cancelled' : 'unknown', retryable: false,
             causes: [{ message: `${cause.code}: ${cause.message}` }], ...(signal.aborted ? { stopReason: String(signal.reason) } : {}) },
         },
       };
@@ -745,7 +749,8 @@ export async function runAgentLoop(
     ) {
       return { status: 'suspended', runId };
     }
-    if (signal.aborted) {
+    if (userCancelled
+      && !(error instanceof LoopFailure && error.code === 'tool_cancel_cleanup_failed')) {
       return await cancelRun(snapshot, { type: 'cancel', runId }, deps, commit);
     }
     const failure = localAgentError(error);

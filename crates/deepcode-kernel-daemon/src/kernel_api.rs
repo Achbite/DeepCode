@@ -2,19 +2,26 @@ use crate::prelude::*;
 use crate::*;
 
 pub(crate) async fn health(State(state): State<AppState>) -> Json<ApiResponse> {
+    let service = state.session_service.clone();
+    match tokio::task::spawn_blocking(move || service.check_ready()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return ApiResponse::error(error.code, error.message),
+        Err(error) => {
+            return ApiResponse::error("session_service_health_failed", error.to_string())
+        }
+    }
     let workspace = current_workspace(&state.host_services.workspace)
         .ok()
         .and_then(|workspace| serde_json::to_value(workspace).ok())
         .unwrap_or(Value::Null);
     let build_info = packaged_build_info().unwrap_or(Value::Null);
-    let session_ready = state.session_service.is_ready();
     ApiResponse::ok(json!({
         "service": "deepcode-kernel-daemon",
         "version": env!("CARGO_PKG_VERSION"),
-        "ok": session_ready,
-        "status": if session_ready { "ok" } else { "degraded" },
+        "ok": true,
+        "status": "ok",
         "kernel": "ready",
-        "session": if session_ready { "ready" } else { "unavailable" },
+        "session": "ready",
         "buildCommit": build_commit(),
         "buildInfo": build_info,
         "protocolVersion": "deepcode.local-agent",
@@ -47,7 +54,9 @@ fn packaged_build_info() -> Option<Value> {
         .ok()
         .and_then(|path| path.parent().map(PathBuf::from))?;
     read_best_effort_json_file(
-        &deepcode_host_connection::runtime_root(&exe_dir).join("BUILDINFO.json"),
+        &deepcode_host_connection::runtime_root(&exe_dir)
+            .ok()?
+            .join("BUILDINFO.json"),
     )
 }
 

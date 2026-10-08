@@ -285,6 +285,11 @@
     "deepcodeGui.outputs.showAll": "查看全部（{count}）",
     "deepcodeGui.outputs.showLess": "收起",
     "deepcodeGui.nameLabel": "名称",
+    "deepcodeGui.navigation.back": "后退",
+    "deepcodeGui.navigation.forward": "前进",
+    "deepcodeGui.navigation.collapse": "收起左侧导航",
+    "deepcodeGui.navigation.resize": "调整左侧导航宽度",
+    "deepcodeGui.navigation.expand": "展开左侧导航",
     "deepcodeGui.settings.close": "关闭设置",
     "agent.session.newTitle": "新对话",
     "agent.session.rename": "重命名",
@@ -627,7 +632,7 @@
     "agent.run.status.cancelled": "已取消",
     "agent.run.status.indeterminate": "结果待确认",
     "tui.authorizationReviewingDetails": "模型正在审查执行权限：{0}",
-    "agent.sources.unresolved": "部分引用来源未返回",
+    "agent.sources.unresolved": "部分引用来源未返回，标为 [?] 的引用无法打开。",
     "agent.sources.title": "来源",
     "agent.tool.summary.count": "{count} 个工具",
     "agent.tool.summary.ended": "已结束",
@@ -1261,6 +1266,18 @@
         "collapsed": "收起",
         "hidden": "隐藏"
       }
+    },
+    "gui.defaultFileOpen": {
+      "label": "文本文件默认打开方式",
+      "description": "选择文本文件的打开应用。",
+      "options": {
+        "reader": "DeepCode Reader",
+        "vscode": "Visual Studio Code"
+      }
+    },
+    "gui.showRuntimeFiles": {
+      "label": "显示运行环境文件",
+      "description": "在文件树的会话文件中显示运行环境目录。"
     },
     "gui.showContextRail": {
       "label": "显示上下文栏",

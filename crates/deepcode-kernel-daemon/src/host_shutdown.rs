@@ -81,6 +81,7 @@ pub(crate) async fn host_shutdown(
 }
 
 pub(crate) async fn shutdown_owned_host_resources(state: &AppState) -> bool {
+    crate::host_lifecycle::begin_host_shutdown();
     let session_service = state.session_service.clone();
     let session_cleanup_ok =
         match tokio::task::spawn_blocking(move || session_service.shutdown()).await {

@@ -1,3 +1,4 @@
+import NativeSelect from '../shared/NativeSelect';
 import { useInterfaceReloadGuard } from '../../services/interfaceReload';
 import { useEffect, useState } from 'react';
 import { t, type UiLanguage } from '../../i18n';
@@ -45,18 +46,18 @@ export default function GuiFontSettings({ language }: { language: UiLanguage }) 
     <div className="appearance-config-box__body">
       <div className="appearance-font-controls">
         <label>{t(language, 'settings.font.family')}
-          <select value={preset} disabled={loading || saving} onChange={(event) => {
+          <NativeSelect value={preset} disabled={loading || saving} onChange={(event) => {
             const next = event.target.value;
             setCustom(next === 'custom');
             if (next !== 'custom') edit(next, size);
           }}>
             {[...Object.keys(UI_FONT_PRESETS), 'custom'].map((value) => <option key={value} value={value}>{t(language, `settings.font.${value}`)}</option>)}
-          </select>
+          </NativeSelect>
         </label>
         <label>{t(language, 'settings.font.size')}
-          <select value={size} disabled={loading || saving} onChange={(event) => edit(family, Number(event.target.value))}>
+          <NativeSelect value={size} disabled={loading || saving} onChange={(event) => edit(family, Number(event.target.value))}>
             {[12, 13, 14, 15, 16, 17, 18].map((value) => <option key={value} value={value}>{value} px</option>)}
-          </select>
+          </NativeSelect>
         </label>
       </div>
       {preset === 'custom' && <label>{t(language, 'settings.font.customName')}

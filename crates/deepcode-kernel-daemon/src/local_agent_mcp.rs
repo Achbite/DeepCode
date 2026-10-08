@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_MCP_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MCP_TOOLS: usize = 256;
+const MAX_MCP_STDERR_BYTES: usize = 16 * 1024;
 const MCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MCP_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -864,10 +865,31 @@ impl McpClient {
                 }
             }
         });
+        let stderr_receipt = Arc::new(Mutex::new(Vec::new()));
         let stderr_reader = starting.child_mut().stderr.take().map(|mut stderr| {
+            let receipt = Arc::clone(&stderr_receipt);
             std::thread::spawn(move || {
                 let mut buffer = [0_u8; 4096];
-                while stderr.read(&mut buffer).is_ok_and(|read| read > 0) {}
+                loop {
+                    let read = stderr.read(&mut buffer);
+                    let mut tail = receipt.lock().expect("MCP stderr receipt lock");
+                    match read {
+                        Ok(0) => break,
+                        Ok(read) => tail.extend_from_slice(&buffer[..read]),
+                        Err(ref error) => {
+                            tail.extend_from_slice(
+                                format!("\nMCP stderr read failed: {error}").as_bytes(),
+                            );
+                        }
+                    }
+                    if tail.len() > MAX_MCP_STDERR_BYTES {
+                        let remove = tail.len() - MAX_MCP_STDERR_BYTES;
+                        tail.drain(..remove);
+                    }
+                    if read.is_err() {
+                        break;
+                    }
+                }
             })
         });
         let (writes, pending_writes) = mpsc::channel::<McpWrite>();
@@ -895,6 +917,7 @@ impl McpClient {
                 stdin_writer: Some(stdin_writer),
                 stdout_reader: Some(stdout_reader),
                 stderr_reader,
+                stderr_receipt,
                 next_id: 1,
                 stopped: false,
                 stop_error: None,
@@ -1089,6 +1112,7 @@ struct OwnedMcpProcess {
     stdin_writer: Option<JoinHandle<()>>,
     stdout_reader: Option<JoinHandle<()>>,
     stderr_reader: Option<JoinHandle<()>>,
+    stderr_receipt: Arc<Mutex<Vec<u8>>>,
     next_id: u64,
     stopped: bool,
     stop_error: Option<McpRuntimeError>,
@@ -1264,6 +1288,23 @@ impl OwnedMcpProcess {
                 "; cleanup failed: {}: {}",
                 cleanup.code, cleanup.message
             ));
+        }
+        match self.owned.child.try_wait() {
+            Ok(Some(status)) => error.message.push_str(&format!("; MCP process {status}")),
+            Ok(None) => {}
+            Err(wait_error) => error
+                .message
+                .push_str(&format!("; MCP process status failed: {wait_error}")),
+        }
+        match self.stderr_receipt.lock() {
+            Ok(tail) if !tail.is_empty() => error.message.push_str(&format!(
+                "; MCP stderr (last {MAX_MCP_STDERR_BYTES} bytes): {}",
+                String::from_utf8_lossy(&tail).trim()
+            )),
+            Ok(_) => {}
+            Err(lock_error) => error
+                .message
+                .push_str(&format!("; MCP stderr receipt failed: {lock_error}")),
         }
         error
     }
@@ -1517,6 +1558,54 @@ mod tests {
         }
         worker.join().unwrap();
         result.expect("owned process and pipe workers must finish within five seconds")
+    }
+
+    #[test]
+    fn startup_failure_preserves_mcp_stderr_and_exit_status() {
+        let directory = TestDirectory::new();
+        let script = directory.0.join("missing_config.py");
+        std::fs::write(&script, "import sys\nsys.stderr.write('Required config is missing: settings.json\\n')\nsys.exit(7)\n").unwrap();
+        let error = McpClient::start(
+            &serde_json::from_value(json!({
+                "id":"missing-config", "command":"python3", "args":script.to_string_lossy(),
+                "enabled":true
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.code,
+            "mcp_server_ended" | "mcp_server_write_failed"
+        ));
+        assert!(
+            error
+                .message
+                .contains("Required config is missing: settings.json"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("exit status: 7"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn failed_mcp_call_keeps_a_bounded_diagnostic_tail() {
+        let directory = TestDirectory::new();
+        let client = directory.server("        if request['method']=='tools/call':\n            sys.stderr.write('discarded-prefix' + 'x' * 20000 + '\\nModuleNotFoundError: example_dependency\\n')\n            sys.stderr.flush()\n            sys.exit(7)");
+        let error = client
+            .call_tool("example", json!({}), None, &Default::default())
+            .unwrap_err();
+        assert_eq!(error.code, "mcp_server_ended");
+        assert!(error
+            .message
+            .contains("ModuleNotFoundError: example_dependency"));
+        assert!(!error.message.contains("discarded-prefix"));
+        assert!(error.message.len() < MAX_MCP_STDERR_BYTES + 512);
+        assert!(client.process.lock().unwrap().stopped);
+        client.shutdown().unwrap();
     }
 
     #[test]

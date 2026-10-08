@@ -926,7 +926,7 @@
   padding: 0 14px;
   border: 1px solid var(--dc-border);
   border-radius: 12px;
-  background: var(--dc-surface-raised);
+  background: var(--dc-surface);
   box-shadow: none;
   text-align: left;
 }
@@ -984,8 +984,8 @@
   padding: 0;
   border: 1px solid var(--dc-border);
   border-radius: 14px;
-  background: var(--dc-surface-raised);
-  box-shadow: 0 1px 2px color-mix(in srgb, var(--dc-foreground-strong) 4%, transparent);
+  background: var(--dc-surface);
+  box-shadow: none;
 }
 
 .local-agent .local-agent__plan-document-meta {
@@ -1002,8 +1002,8 @@
   border: 0;
   border-bottom: 1px solid var(--dc-border);
   border-radius: 13px 13px 0 0;
-  background: var(--dc-surface-raised);
-  box-shadow: 0 4px 8px -8px var(--dc-foreground);
+  background: var(--dc-surface);
+  box-shadow: none;
   color: var(--dc-faint);
   font-size: var(--dc-font-micro);
   text-align: left;
@@ -1474,6 +1474,8 @@
   background: var(--dc-surface-raised);
   color: var(--dc-foreground);
   cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .local-agent button:disabled {
@@ -1523,6 +1525,25 @@
   border-radius: 18px;
   background: var(--dc-surface-raised);
   box-shadow: var(--dc-shadow-panel);
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Composer chrome is not prose; editable fields and decision details remain selectable. */
+.local-agent__composer :is(
+  input, textarea,
+  .local-agent__decision, .local-agent__auto-review,
+  .local-agent__message-edit-notice, .local-agent__message-edit-references,
+  .local-agent__profile-notice, .local-agent__pasted-text,
+  .local-agent__attachment-name
+) {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.local-agent__composer-hint {
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .local-agent__composer--approval {
@@ -1576,8 +1597,7 @@
   border: 1px solid var(--dc-border-strong);
   border-radius: 12px;
   background: var(--dc-surface-raised);
-  box-shadow: 0 18px 42px -24px color-mix(in srgb, var(--dc-foreground-strong) 42%, transparent),
-    0 2px 8px color-mix(in srgb, var(--dc-foreground-strong) 8%, transparent);
+  box-shadow: var(--dc-shadow-panel);
 }
 
 .local-agent .local-agent__command-suggestions > button {
@@ -1637,8 +1657,7 @@
   border: 1px solid var(--dc-border-strong);
   border-radius: 12px;
   background: var(--dc-surface-raised);
-  box-shadow: 0 18px 42px -24px color-mix(in srgb, var(--dc-foreground-strong) 42%, transparent),
-    0 2px 8px color-mix(in srgb, var(--dc-foreground-strong) 8%, transparent);
+  box-shadow: var(--dc-shadow-panel);
 }
 
 .local-agent__plugin-picker-heading,
@@ -1894,8 +1913,7 @@
   border: 1px solid var(--dc-border-strong);
   border-radius: 12px;
   background: var(--dc-surface-raised);
-  box-shadow: 0 18px 42px -24px color-mix(in srgb, var(--dc-foreground-strong) 42%, transparent),
-    0 2px 8px color-mix(in srgb, var(--dc-foreground-strong) 8%, transparent);
+  box-shadow: var(--dc-shadow-panel);
 }
 
 .local-agent .local-agent__attachment-menu > button {
@@ -2251,7 +2269,7 @@
   border-radius: 8px;
   background: var(--dc-surface-subtle);
   color: var(--dc-foreground);
-  box-shadow: 0 4px 18px color-mix(in srgb, var(--dc-foreground) 15%, transparent);
+  box-shadow: var(--dc-shadow-panel);
 }
 .local-agent__path-menu button { color: inherit; background: transparent; border: 0; padding: 8px 16px; cursor: pointer; }
 .local-agent__error pre { white-space: pre-wrap; overflow-wrap: anywhere; }

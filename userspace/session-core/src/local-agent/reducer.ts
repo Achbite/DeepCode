@@ -3,7 +3,7 @@ import { advanceTodoList } from './todoState.js';
 import { appendInputFileBindings } from './workspaceBindings.js';
 import { providerTextStreamId } from './streamIdentity.js';
 import { activeConversationEvents } from './conversationHistory.js';
-import { projectSourceReferences } from './sourceReferences.js';
+import { projectDraftSourceContent, projectSourceContent } from './sourceReferences.js';
 import type {
   ActivityProjection,
   ManagedProcessSnapshot,
@@ -1134,8 +1134,7 @@ function sourceReferenceProjection(state: SessionState, content: string, request
     candidate.kind === 'finalMessage' && candidate.messageId === referenceId
     || candidate.kind === 'narrative' && candidate.narrativeId === referenceId
   ));
-  const sourceReferences = projectSourceReferences(content, block?.item);
-  return sourceReferences ? { sourceReferences } : {};
+  return projectSourceContent(content, block?.item);
 }
 
 export function projectSession(
@@ -1147,6 +1146,10 @@ export function projectSession(
     if (!activity.tool?.fileChanges?.length || !activity.tool.recordId) continue;
     const records = rounds.get(activity.runId) ?? [];
     records.push(activity.tool.recordId); rounds.set(activity.runId, records);
+  }
+  const draft = assistantDraft ? structuredClone(assistantDraft) : null;
+  for (const block of draft?.blocks ?? []) {
+    if (block.kind !== 'providerHosted') Object.assign(block, projectDraftSourceContent(block.content));
   }
   return {
     ...(Object.keys(state.providerAttempts).length ? { providerAttempts: Object.values(state.providerAttempts)
@@ -1179,7 +1182,7 @@ export function projectSession(
     narratives: state.narratives.map((narrative) => ({ ...narrative,
       ...sourceReferenceProjection(state, narrative.content, narrative.providerRequestId, narrative.narrativeId) })),
     timeline: projectTimeline(state),
-    assistantDraft: assistantDraft ? structuredClone(assistantDraft) : null,
+    assistantDraft: draft,
     pendingInteraction: cloneInteraction(state.pendingInteraction),
     pendingApproval: cloneApproval(state.pendingApproval),
     plans: state.plans.map((plan) => clonePlanProjection(plan)),

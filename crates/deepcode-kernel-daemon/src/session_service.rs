@@ -233,11 +233,9 @@ impl SessionServiceProcess {
         }
     }
 
-    pub(crate) fn is_ready(&self) -> bool {
-        self.process
-            .lock()
-            .ok()
-            .is_some_and(|mut process| process.is_running().unwrap_or(false))
+    pub(crate) fn check_ready(&self) -> Result<(), SessionServiceError> {
+        let mut process = self.process.lock().map_err(|_| transport_lock_error())?;
+        process.ensure_running()
     }
 
     pub(crate) fn shutdown(&self) -> Result<(), SessionServiceError> {
@@ -344,18 +342,7 @@ impl OwnedSessionService {
         operation: &str,
         data: Value,
     ) -> Result<mpsc::Receiver<SessionReply>, SessionServiceError> {
-        if !self.is_running()? {
-            let terminal = self
-                .responses
-                .lock()
-                .map_err(|_| transport_lock_error())?
-                .terminal_error
-                .clone()
-                .unwrap_or_else(|| {
-                    SessionServiceError::new("session_service_stopped", "Session Service 已停止。")
-                });
-            return Err(terminal);
-        }
+        self.ensure_running()?;
         let mut encoded = serde_json::to_vec(&json!({
             "protocolVersion": PROTOCOL_VERSION,
             "requestId": request_id,
@@ -397,29 +384,27 @@ impl OwnedSessionService {
         Ok(receiver)
     }
 
-    fn is_running(&mut self) -> Result<bool, SessionServiceError> {
-        if self.stopped || self.closing {
-            return Ok(false);
-        }
+    fn ensure_running(&mut self) -> Result<(), SessionServiceError> {
         let terminal = self
             .responses
             .lock()
             .map_err(|_| transport_lock_error())?
             .terminal_error
             .clone();
+        if self.stopped || self.closing {
+            return Err(terminal.unwrap_or_else(|| {
+                SessionServiceError::new("session_service_stopped", "Session Service 已停止。")
+            }));
+        }
         if let Some(error) = terminal {
-            self.fail_and_stop(error);
-            return Ok(false);
+            return Err(self.fail_and_stop(error));
         }
         match self.owned.child.try_wait() {
-            Ok(None) => Ok(true),
-            Ok(Some(_)) => {
-                self.fail_and_stop(SessionServiceError::new(
-                    "session_service_unavailable",
-                    "Session Service 已退出。",
-                ));
-                Ok(false)
-            }
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(self.fail_and_stop(SessionServiceError::new(
+                "session_service_unavailable",
+                "Session Service 已退出。",
+            ))),
             Err(error) => Err(self.fail_and_stop(process_wait_error(error))),
         }
     }
@@ -752,7 +737,9 @@ input.on('line', line => {
             .unwrap_err();
         assert_eq!(failure.code, "session_service_response_missing");
         assert!(failure.message.contains("session-exit-diagnostic"));
-        assert!(!service.is_ready());
+        let health_failure = service.check_ready().unwrap_err();
+        assert_eq!(health_failure.code, failure.code);
+        assert_eq!(health_failure.message, failure.message);
         let later = service.request("activity", json!({})).unwrap_err();
         assert_eq!(later.code, failure.code);
         assert_eq!(later.message, failure.message);

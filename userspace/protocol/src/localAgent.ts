@@ -970,6 +970,8 @@ export interface SourceReferences {
 interface ProjectionMessageBase {
   messageId: string;
   content: string;
+  /** Session-derived citation display. Original Provider text remains in content. */
+  displayContent?: string;
   sourceReferences?: SourceReferences;
   filesystemReferences: FilesystemReference[];
   pluginSelections: PluginSelectionInput[];
@@ -999,6 +1001,7 @@ export interface NarrativeProjection {
   runId: string;
   providerRequestId: string;
   content: string;
+  displayContent?: string;
   sourceReferences?: SourceReferences;
   sequence: number;
   createdAt: string;
@@ -1060,6 +1063,8 @@ export type AssistantDraftBlockProjection =
   | {
       kind: 'narrative' | 'finalMessage' | 'message';
       content: string;
+      /** Stable prefix while a Provider citation is awaiting its final annotations. */
+      displayContent?: string;
       /** Opaque Session-owned identity shared with the committed timeline text. */
       streamId: string;
       /** Present only when the Provider supplied a native output index. */

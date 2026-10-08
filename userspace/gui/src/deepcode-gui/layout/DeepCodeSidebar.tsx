@@ -5,7 +5,6 @@ import type {
   ConversationSessionStatus,
 } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
-import { usesNativeWindowChrome } from '../../services/hostTarget';
 import DeepCodeBrand from './DeepCodeBrand';
 import DeepCodeShellIcon from '../../components/shared/DeepCodeShellIcon';
 import { SessionRunStatus } from '../../components/local-agent/SessionRunStatus';
@@ -67,6 +66,10 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
   onOpenSessionContextMenu,
   onOpenSettings,
 }) => {
+  const activeProjectId = activeSessionId
+    ? sessions.find((session) => session.id === activeSessionId)?.projectId
+    : draftProjectId;
+  const activeProject = projects.find((project) => project.id === activeProjectId);
   const dragSource = useRef<{
     item: SidebarDragItem; x: number; y: number; pointerId: number; element: HTMLElement;
   } | null>(null);
@@ -234,16 +237,17 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
         event.stopPropagation();
       }}
     >
-      {usesNativeWindowChrome() && (
-        <div className="deepcode-gui-sidebar-brand">
-          <DeepCodeBrand />
-        </div>
-      )}
+      <div className="deepcode-gui-sidebar-brand">
+        <DeepCodeBrand />
+      </div>
       <div className="deepcode-gui-sidebar-actions">
         <button
           type="button"
           className="deepcode-gui-sidebar-action deepcode-gui-sidebar-action--primary"
-          onClick={onCreatePrimarySession}
+          onClick={() => {
+            if (activeProject) onCreateProjectSession(activeProject);
+            else onCreatePrimarySession();
+          }}
           disabled={busy}
         >
           <DeepCodeShellIcon name="compose" className="deepcode-gui-sidebar-icon" />

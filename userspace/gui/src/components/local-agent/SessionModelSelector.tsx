@@ -28,11 +28,12 @@ export default function SessionModelSelector({ language, profiles, connections =
   const rootRef = useRef<HTMLDivElement>(null), menuRef = useRef<HTMLDivElement>(null), triggerRef = useRef<HTMLButtonElement>(null);
   const menuId = useId(), theme = useDisplayTheme(), chinese = language === 'zh-CN';
   const selected = profiles.find(profile => profile.id === selectedProfileId);
+  const effectiveEffort = selected?.thinking === 'disabled' ? null : reasoningEffortOverride ?? selected?.reasoningEffort ?? null;
   const candidate = profiles.find(profile => profile.id === candidateId);
   const title = (selected?.name ?? selectedProfileId ?? (chinese ? '选择模型' : 'Choose model')) + (selectedProfileId && !selected?.enabled ? ` · ${t(language, selected ? 'agent.profile.disabled' : 'agent.profile.missing')}` : '');
   const effortLabel = selected?.thinking === 'disabled'
     ? (chinese ? '不适用' : 'Not applicable')
-    : reasoningEffortOverride ? t(language, `settings.llm.effort.${reasoningEffortOverride}`) : (chinese ? '选择强度' : 'Choose level');
+    : effectiveEffort ? t(language, `settings.llm.effort.${effectiveEffort}`) : (chinese ? '选择强度' : 'Choose level');
   const close = () => { setOpen(false); triggerRef.current?.focus({ preventScroll: true }); };
   useEffect(() => {
     if (!open) return;
@@ -50,7 +51,7 @@ export default function SessionModelSelector({ language, profiles, connections =
       contextOpen={contextOpen} setContextOpen={setContextOpen} rootRef={rootRef}
       onToggle={() => { setOpen(false); setContextOpen(value => !value); }} />
     <UiRegion slot="composer.model" input={{ kind: 'composer.model', profiles, connections, selectedProfileId,
-      reasoningEffort: reasoningEffortOverride, confirmed, busy, locale: language, theme }} actions={{ selectModel: onSelect }}>
+      reasoningEffort: effectiveEffort, confirmed, busy, locale: language, theme }} actions={{ selectModel: onSelect }}>
       <button ref={triggerRef} type="button" className="deepcode-session-model__selector" disabled={busy}
         aria-label={`${title} · ${effortLabel}`} aria-haspopup="menu" aria-expanded={open} aria-controls={open ? menuId : undefined}
         onClick={() => { setContextOpen(false); setCandidateId(selectedProfileId); setOpen(value => !value); }}>
@@ -85,7 +86,7 @@ export default function SessionModelSelector({ language, profiles, connections =
         {candidate?.thinking === 'disabled' ? <button type="button" role="menuitem" disabled={busy} onClick={() => void choose(null)}>{chinese ? '使用此模型' : 'Use this model'}</button>
           : <><div className="deepcode-session-model__menu-title">{t(language, 'settings.llm.reasoningEffort')}</div>
             <div className="deepcode-session-model__efforts">{modelReasoningEfforts(candidate).map(effort => <button
-              key={effort} type="button" role="menuitemradio" aria-checked={confirmed && candidateId === selectedProfileId && reasoningEffortOverride === effort}
+              key={effort} type="button" role="menuitemradio" aria-checked={confirmed && candidateId === selectedProfileId && effectiveEffort === effort}
               disabled={busy || !candidate?.enabled} onClick={() => void choose(effort)}>{t(language, `settings.llm.effort.${effort}`)}</button>)}</div></>}
       </div>}
     </UiRegion>

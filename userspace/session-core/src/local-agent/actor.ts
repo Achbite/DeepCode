@@ -1059,9 +1059,19 @@ export class SessionActor {
           if (updates.length) await this.appendEvents(updates.map(job => ({type: 'process.updated' as const,
             sessionId: this.sessionId, runId: runId, callId: job.callId, payload: {job}})), current);
         }), error => {
-          this.#loopFailure = asError(error);
-          if (this.#active) this.#active.controller.abort(error);
-          else void this.containLoopFailure(runId, error).then(error => { this.#loopFailure = error; });
+          const processes = this.#processes;
+          const settleWaitingRun = () => {
+            if (this.#disposed || this.#loopFailure || this.#processes !== processes) return;
+            if (this.#active) this.#active.controller.abort(error);
+            else this.startLoop({ type: 'fail', runId, error });
+          };
+          const active = this.#active;
+          if (active) {
+            active.controller.abort(error);
+            // The loop may already be returning a waiting result. Once it has
+            // stopped, settle any still-owned feed through the same loop.
+            void active.task.then(settleWaitingRun);
+          } else settleWaitingRun();
         });
     }
   }

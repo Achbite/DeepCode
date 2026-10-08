@@ -1145,6 +1145,7 @@ pub struct ProjectionMessage {
     pub provider_request_id: Option<String>,
     pub role: String,
     pub content: String,
+    pub display_content: Option<String>,
     pub source_references: Option<SourceReferences>,
     pub filesystem_references: Vec<FilesystemReference>,
     pub plugin_selections: Vec<PluginSelectionInput>,
@@ -1152,6 +1153,12 @@ pub struct ProjectionMessage {
     pub sequence: u64,
     pub created_at: String,
     pub reply_to_interaction: Option<InteractionReplyContext>,
+}
+
+impl ProjectionMessage {
+    pub fn display_text(&self) -> &str {
+        self.display_content.as_deref().unwrap_or(&self.content)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1262,9 +1269,16 @@ pub struct NarrativeProjection {
     pub run_id: String,
     pub provider_request_id: String,
     pub content: String,
+    pub display_content: Option<String>,
     pub source_references: Option<SourceReferences>,
     pub sequence: u64,
     pub created_at: String,
+}
+
+impl NarrativeProjection {
+    pub fn display_text(&self) -> &str {
+        self.display_content.as_deref().unwrap_or(&self.content)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1333,6 +1347,8 @@ pub enum AssistantDraftBlockProjection {
         #[serde(rename = "streamId")]
         stream_id: String,
         content: String,
+        #[serde(rename = "displayContent")]
+        display_content: Option<String>,
     },
     #[serde(rename = "finalMessage")]
     FinalMessage {
@@ -1341,6 +1357,8 @@ pub enum AssistantDraftBlockProjection {
         #[serde(rename = "streamId")]
         stream_id: String,
         content: String,
+        #[serde(rename = "displayContent")]
+        display_content: Option<String>,
     },
     #[serde(rename = "message")]
     Message {
@@ -1349,6 +1367,8 @@ pub enum AssistantDraftBlockProjection {
         #[serde(rename = "streamId")]
         stream_id: String,
         content: String,
+        #[serde(rename = "displayContent")]
+        display_content: Option<String>,
     },
     #[serde(rename = "providerHosted")]
     ProviderHosted {
@@ -1376,14 +1396,23 @@ impl AssistantDraftBlockProjection {
     pub fn text(&self) -> Option<(&str, &str)> {
         match self {
             Self::Narrative {
-                stream_id, content, ..
+                stream_id,
+                content,
+                display_content,
+                ..
             }
             | Self::FinalMessage {
-                stream_id, content, ..
+                stream_id,
+                content,
+                display_content,
+                ..
             }
             | Self::Message {
-                stream_id, content, ..
-            } => Some((stream_id, content)),
+                stream_id,
+                content,
+                display_content,
+                ..
+            } => Some((stream_id, display_content.as_deref().unwrap_or(content))),
             Self::ProviderHosted { .. } => None,
         }
     }

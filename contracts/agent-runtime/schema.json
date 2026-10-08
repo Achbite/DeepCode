@@ -215,6 +215,7 @@
           "properties": {
             "kind": { "enum": ["narrative", "finalMessage", "message"] },
             "content": { "type": "string", "minLength": 1 },
+            "displayContent": { "type": "string" },
             "streamId": { "type": "string", "minLength": 1 },
             "outputIndex": { "type": "integer", "minimum": 0 }
           }
@@ -1518,6 +1519,7 @@
         "providerRequestId": {"$ref": "#/$defs/Id"},
         "role": {"enum": ["user", "assistant", "tool", "system"]},
         "content": {"type": "string"},
+        "displayContent": {"type": "string"},
         "filesystemReferences": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/FilesystemReference"}},
         "pluginSelections": {"type": "array", "maxItems": 16, "items": {"$ref": "#/$defs/PluginSelectionInput"}},
         "feedback": {"enum": ["up", "down", null]},
@@ -1549,6 +1551,7 @@
         "runId": {"$ref": "#/$defs/Id"},
         "providerRequestId": {"$ref": "#/$defs/Id"},
         "content": {"type": "string"},
+        "displayContent": {"type": "string"},
         "sequence": {"type": "integer", "minimum": 1},
         "createdAt": {"$ref": "#/$defs/Timestamp"},
         "sourceReferences": {"$ref": "#/$defs/SourceReferences"}
