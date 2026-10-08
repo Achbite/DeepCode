@@ -585,10 +585,10 @@ export function useAgentComposer(
     item.inputId === inputId ? { ...item, inputId: nextPanelId('paste'), text } : item
   )));
   const selectedProfile = profiles.find(profile => profile.id === selectedProfileId);
-  // A persisted choice is already usable; opening a new conversation does not
-  // require another click. Missing effort still requires an explicit selection.
+  // A null Session override inherits the Profile, as it does in Provider binding.
+  // Only a missing effective effort requires an explicit selection.
   const modelSelectionConfirmed = Boolean(selectedProfile?.enabled
-    && (selectedProfile.thinking === 'disabled' || reasoningEffortOverride));
+    && (selectedProfile.thinking === 'disabled' || (reasoningEffortOverride ?? selectedProfile.reasoningEffort)));
   const selectModel = async (profileId: string, effort: import('@deepcode/protocol').LlmReasoningEffort | null) => {
     await saveModelChoice(profileId, effort);
   };

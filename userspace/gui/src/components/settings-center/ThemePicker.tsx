@@ -69,7 +69,12 @@ export default function ThemePicker({ label, choices, selected, mode, accent, di
       if (document.activeElement === document.body || root.current?.contains(document.activeElement)) trigger.current?.focus();
     }
   }, [open, disabled]);
-  const close = () => { restoreFocus.current = true; setOpen(false); trigger.current?.focus(); };
+  const close = (keyboard = true) => {
+    restoreFocus.current = keyboard;
+    setOpen(false);
+    if (keyboard) trigger.current?.focus();
+    else if (root.current?.contains(document.activeElement)) (document.activeElement as HTMLElement).blur();
+  };
   return <div className="theme-picker" ref={root} onBlur={(event) => {
     if (!event.currentTarget.contains(event.relatedTarget as Node)) setOpen(false);
   }} onKeyDown={(event) => {
@@ -78,7 +83,7 @@ export default function ThemePicker({ label, choices, selected, mode, accent, di
     <span id={`${id}-label`}>{label}</span>
     <button type="button" className="theme-picker__trigger" ref={trigger} disabled={disabled}
       aria-labelledby={`${id}-label ${id}-value`} aria-haspopup="listbox" aria-expanded={open} aria-controls={open ? id : undefined}
-      onClick={() => setOpen((value) => !value)} onKeyDown={(event) => {
+      onClick={event => { if (open) close(event.detail === 0); else setOpen(true); }} onKeyDown={(event) => {
         if (['ArrowDown', 'ArrowUp'].includes(event.key)) { event.preventDefault(); setOpen(true); }
       }}>
       <ThemeBadge colors={current.colors} mode={mode} accent={accent} /><span id={`${id}-value`}>{current.name}</span><UiIcon name="chevronDown" size={14} />
@@ -91,7 +96,7 @@ export default function ThemePicker({ label, choices, selected, mode, accent, di
         options.current[index]?.focus();
       }}>
       {choices.map((choice, index) => <button key={choice.id} type="button" role="option" aria-selected={selected === choice.id}
-        tabIndex={-1} ref={(element) => { options.current[index] = element; }} onClick={() => { onSelect(choice.id); close(); }}>
+        tabIndex={-1} ref={(element) => { options.current[index] = element; }} onClick={event => { onSelect(choice.id); close(event.detail === 0); }}>
         <ThemeBadge colors={choice.colors} mode={mode} accent={accent} /><span>{choice.name}</span>
         {selected === choice.id && <UiIcon name="check" size={16} />}
       </button>)}

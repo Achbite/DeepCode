@@ -285,6 +285,11 @@
     "deepcodeGui.outputs.showAll": "查看全部（{count}）",
     "deepcodeGui.outputs.showLess": "收起",
     "deepcodeGui.nameLabel": "名称",
+    "deepcodeGui.navigation.back": "后退",
+    "deepcodeGui.navigation.forward": "前进",
+    "deepcodeGui.navigation.collapse": "收起左侧导航",
+    "deepcodeGui.navigation.resize": "调整左侧导航宽度",
+    "deepcodeGui.navigation.expand": "展开左侧导航",
     "deepcodeGui.settings.close": "关闭设置",
     "agent.session.newTitle": "新对话",
     "agent.session.rename": "重命名",
@@ -1261,6 +1266,18 @@
         "collapsed": "收起",
         "hidden": "隐藏"
       }
+    },
+    "gui.defaultFileOpen": {
+      "label": "文本文件默认打开方式",
+      "description": "选择文本文件的打开应用。",
+      "options": {
+        "reader": "DeepCode Reader",
+        "vscode": "Visual Studio Code"
+      }
+    },
+    "gui.showRuntimeFiles": {
+      "label": "显示运行环境文件",
+      "description": "在文件树的会话文件中显示运行环境目录。"
     },
     "gui.showContextRail": {
       "label": "显示上下文栏",

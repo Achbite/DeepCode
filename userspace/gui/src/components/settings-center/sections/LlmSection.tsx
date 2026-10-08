@@ -1,3 +1,4 @@
+import NativeSelect from '../../shared/NativeSelect';
 import { modelReasoningEfforts, type UserSettings } from '@deepcode/protocol';
 import { t } from '../../../i18n';
 import { useInterfaceReloadGuard } from '../../../services/interfaceReload';
@@ -43,7 +44,7 @@ function ApprovalReviewerModel({ profiles, connections }: { profiles: LlmProvide
         {effort ? ` · ${t(language, `settings.llm.effort.${effort}`)}` : ''}</span></summary>
     <div className="model-form-grid model-reviewer-settings">
       <label>{t(language, 'settings.approvalReview.providerModel')}
-        <select value={selected} disabled={saving} onChange={event => {
+        <NativeSelect value={selected} disabled={saving} onChange={event => {
           const next = profiles.find(profile => profile.id === (event.target.value || conversationModel));
           void save({ 'agent.approvalReview.profileId': event.target.value,
             ...(next?.thinking === 'disabled' || effort && !modelReasoningEfforts(next).some(value => value === effort)
@@ -54,14 +55,14 @@ function ApprovalReviewerModel({ profiles, connections }: { profiles: LlmProvide
           {connections.map(connection => <optgroup key={connection.id} label={connection.name}>
             {available.filter(profile => profile.connectionId === connection.id).map(profile => <option key={profile.id} value={profile.id}>{profile.name} · {profile.model}</option>)}
           </optgroup>)}
-        </select>
+        </NativeSelect>
       </label>
       <label>{t(language, 'settings.llm.reasoningEffort')}
-        <select value={effort} disabled={saving} onChange={event => void save({ 'agent.approvalReview.reasoningEffort': event.target.value })}>
+        <NativeSelect value={effort} disabled={saving} onChange={event => void save({ 'agent.approvalReview.reasoningEffort': event.target.value })}>
           <option value="">{profile?.thinking === 'disabled' ? t(language, 'agent.profile.thinkingDisabled') : t(language, 'settings.approvalReview.inheritEffort')}</option>
           {effort && !efforts.some(value => value === effort) && <option value={effort} disabled>{t(language, `settings.llm.effort.${effort}`)}</option>}
           {efforts.map(value => <option key={value} value={value} disabled={profile?.thinking === 'disabled'}>{t(language, `settings.llm.effort.${value}`)}</option>)}
-        </select>
+        </NativeSelect>
       </label>
       {unsupportedEffort && <p className="model-wide" role="alert">{t(language, 'settings.approvalReview.effortUnavailable')}</p>}
       <p className="model-wide">{t(language, 'settings.approvalReview.description')}</p>
@@ -110,7 +111,7 @@ function ConnectionDetail({ current, adapters, profiles, defaultId, mode, onSave
     <form className="model-connection-form" onSubmit={e => { e.preventDefault(); void save(); }}>
       <fieldset disabled={busy}>
         <div className="model-form-grid">
-          {!current && <label>{text('服务', 'Service')}<select value={draft.adapterId} onChange={e => { const a = adapters.find(a => a.id === e.target.value)!; setDraft(p => ({ ...p, adapterId: a.id, name: a.name, baseUrl: a.defaultBaseUrl, credentialKind: mode === 'subscription' ? 'oauth' : a.authMethods.includes('none') ? 'none' : 'apiKey' })); }}>{available.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}</select></label>}
+          {!current && <label>{text('服务', 'Service')}<NativeSelect value={draft.adapterId} onChange={e => { const a = adapters.find(a => a.id === e.target.value)!; setDraft(p => ({ ...p, adapterId: a.id, name: a.name, baseUrl: a.defaultBaseUrl, credentialKind: mode === 'subscription' ? 'oauth' : a.authMethods.includes('none') ? 'none' : 'apiKey' })); }}>{available.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}</NativeSelect></label>}
           <label>{text('连接名称', 'Connection name')}<input required value={draft.name} onChange={e => { setDraft(p => ({ ...p, name: e.target.value })); setSaved(false); }} /></label>
           {mode === 'metered' && <label className="model-wide">{text('API 地址', 'API address')}<input type="url" required value={draft.baseUrl} onChange={e => { setDraft(p => ({ ...p, baseUrl: e.target.value })); setSaved(false); }} /></label>}
           {draft.credentialKind === 'apiKey' && <label className="model-wide">API Key<input type="password" autoComplete="off" value={apiKey} placeholder={current?.authStatus === 'ready' ? text('已配置，留空保持', 'Configured; leave blank to keep') : ''} onChange={e => { setApiKey(e.target.value); setSaved(false); }} /></label>}

@@ -390,7 +390,7 @@ const store = create<LocalAgentState>((set, get) => ({
 
   selectModel: async (profileId, reasoningEffortOverride) => {
     const profile = get().profiles.find(profile => profile.id === profileId && profile.enabled);
-    if (!profile || (profile.thinking !== 'disabled' && !reasoningEffortOverride)) return false;
+    if (!profile || (profile.thinking !== 'disabled' && !(reasoningEffortOverride ?? profile.reasoningEffort))) return false;
     return saveModelSettings(set, get, { profileId, reasoningEffortOverride });
   },
 
@@ -939,7 +939,8 @@ async function saveModelSettings(set: StoreSet, get: StoreGet, settings: Session
     }
     const profile = get().profiles.find(item => item.id === settings.profileId);
     if (!profile) throw new Error('llm_profile_unavailable');
-    const remembered = { ...profile, reasoningEffort: settings.reasoningEffortOverride ?? undefined };
+    const remembered = { ...profile, reasoningEffort: profile.thinking === 'disabled'
+      ? undefined : settings.reasoningEffortOverride ?? profile.reasoningEffort };
     const saved = await patchLlmProfiles({ profile: remembered });
     if (!saved.ok) throw new Error(saved.message ?? saved.error ?? 'reasoning_preference_save_failed');
     set(state => ({ profiles: state.profiles.map(item => item.id === profile.id ? remembered : item) }));

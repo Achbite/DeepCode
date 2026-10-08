@@ -1,3 +1,4 @@
+import NativeSelect from '../../shared/NativeSelect';
 import { useState } from 'react';
 import { decodeShellCommandRules } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../../i18n';
@@ -29,9 +30,9 @@ export default function CommandRuleSettings({ language }: { language: UiLanguage
     {rules.map((rule, index) => <div key={JSON.stringify(rule.context)} className="settings-command-rule">
       <details><summary><code>{String(rule.context.command)}</code></summary>
         <pre>{JSON.stringify(rule.context, null, 2)}</pre></details>
-      <select disabled={busy} aria-label={t(language, 'settings.commandRules.title')} value={rule.decision} onChange={event => void update(index, event.target.value as 'ask' | 'allow' | 'deny')}>
+      <NativeSelect disabled={busy} aria-label={t(language, 'settings.commandRules.title')} value={rule.decision} onChange={event => void update(index, event.target.value as 'ask' | 'allow' | 'deny')}>
         {(['ask', 'allow', 'deny'] as const).map(mode => <option key={mode} value={mode}>{t(language, `agent.permission.${mode}`)}</option>)}
-      </select>
+      </NativeSelect>
       <button type="button" disabled={busy} onClick={() => void update(index)}>{t(language, 'settings.commandRules.remove')}</button>
     </div>)}
     {error && <p role="alert">{error}</p>}

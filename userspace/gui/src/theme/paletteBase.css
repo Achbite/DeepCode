@@ -7,6 +7,7 @@
   --dc-surface-raised: var(--bg-elevated);
   --dc-surface-hover: color-mix(in srgb, var(--text-main) 7%, transparent);
   --dc-surface-active: color-mix(in srgb, var(--text-main) 12%, transparent);
+  --dc-selection: color-mix(in srgb, var(--dc-surface-active) 70%, var(--dc-surface));
   --dc-border: var(--line);
   --dc-border-strong: var(--line-strong);
   --dc-foreground: var(--text-main);

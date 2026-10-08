@@ -1,3 +1,4 @@
+import NativeSelect from '../../shared/NativeSelect';
 import { useInterfaceReloadGuard } from '../../../services/interfaceReload';
 import '../settingsCenter.css';
 import { useEffect, useState } from 'react';
@@ -41,18 +42,18 @@ export default function ProjectEnvironmentSettings({ chinese, projectId }: { chi
     <div className="settings-card settings-card__body">
       {projectId && <>
         <label className="settings-field settings-field--compact"><span>{chinese ? '运行位置' : 'Run tools in'}</span>
-          <select className="settings-field__select" value={target.kind} disabled={saving}
+          <NativeSelect className="settings-field__select" value={target.kind} disabled={saving}
             onChange={(event) => setTarget(event.target.value === 'wsl' ? { kind: 'wsl', distribution: '', worker: 'deepcode-kernel-daemon' } : { kind: 'native' })}>
             <option value="native">{chinese ? '本机' : 'Native'}</option>
             {(environment?.os === 'windows' || target.kind === 'wsl') && <option value="wsl" disabled={environment?.os !== 'windows'}>WSL</option>}
-          </select></label>
+          </NativeSelect></label>
         {target.kind === 'native' && environment?.os === 'windows' && <>
           <label className="settings-field settings-field--compact"><span>Shell</span>
-            <select className="settings-field__select" disabled={saving} value={target.shell ?? ''} onChange={event => setTarget({ ...target, shell: (event.target.value || undefined) as Extract<ProjectEnvironment, {kind: 'native'}>['shell'] })}>
+            <NativeSelect className="settings-field__select" disabled={saving} value={target.shell ?? ''} onChange={event => setTarget({ ...target, shell: (event.target.value || undefined) as Extract<ProjectEnvironment, {kind: 'native'}>['shell'] })}>
               <option value="">{chinese ? '使用全局默认' : 'Global default'}</option>
               <option value="auto">{chinese ? '自动检测' : 'Auto detect'}</option>
               <option value="powershell7">PowerShell 7</option><option value="windowsPowerShell">Windows PowerShell</option><option value="gitBash">Git Bash</option>
-            </select></label>
+            </NativeSelect></label>
           {target.shell === 'gitBash' && <label className="settings-field settings-field--compact"><span>{chinese ? 'Git Bash 路径' : 'Git Bash path'}</span>
             <input className="settings-field__input" disabled={saving} value={target.gitBashPath ?? ''} placeholder={chinese ? '留空自动检测' : 'Auto detect when empty'} onChange={event => setTarget({ ...target, gitBashPath: event.target.value })} /></label>}
         </>}

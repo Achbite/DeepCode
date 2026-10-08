@@ -47,9 +47,25 @@
   --dc-weight-medium: 560;
   --dc-weight-semibold: 650;
   --dc-weight-bold: 700;
+  --dc-titlebar-height: 52px;
+  --dc-navigation-inset: 14px;
+  --dc-navigation-controls-height: var(--dc-titlebar-height);
+  --dc-navigation-control-gap: 2px;
+  --dc-navigation-title-gap: 8px;
+  --dc-control-size: 30px;
+  --dc-resize-hit-width: 15px;
+  --dc-settings-row-height: 52px;
+  --dc-usage-handle-width: 18px;
+  --dc-usage-handle-height: 28px;
   --dc-radius-outer: 16px;
   --dc-radius-inner: 12px;
   --dc-radius-control: 8px;
+}
+
+/* The native macOS caption occupies the first 32px; custom chrome has no leading window buttons. */
+:root[data-product='deepcode-gui'][data-deepcode-window-chrome='nativeOverlay'] {
+  --dc-navigation-inset: 84px;
+  --dc-navigation-controls-height: 32px;
 }
 
 :root[data-product='deepcode-gui'][data-theme='dark'],

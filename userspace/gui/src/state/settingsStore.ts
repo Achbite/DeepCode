@@ -81,6 +81,8 @@ type SettingsStore = SettingsStateData & SettingsActions;
 
 const SETTING_DEFINITION_SCHEMAS: SettingDefinitionSchema[] = [
   { key: 'gui.showReasoning', group: 'gui', control: 'boolean' },
+  { key: 'gui.defaultFileOpen', group: 'gui', control: 'select', options: ['reader', 'vscode'] },
+  { key: 'gui.showRuntimeFiles', group: 'gui', control: 'boolean' },
   {
     key: 'workbench.language',
     group: 'workbench',

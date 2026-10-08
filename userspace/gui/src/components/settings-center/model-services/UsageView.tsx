@@ -1,3 +1,4 @@
+import NativeSelect from '../../shared/NativeSelect';
 import { useEffect, useMemo, useState } from 'react';
 import type { ConnectionSummary, UsageQuery, UsageReport, UsageBucket } from '@deepcode/protocol';
 import { queryModelUsage } from '../../../services/apiClient';
@@ -30,8 +31,8 @@ export default function UsageView({ connections, initialConnection }: { connecti
   const totals = report?.totals;
   return <div className="model-usage-view">
     <div className="model-heading"><h2>{text('用量统计', 'Usage')}</h2><button onClick={() => setRevision(n => n + 1)}>{text('刷新', 'Refresh')}</button></div>
-    <div className="model-filters"><select aria-label={text('连接', 'Connection')} value={connectionId} onChange={e => { setConnectionId(e.target.value); setDay(null); }}><option value="">{text('全部连接', 'All connections')}</option>{connections.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select>
-      {day ? <button className="model-push" onClick={() => setDay(null)}>{text('返回按日统计', 'Back to daily usage')} · {new Date(day.start).toLocaleDateString(language)}</button> : <select className="model-push" aria-label={text('统计周期', 'Period')} value={days} onChange={e => setDays(Number(e.target.value))}><option value={1}>{text('今日', 'Today')}</option><option value={7}>{text('近 7 天', 'Last 7 days')}</option><option value={30}>{text('近 30 天', 'Last 30 days')}</option></select>}
+    <div className="model-filters"><NativeSelect aria-label={text('连接', 'Connection')} value={connectionId} onChange={e => { setConnectionId(e.target.value); setDay(null); }}><option value="">{text('全部连接', 'All connections')}</option>{connections.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</NativeSelect>
+      {day ? <button className="model-push" onClick={() => setDay(null)}>{text('返回按日统计', 'Back to daily usage')} · {new Date(day.start).toLocaleDateString(language)}</button> : <NativeSelect className="model-push" aria-label={text('统计周期', 'Period')} value={days} onChange={e => setDays(Number(e.target.value))}><option value={1}>{text('今日', 'Today')}</option><option value={7}>{text('近 7 天', 'Last 7 days')}</option><option value={30}>{text('近 30 天', 'Last 30 days')}</option></NativeSelect>}
     </div>
     {error ? <div className="settings-error" role="alert">{error}</div> : !report ? <div role="status">{text('正在读取…', 'Loading…')}</div> : <>
       <div className="model-usage-totals">

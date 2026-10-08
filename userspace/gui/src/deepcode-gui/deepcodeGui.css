@@ -85,7 +85,6 @@ textarea {
 
 /* Native dialogs are portalled to body and share the same applied theme as the workbench. */
 :root[data-product='deepcode-gui'] {
-  --dc-titlebar-height: 48px;
   --bg-app: var(--dc-background);
   --bg-sidebar: var(--dc-sidebar);
   --bg-panel: var(--dc-surface);
@@ -114,8 +113,8 @@ textarea {
   grid-template-columns: minmax(0, 1fr) var(--dc-header-context-width, var(--dc-context-width));
   background: transparent;
 }
-.deepcode-gui-titlebar .local-agent__header-conversation { padding: 2px 8px 8px 16px; gap: 8px; }
-.deepcode-gui-titlebar .local-agent__header-preview { padding: 2px 10px 8px 8px; gap: 6px; }
+.deepcode-gui-titlebar .local-agent__header-conversation { padding: 0 8px 0 16px; gap: 8px; }
+.deepcode-gui-titlebar .local-agent__header-preview { padding: 0 10px 0 8px; gap: 6px; }
 .deepcode-gui-titlebar .local-agent__heading-mark { display: none; }
 .deepcode-gui-titlebar .local-agent__heading strong { font-size: calc(14px * var(--dc-ui-font-scale, 1)); font-weight: var(--dc-weight-semibold); }
 .deepcode-gui-titlebar .local-agent__run-label { flex: none; padding-inline: 4px; }
@@ -125,10 +124,6 @@ textarea {
   grid-template-columns: minmax(260px, 1fr) 5px minmax(280px, var(--reader-width));
 }
 .deepcode-gui-titlebar .local-agent__header--reading .local-agent__header-preview { grid-column: 3; }
-.deepcode-gui-titlebar .local-agent__header--reading:not(.local-agent__header--expanded)::after {
-  content: ''; grid-column: 2; grid-row: 1; justify-self: center; align-self: stretch;
-  width: 1px; background: var(--dc-border);
-}
 .deepcode-gui-titlebar .reader-tabs { min-height: 30px; padding: 0; background: transparent; }
 .deepcode-gui-titlebar .reader-tab button { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 5px 6px; border: 0; background: transparent; color: inherit; font: inherit; font-size: calc(12px * var(--dc-ui-font-scale, 1)); cursor: pointer; }
 .deepcode-gui-titlebar .reader-icon-button { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; flex: 0 0 28px; padding: 5px; border: 0; border-radius: 6px; color: var(--dc-muted); background: transparent; cursor: pointer; }
@@ -138,19 +133,10 @@ textarea {
 .deepcode-gui-titlebar .local-agent__header--expanded .local-agent__header-conversation { display: none; }
 .deepcode-gui-titlebar .local-agent__header--expanded .local-agent__header-preview { grid-column: 1; }
 
-@media (max-width: 800px) {
-  html[data-deepcode-window-chrome='nativeOverlay'] .deepcode-gui-workbench:has(.local-agent--reading) .local-agent__header-conversation { padding-left: 78px; }
-  html[data-deepcode-window-chrome='nativeOverlay'] .deepcode-gui-workbench:has(.local-agent--expanded) .deepcode-gui-session-header { padding-left: 78px; }
-}
-@media (max-width: 760px) {
-  html[data-deepcode-window-chrome='nativeOverlay'] .local-agent__header-conversation { padding-left: 78px; }
-}
 @media (max-width: 620px) {
-  :root[data-product='deepcode-gui']:has(.local-agent--reading:not(.local-agent--expanded)) { --dc-titlebar-height: 72px; }
-  .deepcode-gui-titlebar .local-agent__header--reading:not(.local-agent__header--expanded) { grid-template-columns: minmax(0, 1fr); grid-template-rows: 36px 36px; }
-  .deepcode-gui-titlebar .local-agent__header--reading:not(.local-agent__header--expanded) .local-agent__header-preview { grid-column: 1; }
-  .deepcode-gui-titlebar .local-agent__header--reading:not(.local-agent__header--expanded) :is(.local-agent__header-conversation, .local-agent__header-preview) { padding-block: 0; }
-  .deepcode-gui-titlebar .local-agent__header--reading::after { display: none; }
+  .deepcode-gui-titlebar .local-agent__header--reading { grid-template-columns:minmax(0,1fr); }
+  .deepcode-gui-titlebar .local-agent__header--reading .local-agent__header-conversation { display:none; }
+  .deepcode-gui-titlebar .local-agent__header--reading .local-agent__header-preview { grid-column:1; padding-left:var(--dc-navigation-leading); }
 }
 
 .deepcode-gui-brand,

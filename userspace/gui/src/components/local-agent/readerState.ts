@@ -11,6 +11,18 @@ export type ReaderTarget = ({ kind: 'workspace'; workspaceId: string; logicalPat
   | { kind: 'browser'; previewId?: string; url?: string; filePath?: string; selfPreview?: boolean };
 export type ResolvedReaderTarget = Exclude<ReaderTarget, { kind: 'browser' }>
   | (Extract<ReaderTarget, { kind: 'browser' }> & { previewId: string });
+export interface ReaderLocation {
+  sessionId: string | null;
+  target: ResolvedReaderTarget | null;
+  visible: boolean;
+  expanded: boolean;
+}
+export interface ReaderNavigationRequest { id: number; location: ReaderLocation }
+export interface ReaderNavigation {
+  request: ReaderNavigationRequest | null;
+  onChange: (location: ReaderLocation) => void;
+  onTabClosed: (sessionId: string | null, tabId: string) => void;
+}
 export type ReaderTab = { id: string; target: ResolvedReaderTarget; page?: NativePage };
 export interface ReaderViewState {
   sessionId: string | null;

@@ -285,6 +285,11 @@
     "deepcodeGui.outputs.showAll": "View all ({count})",
     "deepcodeGui.outputs.showLess": "Show less",
     "deepcodeGui.nameLabel": "Name",
+    "deepcodeGui.navigation.back": "Back",
+    "deepcodeGui.navigation.forward": "Forward",
+    "deepcodeGui.navigation.collapse": "Collapse navigation",
+    "deepcodeGui.navigation.resize": "Resize navigation",
+    "deepcodeGui.navigation.expand": "Expand navigation",
     "deepcodeGui.settings.close": "Close settings",
     "agent.session.newTitle": "New chat",
     "agent.session.rename": "Rename",
@@ -1261,6 +1266,18 @@
         "collapsed": "Collapsed",
         "hidden": "Hidden"
       }
+    },
+    "gui.defaultFileOpen": {
+      "label": "Open text files with",
+      "description": "Choose an app for opening text files.",
+      "options": {
+        "reader": "DeepCode Reader",
+        "vscode": "Visual Studio Code"
+      }
+    },
+    "gui.showRuntimeFiles": {
+      "label": "Show runtime files",
+      "description": "Show the runtime directory under Session files in the file tree."
     },
     "gui.showContextRail": {
       "label": "Show context rail",
