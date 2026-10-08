@@ -938,6 +938,7 @@ impl McpClient {
 
     fn list_tools(&self) -> Result<Vec<RemoteToolDefinition>, McpRuntimeError> {
         let mut cursor: Option<String> = None;
+        let mut seen_cursors = BTreeSet::new();
         let mut tools = Vec::new();
         loop {
             let result = self.request(
@@ -977,8 +978,15 @@ impl McpClient {
                 .get("nextCursor")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            if cursor.is_none() {
-                return Ok(tools);
+            match cursor.as_ref() {
+                None => return Ok(tools),
+                Some(next) if !seen_cursors.insert(next.clone()) => {
+                    return Err(McpRuntimeError::new(
+                        "mcp_tools_invalid",
+                        "MCP tools/list returned a repeated pagination cursor.",
+                    ));
+                }
+                Some(_) => {}
             }
         }
     }
@@ -1605,6 +1613,35 @@ mod tests {
         assert!(!error.message.contains("discarded-prefix"));
         assert!(error.message.len() < MAX_MCP_STDERR_BYTES + 512);
         assert!(client.process.lock().unwrap().stopped);
+        client.shutdown().unwrap();
+    }
+
+    #[test]
+    fn repeated_tool_list_cursor_fails_before_another_page() {
+        let directory = TestDirectory::new();
+        // The fixture terminates after three pages even without the regression fix.
+        let client = directory.server(
+            "        if request['method']=='tools/list':\n            page=request['id']-1\n            Path(sys.argv[1], 'pages').write_text(str(page))\n            result={'tools':[]}\n            if page<3: result['nextCursor']='repeated'\n            print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)",
+        );
+        let error = client.list_tools().unwrap_err();
+        assert_eq!(error.code, "mcp_tools_invalid");
+        assert!(error.message.contains("repeated pagination cursor"));
+        assert_eq!(
+            std::fs::read_to_string(directory.0.join("pages")).unwrap(),
+            "2"
+        );
+        client.shutdown().unwrap();
+    }
+
+    #[test]
+    fn tool_list_accepts_a_new_cursor_after_an_empty_page() {
+        let directory = TestDirectory::new();
+        let client = directory.server(
+            "        if request['method']=='tools/list':\n            if 'cursor' not in request['params']: result={'tools':[],'nextCursor':'next'}\n            else:\n                assert request['params']['cursor']=='next'\n                result={'tools':[{'name':'echo','inputSchema':{'type':'object'}}]}\n            print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)",
+        );
+        let tools = client.list_tools().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
         client.shutdown().unwrap();
     }
 
