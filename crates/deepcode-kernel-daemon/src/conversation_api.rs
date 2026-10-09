@@ -397,7 +397,7 @@ fn read_document_resource(path: &StdPath) -> Result<(&'static str, Vec<u8>), Str
 
 // Image presentation uses the same Session/workspace binding check as text.
 // The byte cap applies while reading, including if the file grows concurrently.
-fn read_image_resource(path: &StdPath) -> Result<(&'static str, Vec<u8>), String> {
+pub(crate) fn read_image_resource(path: &StdPath) -> Result<(&'static str, Vec<u8>), String> {
     const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
     let mut bytes = Vec::new();
     fs::File::open(path)
@@ -405,7 +405,12 @@ fn read_image_resource(path: &StdPath) -> Result<(&'static str, Vec<u8>), String
         .take(MAX_IMAGE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
-    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+    let media = image_media_type(&bytes)?;
+    Ok((media, bytes))
+}
+
+pub(crate) fn image_media_type(bytes: &[u8]) -> Result<&'static str, String> {
+    if bytes.len() > 8 * 1024 * 1024 {
         return Err("图片超过 8 MiB 读取限额。".into());
     }
     let media = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -419,7 +424,7 @@ fn read_image_resource(path: &StdPath) -> Result<(&'static str, Vec<u8>), String
     } else {
         return Err("当前资源不是支持的 PNG、JPEG、GIF 或 WebP 图片。".into());
     };
-    Ok((media, bytes))
+    Ok(media)
 }
 
 pub(crate) fn resolve_provider_images(

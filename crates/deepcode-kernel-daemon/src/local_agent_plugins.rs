@@ -6,10 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const MAX_PLUGINS: usize = 128;
 const MAX_SKILL_BYTES: u64 = 512 * 1024;
-const MAX_SCAN_DEPTH: usize = 4;
-const MAX_DYNAMIC_PLUGIN_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -255,7 +252,12 @@ pub(crate) fn plugin_catalog_projection(settings: &Value) -> Result<Value, Strin
     Ok(json!({"revision":revision,"plugins":plugins}))
 }
 
-pub(crate) fn search_plugins(settings: &Value, query: &str, limit: usize) -> Result<Value, String> {
+pub(crate) fn search_plugins(
+    settings: &Value,
+    query: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Value, String> {
     let (revision, sources, _) = plugin_catalog(settings)?;
     let words = query.to_lowercase();
     let mut matches = Vec::new();
@@ -279,9 +281,10 @@ pub(crate) fn search_plugins(settings: &Value, query: &str, limit: usize) -> Res
         }
     }
     let total = matches.len();
-    Ok(
-        json!({"revision":revision,"plugins":matches.into_iter().take(limit).collect::<Vec<_>>(),"total":total}),
-    )
+    let plugins: Vec<_> = matches.into_iter().skip(offset).take(limit).collect();
+    let end = offset.saturating_add(plugins.len());
+    let next_offset = (end < total).then_some(end);
+    Ok(json!({"revision":revision,"plugins":plugins,"total":total,"nextOffset":next_offset}))
 }
 
 /// Settings inspects text Skills through the same loader used for run preparation.
@@ -327,9 +330,6 @@ pub(crate) fn resolve_plugin_selection(
     selections: &mut Vec<PluginSelectionInput>,
     refresh: bool,
 ) -> Result<ResolvedPluginSelection, String> {
-    if selections.len() > 16 {
-        return Err("plugin_selection_invalid: 单次请求最多选择 16 个插件。".to_string());
-    }
     if selections.is_empty() {
         return Ok(ResolvedPluginSelection {
             catalog_revision: "plugin-catalog:empty".into(),
@@ -451,8 +451,8 @@ fn plugin_catalog(
             public: PublicPluginCatalogItem {
                 uri: uri.into(),
                 display_name: "Computer Use".into(),
-                short_description: "控制内置浏览器并检验截图；经单独授权控制电脑与外部应用。"
-                    .into(),
+                short_description:
+                    "按任务选择程序接口或 GUI；提供内置浏览器与经授权的桌面操作和截图。".into(),
                 icon_ref: None,
                 management: Some(json!({"key":"plugins.disabled","id":uri})),
                 activation_media_types: vec![],
@@ -561,9 +561,6 @@ fn plugin_catalog(
         };
         insert_plugin_source(&mut sources, entry)?;
     }
-    if sources.len() > MAX_PLUGINS {
-        return Err(format!("Plugin 数量超过首版上限 {MAX_PLUGINS}"));
-    }
     let mut activation_owners = BTreeMap::new();
     for source in sources
         .values()
@@ -634,7 +631,7 @@ fn skill_catalog_entries(settings: &Value) -> Result<Vec<PluginCatalogEntry>, St
             let root = fs::canonicalize(mount.path.trim())
                 .map_err(|error| format!("Skill 挂载 {} 不可用：{error}", mount.path))?;
             let mut mounted_files = Vec::new();
-            collect_skill_files(&root, 0, &mut mounted_files)?;
+            collect_skill_files(&root, &mut mounted_files)?;
             Ok(mounted_files)
         })();
         match loaded {
@@ -652,9 +649,6 @@ fn skill_catalog_entries(settings: &Value) -> Result<Vec<PluginCatalogEntry>, St
                 });
                 entries.push(PluginCatalogEntry::Unavailable(public));
             }
-        }
-        if files.len() + entries.len() > MAX_PLUGINS {
-            return Err(format!("Skill 数量超过首版上限 {MAX_PLUGINS}"));
         }
     }
     for (index, (path, (mount_id, activation_media_types))) in files.into_iter().enumerate() {
@@ -705,7 +699,7 @@ fn skill_plugin(locator: &SkillLocator) -> Result<PluginSource, String> {
         plugin_artifact_ref,
         plugin_instance_ref: String::new(),
         capability_refs: vec![format!("skill:{}", locator.id)],
-        capability_summary: truncate_utf8(&instructions, MAX_DYNAMIC_PLUGIN_BYTES),
+        capability_summary: instructions.clone(),
         tool_prompt_provider: None,
         contribution: PluginContribution::Skill,
         implementation: json!({"id": locator.id, "path": path}),
@@ -714,9 +708,6 @@ fn skill_plugin(locator: &SkillLocator) -> Result<PluginSource, String> {
 }
 
 fn normalize_activation_media_types(values: &[String]) -> Result<Vec<String>, String> {
-    if values.len() > 16 {
-        return Err("Skill activationMediaTypes 最多包含 16 项。".to_string());
-    }
     let mut normalized = BTreeSet::new();
     for value in values {
         let candidate = value.trim().to_ascii_lowercase();
@@ -740,10 +731,7 @@ fn normalize_activation_media_types(values: &[String]) -> Result<Vec<String>, St
     Ok(normalized.into_iter().collect())
 }
 
-fn collect_skill_files(path: &Path, depth: usize, output: &mut Vec<PathBuf>) -> Result<(), String> {
-    if output.len() > MAX_PLUGINS || depth > MAX_SCAN_DEPTH {
-        return Ok(());
-    }
+fn collect_skill_files(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
     if path.is_file() {
         if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
             output.push(path.to_path_buf());
@@ -753,9 +741,6 @@ fn collect_skill_files(path: &Path, depth: usize, output: &mut Vec<PathBuf>) -> 
     let direct = path.join("SKILL.md");
     if direct.is_file() {
         output.push(direct);
-    }
-    if depth == MAX_SCAN_DEPTH {
-        return Ok(());
     }
     let mut entries = fs::read_dir(path)
         .map_err(|error| format!("扫描 Skill 目录 {} 失败：{error}", path.display()))?
@@ -773,7 +758,7 @@ fn collect_skill_files(path: &Path, depth: usize, output: &mut Vec<PathBuf>) -> 
             && !name.starts_with('.')
             && !matches!(name.as_ref(), "node_modules" | "target")
         {
-            collect_skill_files(&entry.path(), depth + 1, output)?;
+            collect_skill_files(&entry.path(), output)?;
         }
     }
     Ok(())
@@ -863,6 +848,97 @@ const fn enabled_by_default() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capability_search_reads_cli_tools_and_mcp_descriptions_without_starting_programs() {
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = Directory(std::env::temp_dir().join(format!(
+            "deepcode-discovery-{}-{}",
+            std::process::id(),
+            crate::now_millis()
+        )));
+        fs::create_dir(&directory.0).unwrap();
+        let marker = directory.0.join("started");
+        let entry = directory.0.join("main.py");
+        fs::write(
+            &entry,
+            format!("from pathlib import Path\nPath({:?}).touch()\n", marker),
+        )
+        .unwrap();
+        fs::write(
+            directory.0.join("deepcode-tool.json"),
+            serde_json::to_vec(&json!({
+                "id":"warehouse", "name":"Warehouse bridge", "description":"Work with stock records.",
+                "command":"python3", "entry":"main.py", "tools":[{
+                    "name":"list_inventory", "description":"Read warehouse stock counts.",
+                    "inputSchema":{"type":"object"}
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let settings = json!({
+            "plugins.sources":serde_json::to_string(&json!([{
+                "id":"warehouse", "path":directory.0
+            }])).unwrap(),
+            "mcp.servers":serde_json::to_string(&json!([{
+                "id":"lab", "name":"Lab bridge", "description":"Inspect thermometers and read ambient temperature.",
+                "command":"python3", "args":entry
+            }])).unwrap()
+        });
+        for (query, uri) in [
+            ("LIST_INVENTORY", "plugin://warehouse@cli"),
+            ("stock counts", "plugin://warehouse@cli"),
+            ("ambient temperature", "plugin://lab@mcp"),
+        ] {
+            let found = search_plugins(&settings, query, 20, 0).unwrap();
+            assert_eq!(found["total"], 1, "{query}");
+            assert_eq!(found["plugins"][0]["uri"], uri);
+            assert_eq!(found["plugins"][0]["available"], true);
+        }
+        let missing = search_plugins(&settings, "stock ambient", 20, 0).unwrap();
+        assert_eq!(
+            missing["total"], 0,
+            "all keywords must match the same plugin"
+        );
+        assert_eq!(missing["plugins"], json!([]));
+        assert!(missing["nextOffset"].is_null());
+        assert!(
+            !marker.exists(),
+            "discovery must not execute a plugin entrypoint"
+        );
+    }
+
+    #[test]
+    fn catalog_browsing_can_continue_until_all_results_are_read() {
+        let settings = json!({});
+        let all = search_plugins(&settings, "", usize::MAX, 0).unwrap();
+        let expected = all["plugins"].as_array().unwrap();
+        assert!(expected.len() > 2);
+        let mut seen = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = search_plugins(&settings, "", 2, offset).unwrap();
+            assert_eq!(page["total"], all["total"]);
+            let plugins = page["plugins"].as_array().unwrap();
+            assert!(!plugins.is_empty());
+            seen.extend(plugins.iter().cloned());
+            let Some(next) = page["nextOffset"].as_u64() else {
+                break;
+            };
+            assert_eq!(next as usize, offset + plugins.len());
+            offset = next as usize;
+        }
+        assert_eq!(&seen, expected);
+        let exhausted = search_plugins(&settings, "", 2, expected.len()).unwrap();
+        assert_eq!(exhausted["plugins"], json!([]));
+        assert!(exhausted["nextOffset"].is_null());
+    }
 
     #[test]
     fn computer_plugin_has_selected_identity_and_honors_disabled_setting() {
@@ -959,7 +1035,7 @@ mod tests {
             .find(|plugin| plugin["displayName"] == "Good Skill")
             .unwrap();
         assert_eq!(good["available"], true);
-        let found = search_plugins(&settings, "Good Skill selected document", 10).unwrap();
+        let found = search_plugins(&settings, "Good Skill selected document", 10, 0).unwrap();
         assert_eq!(found["total"], 1);
         for key in [
             "uri",
@@ -989,7 +1065,7 @@ mod tests {
             .as_str()
             .unwrap()
             .contains(&original_error));
-        let found = search_plugins(&settings, bad["uri"].as_str().unwrap(), 10).unwrap();
+        let found = search_plugins(&settings, bad["uri"].as_str().unwrap(), 10, 0).unwrap();
         assert_eq!(found["total"], 1);
         assert_eq!(found["plugins"][0]["available"], false);
         assert_eq!(found["plugins"][0]["error"], bad["error"]);
@@ -1005,16 +1081,16 @@ mod tests {
             selected.plugins[0].capability_summary
         );
 
-        fs::write(
-            directory.0.join("good/SKILL.md"),
-            "# Good Skill\nRead the newly selected document.",
-        )
-        .unwrap();
+        let revised_instructions = format!(
+            "# Good Skill\n{}\nRead the newly selected document.",
+            "Preserve the selected document and verify the result.\n".repeat(100)
+        );
+        fs::write(directory.0.join("good/SKILL.md"), &revised_instructions).unwrap();
         let selected_after_content_change =
             resolve_plugin_selection(&settings, &mut vec![selection(good)], false).unwrap();
         assert_eq!(
             selected_after_content_change.plugins[0].capability_summary,
-            "# Good Skill\nRead the newly selected document."
+            revised_instructions
         );
         assert!(plugins
             .iter()

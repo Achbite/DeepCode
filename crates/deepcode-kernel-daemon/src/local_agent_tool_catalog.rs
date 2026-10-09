@@ -51,6 +51,7 @@ enum ToolExecutorBinding {
     },
     Mcp(Box<McpTool>),
     Product(Arc<ProductTools>),
+    Artifact,
     Process,
     Browser(Value),
     Container(Arc<crate::container_tools::Containers>),
@@ -189,6 +190,18 @@ impl ToolProvider for ProductToolProvider {
                 },
             )
             .collect();
+        for (name, field, description, scope) in [
+            ("artifact.prepare", "path", "Archive a workspace file as an immutable resource version. Re-prepare after modifying it; its logical identity stays stable.", CatalogEffectScope::WorkspaceRead),
+            ("artifact.preview", "url", "Register an HTTP(S) live preview reference without fetching or verifying it. Call after updating the preview to record its latest presentation version.", CatalogEffectScope::LocalRead),
+        ] {
+            tools.push(PendingToolContribution {
+                origin: "coreBuiltin", provider_ref: "deepcode:resources".into(), plugin_uri: None, plugin_instance_ref: None,
+                contribution_ref: format!("deepcode:resources/{name}"), name: name.into(),
+                description: format!("{description} This does not add it to user outputs. Use artifact.present for requested results or review materials. Temporary scripts, logs and observation images stay intermediate unless explicitly presented."),
+                input_schema: crate::artifact_resources::schema(field), effect_class: Some(ToolEffectClass::Read),
+                effect_scope: scope, availability: ToolAvailability::Callable, logical_target: None, binding: ToolExecutorBinding::Artifact,
+            });
+        }
         if let (Some(binding), Some(instance)) = (
             self.0.browser_binding.as_ref(),
             self.0.computer_use_instance.as_ref(),
@@ -780,7 +793,8 @@ impl PreparedCatalogBinding {
                         host,
                         &json!({"action":"status","previewId":input["previewId"]}),
                     )
-                    .map_err(|message| {
+                    .map_err(|error| {
+                        let message = error.message;
                         let input_issues = (message == "native_browser_page_closed"
                             || message.starts_with("native_browser_page_closed:"))
                         .then(|| {
@@ -838,6 +852,14 @@ impl PreparedCatalogBinding {
         raw_arguments: Value,
     ) -> Result<PreparedToolInput, ToolCatalogError> {
         match &self.entry().binding {
+            ToolExecutorBinding::Artifact => {
+                let targets = crate::artifact_resources::targets(self.tool_name(), &raw_arguments)
+                    .map_err(|message| ToolCatalogError::new("tool_input_invalid", message))?;
+                Ok(PreparedToolInput::Dynamic {
+                    arguments: raw_arguments,
+                    targets,
+                })
+            }
             ToolExecutorBinding::Process => crate::managed_processes::parse(raw_arguments)
                 .map(PreparedToolInput::Process)
                 .map_err(|message| ToolCatalogError::new("tool_input_invalid", message)),
@@ -908,6 +930,28 @@ impl PreparedCatalogBinding {
         context: KernelToolExecutionContext,
     ) -> Result<KernelToolExecutionResult, ToolCatalogError> {
         match (&self.entry().binding, input) {
+            (ToolExecutorBinding::Artifact, PreparedToolInput::Dynamic { arguments, .. }) => {
+                let result =
+                    crate::artifact_resources::prepare(invocation_id, &arguments, &context);
+                Ok(match result {
+                    Ok(output) => KernelToolExecutionResult {
+                        invocation_id: invocation_id.into(),
+                        outcome: KernelToolExecutionOutcome::Completed,
+                        output,
+                        error: None,
+                    },
+                    Err(message) => KernelToolExecutionResult {
+                        invocation_id: invocation_id.into(),
+                        outcome: KernelToolExecutionOutcome::Failed,
+                        output: Value::Null,
+                        error: Some(KernelToolExecutionFailure {
+                            code: "artifact_prepare_failed".into(),
+                            message,
+                        }),
+                    },
+                })
+            }
+
             (
                 ToolExecutorBinding::Container(adapter),
                 PreparedToolInput::Container { input, target },
@@ -927,23 +971,10 @@ impl PreparedCatalogBinding {
                     &context,
                     invocation_id,
                 );
-                Ok(match result {
-                    Ok(output) => KernelToolExecutionResult {
-                        invocation_id: invocation_id.into(),
-                        outcome: KernelToolExecutionOutcome::Completed,
-                        output,
-                        error: None,
-                    },
-                    Err(message) => KernelToolExecutionResult {
-                        invocation_id: invocation_id.into(),
-                        outcome: KernelToolExecutionOutcome::Failed,
-                        output: Value::Null,
-                        error: Some(KernelToolExecutionFailure {
-                            code: "native_browser_failed".into(),
-                            message,
-                        }),
-                    },
-                })
+                Ok(crate::browser_tools::execution_result(
+                    invocation_id,
+                    result,
+                ))
             }
             (ToolExecutorBinding::Document { python }, PreparedToolInput::Document(input)) => {
                 let workspace_id = context.workspace_id.as_deref().ok_or_else(|| {
@@ -1095,24 +1126,23 @@ impl PreparedCatalogBinding {
             ) => tool
                 .call(input, &context)
                 .map(|result| {
-                    let crate::local_agent_mcp::McpToolCallResult { output, failure } = result;
-                    match failure {
-                        Some(failure) => KernelToolExecutionResult {
-                            invocation_id: invocation_id.to_string(),
-                            outcome: KernelToolExecutionOutcome::Failed,
-                            output,
-                            error: Some(KernelToolExecutionFailure {
-                                code: failure.code,
-                                message: failure.message,
-                            }),
+                    let error = result.failure.map(|failure| KernelToolExecutionFailure {
+                        code: failure.code,
+                        message: failure.message,
+                    });
+                    crate::tool_images::archive_result_images(
+                        KernelToolExecutionResult {
+                            invocation_id: invocation_id.into(),
+                            outcome: if error.is_some() {
+                                KernelToolExecutionOutcome::Failed
+                            } else {
+                                KernelToolExecutionOutcome::Completed
+                            },
+                            output: result.output,
+                            error,
                         },
-                        None => KernelToolExecutionResult {
-                            invocation_id: invocation_id.to_string(),
-                            outcome: KernelToolExecutionOutcome::Completed,
-                            output,
-                            error: None,
-                        },
-                    }
+                        &context,
+                    )
                 })
                 .map_err(|error| ToolCatalogError::new(error.code, error.message)),
             _ => Err(ToolCatalogError::new(
