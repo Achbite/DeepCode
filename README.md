@@ -99,10 +99,10 @@ Workspace files and conversation journals are stored locally. Selected prompts, 
 
 Install Docker and GNU Make. On Windows, run the build commands in WSL2 with Docker integration enabled. macOS packaging additionally needs the host's Xcode Command Line Tools, Rust toolchain from `rust-toolchain.toml`, and Node.js.
 
-The commands below use `dev-main` for the current development version shown here. Use `main` for stable release source.
+The commands below build the stable release from `main`. Use `dev-main` for ongoing development.
 
 ```bash
-git clone --branch dev-main https://github.com/Achbite/DeepCode.git
+git clone --branch main https://github.com/Achbite/DeepCode.git
 cd DeepCode
 make shell
 ```

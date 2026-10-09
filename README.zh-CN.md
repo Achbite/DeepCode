@@ -99,10 +99,10 @@ Session 负责唯一的 Agent Loop 和会话状态，Kernel 负责工具与执�
 
 先安装 Docker 和 GNU Make。Windows 请在已启用 Docker 集成的 WSL2 中运行构建命令。打包 macOS 还需要宿主机的 Xcode Command Line Tools、`rust-toolchain.toml` 指定的 Rust 工具链和 Node.js。
 
-下列命令使用 `dev-main`，对应本文展示的当前开发版本。稳定发布源码使用 `main`。
+下列命令从 `main` 编译稳定发布版本；持续开发版本使用 `dev-main`。
 
 ```bash
-git clone --branch dev-main https://github.com/Achbite/DeepCode.git
+git clone --branch main https://github.com/Achbite/DeepCode.git
 cd DeepCode
 make shell
 ```
