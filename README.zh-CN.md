@@ -35,7 +35,7 @@ DeepCode 是优先在本机工作的编程 Agent，提供桌面 GUI、用于脚�
 
 GUI 支持向消息附加文件或文件夹、查看产物和 diff，以及让 Agent 打开 HTML 预览。浏览器批注仅通过工具栏按钮或 Esc 退出。新对话继承上次提交任务使用的模型及该模型记住的推理强度。重载界面使用 macOS 的 **Cmd+Shift+R**，其他平台使用 **Ctrl+Shift+R**。
 
-Windows Setup 会在缺少 WebView2 Evergreen Runtime 时安装它，解压版需自行准备该依赖。Linux GUI 需要 GTK/WebKitGTK。macOS 程序包使用 ad-hoc 签名。配置、持久数据、缓存、临时文件和日志分别使用对应的平台目录，详见[安装与用户文件](docs/distribution.md)。
+Windows Setup 会在缺少 WebView2 Evergreen Runtime 时安装它，解压版需自行准备该依赖。Linux GUI 需要 GTK/WebKitGTK。macOS 程序包使用 ad-hoc 签名；即使应用路径相同，重新构建也可能使已有的辅助功能和屏幕录制授权失效。安装并授权目标构建后，应通过 `computer.control status` 核对实际 GUI 进程。配置、持久数据、缓存、临时文件和日志分别使用对应的平台目录，详见[安装与用户文件](docs/distribution.md)。
 
 ## 从源码编译
 
@@ -74,7 +74,11 @@ make ui-update UI_PACKAGE=bin/macos-arm64
 - <strong>查看任务进度：</strong> 任务面板展示 Agent 维护的阶段列表和状态，同类工作可以合并为一个阶段。阶段进度与工具结果、Plan 审批分别呈现。
 - <strong>预览并持续修改：</strong> 检查内置浏览器的 DOM 并与页面交互，选取元素或区域批注，在同一对话中继续修改。原生视口截图目前需要 macOS；Windows 和 Linux 保留 DOM 检查及批注元数据。原始附件保持只读，可编辑副本可以放在 DeepCode 管理的会话目录中。
 - <strong>使用模型服务：</strong> API 连接与订阅服务分别配置和查看用量。Provider 返回的 Token、缓存计数与上下文估算分开呈现。
-- <strong>扩展工具与界面：</strong> 通过 Skill、CLI 工具、MCP 和 UI 插件扩展能力。Agent 可以发现并激活可用插件，用户也可以显式引用。外部电脑控制目前支持 macOS，每次调用需要额外授权。
+- <strong>控制外部程序：</strong> Agent 按任务选择可用的 CLI、合适的 MCP 工具或 GUI 交互。Git 操作可以直接使用 CLI，确认界面呈现则需要视觉观察。当前工具缺少所需能力时，Agent 可以搜索已登记插件，并在本次运行中按需激活；用户明确选择插件是可选方式。登记使插件可被发现，激活加载工具和说明，执行仍遵循权限。外部桌面控制目前支持 macOS，遵循允许、询问或拒绝的外部操作权限设置，也可使用“替我批准”逐次自动审查；依据不足时交由用户决定。GUI 审批后恢复观察时的原窗口，目标位置或尺寸改变时要求重新观察。
+- <strong>扩展工具与界面：</strong> 添加 Skill、CLI 工具、MCP 连接和 UI 插件。为外部连接填写产品和支持任务的用途说明，帮助 Agent 按能力发现；CLI 检索还使用 manifest 中的工具名称和说明。见[插件发现与配置](docs/product/operations.md#settings-and-extensions)。
+- <strong>审核任务结果：</strong> 产出面板展示 Agent 明确交付的结果和审核材料；观察截图、临时脚本与日志默认留在执行历史。文件和预览更新复用同一产出项，按最近更新时间排序；最终正文可以引用固定版本并展示可展开的图片。
+- <strong>重开窗口后继续：</strong> 等待回答或审批的任务保留原 Host；重开 GUI 后，可显式选择“使用当前 GUI 继续”。后续调用使用新窗口，旧观察与预览句柄需重新获取，待回答或审批内容保留。
+- <strong>边分析边澄清：</strong> Agent 可先提出问题，继续不依赖答案的分析，并在下一次模型请求时纳入用户回答。未答问题保留在对话中；独立工作结束后，本轮保持等待裁决。
 - <strong>生成与阅读文档：</strong> 生成 HTML、Markdown、PDF 产物。文件阅读器展示文本源码和 PDF，HTML 页面可在内置浏览器中打开。PDF 阅读使用内置 Web 阅读器，PDF 生成需要安装[文档运行环境](skills/deepcode-documents/SKILL.md)。
 
 工作区数据、会话日志和工具执行保留在本机。选中的提示词、上下文和图片会发送给配置的模型服务；如果模型服务也在本机运行，则无需发送到远程 Provider。
