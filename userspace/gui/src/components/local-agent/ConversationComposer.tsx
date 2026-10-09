@@ -11,6 +11,7 @@ import { useLocalAgentStore } from '../../state/localAgentStore';
 import type { AgentComposer } from './useAgentComposer';
 import { pastedTextTitle } from '../../services/pastedText';
 import { DismissibleError } from './DismissibleError';
+import { HostRebind } from './HostRebind';
 
 interface ConversationComposerProps {
   changeBar?: React.ReactNode;
@@ -147,6 +148,7 @@ export function ConversationComposer({
       {uiActionError && <DismissibleError language={language} onDismiss={onDismissUiActionError}>{uiActionError.includes('\n')
         ? <details><summary>{uiActionError.split('\n')[0]}</summary><pre>{uiActionError.slice(uiActionError.indexOf('\n') + 1)}</pre></details>
         : uiActionError}</DismissibleError>}
+      <HostRebind run={projection?.run ?? null} />
       {composer.failedDrafts.map((failed, index) => <details className="local-agent__failed-draft" key={index}>
         <summary>{language === 'zh-CN' ? '未发送草稿已保留' : 'Unsent draft saved'}</summary>
         <pre>{[failed.draft, ...failed.pastedTexts.map((item) => item.text)].filter(Boolean).join('\n\n')}</pre>

@@ -2,7 +2,7 @@ import { t } from '../../i18n';
 import { useUiLanguage } from '../../useUiLanguage';
 import { useConversationHost } from './ConversationHost';
 import { highlightCode, type CodeSpan } from './codeLanguage';
-import { memo, useEffect, useId, useState } from 'react';
+import { memo, useEffect, useId, useState, useRef } from 'react';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 
@@ -43,6 +43,7 @@ export function ImageContent({ source, alt }: { source: string; alt: string }) {
   const uiLanguage = useUiLanguage();
   const { loadImage } = useConversationHost();
   const sessionId = useLocalAgentStore((state) => state.sessionId);
+  const dialog = useRef<HTMLDialogElement>(null);
   const [result, setResult] = useState<{ source: string; url?: string; error?: string; decodeFailed?: boolean } | null>(null);
   useEffect(() => {
     const controller = new AbortController();
@@ -55,7 +56,15 @@ export function ImageContent({ source, alt }: { source: string; alt: string }) {
     return () => { controller.abort(); release?.(); };
   }, [loadImage, sessionId, source]);
   if (result?.source !== source) return <span role="status">{t(uiLanguage, 'content.image.loading')}</span>;
-  return result.url ? <img src={result.url} alt={alt} loading="lazy" onError={() => setResult({ source, decodeFailed: true })} />
+  return result.url ? <span className="conversation-image-review">
+    <button type="button" className="conversation-image-review__open" aria-label={t(uiLanguage, 'content.image.expand')} onClick={() => dialog.current?.showModal()}>
+      <img src={result.url} alt={alt} loading="lazy" onError={() => setResult({ source, decodeFailed: true })} />
+    </button>
+    <dialog ref={dialog} className="conversation-image-review__dialog" aria-label={alt || t(uiLanguage, 'content.image.expand')}>
+      <button type="button" className="conversation-image-review__close" onClick={() => dialog.current?.close()}>{t(uiLanguage, 'content.image.close')}</button>
+      <span className="conversation-image-review__scroll"><img src={result.url} alt={alt} /></span>
+    </dialog>
+  </span>
     : <span role="status">{alt} · {result.decodeFailed ? t(uiLanguage, 'content.image.decodeError') : result.error}</span>;
 }
 

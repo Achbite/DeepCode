@@ -4,7 +4,8 @@
   min-height: 0;
   flex-direction: column;
   gap: 12px;
-  overflow: auto;
+  overflow: hidden;
+  box-sizing: border-box;
   padding: 12px 10px 10px;
 }
 
@@ -66,8 +67,14 @@
 
 .deepcode-gui-sidebar-section {
   display: grid;
-  gap: 4px;
-  margin-top: 18px;
+  flex: 1;
+  min-height: 0;
+  /* Keep the scrollbar on the rail edge while preserving the content inset. */
+  margin-inline-end: -10px;
+  padding-inline-end: 10px;
+  align-content: start;
+  overflow: auto;
+  gap: 7px;
 }
 
 .deepcode-gui-sidebar-section__label {
@@ -87,10 +94,6 @@
   color: var(--dc-faint);
   font-size: var(--dc-font-caption);
   line-height: var(--dc-line-compact);
-}
-
-.deepcode-gui-sidebar-spacer {
-  flex: 1;
 }
 
 .deepcode-gui-sidebar-settings {
@@ -292,12 +295,7 @@
   gap: 3px;
 }
 
-.deepcode-gui-sidebar-section {
-  display: grid;
-  gap: 7px;
-  margin-top: 0;
-}
-
+.deepcode-gui-sidebar-actions { flex: none; }
 .deepcode-gui-sidebar-section__heading {
   display: flex;
   min-height: 27px;

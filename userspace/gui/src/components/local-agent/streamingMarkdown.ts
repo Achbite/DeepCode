@@ -67,7 +67,7 @@ function renderTree(root: MarkdownRoot): Root {
     if (node.type === 'element') {
       for (const name of ['href', 'src']) {
         const value = node.properties[name];
-        if (typeof value === 'string') node.properties[name] = /^workspace:\/\/[^/]+\/.+/.test(value)
+        if (typeof value === 'string') node.properties[name] = /^(?:workspace:\/\/[^/]+\/.+|artifact:\/\/.+)/.test(value)
           ? value : defaultUrlTransform(value);
       }
     }

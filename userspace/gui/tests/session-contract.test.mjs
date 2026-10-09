@@ -420,7 +420,7 @@ test('document Plan scope and completed artifacts pass through Session to the GU
     documentRecord = reply.record;
     return reply;
   } });
-  const actor = actorWith(journal, sessionId, provider, kernel, fakeRunPreparation({ tools: [tool] }).port, 'document-artifact');
+  const actor = actorWith(journal, sessionId, provider, kernel, fakeRunPreparation({ tools: [tool], contextWindowTokens: 8192 }).port, 'document-artifact');
   t.after(() => actor.dispose());
   await actor.submit(messageCommand(sessionId, 'command:document-start', 'Render a report.'));
   const waiting = await waitForProjection(actor, (value) => value.pendingPlan !== null);
@@ -1707,6 +1707,22 @@ test('virtual rows preserve measured height, reading layout and per-session pres
   assert.match(markup(other), /closed/, 'another session never inherits it');
 });
 
+test('Markdown keeps archived artifact links and image sources in streaming and final answers', async (t) => {
+  const { StreamingMarkdownParser } = await loadGuiModule(t, '/src/components/local-agent/streamingMarkdown.ts');
+  const artifact = 'artifact://artifact:session:review:attempt:final';
+  const source = `[Report](${artifact})\n\n![Review image](${artifact})\n\n[Unsafe](javascript:alert)\n\n![Workspace image](workspace://workspace:review/review.png)`;
+  const parser = new StreamingMarkdownParser();
+  for (const streaming of [true, false]) {
+    const references = [];
+    const visit = node => {
+      if (node.type === 'element' && ['a', 'img'].includes(node.tagName)) references.push([node.tagName, node.properties.href ?? node.properties.src]);
+      node.children?.forEach(visit);
+    };
+    parser.update(source, streaming).forEach(block => visit(block.tree));
+    assert.deepEqual(references, [['a', artifact], ['img', artifact], ['a', ''], ['img', 'workspace://workspace:review/review.png']]);
+  }
+});
+
 test('completed Markdown is reused across remounts while changed and streaming text stay current', async (t) => {
   const { StreamingMarkdownParser } = await loadGuiModule(t, '/src/components/local-agent/streamingMarkdown.ts');
   const text = '# Cached answer\n\nA **completed** paragraph.';
@@ -1830,7 +1846,7 @@ test('tool rows accumulate across adjacent requests without crossing message or 
   const { projectionItems } = await loadGuiModule(t, '/src/components/local-agent/conversationItems.ts');
   const activities = [1, 2, 3, 4].map((id) => ({ activityId: `a${id}`, runId: id === 4 ? 'run:two' : 'run:one' }));
   const group = (id) => ({ kind: 'toolGroup', timelineId: `group:${id}`, sequence: id, activityIds: [`a${id}`] });
-  const projection = { activities, narratives: [], plans: [], messages: [{ messageId: 'message:boundary', runId: 'run:one', role: 'user' }], timeline: [group(1), group(2), { kind: 'message', sequence: 3, messageId: 'message:boundary' }, group(3), group(4)] };
+  const projection = { interactions: [], activities, narratives: [], plans: [], messages: [{ messageId: 'message:boundary', runId: 'run:one', role: 'user' }], timeline: [group(1), group(2), { kind: 'message', sequence: 3, messageId: 'message:boundary' }, group(3), group(4)] };
   const items = projectionItems(projection);
   assert.deepEqual(items.map((item) => item.type), ['toolGroup', 'message', 'toolGroup', 'toolGroup']);
   assert.equal(items[0].groupId, 'group:1');
@@ -2606,8 +2622,9 @@ test('composer submission receipts preserve newer text and retain the complete f
 
 test('artifact delivery waits for final text display and keeps historical or interrupted output available', async (t) => {
   const { conversationDisplay } = await loadGuiModule(t, '/src/components/local-agent/conversationDisplay.ts');
-  const artifacts = [{ artifactId: 'image:old', runId: 'run:old' }, { artifactId: 'image:new', runId: 'run:new' }];
-  const projection = { run: { runId: 'run:new', status: 'running' }, messages: [], timeline: [], artifacts,
+  const artifacts = [{ artifactId: 'image:old', runId: 'run:old', presentationRunId: 'run:old' }, { artifactId: 'image:new', runId: 'run:new', presentationRunId: 'run:new' }];
+  const resources = [...artifacts, { artifactId: 'image:observation', runId: 'run:old' }];
+  const projection = { run: { runId: 'run:new', status: 'running' }, messages: [], timeline: [], artifacts: resources, deliverables: artifacts,
     assistantDraft: { runId: 'run:new', blocks: [{ content: 'Still writing' }] } };
   const live = new Set(['run:new']);
   const shown = new Map();
@@ -2626,7 +2643,7 @@ test('artifact delivery waits for final text display and keeps historical or int
   assert.deepEqual(conversationDisplay(committed, new Set(), new Map()).artifacts, artifacts, 'settled history does not replay a reveal animation');
   const interrupted = { ...projection, assistantDraft: null, run: { ...projection.run, status: 'cancelled' } };
   assert.deepEqual(conversationDisplay(interrupted, live, shown).artifacts, artifacts, 'actual output is retained after cancellation without a final answer');
-  assert.deepEqual(projection.artifacts, artifacts, 'presentation cannot remove canonical artifacts');
+  assert.deepEqual(projection.artifacts, resources, 'observations remain archived without becoming deliverables');
 });
 
 test('pending approvals replace ordinary input while preserving its draft for return', async (t) => {

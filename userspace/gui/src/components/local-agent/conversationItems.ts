@@ -15,6 +15,7 @@ export type ProjectionItem =
     }
   | { type: 'plan'; sequence: number; value: SessionProjection['plans'][number] }
   | { type: 'approval'; sequence: number; value: ActivityProjection }
+  | { type: 'interaction'; sequence: number; value: SessionProjection['interactions'][number] }
   | {
       type: 'toolGroup';
       sequence: number;
@@ -78,6 +79,7 @@ export function projectionItems(projection: SessionProjection | null): Projectio
   const narratives = new Map(projection.narratives.map((value) => [value.narrativeId, value]));
   const plans = new Map(projection.plans.map((value) => [`${value.planId}:${value.revision}`, value]));
   const activities = new Map(projection.activities.map((value) => [value.activityId, value]));
+  const interactions = new Map(projection.interactions.map(value => [value.callId, value]));
   const items = projection.timeline.map((item): ProjectionItem => {
     switch (item.kind) {
       case 'message':
@@ -123,10 +125,14 @@ export function projectionItems(projection: SessionProjection | null): Projectio
   });
   const grouped: ProjectionItem[] = [];
   const displayItems = items.flatMap((item): ProjectionItem[] => {
-    if (item.type !== 'toolGroup' || !item.values.some((activity) => activity.kind === 'approval')) return [item];
+    if (item.type !== 'toolGroup' || !item.values.some((activity) => activity.kind === 'approval' || activity.kind === 'interaction')) return [item];
     const rows: ProjectionItem[] = [];
     for (const activity of item.values) {
       if (activity.kind === 'approval') rows.push({ type: 'approval', sequence: activity.sequence, value: activity });
+      else if (activity.kind === 'interaction') {
+        const interaction = requiredProjectionValue(interactions.get(activity.callId!), 'conversation_interaction_missing');
+        rows.push({ type: 'interaction', sequence: interaction.sequence, value: interaction });
+      }
       else {
         const previous = rows.at(-1);
         if (previous?.type === 'toolGroup') previous.values.push(activity);

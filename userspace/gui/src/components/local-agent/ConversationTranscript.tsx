@@ -5,10 +5,10 @@ import type { MessageFeedback, SessionProjection } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
 import { useConversationHost } from './ConversationHost';
 import { workspaceResourceLink } from './documentResources';
+import { requestReader } from './readerState';
 import { useLocalAgentStore } from '../../state/localAgentStore';
 import type { PresentedCommittedContent } from '../../presentation/PresentationRuntime';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
-import { ArtifactLinks } from './ArtifactLinks';
 import { FileChanges, roundChangeActivities } from './FileChanges';
 import { ReasoningHistory } from './ReasoningDetails';
 import { PlanPreviewCard } from './PlanPreviewCard';
@@ -27,13 +27,13 @@ import { ConversationVirtualRow, useConversationRowState } from './ConversationV
 import { MessageActions } from './MessageActions';
 import { RunFailureDetails, ProviderRetryStatus } from './RunFailureDetails';
 import { ApprovalActivity } from './ApprovalActivity';
+import { InteractionCard } from './InteractionCard';
 
 interface ConversationTranscriptProps {
   language: UiLanguage;
   loading: boolean;
   showReasoning?: boolean;
   displaySettledRunIds: Set<string>;
-  artifacts: SessionProjection['artifacts'];
   onDisplayed(identity: string, text: string): void;
   projection: SessionProjection | null;
   activeProject: { title: string } | undefined;
@@ -52,7 +52,6 @@ export function ConversationTranscript({
   language,
   showReasoning = false,
   displaySettledRunIds,
-  artifacts,
   onDisplayed,
   loading,
   projection,
@@ -153,6 +152,18 @@ export function ConversationTranscript({
       : null;
     if (!anchor || !event.currentTarget.contains(anchor)) return;
     const href = anchor.getAttribute('href') ?? '';
+    if (href.startsWith('artifact://')) {
+      event.preventDefault();
+      const artifact = projection?.artifacts.find(item => item.artifactId === href.slice('artifact://'.length));
+      if (!artifact) { setUiActionError(t(language, 'reader.artifactMissing')); return; }
+      if (artifact.contentMode === 'fixed') requestReader(artifact.sessionId, { kind: 'artifact', artifact });
+      else if (artifact.uri && /^https?:\/\//i.test(artifact.uri)) {
+        void host.openExternalLink(artifact.uri).catch(reason => setUiActionError(String(reason)));
+      } else if (artifact.workspaceId && artifact.logicalPath) {
+        void openWorkspaceResource(artifact.workspaceId, artifact.logicalPath).catch(reason => setUiActionError(String(reason)));
+      }
+      return;
+    }
     const resource = workspaceResourceLink(href);
     if (resource) {
       event.preventDefault();
@@ -269,6 +280,8 @@ export function ConversationTranscript({
           language={language}
           onToggle={onPlanToggle}
         />
+      ) : item.type === 'interaction' ? (
+        <InteractionCard interaction={item.value} language={language} />
       ) : item.type === 'approval' ? (
         <ApprovalActivity activity={item.value} language={language}
           pending={projection?.pendingApproval?.callId === item.value.callId}
@@ -390,7 +403,6 @@ export function ConversationTranscript({
         if (current && !displaySettled) rows.push({ key: `${round.key}:provider-status`, process: true, required: false, live: true, content: () => providerStatus });
         if (showReasoning && projection && displaySettled) rows.push({ key: `${round.key}:reasoning-history`, process: true, required: false, live: false, content: () => <ReasoningHistory sessionId={projection.sessionId} runId={round.runId} /> });
         return <ConversationRoundView language={language} key={`${projection?.sessionId}:${round.key}`} roundKey={round.key} virtualizer={virtualizer} eagerRows={eagerRows} displaySettled={displaySettled} followingLatest={viewport.followingLatest} rows={rows}>
-          <ArtifactLinks artifacts={artifacts.filter((artifact) => artifact.runId === round.runId)} onOpen={openWorkspaceResource} />
           {(displaySettled || terminal) && <FileChanges activities={roundChangeActivities(projection, round.runId)} />}
         </ConversationRoundView>;
       })}
