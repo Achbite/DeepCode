@@ -325,6 +325,7 @@ fn responses_request_body(
     if !provider_tools.is_empty() {
         body["tools"] = Value::Array(provider_tools);
     }
+    let mut include = Vec::new();
     if profile.connection.adapter_id == "openai-codex" {
         let instructions = messages
             .iter()
@@ -345,13 +346,24 @@ fn responses_request_body(
             }
         }
         body["store"] = json!(false);
-        body["include"] = json!(["reasoning.encrypted_content"]);
+        include.push("reasoning.encrypted_content");
         body.as_object_mut().unwrap().remove("max_output_tokens");
         body.as_object_mut().unwrap().remove("temperature");
         body["parallel_tool_calls"] = json!(true);
         if body.get("reasoning").is_some() {
             body["reasoning"]["summary"] = json!("auto");
         }
+    }
+    if !hosted_tools.is_empty()
+        && matches!(
+            profile.connection.adapter_id.as_str(),
+            "openai" | "openai-codex"
+        )
+    {
+        include.push("web_search_call.action.sources");
+    }
+    if !include.is_empty() {
+        body["include"] = json!(include);
     }
     Ok(body)
 }
@@ -2310,6 +2322,39 @@ mod tests {
             assert_eq!(replay.as_bytes(), delivered.as_ref());
             assert_eq!(lines.last().unwrap()["data"]["outcome"], outcome);
             std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn gpt_hosted_search_requests_sources_without_overwriting_reasoning_include() {
+        let mut profile = test_profile("responses");
+        let hosted: Vec<LocalProviderHostedTool> = serde_json::from_value(json!([
+            { "type": "webSearch", "providerToolType": "web_search" }
+        ]))
+        .unwrap();
+        for (adapter, expected) in [
+            ("openai", json!(["web_search_call.action.sources"])),
+            (
+                "openai-codex",
+                json!([
+                    "reasoning.encrypted_content",
+                    "web_search_call.action.sources"
+                ]),
+            ),
+            ("deepseek", Value::Null),
+        ] {
+            profile.connection.adapter_id = adapter.into();
+            let body = responses_request_body(&profile, &[], &[], &hosted, true).unwrap();
+            assert_eq!(body["include"], expected);
+            let without_search = responses_request_body(&profile, &[], &[], &[], true).unwrap();
+            assert_eq!(
+                without_search["include"],
+                if adapter == "openai-codex" {
+                    json!(["reasoning.encrypted_content"])
+                } else {
+                    Value::Null
+                }
+            );
         }
     }
 

@@ -186,12 +186,15 @@ pub(crate) mod fixtures {
             "schemaVersion": deepcode_kernel_client::SESSION_PROJECTION_VERSION, "permissionOverrides":{}, "effectivePermissions":null, "shellAuthorizations":[],
             "sessionId":"session:test", "revision":1, "display":{"creationTitle":"input"},
             "workspaceBindings":[], "sessionDirectoryIndexes":[], "timeline":[], "messages":[],
-            "queuedInputs":[], "narratives":[], "plans":[], "contextCompositions":[],
-            "tokenUsageHistory":[], "activities":[], "artifacts":[],
+            "queuedInputs":[], "narratives":[], "plans":[], "contextCompositions":[], "interactions":[],
+            "tokenUsageHistory":[], "activities":[], "artifacts":[],"deliverables":[],
             "tokenUsage":{"providerCallCount":0,"reportedCallCount":0,"inputTokens":0,"outputTokens":0,
               "cacheReadInputTokens":0,"cacheMissInputTokens":0,"cacheAvailable":false,"cacheComplete":false},
             "run":{"runId":"run:test","profileId":"profile:current","workspaceBindings":[],"status":"waiting"}
         });
+        if field == "pendingInteraction" {
+            value["interactions"] = json!([decision.clone()]);
+        }
         value[field] = decision;
         serde_json::from_value(value).unwrap()
     }
@@ -216,7 +219,7 @@ pub(crate) mod fixtures {
             (
                 "pendingInteraction",
                 json!({"interactionId":"interaction:test","runId":"run:test","callId":"call:question",
-                "kind":"question","prompt":"Choose","options":[{"id":"a","label":"Option A"}],
+                "status":"pending","kind":"question","prompt":"Choose","options":[{"id":"a","label":"Option A"}],
                 "allowFreeform":true,"sequence":1,"createdAt":"now"}),
                 "interaction.respond",
                 "response",

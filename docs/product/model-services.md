@@ -8,6 +8,14 @@ Coding Plan is a service category. The first adapter is OpenAI Codex. DeepCode i
 
 Quota is a timestamped response from the provider, not an estimate from local tokens. Its windows retain the supplied reset time and used percentage. A failed refresh displays its error. Subscription fees and subscription usage are not counted as metered API cost.
 
+## Web search citations
+
+For OpenAI API and Codex subscription Responses connections with hosted web search enabled, requests include the search source list. Native search actions and message annotations remain in the Provider record and Session journal. A search source list alone does not associate an internal citation ID with a particular URL.
+
+Session derives one display text for CLI, TUI and GUI. When the Provider supplies a valid URL citation covering an internal citation marker, the display uses a clickable Markdown link. Ordinary Markdown links and local source-file links remain unchanged. An unresolved marker appears as `[?]` with a missing-source notice; DeepCode does not guess its URL. During streaming, text from an internal citation marker onward waits for the final annotations so terminals do not print identifiers that would need to be rewritten. Original response text remains available in the conversation data for inspection.
+
+The GUI copy action copies the displayed answer. A stored response with no citation mapping cannot acquire that mapping from a display update; a fresh search is needed to obtain the missing sources.
+
 ## Usage
 
 The default interval is **the last 30 days**, including today and the previous 29 local dates. The daily chart can drill into hourly usage; today and seven-day ranges are also available. It is not a calendar-month report.

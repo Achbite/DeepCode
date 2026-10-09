@@ -15,15 +15,15 @@ export function conversationDisplay(
     if (message.role !== 'assistant') continue;
     const streamId = streams.get(message.messageId);
     const caughtUp = !liveRuns.has(message.runId)
-      || Boolean(streamId && displayed.get(streamId) === message.content);
+      || Boolean(streamId && displayed.get(streamId) === (message.displayContent ?? message.content));
     const ready = caughtUp && (message.runId !== current?.runId || (terminal && !projection?.assistantDraft));
     readiness.set(message.runId, ready && readiness.get(message.runId) !== false);
   }
   const displaySettledRunIds = new Set([...readiness].filter(([, ready]) => ready).map(([runId]) => runId));
-  const artifacts = (projection?.artifacts ?? []).filter((artifact) => {
-    if (artifact.runId === current?.runId && !terminal) return false;
-    if (readiness.has(artifact.runId)) return displaySettledRunIds.has(artifact.runId);
-    return artifact.runId !== current?.runId || current?.status !== 'completed';
+  const artifacts = (projection?.deliverables ?? []).filter((artifact) => {
+    if (artifact.presentationRunId === current?.runId && !terminal) return false;
+    if (readiness.has(artifact.presentationRunId)) return displaySettledRunIds.has(artifact.presentationRunId);
+    return artifact.presentationRunId !== current?.runId || current?.status !== 'completed';
   });
   return { displaySettledRunIds, artifacts };
 }

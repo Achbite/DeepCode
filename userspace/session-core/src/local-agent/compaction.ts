@@ -175,6 +175,7 @@ function closesModelContextPrefix(event: SessionEvent): boolean {
     || event.type === 'plan.cancelled'
     || event.type === 'plan.invalidated'
     || event.type === 'todo.updated'
+    || event.type === 'artifacts.presented'
     || event.type === 'session.control.rejected'
     || event.type === 'tool.input-rejected'
     || event.type === 'tool.completed';

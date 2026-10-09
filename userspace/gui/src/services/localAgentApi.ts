@@ -355,6 +355,7 @@ function decodeProjection(value: unknown): SessionProjection {
       'queuedInputs',
       'narratives',
       'assistantDraft',
+      'interactions',
       'pendingInteraction',
       'pendingApproval',
       'plans',
@@ -368,6 +369,7 @@ function decodeProjection(value: unknown): SessionProjection {
       'run',
       'activities',
       'artifacts',
+      'deliverables',
       'terminalError',
     ], ['fileChangeRounds', 'providerAttempts', 'failureSnapshot'])
     || (value.providerAttempts !== undefined && !isArrayOf(value.providerAttempts, isProviderAttempt))
@@ -390,6 +392,7 @@ function decodeProjection(value: unknown): SessionProjection {
     || !isArrayOf(value.queuedInputs, isQueuedInput)
     || !isArrayOf(value.narratives, isNarrative)
     || !isNullable(value.assistantDraft, isAssistantDraft)
+    || !isArrayOf(value.interactions, isInteraction)
     || !isNullable(value.pendingInteraction, isInteraction)
     || !isNullable(value.pendingApproval, isApproval)
     || !isArrayOf(value.plans, isPlanProjection)
@@ -403,6 +406,7 @@ function decodeProjection(value: unknown): SessionProjection {
     || !isNullable(value.run, isRun)
     || !isArrayOf(value.activities, isActivity)
     || !isArrayOf(value.artifacts, isArtifact)
+    || !isArrayOf(value.deliverables, isDeliverable)
     || !isNullable(value.terminalError, isLocalAgentError)
   ) {
     throw new Error('conversation_projection_invalid');
@@ -475,7 +479,8 @@ function isTimelineItem(value: unknown): boolean {
 }
 
 function isQueuedInput(value: unknown): boolean {
-  return isExactRecord(value, ['commandId', 'messageId', 'runId', 'text', 'filesystemReferences', 'pluginSelections', 'sequence', 'createdAt', 'status'], ['pluginCatalogRevision','guidanceReferences'])
+  return isExactRecord(value, ['commandId', 'messageId', 'runId', 'text', 'filesystemReferences', 'pluginSelections', 'sequence', 'createdAt', 'status'], ['pluginCatalogRevision','guidanceReferences','interactionId'])
+    && (value.interactionId === undefined || isIdentifier(value.interactionId))
     && isIdentifier(value.commandId) && isIdentifier(value.messageId) && isIdentifier(value.runId)
     && typeof value.text === 'string'
     && isArrayOf(value.filesystemReferences, isFilesystemReference)
@@ -537,7 +542,7 @@ function timelineReferencesAreValid(
           addUnique(activityIds, activityId)
           && activities.some((activity) => (
             activity.activityId === activityId
-            && ['tool', 'providerHosted', 'approval'].includes(String(activity.kind))
+            && ['tool', 'providerHosted', 'approval', 'interaction'].includes(String(activity.kind))
           ))
         ));
       default:
@@ -551,7 +556,7 @@ function timelineReferencesAreValid(
     && narrativeIds.size === narratives.length
     && planRefs.size === plans.length
     && activityIds.size === activities.filter((activity) => (
-      ['tool', 'providerHosted', 'approval'].includes(String(activity.kind))
+      ['tool', 'providerHosted', 'approval', 'interaction'].includes(String(activity.kind))
     )).length;
 }
 
@@ -675,7 +680,7 @@ function isProjectionMessage(value: unknown): boolean {
   if (!isExactRecord(value, [
     'messageId', 'role', 'content', 'filesystemReferences',
     'pluginSelections', 'feedback', 'sequence', 'createdAt',
-  ], ['runId', 'providerRequestId', 'replyToInteraction', 'guidanceReferences', 'sourceReferences'])) return false;
+  ], ['runId', 'providerRequestId', 'replyToInteraction', 'guidanceReferences', 'sourceReferences', 'displayContent'])) return false;
   const hasRunId = value.runId !== undefined;
   const hasProviderRequestId = value.providerRequestId !== undefined;
   return isIdentifier(value.messageId)
@@ -684,6 +689,7 @@ function isProjectionMessage(value: unknown): boolean {
       && isIdentifier(value.replyToInteraction.interactionId) && isNonEmptyText(value.replyToInteraction.prompt))
     && ['user', 'assistant', 'tool', 'system'].includes(String(value.role))
     && typeof value.content === 'string'
+    && (value.displayContent === undefined || value.role === 'assistant' && typeof value.displayContent === 'string')
     && (value.sourceReferences === undefined || value.role === 'assistant' && isSourceReferences(value.sourceReferences))
     && isArrayOf(value.filesystemReferences, isFilesystemReference)
     && isArrayOf(value.pluginSelections, isPluginSelection)
@@ -731,11 +737,12 @@ function isMediaType(value: unknown): value is string {
 function isNarrative(value: unknown): boolean {
   return isExactRecord(value, [
     'narrativeId', 'runId', 'providerRequestId', 'content', 'sequence', 'createdAt',
-  ], ['sourceReferences'])
+  ], ['sourceReferences', 'displayContent'])
     && isIdentifier(value.narrativeId)
     && isIdentifier(value.runId)
     && isIdentifier(value.providerRequestId)
     && isNonEmptyText(value.content)
+    && (value.displayContent === undefined || typeof value.displayContent === 'string')
     && (value.sourceReferences === undefined || isSourceReferences(value.sourceReferences))
     && isNaturalNumber(value.sequence)
     && isNonEmptyText(value.createdAt);
@@ -797,8 +804,9 @@ function isProviderActivity(value: unknown): boolean {
 function isAssistantDraftBlock(value: unknown): value is AssistantDraftBlockProjection {
   if (!isRecord(value)) return false;
   if (value.kind === 'narrative' || value.kind === 'finalMessage' || value.kind === 'message') {
-    return isExactRecord(value, ['kind', 'content', 'streamId'], ['outputIndex'])
+    return isExactRecord(value, ['kind', 'content', 'streamId'], ['outputIndex', 'displayContent'])
       && typeof value.content === 'string' && value.content.length > 0
+      && (value.displayContent === undefined || typeof value.displayContent === 'string')
       && isStreamId(value.streamId)
       && (value.outputIndex === undefined || isNaturalNumber(value.outputIndex));
   }
@@ -818,10 +826,13 @@ function isInteraction(value: unknown): boolean {
     value,
     [
       'kind', 'prompt', 'allowFreeform', 'interactionId', 'runId', 'callId', 'sequence',
-      'createdAt',
+      'createdAt', 'status',
     ],
-    ['options'],
+    ['options', 'mode', 'response'],
   )
+    && ['pending', 'answered', 'closed'].includes(String(value.status))
+    && (value.mode === undefined || ['wait', 'continue'].includes(String(value.mode)))
+    && (value.response === undefined || isNonEmptyText(value.response))
     && ['question', 'confirmation'].includes(String(value.kind))
     && isNonEmptyText(value.prompt)
     && typeof value.allowFreeform === 'boolean'
@@ -1267,10 +1278,12 @@ function isRun(value: unknown): boolean {
   return isExactRecord(
     value,
     ['runId', 'profileId', 'workspaceBindings', 'status'],
-    ['waitingReason', 'reasoningEffort', 'thinking'],
+    ['waitingReason', 'reasoningEffort', 'thinking', 'hostBinding'],
   )
     && isIdentifier(value.runId)
     && isIdentifier(value.profileId)
+    && (value.hostBinding === undefined || (isExactRecord(value.hostBinding, ['hostInstanceId', 'windowLabel'])
+      && isIdentifier(value.hostBinding.hostInstanceId) && isIdentifier(value.hostBinding.windowLabel)))
     && (value.reasoningEffort === undefined || isReasoningEffort(value.reasoningEffort))
     && (value.thinking === undefined || ['enabled', 'disabled'].includes(String(value.thinking)))
     && isWorkspaceBindings(value.workspaceBindings)
@@ -1395,17 +1408,26 @@ function isActivityResource(value: unknown): boolean {
 }
 
 function isArtifact(value: unknown): boolean {
-  return isExactRecord(value, ['artifactId', 'label', 'sessionId', 'runId', 'callId', 'recordId', 'contentType', 'contentMode', 'createdAt'], ['workspaceId', 'logicalPath', 'uri', 'sourcePage'])
+  return isExactRecord(value, ['artifactId', 'label', 'sessionId', 'runId', 'callId', 'recordId', 'contentType', 'contentMode', 'createdAt'], ['workspaceId', 'logicalPath', 'uri', 'sourcePage', 'modifiedAt', 'resourceKey'])
     && isIdentifier(value.artifactId)
     && isNonEmptyText(value.label)
     && ['sessionId', 'runId', 'callId', 'recordId'].every((key) => isIdentifier(value[key]))
     && isNonEmptyText(value.contentType)
     && (value.contentMode === 'fixed' || value.contentMode === 'live')
     && isNonEmptyText(value.createdAt)
+    && (value.modifiedAt === undefined || isNonEmptyText(value.modifiedAt))
+    && (value.resourceKey === undefined || isIdentifier(value.resourceKey))
     && (value.sourcePage === undefined || isRecord(value.sourcePage))
     && (value.workspaceId === undefined || isIdentifier(value.workspaceId))
     && (value.logicalPath === undefined || isNonEmptyText(value.logicalPath))
     && (value.uri === undefined || isNonEmptyText(value.uri));
+}
+
+function isDeliverable(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  const { deliveryId, presentationRunId, presentedAt, updatedAt, sequence, ...artifact } = value;
+  return isArtifact(artifact) && isIdentifier(deliveryId) && isIdentifier(presentationRunId)
+    && isNonEmptyText(presentedAt) && isNonEmptyText(updatedAt) && isPositiveNaturalNumber(sequence);
 }
 
 function isLocalAgentError(value: unknown): boolean {

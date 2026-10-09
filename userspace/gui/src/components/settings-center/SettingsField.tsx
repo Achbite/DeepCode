@@ -1,3 +1,4 @@
+import NativeSelect from '../shared/NativeSelect';
 import { useInterfaceReloadGuard } from '../../services/interfaceReload';
 import { useSettingsSearchTarget } from './settingsSearch';
 import { useSettingsHelp } from './SettingsHelp';
@@ -106,7 +107,7 @@ const SettingsField: React.FC<SettingsFieldProps> = ({
 
     if (definition.control === 'select') {
       return (
-        <select
+        <NativeSelect
           className="settings-field__select"
           aria-label={definition.label} aria-describedby={helpId}
           value={String(value ?? defaultValue ?? '')}
@@ -118,7 +119,7 @@ const SettingsField: React.FC<SettingsFieldProps> = ({
               {option.label}
             </option>
           ))}
-        </select>
+        </NativeSelect>
       );
     }
 

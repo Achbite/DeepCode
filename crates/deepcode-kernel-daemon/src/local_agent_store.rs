@@ -1014,6 +1014,7 @@ fn validate_new_event(
         "input.accepted",
         "input.queued",
         "run.tools.prepared",
+        "run.host.rebound",
         "run.started",
         "message.committed",
         "message.feedback.updated",
@@ -1027,6 +1028,7 @@ fn validate_new_event(
         "plan.cancelled",
         "plan.invalidated",
         "todo.updated",
+        "artifacts.presented",
         "tool.requested",
         "tool.started",
         "approval.requested",
@@ -1088,6 +1090,7 @@ fn validate_new_event(
             | "tool.interrupted"
             | "session.control.rejected"
             | "session.plugins.activated"
+            | "artifacts.presented"
     );
     if needs_run {
         validate_id("runId", required_string(event, "runId")?)?;
@@ -1120,6 +1123,7 @@ fn validate_new_event(
             | "tool.requested"
             | "session.control.rejected"
             | "session.plugins.activated"
+            | "artifacts.presented"
     ) || progress_call
     {
         let payload = event.get("payload").expect("validated payload");
@@ -1371,6 +1375,7 @@ fn validate_new_event(
                         "pluginSelections",
                         "pluginCatalogRevision",
                         "guidanceReferences",
+                        "interactionId",
                     ]
                 } else {
                     &["pluginSelections", "guidanceReferences"]
@@ -1378,6 +1383,9 @@ fn validate_new_event(
             )?;
             validate_id("commandId", required_string(payload, "commandId")?)?;
             validate_id("messageId", required_string(payload, "messageId")?)?;
+            if payload.get("interactionId").is_some() {
+                validate_id("interactionId", required_string(payload, "interactionId")?)?;
+            }
             if !payload.get("text").is_some_and(Value::is_string) {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
@@ -1409,9 +1417,27 @@ fn validate_new_event(
             validate_id("commandId", required_string(payload, "commandId")?)?;
             validate_id("workspaceId", required_string(payload, "workspaceId")?)?;
         }
-        "run.tools.prepared" => {
+        "run.tools.prepared" | "run.host.rebound" => {
             let payload = event.get("payload").expect("validated payload");
-            exact_object(payload, &["toolView"], &[])?;
+            if event_type == "run.host.rebound" {
+                exact_object(
+                    payload,
+                    &["commandId", "previousBinding", "hostBinding", "toolView"],
+                    &[],
+                )?;
+                validate_id("commandId", required_string(payload, "commandId")?)?;
+                for name in ["previousBinding", "hostBinding"] {
+                    let binding = &payload[name];
+                    exact_object(binding, &["hostInstanceId", "windowLabel"], &[])?;
+                    validate_id(
+                        "hostInstanceId",
+                        required_string(binding, "hostInstanceId")?,
+                    )?;
+                    validate_id("windowLabel", required_string(binding, "windowLabel")?)?;
+                }
+            } else {
+                exact_object(payload, &["toolView"], &[])?;
+            }
             exact_object(
                 &payload["toolView"],
                 &[
@@ -1670,7 +1696,6 @@ fn validate_new_event(
             })?;
             let mut seen = std::collections::HashSet::new();
             if uris.is_empty()
-                || uris.len() > 16
                 || uris.iter().any(|uri| {
                     uri.as_str()
                         .is_none_or(|uri| !uri.starts_with("plugin://") || !seen.insert(uri))
@@ -1678,8 +1703,36 @@ fn validate_new_event(
             {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
-                    "pluginUris 必须包含 1 至 16 个不重复的插件 URI。",
+                    "pluginUris 必须包含至少一个不重复的插件 URI。",
                 ));
+            }
+        }
+        "artifacts.presented" => {
+            let payload = &event["payload"];
+            exact_object(payload, &["providerCallId", "items"], &[])?;
+            let items = payload["items"]
+                .as_array()
+                .filter(|items| !items.is_empty())
+                .ok_or_else(|| {
+                    LocalAgentStoreError::new("session_event_invalid", "交付项必须是非空数组。")
+                })?;
+            let mut deliveries = std::collections::HashSet::new();
+            let mut artifacts = std::collections::HashSet::new();
+            for item in items {
+                exact_object(item, &["artifactId", "deliveryId", "label"], &[])?;
+                let artifact = required_string(item, "artifactId")?;
+                let delivery = required_string(item, "deliveryId")?;
+                validate_id("artifactId", artifact)?;
+                validate_id("deliveryId", delivery)?;
+                if required_string(item, "label")?.trim().is_empty()
+                    || !deliveries.insert(delivery)
+                    || !artifacts.insert(artifact)
+                {
+                    return Err(LocalAgentStoreError::new(
+                        "session_event_invalid",
+                        "交付项身份不能重复，名称不能为空。",
+                    ));
+                }
             }
         }
         "session.control.rejected" => {
@@ -1691,7 +1744,11 @@ fn validate_new_event(
             )?;
             if !matches!(
                 required_string(payload, "toolName")?,
-                "interaction.request" | "plan.publish" | "todo.update" | "plugin.activate"
+                "interaction.request"
+                    | "plan.publish"
+                    | "todo.update"
+                    | "plugin.activate"
+                    | "artifact.present"
             ) {
                 return Err(LocalAgentStoreError::new(
                     "session_event_invalid",
@@ -2238,7 +2295,9 @@ fn validate_event_references(
             ));
         }
     }
-    if event["type"] == "interaction.resolved" {
+    if event["type"] == "interaction.resolved"
+        || event["type"] == "input.queued" && event["payload"].get("interactionId").is_some()
+    {
         let interaction_id = required_string(&event["payload"], "interactionId")?;
         let exists: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1 AND run_id=?2
@@ -2306,6 +2365,7 @@ fn validate_command(command: &Value) -> Result<(), LocalAgentStoreError> {
         "context.focus",
         "message.feedback.set",
         "run.cancel",
+        "run.host.rebind",
         "interaction.respond",
         "approval.respond",
         "plan.respond",
@@ -2316,6 +2376,31 @@ fn validate_command(command: &Value) -> Result<(), LocalAgentStoreError> {
             "session_command_type_invalid",
             format!("当前 Session 合同不接受命令：{command_type}"),
         ));
+    }
+    if command_type == "run.host.rebind" {
+        exact_object(
+            command,
+            &[
+                "schemaVersion",
+                "type",
+                "commandId",
+                "sessionId",
+                "runId",
+                "expectedHostBinding",
+                "hostBinding",
+            ],
+            &[],
+        )?;
+        validate_id("runId", required_string(command, "runId")?)?;
+        for name in ["expectedHostBinding", "hostBinding"] {
+            let binding = &command[name];
+            exact_object(binding, &["hostInstanceId", "windowLabel"], &[])?;
+            validate_id(
+                "hostInstanceId",
+                required_string(binding, "hostInstanceId")?,
+            )?;
+            validate_id("windowLabel", required_string(binding, "windowLabel")?)?;
+        }
     }
     if command_type == "session.permissions.set" {
         exact_object(
@@ -3593,12 +3678,6 @@ fn validate_plugin_selection_list(selections: &Value) -> Result<(), LocalAgentSt
     let selections = selections.as_array().ok_or_else(|| {
         LocalAgentStoreError::new("plugin_selection_invalid", "pluginSelections 必须是数组。")
     })?;
-    if selections.len() > 16 {
-        return Err(LocalAgentStoreError::new(
-            "plugin_selection_invalid",
-            "单次请求最多选择 16 个插件。",
-        ));
-    }
     let mut selection_ids = std::collections::HashSet::new();
     let mut uris = std::collections::HashSet::new();
     for selection in selections {
@@ -3932,12 +4011,6 @@ fn validate_run_runtime_snapshot(
                 "runtimeSnapshot toolPromptContributions 必须是数组。",
             )
         })?;
-    if tool_prompt_contributions.len() > 128 {
-        return Err(LocalAgentStoreError::new(
-            "session_event_invalid",
-            "runtimeSnapshot toolPromptContributions 超过单次上限。",
-        ));
-    }
     let mut prompt_contribution_refs =
         std::collections::HashSet::with_capacity(tool_prompt_contributions.len());
     let mut prompt_tool_names =
@@ -4164,12 +4237,6 @@ fn validate_run_runtime_snapshot(
                 "runtimeSnapshot selectedPlugins.plugins 必须是数组。",
             )
         })?;
-    if plugins.len() > 16 {
-        return Err(LocalAgentStoreError::new(
-            "session_event_invalid",
-            "runtimeSnapshot selectedPlugins 超过单次选择上限。",
-        ));
-    }
     let mut plugin_uris = std::collections::HashSet::with_capacity(plugins.len());
     let mut plugin_instance_refs = std::collections::HashSet::with_capacity(plugins.len());
     for plugin in plugins {
@@ -4754,6 +4821,81 @@ mod tests {
     }
 
     #[test]
+    fn journal_records_explicit_gui_rebind_with_its_tool_view() {
+        let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
+        journal
+            .create_session("session:rebind", "Rebind", &json!([]), None)
+            .unwrap();
+        let runtime = runtime_snapshot();
+        journal.append(&json!({"type":"run.started","sessionId":"session:rebind","runId":"run:rebind",
+            "payload":{"inputMessageId":"message:rebind","workspaceBindings":[],"runtimeSnapshot":runtime}})).unwrap();
+        let binding = |host: &str| json!({"hostInstanceId":host,"windowLabel":"main"});
+        let mut tool_view = serde_json::Map::new();
+        for key in [
+            "extensionGenerationRef",
+            "kernelCatalogSnapshotRef",
+            "instructions",
+            "tools",
+            "toolPromptContributions",
+            "providerToolAliases",
+            "selectedPlugins",
+        ] {
+            tool_view.insert(key.to_string(), runtime[key].clone());
+        }
+        let command = json!({"schemaVersion":COMMAND_VERSION,"type":"run.host.rebind","commandId":"command:rebind",
+            "sessionId":"session:rebind","runId":"run:rebind","expectedHostBinding":binding("gui:old"),"hostBinding":binding("gui:new")});
+        let event = json!({"type":"run.host.rebound","sessionId":"session:rebind","runId":"run:rebind",
+            "payload":{"commandId":"command:rebind","previousBinding":binding("gui:old"),"hostBinding":binding("gui:new"),"toolView":tool_view}});
+        let commit = json!({"command":command,"events":[event],"reply":{"schemaVersion":REPLY_VERSION,
+            "commandId":"command:rebind","sessionId":"session:rebind","status":"accepted","revision":0}});
+        assert_eq!(
+            journal.commit_command(&commit).unwrap()["status"],
+            "accepted"
+        );
+        assert_eq!(
+            journal.read_events("session:rebind", 2).unwrap()[0]["payload"],
+            event["payload"]
+        );
+        assert_eq!(
+            journal.commit_command(&commit).unwrap_err().code,
+            "session_command_already_recorded"
+        );
+    }
+
+    #[test]
+    fn journal_persists_explicit_delivery_and_accepts_task_sized_plugin_selection() {
+        let journal = LocalAgentJournal::open(Path::new(":memory:")).unwrap();
+        journal
+            .create_session("session:delivery", "Delivery", &json!([]), None)
+            .unwrap();
+        journal.append(&json!({"type":"run.started", "sessionId":"session:delivery", "runId":"run:delivery",
+            "payload":{"inputMessageId":"message:delivery","workspaceBindings":[],"runtimeSnapshot":runtime_snapshot()}})).unwrap();
+        let event = json!({"type":"artifacts.presented", "sessionId":"session:delivery", "runId":"run:delivery", "callId":"call:delivery",
+            "payload":{"providerCallId":"provider:delivery","items":[{"artifactId":"artifact:report","deliveryId":"delivery:report","label":"Review report"}]}});
+        let committed = journal.append(&event).unwrap();
+        assert_eq!(
+            journal.read_events("session:delivery", 2).unwrap(),
+            vec![committed]
+        );
+        let mut duplicate = event.clone();
+        duplicate["payload"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(event["payload"]["items"][0].clone());
+        assert_eq!(
+            journal.append(&duplicate).unwrap_err().code,
+            "session_event_invalid"
+        );
+        let rejected = json!({"type":"session.control.rejected", "sessionId":"session:delivery", "runId":"run:delivery", "callId":"call:invalid",
+            "payload":{"providerCallId":"provider:invalid","toolName":"artifact.present","input":{},"error":{"code":"artifact_not_found","message":"Unknown resource"}}});
+        journal.append(&rejected).unwrap();
+        let selections: Vec<Value> = (0..17).map(|index| json!({"selectionId":format!("selection:{index}"),"uri":format!("plugin://tool-{index}@local"),"label":format!("Tool {index}")})).collect();
+        validate_plugin_selection_list(&json!(selections)).unwrap();
+        journal.append(&json!({"type":"session.plugins.activated", "sessionId":"session:delivery", "runId":"run:delivery", "callId":"call:plugins",
+            "payload":{"providerCallId":"provider:plugins","pluginUris":selections.iter().map(|item|item["uri"].clone()).collect::<Vec<_>>()}})).unwrap();
+    }
+
+    #[test]
     fn runtime_snapshot_requires_tool_prompt_to_match_a_callable_prepared_binding() {
         let mut runtime = runtime_snapshot();
         runtime["tools"] = json!([{
@@ -5048,6 +5190,39 @@ mod tests {
         let events = reopened.read_events("session:loop", 0).unwrap();
         assert_eq!(events.last().unwrap()["type"], "interaction.resolved");
         assert!(events.last().unwrap().get("callId").is_none());
+        assert_eq!(events.last().unwrap()["payload"], resolved["payload"]);
+    }
+
+    #[test]
+    fn deferred_question_reply_keeps_its_identity_through_the_queue_and_storage() {
+        let store = Store::new();
+        let journal = LocalAgentJournal::open(&store.path()).unwrap();
+        journal
+            .create_session("session:loop", "Loop", &json!([]), None)
+            .unwrap();
+        journal.append(&json!({"type":"run.started","sessionId":"session:loop","runId":"run:loop",
+            "payload":{"inputMessageId":"message:loop","workspaceBindings":[],"runtimeSnapshot":runtime_snapshot()}})).unwrap();
+        journal.append(&json!({"type":"interaction.requested","sessionId":"session:loop","runId":"run:loop","callId":"call:question",
+            "payload":{"interactionId":"interaction:format","providerCallId":"provider:question","kind":"question","mode":"continue",
+                "prompt":"Report format?","allowFreeform":true}})).unwrap();
+        let queued = json!({"type":"input.queued","sessionId":"session:loop","runId":"run:loop",
+            "payload":{"commandId":"command:answer","messageId":"message:answer","text":"Brief",
+                "interactionId":"interaction:format"}});
+        let mut missing = queued.clone();
+        missing["payload"]["interactionId"] = json!("interaction:missing");
+        assert_eq!(
+            journal.append(&missing).unwrap_err().code,
+            "session_event_interaction_missing"
+        );
+        let resolved = json!({"type":"interaction.resolved","sessionId":"session:loop","runId":"run:loop",
+            "payload":{"interactionId":"interaction:format","commandId":"command:answer","response":"Brief"}});
+        journal
+            .append_batch(&[queued.clone(), resolved.clone()])
+            .unwrap();
+        drop(journal);
+        let reopened = LocalAgentJournal::open(&store.path()).unwrap();
+        let events = reopened.read_events("session:loop", 0).unwrap();
+        assert_eq!(events[events.len() - 2]["payload"], queued["payload"]);
         assert_eq!(events.last().unwrap()["payload"], resolved["payload"]);
     }
 

@@ -4,30 +4,73 @@ use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
+pub fn parse_port(value: &str) -> io::Result<u16> {
+    value.parse::<u16>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid Host port {value:?}: {error}"),
+        )
+    })
+}
+
+pub fn connect_loopback(host: &str, port: &str, timeout: Duration) -> io::Result<TcpStream> {
+    let port = parse_port(port)?;
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| super::host_io_error(format!("Resolve Host {host}:{port}"), error))?;
+    let mut last_error = io::Error::new(
+        io::ErrorKind::AddrNotAvailable,
+        "Host address did not resolve",
+    );
+    for address in addresses {
+        match TcpStream::connect_timeout(&address, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => {
+                let unavailable = matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut
+                );
+                let error = super::host_io_error(format!("Connect Host {address}"), error);
+                if !unavailable {
+                    return Err(error);
+                }
+                last_error = error;
+            }
+        }
+    }
+    Err(last_error)
+}
+
+pub fn probe_loopback_listener(host: &str, port: &str) -> io::Result<bool> {
+    match connect_loopback(host, port, Duration::from_millis(180)) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub fn request_loopback_json<T: DeserializeOwned>(
     host: &str,
     port: &str,
     request: &str,
     read_timeout_millis: u64,
 ) -> io::Result<T> {
-    let port = port
-        .parse::<u16>()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let mut last_error = io::Error::new(
-        io::ErrorKind::AddrNotAvailable,
-        "Host address did not resolve",
-    );
-    let mut connected = None;
-    for address in (host, port).to_socket_addrs()? {
-        match TcpStream::connect_timeout(&address, Duration::from_millis(180)) {
-            Ok(stream) => {
-                connected = Some(stream);
-                break;
-            }
-            Err(error) => last_error = error,
-        }
-    }
-    let mut stream = connected.ok_or(last_error)?;
+    let stream = connect_loopback(host, port, Duration::from_millis(180))?;
+    request_connected_json(stream, request, read_timeout_millis)
+}
+
+pub fn request_connected_json<T: DeserializeOwned>(
+    mut stream: TcpStream,
+    request: &str,
+    read_timeout_millis: u64,
+) -> io::Result<T> {
     stream.set_read_timeout(Some(Duration::from_millis(read_timeout_millis)))?;
     stream.set_write_timeout(Some(Duration::from_millis(300)))?;
     stream.write_all(request.as_bytes())?;
@@ -70,6 +113,20 @@ pub fn request_loopback_json<T: DeserializeOwned>(
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn listener_probe_keeps_invalid_ports_distinct_from_absent_listeners() {
+        for port in ["", "invalid", "65536"] {
+            let error = probe_loopback_listener("127.0.0.1", port).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("Invalid Host port"));
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        assert!(probe_loopback_listener("127.0.0.1", &port).unwrap());
+        drop(listener);
+        assert!(!probe_loopback_listener("127.0.0.1", &port).unwrap());
+    }
 
     #[test]
     fn shared_exchange_preserves_json_status_and_decode_failures() {

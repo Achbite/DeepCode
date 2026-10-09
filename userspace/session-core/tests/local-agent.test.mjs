@@ -784,7 +784,8 @@ test('run binding exposes hosted search once and replays its Provider item uncha
     type: 'web_search_call',
     id: 'ws_1',
     status: 'completed',
-    action: { type: 'search', queries: ['current compiler release'] },
+    action: { type: 'search', queries: ['current compiler release'],
+      sources: [{ type: 'url', url: 'https://example.com/compiler-release' }] },
   }, {
     type: 'web_search_call',
     id: 'ws_2',
@@ -913,6 +914,7 @@ test('Responses output items preserve narrative, hosted activity, and final-mess
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:ordered-provider-output';
   await createSession(journal, sessionId, [workspaceBinding]);
+  const finalText = '发布说明见这里。\uE200cite\uE202turn0search0\uE201';
   const nativeItems = [{
     type: 'message',
     id: 'provider-message:search-intro',
@@ -943,9 +945,9 @@ test('Responses output items preserve narrative, hosted activity, and final-mess
     role: 'assistant',
     phase: 'final_answer',
     status: 'completed',
-    content: [{ type: 'output_text', text: 'The current release is recorded in the cited result.', annotations: [{ type: 'url_citation', url: 'https://example.com/compiler-release', title: 'Compiler release', start_index: 0, end_index: 50 }] }],
+    content: [{ type: 'output_text', text: finalText, annotations: [{ type: 'url_citation', url: 'https://example.com/compiler-release', title: 'Compiler release', start_index: 8, end_index: finalText.length }] }],
   }];
-  const preparation = fakeRunPreparation({
+  const preparation = fakeRunPreparation({ contextWindowTokens: 8192,
     apiSurface: 'responses',
     hostedWebSearch: 'web_search',
     webSearch: { owner: 'providerHosted', providerToolType: 'web_search' },
@@ -1015,6 +1017,7 @@ test('Responses output items preserve narrative, hosted activity, and final-mess
     finalStreamingProjection.assistantDraft.blocks.at(-1).content,
     nativeItems.at(-1).content[0].text,
   );
+  assert.equal(finalStreamingProjection.assistantDraft.blocks.at(-1).displayContent, '发布说明见这里。');
   completeFinalItem();
   const streamingProjection = await waitForProjection(actor, (value) => (
     value.assistantDraft?.blocks?.length === nativeItems.length
@@ -1057,6 +1060,9 @@ test('Responses output items preserve narrative, hosted activity, and final-mess
     block.kind === 'providerHosted' ? [block.activityId] : []
   )));
   const finalMessageId = orderedBlocks.find((block) => block.kind === 'finalMessage').messageId;
+  assert.equal(firstProjection.messages.find(message => message.messageId === finalMessageId).content, finalText);
+  assert.equal(firstProjection.messages.find(message => message.messageId === finalMessageId).displayContent,
+    '发布说明见这里。[Compiler release](<https://example.com/compiler-release>)');
   assert.deepEqual(firstProjection.messages.find(message => message.messageId === finalMessageId).sourceReferences, {
     citations: [{ url: 'https://example.com/compiler-release', title: 'Compiler release' }], unresolved: false,
   });
@@ -1104,7 +1110,7 @@ test('Responses output items preserve narrative, hosted activity, and final-mess
   );
   assert.equal(
     firstProjection.messages.find((message) => message.messageId === finalMessageId)?.content,
-    'The current release is recorded in the cited result.',
+    finalText,
   );
 
   await actor.submit(messageCommand(
@@ -2171,6 +2177,7 @@ test('a run without workspace bindings never exposes workspace-scoped tools', as
   assert.deepEqual(capturedRequest.workspaceBindings, []);
   assert.deepEqual(capturedRequest.tools.map((tool) => tool.name), [
     'web_search',
+    'artifact_present',
     'interaction_request',
     'mcp_echo',
   ]);
@@ -2186,7 +2193,7 @@ test('a run without workspace bindings never exposes workspace-scoped tools', as
   )), false);
   assert.deepEqual(
     projection.contextCompositions.at(-1).tools.map((tool) => tool.itemId),
-    ['web.search', 'interaction.request', 'mcp.echo'],
+    ['web.search', 'artifact.present', 'interaction.request', 'mcp.echo'],
   );
   await actor.dispose();
 });
@@ -3002,7 +3009,7 @@ test('confirmed fs.delete reads targetKind from canonical arguments and complete
     availability: 'callable',
     origin: 'coreBuiltin',
   };
-  const preparation = fakeRunPreparation({ tools: [preparedTool] });
+  const preparation = fakeRunPreparation({ contextWindowTokens: 8192, tools: [preparedTool] });
   const kernelRequests = [];
   const kernel = emptyKernel({
     async execute(request) {
@@ -3294,7 +3301,7 @@ test('Plan revisions preserve independent Todo and completed Todo does not revok
     const todo = payloads.findLast((payload) => payload?.type === 'todo.current');
     const record = payloads.find((payload) => payload?.recordId);
     const planTool = request.tools.find((tool) => tool.inputSchema.properties?.mutationManifest);
-    const progressTool = request.tools.find((tool) => tool.inputSchema.properties?.items);
+    const progressTool = request.tools.find((tool) => tool.name === 'todo_update');
     const writeTool = request.tools.find((tool) => tool.inputSchema.properties?.content);
     let name, input;
     if (turn === 1) { name = planTool.name; input = initial; }
@@ -3816,7 +3823,7 @@ async function verifyExplicitFocusCompaction() {
   const sessionId = 'session:focus-chain';
   await createSession(journal, sessionId);
   const preparation = fakeRunPreparation({
-    contextWindowTokens: 1_000,
+    contextWindowTokens: 2_000,
     maxOutputTokens: 120,
   });
   const requests = [];
@@ -3853,7 +3860,7 @@ async function verifyExplicitFocusCompaction() {
             usage: {
               inputTokens: 100,
               outputTokens: 10,
-              contextWindowTokens: 1_000,
+              contextWindowTokens: 2_000,
             },
           }
         : {});
@@ -3909,7 +3916,7 @@ async function verifyPressureCompaction() {
   const sessionId = 'session:pressure-chain';
   await createSession(journal, sessionId);
   const preparation = fakeRunPreparation({
-    contextWindowTokens: 1_000,
+    contextWindowTokens: 2_000,
     maxOutputTokens: 200,
   });
   const requests = [];
@@ -3935,9 +3942,9 @@ async function verifyPressureCompaction() {
       yield providerEvent(request.requestId, 'completed', agentTurn === 1
         ? {
             usage: {
-              inputTokens: 850,
+              inputTokens: 1_850,
               outputTokens: 20,
-              contextWindowTokens: 1_000,
+              contextWindowTokens: 2_000,
             },
           }
         : {});
@@ -3967,7 +3974,7 @@ async function verifyPressureCompaction() {
     'agent',
   ]);
   const runtime = preparation.snapshots[1].provider;
-  assert.ok(850 + runtime.maxOutputTokens >= runtime.contextWindowTokens);
+  assert.ok(1_850 + runtime.maxOutputTokens >= runtime.contextWindowTokens);
   const events = await readEvents(journal, sessionId);
   const pressureRequest = events.find((event) => (
     event.type === 'context.compaction.requested' && event.payload.trigger === 'pressure'
@@ -4016,7 +4023,7 @@ async function verifyWaitingCancelRelease() {
     value.run?.status === 'waiting' && value.pendingInteraction !== null
   ));
   assert.equal(preparation.released.length, 0);
-  await waitUntil(async () => !await actor.hasActiveWork(), 'waiting for a user decision permits idle Host shutdown');
+  assert.equal(await actor.hasActiveWork(), true, 'waiting retains the Host that owns the run bindings');
   const cancelReply = await actor.submit({
     schemaVersion: 'deepcode.command.v3',
     type: 'run.cancel',
@@ -4703,7 +4710,7 @@ test('aggregate input admission preserves raw errors, permits correction, and ne
       }
       yield providerEvent(request.requestId, 'completed', {});
     } };
-    const preparation = fakeRunPreparation({ tools: [tool] });
+    const preparation = fakeRunPreparation({ contextWindowTokens: 8192, tools: [tool] });
     const actor = actorWith(journal, sessionId, provider, kernel, {
       ...preparation.port,
       async prepare(request) {
@@ -4756,7 +4763,7 @@ test('mixed Plan batches are rejected before any effect and can be corrected to 
         { workspace: 'primary', path: 'probe.txt' }, 1);
       yield providerEvent(request.requestId, 'completed', {});
     } };
-    const actor = actorWith(journal, sessionId, provider, emptyKernel(), fakeRunPreparation({ tools: [tool] }).port, `mixed-${surface}`);
+    const actor = actorWith(journal, sessionId, provider, emptyKernel(), fakeRunPreparation({ tools: [tool], contextWindowTokens: 8192 }).port, `mixed-${surface}`);
     t.after(() => actor.dispose());
     await actor.submit(messageCommand(sessionId, 'command:start', 'Prepare a plan.'));
     const projection = await waitForProjection(actor, (value) => value.pendingPlan !== null);
@@ -4944,7 +4951,7 @@ test('Todo can start before tools without a Plan, preserve a failed record and e
   const journal = new InMemoryCommandJournal();
   const sessionId = 'session:independent-todo';
   await createSession(journal, sessionId, [workspaceBinding]);
-  const preparation = fakeRunPreparation({ tools: [{
+  const preparation = fakeRunPreparation({ contextWindowTokens: 8192, tools: [{
     toolBindingRef: 'tool-binding:read:g1', name: 'fs.read', description: 'Read a file.',
     inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } },
     possibleEffects: ['workspaceRead'], availability: 'callable', origin: 'coreBuiltin',
@@ -4956,7 +4963,7 @@ test('Todo can start before tools without a Plan, preserve a failed record and e
   } });
   const provider = { async *stream(request) {
     turn += 1;
-    const tool = request.tools.find(tool => tool.inputSchema.properties?.items);
+    const tool = request.tools.find(tool => tool.name === 'todo_update');
     assert.ok(tool, 'Todo must be available without Plan approval');
     if (turn === 1) {
       yield providerEvent(request.requestId, 'tool.call', { callId: 'provider:todo-start', name: tool.name,
@@ -5009,4 +5016,65 @@ test('tool results keep the workspace handle of the request that produced the ca
   assert.equal(content.output.workspaceId, undefined);
   assert.deepEqual(content.output.paths, { workspace: '/project', home: '/session/home' });
   assert.equal(JSON.parse(message.content).output.workspaceId, 'workspace:one');
+});
+
+test('explicit GUI rebind preserves waiting and uses the new catalog only for subsequent calls', async t => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:host-rebind';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const oldBinding = { hostInstanceId: 'gui:old', windowLabel: 'main' };
+  const newBinding = { hostInstanceId: 'gui:new', windowLabel: 'main' };
+  const tool = { toolBindingRef: 'binding:status', name: 'computer.control', description: 'Read GUI status.',
+    inputSchema: { type: 'object', properties: { action: { const: 'status' } }, required: ['action'] },
+    possibleEffects: ['external'], availability: 'callable', origin: 'extension', pluginUri: 'plugin://computer-use@builtin' };
+  const preparation = fakeRunPreparation({ apiSurface: 'responses', tools: [tool], contextWindowTokens: 32768 });
+  const prepare = preparation.port.prepare;
+  preparation.port.prepare = async request => {
+    const result = await prepare(request);
+    result.runtimeSnapshot.environment.hostBinding = request.rebindHost?.hostBinding ?? oldBinding;
+    if (request.rebindHost) result.runtimeSnapshot.kernelCatalogSnapshotRef = 'catalog:new-gui';
+    return result;
+  };
+  const requests = [], executions = [];
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    requests.push(request);
+    if (requests.length === 1) yield providerEvent(request.requestId, 'output.item.completed', {
+      outputIndex: 0, item: { type: 'function_call', call_id: 'native:question', name: 'interaction_request',
+        arguments: JSON.stringify({ kind: 'question', prompt: 'Continue after reopening?', allowFreeform: true }), status: 'completed' },
+    });
+    else if (requests.length === 2) yield providerEvent(request.requestId, 'tool.call', {
+      callId: 'native:status', name: 'computer_control', input: { action: 'status' },
+    });
+    else yield providerEvent(request.requestId, 'text.delta', { text: 'New GUI checked.' });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel({ async execute(request) { executions.push(request); return completedExecutionReply(request, { status: 'ready' }); } }), preparation.port, 'host-rebind');
+  t.after(() => actor.dispose());
+  await actor.submit({ ...messageCommand(sessionId, 'command:start', 'Wait before using a new GUI.'), hostBinding: oldBinding });
+  const waiting = await waitForProjection(actor, p => p.run?.status === 'waiting');
+  const command = { schemaVersion: 'deepcode.command.v3', type: 'run.host.rebind', commandId: 'command:rebind',
+    sessionId, runId: waiting.run.runId, expectedHostBinding: oldBinding, hostBinding: newBinding };
+  const stale = await actor.submit({ ...command, commandId: 'command:stale', expectedHostBinding: newBinding });
+  assert.equal(stale.error.code, 'host_rebind_target_changed');
+  assert.equal((await actor.submit(command)).status, 'accepted');
+  assert.equal((await actor.submit(command)).status, 'replayed');
+  const rebound = await actor.snapshot();
+  assert.equal(rebound.run.status, 'waiting');
+  assert.deepEqual(rebound.run.hostBinding, newBinding);
+  assert.deepEqual(rebound.pendingInteraction, waiting.pendingInteraction);
+  assert.equal(requests.length, 1, 'rebind does not answer, resume or replay');
+  await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'interaction.respond', commandId: 'command:answer',
+    sessionId, runId: waiting.run.runId, interactionId: waiting.pendingInteraction.interactionId, response: 'Continue.' });
+  await waitForProjection(actor, p => p.run?.status === 'completed');
+  assert.equal(executions.length, 1);
+  assert.equal(executions[0].kernelCatalogSnapshotRef, 'catalog:new-gui');
+  const resumed = requests[1].messages;
+  const callIndex = resumed.findIndex(m => m.providerOutputBlocks?.some(b => b.providerCallId === 'native:question'));
+  const resultIndex = resumed.findIndex(m => m.role === 'tool' && m.providerCallId === 'native:question');
+  const noticeIndex = resumed.findIndex(m => m.content.includes('gui:new') && m.content.includes('observationId'));
+  assert.ok(callIndex >= 0 && resultIndex > callIndex && noticeIndex > resultIndex,
+    'the GUI rebind notice must follow the pending native tool result, not split the call/result pair');
+  assert.deepEqual(requests[2].messages.slice(0, resumed.length), resumed,
+    'later requests retain the same binding-notice position in the completed history');
+  assert.equal(requests[1].providerRuntimeRef, requests[0].providerRuntimeRef);
+  assert.equal((await readEvents(journal, sessionId)).filter(e => e.type === 'run.host.rebound').length, 1);
+  assert.equal((await actor.submit({ ...command, commandId: 'command:finished' })).error.code, 'host_rebind_not_waiting');
 });

@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_MCP_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MCP_TOOLS: usize = 256;
+const MAX_MCP_STDERR_BYTES: usize = 16 * 1024;
 const MCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MCP_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -488,21 +489,33 @@ fn external_server_source(setting: McpServerSetting) -> Result<McpServerSource, 
     let identity = json!({
         "id": setting.id,
         "name": setting.name,
+        "description": setting.description,
         "transport": setting.transport,
         "command": setting.command,
         "args": setting.args,
     });
     let descriptor = McpPluginDescriptor {
-        management:json!({"key":"mcp.servers","id":setting.id}),
+        management: json!({"key":"mcp.servers","id":setting.id}),
         uri: mcp_plugin_uri(&setting.id),
         name: setting.name.clone(),
-        short_description: "连接的外部工具".to_string(),
+        short_description: if setting.description.trim().is_empty() {
+            "连接的外部工具".into()
+        } else {
+            setting.description.clone()
+        },
         activation_media_types: Vec::new(),
         implementation: identity,
         content: Arc::from([]),
         provider_ref: "tool-provider:mcp".to_string(),
         capability_refs: vec![format!("mcp-server:{}", setting.id)],
-        capability_summary: "The selected MCP service is active for this run. Its callable tools are supplied separately by the current tool catalog.".to_string(),
+        capability_summary: format!(
+            "{}\nIts callable tools are supplied by the current tool catalog after activation.",
+            if setting.description.trim().is_empty() {
+                "No capability description was provided at registration."
+            } else {
+                &setting.description
+            }
+        ),
         tool_prompt_provider: None,
         enabled: setting.enabled,
         error: None,
@@ -566,6 +579,7 @@ fn first_party_server_source(
         setting: McpServerSetting {
             id: format!("first-party.{id}"),
             name: display_name,
+            description: descriptor.short_description.clone(),
             transport: "cli".to_string(),
             command: provider_binary.to_string(),
             args: format!("--plugin {id} --call"),
@@ -668,6 +682,8 @@ struct McpServerSetting {
     id: String,
     #[serde(default = "default_server_name")]
     name: String,
+    #[serde(default)]
+    description: String,
     #[serde(default = "default_transport")]
     transport: String,
     command: String,
@@ -723,6 +739,7 @@ fn local_cli_source(source: LocalPluginSource) -> McpServerSource {
         setting: McpServerSetting {
             id: source.id.clone(),
             name: source.id.clone(),
+            description: String::new(),
             transport: "cli".into(),
             command: String::new(),
             args: String::new(),
@@ -797,13 +814,29 @@ fn local_cli_source(source: LocalPluginSource) -> McpServerSource {
         result.descriptor.content = Arc::from(bytes.as_slice());
         result.descriptor.name = manifest.name.clone();
         result.descriptor.short_description = manifest.description.clone();
-        result.descriptor.capability_summary = manifest.description;
+        result.descriptor.capability_summary = format!(
+            "{}\nTools:\n{}",
+            manifest.description,
+            manifest
+                .tools
+                .iter()
+                .map(|tool| format!(
+                    "- {}: {}",
+                    tool.name,
+                    tool.description
+                        .as_deref()
+                        .expect("validated tool description")
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
         result.descriptor.capability_refs = manifest
             .tools
             .iter()
             .map(|tool| format!("{}.{}", source.id, tool.name))
             .collect();
         result.setting.name = manifest.name;
+        result.setting.description = manifest.description;
         result.setting.command = manifest.command;
         result.cli_entry = Some((manifest.entry, bytes));
         result.contract = McpServerContract::LocalCli {
@@ -864,10 +897,31 @@ impl McpClient {
                 }
             }
         });
+        let stderr_receipt = Arc::new(Mutex::new(Vec::new()));
         let stderr_reader = starting.child_mut().stderr.take().map(|mut stderr| {
+            let receipt = Arc::clone(&stderr_receipt);
             std::thread::spawn(move || {
                 let mut buffer = [0_u8; 4096];
-                while stderr.read(&mut buffer).is_ok_and(|read| read > 0) {}
+                loop {
+                    let read = stderr.read(&mut buffer);
+                    let mut tail = receipt.lock().expect("MCP stderr receipt lock");
+                    match read {
+                        Ok(0) => break,
+                        Ok(read) => tail.extend_from_slice(&buffer[..read]),
+                        Err(ref error) => {
+                            tail.extend_from_slice(
+                                format!("\nMCP stderr read failed: {error}").as_bytes(),
+                            );
+                        }
+                    }
+                    if tail.len() > MAX_MCP_STDERR_BYTES {
+                        let remove = tail.len() - MAX_MCP_STDERR_BYTES;
+                        tail.drain(..remove);
+                    }
+                    if read.is_err() {
+                        break;
+                    }
+                }
             })
         });
         let (writes, pending_writes) = mpsc::channel::<McpWrite>();
@@ -895,6 +949,7 @@ impl McpClient {
                 stdin_writer: Some(stdin_writer),
                 stdout_reader: Some(stdout_reader),
                 stderr_reader,
+                stderr_receipt,
                 next_id: 1,
                 stopped: false,
                 stop_error: None,
@@ -915,6 +970,7 @@ impl McpClient {
 
     fn list_tools(&self) -> Result<Vec<RemoteToolDefinition>, McpRuntimeError> {
         let mut cursor: Option<String> = None;
+        let mut seen_cursors = BTreeSet::new();
         let mut tools = Vec::new();
         loop {
             let result = self.request(
@@ -954,8 +1010,15 @@ impl McpClient {
                 .get("nextCursor")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            if cursor.is_none() {
-                return Ok(tools);
+            match cursor.as_ref() {
+                None => return Ok(tools),
+                Some(next) if !seen_cursors.insert(next.clone()) => {
+                    return Err(McpRuntimeError::new(
+                        "mcp_tools_invalid",
+                        "MCP tools/list returned a repeated pagination cursor.",
+                    ));
+                }
+                Some(_) => {}
             }
         }
     }
@@ -1039,7 +1102,30 @@ fn decode_tool_call_result(
                 .and_then(Value::as_str)
                 .filter(|message| !message.is_empty())
                 .map(str::to_string)
-                .unwrap_or_else(|| format!("MCP 工具 {name} 返回错误：{output}")),
+                .unwrap_or_else(|| {
+                    // Image bytes belong to the artifact archive, never to diagnostic text.
+                    if !output["content"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|block| block["type"] == "image")
+                    {
+                        return format!("MCP 工具 {name} 返回错误：{output}");
+                    }
+                    let text = output["content"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|block| block["type"] == "text")
+                        .filter_map(|block| block["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if text.is_empty() {
+                        format!("MCP 工具 {name} 返回错误，详见工具结果。")
+                    } else {
+                        format!("MCP 工具 {name} 返回错误：{text}")
+                    }
+                }),
         }
     });
     Ok(McpToolCallResult { output, failure })
@@ -1089,6 +1175,7 @@ struct OwnedMcpProcess {
     stdin_writer: Option<JoinHandle<()>>,
     stdout_reader: Option<JoinHandle<()>>,
     stderr_reader: Option<JoinHandle<()>>,
+    stderr_receipt: Arc<Mutex<Vec<u8>>>,
     next_id: u64,
     stopped: bool,
     stop_error: Option<McpRuntimeError>,
@@ -1264,6 +1351,23 @@ impl OwnedMcpProcess {
                 "; cleanup failed: {}: {}",
                 cleanup.code, cleanup.message
             ));
+        }
+        match self.owned.child.try_wait() {
+            Ok(Some(status)) => error.message.push_str(&format!("; MCP process {status}")),
+            Ok(None) => {}
+            Err(wait_error) => error
+                .message
+                .push_str(&format!("; MCP process status failed: {wait_error}")),
+        }
+        match self.stderr_receipt.lock() {
+            Ok(tail) if !tail.is_empty() => error.message.push_str(&format!(
+                "; MCP stderr (last {MAX_MCP_STDERR_BYTES} bytes): {}",
+                String::from_utf8_lossy(&tail).trim()
+            )),
+            Ok(_) => {}
+            Err(lock_error) => error
+                .message
+                .push_str(&format!("; MCP stderr receipt failed: {lock_error}")),
         }
         error
     }
@@ -1517,6 +1621,83 @@ mod tests {
         }
         worker.join().unwrap();
         result.expect("owned process and pipe workers must finish within five seconds")
+    }
+
+    #[test]
+    fn startup_failure_preserves_mcp_stderr_and_exit_status() {
+        let directory = TestDirectory::new();
+        let script = directory.0.join("missing_config.py");
+        std::fs::write(&script, "import sys\nsys.stderr.write('Required config is missing: settings.json\\n')\nsys.exit(7)\n").unwrap();
+        let error = McpClient::start(
+            &serde_json::from_value(json!({
+                "id":"missing-config", "command":"python3", "args":script.to_string_lossy(),
+                "enabled":true
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.code,
+            "mcp_server_ended" | "mcp_server_write_failed"
+        ));
+        assert!(
+            error
+                .message
+                .contains("Required config is missing: settings.json"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("exit status: 7"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn failed_mcp_call_keeps_a_bounded_diagnostic_tail() {
+        let directory = TestDirectory::new();
+        let client = directory.server("        if request['method']=='tools/call':\n            sys.stderr.write('discarded-prefix' + 'x' * 20000 + '\\nModuleNotFoundError: example_dependency\\n')\n            sys.stderr.flush()\n            sys.exit(7)");
+        let error = client
+            .call_tool("example", json!({}), None, &Default::default())
+            .unwrap_err();
+        assert_eq!(error.code, "mcp_server_ended");
+        assert!(error
+            .message
+            .contains("ModuleNotFoundError: example_dependency"));
+        assert!(!error.message.contains("discarded-prefix"));
+        assert!(error.message.len() < MAX_MCP_STDERR_BYTES + 512);
+        assert!(client.process.lock().unwrap().stopped);
+        client.shutdown().unwrap();
+    }
+
+    #[test]
+    fn repeated_tool_list_cursor_fails_before_another_page() {
+        let directory = TestDirectory::new();
+        // The fixture terminates after three pages even without the regression fix.
+        let client = directory.server(
+            "        if request['method']=='tools/list':\n            page=request['id']-1\n            Path(sys.argv[1], 'pages').write_text(str(page))\n            result={'tools':[]}\n            if page<3: result['nextCursor']='repeated'\n            print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)",
+        );
+        let error = client.list_tools().unwrap_err();
+        assert_eq!(error.code, "mcp_tools_invalid");
+        assert!(error.message.contains("repeated pagination cursor"));
+        assert_eq!(
+            std::fs::read_to_string(directory.0.join("pages")).unwrap(),
+            "2"
+        );
+        client.shutdown().unwrap();
+    }
+
+    #[test]
+    fn tool_list_accepts_a_new_cursor_after_an_empty_page() {
+        let directory = TestDirectory::new();
+        let client = directory.server(
+            "        if request['method']=='tools/list':\n            if 'cursor' not in request['params']: result={'tools':[],'nextCursor':'next'}\n            else:\n                assert request['params']['cursor']=='next'\n                result={'tools':[{'name':'echo','inputSchema':{'type':'object'}}]}\n            print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)",
+        );
+        let tools = client.list_tools().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+        client.shutdown().unwrap();
     }
 
     #[test]
@@ -1800,6 +1981,16 @@ for line in sys.stdin:
         assert_eq!(failure.code, "pdf_extract_failed");
         assert_eq!(failure.message, "invalid PDF");
         assert_eq!(result.output["isError"], true);
+        let image_failure = decode_tool_call_result(
+            "capture",
+            json!({"isError":true,"content":[
+            {"type":"text","text":"Window no longer exists"},
+            {"type":"image","data":"pixel-bytes","mimeType":"image/png"}]}),
+        )
+        .unwrap();
+        let message = image_failure.failure.unwrap().message;
+        assert!(message.contains("Window no longer exists"));
+        assert!(!message.contains("pixel-bytes"));
     }
 
     #[test]

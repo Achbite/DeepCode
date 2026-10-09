@@ -1720,7 +1720,7 @@ mod input_tests {
                 "pendingInteraction",
                 json!({
                     "interactionId":"interaction:test","runId":"run:test","callId":"call:test",
-                    "kind":"question","prompt":"Provider 原文 {0}","options":[],"allowFreeform":true,
+                    "status":"pending","kind":"question","prompt":"Provider 原文 {0}","options":[],"allowFreeform":true,
                     "sequence":1,"createdAt":"now"
                 }),
             ));

@@ -4,6 +4,9 @@ import { UiRegion } from '../../ui-plugins/UiRegion';
 import ProjectEnvironmentSettings from '../../components/settings-center/sections/ProjectEnvironmentSettings';
 import { restoredInterfaceView, useInterfaceReloadView } from '../../services/interfaceReload';
 import DeepCodeNavigationBox from './DeepCodeNavigationBox';
+import ResizeHandle from '../../components/shared/ResizeHandle';
+import { usePaneWidth } from '../../components/shared/usePaneWidth';
+import { PANE_GEOMETRY } from '../../components/shared/paneGeometry';
 import { InterfaceLoadBoundary } from '../../components/shared/InterfaceUpdateNotice';
 import { loadInterfaceModule } from '../../services/interfaceUpdates';
 import ModalDialog from '../../components/shared/ModalDialog';
@@ -21,6 +24,8 @@ import { useReadRunMarkers } from './useReadRunMarkers';
 import { useSidebarOrder } from './useSidebarOrder';
 import DeepCodeTaskPanel from './DeepCodeTaskPanel';
 import DeepCodeTitlebar from './DeepCodeTitlebar';
+import type { ReaderLocation, ReaderNavigationRequest } from '../../components/local-agent/readerState';
+import { forgetClosedBrowser, locationKey, visitLocation, type NavigationHistory, type WorkbenchLocation } from './navigationHistory';
 import DeepCodeShellIcon from '../../components/shared/DeepCodeShellIcon';
 import ProjectFolderDialog from '../../components/workspace-open-dialog/ProjectFolderDialog';
 import '../styles/deepcodeShell.css';
@@ -96,6 +101,16 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   const deleteSession = useLocalAgentStore((state) => state.deleteSession);
 
   const [settingsOpen, setSettingsOpen] = useState(() => restoredInterfaceView('settingsOpen', false));
+  const [navigationCollapsed, setNavigationCollapsed] = useState(() => restoredInterfaceView('navigationCollapsed', false));
+  const workbench = useRef<HTMLDivElement>(null);
+  const navigationWidth = usePaneWidth('navigationWidth', PANE_GEOMETRY.navigation, workbench);
+  useInterfaceReloadView('navigationCollapsed', navigationCollapsed);
+  const [readerLocation, setReaderLocation] = useState<ReaderLocation | null>(null);
+  const [readerRequest, setReaderRequest] = useState<ReaderNavigationRequest | null>(null);
+  const [history, setHistory] = useState<NavigationHistory>({ entries: [], cursor: -1 });
+  const [navigationPending, setNavigationPending] = useState<{ index: number; location: WorkbenchLocation } | null>(null);
+  const [navigationError, setNavigationError] = useState<string | null>(null);
+  const navigationRequestId = useRef(0);
   const [readerLayout, setReaderLayout] = useState<ConversationReaderLayout>({ visible: false, expanded: false, conversationBounds: null });
   useInterfaceReloadView('settingsOpen', settingsOpen);
   useInterfaceReloadView('conversation', { sessionId: activeSessionId, draftProjectId });
@@ -145,7 +160,39 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
     loading: boolean;
     error: string | null;
   } | null>(null);
-  const busy = loading || submitting || catalogBusy;
+  const busy = loading || submitting || catalogBusy || !!navigationPending;
+  useEffect(() => {
+    if (loading || !readerLocation || readerLocation.sessionId !== activeSessionId) return;
+    const location: WorkbenchLocation = { sessionId: activeSessionId, draftProjectId, settingsOpen, reader: readerLocation };
+    if (navigationPending) {
+      if (locationKey(location) !== locationKey(navigationPending.location)) return;
+      setHistory(current => ({ ...current, cursor: navigationPending.index }));
+      setNavigationPending(null);
+      setReaderRequest(null);
+    } else setHistory(current => visitLocation(current, location));
+  }, [activeSessionId, draftProjectId, settingsOpen, readerLocation, loading, navigationPending]);
+
+  const navigate = async (direction: -1 | 1) => {
+    const index = history.cursor + direction;
+    const location = history.entries[index];
+    if (busy || !location) return;
+    setNavigationError(null);
+    setNavigationPending({ index, location });
+    try {
+      if (location.sessionId && location.sessionId !== activeSessionId) {
+        await activateSession(location.sessionId);
+        const state = useLocalAgentStore.getState();
+        if (state.error || state.sessionId !== location.sessionId) throw new Error(state.error ?? 'conversation_session_not_found');
+      } else if (!location.sessionId && (activeSessionId || draftProjectId !== location.draftProjectId)) {
+        startNewSession(location.draftProjectId);
+      }
+      setSettingsOpen(location.settingsOpen);
+      setReaderRequest({ id: ++navigationRequestId.current, location: location.reader });
+    } catch (error) {
+      setNavigationError(String(error));
+      setNavigationPending(null);
+    }
+  };
   const collapsedSet = useMemo(() => new Set(collapsedProjectIds), [collapsedProjectIds]);
 
   useEffect(() => {
@@ -294,7 +341,8 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
   };
 
   return (
-    <div className={`deepcode-gui-workbench${settingsOpen ? ' deepcode-gui-workbench--settings' : ''}`}
+    <div className={`deepcode-gui-workbench${settingsOpen ? ' deepcode-gui-workbench--settings' : ''}${navigationCollapsed ? ' deepcode-gui-workbench--navigation-collapsed' : ''}`}
+      ref={workbench} style={{ '--dc-navigation-width': `${navigationWidth.width}px` } as React.CSSProperties}
       onKeyDown={(event) => {
         if (settingsOpen && event.key !== 'Escape') event.stopPropagation();
       }}>
@@ -306,7 +354,15 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
         </button>
       </> : undefined} /></>,
         navigation: <UiRegion slot="navigation" data={{ kind: 'navigation', projects: sidebarOrder.projects, sessions: sidebarOrder.sessions, activeSessionId, busy }}
-          actions={{ activateSession: async (id: string) => { if (!busy && catalog.sessions.some(session => session.id === id)) await activateSession(id); } }}><DeepCodeNavigationBox settingsOpen={settingsOpen} settingsTargetRef={setSettingsNavigation}>
+          actions={{ activateSession: async (id: string) => { if (!busy && catalog.sessions.some(session => session.id === id)) await activateSession(id); } }}><DeepCodeNavigationBox settingsOpen={settingsOpen} settingsTargetRef={setSettingsNavigation} collapsed={navigationCollapsed}
+          resizeHandle={<ResizeHandle className="deepcode-gui-navigation-resize" label={t(language, 'deepcodeGui.navigation.resize')}
+            value={navigationWidth.width} min={navigationWidth.min} max={navigationWidth.max} step={PANE_GEOMETRY.navigation.step}
+            direction={1} onResize={navigationWidth.setWidth} />} toolbar={<>
+            <button type="button" aria-label={t(language, 'deepcodeGui.navigation.back')} title={t(language, 'deepcodeGui.navigation.back')} disabled={busy || history.cursor <= 0} onClick={() => void navigate(-1)}><DeepCodeShellIcon name="chevronLeft" /></button>
+            <button type="button" aria-label={t(language, 'deepcodeGui.navigation.forward')} title={t(language, 'deepcodeGui.navigation.forward')} disabled={busy || history.cursor >= history.entries.length - 1} onClick={() => void navigate(1)}><DeepCodeShellIcon name="chevronRight" /></button>
+            <button type="button" className="deepcode-gui-navigation-toggle" aria-label={t(language, navigationCollapsed ? 'deepcodeGui.navigation.expand' : 'deepcodeGui.navigation.collapse')} title={t(language, navigationCollapsed ? 'deepcodeGui.navigation.expand' : 'deepcodeGui.navigation.collapse')} aria-expanded={!navigationCollapsed} aria-controls="deepcode-navigation-content" onClick={() => setNavigationCollapsed(value => !value)}><DeepCodeShellIcon name="sidebar" /></button>
+            {navigationError && <p className="deepcode-gui-navigation-error" role="alert">{navigationError}</p>}
+          </>}>
         <DeepCodeSidebar
           language={language}
           projects={sidebarOrder.projects}
@@ -343,7 +399,10 @@ const DeepCodeWorkbenchLayout: React.FC<DeepCodeWorkbenchLayoutProps> = ({
         data-navigation-density={navigationDensity}
       >
         <div className="deepcode-gui-main-surfaces" inert={settingsOpen} aria-hidden={settingsOpen || undefined}>
-          <DeepCodeConversationShell headerTarget={sessionHeader} onReaderLayoutChange={setReaderLayout} />
+          <DeepCodeConversationShell headerTarget={sessionHeader} onReaderLayoutChange={setReaderLayout} readerNavigation={{
+            request: readerRequest, onChange: setReaderLocation,
+            onTabClosed: (sessionId, tabId) => setHistory(current => forgetClosedBrowser(current, sessionId, tabId)),
+          }} />
           {showContextRail && <DeepCodeTaskPanel language={language} projection={projection} />}
         </div>
         <UsageWidget readerLayout={readerLayout} hidden={settingsOpen} />

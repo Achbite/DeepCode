@@ -36,6 +36,7 @@ import {
   SESSION_CONTROL_PLAN_PUBLISH,
   SESSION_CONTROL_TODO_UPDATE,
   SESSION_CONTROL_PLUGIN_ACTIVATE,
+  SESSION_CONTROL_ARTIFACT_PRESENT,
 } from '@deepcode/protocol';
 import type { AgentComposition } from './plugins.js';
 import {
@@ -57,6 +58,8 @@ import { activeConversationEvents } from './conversationHistory.js';
 import { providerTextStreamId } from './streamIdentity.js';
 import { PlanPreviewBuffer } from './planPreview.js';
 import { publishPlan, confirmationFacts } from './planStage.js';
+import { presentArtifacts } from './deliverables.js';
+import type { ArtifactPresentationInput } from './sessionControls.js';
 import { todoUpdateFact } from './todoState.js';
 import {
   decodeSessionControlCall,
@@ -76,6 +79,7 @@ export type LoopCommand =
   | { type: 'start'; runId: string }
   | { type: 'resume'; runId: string }
   | { type: 'recover'; runId: string }
+  | { type: 'fail'; runId: string; error: unknown }
   | { type: 'cancel'; runId: string };
 
 export type LoopResult =
@@ -180,6 +184,7 @@ interface ProviderControlRejection {
 }
 
 type ProviderTurn =
+  | ({ kind: 'artifactPresent'; callId: string; providerCallId: string; items: ArtifactPresentationInput[] } & ProviderTurnCommon)
   | ({ kind: 'pluginActivate'; callId: string; providerCallId: string; pluginUris: string[] } & ProviderTurnCommon)
   | ({ kind: 'answer'; content: string; messageId?: string } & ProviderTurnCommon)
   | ({ kind: 'continuation' } & ProviderTurnCommon)
@@ -263,6 +268,7 @@ export async function runAgentLoop(
   }
   let runtime = runRuntimeSnapshot(snapshot, runId);
   try {
+    if (command.type === 'fail') throw command.error;
     for (const requestEvent of pendingToolRequests(snapshot.events, runId)) {
       const existing = await deps.composition.kernel.readRecord(requestEvent.callId);
       if (existing) {
@@ -501,6 +507,18 @@ export async function runAgentLoop(
         });
       }
       switch (turn.kind) {
+        case 'artifactPresent': {
+          let fact: NewSessionEvent;
+          try {
+            fact = presentArtifacts(snapshot.state, runId, turn.callId, turn.providerCallId, turn.items, deps.nextId);
+          } catch (error) {
+            fact = controlRejectionFact(snapshot.state.sessionId, runId, { callId: turn.callId,
+              providerCallId: turn.providerCallId, toolName: SESSION_CONTROL_ARTIFACT_PRESENT,
+              input: { items: turn.items }, error: localAgentError(error) });
+          }
+          await commit([fact, providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion), ...completionDerivedFacts]);
+          break;
+        }
         case 'pluginActivate': {
           let prepared: PreparedRunRuntime;
           try {
@@ -560,13 +578,14 @@ export async function runAgentLoop(
             ),
             providerTurnSettledEvent(snapshot.state.sessionId, runId, turn.completion),
             ...completionDerivedFacts,
-            {
+            ...(turn.request.mode === 'continue' ? [] : [{
               type: 'run.waiting',
               sessionId: snapshot.state.sessionId,
               runId,
               payload: { reason: 'userInput', detail: turn.request.prompt },
-            },
+            } as const]),
           ]);
+          if (turn.request.mode === 'continue') break;
           return {
             status: 'waiting',
             runId,
@@ -618,13 +637,18 @@ export async function runAgentLoop(
                 providerRequestId: turn.completion.providerRequestId,
               },
             },
-            ...(current.state.queuedInputs.some((input) => input.runId === runId) ? [] : [{
+            ...(current.state.queuedInputs.some((input) => input.runId === runId) ? []
+              : current.state.interactions.some(item => item.runId === runId && item.status === 'pending') ? [{
+                type: 'run.waiting', sessionId: snapshot.state.sessionId, runId,
+                payload: { reason: 'userInput', detail: 'Independent work is complete; awaiting answers to open questions.' },
+              } as const] : [{
               type: 'run.finishing',
               sessionId: snapshot.state.sessionId,
               runId,
               payload: settlement,
             } as const]),
           ]);
+          if (snapshot.state.run?.status === 'waiting') return { status: 'waiting', runId, reason: 'userInput' };
           if (!snapshot.state.pendingRunSettlements[runId]) break;
           return finishingResult(runId, settlement);
         }
@@ -680,6 +704,8 @@ export async function runAgentLoop(
       }
     }
   } catch (error) {
+    const userCancelled = signal.aborted
+      && (signal.reason === 'user_cancelled' || signal.reason === 'user_cancelled_plan');
     const pendingProvider = uncompletedProviderComposition(snapshot, runId);
     const completedAttempt = pendingProvider && Object.values(snapshot.state.providerAttempts).some((attempt) => (
       attempt.providerRequestId === pendingProvider.providerRequestId && attempt.phase === 'completed'
@@ -715,9 +741,9 @@ export async function runAgentLoop(
         outcome: 'indeterminate',
         error: {
           code: 'provider_turn_outcome_unknown',
-          message: signal.reason === 'user_cancelled' ? '已收到取消请求，本次生成未完成；Provider 最终完成结果未知。'
+          message: userCancelled ? '已收到取消请求，本次生成未完成；Provider 最终完成结果未知。'
             : `Provider request ${unknownTurn.providerRequestId} 的完成结果不可判定；原始错误 ${cause.code}：${cause.message}`,
-          diagnostics: { source: 'session', phase: 'provider', category: signal.aborted ? 'cancelled' : 'unknown', retryable: false,
+          diagnostics: { source: 'session', phase: 'provider', category: userCancelled ? 'cancelled' : 'unknown', retryable: false,
             causes: [{ message: `${cause.code}: ${cause.message}` }], ...(signal.aborted ? { stopReason: String(signal.reason) } : {}) },
         },
       };
@@ -745,7 +771,8 @@ export async function runAgentLoop(
     ) {
       return { status: 'suspended', runId };
     }
-    if (signal.aborted) {
+    if (userCancelled
+      && !(error instanceof LoopFailure && error.code === 'tool_cancel_cleanup_failed')) {
       return await cancelRun(snapshot, { type: 'cancel', runId }, deps, commit);
     }
     const failure = localAgentError(error);
@@ -1196,9 +1223,9 @@ async function consumeProviderOutput(
   ));
   const conflict = inputBlocks.some((block) => (
     block.name === SESSION_CONTROL_INTERACTION_REQUEST || block.name === SESSION_CONTROL_PLAN_PUBLISH
-      || block.name === SESSION_CONTROL_PLUGIN_ACTIVATE
+      || block.name === SESSION_CONTROL_PLUGIN_ACTIVATE || block.name === SESSION_CONTROL_ARTIFACT_PRESENT
   )) && inputBlocks.length > 1
-    ? 'interaction.request、plan.publish 与 plugin.activate 必须独占 Provider turn；本批次未执行，请单独提交。'
+    ? 'interaction.request、plan.publish、plugin.activate 与 artifact.present 必须独占 Provider turn；本批次未执行，请单独提交。'
     : inputBlocks.filter((block) => block.name === SESSION_CONTROL_TODO_UPDATE).length > 1
       ? '每个 Provider turn 最多包含一个 todo.update；本批次未执行，请合并步骤更新。'
       : undefined;
@@ -1499,7 +1526,7 @@ async function consumeProviderOutput(
     ...(orderedNarratives.length > 0 ? { narratives: orderedNarratives } : {}),
   };
   const control = controlCalls[0];
-  if (control?.kind === 'pluginActivate') {
+  if (control?.kind === 'pluginActivate' || control?.kind === 'artifactPresent') {
     return { ...control, providerCallId: control.providerCallId, ...common };
   }
   if (control?.kind === 'interaction') {
@@ -2207,6 +2234,9 @@ function runRuntimeSnapshot(snapshot: LoopSnapshot, runId: string): RunRuntimeSn
   const runtime = snapshot.state.runRuntimeSnapshots[runId];
   if (!runtime) throw new LoopFailure('run_runtime_snapshot_missing', '当前 run 缺少运行时快照。');
   const view = { ...runtime, ...snapshot.state.runToolViews[runId] };
+  if (snapshot.state.run?.runId === runId && snapshot.state.run.hostBinding) {
+    view.environment = { ...view.environment, hostBinding: { ...snapshot.state.run.hostBinding } };
+  }
   const permissions = permissionSettings({ ...runtime.permissions, ...snapshot.state.permissionOverrides });
   return { ...view, permissions, instructions: view.instructions.map(instruction => instruction.id === 'deepcode.workspace-autonomy'
     ? { ...instruction, text: permissionInstructionText(permissions,
@@ -2226,9 +2256,9 @@ function runtimeForToolRequest(snapshot: LoopSnapshot, request: Extract<SessionE
   const base = snapshot.state.runRuntimeSnapshots[request.runId];
   if (!base) throw new LoopFailure('tool_request_binding_missing', '工具调用缺少所属 run。');
   if (!receipt.kernelCatalogSnapshotRef || receipt.kernelCatalogSnapshotRef === base.kernelCatalogSnapshotRef) return base;
-  const prepared = snapshot.events.find((event) => event.type === 'run.tools.prepared'
+  const prepared = snapshot.events.find((event) => (event.type === 'run.tools.prepared' || event.type === 'run.host.rebound')
     && event.runId === request.runId && event.payload.toolView.kernelCatalogSnapshotRef === receipt.kernelCatalogSnapshotRef);
-  if (prepared?.type !== 'run.tools.prepared') throw new LoopFailure('tool_request_binding_missing', '工具请求引用的准备视图不存在。');
+  if (prepared?.type !== 'run.tools.prepared' && prepared?.type !== 'run.host.rebound') throw new LoopFailure('tool_request_binding_missing', '工具请求引用的准备视图不存在。');
   return { ...base, ...prepared.payload.toolView };
 }
 

@@ -750,7 +750,7 @@ impl Renderer {
                         output.push_str(&format!(
                             "{}: {}\n",
                             kind_label(language, &message.role),
-                            message.content
+                            message.display_text()
                         ));
                         output.push_str(&source_references(
                             language,
@@ -771,7 +771,7 @@ impl Renderer {
                     TimelineItem::Narrative {
                         value: narrative, ..
                     } => {
-                        output.push_str(&format!("{}\n", narrative.content));
+                        output.push_str(&format!("{}\n", narrative.display_text()));
                         output.push_str(&source_references(
                             language,
                             narrative.source_references.as_ref(),
@@ -1227,12 +1227,12 @@ impl Renderer {
                         )));
                         if message.role == "assistant" {
                             lines.extend(crate::markdown::render(
-                                &message.content,
+                                message.display_text(),
                                 area.width,
                                 Style::default(),
                             ));
                         } else {
-                            lines.extend(Text::raw(message.content.clone()).lines);
+                            lines.extend(Text::raw(message.display_text().to_owned()).lines);
                         }
                         lines.extend(crate::markdown::render(
                             &source_references(language, message.source_references.as_ref()),
@@ -1261,7 +1261,7 @@ impl Renderer {
                         value: narrative, ..
                     } => {
                         lines.extend(crate::markdown::render(
-                            &narrative.content,
+                            narrative.display_text(),
                             area.width,
                             Style::default().fg(Color::Gray),
                         ));
@@ -2471,7 +2471,7 @@ mod approval_presentation_tests {
         let mut projection: SessionProjection = serde_json::from_value(json!({
             "schemaVersion":deepcode_kernel_client::SESSION_PROJECTION_VERSION,"sessionId":"session:test","revision":1,
             "display":{"creationTitle":"Review"},"workspaceBindings":[],"sessionDirectoryIndexes":[],"messages":[],"queuedInputs":[],
-            "narratives":[],"timeline":[],"plans":[],"contextCompositions":[],"tokenUsageHistory":[],"activities":[],"artifacts":[],
+            "narratives":[],"timeline":[],"plans":[],"interactions":[],"contextCompositions":[],"tokenUsageHistory":[],"activities":[],"artifacts":[],"deliverables":[],
             "permissionOverrides":{},"effectivePermissions":null,"shellAuthorizations":[],
             "tokenUsage":{"providerCallCount":0,"reportedCallCount":0,"inputTokens":0,"outputTokens":0,"cacheReadInputTokens":0,"cacheMissInputTokens":0,"cacheAvailable":false,"cacheComplete":false},
             "run":{"runId":"run:test","profileId":"profile:test","workspaceBindings":[],"status":"running"},

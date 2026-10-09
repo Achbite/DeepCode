@@ -10,7 +10,10 @@ mod native_browser;
 #[path = "../../../shared/native_path_dialog/mod.rs"]
 mod native_path_dialog;
 
-use deepcode_host_connection::loopback_http::request_loopback_json;
+use deepcode_host_connection::loopback_http::{
+    connect_loopback, parse_port, probe_loopback_listener, request_connected_json,
+    request_loopback_json,
+};
 use deepcode_kernel_abi::{
     is_valid_host_instance_id, is_valid_host_shell_token, is_valid_host_ui_token,
     HostProcessIdentity, HOST_INSTANCE_ID_ENV, HOST_INSTANCE_ID_PREFIX, HOST_SHELL_TOKEN_ENV,
@@ -20,13 +23,14 @@ use deepcode_kernel_abi::{
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::http::{header, Request, Response, StatusCode};
 use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent};
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 use deepcode_host_connection::process::{
     spawn_owned_host_process, terminate_owned_process_tree, OwnedHostProcess,
@@ -34,12 +38,13 @@ use deepcode_host_connection::process::{
 use deepcode_host_connection::shell_lifecycle::{shutdown_daemon_process, OwnedHostChildren};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
-const DEFAULT_PORT: &str = "31246";
+const DEFAULT_PORT: u16 = 31246;
 const APP_ASSET_SCHEME: &str = "deepcode-gui";
 const APP_ASSET_DIR: &str = "web-deepcode-gui";
 
 struct RuntimeLocations {
     resources: PathBuf,
+    client_dist: Option<PathBuf>,
     user: deepcode_host_connection::UserDirectories,
 }
 
@@ -48,11 +53,16 @@ static RUNTIME_LOCATIONS: OnceLock<RuntimeLocations> = OnceLock::new();
 fn initialize_runtime_locations() -> std::io::Result<()> {
     let executable_dir = current_exe_dir()
         .ok_or_else(|| std::io::Error::other("executable directory is unavailable"))?;
-    let resources = deepcode_host_connection::runtime_root(&executable_dir);
+    let resources = deepcode_host_connection::runtime_root(&executable_dir)?;
+    let client_dist = deepcode_host_connection::configured_path("DEEPCODE_CLIENT_DIST")?;
     let user = deepcode_host_connection::UserDirectories::resolve()?;
     user.create()?;
     RUNTIME_LOCATIONS
-        .set(RuntimeLocations { resources, user })
+        .set(RuntimeLocations {
+            resources,
+            client_dist,
+            user,
+        })
         .map_err(|_| std::io::Error::other("runtime locations already initialized"))
 }
 
@@ -311,7 +321,19 @@ fn main() {
         })
         .setup(|app| {
             initialize_runtime_locations()?;
-            let target = resolve_launch_target();
+            let target = match resolve_launch_target() {
+                Ok(target) => target,
+                Err(error) => {
+                    eprintln!("host_startup_configuration_failed: {error}");
+                    let handle = app.handle().clone();
+                    app.dialog()
+                        .message(error.to_string())
+                        .title("DeepCode")
+                        .kind(MessageDialogKind::Error)
+                        .show(move |_| handle.exit(1));
+                    return Ok(());
+                }
+            };
             let mut host_tokens = HostConnectionTokens::resolve()?;
             let registration = Arc::clone(&host_tokens.browser_registration);
             let browser_id = host_tokens.browser_instance_id.clone();
@@ -399,8 +421,12 @@ fn main() {
 
     app.run(|app_handle, event| match event {
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
-            app_handle.state::<native_browser::NativeBrowser>().stop();
-            app_handle.state::<HostProcessGroup>().detach();
+            if let Some(browser) = app_handle.try_state::<native_browser::NativeBrowser>() {
+                browser.stop();
+            }
+            if let Some(processes) = app_handle.try_state::<HostProcessGroup>() {
+                processes.detach();
+            }
         }
         _ => {}
     });
@@ -511,6 +537,28 @@ fn generate_local_identity(
 struct HostApiEnvelope<T> {
     ok: bool,
     data: Option<T>,
+    error: Option<String>,
+    message: Option<String>,
+}
+
+impl<T> HostApiEnvelope<T> {
+    fn into_data(self) -> std::io::Result<T> {
+        if !self.ok {
+            return Err(std::io::Error::other(format!(
+                "{}: {}",
+                self.error.as_deref().unwrap_or("host_api_failed"),
+                self.message
+                    .as_deref()
+                    .unwrap_or("Host returned no error message")
+            )));
+        }
+        self.data.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Host response is missing data",
+            )
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -629,30 +677,54 @@ async fn deepcode_open_external_url(url: String) -> Result<(), String> {
     .map_err(|error| error.to_string())?
 }
 
-fn resolve_launch_target() -> LaunchTarget {
+fn resolve_launch_target() -> std::io::Result<LaunchTarget> {
     let host = std::env::var("DEEPCODE_HOST").unwrap_or_else(|_| DEFAULT_HOST.to_string());
-    assert!(
-        is_loopback_host(&host),
-        "DeepCode desktop Host requires a loopback target"
-    );
-    let port = std::env::var("DEEPCODE_PORT")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            if local_port_is_available(&host, DEFAULT_PORT) {
-                DEFAULT_PORT.to_string()
-            } else {
-                available_local_port(&host).unwrap_or_else(|| DEFAULT_PORT.to_string())
-            }
-        });
-    let daemon_port = available_local_port(&host)
-        .filter(|candidate| candidate != &port)
-        .expect("available loopback daemon port");
-    LaunchTarget {
-        host,
-        port,
-        daemon_port,
+    if !is_loopback_host(&host) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "DeepCode desktop Host requires a loopback target",
+        ));
     }
+    let explicit_port = match std::env::var("DEEPCODE_PORT") {
+        Ok(value) => Some(parse_port(&value)?),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, error)),
+    };
+    select_launch_ports(host, explicit_port)
+}
+
+fn select_launch_ports(host: String, explicit_port: Option<u16>) -> std::io::Result<LaunchTarget> {
+    // Hold the selected proxy port until the daemon port has been chosen.
+    let (port, _proxy_listener) = match explicit_port {
+        Some(port) if port != 0 => (port, None),
+        _ => {
+            let listener =
+                match TcpListener::bind((host.as_str(), explicit_port.unwrap_or(DEFAULT_PORT))) {
+                    Ok(listener) => listener,
+                    Err(error)
+                        if explicit_port.is_none()
+                            && error.kind() == std::io::ErrorKind::AddrInUse =>
+                    {
+                        TcpListener::bind((host.as_str(), 0))?
+                    }
+                    Err(error) => return Err(error),
+                };
+            (listener.local_addr()?.port(), Some(listener))
+        }
+    };
+    let daemon_listener = TcpListener::bind((host.as_str(), 0))?;
+    let daemon_port = daemon_listener.local_addr()?.port();
+    if daemon_port == port {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!("Host proxy and Kernel daemon selected the same port: {port}"),
+        ));
+    }
+    Ok(LaunchTarget {
+        host,
+        port: port.to_string(),
+        daemon_port: daemon_port.to_string(),
+    })
 }
 
 fn create_main_window(
@@ -725,8 +797,9 @@ fn serve_bundled_asset(web_dir_name: &str, request: Request<Vec<u8>>) -> Respons
 }
 
 fn resolve_asset_path(web_dir_name: &str, uri_path: &str) -> Result<PathBuf, String> {
-    let web_root = std::env::var_os("DEEPCODE_CLIENT_DIST")
-        .map(PathBuf::from)
+    let web_root = runtime_locations()
+        .client_dist
+        .clone()
         .unwrap_or_else(|| runtime_locations().resources.join(web_dir_name));
     let requested = uri_path.trim_start_matches('/');
     let relative = if requested.is_empty() {
@@ -992,23 +1065,23 @@ fn spawn_host_processes_if_available(
     })?;
     let daemon_path =
         configured_or_bundled_file("DEEPCODE_KERNEL_DAEMON_BIN", &exe_dir, kernel_binary_name())
-            .ok_or_else(|| {
+            .map_err(|error| {
                 startup_failure(
                     "binaryResolution",
                     "host_startup_daemon_binary_missing",
                     None,
-                    "The bundled Kernel daemon binary is unavailable.",
+                    error.to_string(),
                     false,
                 )
             })?;
     let proxy_path =
         configured_or_bundled_file("DEEPCODE_HOST_WEB_BIN", &exe_dir, host_web_binary_name())
-            .ok_or_else(|| {
+            .map_err(|error| {
                 startup_failure(
                     "binaryResolution",
                     "host_startup_proxy_binary_missing",
                     None,
-                    "The bundled Host UI proxy binary is unavailable.",
+                    error.to_string(),
                     false,
                 )
             })?;
@@ -1059,27 +1132,28 @@ fn spawn_host_processes_if_available(
         host_tokens.instance_id = connection.identity.instance_id.clone();
     }
 
-    let web_dir = std::env::var_os("DEEPCODE_CLIENT_DIST")
-        .map(PathBuf::from)
+    let web_dir = runtime_locations()
+        .client_dist
+        .clone()
         .unwrap_or_else(|| runtime_locations().resources.join(APP_ASSET_DIR));
 
     let (mut daemon, daemon_identity) = if let Some(connection) = shared {
-        if !matches!(
-            authenticated_health_status(
-                &target.host,
-                &target.daemon_port,
-                HOST_SHELL_TOKEN_HEADER,
-                host_tokens.daemon_token()
-            ),
-            AuthenticatedHealthStatus::Ready
+        match authenticated_health_status(
+            &target.host,
+            &target.daemon_port,
+            HOST_SHELL_TOKEN_HEADER,
+            host_tokens.daemon_token(),
         ) {
-            return Err(startup_failure(
-                "sharedHost",
-                "host_connection_health_failed",
-                None,
-                "The shared Host did not pass authenticated health.",
-                true,
-            ));
+            Ok(AuthenticatedHealthStatus::Ready) => {}
+            Ok(AuthenticatedHealthStatus::Unavailable(error)) | Err(error) => {
+                return Err(startup_failure(
+                    "sharedHost",
+                    "host_connection_health_failed",
+                    None,
+                    format!("The shared Host did not pass authenticated health: {error}"),
+                    true,
+                ))
+            }
         }
         (None, connection.identity)
     } else {
@@ -1101,11 +1175,23 @@ fn spawn_host_processes_if_available(
         runtime_locations()
             .user
             .configure_child(&mut daemon_command);
+        deepcode_host_connection::configure_runtime_child(
+            &mut daemon_command,
+            &runtime_locations().resources,
+        )
+        .map_err(|error| {
+            startup_failure(
+                "daemonSpawn",
+                "host_startup_runtime_path_invalid",
+                None,
+                error.to_string(),
+                false,
+            )
+        })?;
         daemon_command
             .current_dir(&daemon_dir)
             .env("DEEPCODE_HOST", &target.host)
             .env("DEEPCODE_PORT", &target.daemon_port)
-            .env("DEEPCODE_RUNTIME_DIR", &runtime_locations().resources)
             .env_remove(HOST_UI_TOKEN_ENV)
             .env(HOST_SHELL_TOKEN_ENV, host_tokens.daemon_token())
             .env(deepcode_host_connection::HOST_LIFETIME_ENV, "automatic")
@@ -1247,7 +1333,7 @@ fn spawn_host_processes_if_available(
         .env(HOST_SHELL_TOKEN_ENV, host_tokens.daemon_token())
         .env(deepcode_host_connection::HOST_LIFETIME_ENV, "automatic")
         .env(HOST_INSTANCE_ID_ENV, host_tokens.instance_id())
-        .stdin(Stdio::null());
+        .stdin(Stdio::piped());
     if let Err(error) = configure_process_capture(
         &mut proxy_command,
         diagnostic.map(|value| value.directory.as_path()),
@@ -1383,15 +1469,19 @@ fn configured_or_bundled_file(
     environment_key: &str,
     exe_dir: &Path,
     bundled_name: &str,
-) -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(environment_key).map(PathBuf::from) {
-        return path
-            .is_absolute()
-            .then_some(path)
-            .filter(|path| path.is_file());
+) -> std::io::Result<PathBuf> {
+    let path = deepcode_host_connection::configured_path(environment_key)?
+        .unwrap_or_else(|| exe_dir.join(bundled_name));
+    if !path.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "Host binary {environment_key} is unavailable: {}",
+                path.display()
+            ),
+        ));
     }
-    let path = exe_dir.join(bundled_name);
-    path.is_file().then_some(path)
+    Ok(path)
 }
 
 fn startup_mode() -> &'static str {
@@ -1507,79 +1597,15 @@ fn private_log_file(path: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
-struct KernelStartLock {
-    path: PathBuf,
-}
-
-impl Drop for KernelStartLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-fn acquire_kernel_start_lock(host: &str, port: &str) -> std::io::Result<Option<KernelStartLock>> {
-    let path = runtime_locations().user.temp_dir.join(format!(
-        "deepcode-kernel-start-{}-{}.lock",
-        sanitize_lock_component(host),
-        sanitize_lock_component(port)
-    ));
-    let create = || {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-    };
-    let result = match create() {
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if kernel_start_lock_is_stale(&path)? {
-                std::fs::remove_file(&path)?;
-                create()
-            } else {
-                Err(error)
-            }
-        }
-        result => result,
-    };
-    match result {
-        Ok(mut file) => {
-            let lock = KernelStartLock { path };
-            std::io::Write::write_all(
-                &mut file,
-                format!("pid={}\n", std::process::id()).as_bytes(),
-            )?;
-            Ok(Some(lock))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            wait_for_kernel_listener(host, port, 40);
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn kernel_start_lock_is_stale(path: &Path) -> std::io::Result<bool> {
-    std::fs::metadata(path)
-        .and_then(|metadata| metadata.modified())?
-        .elapsed()
-        .map(|age| age > Duration::from_secs(30))
-        .map_err(std::io::Error::other)
-}
-
-fn sanitize_lock_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-        .collect()
-}
-
-fn wait_for_kernel_listener(host: &str, port: &str, attempts: usize) -> bool {
-    for _ in 0..attempts {
-        if local_port_has_listener(host, port) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(75));
-    }
-    false
+fn acquire_kernel_start_lock(
+    host: &str,
+    port: &str,
+) -> std::io::Result<Option<deepcode_host_connection::HostStartGuard>> {
+    deepcode_host_connection::HostStartGuard::try_acquire_port(
+        &runtime_locations().user.temp_dir,
+        host,
+        port,
+    )
 }
 
 fn wait_for_authenticated_health(
@@ -1591,6 +1617,7 @@ fn wait_for_authenticated_health(
     processes: &HostProcessGroup,
     attempts: usize,
 ) -> Result<(), HostStartupFailure> {
+    let mut last_unavailable = None;
     for _ in 0..attempts {
         if processes.is_shutting_down() {
             return Err(startup_stopped_failure());
@@ -1617,17 +1644,17 @@ fn wait_for_authenticated_health(
             Ok(None) => {}
         }
         match authenticated_health_status(host, port, token_header, token) {
-            AuthenticatedHealthStatus::Ready => return Ok(()),
-            AuthenticatedHealthStatus::Failed => {
+            Ok(AuthenticatedHealthStatus::Ready) => return Ok(()),
+            Err(error) => {
                 return Err(startup_failure(
                     "daemonRecovery",
                     "host_startup_daemon_recovery_failed",
                     None,
-                    "Kernel 与 Session 未能进入就绪状态。",
+                    format!("Kernel 与 Session 未能进入就绪状态：{error}"),
                     true,
                 ));
             }
-            AuthenticatedHealthStatus::Unavailable => {}
+            Ok(AuthenticatedHealthStatus::Unavailable(error)) => last_unavailable = Some(error),
         }
         std::thread::sleep(Duration::from_millis(75));
     }
@@ -1635,7 +1662,12 @@ fn wait_for_authenticated_health(
         "daemonRecovery",
         "host_startup_health_timeout",
         None,
-        "A managed Host process did not become ready before the startup deadline.",
+        format!(
+            "A managed Host process did not become ready before the startup deadline.{}",
+            last_unavailable
+                .map(|error| format!(" Last connection error: {error}"))
+                .unwrap_or_default()
+        ),
         true,
     ))
 }
@@ -1717,7 +1749,9 @@ fn wait_for_public_identity(
             expected_service,
             expected_instance_id,
             expected_pid,
-        ) {
+        )
+        .map_err(|error| startup_failure(stage, identity_failure, None, error.to_string(), true))?
+        {
             return Ok(identity);
         }
         std::thread::sleep(Duration::from_millis(75));
@@ -1749,26 +1783,39 @@ fn matching_public_identity(
     expected_service: &str,
     expected_instance_id: &str,
     expected_pid: u32,
-) -> Option<HostProcessIdentity> {
+) -> std::io::Result<Option<HostProcessIdentity>> {
     let request = http_request(host, port, "GET", "/api/host/identity", &[]);
-    let Ok(envelope) =
-        request_loopback_json::<HostApiEnvelope<HostProcessIdentity>>(host, port, &request, 300)
-    else {
-        return None;
+    let stream = match connect_loopback(host, port, Duration::from_millis(180)) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
     };
-    let Some(identity) = envelope.ok.then_some(envelope.data).flatten() else {
-        return None;
-    };
-    (identity.service == expected_service
+    let identity =
+        request_connected_json::<HostApiEnvelope<HostProcessIdentity>>(stream, &request, 300)?
+            .into_data()?;
+    if identity.service == expected_service
         && identity.instance_id == expected_instance_id
-        && identity.pid == expected_pid)
-        .then_some(identity)
+        && identity.pid == expected_pid
+    {
+        Ok(Some(identity))
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!(
+            "Host identity mismatch: expected {expected_service} / {expected_instance_id} / PID {expected_pid}, received {} / {} / PID {}",
+            identity.service, identity.instance_id, identity.pid)))
+    }
 }
 
+#[derive(Debug)]
 enum AuthenticatedHealthStatus {
     Ready,
-    Failed,
-    Unavailable,
+    Unavailable(std::io::Error),
 }
 
 fn authenticated_health_status(
@@ -1776,20 +1823,29 @@ fn authenticated_health_status(
     port: &str,
     token_header: &str,
     token: &str,
-) -> AuthenticatedHealthStatus {
+) -> std::io::Result<AuthenticatedHealthStatus> {
     let request = http_request(host, port, "GET", "/api/health", &[(token_header, token)]);
-    let Ok(envelope) =
-        request_loopback_json::<HostApiEnvelope<HostHealthData>>(host, port, &request, 500)
-    else {
-        return AuthenticatedHealthStatus::Unavailable;
+    let stream = match connect_loopback(host, port, Duration::from_millis(180)) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Ok(AuthenticatedHealthStatus::Unavailable(error))
+        }
+        Err(error) => return Err(error),
     };
-    let Some(data) = envelope.ok.then_some(envelope.data).flatten() else {
-        return AuthenticatedHealthStatus::Unavailable;
-    };
+    let data = request_connected_json::<HostApiEnvelope<HostHealthData>>(stream, &request, 500)?
+        .into_data()?;
     if data.ok && data.status == "ok" {
-        return AuthenticatedHealthStatus::Ready;
+        return Ok(AuthenticatedHealthStatus::Ready);
     }
-    AuthenticatedHealthStatus::Failed
+    Err(std::io::Error::other(format!(
+        "Host health failed: ok={}, status={}",
+        data.ok, data.status
+    )))
 }
 
 fn http_request(
@@ -1855,9 +1911,20 @@ fn admit_private_host_ports(
     target: &LaunchTarget,
     reuse_daemon: bool,
 ) -> Result<(), HostStartupFailure> {
-    let unavailable = if local_port_has_listener(&target.host, &target.port) {
+    let probe = |port: &str| {
+        probe_loopback_listener(&target.host, port).map_err(|error| {
+            startup_failure(
+                "startAdmission",
+                "host_startup_port_probe_failed",
+                None,
+                error.to_string(),
+                true,
+            )
+        })
+    };
+    let unavailable = if probe(&target.port)? {
         Some(("Host proxy", &target.port))
-    } else if !reuse_daemon && local_port_has_listener(&target.host, &target.daemon_port) {
+    } else if !reuse_daemon && probe(&target.daemon_port)? {
         Some(("Kernel daemon", &target.daemon_port))
     } else {
         None
@@ -1875,32 +1942,6 @@ fn admit_private_host_ports(
         ));
     }
     Ok(())
-}
-
-fn local_port_has_listener(host: &str, port: &str) -> bool {
-    let Ok(port) = port.parse::<u16>() else {
-        return false;
-    };
-    let Ok(addrs) = (host, port).to_socket_addrs() else {
-        return false;
-    };
-    addrs
-        .into_iter()
-        .any(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(180)).is_ok())
-}
-
-fn available_local_port(host: &str) -> Option<String> {
-    TcpListener::bind((host, 0))
-        .ok()
-        .and_then(|listener| listener.local_addr().ok())
-        .map(|addr| addr.port().to_string())
-}
-
-fn local_port_is_available(host: &str, port: &str) -> bool {
-    let Ok(port) = port.parse::<u16>() else {
-        return false;
-    };
-    TcpListener::bind((host, port)).is_ok()
 }
 
 fn current_exe_dir() -> Option<PathBuf> {
@@ -1954,6 +1995,43 @@ fn env_truthy(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpStream;
+
+    #[test]
+    fn launch_ports_are_distinct_and_invalid_bind_addresses_are_errors() {
+        let target = select_launch_ports("127.0.0.1".into(), Some(0)).unwrap();
+        assert_ne!(target.port, "0");
+        assert_ne!(target.port, target.daemon_port);
+        assert!(select_launch_ports("".into(), Some(0)).is_err());
+    }
+
+    #[test]
+    fn authenticated_health_preserves_the_daemon_failure() {
+        use std::io::Write;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"session_service_unavailable\",\"message\":\"bridge exited: original failure\"}").unwrap();
+        });
+        let error =
+            authenticated_health_status("127.0.0.1", &port, HOST_SHELL_TOKEN_HEADER, "test-token")
+                .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "session_service_unavailable: bridge exited: original failure"
+        );
+    }
 
     #[test]
     fn retry_only_requires_ports_for_processes_it_will_start() {

@@ -1,6 +1,8 @@
 //! Physical Host lifetime. Session remains the sole owner of active work.
 use crate::prelude::*;
-use crate::{request_host_shutdown, wait_for_host_shutdown, AppState};
+use crate::{
+    request_host_shutdown, shutdown_owned_host_resources, wait_for_host_shutdown, AppState,
+};
 use axum::body::Body;
 use std::convert::Infallible;
 use std::sync::{Mutex, OnceLock};
@@ -108,8 +110,45 @@ pub(crate) async fn host_client(Query(query): Query<ClientQuery>) -> Response {
 }
 
 pub(crate) async fn monitor_host_lifetime(state: AppState) {
+    if let Err(error) = observe_host_lifetime(&state).await {
+        if !begin_host_shutdown() {
+            return;
+        }
+        eprintln!("host_lifecycle_failed: {error}");
+        // A dead Session cannot own more work. Release this Host's resources
+        // before the next normal startup can acquire the data-root lease.
+        shutdown_owned_host_resources(&state).await;
+        request_host_shutdown();
+    }
+}
+
+pub(crate) fn begin_host_shutdown() -> bool {
+    let Some(lifetime) = LIFETIME.get() else {
+        return false;
+    };
+    let mut lifetime = lifetime.lock().expect("Host lifetime lock");
+    let started = !lifetime.stopping;
+    lifetime.stopping = true;
+    started
+}
+
+async fn observe_host_lifetime(state: &AppState) -> Result<(), String> {
     loop {
         tokio::time::sleep(Duration::from_millis(250)).await;
+        if LIFETIME
+            .get()
+            .expect("Host lifetime configured")
+            .lock()
+            .expect("Host lifetime lock")
+            .stopping
+        {
+            return Ok(());
+        }
+        let service = state.session_service.clone();
+        tokio::task::spawn_blocking(move || service.check_ready())
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
         let revision = LIFETIME
             .get()
             .expect("Host lifetime configured")
@@ -126,13 +165,11 @@ pub(crate) async fn monitor_host_lifetime(state: AppState) {
             Ok(Ok(value)) => match value.get("active").and_then(Value::as_bool) {
                 Some(active) => active,
                 None => {
-                    eprintln!("host_lifecycle_activity_invalid");
-                    return;
+                    return Err("host_lifecycle_activity_invalid".into());
                 }
             },
             error => {
-                eprintln!("host_lifecycle_activity_failed: {error:?}");
-                return;
+                return Err(format!("host_lifecycle_activity_failed: {error:?}"));
             }
         };
         if LIFETIME
@@ -143,7 +180,7 @@ pub(crate) async fn monitor_host_lifetime(state: AppState) {
             .stop_if_idle(revision, active)
         {
             request_host_shutdown();
-            return;
+            return Ok(());
         }
     }
 }

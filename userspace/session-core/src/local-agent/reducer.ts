@@ -1,20 +1,23 @@
 import { isManagedProcessSnapshot, isSessionAuthorizationScope, providerRuntimeForPurpose } from '@deepcode/protocol';
+import { advanceDeliverables, compareDeliverables } from './deliverables.js';
 import { advanceTodoList } from './todoState.js';
 import { appendInputFileBindings } from './workspaceBindings.js';
 import { providerTextStreamId } from './streamIdentity.js';
 import { activeConversationEvents } from './conversationHistory.js';
-import { projectSourceReferences } from './sourceReferences.js';
+import { projectDraftSourceContent, projectSourceContent } from './sourceReferences.js';
 import type {
   ActivityProjection,
   ManagedProcessSnapshot,
   AssistantDraftProjection,
   ArtifactProjection,
+  DeliverableProjection,
   JsonObject,
   PendingPlanProjection,
   PlanProjection,
   ProviderOutputBlock,
   ProviderToolCallInput,
   RunSettlement,
+  RunProjection,
   RunRuntimeSnapshot,
   PreparedRequestToolView,
   SessionEvent,
@@ -46,7 +49,7 @@ export interface SessionState {
   queuedInputs: SessionProjection['queuedInputs'];
   acceptedInputs: Record<string, { messageId: string; replyToInteraction?: { interactionId: string; prompt: string } }>;
   narratives: SessionProjection['narratives'];
-  pendingInteraction: SessionProjection['pendingInteraction'];
+  interactions: SessionProjection['interactions'];
   pendingApproval: SessionProjection['pendingApproval'];
   plans: SessionProjection['plans'];
   activePlanRef: SessionProjection['activePlanRef'];
@@ -70,6 +73,7 @@ export interface SessionState {
   activities: Record<string, ActivityProjection>;
   processes: Record<string, ManagedProcessSnapshot>;
   artifacts: Record<string, ArtifactProjection>;
+  deliverables: Record<string, DeliverableProjection>;
   terminalError: SessionProjection['terminalError'];
 }
 
@@ -111,7 +115,7 @@ export function emptySessionState(sessionId: string): SessionState {
     queuedInputs: [],
     acceptedInputs: {},
     narratives: [],
-    pendingInteraction: null,
+    interactions: [],
     pendingApproval: null,
     plans: [],
     activePlanRef: null,
@@ -142,6 +146,7 @@ export function emptySessionState(sessionId: string): SessionState {
     activities: {},
     processes: {},
     artifacts: {},
+    deliverables: {},
     terminalError: null,
   };
 }
@@ -189,14 +194,28 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         status: 'queued',
       }];
       break;
+    case 'run.host.rebound': {
+      const binding = next.run?.hostBinding;
+      if (next.run?.runId !== event.runId || next.run.status !== 'waiting'
+        || binding?.hostInstanceId !== event.payload.previousBinding.hostInstanceId
+        || binding?.windowLabel !== event.payload.previousBinding.windowLabel) throw new Error('host_rebind_state_invalid');
+      next.run = { ...next.run, hostBinding: { ...event.payload.hostBinding } };
+      next.runToolViews = { ...next.runToolViews, [event.runId]: structuredClone(event.payload.toolView) };
+      break;
+    }
     case 'run.tools.prepared':
       assertRunningRun(next, event.runId, 'run_tool_view_run_not_active');
       next.runToolViews = { ...next.runToolViews, [event.runId]: structuredClone(event.payload.toolView) };
       break;
-    case 'input.accepted':
+    case 'input.accepted': {
       next.acceptedInputs = { ...next.acceptedInputs };
-      next.acceptedInputs[event.payload.commandId] = { messageId: event.payload.messageId };
+      const queued = next.queuedInputs.find(item => item.commandId === event.payload.commandId);
+      const interaction = queued?.interactionId ? next.interactions.find(item => item.interactionId === queued.interactionId) : undefined;
+      if (queued?.interactionId && (!interaction || interaction.status !== 'answered')) throw new Error('queued_interaction_response_missing');
+      next.acceptedInputs[event.payload.commandId] = { messageId: event.payload.messageId,
+        ...(interaction ? { replyToInteraction: { interactionId: interaction.interactionId, prompt: interaction.prompt } } : {}) };
       break;
+    }
     case 'session.permissions.updated':
       validatePermissionPatches(event.payload.patches);
       next.permissionOverrides = { ...next.permissionOverrides, ...event.payload.patches };
@@ -275,6 +294,8 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       }
       next.run = {
         runId: event.runId,
+        ...(event.payload.runtimeSnapshot.environment.hostBinding
+          ? { hostBinding: structuredClone(event.payload.runtimeSnapshot.environment.hostBinding) as unknown as NonNullable<RunProjection['hostBinding']> } : {}),
         status: 'running',
         workspaceBindings: event.payload.workspaceBindings.map((binding) => ({ ...binding })),
         profileId: event.payload.runtimeSnapshot.provider.profileId,
@@ -384,19 +405,22 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         SESSION_CONTROL_INTERACTION_REQUEST,
         event.sequence,
       );
-      next.pendingInteraction = {
+      if (next.interactions.some(item => item.interactionId === event.payload.interactionId)) throw new Error('interaction_duplicate');
+      next.interactions = [...next.interactions, {
         interactionId: event.payload.interactionId,
         runId: event.runId,
         callId: event.callId,
         kind: event.payload.kind,
         prompt: event.payload.prompt,
         allowFreeform: event.payload.allowFreeform,
+        ...(event.payload.mode ? { mode: event.payload.mode } : {}),
+        status: 'pending',
         ...(event.payload.options
           ? { options: event.payload.options.map((option) => ({ ...option })) }
           : {}),
         sequence: event.sequence,
         createdAt: event.occurredAt,
-      };
+      }];
       next.activities[interactionActivityId(event.payload.interactionId)] = {
         activityId: interactionActivityId(event.payload.interactionId),
         kind: 'interaction',
@@ -408,20 +432,24 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
       };
       break;
     case 'interaction.resolved': {
-      if (
-        !next.pendingInteraction
-        || next.pendingInteraction.interactionId !== event.payload.interactionId
-        || next.pendingInteraction.runId !== event.runId
-      ) throw new Error('interaction_request_missing');
+      const interaction = next.interactions.find(item => item.interactionId === event.payload.interactionId
+        && item.runId === event.runId && item.status === 'pending');
+      if (!interaction) throw new Error('interaction_request_missing');
       next.acceptedInputs = { ...next.acceptedInputs };
       const input = next.acceptedInputs[event.payload.commandId];
-      if (!input) throw new Error('interaction_response_input_missing');
-      next.acceptedInputs[event.payload.commandId] = { ...input, replyToInteraction: {
-        interactionId: next.pendingInteraction.interactionId, prompt: next.pendingInteraction.prompt,
+      const queued = next.queuedInputs.find(item => item.commandId === event.payload.commandId
+        && item.interactionId === interaction.interactionId && item.text === event.payload.response);
+      if (!input && !queued) throw new Error('interaction_response_input_missing');
+      if (input) next.acceptedInputs[event.payload.commandId] = { ...input, replyToInteraction: {
+        interactionId: interaction.interactionId, prompt: interaction.prompt,
       } };
-      next.pendingInteraction = null;
+      next.interactions = next.interactions.map(item => item === interaction
+        ? { ...item, status: 'answered', response: event.payload.response } : item);
       settleActivity(next, interactionActivityId(event.payload.interactionId), 'completed');
-      resumeRun(next, event.runId);
+      if (next.run?.status === 'waiting' && next.run.waitingReason === 'userInput'
+        && !next.interactions.some(item => item.runId === event.runId && item.status === 'pending' && item.mode !== 'continue')) {
+        resumeRun(next, event.runId);
+      }
       break;
     }
     case 'plan.published': {
@@ -548,6 +576,12 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         if (invalidatedPending) resumeRun(next, event.runId);
       }
       break;
+    case 'artifacts.presented': {
+      assertRunningRun(next, event.runId, 'artifact_presentation_run_not_active');
+      recordProviderCallFact(next, event.callId, event.runId, event.payload.providerCallId, 'artifact.present', event.sequence);
+      next.deliverables = advanceDeliverables(next, event);
+      break;
+    }
     case 'todo.updated': {
       assertRunningRun(next, event.runId, 'todo_run_not_active');
       if (Boolean(event.callId) !== Boolean(event.payload.providerCallId)) throw new Error('todo_call_identity_invalid');
@@ -1000,6 +1034,9 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         || next.runRuntimeReleases[event.runId]
         || !['running', 'waiting'].includes(next.run!.status)
       ) throw new Error('run_finishing_state_invalid');
+      if (event.payload.outcome === 'completed' && next.interactions.some(item => item.runId === event.runId && item.status === 'pending')) {
+        throw new Error('run_finishing_unanswered_interaction');
+      }
       next.pendingRunSettlements[event.runId] = cloneRunSettlement(event.payload);
       next.activePlanRef = null;
       next.run = {
@@ -1008,7 +1045,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         workspaceBindings: currentRunBindings(next, event.runId),
         profileId: requiredRunRuntimeSnapshot(next, event.runId).provider.profileId,
       };
-      next.pendingInteraction = null;
+      closeInteractions(next, event.runId);
       next.pendingApproval = null;
       break;
     case 'run.runtime.release_failed': {
@@ -1087,7 +1124,7 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
         workspaceBindings: currentRunBindings(next, event.runId),
         profileId: requiredRunRuntimeSnapshot(next, event.runId).provider.profileId,
       };
-      next.pendingInteraction = null;
+      closeInteractions(next, event.runId);
       next.pendingApproval = null;
       settleActivity(next, runActivityId(event.runId), event.payload.outcome);
       next.terminalError = event.payload.outcome === 'failed'
@@ -1099,8 +1136,12 @@ export function reduceSession(previous: SessionState, event: SessionEvent): Sess
   }
   if (next.run) {
     const provider = requiredRunRuntimeSnapshot(next, next.run.runId).provider;
+    // Lifecycle transitions preserve the explicitly selected GUI target.
+    const binding = event.type === 'run.started' || event.type === 'run.host.rebound'
+      ? next.run.hostBinding : previous.run?.hostBinding;
     next.run = {
       ...next.run,
+      ...(binding ? { hostBinding: { ...binding } } : {}),
       ...(provider.reasoningEffort ? { reasoningEffort: provider.reasoningEffort } : {}),
       ...(provider.thinking ? { thinking: provider.thinking } : {}),
     };
@@ -1134,8 +1175,7 @@ function sourceReferenceProjection(state: SessionState, content: string, request
     candidate.kind === 'finalMessage' && candidate.messageId === referenceId
     || candidate.kind === 'narrative' && candidate.narrativeId === referenceId
   ));
-  const sourceReferences = projectSourceReferences(content, block?.item);
-  return sourceReferences ? { sourceReferences } : {};
+  return projectSourceContent(content, block?.item);
 }
 
 export function projectSession(
@@ -1147,6 +1187,10 @@ export function projectSession(
     if (!activity.tool?.fileChanges?.length || !activity.tool.recordId) continue;
     const records = rounds.get(activity.runId) ?? [];
     records.push(activity.tool.recordId); rounds.set(activity.runId, records);
+  }
+  const draft = assistantDraft ? structuredClone(assistantDraft) : null;
+  for (const block of draft?.blocks ?? []) {
+    if (block.kind !== 'providerHosted') Object.assign(block, projectDraftSourceContent(block.content));
   }
   return {
     ...(Object.keys(state.providerAttempts).length ? { providerAttempts: Object.values(state.providerAttempts)
@@ -1179,8 +1223,9 @@ export function projectSession(
     narratives: state.narratives.map((narrative) => ({ ...narrative,
       ...sourceReferenceProjection(state, narrative.content, narrative.providerRequestId, narrative.narrativeId) })),
     timeline: projectTimeline(state),
-    assistantDraft: assistantDraft ? structuredClone(assistantDraft) : null,
-    pendingInteraction: cloneInteraction(state.pendingInteraction),
+    assistantDraft: draft,
+    interactions: state.interactions.map(item => cloneInteraction(item)!),
+    pendingInteraction: cloneInteraction(pendingInteraction(state)),
     pendingApproval: cloneApproval(state.pendingApproval),
     plans: state.plans.map((plan) => clonePlanProjection(plan)),
     activePlanRef: state.activePlanRef ? { ...state.activePlanRef } : null,
@@ -1201,6 +1246,7 @@ export function projectSession(
       .sort((left, right) => left.sequence - right.sequence)
       .map(cloneActivity),
     artifacts: Object.values(state.artifacts).map((artifact) => ({ ...artifact })),
+    deliverables: Object.values(state.deliverables).sort(compareDeliverables).map(item => ({ ...item })),
     terminalError: state.terminalError ? { ...state.terminalError } : null,
   };
 }
@@ -1223,6 +1269,7 @@ function currentRunBindings(state: SessionState, runId: string): WorkspaceBindin
 function cloneRun(run: NonNullable<SessionProjection['run']>): NonNullable<SessionProjection['run']> {
   return {
     ...run,
+    ...(run.hostBinding ? { hostBinding: { ...run.hostBinding } } : {}),
     workspaceBindings: run.workspaceBindings.map((binding) => ({ ...binding })),
   };
 }
@@ -1482,7 +1529,7 @@ function projectTimeline(state: SessionState): SessionProjection['timeline'] {
     }
     const toolActivities = orderedCallIds.flatMap((callId) => {
       const activity = Object.values(state.activities).find((candidate) => (
-        candidate.kind === 'tool' && candidate.callId === callId
+        (candidate.kind === 'tool' || candidate.kind === 'interaction') && candidate.callId === callId
       ));
       return activity ? [...approvalActivities(state, callId), activity] : [];
     });
@@ -1589,7 +1636,7 @@ function projectOrderedProviderTurnTimeline(
           break;
         }
         const activity = Object.values(state.activities).find((candidate) => (
-          candidate.kind === 'tool' && candidate.callId === block.callId
+          (candidate.kind === 'tool' || candidate.kind === 'interaction') && candidate.callId === block.callId
         ));
         if (activity) groupedActivities.push(...approvalActivities(state, block.callId), activity);
         break;
@@ -1663,6 +1710,19 @@ function projectPlan(
     createdAt: event.occurredAt,
     updatedAt: event.occurredAt,
   };
+}
+
+export function pendingInteraction(state: SessionState): SessionProjection['pendingInteraction'] {
+  const pending = state.interactions.filter(item => item.runId === state.run?.runId && item.status === 'pending');
+  return pending.find(item => item.mode !== 'continue') ?? pending[0] ?? null;
+}
+
+function closeInteractions(state: SessionState, runId: string): void {
+  state.interactions = state.interactions.map(item => item.runId === runId && item.status === 'pending'
+    ? { ...item, status: 'closed' } : item);
+  for (const item of state.interactions) {
+    if (item.runId === runId && item.status === 'closed') settleActivity(state, interactionActivityId(item.interactionId), 'cancelled');
+  }
 }
 
 function cloneInteraction(
@@ -2148,7 +2208,7 @@ function artifactsFromRecord(record: ToolExecutionRecord): ArtifactProjection[] 
   if (!Array.isArray(artifacts)) throw new ToolDetailProjectionError('tool_artifact_invalid');
   return artifacts.flatMap((candidate) => {
     if (!isRecord(candidate)) throw new ToolDetailProjectionError('tool_artifact_invalid');
-    const { artifactId, label, workspaceId, logicalPath, uri, contentType, contentMode, sourcePage } = candidate;
+    const { artifactId, label, workspaceId, logicalPath, uri, contentType, contentMode, sourcePage, modifiedAt, resourceKey } = candidate;
     if (typeof artifactId !== 'string' || !artifactId.trim() || typeof label !== 'string' || !label.trim()
       || typeof contentType !== 'string' || !contentType
       || !['fixed', 'live'].includes(String(contentMode))) throw new ToolDetailProjectionError('tool_artifact_invalid');
@@ -2168,6 +2228,8 @@ function artifactsFromRecord(record: ToolExecutionRecord): ArtifactProjection[] 
       createdAt: record.completedAt,
       contentType,
       contentMode: contentMode as 'fixed' | 'live',
+      ...(typeof modifiedAt === 'string' ? { modifiedAt } : {}),
+      ...(typeof resourceKey === 'string' ? { resourceKey } : {}),
       ...(isRecord(sourcePage) ? { sourcePage: structuredClone(sourcePage) as JsonObject } : {}),
       ...(typeof workspaceId === 'string' ? { workspaceId } : {}),
       ...(typeof logicalPath === 'string' ? { logicalPath } : {}),

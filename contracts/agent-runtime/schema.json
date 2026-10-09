@@ -92,7 +92,6 @@
         "catalogRevision": { "$ref": "#/$defs/Id" },
         "plugins": {
           "type": "array",
-          "maxItems": 16,
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -215,6 +214,7 @@
           "properties": {
             "kind": { "enum": ["narrative", "finalMessage", "message"] },
             "content": { "type": "string", "minLength": 1 },
+            "displayContent": { "type": "string" },
             "streamId": { "type": "string", "minLength": 1 },
             "outputIndex": { "type": "integer", "minimum": 0 }
           }
@@ -284,6 +284,18 @@
           "properties": {
             "role": {"enum": ["system", "user"]},
             "content": {"type": "string"},
+            "toolImages": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["callId", "artifactId"],
+                "properties": {
+                  "callId": {"$ref": "#/$defs/Id"},
+                  "artifactId": {"$ref": "#/$defs/Id"}
+                }
+              }
+            },
             "images": {
               "type": "array",
               "items": {
@@ -300,8 +312,11 @@
           },
           "anyOf": [
             {"properties": {"content": {"minLength": 1}}},
-            {"required": ["images"], "properties": {"images": {"minItems": 1}}}
-          ]
+            {"required": ["images"], "properties": {"images": {"minItems": 1}}},
+            {"required": ["toolImages"], "properties": {"toolImages": {"minItems": 1}}}
+          ],
+          "if": {"required": ["toolImages"]},
+          "then": {"properties": {"role": {"const": "user"}}}
         },
         {
           "type": "object",
@@ -341,8 +356,7 @@
             "role": {"const": "tool"},
             "content": {"type": "string"},
             "toolCallId": {"$ref": "#/$defs/Id"},
-            "providerCallId": {"$ref": "#/$defs/Id"},
-            "toolImages": {"type": "array", "items": {"$ref": "#/$defs/Id"}}
+            "providerCallId": {"$ref": "#/$defs/Id"}
           }
         }
       ]
@@ -535,7 +549,7 @@
           }
         },
         "tools": {"type": "array", "items": {"$ref": "#/$defs/PreparedToolDescriptor"}},
-        "toolPromptContributions": {"type": "array", "maxItems": 128, "items": {"$ref": "#/$defs/PreparedToolPromptContribution"}},
+        "toolPromptContributions": {"type": "array", "items": {"$ref": "#/$defs/PreparedToolPromptContribution"}},
         "providerToolAliases": {
           "type": "array",
           "items": {
@@ -1361,7 +1375,7 @@
         "commandId": {"$ref": "#/$defs/Id"},
         "messageId": {"$ref": "#/$defs/Id"},
         "text": {"type": "string"},
-        "pluginSelections": {"type": "array", "maxItems": 16, "items": {"$ref": "#/$defs/PluginSelectionInput"}},
+        "pluginSelections": {"type": "array", "items": {"$ref": "#/$defs/PluginSelectionInput"}},
         "guidanceReferences": {"type": "array", "items": {"$ref": "#/$defs/GuidanceReference"}}
       }
     },
@@ -1374,7 +1388,7 @@
         "role": {"enum": ["user", "assistant", "tool", "system"]},
         "content": {"type": "string"},
         "filesystemReferences": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/FilesystemReference"}},
-        "pluginSelections": {"type": "array", "maxItems": 16, "items": {"$ref": "#/$defs/PluginSelectionInput"}},
+        "pluginSelections": {"type": "array", "items": {"$ref": "#/$defs/PluginSelectionInput"}},
         "providerRequestId": {"$ref": "#/$defs/Id"},
         "guidanceReferences": {"type": "array", "items": {"$ref": "#/$defs/GuidanceReference"}}
       },
@@ -1410,38 +1424,110 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "interactionId", "runId", "callId", "kind", "prompt", "allowFreeform",
-        "sequence", "createdAt"
+        "interactionId",
+        "runId",
+        "callId",
+        "kind",
+        "prompt",
+        "allowFreeform",
+        "sequence",
+        "createdAt",
+        "status"
       ],
       "properties": {
-        "interactionId": { "$ref": "#/$defs/Id" },
-        "runId": { "$ref": "#/$defs/Id" },
-        "callId": { "$ref": "#/$defs/Id" },
-        "kind": { "enum": ["question", "confirmation"] },
-        "prompt": { "type": "string" },
+        "interactionId": {
+          "$ref": "#/$defs/Id"
+        },
+        "runId": {
+          "$ref": "#/$defs/Id"
+        },
+        "callId": {
+          "$ref": "#/$defs/Id"
+        },
+        "kind": {
+          "enum": [
+            "question",
+            "confirmation"
+          ]
+        },
+        "prompt": {
+          "type": "string"
+        },
         "options": {
           "type": "array",
-          "items": { "$ref": "#/$defs/InteractionOption" }
+          "items": {
+            "$ref": "#/$defs/InteractionOption"
+          }
         },
-        "allowFreeform": { "type": "boolean" },
-        "sequence": { "type": "integer", "minimum": 1 },
-        "createdAt": { "$ref": "#/$defs/Timestamp" }
+        "allowFreeform": {
+          "type": "boolean"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "createdAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "mode": {
+          "enum": [
+            "wait",
+            "continue"
+          ]
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "answered",
+            "closed"
+          ]
+        },
+        "response": {
+          "type": "string"
+        }
       }
     },
     "InteractionRequestedPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["interactionId", "providerCallId", "kind", "prompt", "allowFreeform"],
+      "required": [
+        "interactionId",
+        "providerCallId",
+        "kind",
+        "prompt",
+        "allowFreeform"
+      ],
       "properties": {
-        "interactionId": { "$ref": "#/$defs/Id" },
-        "providerCallId": { "$ref": "#/$defs/Id" },
-        "kind": { "enum": ["question", "confirmation"] },
-        "prompt": { "type": "string" },
+        "interactionId": {
+          "$ref": "#/$defs/Id"
+        },
+        "providerCallId": {
+          "$ref": "#/$defs/Id"
+        },
+        "kind": {
+          "enum": [
+            "question",
+            "confirmation"
+          ]
+        },
+        "prompt": {
+          "type": "string"
+        },
         "options": {
           "type": "array",
-          "items": { "$ref": "#/$defs/InteractionOption" }
+          "items": {
+            "$ref": "#/$defs/InteractionOption"
+          }
         },
-        "allowFreeform": { "type": "boolean" }
+        "allowFreeform": {
+          "type": "boolean"
+        },
+        "mode": {
+          "enum": [
+            "wait",
+            "continue"
+          ]
+        }
       }
     },
     "ProviderTurnSettledPayload": {
@@ -1518,8 +1604,9 @@
         "providerRequestId": {"$ref": "#/$defs/Id"},
         "role": {"enum": ["user", "assistant", "tool", "system"]},
         "content": {"type": "string"},
+        "displayContent": {"type": "string"},
         "filesystemReferences": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/FilesystemReference"}},
-        "pluginSelections": {"type": "array", "maxItems": 16, "items": {"$ref": "#/$defs/PluginSelectionInput"}},
+        "pluginSelections": {"type": "array", "items": {"$ref": "#/$defs/PluginSelectionInput"}},
         "feedback": {"enum": ["up", "down", null]},
         "sequence": {"type": "integer", "minimum": 1},
         "createdAt": {"$ref": "#/$defs/Timestamp"},
@@ -1549,6 +1636,7 @@
         "runId": {"$ref": "#/$defs/Id"},
         "providerRequestId": {"$ref": "#/$defs/Id"},
         "content": {"type": "string"},
+        "displayContent": {"type": "string"},
         "sequence": {"type": "integer", "minimum": 1},
         "createdAt": {"$ref": "#/$defs/Timestamp"},
         "sourceReferences": {"$ref": "#/$defs/SourceReferences"}
@@ -1566,6 +1654,14 @@
     },
     "ConversationCommand": {
       "oneOf": [
+        {"type": "object", "additionalProperties": false,
+          "required": ["schemaVersion", "type", "commandId", "sessionId", "runId", "expectedHostBinding", "hostBinding"],
+          "properties": {
+            "schemaVersion": {"const": "deepcode.command.v3"}, "type": {"const": "run.host.rebind"},
+            "commandId": {"$ref": "#/$defs/Id"}, "sessionId": {"$ref": "#/$defs/Id"}, "runId": {"$ref": "#/$defs/Id"},
+            "expectedHostBinding": {"$ref": "#/$defs/HostWindowBinding"}, "hostBinding": {"$ref": "#/$defs/HostWindowBinding"}
+          }
+        },
         {
           "type": "object",
           "additionalProperties": false,
@@ -1606,7 +1702,7 @@
                 "profileId": {"$ref": "#/$defs/Id"},
                 "filesystemReferences": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/FilesystemReference"}},
                 "pluginCatalogRevision": {"$ref": "#/$defs/Id"},
-                "pluginSelections": {"type": "array", "maxItems": 16, "items": {"$ref": "#/$defs/PluginSelectionInput"}},
+                "pluginSelections": {"type": "array", "items": {"$ref": "#/$defs/PluginSelectionInput"}},
                 "reasoningEffortOverride": {"oneOf": [{"type": "null"}, {"enum": ["low", "medium", "high", "xhigh", "max"]}]},
                 "guidanceReferences": {"type": "array", "items": {"$ref": "#/$defs/GuidanceReference"}},
                 "hostBinding": {
@@ -1640,7 +1736,7 @@
                 "profileId": {"$ref": "#/$defs/Id"},
                 "filesystemReferences": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/FilesystemReference"}},
                 "pluginCatalogRevision": {"$ref": "#/$defs/Id"},
-                "pluginSelections": {"type": "array", "maxItems": 16, "items": {"$ref": "#/$defs/PluginSelectionInput"}},
+                "pluginSelections": {"type": "array", "items": {"$ref": "#/$defs/PluginSelectionInput"}},
                 "reasoningEffortOverride": {"oneOf": [{"type": "null"}, {"enum": ["low", "medium", "high", "xhigh", "max"]}]},
                 "guidanceReferences": {"type": "array", "items": {"$ref": "#/$defs/GuidanceReference"}},
                 "hostBinding": {
@@ -1840,6 +1936,7 @@
             "input.queued",
             "run.started",
             "run.tools.prepared",
+            "run.host.rebound",
             "message.committed",
             "message.feedback.updated",
             "narrative.committed",
@@ -1863,6 +1960,7 @@
             "process.updated",
             "tool.completed",
             "session.plugins.activated",
+            "artifacts.presented",
             "session.control.rejected",
             "context.compaction.requested",
             "context.compacted",
@@ -1990,6 +2088,7 @@
                 "additionalProperties": false,
                 "required": ["commandId", "messageId", "text"],
                 "properties": {
+                  "interactionId": {"$ref": "#/$defs/Id"},
                   "commandId": {"$ref": "#/$defs/Id"},
                   "messageId": {"$ref": "#/$defs/Id"},
                   "text": {"type": "string"},
@@ -2010,6 +2109,17 @@
             "properties": {"payload": {"$ref": "#/$defs/RunStartedPayload"}},
             "required": ["runId"],
             "not": {"anyOf": [{"required": ["callId"]}]}
+          }
+        },
+        {
+          "if": {"properties": {"type": {"const": "run.host.rebound"}}},
+          "then": {
+            "properties": {"payload": {"type": "object", "additionalProperties": false,
+              "required": ["commandId", "previousBinding", "hostBinding", "toolView"],
+              "properties": {"commandId": {"$ref": "#/$defs/Id"}, "previousBinding": {"$ref": "#/$defs/HostWindowBinding"},
+                "hostBinding": {"$ref": "#/$defs/HostWindowBinding"}, "toolView": {"$ref": "#/$defs/PreparedRequestToolView"}}
+            }},
+            "required": ["runId"], "not": {"anyOf": [{"required": ["callId"]}]}
           }
         },
         {
@@ -2380,6 +2490,60 @@
           }
         },
         {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "artifacts.presented"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "runId",
+              "callId"
+            ],
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "providerCallId",
+                  "items"
+                ],
+                "properties": {
+                  "providerCallId": {
+                    "$ref": "#/$defs/Id"
+                  },
+                  "items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "artifactId",
+                        "label",
+                        "deliveryId"
+                      ],
+                      "properties": {
+                        "artifactId": {
+                          "$ref": "#/$defs/Id"
+                        },
+                        "label": {
+                          "$ref": "#/$defs/Id"
+                        },
+                        "deliveryId": {
+                          "$ref": "#/$defs/Id"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
           "if": {"properties": {"type": {"const": "session.plugins.activated"}}},
           "then": {
             "properties": {
@@ -2618,6 +2782,7 @@
         "narratives",
         "timeline",
         "assistantDraft",
+        "interactions",
         "pendingInteraction",
         "pendingApproval",
         "plans",
@@ -2631,6 +2796,7 @@
         "run",
         "activities",
         "artifacts",
+        "deliverables",
         "terminalError",
         "permissionOverrides",
         "effectivePermissions",
@@ -2649,6 +2815,7 @@
         "narratives": {"type": "array", "items": {"$ref": "#/$defs/NarrativeProjection"}},
         "timeline": {"type": "array", "items": {"$ref": "#/$defs/SessionTimelineItem"}},
         "assistantDraft": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/AssistantDraftProjection"}]},
+        "interactions": {"type":"array","items":{"$ref":"#/$defs/InteractionProjection"}},
         "pendingInteraction": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/InteractionProjection"}]},
         "pendingApproval": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/ApprovalProjection"}]},
         "plans": {"type": "array", "items": {"$ref": "#/$defs/PlanProjection"}},
@@ -2678,6 +2845,7 @@
         "run": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/RunProjection"}]},
         "activities": {"type": "array", "items": {"$ref": "#/$defs/ActivityProjection"}},
         "artifacts": {"type": "array", "items": {"$ref": "#/$defs/ArtifactProjection"}},
+        "deliverables": {"type":"array","items":{"$ref":"#/$defs/DeliverableProjection"}},
         "terminalError": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/LocalAgentError"}]},
         "permissionOverrides": {"$ref": "#/$defs/PermissionSettings"},
         "effectivePermissions": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/PermissionSettings"}]},
@@ -2724,11 +2892,17 @@
         }
       }
     },
+    "HostWindowBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["hostInstanceId", "windowLabel"],
+      "properties": {"hostInstanceId": {"$ref": "#/$defs/Id"}, "windowLabel": {"$ref": "#/$defs/Id"}}
+    },
     "RunProjection": {
       "type": "object",
       "additionalProperties": false,
       "required": ["runId", "profileId", "status", "workspaceBindings"],
       "properties": {
+        "hostBinding": {"$ref": "#/$defs/HostWindowBinding"},
         "runId": {"$ref": "#/$defs/Id"},
         "profileId": {"$ref": "#/$defs/Id"},
         "waitingReason": {"enum": ["approval", "userInput", "plan"]},
@@ -3064,7 +3238,7 @@
           }
         },
         "tools": {"type": "array", "items": {"$ref": "#/$defs/PreparedToolDescriptor"}},
-        "toolPromptContributions": {"type": "array", "maxItems": 128, "items": {"$ref": "#/$defs/PreparedToolPromptContribution"}},
+        "toolPromptContributions": {"type": "array", "items": {"$ref": "#/$defs/PreparedToolPromptContribution"}},
         "providerToolAliases": {
           "type": "array",
           "items": {
@@ -3392,17 +3566,55 @@
         "pluginSelections"
       ],
       "properties": {
-        "commandId": {"$ref": "#/$defs/Id"},
-        "messageId": {"$ref": "#/$defs/Id"},
-        "text": {"type": "string"},
-        "pluginCatalogRevision": {"$ref": "#/$defs/Id"},
-        "filesystemReferences": {"type": "array", "items": {"$ref": "#/$defs/FilesystemReference"}},
-        "pluginSelections": {"type": "array", "items": {"$ref": "#/$defs/PluginSelectionInput"}},
-        "guidanceReferences": {"type": "array", "items": {"$ref": "#/$defs/GuidanceReference"}},
-        "runId": {"$ref": "#/$defs/Id"},
-        "sequence": {"type": "integer", "minimum": 1},
-        "createdAt": {"$ref": "#/$defs/Timestamp"},
-        "status": {"enum": ["queued", "notApplied"]}
+        "commandId": {
+          "$ref": "#/$defs/Id"
+        },
+        "messageId": {
+          "$ref": "#/$defs/Id"
+        },
+        "text": {
+          "type": "string"
+        },
+        "pluginCatalogRevision": {
+          "$ref": "#/$defs/Id"
+        },
+        "filesystemReferences": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FilesystemReference"
+          }
+        },
+        "pluginSelections": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginSelectionInput"
+          }
+        },
+        "guidanceReferences": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GuidanceReference"
+          }
+        },
+        "runId": {
+          "$ref": "#/$defs/Id"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "createdAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "status": {
+          "enum": [
+            "queued",
+            "notApplied"
+          ]
+        },
+        "interactionId": {
+          "$ref": "#/$defs/Id"
+        }
       }
     },
     "ActivityResourceProjection": {
@@ -3581,21 +3793,152 @@
     "ArtifactProjection": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["artifactId", "label", "sessionId", "runId", "callId", "recordId", "contentType", "contentMode", "createdAt"],
+      "required": [
+        "artifactId",
+        "label",
+        "sessionId",
+        "runId",
+        "callId",
+        "recordId",
+        "contentType",
+        "contentMode",
+        "createdAt"
+      ],
       "properties": {
-        "artifactId": {"$ref": "#/$defs/Id"},
-        "label": {"type": "string"},
-        "sessionId": {"$ref": "#/$defs/Id"},
-        "runId": {"$ref": "#/$defs/Id"},
-        "callId": {"$ref": "#/$defs/Id"},
-        "recordId": {"$ref": "#/$defs/Id"},
-        "contentType": {"$ref": "#/$defs/Id"},
-        "contentMode": {"enum": ["fixed", "live"]},
-        "createdAt": {"$ref": "#/$defs/Timestamp"},
-        "sourcePage": {"$ref": "#/$defs/JsonObject"},
-        "workspaceId": {"$ref": "#/$defs/Id"},
-        "logicalPath": {"$ref": "#/$defs/Id"},
-        "uri": {"$ref": "#/$defs/Id"}
+        "artifactId": {
+          "$ref": "#/$defs/Id"
+        },
+        "label": {
+          "type": "string"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/Id"
+        },
+        "runId": {
+          "$ref": "#/$defs/Id"
+        },
+        "callId": {
+          "$ref": "#/$defs/Id"
+        },
+        "recordId": {
+          "$ref": "#/$defs/Id"
+        },
+        "contentType": {
+          "$ref": "#/$defs/Id"
+        },
+        "contentMode": {
+          "enum": [
+            "fixed",
+            "live"
+          ]
+        },
+        "createdAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "sourcePage": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/Id"
+        },
+        "logicalPath": {
+          "$ref": "#/$defs/Id"
+        },
+        "uri": {
+          "$ref": "#/$defs/Id"
+        },
+        "modifiedAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "resourceKey": {
+          "$ref": "#/$defs/Id"
+        }
+      }
+    },
+    "DeliverableProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifactId",
+        "label",
+        "sessionId",
+        "runId",
+        "callId",
+        "recordId",
+        "contentType",
+        "contentMode",
+        "createdAt",
+        "deliveryId",
+        "presentationRunId",
+        "presentedAt",
+        "updatedAt",
+        "sequence"
+      ],
+      "properties": {
+        "artifactId": {
+          "$ref": "#/$defs/Id"
+        },
+        "label": {
+          "type": "string"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/Id"
+        },
+        "runId": {
+          "$ref": "#/$defs/Id"
+        },
+        "callId": {
+          "$ref": "#/$defs/Id"
+        },
+        "recordId": {
+          "$ref": "#/$defs/Id"
+        },
+        "contentType": {
+          "$ref": "#/$defs/Id"
+        },
+        "contentMode": {
+          "enum": [
+            "fixed",
+            "live"
+          ]
+        },
+        "createdAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "sourcePage": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/Id"
+        },
+        "logicalPath": {
+          "$ref": "#/$defs/Id"
+        },
+        "uri": {
+          "$ref": "#/$defs/Id"
+        },
+        "modifiedAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "resourceKey": {
+          "$ref": "#/$defs/Id"
+        },
+        "deliveryId": {
+          "$ref": "#/$defs/Id"
+        },
+        "presentationRunId": {
+          "$ref": "#/$defs/Id"
+        },
+        "presentedAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "updatedAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        }
       }
     }
   }

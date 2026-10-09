@@ -20,6 +20,7 @@ type Source = {
   id?: string;
   path?: string;
   name?: string;
+  description?: string;
   command?: string;
   args?: string;
   enabled?: boolean;
@@ -521,7 +522,7 @@ export default function PluginsSection({ query = '' }: { query?: string }) {
           <button
             className="settings-button"
             disabled={busy}
-            onClick={() => setConnection({ name: '', command: '', args: '' })}
+            onClick={() => setConnection({ name: '', description: '', command: '', args: '' })}
           >
             {t(language, 'settings.plugins.addConnection')}
           </button>
@@ -605,6 +606,14 @@ function PluginConnectionForm({
           />
         </label>
       ))}
+      <label>
+        {t(language, 'settings.plugins.capabilities')}
+        <textarea
+          value={draft.description ?? ''}
+          placeholder={t(language, 'settings.plugins.capabilitiesPlaceholder')}
+          onChange={(event) => setDraft({ ...draft, description: event.target.value })}
+        />
+      </label>
       <button
         className="settings-button"
         disabled={

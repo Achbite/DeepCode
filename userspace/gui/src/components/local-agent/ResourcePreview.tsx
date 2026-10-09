@@ -1,3 +1,6 @@
+import ResizeHandle from '../shared/ResizeHandle';
+import { usePaneWidth } from '../shared/usePaneWidth';
+import { PANE_GEOMETRY, boundedPaneWidth } from '../shared/paneGeometry';
 import { readDocumentText } from './documentResources';
 import { UiRegion } from '../../ui-plugins/UiRegion';
 import { ResourceTree } from './ResourceTree';
@@ -34,6 +37,7 @@ import { useSettingsStore } from '../../state/settingsStore';
 import DeepCodeShellIcon from '../shared/DeepCodeShellIcon';
 import ProjectFolderDialog from '../workspace-open-dialog/ProjectFolderDialog';
 import './documentPreview.css';
+import type { ReaderNavigation } from './readerState';
 
 const DocumentPreview = lazy(() =>
   loadInterfaceModule(() => import('./DocumentPreview').then((module) => ({ default: module.DocumentPreview }))),
@@ -80,12 +84,12 @@ function tabName(tab: ReaderTab, language: UiLanguage): string {
 }
 
 /** View state owns open tabs; a collapsed panel keeps their content and native pages mounted. */
-export function useResourcePreview(sessionId: string | null) {
+export function useResourcePreview(sessionId: string | null, navigation?: ReaderNavigation) {
   const host = useConversationHost();
   const [state, setState] = useState<ReaderViewState>({ sessionId, tabs: [], activeId: null, visible: false, expanded: false });
   useInterfaceReloadView('reader', { ...state, tabs: state.tabs.map(tab => tab.page ? { ...tab, target: { kind: 'browser', previewId: tab.page.previewId } } : tab) });
   const [treeVisible, setTreeVisible] = useState(() => readViewState('file-tree', true));
-  const [width, setWidth] = useState(() => readViewState('panel-width', 55));
+  const [width, setWidth] = useState(() => readViewState<number>('panel-width', PANE_GEOMETRY.preview.initial));
   const [error, setError] = useState<string | null>(null);
   const [reviewEdit, setReviewEdit] = useState<(BrowserReviewEdit & { sessionId: string | null }) | null>(null);
   const bindings = useRef(new Map<string, NativeHostBinding>());
@@ -158,6 +162,20 @@ export function useResourcePreview(sessionId: string | null) {
     window.addEventListener(READER_OPEN_EVENT, listener);
     return () => window.removeEventListener(READER_OPEN_EVENT, listener);
   }, [sessionId, openTarget]);
+  const request = navigation?.request;
+  useEffect(() => {
+    if (!request || request.location.sessionId !== sessionId) return;
+    const { target, visible, expanded } = request.location;
+    if (target) selectTarget(target);
+    else saveViewState(sessionId + ':selection', null);
+    setState(old => ({ ...old, sessionId, activeId: target ? old.activeId : null, visible, expanded }));
+  }, [request, sessionId, selectTarget]);
+  const selectedTarget = live.tabs.find(tab => tab.id === live.activeId)?.target ?? null;
+  const onNavigationChange = navigation?.onChange;
+  useEffect(() => {
+    // Wait for this session's reader state to settle before reporting a location.
+    if (state.sessionId === sessionId) onNavigationChange?.({ sessionId, target: selectedTarget, visible: live.visible, expanded: live.expanded });
+  }, [sessionId, state.sessionId, selectedTarget, live.visible, live.expanded, onNavigationChange]);
   useEffect(() => {
     if (!sessionId || !hasNativeBrowser()) return;
     let ended = false;
@@ -214,6 +232,7 @@ export function useResourcePreview(sessionId: string | null) {
     openTarget({ kind: 'workspace', workspaceId, logicalPath, line: position?.line, column: position?.column });
   };
   const removeTab = (id: string) => {
+    navigation?.onTabClosed(sessionId, id);
     bindings.current.delete(id);
     setState((old) => {
       const tabs = old.tabs.filter((tab) => tab.id !== id);
@@ -247,7 +266,7 @@ export function useResourcePreview(sessionId: string | null) {
     }));
   };
   const resize = (value: number) => {
-    const next = Math.min(75, Math.max(30, value));
+    const next = boundedPaneWidth(value, PANE_GEOMETRY.preview.min, PANE_GEOMETRY.preview.max);
     setWidth(next);
     saveViewState('panel-width', next);
   };
@@ -304,19 +323,8 @@ export function ResourcePreview({
   const readerActions = { toggleTree: preview.toggleTree, toggleReaderExpanded: preview.expand,
     selectReaderTab: (id: string) => { if (preview.tabs.some(tab => tab.id === id)) preview.selectTab(id); } };
   const tabsId = useId();
-  const resizeHandle = useRef<HTMLDivElement | null>(null);
-  const resizePointer = useRef<number | null>(null);
-  const endResize = useCallback(() => {
-    const pointer = resizePointer.current;
-    resizePointer.current = null;
-    if (pointer !== null && resizeHandle.current?.hasPointerCapture(pointer)) resizeHandle.current.releasePointerCapture(pointer);
-    document.body.classList.remove('reader-resizing');
-  }, []);
-  useEffect(() => {
-    window.addEventListener('blur', endResize);
-    return () => { window.removeEventListener('blur', endResize); endResize(); };
-  }, [endResize]);
-  useEffect(() => { if (!preview.visible || preview.expanded) endResize(); }, [preview.visible, preview.expanded, endResize]);
+  const workspace = useRef<HTMLDivElement>(null);
+  const treeWidth = usePaneWidth('fileTreeWidth', PANE_GEOMETRY.fileTree, workspace);
   const tabs = (
         <header className="reader-tabs">
           <div
@@ -371,47 +379,19 @@ export function ResourcePreview({
           >
             <DeepCodeShellIcon name="plus" />
           </button>
+          <div className="reader-tabs__actions">
+            <UiRegion slot="reader.toolbar" data={readerData} actions={readerActions}>
+              <ReaderFileActions sessionId={preview.sessionId} target={preview.tabs.find(tab => tab.id === preview.activeId)?.target} language={language} />
+            </UiRegion>
+          </div>
         </header>
   );
   return (
     <>
-      {preview.visible && (
-        <div
-          className="reader-resize"
-          ref={resizeHandle}
-          role="separator"
-          tabIndex={0}
-          aria-label={chinese ? '调整预览宽度' : 'Resize preview'}
-          aria-orientation="vertical"
-          aria-valuemin={30}
-          aria-valuemax={75}
-          aria-valuenow={Math.round(preview.width)}
-          onPointerDown={(event) => {
-            if (event.button !== 0) return;
-            event.preventDefault();
-            document.getSelection()?.removeAllRanges();
-            document.body.classList.add('reader-resizing');
-            resizePointer.current = event.pointerId;
-            event.currentTarget.setPointerCapture(event.pointerId);
-          }}
-          onPointerUp={(event) => {
-            if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
-            endResize();
-          }}
-          onPointerCancel={endResize}
-          onLostPointerCapture={endResize}
-          onPointerMove={(event) => {
-            if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
-            const rect = event.currentTarget.parentElement!.getBoundingClientRect();
-            preview.resize(((rect.right - event.clientX) / rect.width) * 100);
-          }}
-          onKeyDown={(event) => {
-            if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
-              event.preventDefault();
-              preview.resize(preview.width + (event.key === 'ArrowLeft' ? 3 : -3));
-            }
-          }}
-        />
+      {preview.visible && !preview.expanded && (
+        <ResizeHandle className="reader-resize" label={chinese ? '调整预览宽度' : 'Resize preview'}
+          value={preview.width} min={PANE_GEOMETRY.preview.min} max={PANE_GEOMETRY.preview.max} step={PANE_GEOMETRY.preview.step}
+          direction={-1} onResize={preview.resize} pixelsPerUnit={element => element.parentElement!.getBoundingClientRect().width / 100} />
       )}
       <aside
         className="local-agent__reader"
@@ -424,8 +404,7 @@ export function ResourcePreview({
             {preview.error}
           </p>
         )}
-        <UiRegion slot="reader.toolbar" data={readerData} actions={readerActions}><ReaderFileHeader sessionId={preview.sessionId} target={preview.tabs.find(tab => tab.id === preview.activeId)?.target} language={language} treeVisible={preview.treeVisible} /></UiRegion>
-        <div className="reader-workspace"><UiRegion slot="reader.layout" data={readerData} actions={readerActions}>
+        <div className="reader-workspace" ref={workspace}><UiRegion slot="reader.layout" data={readerData} actions={readerActions}>
         <div className="reader-panes">
           {preview.tabs.map((tab, index) => (
             <div
@@ -452,7 +431,6 @@ export function ResourcePreview({
                     key={tab.target.kind === 'workspace' ? `${tab.id}:${tab.target.line ?? ''}:${tab.target.column ?? ''}` : tab.id}
                     sessionId={preview.sessionId}
                     target={tab.target as Exclude<ReaderTarget, { kind: 'browser' | 'diff' }>}
-                    active={preview.visible && preview.activeId === tab.id}
                     language={language}
                     openTarget={preview.openTarget}
                   />
@@ -468,7 +446,11 @@ export function ResourcePreview({
             />
           )}
         </div>
-        {preview.sessionId && <ResourceTree key={preview.sessionId} sessionId={preview.sessionId} visible={preview.visible && preview.treeVisible} activeTarget={preview.tabs.find(tab => tab.id === preview.activeId)?.target} language={language} openTarget={preview.openTarget} />}
+        {preview.sessionId && <div className="reader-tree-panel" hidden={!preview.visible || !preview.treeVisible} style={{ width: treeWidth.width }}>
+          {preview.visible && preview.treeVisible && <ResizeHandle className="reader-tree-resize" label={chinese ? '调整文件树宽度' : 'Resize file tree'}
+            value={treeWidth.width} min={treeWidth.min} max={treeWidth.max} step={PANE_GEOMETRY.fileTree.step}
+            direction={-1} onResize={treeWidth.setWidth} />}
+          <ResourceTree key={preview.sessionId} sessionId={preview.sessionId} visible={preview.visible && preview.treeVisible} activeTarget={preview.tabs.find(tab => tab.id === preview.activeId)?.target} language={language} openTarget={preview.openTarget} /></div>}
         </UiRegion></div>
       </aside>
     </>
@@ -612,14 +594,12 @@ function ReaderStart({
 }
 
 function ReaderDocument({
-  active,
   sessionId,
   target,
   language,
   openTarget,
 }: {
   sessionId: string;
-  active: boolean;
   target: Exclude<ReaderTarget, { kind: 'browser' | 'diff' }>;
   language: UiLanguage;
   openTarget(target: ReaderTarget): void;
@@ -641,20 +621,22 @@ function ReaderDocument({
   const columnOffset = state.status === 'text' && sourceLine && sourceColumn && startByte === undefined
     ? Math.min(sourceColumn - 1, state.result.content.split('\n', 1)[0].length)
     : undefined;
-  useEffect(() => { setStartByte(undefined); }, [target]);
+  useEffect(() => { setStartByte(undefined); }, [key]);
   const reference = targetResource(target);
   const referenceId = reference && resourceKey(reference);
   const [watchError, setWatchError] = useState('');
   useEffect(() => {
-    if (!active || !reference) return;
+    if (!reference) return;
     const controller = new AbortController();
     setWatchError('');
+    // Keep the subscription for the lifetime of the open tab. Its ready event
+    // starts the first read after the watch is installed, closing the read/watch gap.
     void host.resources.watchResources(sessionId, [reference], controller.signal, () => setRevision(value => value + 1))
       .catch(error => { if (!controller.signal.aborted) setWatchError(String(error)); });
     return () => controller.abort();
-  }, [sessionId, active, referenceId, host]);
+  }, [sessionId, referenceId, host]);
   useEffect(() => {
-    if (!active) return;
+    if (reference && revision === 0) return;
     const controller = new AbortController();
     setState({ status: 'loading' });
     void (async () => {
@@ -707,7 +689,9 @@ function ReaderDocument({
       if (!controller.signal.aborted) setState({ status: 'error', error: String(reason) });
     });
     return () => controller.abort();
-  }, [sessionId, target, host, path, startByte, sourceLine, revision, active]);
+  // Reselecting the same file may create a new target object; only its resource
+  // identity/location or an explicit revision changes the content being read.
+  }, [sessionId, key, host, path, startByte, sourceLine, revision]);
   useEffect(() => {
     if (scroll.current) scroll.current.scrollTop = sourceLine ? 0 : readViewState(key + ':scroll', 0);
   }, [key, state.status, sourceLine]);
@@ -846,15 +830,12 @@ function targetResource(target: ReaderTarget): ResourceReference | undefined {
   }
 }
 
-function ReaderFileHeader({ sessionId, target, language, treeVisible }: {
-  sessionId: string | null; target?: ReaderTarget; language: UiLanguage; treeVisible: boolean;
+function ReaderFileActions({ sessionId, target, language }: {
+  sessionId: string | null; target?: ReaderTarget; language: UiLanguage;
 }) {
   const host = useConversationHost();
   const [error, setError] = useState('');
   const menu = useRef<HTMLDetailsElement>(null);
-  const name = !target || target.kind === 'browser' ? '' : target.kind === 'diff' ? readerFilename(target.file.path)
-    : target.kind === 'resource' ? target.name : target.kind === 'workspace' ? readerFilename(target.logicalPath)
-    : target.kind === 'file' ? readerFilename(target.path) : target.artifact.label;
   const open = async (action: 'code' | 'folder') => {
     if (!sessionId || !target) return;
     if (menu.current) menu.current.open = false;
@@ -868,20 +849,19 @@ function ReaderFileHeader({ sessionId, target, language, treeVisible }: {
     } catch (error) { setError(String(error)); }
   };
   useEffect(() => setError(''), [target]);
-  return <>
-    <div className="reader-file-header">
-      <strong title={name}>{name}</strong>
-      {treeVisible && <span className="reader-file-header__tree-title">{language === 'zh-CN' ? '文件' : 'Files'}</span>}
-      <details className="reader-external-open" ref={menu} data-native-overlay onKeyDown={event => {
+  if (!sessionId || !target || target.kind === 'browser' || target.kind === 'artifact') return null;
+  return <div className="reader-file-actions">
+      <details className="reader-external-open" ref={menu} data-native-overlay onBlur={event => {
+        if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false;
+      }} onKeyDown={event => {
         if (event.key === 'Escape') { event.stopPropagation(); event.currentTarget.open = false; event.currentTarget.querySelector('summary')?.focus(); }
       }}>
-        <summary>{language === 'zh-CN' ? '打开' : 'Open'} <DeepCodeShellIcon name="chevronDown" /></summary>
+        <summary aria-label={language === 'zh-CN' ? '文件打开方式' : 'Open file with'}>{language === 'zh-CN' ? '打开' : 'Open'} <DeepCodeShellIcon name="chevronDown" /></summary>
         <div role="menu">
-          <button role="menuitem" disabled={!target || target.kind === 'browser' || target.kind === 'artifact'} onClick={() => void open('code')}>{language === 'zh-CN' ? '在 VS Code 中打开' : 'Open in VS Code'}</button>
-          <button role="menuitem" disabled={!target || target.kind === 'browser' || target.kind === 'artifact'} onClick={() => void open('folder')}>{language === 'zh-CN' ? '打开所在文件夹' : 'Show in folder'}</button>
+          <button role="menuitem" onClick={() => void open('code')}>{language === 'zh-CN' ? '在 VS Code 中打开' : 'Open in VS Code'}</button>
+          <button role="menuitem" onClick={() => void open('folder')}>{language === 'zh-CN' ? '打开所在文件夹' : 'Show in folder'}</button>
         </div>
       </details>
-    </div>
-    {error && <p role="alert" className="local-agent__resource-error">{error}</p>}
-  </>;
+    {error && <p role="alert" className="reader-file-actions__error local-agent__resource-error" data-native-overlay>{error}</p>}
+  </div>;
 }

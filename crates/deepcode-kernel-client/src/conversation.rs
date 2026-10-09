@@ -178,6 +178,7 @@ pub struct SessionProjection {
     pub queued_inputs: Vec<QueuedInputProjection>,
     pub narratives: Vec<NarrativeProjection>,
     pub assistant_draft: Option<AssistantDraftProjection>,
+    pub interactions: Vec<InteractionProjection>,
     pub pending_interaction: Option<InteractionProjection>,
     pub pending_approval: Option<ApprovalProjection>,
     pub plans: Vec<PlanProjection>,
@@ -193,6 +194,7 @@ pub struct SessionProjection {
     #[serde(default)]
     pub file_change_rounds: Vec<FileChangeRound>,
     pub artifacts: Vec<ArtifactProjection>,
+    pub deliverables: Vec<DeliverableProjection>,
     pub terminal_error: Option<ConversationError>,
     #[serde(default)]
     pub provider_attempts: Vec<ProviderAttemptProjection>,
@@ -202,6 +204,7 @@ pub struct SessionProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueuedInputProjection {
+    pub interaction_id: Option<String>,
     pub guidance_references: Option<Vec<GuidanceReference>>,
     pub plugin_catalog_revision: Option<String>,
     pub command_id: String,
@@ -420,10 +423,19 @@ impl SessionProjection {
             return Err("shared Session projection has invalid narratives".to_string());
         }
         if self
-            .pending_interaction
-            .as_ref()
-            .is_some_and(|interaction| {
+            .interactions
+            .iter()
+            .chain(self.pending_interaction.iter())
+            .any(|interaction| {
                 !matches!(interaction.kind.as_str(), "question" | "confirmation")
+                    || !matches!(
+                        interaction.status.as_str(),
+                        "pending" | "answered" | "closed"
+                    )
+                    || interaction
+                        .mode
+                        .as_deref()
+                        .is_some_and(|mode| !matches!(mode, "wait" | "continue"))
                     || interaction.interaction_id.is_empty()
                     || interaction.run_id.is_empty()
                     || interaction.call_id.is_empty()
@@ -611,7 +623,7 @@ impl SessionProjection {
                 || !activity_ids.insert(activity.activity_id.as_str())
                 || !matches!(
                     activity.kind.as_str(),
-                    "run" | "tool" | "providerHosted" | "approval" | "plan" | "interaction"
+                    "run" | "tool" | "providerHosted" | "approval" | "interaction" | "plan"
                 )
                 || !matches!(
                     activity.status.as_str(),
@@ -806,7 +818,7 @@ impl SessionProjection {
                                     activity.activity_id != *activity_id
                                         || !matches!(
                                             activity.kind.as_str(),
-                                            "tool" | "providerHosted" | "approval"
+                                            "tool" | "providerHosted" | "approval" | "interaction"
                                         )
                                 })
                         })
@@ -830,7 +842,7 @@ impl SessionProjection {
                     .filter(|activity| {
                         matches!(
                             activity.kind.as_str(),
-                            "tool" | "providerHosted" | "approval"
+                            "tool" | "providerHosted" | "approval" | "interaction"
                         )
                     })
                     .count()
@@ -1145,6 +1157,7 @@ pub struct ProjectionMessage {
     pub provider_request_id: Option<String>,
     pub role: String,
     pub content: String,
+    pub display_content: Option<String>,
     pub source_references: Option<SourceReferences>,
     pub filesystem_references: Vec<FilesystemReference>,
     pub plugin_selections: Vec<PluginSelectionInput>,
@@ -1152,6 +1165,12 @@ pub struct ProjectionMessage {
     pub sequence: u64,
     pub created_at: String,
     pub reply_to_interaction: Option<InteractionReplyContext>,
+}
+
+impl ProjectionMessage {
+    pub fn display_text(&self) -> &str {
+        self.display_content.as_deref().unwrap_or(&self.content)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1262,9 +1281,16 @@ pub struct NarrativeProjection {
     pub run_id: String,
     pub provider_request_id: String,
     pub content: String,
+    pub display_content: Option<String>,
     pub source_references: Option<SourceReferences>,
     pub sequence: u64,
     pub created_at: String,
+}
+
+impl NarrativeProjection {
+    pub fn display_text(&self) -> &str {
+        self.display_content.as_deref().unwrap_or(&self.content)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1333,6 +1359,8 @@ pub enum AssistantDraftBlockProjection {
         #[serde(rename = "streamId")]
         stream_id: String,
         content: String,
+        #[serde(rename = "displayContent")]
+        display_content: Option<String>,
     },
     #[serde(rename = "finalMessage")]
     FinalMessage {
@@ -1341,6 +1369,8 @@ pub enum AssistantDraftBlockProjection {
         #[serde(rename = "streamId")]
         stream_id: String,
         content: String,
+        #[serde(rename = "displayContent")]
+        display_content: Option<String>,
     },
     #[serde(rename = "message")]
     Message {
@@ -1349,6 +1379,8 @@ pub enum AssistantDraftBlockProjection {
         #[serde(rename = "streamId")]
         stream_id: String,
         content: String,
+        #[serde(rename = "displayContent")]
+        display_content: Option<String>,
     },
     #[serde(rename = "providerHosted")]
     ProviderHosted {
@@ -1376,14 +1408,23 @@ impl AssistantDraftBlockProjection {
     pub fn text(&self) -> Option<(&str, &str)> {
         match self {
             Self::Narrative {
-                stream_id, content, ..
+                stream_id,
+                content,
+                display_content,
+                ..
             }
             | Self::FinalMessage {
-                stream_id, content, ..
+                stream_id,
+                content,
+                display_content,
+                ..
             }
             | Self::Message {
-                stream_id, content, ..
-            } => Some((stream_id, content)),
+                stream_id,
+                content,
+                display_content,
+                ..
+            } => Some((stream_id, display_content.as_deref().unwrap_or(content))),
             Self::ProviderHosted { .. } => None,
         }
     }
@@ -1426,6 +1467,9 @@ pub struct InteractionOption {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InteractionProjection {
+    pub mode: Option<String>,
+    pub status: String,
+    pub response: Option<String>,
     pub interaction_id: String,
     pub run_id: String,
     pub call_id: String,
@@ -1727,12 +1771,20 @@ pub struct ContextCompositionTool {
 #[serde(rename_all = "camelCase")]
 pub struct RunProjection {
     pub run_id: String,
+    pub host_binding: Option<HostWindowBinding>,
     pub profile_id: String,
     pub reasoning_effort: Option<String>,
     pub thinking: Option<String>,
     pub waiting_reason: Option<String>,
     pub workspace_bindings: Vec<WorkspaceBindingDisplay>,
     pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostWindowBinding {
+    pub host_instance_id: String,
+    pub window_label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1894,12 +1946,26 @@ pub struct ArtifactProjection {
     pub content_type: String,
     pub content_mode: String,
     pub created_at: String,
+    pub modified_at: Option<String>,
+    pub resource_key: Option<String>,
     pub source_page: Option<serde_json::Value>,
     pub artifact_id: String,
     pub label: String,
     pub workspace_id: Option<String>,
     pub logical_path: Option<String>,
     pub uri: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliverableProjection {
+    #[serde(flatten)]
+    pub artifact: ArtifactProjection,
+    pub delivery_id: String,
+    pub presentation_run_id: String,
+    pub presented_at: String,
+    pub updated_at: String,
+    pub sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2559,8 +2625,10 @@ mod tests {
                 }
             }],
             "artifacts": [],
+            "deliverables": [],
             "terminalError": null
         });
+        value["interactions"] = json!([]);
         value["queuedInputs"] = json!([]);
         value["timeline"] = json!([
             {
@@ -2610,6 +2678,39 @@ mod tests {
             projection.activities[0].call_id.as_deref(),
             Some("call:read")
         );
+    }
+
+    #[test]
+    fn explicit_deliverables_decode_without_reclassifying_archived_resources() {
+        let mut value = projection_value();
+        let resource = json!({
+            "sessionId":"session:test", "runId":"run:test", "callId":"call:prepare", "recordId":"record:prepare",
+            "artifactId":"artifact:report", "label":"Report", "uri":"artifact://artifact:report",
+            "contentType":"text/markdown", "contentMode":"fixed", "createdAt":"2026-10-09T01:00:00Z",
+            "modifiedAt":"2026-10-09T00:59:00Z", "resourceKey":"file:report"
+        });
+        value["artifacts"] = json!([resource]);
+        let mut delivery = resource.clone();
+        delivery.as_object_mut().unwrap().extend(
+            json!({
+                "deliveryId":"delivery:report", "presentationRunId":"run:test", "sequence":9,
+                "presentedAt":"2026-10-09T01:01:00Z", "updatedAt":"2026-10-09T00:59:00Z"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        value["deliverables"] = json!([delivery]);
+        let projection: SessionProjection = serde_json::from_value(value.clone()).unwrap();
+        projection.validate().unwrap();
+        assert_eq!(projection.deliverables[0].artifact, projection.artifacts[0]);
+        assert_eq!(projection.deliverables[0].delivery_id, "delivery:report");
+        value["deliverables"] = json!([]);
+        let unpresented: SessionProjection = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(unpresented.artifacts.len(), 1);
+        assert!(unpresented.deliverables.is_empty());
+        value.as_object_mut().unwrap().remove("deliverables");
+        assert!(serde_json::from_value::<SessionProjection>(value).is_err());
     }
 
     #[test]

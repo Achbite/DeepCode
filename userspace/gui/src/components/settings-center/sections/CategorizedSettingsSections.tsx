@@ -14,7 +14,7 @@ import GuiAppearanceSettings from '../GuiAppearanceSettings';
 import SettingsField from '../SettingsField';
 import WorkspaceSandboxSettings from './WorkspaceSandboxSettings';
 import DocumentEnvironmentSettings from './DocumentEnvironmentSettings';
-import FileOpeningSettings from './FileOpeningSettings';
+import FileOpeningSettings, { FILE_READING_KEYS } from './FileOpeningSettings';
 import CommandDenylistSettings from './CommandDenylistSettings';
 import { matchesSettingsQuery } from '../settingsSearch';
 
@@ -81,7 +81,7 @@ function definitionsFor(
 export function settingsSearchDefinitions(language: ReturnType<typeof normalizeUiLanguage>, os: unknown) {
   const available = [...guiDefinitions(), ...agentSettingDefinitions()];
   const groups = {
-    general: ['workbench.language', 'gui.defaultFileOpen'],
+    general: ['workbench.language', ...FILE_READING_KEYS],
     gui: [...APPEARANCE_KEYS, ...INTERFACE_KEYS.filter((key) => key !== 'workbench.language')],
     agent: [...AGENT_INSTRUCTION_KEYS, ...AGENT_RESPONSE_KEYS],
     environment: [...(os === 'windows' ? AGENT_SHELL_KEYS : []), 'agent.documents.pythonPath'],

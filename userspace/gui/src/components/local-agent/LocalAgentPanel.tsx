@@ -18,6 +18,7 @@ import { ConversationTranscript } from './ConversationTranscript';
 import { ReaderControls, ResourcePreview, useResourcePreview } from './ResourcePreview';
 import { ArtifactLinks } from './ArtifactLinks';
 import './localAgentPanel.css';
+import type { ReaderNavigation } from './readerState';
 
 export interface ConversationReaderLayout {
   visible: boolean;
@@ -29,9 +30,10 @@ interface LocalAgentPanelProps {
   mode?: 'panel' | 'workbench';
   headerTarget?: HTMLElement | null;
   onReaderLayoutChange?: (layout: ConversationReaderLayout) => void;
+  readerNavigation?: ReaderNavigation;
 }
 
-const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', headerTarget, onReaderLayoutChange }) => {
+const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', headerTarget, onReaderLayoutChange, readerNavigation }) => {
   const effectiveSettings = useSettingsStore((state) => state.effectiveSettings);
   const showReasoning = effectiveSettings['gui.showReasoning'] === true;
   const language = normalizeUiLanguage(effectiveSettings['workbench.language']);
@@ -95,7 +97,7 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
   });
   const { bodyRef, bodyHandlers, showJumpToLatest, scrollToLatest } = viewport;
   const composer = useAgentComposer(language, viewport.setLatestFollowMode);
-  const resourcePreview = useResourcePreview(sessionId);
+  const resourcePreview = useResourcePreview(sessionId, readerNavigation);
   const [readerHeader, setReaderHeader] = useState<HTMLDivElement | null>(null);
   const [conversationBounds, setConversationBounds] = useState<HTMLDivElement | null>(null);
   const readerLayout = { '--reader-width': `${resourcePreview.width}%` } as React.CSSProperties;
@@ -138,7 +140,6 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
       <div ref={bodyRef} className="local-agent__body" aria-live="polite" {...bodyHandlers}>
         <ConversationTranscript
           displaySettledRunIds={display.displaySettledRunIds}
-          artifacts={display.artifacts}
           onDisplayed={display.onDisplayed}
           showReasoning={showReasoning}
           language={language}

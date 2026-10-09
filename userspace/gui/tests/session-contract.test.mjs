@@ -28,6 +28,61 @@ import {
   waitUntil,
 } from '../../session-core/tests/local-agent-fixtures.mjs';
 
+test('Pane resizing follows the grabbed edge and stops at the usable width limits', async t => {
+  const { PANE_GEOMETRY, resizedPaneWidth, boundedPaneWidth } = await loadGuiModule(t, '/src/components/shared/paneGeometry.ts');
+  const nav = PANE_GEOMETRY.navigation;
+  const tree = PANE_GEOMETRY.fileTree;
+  assert.equal(resizedPaneWidth(nav.initial, 60, 1, 1, nav.min, nav.max), 304, 'moving the left navigation edge right widens it');
+  assert.equal(resizedPaneWidth(tree.initial, -60, -1, 1, tree.min, tree.max), 270, 'moving the right tree edge left widens it');
+  assert.equal(resizedPaneWidth(nav.initial, -1000, 1, 1, nav.min, nav.max), nav.min);
+  assert.equal(resizedPaneWidth(tree.initial, -1000, -1, 1, tree.min, tree.max), tree.max);
+  assert.equal(boundedPaneWidth(360, tree.min, 240), 240, 'a narrower reader retains room for the document');
+  assert.equal(resizedPaneWidth(240, 32, -1, 1, tree.min, 240), 208, 'a subsequent drag starts at the displayed width');
+});
+
+test('Preview resizing uses its container width for percentage units', async t => {
+  const { PANE_GEOMETRY, resizedPaneWidth } = await loadGuiModule(t, '/src/components/shared/paneGeometry.ts');
+  const preview = PANE_GEOMETRY.preview;
+  assert.equal(resizedPaneWidth(55, -120, -1, 12, preview.min, preview.max), 65, '120px in a 1200px workspace adds ten percentage points');
+  assert.equal(resizedPaneWidth(55, 120, -1, 12, preview.min, preview.max), 45);
+  assert.equal(resizedPaneWidth(55, -1200, -1, 12, preview.min, preview.max), 75);
+});
+
+test('Workbench view history deduplicates locations and branches after navigating back', async (t) => {
+  const { visitLocation, locationKey } = await loadGuiModule(t, '/src/deepcode-gui/layout/navigationHistory.ts');
+  const conversation = { sessionId: 'session:view', draftProjectId: null, settingsOpen: false,
+    reader: { sessionId: 'session:view', target: null, visible: false, expanded: false } };
+  const file = { ...conversation, reader: { ...conversation.reader, visible: true,
+    target: { kind: 'workspace', workspaceId: 'workspace:view', logicalPath: 'main.ts', line: 12 } } };
+  const settings = { ...file, settingsOpen: true };
+  let history = visitLocation({ entries: [], cursor: -1 }, conversation);
+  history = visitLocation(history, file);
+  assert.equal(visitLocation(history, { ...file }), history);
+  history = visitLocation(history, settings);
+  history = visitLocation({ ...history, cursor: 1 }, { ...conversation, draftProjectId: 'project:new', sessionId: null,
+    reader: { ...conversation.reader, sessionId: null } });
+  assert.equal(history.cursor, 2);
+  assert.equal(history.entries.length, 3);
+  assert.equal(history.entries[1], file);
+  assert.equal(history.entries[2].settingsOpen, false);
+  assert.equal(history.entries[2].draftProjectId, 'project:new');
+  assert.notEqual(locationKey(file), locationKey({ ...file, reader: { ...file.reader, target: { ...file.reader.target, line: 40 } } }));
+});
+
+test('Workbench history cannot reactivate a closed native browser page', async (t) => {
+  const { visitLocation, forgetClosedBrowser } = await loadGuiModule(t, '/src/deepcode-gui/layout/navigationHistory.ts');
+  const conversation = { sessionId: 'session:view', draftProjectId: null, settingsOpen: false,
+    reader: { sessionId: 'session:view', target: null, visible: true, expanded: false } };
+  const browser = { ...conversation, reader: { ...conversation.reader, target: { kind: 'browser', previewId: 'page:closed' } } };
+  const file = { ...conversation, reader: { ...conversation.reader, target: { kind: 'file', path: '/workspace/main.ts' } } };
+  let history = [conversation, browser, file].reduce(visitLocation, { entries: [], cursor: -1 });
+  assert.equal(forgetClosedBrowser(history, 'session:other', 'browser:page:closed'), history);
+  history = forgetClosedBrowser(history, 'session:view', 'browser:page:closed');
+  assert.deepEqual(history.entries, [conversation, file]);
+  assert.equal(history.cursor, 1);
+  assert.equal(forgetClosedBrowser(history, 'session:view', 'file:/workspace/main.ts'), history);
+});
+
 test('Shell history diagnostics are read without applying current execution policy', async (t) => {
   const { isShellExecutionEnvironment } = await loadGuiModule(t, '/src/services/shellActivityCodec.ts');
   const environment = {
@@ -365,7 +420,7 @@ test('document Plan scope and completed artifacts pass through Session to the GU
     documentRecord = reply.record;
     return reply;
   } });
-  const actor = actorWith(journal, sessionId, provider, kernel, fakeRunPreparation({ tools: [tool] }).port, 'document-artifact');
+  const actor = actorWith(journal, sessionId, provider, kernel, fakeRunPreparation({ tools: [tool], contextWindowTokens: 8192 }).port, 'document-artifact');
   t.after(() => actor.dispose());
   await actor.submit(messageCommand(sessionId, 'command:document-start', 'Render a report.'));
   const waiting = await waitForProjection(actor, (value) => value.pendingPlan !== null);
@@ -451,6 +506,54 @@ test('sidebar order uses the shared settings store and failed saves retain the s
   assert.equal(await reloaded.getState().patchUserSetting(SIDEBAR_ORDER_SETTING, '{"projects":[],"sessions":[]}'), null);
   assert.match(reloaded.getState().errorMessage, /settings write failed/);
   assert.deepEqual(readSidebarOrder(reloaded.getState().effectiveSettings[SIDEBAR_ORDER_SETTING]), order);
+});
+
+test('runtime file visibility is a searchable shared GUI preference and failed saves retain its value', async (t) => {
+  const [{ useSettingsStore, shellPreferenceSettingDefinitions }, { GuiSettingsSection, settingsSearchDefinitions }] = await loadGuiModules(t, [
+    '/src/state/settingsStore.ts', '/src/components/settings-center/sections/CategorizedSettingsSections.tsx',
+  ]);
+  const key = 'gui.showRuntimeFiles';
+  const definition = shellPreferenceSettingDefinitions('gui').find(item => item.key === key);
+  assert.equal(definition.control, 'boolean');
+  assert.deepEqual(definition.catalog.shellSurface, ['gui']);
+  let persisted = { 'workbench.language': 'en-US', 'gui.defaultFileOpen': 'reader' };
+  let fail = false;
+  installGuiFetch(t, (url, init) => {
+    assert.equal(url.pathname, '/api/user-settings');
+    if (init.method === 'PATCH') {
+      const { patches } = JSON.parse(init.body);
+      assert.deepEqual(Object.keys(patches), [key]);
+      if (fail) return Response.json({ ok: false, message: 'settings write failed' });
+      persisted = { ...persisted, ...patches };
+      return Response.json({ ok: true, data: { settings: persisted, changedKeys: [key], activation: 'immediate' } });
+    }
+    return Response.json({ ok: true, data: { settings: persisted, runtimeSettings: persisted, overriddenKeys: Object.keys(persisted), storePath: '/test/user-settings.json' } });
+  });
+  await useSettingsStore.getState().loadUserSettings();
+  assert.equal(useSettingsStore.getState().effectiveSettings[key], false);
+  assert.equal(await useSettingsStore.getState().patchUserSetting(key, true), 'immediate');
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const initial = useSettingsStore.getInitialState();
+  const original = initial.effectiveSettings;
+  t.after(() => { initial.effectiveSettings = original; });
+  initial.effectiveSettings = useSettingsStore.getState().effectiveSettings;
+  const html = renderToStaticMarkup(createElement(GuiSettingsSection, { category: 'general', query: 'runtime', apiStatus: 'ready' }));
+  assert.match(html, /aria-label="Show runtime files"[^>]*checked=""/);
+  assert.doesNotMatch(html, /aria-label="Open text files with"/);
+  for (const [language, label] of [['zh-CN', '显示运行环境文件'], ['en-US', 'Show runtime files']]) {
+    const search = settingsSearchDefinitions(language, 'macos').find(item => item.id === key);
+    assert.equal(search.category, 'general');
+    assert.equal(search.title, label);
+  }
+  const { useSettingsStore: reloaded } = await loadGuiModule(t, '/src/state/settingsStore.ts');
+  await reloaded.getState().loadUserSettings();
+  assert.equal(reloaded.getState().effectiveSettings[key], true);
+  assert.equal(reloaded.getState().effectiveSettings['gui.defaultFileOpen'], 'reader');
+  fail = true;
+  assert.equal(await reloaded.getState().patchUserSetting(key, false), null);
+  assert.equal(reloaded.getState().effectiveSettings[key], true);
+  assert.match(reloaded.getState().errorMessage, /settings write failed/);
 });
 
 test('native path selection preserves OS paths, cancellation and dialog errors', async (t) => {
@@ -1272,13 +1375,14 @@ test('draft model choices remember per-model effort and preserve saved preferenc
   await reopened.getState().refreshProfiles();
   assert.equal(reopened.getState().reasoningEffortOverride, 'high');
   assert.equal(reopened.getState().profiles.find(profile => profile.id === 'profile:two').reasoningEffort, 'low');
-  assert.equal(await reopened.getState().selectModel('profile:one', null), false);
-  assert.equal(reopened.getState().reasoningEffortOverride, 'high');
+  assert.equal(await reopened.getState().selectModel('profile:one', null), true);
+  assert.equal(reopened.getState().reasoningEffortOverride, null, 'inheritance remains an absent Session override');
+  assert.equal(profiles[0].reasoningEffort, 'high', 'inheriting does not erase the configured Profile effort');
   failSave = true;
   assert.equal(await reopened.getState().selectModel('profile:one', 'max'), false);
   assert.match(reopened.getState().error, /fixture_preference_save_failed/);
   assert.equal(profiles[0].reasoningEffort, 'high');
-  assert.equal(reopened.getState().reasoningEffortOverride, 'high');
+  assert.equal(reopened.getState().reasoningEffortOverride, null, 'failed explicit selection preserves inheritance');
   assert.equal(reopened.getState().modelSettingsBusy, false);
   failSave = false;
   assert.equal(await reopened.getState().selectModel('profile:off', null), true);
@@ -1317,6 +1421,11 @@ test('composer accepts inherited effort and never enables a new run with a blank
   store.getState().startNewSession('project:another');
   render();
   assert.equal(composer.canSend, true);
+  store.setState({ selectedProfileId: 'profile:one', reasoningEffortOverride: null,
+    sessionId: 'session:from-cli', projection: { plans: [], modelSettings: { profileId: 'profile:one', reasoningEffortOverride: null } } });
+  assert.match(render(), /One · 高/);
+  assert.equal(composer.canSend, true, 'a CLI Session can inherit its configured Profile without a GUI-only confirmation');
+  assert.equal(store.getState().reasoningEffortOverride, null, 'rendering must not manufacture a Session override');
   store.setState({ selectedProfileId: 'profile:two', reasoningEffortOverride: null,
     sessionId: 'session:existing', projection: { plans: [], modelSettings: { profileId: 'profile:two', reasoningEffortOverride: null } } });
   assert.match(render(), /Two · 选择强度/);
@@ -1598,6 +1707,22 @@ test('virtual rows preserve measured height, reading layout and per-session pres
   assert.match(markup(other), /closed/, 'another session never inherits it');
 });
 
+test('Markdown keeps archived artifact links and image sources in streaming and final answers', async (t) => {
+  const { StreamingMarkdownParser } = await loadGuiModule(t, '/src/components/local-agent/streamingMarkdown.ts');
+  const artifact = 'artifact://artifact:session:review:attempt:final';
+  const source = `[Report](${artifact})\n\n![Review image](${artifact})\n\n[Unsafe](javascript:alert)\n\n![Workspace image](workspace://workspace:review/review.png)`;
+  const parser = new StreamingMarkdownParser();
+  for (const streaming of [true, false]) {
+    const references = [];
+    const visit = node => {
+      if (node.type === 'element' && ['a', 'img'].includes(node.tagName)) references.push([node.tagName, node.properties.href ?? node.properties.src]);
+      node.children?.forEach(visit);
+    };
+    parser.update(source, streaming).forEach(block => visit(block.tree));
+    assert.deepEqual(references, [['a', artifact], ['img', artifact], ['a', ''], ['img', 'workspace://workspace:review/review.png']]);
+  }
+});
+
 test('completed Markdown is reused across remounts while changed and streaming text stay current', async (t) => {
   const { StreamingMarkdownParser } = await loadGuiModule(t, '/src/components/local-agent/streamingMarkdown.ts');
   const text = '# Cached answer\n\nA **completed** paragraph.';
@@ -1721,7 +1846,7 @@ test('tool rows accumulate across adjacent requests without crossing message or 
   const { projectionItems } = await loadGuiModule(t, '/src/components/local-agent/conversationItems.ts');
   const activities = [1, 2, 3, 4].map((id) => ({ activityId: `a${id}`, runId: id === 4 ? 'run:two' : 'run:one' }));
   const group = (id) => ({ kind: 'toolGroup', timelineId: `group:${id}`, sequence: id, activityIds: [`a${id}`] });
-  const projection = { activities, narratives: [], plans: [], messages: [{ messageId: 'message:boundary', runId: 'run:one', role: 'user' }], timeline: [group(1), group(2), { kind: 'message', sequence: 3, messageId: 'message:boundary' }, group(3), group(4)] };
+  const projection = { interactions: [], activities, narratives: [], plans: [], messages: [{ messageId: 'message:boundary', runId: 'run:one', role: 'user' }], timeline: [group(1), group(2), { kind: 'message', sequence: 3, messageId: 'message:boundary' }, group(3), group(4)] };
   const items = projectionItems(projection);
   assert.deepEqual(items.map((item) => item.type), ['toolGroup', 'message', 'toolGroup', 'toolGroup']);
   assert.equal(items[0].groupId, 'group:1');
@@ -2497,8 +2622,9 @@ test('composer submission receipts preserve newer text and retain the complete f
 
 test('artifact delivery waits for final text display and keeps historical or interrupted output available', async (t) => {
   const { conversationDisplay } = await loadGuiModule(t, '/src/components/local-agent/conversationDisplay.ts');
-  const artifacts = [{ artifactId: 'image:old', runId: 'run:old' }, { artifactId: 'image:new', runId: 'run:new' }];
-  const projection = { run: { runId: 'run:new', status: 'running' }, messages: [], timeline: [], artifacts,
+  const artifacts = [{ artifactId: 'image:old', runId: 'run:old', presentationRunId: 'run:old' }, { artifactId: 'image:new', runId: 'run:new', presentationRunId: 'run:new' }];
+  const resources = [...artifacts, { artifactId: 'image:observation', runId: 'run:old' }];
+  const projection = { run: { runId: 'run:new', status: 'running' }, messages: [], timeline: [], artifacts: resources, deliverables: artifacts,
     assistantDraft: { runId: 'run:new', blocks: [{ content: 'Still writing' }] } };
   const live = new Set(['run:new']);
   const shown = new Map();
@@ -2517,7 +2643,7 @@ test('artifact delivery waits for final text display and keeps historical or int
   assert.deepEqual(conversationDisplay(committed, new Set(), new Map()).artifacts, artifacts, 'settled history does not replay a reveal animation');
   const interrupted = { ...projection, assistantDraft: null, run: { ...projection.run, status: 'cancelled' } };
   assert.deepEqual(conversationDisplay(interrupted, live, shown).artifacts, artifacts, 'actual output is retained after cancellation without a final answer');
-  assert.deepEqual(projection.artifacts, artifacts, 'presentation cannot remove canonical artifacts');
+  assert.deepEqual(projection.artifacts, resources, 'observations remain archived without becoming deliverables');
 });
 
 test('pending approvals replace ordinary input while preserving its draft for return', async (t) => {
@@ -3288,22 +3414,30 @@ test('startup opens a new draft even when history exists, and status failure doe
 });
 
 
-test('usage widget dismisses details on outside pointerdown without closing on internal actions', async (t) => {
+test('usage widget preserves outside dismissal and docks collapsed dragging to the nearest edge', async (t) => {
   const { default: plugin } = await import('../src/ui-plugins/builtinUsage.mjs');
   const { usageWidgetLabels } = await loadGuiModule(t, '/src/ui-plugins/usageWidgetLabels.ts');
   class Element {
     children = []; dataset = {}; hidden = false; attrs = {}; clientWidth = 800; clientHeight = 600;
+    listeners = new Map(); captures = new Set();
     style = { setProperty() {} };
     append(...children) { for (const child of children) { child.parentElement = this; this.children.push(child); } }
     replaceChildren() { this.children = []; }
     setAttribute(key, value) { this.attrs[key] = value; }
-    addEventListener() {}
+    addEventListener(type, listener) { this.listeners.set(type, listener); }
+    closest(selector) { return selector === '[data-usage-drag]' && 'usageDrag' in this.dataset ? this : this.parentElement?.closest(selector); }
+    setPointerCapture(id) { this.captures.add(id); }
+    hasPointerCapture(id) { return this.captures.has(id); }
+    releasePointerCapture(id) { this.captures.delete(id); }
     contains(target) { return this === target || this.children.some(child => child.contains(target)); }
     querySelectorAll(selector) {
       const classes = selector.split(',').map(value => value.slice(1));
       return this.children.flatMap(child => [...(classes.includes(child.className) ? [child] : []), ...child.querySelectorAll(selector)]);
     }
-    getBoundingClientRect() { return { left: 0, top: 0, width: 200, height: 80 }; }
+    getBoundingClientRect() {
+      const collapsed = this.children.some(child => child.className === 'dc-usage__handle');
+      return { left: parseFloat(this.style.left) || 0, top: parseFloat(this.style.top) || 0, width: collapsed ? 18 : 200, height: collapsed ? 28 : 80 };
+    }
     remove() { this.parentElement.children = this.parentElement.children.filter(child => child !== this); }
   }
   const listeners = new Map();
@@ -3329,10 +3463,13 @@ test('usage widget dismisses details on outside pointerdown without closing on i
     labels: usageWidgetLabels('zh-CN'), costDisplay: { currency: 'USD', usdRate: 1 },
     connection: { id: 'connection:quota', name: 'Codex', billingMode: 'subscription' } };
   let reads = 0;
+  const actions = {
+    setExpanded(value) { changes.push(value); input = { ...input, expanded: value }; view.update(input); },
+    setUsageVisibility() { assert.fail('outside dismissal must not hide the summary or change its preference'); },
+  };
   view = mount(container, input, { signal: new AbortController().signal,
     quota: { async read() { reads++; return { windows: [{ label: 'Codex', usedPercent: 21, windowDurationSeconds: 300 }] }; } },
-    actions: { setExpanded(value) { changes.push(value); input = { ...input, expanded: value }; view.update(input); },
-      setUsageVisibility() { assert.fail('outside dismissal must not hide the summary or change its preference'); } },
+    actions,
   });
   await Promise.resolve();
   const root = container.children[0];
@@ -3366,6 +3503,56 @@ test('usage widget dismisses details on outside pointerdown without closing on i
   root.querySelectorAll('.dc-usage__body')[0].onclick();
   listeners.get('keydown').listener({ key: 'Escape' });
   assert.equal(root.querySelectorAll('.dc-usage__details').length, 0);
+
+  const visibilityChanges = [];
+  actions.setUsageVisibility = visibility => {
+    visibilityChanges.push(visibility); input = { ...input, visibility }; view.update(input);
+  };
+  input = { ...input, visibility: 'collapsed' }; view.update(input);
+  let handle = root.querySelectorAll('.dc-usage__handle')[0];
+  const before = root.getBoundingClientRect();
+  const down = (x, y) => root.listeners.get('pointerdown')({ target: handle, button: 0, isPrimary: true, pointerId: 1, clientX: x, clientY: y });
+  down(before.left + 9, before.top + 14);
+  listeners.get('pointermove').listener({ pointerId: 1, clientX: before.left - 591, clientY: before.top - 86, preventDefault() {} });
+  assert.equal(parseFloat(root.style.left), before.left - 600, 'collapsed handle follows the pointer before release');
+  listeners.get('pointerup').listener({ pointerId: 1 });
+  assert.equal(parseFloat(root.style.left), 0, 'release near the left edge docks left');
+  assert.equal(parseFloat(root.style.top), before.top - 100, 'collapsed handle moves vertically');
+  assert.equal(handle.textContent, '›', 'left-docked handle points into the panel');
+  assert.equal(root.captures.size, 0, 'ending a drag releases pointer capture');
+  let blocked = false;
+  root.listeners.get('click')({ detail: 1, preventDefault() { blocked = true; }, stopPropagation() {} });
+  if (!blocked) handle.onclick();
+  assert.equal(blocked, true, 'drag completion must not expand the handle');
+  assert.deepEqual(visibilityChanges, []);
+
+  const moved = root.getBoundingClientRect();
+  down(moved.left + 9, moved.top + 14);
+  blocked = false;
+  root.listeners.get('click')({ detail: 1, preventDefault() { blocked = true; }, stopPropagation() {} });
+  if (!blocked) handle.onclick();
+  assert.deepEqual(visibilityChanges, ['summary'], 'a subsequent ordinary click still expands');
+  assert.equal(parseFloat(root.style.left), 8, 'left-docked form expands inside the panel');
+  input = { ...input, visibility: 'collapsed' }; view.update(input);
+  handle = root.querySelectorAll('.dc-usage__handle')[0];
+  assert.equal(parseFloat(root.style.left), 0, 'collapsing keeps the chosen edge');
+  root.listeners.get('keydown')({ target: handle, key: 'ArrowRight', preventDefault() {} });
+  assert.equal(parseFloat(root.style.left), 782, 'keyboard movement can select the right edge');
+  root.listeners.get('keydown')({ target: handle, key: 'ArrowUp', preventDefault() {} });
+  assert.equal(parseFloat(root.style.top), moved.top - 10, 'keyboard vertical movement keeps the edge');
+  const right = root.getBoundingClientRect();
+  down(right.left + 9, right.top + 14);
+  listeners.get('pointermove').listener({ pointerId: 1, clientX: right.left - 191, clientY: right.top + 54, preventDefault() {} });
+  listeners.get('pointerup').listener({ pointerId: 1 });
+  assert.equal(parseFloat(root.style.left), 782, 'release near the right edge docks right');
+  assert.equal(parseFloat(root.style.top), right.top + 40, 'docking preserves the chosen height');
+  assert.equal(handle.textContent, '‹', 'right-docked handle points into the panel');
+  down(0, 0);
+  listeners.get('pointermove').listener({ pointerId: 1, clientX: -2000, clientY: -2000, preventDefault() {} });
+  listeners.get('pointercancel').listener({ pointerId: 1 });
+  assert.equal(parseFloat(root.style.left), 0);
+  assert.equal(parseFloat(root.style.top), 8, 'movement stays inside the existing boundary');
+  assert.equal(root.captures.size, 0, 'cancelling a drag releases pointer capture');
   view.dispose(); disposed = true;
   assert.equal(listeners.size, 0, 'capture listeners and existing drag listeners are all removed');
   assert.equal(container.children.length, 0);
@@ -3639,6 +3826,43 @@ test('failure details count retries within each model request and retain source 
   assert.match(source, /href="https:\/\/example.test\/docs"/);
   assert.match(source, /Actual documentation/);
   assert.match(source, /部分引用来源未返回/);
+});
+
+test('GUI consumes Session citation display, keeps original facts, and settles on displayed text', async (t) => {
+  const journal = new InMemoryCommandJournal();
+  const sessionId = 'session:gui-citations';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const raw = '网页来源。\uE200cite\uE202turn0search0\uE201 本地 [源码](/workspace/src/main.rs:42)。';
+  const native = { type: 'message', id: 'native:citations', role: 'assistant', phase: 'final_answer', status: 'completed',
+    content: [{ type: 'output_text', text: raw, annotations: [{ type: 'url_citation',
+      title: '真实网页', url: 'https://example.test/article', start_index: 5, end_index: raw.indexOf(' 本地') }] }] };
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    yield providerEvent(request.requestId, 'text.delta', { outputIndex: 0, text: raw });
+    yield providerEvent(request.requestId, 'output.item.completed', { outputIndex: 0, item: native });
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel(), fakeRunPreparation({ apiSurface: 'responses' }).port, 'gui-citations');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:citations', 'Explain with sources.'));
+  const projection = await decodeGuiProjection(await waitForProjection(actor, value => value.run?.status === 'completed'));
+  const message = projection.messages.find(value => value.role === 'assistant');
+  assert.equal(message.content, raw);
+  const { projectCommittedText } = await import('../../presentation-core/dist/index.js');
+  const text = projectCommittedText(projection).get(`message:${message.messageId}:content`).text;
+  assert.equal(text, message.displayContent);
+  assert.match(text, /\[真实网页\]\(<https:\/\/example.test\/article>\)/u);
+  assert.match(text, /\[源码\]\(\/workspace\/src\/main.rs:42\)/u);
+  assert.doesNotMatch(text, /turn0search0|\uE200/u);
+  const [{ MarkdownContent }, { conversationDisplay }] = await loadGuiModules(t, [
+    '/src/components/local-agent/BufferedMarkdown.tsx', '/src/components/local-agent/conversationDisplay.ts',
+  ]);
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const html = renderToStaticMarkup(createElement(MarkdownContent, null, text));
+  assert.match(html, /href="https:\/\/example.test\/article"/u);
+  const stream = projection.timeline.find(value => value.kind === 'message' && value.messageId === message.messageId).streamId;
+  const live = new Set([message.runId]);
+  assert.equal(conversationDisplay(projection, live, new Map([[stream, raw]])).displaySettledRunIds.has(message.runId), false);
+  assert.equal(conversationDisplay(projection, live, new Map([[stream, text]])).displaySettledRunIds.has(message.runId), true);
 });
 
 test('workbench control examples use region data and Host actions while retaining Reader content', async t => {

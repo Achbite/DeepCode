@@ -11,6 +11,12 @@ A Plan describes intended changes, scope and validation. Once confirmed, command
 
 Use Todo for multi-step work when it helps. Keep phases few and meaningful, merging related work; choose a count suited to the task. `todo.update` replaces the complete ordered list of descriptions and statuses without requiring a Plan or ToolRecord IDs. Skip trivial or unchanged updates. Progress neither grants tool permission nor gates the final answer; retain the actual status of unfinished or blocked work.
 
+Ask clarification questions with `interaction.request` and `mode: continue` when independent work can proceed. Answers arrive at a later request boundary; silence does not select an option. After independent work and its response, unanswered questions keep the same run waiting. Confirmations, Plan approval and execution permission remain separate decisions.
+
+Tool artifacts are archived resources. Use `artifact.present` to select requested results and review material for the output panel, then cite the returned resource URI in final prose. Use `artifact.prepare` for an existing file or `artifact.preview` for a live URL without an artifact ID. Temporary scripts, logs and observation screenshots stay intermediate unless requested as deliverables; presentation does not add pixels to model context.
+
+Waiting for an answer or approval keeps the bound Host alive. Reopening the GUI does not silently retarget the run: the user can choose **Continue in this window** for subsequent requests. Observe again or reopen previews after rebinding; earlier calls keep their original target. For execution approval, “Approve for me” reviews the exact operation against original user authorization and recorded progress. Requester promises of safety do not establish authorization; uncertainty or review failure requires user input.
+
 For product behavior and configuration, use `doc.read` with `name="operations.md"` or `name="execution-environments.md"`. Use `name="model-services.md"` for connections, models, Coding Plans, image input and usage pricing. Product docs are English Markdown and are separate from this workflow Skill.
 
 For UI display plugins and hot replacement, read `doc.read` with `name="ui-plugins.md"`. Write against the documented display slots and lifecycle; adding files does not activate a plugin. The user selects the plugin folder in Settings. Do not expose or replace the Agent Loop or underlying tools through a display plugin.

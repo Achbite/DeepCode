@@ -37,6 +37,7 @@ import {
   SESSION_CONTROL_PLAN_PUBLISH,
   SESSION_CONTROL_TODO_UPDATE,
   SESSION_CONTROL_PLUGIN_ACTIVATE,
+  SESSION_CONTROL_ARTIFACT_PRESENT,
 } from '@deepcode/protocol';
 import { createProviderToolAliases } from './providerToolCodec.js';
 import { LoopFailure, errorFact } from './loopFailure.js';
@@ -454,6 +455,7 @@ export class HttpRunPreparationPort extends LocalAgentHttpPort implements RunPre
             planPublish: wireName(SESSION_CONTROL_PLAN_PUBLISH),
             todoUpdate: wireName(SESSION_CONTROL_TODO_UPDATE),
             pluginActivate: wireName(SESSION_CONTROL_PLUGIN_ACTIVATE),
+            artifactPresent: wireName(SESSION_CONTROL_ARTIFACT_PRESENT),
           })],
           tools,
           toolPromptContributions: toolPromptContributions as PreparedToolPromptContribution[],
@@ -558,7 +560,6 @@ function decodeSelectedPluginSnapshot(
     !isExactRecord(value, ['catalogRevision', 'plugins'])
     || !isNonEmptyText(value.catalogRevision)
     || !Array.isArray(value.plugins)
-    || value.plugins.length > 16
   ) throw new Error('selected_plugin_snapshot_invalid');
   const seen = new Set<string>();
   const plugins = value.plugins.map((plugin) => {

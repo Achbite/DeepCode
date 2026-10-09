@@ -12,13 +12,15 @@ const css = `
 .dc-usage__details,.dc-usage__menu {position:absolute;box-sizing:border-box;overflow:auto;background:var(--dc-surface-raised);border:1px solid var(--dc-border);box-shadow:0 6px 24px #00000010;border-radius:12px;padding:14px;width:260px;max-width:calc(var(--dc-usage-boundary-width) - 32px)}
 .dc-usage__line {display:flex;justify-content:space-between;gap:12px;margin:10px 0}.dc-usage__menu {width:180px;padding:5px}.dc-usage__menu button {display:block;width:100%}
 .dc-usage__chart {height:28px;display:flex;gap:3px;align-items:end;margin-top:14px}.dc-usage__chart i{flex:1;background:var(--dc-accent);opacity:.6;min-height:1px;border-radius:2px}
-.dc-usage__error {color:var(--dc-danger);overflow-wrap:anywhere}.dc-usage__handle{background:var(--dc-surface-raised)!important;border:1px solid var(--dc-border)!important;border-radius:8px 0 0 8px!important}
+.dc-usage__error {color:var(--dc-danger);overflow-wrap:anywhere}.dc-usage__handle{display:flex;align-items:center;justify-content:center;width:var(--dc-usage-handle-width,18px);height:var(--dc-usage-handle-height,28px);padding:0!important;background:var(--dc-surface-raised)!important;border:1px solid var(--dc-border)!important;border-radius:var(--dc-radius-control) 0 0 var(--dc-radius-control)!important}
+.dc-usage[data-dock='left'] .dc-usage__handle {border-radius:0 var(--dc-radius-control) var(--dc-radius-control) 0!important}
+.dc-usage[data-dragging] .dc-usage__handle {border-radius:var(--dc-radius-control)!important}
 `;
 export default { apply(context) {
   context.addStyle(css);
   context.register('usage.widget', (container, initial, scope) => {
     let input = initial, request, requestKey = '', data = null, error = '', loading = false, menu = false, timer;
-    let position = null, drag = null, suppressClick = false;
+    let position = null, drag = null, suppressClick = false, dock = 'right';
     const root = document.createElement('section'); root.className = 'dc-usage'; container.append(root);
     const text = key => input.labels[key];
     const node = (tag, content, cls) => { const el = document.createElement(tag); if (content != null) el.textContent = content; if(cls) el.className = cls; return el; };
@@ -32,10 +34,15 @@ export default { apply(context) {
       const width = container.clientWidth, height = container.clientHeight;
       root.style.setProperty('--dc-usage-boundary-width', `${width}px`);
       const box = root.getBoundingClientRect();
-      // Keep the summary's vertical center when docking to the page edge.
+      // The compact handle docks at an edge; the summary opens into the panel.
       position ??= { x: width - box.width - 16, centerY: height - 16 - box.height / 2 };
-      const x = input.visibility === 'collapsed' ? width - box.width : clamp(position.x, 8, width - box.width - 8);
+      const docked = input.visibility === 'collapsed' && !drag?.started;
+      const x = docked ? dock === 'left' ? 0 : width - box.width : clamp(position.x, 8, width - box.width - 8);
       const y = clamp(position.centerY - box.height / 2, 8, height - box.height - 8);
+      if (docked) position.x = x;
+      root.dataset.dock = dock;
+      const handle = root.querySelectorAll('.dc-usage__handle')[0];
+      if (handle) handle.textContent = dock === 'left' ? '›' : '‹';
       root.style.left = `${x}px`; root.style.top = `${y}px`;
       for (const panel of root.querySelectorAll('.dc-usage__details,.dc-usage__menu')) {
         panel.style.maxHeight = `${Math.max(0, height - 16)}px`;
@@ -66,8 +73,14 @@ export default { apply(context) {
     };
     const endDrag = event => {
       if (!drag || event.pointerId !== drag.id) return;
+      const moved = drag.started;
       drag = null; delete root.dataset.dragging;
       if (root.hasPointerCapture(event.pointerId)) root.releasePointerCapture(event.pointerId);
+      if (moved && input.visibility === 'collapsed') {
+        const box = root.getBoundingClientRect();
+        dock = position.x + box.width / 2 < container.clientWidth / 2 ? 'left' : 'right';
+        place();
+      }
     };
     const cancelDrag = () => { if (drag) endDrag({ pointerId: drag.id }); };
     root.addEventListener('lostpointercapture', endDrag);
@@ -79,6 +92,7 @@ export default { apply(context) {
       const offset = { ArrowLeft: [-1,0], ArrowRight: [1,0], ArrowUp: [0,-1], ArrowDown: [0,1] }[event.key];
       if (!offset || !position) return;
       event.preventDefault(); const step = event.shiftKey ? 40 : 10;
+      if (input.visibility === 'collapsed' && offset[0]) dock = offset[0] < 0 ? 'left' : 'right';
       const box = root.getBoundingClientRect(), bounds = container.getBoundingClientRect();
       position = { x: clamp(box.left - bounds.left + offset[0] * step, 8, container.clientWidth - box.width - 8),
         centerY: clamp(box.top - bounds.top + box.height / 2 + offset[1] * step, box.height / 2 + 8, container.clientHeight - box.height / 2 - 8) };
@@ -96,7 +110,7 @@ export default { apply(context) {
       root.oncontextmenu = event => {event.preventDefault();menu=true;render();};
       if(menu) { const box=node('div',null,'dc-usage__menu');box.setAttribute('role','menu');box.dataset.nativeOverlay='';
         box.append(button(text('settings'),()=>{menu=false;render();scope.actions.openUsageSettings();}),button(text('hide'),()=>{menu=false;scope.actions.setUsageVisibility('hidden');}));root.append(box); }
-      if(input.visibility === 'collapsed') { const el=button('‹',()=>scope.actions.setUsageVisibility('summary'),'dc-usage__handle');el.setAttribute('aria-label',text('show'));root.append(el);place();return; }
+      if(input.visibility === 'collapsed') { const el=button('‹',()=>scope.actions.setUsageVisibility('summary'),'dc-usage__handle');el.dataset.usageDrag='';el.setAttribute('aria-label',text('show'));root.append(el);place();return; }
       const plan = input.connection.billingMode === 'subscription';
       const windows = plan && data?.windows ? [...data.windows].sort((a,b)=>b.windowDurationSeconds-a.windowDurationSeconds) : [];
       const totals = !plan && data?.totals;

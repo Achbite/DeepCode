@@ -231,6 +231,11 @@ function decodeCommand(value: unknown): ConversationCommand {
         || value.feedback !== null && value.feedback !== 'up' && value.feedback !== 'down'
       ) throw new Error('conversation_command_invalid');
       return value as unknown as ConversationCommand;
+    case 'run.host.rebind':
+      if (!hasExactKeys(value, ['schemaVersion', 'type', 'commandId', 'sessionId', 'runId', 'expectedHostBinding', 'hostBinding'])
+        || !validId(value.runId) || !value.expectedHostBinding || !value.hostBinding
+        || !validHostBinding(value.expectedHostBinding) || !validHostBinding(value.hostBinding)) throw new Error('conversation_command_invalid');
+      return value as unknown as ConversationCommand;
     case 'run.cancel':
       if (
         !hasExactKeys(value, [
@@ -372,7 +377,7 @@ function validGuidanceReferences(value:unknown):boolean {
 
 function validPluginSelections(revision: unknown, value: unknown): boolean {
   if (value === undefined) return revision === undefined || validId(revision);
-  if (!Array.isArray(value) || value.length > 16) return false;
+  if (!Array.isArray(value)) return false;
   if (value.length === 0) return revision === undefined || validId(revision);
   if (!validId(revision)) return false;
   const selectionIds = new Set<string>();

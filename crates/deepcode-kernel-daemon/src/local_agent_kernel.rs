@@ -2301,7 +2301,6 @@ struct PreparedEffect {
 impl PreparedEffect {
     fn agent_can_review(&self) -> bool {
         self.permissions.shell == ShellApprovalMode::Review
-            && self.operation != "computer.control"
             && self.command_rule().is_none_or(|rule| rule == "allow")
     }
 
@@ -4355,7 +4354,7 @@ mod attempt_control_tests {
             "observation:closed",
         )
         .unwrap_err();
-        assert_eq!(error, "native_browser_page_closed: preview-closed");
+        assert_eq!(error.message, "native_browser_page_closed: preview-closed");
         assert_eq!(
             received.lock().unwrap().len(),
             before + 1,
@@ -4373,7 +4372,7 @@ mod attempt_control_tests {
             rejected["rejection"]["error"]["code"],
             "native_browser_failed"
         );
-        assert_eq!(rejected["rejection"]["error"]["message"], error);
+        assert_eq!(rejected["rejection"]["error"]["message"], error.message);
         assert_eq!(
             rejected["rejection"]["error"]["issues"][0]["path"],
             "$.previewId"
@@ -4487,7 +4486,8 @@ mod attempt_control_tests {
         let computer = kernel.prepare_tool(&request).unwrap();
         let mut delegated_computer = computer.clone();
         delegated_computer.permissions.shell = ShellApprovalMode::Review;
-        assert!(!delegated_computer.agent_can_review());
+        assert!(delegated_computer.agent_can_review());
+        assert!(!computer.agent_can_review());
         assert!(matches!(
             kernel.admit(&request, &computer).unwrap(),
             Admission::ApprovalRequired

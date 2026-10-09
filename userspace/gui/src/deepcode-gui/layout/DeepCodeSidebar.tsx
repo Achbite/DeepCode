@@ -5,7 +5,6 @@ import type {
   ConversationSessionStatus,
 } from '@deepcode/protocol';
 import { t, type UiLanguage } from '../../i18n';
-import { usesNativeWindowChrome } from '../../services/hostTarget';
 import DeepCodeBrand from './DeepCodeBrand';
 import DeepCodeShellIcon from '../../components/shared/DeepCodeShellIcon';
 import { SessionRunStatus } from '../../components/local-agent/SessionRunStatus';
@@ -67,6 +66,11 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
   onOpenSessionContextMenu,
   onOpenSettings,
 }) => {
+  const listRef = useRef<HTMLElement>(null);
+  const activeProjectId = activeSessionId
+    ? sessions.find((session) => session.id === activeSessionId)?.projectId
+    : draftProjectId;
+  const activeProject = projects.find((project) => project.id === activeProjectId);
   const dragSource = useRef<{
     item: SidebarDragItem; x: number; y: number; pointerId: number; element: HTMLElement;
   } | null>(null);
@@ -110,9 +114,12 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
     dragged.current = true;
     event.preventDefault();
     setDraggingId(source.item.id);
-    const rail = event.currentTarget.getBoundingClientRect();
-    if (event.clientY < rail.top + 24) event.currentTarget.scrollTop -= 12;
-    else if (event.clientY > rail.bottom - 24) event.currentTarget.scrollTop += 12;
+    const list = listRef.current;
+    if (list) {
+      const bounds = list.getBoundingClientRect();
+      if (event.clientY < bounds.top + 24) list.scrollTop -= 12;
+      else if (event.clientY > bounds.bottom - 24) list.scrollTop += 12;
+    }
     const target = targetAt(source.item, event.clientX, event.clientY);
     setDropTarget(target ? { id: target.item.id, edge: target.edge } : null);
   };
@@ -234,16 +241,17 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
         event.stopPropagation();
       }}
     >
-      {usesNativeWindowChrome() && (
-        <div className="deepcode-gui-sidebar-brand">
-          <DeepCodeBrand />
-        </div>
-      )}
+      <div className="deepcode-gui-sidebar-brand">
+        <DeepCodeBrand />
+      </div>
       <div className="deepcode-gui-sidebar-actions">
         <button
           type="button"
           className="deepcode-gui-sidebar-action deepcode-gui-sidebar-action--primary"
-          onClick={onCreatePrimarySession}
+          onClick={() => {
+            if (activeProject) onCreateProjectSession(activeProject);
+            else onCreatePrimarySession();
+          }}
           disabled={busy}
         >
           <DeepCodeShellIcon name="compose" className="deepcode-gui-sidebar-icon" />
@@ -262,7 +270,7 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
         </div>
       )}
 
-      <section className="deepcode-gui-sidebar-section">
+      <section ref={listRef} className="deepcode-gui-sidebar-section">
         <div className="deepcode-gui-sidebar-section__heading deepcode-gui-sidebar-section__heading--project">
           <div className="deepcode-gui-sidebar-section__label">
             {t(language, 'deepcodeGui.sidebar.project')}
@@ -383,7 +391,6 @@ const DeepCodeSidebar: React.FC<DeepCodeSidebarProps> = ({
         )}
       </section>
 
-      <div className="deepcode-gui-sidebar-spacer" />
       <footer className="deepcode-gui-sidebar-footer">
       <button type="button" className="deepcode-gui-sidebar-settings" onClick={onOpenSettings}>
         <span className="deepcode-gui-sidebar-settings__icon">

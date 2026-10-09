@@ -1,9 +1,13 @@
 //! Local Host transport discovery and user directories. No Session or Kernel business state.
 mod user_directories;
 pub use user_directories::UserDirectories;
+mod paths;
+pub use paths::{configure_runtime_child, configured_path, runtime_root};
 mod client_lease;
 pub mod loopback_http;
 pub mod process;
+#[cfg(test)]
+mod regression_tests;
 pub mod shell_lifecycle;
 pub use client_lease::{HostClientLease, HOST_LIFETIME_ENV};
 use deepcode_kernel_abi::{
@@ -41,6 +45,41 @@ pub struct HostStartupStatusV1 {
 }
 
 const CONNECTION_FILE: &str = "agent-runtime/host-connection.json";
+
+#[derive(Debug)]
+struct HostIoError {
+    operation: String,
+    source: io::Error,
+}
+
+impl std::fmt::Display for HostIoError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: {} [kind={:?}, os_code={:?}]",
+            self.operation,
+            self.source,
+            self.source.kind(),
+            self.source.raw_os_error()
+        )
+    }
+}
+
+impl std::error::Error for HostIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn host_io_error(operation: impl Into<String>, source: io::Error) -> io::Error {
+    io::Error::new(
+        source.kind(),
+        HostIoError {
+            operation: operation.into(),
+            source,
+        },
+    )
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -106,14 +145,48 @@ impl LocalHostConnection {
     pub fn publish(&self, root: &Path) -> io::Result<PublishedHostConnection> {
         self.validate()?;
         let path = root.join(CONNECTION_FILE);
-        std::fs::create_dir_all(path.parent().expect("connection parent"))?;
+        let parent = path.parent().expect("connection parent");
+        std::fs::create_dir_all(parent).map_err(|error| {
+            host_io_error(
+                format!("Create Host connection directory {}", parent.display()),
+                error,
+            )
+        })?;
         let temporary = path.with_extension(format!("{}.tmp", self.identity.instance_id));
+        // Only clean up a temporary file created by this publication attempt.
+        let mut file = private_file(&temporary).map_err(|error| {
+            host_io_error(
+                format!(
+                    "Create Host connection temporary file {}",
+                    temporary.display()
+                ),
+                error,
+            )
+        })?;
         let result = (|| {
-            let mut file = private_file(&temporary)?;
-            serde_json::to_writer(&mut file, self).map_err(io::Error::other)?;
-            file.flush()?;
+            serde_json::to_writer(&mut file, self).map_err(|error| {
+                host_io_error(
+                    format!("Write Host connection {}", temporary.display()),
+                    io::Error::other(error),
+                )
+            })?;
+            file.flush().map_err(|error| {
+                host_io_error(
+                    format!("Flush Host connection {}", temporary.display()),
+                    error,
+                )
+            })?;
             drop(file);
-            std::fs::rename(&temporary, &path)
+            std::fs::rename(&temporary, &path).map_err(|error| {
+                host_io_error(
+                    format!(
+                        "Replace Host connection {} from {}",
+                        path.display(),
+                        temporary.display()
+                    ),
+                    error,
+                )
+            })
         })();
         if let Err(error) = result {
             let _ = std::fs::remove_file(&temporary);
@@ -122,18 +195,31 @@ impl LocalHostConnection {
         Ok(PublishedHostConnection { path })
     }
 
-    /// Refused connection means the recorded process no longer listens. A live
-    /// listener must prove the exact instance; callers still authenticate health.
+    /// A refused or timed-out connection is not reusable. A live listener must
+    /// prove the exact instance; the daemon root lease still prevents a second owner.
     pub fn discover(root: &Path) -> io::Result<Option<Self>> {
-        let mut file = match File::open(root.join(CONNECTION_FILE)) {
+        Self::discover_with_connector(root, TcpStream::connect_timeout)
+    }
+
+    fn discover_with_connector(
+        root: &Path,
+        connect: impl FnOnce(&SocketAddr, Duration) -> io::Result<TcpStream>,
+    ) -> io::Result<Option<Self>> {
+        let path = root.join(CONNECTION_FILE);
+        let context = |operation: &str, error| {
+            host_io_error(format!("{operation} {}", path.display()), error)
+        };
+        let mut file = match File::open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
+            Err(error) => return Err(context("Open Host connection", error)),
         };
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            let metadata = file.metadata()?;
+            let metadata = file
+                .metadata()
+                .map_err(|error| context("Inspect Host connection", error))?;
             if metadata.mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -147,19 +233,46 @@ impl LocalHostConnection {
             })?;
         connection.validate()?;
         let address = connection.address()?;
-        let mut stream = match TcpStream::connect_timeout(&address, Duration::from_millis(500)) {
+        let mut stream = match connect(&address, Duration::from_millis(500)) {
             Ok(stream) => stream,
-            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => return Ok(None),
-            Err(error) => return Err(error),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut
+                ) =>
+            {
+                eprintln!(
+                    "{}",
+                    context(
+                        &format!("Recorded Host at {address} is unavailable; connect"),
+                        error
+                    )
+                );
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(context(
+                    &format!("Connect to recorded Host at {address}"),
+                    error,
+                ))
+            }
         };
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(|error| context("Set Host identity read timeout for", error))?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .map_err(|error| context("Set Host identity write timeout for", error))?;
         write!(
             stream,
             "GET /api/host/identity HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
-        )?;
+        )
+        .map_err(|error| context("Write Host identity request for", error))?;
         let mut response = String::new();
-        stream.take(16 * 1024).read_to_string(&mut response)?;
+        stream
+            .take(16 * 1024)
+            .read_to_string(&mut response)
+            .map_err(|error| context("Read Host identity response for", error))?;
         let body = response
             .split_once("\r\n\r\n")
             .filter(|(header, _)| header.starts_with("HTTP/1.1 200 "))
@@ -207,46 +320,70 @@ pub struct HostStartGuard {
 impl HostStartGuard {
     pub fn acquire(root: &Path) -> io::Result<Self> {
         let path = root.join("agent-runtime/host-start.lock");
-        std::fs::create_dir_all(path.parent().expect("startup parent"))?;
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)?;
+        let file = Self::open(&path)?;
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match lock_file(&file) {
                 Ok(()) => return Ok(Self { _file: file }),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     if Instant::now() >= deadline {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "Another shell is still starting the shared Host",
+                        return Err(host_io_error(
+                            format!("Acquire Host startup lock {}", path.display()),
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "Another shell is still starting the shared Host",
+                            ),
                         ));
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    return Err(host_io_error(
+                        format!("Lock Host startup {}", path.display()),
+                        error,
+                    ))
+                }
             }
         }
     }
-}
 
-/// Packaged resources are independent of the writable user data directory.
-pub fn runtime_root(executable_dir: &Path) -> PathBuf {
-    std::env::var_os("DEEPCODE_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "macos") && executable_dir.ends_with("Contents/MacOS") {
-                executable_dir
-                    .parent()
-                    .expect("bundle Contents")
-                    .join("Resources")
-            } else {
-                executable_dir.to_path_buf()
-            }
-        })
+    /// Port admission uses the same OS lock as shared-Host startup. The file may
+    /// remain after a crash; only a live handle owns the lock, never its age or PID.
+    pub fn try_acquire_port(temporary: &Path, host: &str, port: &str) -> io::Result<Option<Self>> {
+        let component = |value: &str| {
+            value
+                .chars()
+                .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+                .collect::<String>()
+        };
+        let path = temporary.join(format!(
+            "deepcode-kernel-start-{}-{}.lock",
+            component(host),
+            component(port)
+        ));
+        let file = Self::open(&path)?;
+        match lock_file(&file) {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(host_io_error(
+                format!("Lock Host port startup {}", path.display()),
+                error,
+            )),
+        }
+    }
+
+    fn open(path: &Path) -> io::Result<File> {
+        std::fs::create_dir_all(path.parent().expect("startup parent"))?;
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| {
+                host_io_error(format!("Open Host startup lock {}", path.display()), error)
+            })
+    }
 }
 
 #[cfg(unix)]
@@ -385,6 +522,24 @@ fn private_file(path: &Path) -> io::Result<File> {
         },
         Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ},
     };
+    // The parent already exists. Canonicalization supplies a normalized extended
+    // Windows path before this direct Win32 call, including for long/UNC roots.
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Host connection file name is missing",
+        )
+    })?;
+    let path = path
+        .parent()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Host connection parent is missing",
+            )
+        })?
+        .canonicalize()?
+        .join(name);
     let sddl: Vec<u16> = "D:P(A;;FA;;;OW)\0".encode_utf16().collect();
     let mut descriptor = std::ptr::null_mut();
     if unsafe {

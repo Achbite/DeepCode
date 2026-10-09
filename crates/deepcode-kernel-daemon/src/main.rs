@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod api_response;
+mod artifact_resources;
 mod command_denylist;
 mod config_root_lease;
 mod config_setup;
@@ -42,6 +43,7 @@ mod session_environment;
 mod session_service;
 mod settings_api;
 mod state;
+mod tool_images;
 mod utils;
 mod workspace_api;
 
@@ -113,10 +115,15 @@ async fn main() {
         return;
     }
     let host = std::env::var("DEEPCODE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let port = std::env::var("DEEPCODE_PORT")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(31245);
+    let port = match std::env::var("DEEPCODE_PORT") {
+        Ok(value) => deepcode_host_connection::loopback_http::parse_port(&value),
+        Err(std::env::VarError::NotPresent) => Ok(31245),
+        Err(error) => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, error)),
+    }
+    .unwrap_or_else(|error| {
+        eprintln!("host_port_invalid: DEEPCODE_PORT: {error}");
+        std::process::exit(1);
+    });
     let addr: SocketAddr = format!("{host}:{port}").parse().expect("valid host/port");
     assert!(
         addr.ip().is_loopback(),

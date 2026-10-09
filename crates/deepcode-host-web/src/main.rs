@@ -152,7 +152,24 @@ async fn main() {
     println!(
         "DeepCode dev Host proxies /api/* to Kernel daemon at http://{daemon_host}:{daemon_port}"
     );
+    // The owning GUI retains the pipe writer in Child.stdin. EOF also covers
+    // owner termination, when its normal shutdown callbacks cannot run.
+    let (owner_closed, closed) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let result = std::io::copy(
+            &mut std::io::stdin().lock().take(u64::MAX),
+            &mut std::io::sink(),
+        );
+        if let Err(error) = result {
+            eprintln!("Host owner pipe failed: {error}");
+        }
+        let _ = owner_closed.send(());
+    });
     axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = closed.await;
+        })
         .await
         .expect("serve deepcode dev host");
 }

@@ -6,8 +6,8 @@ use deepcode_kernel_abi::{
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -161,31 +161,13 @@ impl KernelBootstrap {
                 reason: "Host connection is restricted to a local Kernel URL".to_string(),
             });
         }
-        let initial_probe = probe_existing_kernel(&config).await?;
-        match initial_probe {
-            ExistingKernelProbe::Healthy(client) => {
-                return Self::attached(
-                    client,
-                    KernelBootstrapGuard::external(),
-                    &config,
-                    options.persistent,
-                );
-            }
-            ExistingKernelProbe::NotListening => {}
-            ExistingKernelProbe::TokenMissing => {
-                return Err(KernelClientError::HostConnectionTokenMissing);
-            }
-            ExistingKernelProbe::TokenRejected => {
-                return Err(KernelClientError::HostConnectionRejected {
-                    base_url: config.base_url.clone(),
-                });
-            }
-            ExistingKernelProbe::Unavailable(reason) => {
-                return Err(KernelClientError::DaemonUnavailable {
-                    base_url: config.base_url.clone(),
-                    reason,
-                });
-            }
+        if let Some(client) = probe_existing_kernel(&config).await? {
+            return Self::attached(
+                client,
+                KernelBootstrapGuard::external(),
+                &config,
+                options.persistent,
+            );
         }
 
         if !kernel_auto_start_enabled(options.auto_start) {
@@ -210,25 +192,13 @@ impl KernelBootstrap {
             }
             let listener_deadline = Instant::now() + KERNEL_LISTENER_STARTUP_WAIT;
             loop {
-                let probe = probe_existing_kernel(&config).await?;
-                match probe {
-                    ExistingKernelProbe::Healthy(client) => {
-                        return Self::attached(
-                            client,
-                            KernelBootstrapGuard::external(),
-                            &config,
-                            options.persistent,
-                        );
-                    }
-                    ExistingKernelProbe::TokenRejected => {
-                        return Err(KernelClientError::HostConnectionRejected {
-                            base_url: config.base_url.clone(),
-                        });
-                    }
-                    ExistingKernelProbe::TokenMissing => {
-                        return Err(KernelClientError::HostConnectionTokenMissing);
-                    }
-                    ExistingKernelProbe::NotListening | ExistingKernelProbe::Unavailable(_) => {}
+                if let Some(client) = probe_existing_kernel(&config).await? {
+                    return Self::attached(
+                        client,
+                        KernelBootstrapGuard::external(),
+                        &config,
+                        options.persistent,
+                    );
                 }
                 if Instant::now() >= listener_deadline {
                     break;
@@ -240,31 +210,13 @@ impl KernelBootstrap {
                 reason: "another owner is starting the Kernel, but its authenticated health endpoint did not become ready".to_string(),
             });
         };
-        let locked_probe = probe_existing_kernel(&config).await?;
-        match locked_probe {
-            ExistingKernelProbe::Healthy(client) => {
-                return Self::attached(
-                    client,
-                    KernelBootstrapGuard::external(),
-                    &config,
-                    options.persistent,
-                );
-            }
-            ExistingKernelProbe::NotListening => {}
-            ExistingKernelProbe::TokenMissing => {
-                return Err(KernelClientError::HostConnectionTokenMissing);
-            }
-            ExistingKernelProbe::TokenRejected => {
-                return Err(KernelClientError::HostConnectionRejected {
-                    base_url: config.base_url.clone(),
-                });
-            }
-            ExistingKernelProbe::Unavailable(reason) => {
-                return Err(KernelClientError::DaemonUnavailable {
-                    base_url: config.base_url.clone(),
-                    reason,
-                });
-            }
+        if let Some(client) = probe_existing_kernel(&config).await? {
+            return Self::attached(
+                client,
+                KernelBootstrapGuard::external(),
+                &config,
+                options.persistent,
+            );
         }
         let kernel_bin = find_kernel_binary()?.ok_or_else(|| {
             KernelClientError::Bootstrap(
@@ -281,15 +233,8 @@ impl KernelBootstrap {
 
         let listener_deadline = Instant::now() + KERNEL_LISTENER_STARTUP_WAIT;
         loop {
-            let probe = match probe_existing_kernel(&owned_config).await {
-                Ok(probe) => probe,
-                Err(error) => {
-                    terminate_owned_kernel_process(&mut process);
-                    return Err(error);
-                }
-            };
-            match probe {
-                ExistingKernelProbe::Healthy(client) => {
+            match probe_existing_kernel(&owned_config).await {
+                Ok(Some(client)) => {
                     if !bind_owned_kernel_shutdown_identity(&mut process.shutdown_target) {
                         terminate_owned_kernel_process(&mut process);
                         return Err(KernelClientError::Bootstrap(
@@ -310,17 +255,14 @@ impl KernelBootstrap {
                         options.persistent,
                     );
                 }
-                ExistingKernelProbe::TokenRejected => {
+                Ok(None) => {}
+                Err(mut error) => {
                     terminate_owned_kernel_process(&mut process);
-                    return Err(KernelClientError::HostConnectionRejected {
-                        base_url: owned_config.base_url.clone(),
-                    });
+                    if let KernelClientError::DaemonUnavailable { reason, .. } = &mut error {
+                        reason.push_str(&format!("; log: {}", process.log_path.display()));
+                    }
+                    return Err(error);
                 }
-                ExistingKernelProbe::TokenMissing => {
-                    terminate_owned_kernel_process(&mut process);
-                    return Err(KernelClientError::HostConnectionTokenMissing);
-                }
-                ExistingKernelProbe::NotListening | ExistingKernelProbe::Unavailable(_) => {}
             }
             match process.child.try_wait() {
                 Ok(Some(status)) => {
@@ -419,36 +361,33 @@ pub struct DaemonStatus {
     pub raw: Value,
 }
 
-enum ExistingKernelProbe {
-    NotListening,
-    Healthy(HttpKernelClient),
-    TokenMissing,
-    TokenRejected,
-    Unavailable(String),
-}
-
+/// Absence permits startup; a listener's authentication and health failures do not.
 async fn probe_existing_kernel(
     config: &KernelClientConfig,
-) -> KernelClientResult<ExistingKernelProbe> {
-    if !probe_kernel_tcp(&config.base_url) {
-        return Ok(ExistingKernelProbe::NotListening);
+) -> KernelClientResult<Option<HttpKernelClient>> {
+    if !probe_kernel_tcp(&config.base_url)? {
+        return Ok(None);
     }
     if !config.has_host_shell_token() {
-        return Ok(ExistingKernelProbe::TokenMissing);
+        return Err(KernelClientError::HostConnectionTokenMissing);
     }
     let client = HttpKernelClient::new(config.clone())?;
-    match client.health().await {
-        Ok(status) if status.ok => Ok(ExistingKernelProbe::Healthy(client)),
-        Ok(_) => Ok(ExistingKernelProbe::Unavailable(
-            "Kernel health endpoint reported an unhealthy state".to_string(),
-        )),
+    let reason = match client.health().await {
+        Ok(status) if status.ok => return Ok(Some(client)),
+        Ok(_) => "Kernel health endpoint reported an unhealthy state".to_string(),
         Err(KernelClientError::Http(error))
             if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED) =>
         {
-            Ok(ExistingKernelProbe::TokenRejected)
+            return Err(KernelClientError::HostConnectionRejected {
+                base_url: config.base_url.clone(),
+            });
         }
-        Err(error) => Ok(ExistingKernelProbe::Unavailable(error.to_string())),
-    }
+        Err(error) => error.to_string(),
+    };
+    Err(KernelClientError::DaemonUnavailable {
+        base_url: config.base_url.clone(),
+        reason,
+    })
 }
 
 fn generate_local_token(prefix: &str) -> KernelClientResult<String> {
@@ -469,23 +408,12 @@ fn generate_local_token(prefix: &str) -> KernelClientResult<String> {
     Ok(encoded)
 }
 
-fn probe_kernel_tcp(base_url: &str) -> bool {
-    let Some((host, port)) = parse_kernel_host_port(base_url) else {
-        return false;
-    };
-    let Ok(port) = port.parse::<u16>() else {
-        return false;
-    };
-    let Ok(addrs) = (host.as_str(), port).to_socket_addrs() else {
-        return false;
-    };
-    addrs
-        .into_iter()
-        .any(|addr| connect_socket(addr, Duration::from_millis(180)).is_ok())
-}
-
-fn connect_socket(addr: SocketAddr, timeout: Duration) -> std::io::Result<TcpStream> {
-    TcpStream::connect_timeout(&addr, timeout)
+fn probe_kernel_tcp(base_url: &str) -> KernelClientResult<bool> {
+    let (host, port) = parse_kernel_host_port(base_url).ok_or_else(|| {
+        KernelClientError::Bootstrap(format!("Cannot resolve Host address from {base_url}"))
+    })?;
+    deepcode_host_connection::loopback_http::probe_loopback_listener(&host, &port)
+        .map_err(|error| KernelClientError::Bootstrap(error.to_string()))
 }
 
 fn kernel_auto_start_enabled(default_enabled: bool) -> bool {
@@ -546,7 +474,9 @@ fn is_local_kernel_url(base_url: &str) -> bool {
 }
 
 fn find_kernel_binary() -> KernelClientResult<Option<PathBuf>> {
-    if let Some(path) = std::env::var_os("DEEPCODE_KERNEL_BIN").map(PathBuf::from) {
+    if let Some(path) = deepcode_host_connection::configured_path("DEEPCODE_KERNEL_BIN")
+        .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?
+    {
         if path.is_file() {
             return Ok(Some(path));
         }
@@ -587,12 +517,12 @@ fn spawn_kernel_binary(
     })?;
     let mut command = Command::new(kernel_bin);
     directories.configure_child(&mut command);
+    let resources = deepcode_host_connection::runtime_root(&kernel_dir)
+        .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?;
+    deepcode_host_connection::configure_runtime_child(&mut command, &resources)
+        .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?;
     command
         .current_dir(&kernel_dir)
-        .env(
-            "DEEPCODE_RUNTIME_DIR",
-            deepcode_host_connection::runtime_root(&kernel_dir),
-        )
         .env("DEEPCODE_HOST", host)
         .env("DEEPCODE_PORT", port)
         .env(HOST_SHELL_TOKEN_ENV, host_shell_token)
@@ -698,8 +628,9 @@ fn request_owned_kernel_api<T: for<'de> Deserialize<'de>>(
     request: &[u8],
 ) -> Option<HostApiEnvelope<T>> {
     let mut addresses = (target.host.as_str(), target.port).to_socket_addrs().ok()?;
-    let mut stream = addresses
-        .find_map(|address| connect_socket(address, KERNEL_OWNED_SHUTDOWN_CONNECT_WAIT).ok())?;
+    let mut stream = addresses.find_map(|address| {
+        TcpStream::connect_timeout(&address, KERNEL_OWNED_SHUTDOWN_CONNECT_WAIT).ok()
+    })?;
     stream
         .set_read_timeout(Some(KERNEL_OWNED_SHUTDOWN_IO_WAIT))
         .ok()?;
@@ -720,74 +651,15 @@ fn request_owned_kernel_api<T: for<'de> Deserialize<'de>>(
     serde_json::from_slice(&response[body_offset..]).ok()
 }
 
-struct KernelStartLock {
-    path: PathBuf,
-}
-
-impl Drop for KernelStartLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 fn acquire_kernel_start_lock(
     host: &str,
     port: &str,
-) -> KernelClientResult<Option<KernelStartLock>> {
+) -> KernelClientResult<Option<deepcode_host_connection::HostStartGuard>> {
     let temporary = deepcode_host_connection::UserDirectories::resolve()
-        .and_then(|directories| {
-            std::fs::create_dir_all(&directories.temp_dir)?;
-            Ok(directories.temp_dir)
-        })
+        .map(|directories| directories.temp_dir)
         .map_err(|error| KernelClientError::Bootstrap(error.to_string()))?;
-    let path = temporary.join(format!(
-        "deepcode-kernel-start-{}-{}.lock",
-        sanitize_lock_component(host),
-        sanitize_lock_component(port)
-    ));
-    match create_kernel_start_lock_file(&path) {
-        Ok(()) => Ok(Some(KernelStartLock { path })),
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            if kernel_start_lock_is_stale(&path) {
-                let _ = std::fs::remove_file(&path);
-                return match create_kernel_start_lock_file(&path) {
-                    Ok(()) => Ok(Some(KernelStartLock { path })),
-                    Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(None),
-                    Err(error) => Err(KernelClientError::Bootstrap(format!(
-                        "failed to create kernel start lock {}: {error}",
-                        path.display()
-                    ))),
-                };
-            }
-            Ok(None)
-        }
-        Err(error) => Err(KernelClientError::Bootstrap(format!(
-            "failed to create kernel start lock {}: {error}",
-            path.display()
-        ))),
-    }
-}
-
-fn create_kernel_start_lock_file(path: &Path) -> std::io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    writeln!(file, "pid={}", std::process::id())?;
-    Ok(())
-}
-
-fn kernel_start_lock_is_stale(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.elapsed().ok())
-        .map(|age| age > Duration::from_secs(30))
-        .unwrap_or(false)
-}
-
-fn sanitize_lock_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-        .collect()
+    deepcode_host_connection::HostStartGuard::try_acquire_port(&temporary, host, port)
+        .map_err(|error| KernelClientError::Bootstrap(error.to_string()))
 }
 
 fn open_kernel_log_file(log_dir: &Path) -> KernelClientResult<(File, PathBuf)> {

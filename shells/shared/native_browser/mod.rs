@@ -16,6 +16,14 @@ mod services;
 
 static PAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+fn resource_id(binding: &HostBinding, kind: &str) -> String {
+    format!(
+        "{kind}-{}-{}",
+        binding.host_instance_id,
+        PAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostBinding {
@@ -144,11 +152,16 @@ fn serve_connection(app: tauri::AppHandle, mut stream: TcpStream, token: &str) {
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let mut line = String::new();
     let read = BufReader::new((&stream).take(1024 * 1024)).read_line(&mut line);
+    let mut command = String::new();
     let response = read.map_err(|error| error.to_string()).and_then(|_| {
         let request: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
         if request.get("token").and_then(Value::as_str) != Some(token) {
             return Err("native_browser_connection_rejected".into());
         }
+        command = request["input"]["action"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         tauri::async_runtime::block_on(execute(
             app,
             request["binding"].clone(),
@@ -157,7 +170,17 @@ fn serve_connection(app: tauri::AppHandle, mut stream: TcpStream, token: &str) {
     });
     let envelope = match response {
         Ok(data) => json!({"ok":true,"data":data}),
-        Err(message) => json!({"ok":false,"message":message}),
+        Err(message) => {
+            let mut failure = json!({"ok":false,"message":message});
+            #[cfg(target_os = "macos")]
+            if command.starts_with("computer:") {
+                failure["diagnostics"] = match computer_macos::status() {
+                    Ok(status) => json!({"phase":command,"native":status}),
+                    Err(error) => json!({"phase":command,"statusError":error}),
+                };
+            }
+            failure
+        }
     };
     if let Ok(mut encoded) = serde_json::to_vec(&envelope) {
         encoded.push(b'\n');
@@ -347,7 +370,7 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
     let action = string(&input, "action")?;
     if action.starts_with("computer:") {
         #[cfg(target_os = "macos")]
-        return computer_macos::execute(&input);
+        return computer_macos::execute(&app, &input);
         #[cfg(not(target_os = "macos"))]
         return Err("External computer control currently requires a macOS GUI Host.".into());
     }
@@ -437,7 +460,7 @@ pub async fn execute(app: tauri::AppHandle, binding: Value, input: Value) -> Res
             };
             return serde_json::to_value(page).map_err(|error| error.to_string());
         }
-        let id = format!("preview-{}", PAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed));
+        let id = resource_id(&binding, "preview");
         let page = Page {
             binding: binding.clone(),
             preview_id: id.clone(),

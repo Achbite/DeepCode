@@ -24,4 +24,6 @@ Use Markdown headings, meaningful link labels, fenced code with a language and t
 
 ## Delivery
 
-`document.render` writes to the prepared workspace destination and returns the actual artifact metadata. Use that artifact in the answer. Supply both source and PDF only when requested or useful to the user's stated deliverable. Do not claim download, publication, printing or visual review without performing that action.
+`document.render` writes to the prepared workspace destination and returns the actual artifact metadata. Call `artifact.present` with its artifact ID and a readable label, then cite the returned resource URI in the answer. Existing files can be archived with `artifact.prepare`; a live HTTP(S) preview can be registered with `artifact.preview`. Registering a preview does not fetch or verify its content.
+
+Present a revised file using its new artifact ID and the same delivery entry. The output panel shows its latest version; earlier fixed references still identify the archived version originally cited. Supply both source and PDF only when requested or useful to the user's stated deliverable. Keep scratch files, logs and inspection screenshots in execution history unless the user needs them as results or review material. Do not claim download, publication, printing or visual review without performing that action.

@@ -22,7 +22,7 @@ export function ArtifactLinks({ artifacts, onOpen }: { artifacts: readonly Artif
       const location = artifact.logicalPath ?? artifact.uri ?? artifact.label;
       const content = <><span className="document-artifacts__thumbnail">{imagePreview ? <ArtifactImage artifact={artifact} /> : <DeepCodeShellIcon name={artifact.contentType === 'text/html' ? 'browser' : 'artifact'} />}</span><strong>{label}</strong></>;
       return fixed || resource || external ? <button type="button" className="deepcode-gui-output-item document-artifacts__item" key={artifact.artifactId}
-        aria-label={label} title={`${location}\n${formatArtifactTime(artifact.createdAt)}`}
+        aria-label={label} title={`${location}\n${formatArtifactTime('updatedAt' in artifact ? String(artifact.updatedAt) : artifact.createdAt)}`}
         onClick={() => { setError(null); if(fixed) {requestReader(artifact.sessionId,{kind:'artifact',artifact});return;} void (resource ? onOpen(resource.workspaceId, resource.logicalPath) : host.openExternalLink(external!))
           .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason))); }}>{content}</button>
         : <div className="deepcode-gui-output-item document-artifacts__item" title={location} key={artifact.artifactId}>{content}</div>;
