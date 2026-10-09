@@ -255,7 +255,7 @@ export function decodeProviderToolInput(
     if (!Array.isArray(manifest)) return decoded;
     decoded.mutationManifest = manifest.map((operation) => {
       if (!isRecord(operation)) return operation;
-      return decodeWorkspaceHandle(codec, structuredClone(operation));
+      return decodeWorkspaceHandle(codec, operation);
     });
   }
   return decoded;
@@ -266,7 +266,8 @@ export function encodeProviderMessage(
   codec: ProviderToolCodec,
   journalCodecsByCallId: ReadonlyMap<string, ProviderMessageToolCodec> = new Map(),
 ): ModelMessage {
-  const encoded = cloneModelMessage(message);
+  // Each rewritten tool input is cloned by encodeProviderToolInput below.
+  const encoded = { ...message };
   if (encoded.role === 'tool' && encoded.toolCallId) {
     const callCodec = journalCodecsByCallId.get(encoded.toolCallId) ?? codec;
     // These are structured Session results, not model-authored JSON to repair.
@@ -468,7 +469,7 @@ function encodeProviderToolInput(
     if (!Array.isArray(manifest)) return encoded;
     encoded.mutationManifest = manifest.map((operation) => {
       if (!isRecord(operation)) return operation;
-      return encodeWorkspaceIdentity(codec, structuredClone(operation));
+      return encodeWorkspaceIdentity(codec, operation);
     });
   }
   return encoded;
@@ -491,20 +492,6 @@ function isWorkspaceScopedTool(tool: PreparedToolDescriptor): boolean {
     || effect === 'workspaceMutation'
     || effect === 'process'
   ));
-}
-
-function cloneModelMessage(message: ModelMessage): ModelMessage {
-  return {
-    ...message,
-    ...(message.toolCalls
-      ? {
-          toolCalls: message.toolCalls.map((call) => ({
-            ...call,
-            input: structuredClone(call.input),
-          })),
-        }
-      : {}),
-  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
