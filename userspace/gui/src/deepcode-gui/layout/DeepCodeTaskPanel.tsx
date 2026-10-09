@@ -13,15 +13,12 @@ interface DeepCodeTaskPanelProps {
 }
 
 const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, projection }) => {
-  // Each fixed delivery is immutable; its execution timestamp is the last
-  // content change of that version. Keep all versions in this Session.
+  // Session publishes the latest version and ordering of explicit deliveries.
   const display = useDisplayedConversation();
   const [showAllArtifacts, setShowAllArtifacts] = React.useState(false);
   const outputListId = React.useId();
   React.useEffect(() => { setShowAllArtifacts(false); }, [projection?.sessionId]);
-  const artifacts = [...display.artifacts].sort(
-    (left, right) => artifactTimestamp(right.createdAt) - artifactTimestamp(left.createdAt),
-  );
+  const artifacts = display.artifacts;
   const todos = projection?.todoList?.items ?? [];
   const todoRun = projection?.todoList && projection.tokenUsageHistory.find(run => run.runId === projection.todoList!.runId);
   const remaining = todos.filter(todo => todo.status !== 'completed').length;
@@ -77,10 +74,6 @@ const DeepCodeTaskPanel: React.FC<DeepCodeTaskPanelProps> = ({ language, project
     </aside>
   );
 };
-
-function artifactTimestamp(value: string): number {
-  return /^\d+$/u.test(value) ? Number(value) : Date.parse(value);
-}
 
 function todoStatus(status: 'pending' | 'inProgress' | 'completed' | 'blocked', language: UiLanguage): string {
   return t(language, `deepcodeGui.tasks.status.${status}`);

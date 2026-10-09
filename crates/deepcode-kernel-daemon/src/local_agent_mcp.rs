@@ -489,21 +489,33 @@ fn external_server_source(setting: McpServerSetting) -> Result<McpServerSource, 
     let identity = json!({
         "id": setting.id,
         "name": setting.name,
+        "description": setting.description,
         "transport": setting.transport,
         "command": setting.command,
         "args": setting.args,
     });
     let descriptor = McpPluginDescriptor {
-        management:json!({"key":"mcp.servers","id":setting.id}),
+        management: json!({"key":"mcp.servers","id":setting.id}),
         uri: mcp_plugin_uri(&setting.id),
         name: setting.name.clone(),
-        short_description: "连接的外部工具".to_string(),
+        short_description: if setting.description.trim().is_empty() {
+            "连接的外部工具".into()
+        } else {
+            setting.description.clone()
+        },
         activation_media_types: Vec::new(),
         implementation: identity,
         content: Arc::from([]),
         provider_ref: "tool-provider:mcp".to_string(),
         capability_refs: vec![format!("mcp-server:{}", setting.id)],
-        capability_summary: "The selected MCP service is active for this run. Its callable tools are supplied separately by the current tool catalog.".to_string(),
+        capability_summary: format!(
+            "{}\nIts callable tools are supplied by the current tool catalog after activation.",
+            if setting.description.trim().is_empty() {
+                "No capability description was provided at registration."
+            } else {
+                &setting.description
+            }
+        ),
         tool_prompt_provider: None,
         enabled: setting.enabled,
         error: None,
@@ -567,6 +579,7 @@ fn first_party_server_source(
         setting: McpServerSetting {
             id: format!("first-party.{id}"),
             name: display_name,
+            description: descriptor.short_description.clone(),
             transport: "cli".to_string(),
             command: provider_binary.to_string(),
             args: format!("--plugin {id} --call"),
@@ -669,6 +682,8 @@ struct McpServerSetting {
     id: String,
     #[serde(default = "default_server_name")]
     name: String,
+    #[serde(default)]
+    description: String,
     #[serde(default = "default_transport")]
     transport: String,
     command: String,
@@ -724,6 +739,7 @@ fn local_cli_source(source: LocalPluginSource) -> McpServerSource {
         setting: McpServerSetting {
             id: source.id.clone(),
             name: source.id.clone(),
+            description: String::new(),
             transport: "cli".into(),
             command: String::new(),
             args: String::new(),
@@ -798,13 +814,29 @@ fn local_cli_source(source: LocalPluginSource) -> McpServerSource {
         result.descriptor.content = Arc::from(bytes.as_slice());
         result.descriptor.name = manifest.name.clone();
         result.descriptor.short_description = manifest.description.clone();
-        result.descriptor.capability_summary = manifest.description;
+        result.descriptor.capability_summary = format!(
+            "{}\nTools:\n{}",
+            manifest.description,
+            manifest
+                .tools
+                .iter()
+                .map(|tool| format!(
+                    "- {}: {}",
+                    tool.name,
+                    tool.description
+                        .as_deref()
+                        .expect("validated tool description")
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
         result.descriptor.capability_refs = manifest
             .tools
             .iter()
             .map(|tool| format!("{}.{}", source.id, tool.name))
             .collect();
         result.setting.name = manifest.name;
+        result.setting.description = manifest.description;
         result.setting.command = manifest.command;
         result.cli_entry = Some((manifest.entry, bytes));
         result.contract = McpServerContract::LocalCli {
@@ -938,6 +970,7 @@ impl McpClient {
 
     fn list_tools(&self) -> Result<Vec<RemoteToolDefinition>, McpRuntimeError> {
         let mut cursor: Option<String> = None;
+        let mut seen_cursors = BTreeSet::new();
         let mut tools = Vec::new();
         loop {
             let result = self.request(
@@ -977,8 +1010,15 @@ impl McpClient {
                 .get("nextCursor")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            if cursor.is_none() {
-                return Ok(tools);
+            match cursor.as_ref() {
+                None => return Ok(tools),
+                Some(next) if !seen_cursors.insert(next.clone()) => {
+                    return Err(McpRuntimeError::new(
+                        "mcp_tools_invalid",
+                        "MCP tools/list returned a repeated pagination cursor.",
+                    ));
+                }
+                Some(_) => {}
             }
         }
     }
@@ -1062,7 +1102,30 @@ fn decode_tool_call_result(
                 .and_then(Value::as_str)
                 .filter(|message| !message.is_empty())
                 .map(str::to_string)
-                .unwrap_or_else(|| format!("MCP 工具 {name} 返回错误：{output}")),
+                .unwrap_or_else(|| {
+                    // Image bytes belong to the artifact archive, never to diagnostic text.
+                    if !output["content"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|block| block["type"] == "image")
+                    {
+                        return format!("MCP 工具 {name} 返回错误：{output}");
+                    }
+                    let text = output["content"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|block| block["type"] == "text")
+                        .filter_map(|block| block["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if text.is_empty() {
+                        format!("MCP 工具 {name} 返回错误，详见工具结果。")
+                    } else {
+                        format!("MCP 工具 {name} 返回错误：{text}")
+                    }
+                }),
         }
     });
     Ok(McpToolCallResult { output, failure })
@@ -1609,6 +1672,35 @@ mod tests {
     }
 
     #[test]
+    fn repeated_tool_list_cursor_fails_before_another_page() {
+        let directory = TestDirectory::new();
+        // The fixture terminates after three pages even without the regression fix.
+        let client = directory.server(
+            "        if request['method']=='tools/list':\n            page=request['id']-1\n            Path(sys.argv[1], 'pages').write_text(str(page))\n            result={'tools':[]}\n            if page<3: result['nextCursor']='repeated'\n            print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)",
+        );
+        let error = client.list_tools().unwrap_err();
+        assert_eq!(error.code, "mcp_tools_invalid");
+        assert!(error.message.contains("repeated pagination cursor"));
+        assert_eq!(
+            std::fs::read_to_string(directory.0.join("pages")).unwrap(),
+            "2"
+        );
+        client.shutdown().unwrap();
+    }
+
+    #[test]
+    fn tool_list_accepts_a_new_cursor_after_an_empty_page() {
+        let directory = TestDirectory::new();
+        let client = directory.server(
+            "        if request['method']=='tools/list':\n            if 'cursor' not in request['params']: result={'tools':[],'nextCursor':'next'}\n            else:\n                assert request['params']['cursor']=='next'\n                result={'tools':[{'name':'echo','inputSchema':{'type':'object'}}]}\n            print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)",
+        );
+        let tools = client.list_tools().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+        client.shutdown().unwrap();
+    }
+
+    #[test]
     fn oversized_frame_is_rejected_before_reading_the_entire_source() {
         let mut source = std::io::Cursor::new(vec![b'x'; MAX_MCP_FRAME_BYTES + 1024]);
         let error = read_frame(&mut source).unwrap_err();
@@ -1889,6 +1981,16 @@ for line in sys.stdin:
         assert_eq!(failure.code, "pdf_extract_failed");
         assert_eq!(failure.message, "invalid PDF");
         assert_eq!(result.output["isError"], true);
+        let image_failure = decode_tool_call_result(
+            "capture",
+            json!({"isError":true,"content":[
+            {"type":"text","text":"Window no longer exists"},
+            {"type":"image","data":"pixel-bytes","mimeType":"image/png"}]}),
+        )
+        .unwrap();
+        let message = image_failure.failure.unwrap().message;
+        assert!(message.contains("Window no longer exists"));
+        assert!(!message.contains("pixel-bytes"));
     }
 
     #[test]

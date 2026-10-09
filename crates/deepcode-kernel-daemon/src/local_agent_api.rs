@@ -166,7 +166,18 @@ impl LocalAgentRuntime {
             "pluginCatalogRevision": request.plugin_catalog_revision.clone(),
             "refreshPlugins":request.refresh_plugins,
             "pluginSelections": request.plugin_selections.clone(),
+            "rebindHost": request.rebind_host,
         });
+        let requested_host = request
+            .rebind_host
+            .as_ref()
+            .map(|change| &change.host_binding)
+            .or_else(|| {
+                previous
+                    .as_ref()
+                    .and_then(|view| view.response.pointer("/environment/hostBinding"))
+            })
+            .or(request.host_binding.as_ref());
         if let Some(prepared) = &previous {
             let effective_profile_id = prepared
                 .response
@@ -203,6 +214,7 @@ impl LocalAgentRuntime {
                 views.iter().find(|view| {
                     view.requested_plugin_identity == requested_plugin_identity
                         && view.plugin_selection.same_inputs(&plugin_selection)
+                        && view.response.pointer("/environment/hostBinding") == requested_host
                 })
             }) {
                 return Ok(existing.response.clone());
@@ -253,6 +265,26 @@ impl LocalAgentRuntime {
                 }
                 environment["hostBinding"] = binding.clone();
             }
+        }
+        if let Some(change) = &request.rebind_host {
+            if previous.is_none()
+                || environment.get("hostBinding") != Some(&change.expected_binding)
+            {
+                return Err(RunPreparationError::new(
+                    "host_rebind_target_changed",
+                    "The prepared run no longer has the expected GUI binding.",
+                ));
+            }
+            if change.command_id.is_empty() || change.host_binding == change.expected_binding {
+                return Err(RunPreparationError::new(
+                    "host_rebind_invalid",
+                    "An explicit command and a different GUI binding are required.",
+                ));
+            }
+            crate::browser_tools::host_status(&change.host_binding)
+                .and_then(|status| status.check_tool("browser.open").map_err(str::to_owned))
+                .map_err(|error| RunPreparationError::new("host_rebind_unavailable", error))?;
+            environment["hostBinding"] = change.host_binding.clone();
         }
         // Validate and freeze the requested Provider before starting any new
         // out-of-process plugin generation. A bad Profile must not replace the
@@ -701,6 +733,7 @@ pub(crate) struct PrepareRunRuntimeRequest {
     reasoning_effort_override: Option<String>,
     environment: Option<Value>,
     host_binding: Option<Value>,
+    rebind_host: Option<RebindHostRequest>,
     #[serde(default)]
     restore_environment: bool,
     plugin_catalog_revision: Option<String>,
@@ -708,6 +741,14 @@ pub(crate) struct PrepareRunRuntimeRequest {
     refresh_plugins: bool,
     #[serde(default)]
     plugin_selections: Vec<crate::local_agent_plugins::PluginSelectionInput>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RebindHostRequest {
+    command_id: String,
+    expected_binding: Value,
+    host_binding: Value,
 }
 
 #[derive(Debug)]

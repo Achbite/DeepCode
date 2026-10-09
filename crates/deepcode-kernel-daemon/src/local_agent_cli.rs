@@ -33,6 +33,12 @@ impl CliClient {
                 "CLI call cancelled before spawn".into(),
             ));
         }
+        let mut metadata = metadata.unwrap_or_else(|| json!({}));
+        if let Some(directory) = &context.output_directory {
+            std::fs::create_dir_all(directory)
+                .map_err(|error| fail("cli_archive_failed", error.to_string()))?;
+            metadata["deepcode"]["outputDirectory"] = json!(directory);
+        }
         let mut command = Command::new(&self.command);
         if let Some((filename, bytes)) = &self.entry {
             let archive = context.output_directory.as_ref().ok_or_else(|| {

@@ -140,7 +140,6 @@ const LocalAgentPanel: React.FC<LocalAgentPanelProps> = ({ mode = 'panel', heade
       <div ref={bodyRef} className="local-agent__body" aria-live="polite" {...bodyHandlers}>
         <ConversationTranscript
           displaySettledRunIds={display.displaySettledRunIds}
-          artifacts={display.artifacts}
           onDisplayed={display.onDisplayed}
           showReasoning={showReasoning}
           language={language}

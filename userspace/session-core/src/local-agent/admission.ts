@@ -35,6 +35,16 @@ function admitCommandBatch(current: LoopSnapshot, command: ConversationCommand, 
     if (events.length) throw new Error('rejected_command_event_batch_invalid');
     return;
   }
+  if (command.type === 'run.host.rebind') {
+    const event = events[0];
+    if (events.length !== 1 || event?.type !== 'run.host.rebound' || event.runId !== command.runId
+      || event.payload.commandId !== command.commandId
+      || event.payload.previousBinding.hostInstanceId !== command.expectedHostBinding.hostInstanceId
+      || event.payload.previousBinding.windowLabel !== command.expectedHostBinding.windowLabel
+      || event.payload.hostBinding.hostInstanceId !== command.hostBinding.hostInstanceId
+      || event.payload.hostBinding.windowLabel !== command.hostBinding.windowLabel) throw new Error('host_rebind_command_event_invalid');
+    return;
+  }
   if (command.type !== 'plan.respond') return;
   const decisions = events.filter((event) => (event.type === 'plan.confirmed'
     || event.type === 'plan.revision.requested' || event.type === 'plan.cancelled')
@@ -100,6 +110,7 @@ function admitEvent(snapshot: LoopSnapshot, event: NewSessionEvent): void {
     case 'plan.published':
     case 'session.control.rejected':
     case 'session.plugins.activated':
+    case 'artifacts.presented':
       if (!pendingProvider) throw new Error('provider_turn_composition_missing');
       break;
     case 'todo.updated': {

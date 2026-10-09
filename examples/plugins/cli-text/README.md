@@ -2,7 +2,11 @@
 
 设置 → 插件 → 添加，选择本目录。界面读取 `deepcode-tool.json` 的名称、用途和入口。
 
-启用后在输入框明确选择“文本统计”，下一次模型请求才会获得工具。程序从 stdin 接收一个 JSON 对象 `{name, arguments, context}`，向 stdout 写出一个 JSON 结果；失败返回 `{error:{code,message}}`，诊断写 stderr。
+登记并启用后，Agent 可以根据任务通过 `plugin.search` 发现“文本统计”，再通过 `plugin.activate` 加载；也可以由用户在输入框明确选择。仅登记不会把工具加入每个任务。激活后的下一次模型请求获得工具和说明，作用于本次运行。
+
+搜索使用 manifest 的名称、用途以及各工具的名称和说明；因此应描述实际能完成的任务。查询使用短关键词，空白分隔的词必须全部命中同一插件。需要浏览目录时可省略 query，使用返回的 nextOffset 继续读取，不必预先知道插件名。
+
+程序从 stdin 接收一个 JSON 对象 `{name, arguments, context}`，向 stdout 写出一个 JSON 结果；失败返回 `{error:{code,message}}`，诊断写 stderr。
 
 `command` 是已有解释器，`entry` 是目录内的单文件构建产物，`args` 在入口后传递。不通过 Shell 拼接执行。需要第三方库的工具应将自身代码构建为单文件入口并使用已配置的解释器环境。其他静态文件不自动复制到调用目录。
 

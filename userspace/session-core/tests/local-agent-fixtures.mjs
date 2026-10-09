@@ -234,7 +234,7 @@ export function cancelNotFound(callId, attemptId) {
 }
 
 export function* todoUpdateEvents(request, status = 'completed', native = false) {
-  const tool = request.tools.find((candidate) => candidate.inputSchema?.properties?.items);
+  const tool = request.tools.find((candidate) => candidate.name === 'todo_update');
   const payloads = request.messages.map(jsonMessagePayload);
   const todo = payloads.findLast((payload) => payload?.type === 'todo.current');
   assert.ok(tool && todo, 'progress uses the control and current Todo without execution evidence');

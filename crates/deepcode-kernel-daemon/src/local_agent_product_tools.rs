@@ -81,10 +81,14 @@ impl ProductTools {
             "plugin.search" => {
                 let query = input["query"].as_str().unwrap_or("");
                 let limit = input["limit"].as_u64().unwrap_or(20) as usize;
-                crate::local_agent_plugins::search_plugins(&self.plugin_settings, query, limit)
-                    .map_err(|message| {
-                        SessionServiceError::new("plugin_catalog_unavailable", message)
-                    })
+                let offset = input["offset"].as_u64().unwrap_or(0) as usize;
+                crate::local_agent_plugins::search_plugins(
+                    &self.plugin_settings,
+                    query,
+                    limit,
+                    offset,
+                )
+                .map_err(|message| SessionServiceError::new("plugin_catalog_unavailable", message))
             }
             _ => Err(SessionServiceError::new("tool_not_found", name)),
         }
@@ -92,10 +96,11 @@ impl ProductTools {
 
     pub(crate) fn definitions() -> Vec<(&'static str, String, Value)> {
         vec![
-            ("plugin.search", "Discover installed plugins when a task needs unlisted tools. Omit query to list, or use short capability keywords such as browser. Discovery does not load tools. Activate enabled, available results with the Session plugin activation tool; user mentions are optional. Disabled/unavailable results retain their diagnostic status.".into(), json!({
+            ("plugin.search", "Discover installed capabilities needed for the task. Search uses case-insensitive literal keywords separated by whitespace; EVERY keyword must match a plugin's name, URI or capability description. Use a short product name or capability, not a sentence. Zero matches means this query did not match: shorten it or omit query to browse when useful. Results retain enabled/available status and errors. total counts all matches; nextOffset continues the same query. Discovery does not load tools or start external programs. Activate relevant enabled, available results with the Session plugin activation tool, then use their declared tools. User mentions are optional.".into(), json!({
                 "type":"object", "additionalProperties":false, "properties":{
-                    "query":{"type":"string","maxLength":240},
-                    "limit":{"type":"integer","minimum":1,"maximum":50}
+                    "query":{"type":"string","maxLength":240,"description":"Short literal keywords; all must match. Omit to browse the catalog."},
+                    "limit":{"type":"integer","minimum":1,"description":"Page size; defaults to 20. More results remain accessible through nextOffset."},
+                    "offset":{"type":"integer","minimum":0,"description":"Use nextOffset from the previous result with the same query; defaults to 0."}
                 }
             })),
             ("session.read", "Read persisted DeepCode conversation facts without resuming the session. Query directly; no prior Skill read is required. Start with summary; use messages, tools, plans or context for details. view=images lists archived image references. To inspect images from the current session, pass imageIds with exact referenceId/artifactId values; their pixels enter the next visual input. Include all images needed for comparison. imageIds=[] releases current images. before is an exclusive event-sequence cursor; nextBefore continues older items. Excerpts report truncation. A session ID is required.".into(), json!({
@@ -103,7 +108,7 @@ impl ProductTools {
                 "properties": {
                     "sessionId":{"type":"string","description":"Exact complete ID from the user or DeepCode. Preserve it verbatim, including prefixes such as session:."},
                     "view":{"type":"string","enum":["summary","messages","tools","plans","context","reasoning","images"]},
-                    "imageIds":{"type":"array","maxItems":8,"uniqueItems":true,"items":{"type":"string","minLength":1},"description":"Requires view=images. Exact current-session image references to inspect together. Omit to list references; [] releases pixels. Do not combine with before or limit."},
+                    "imageIds":{"type":"array","uniqueItems":true,"items":{"type":"string","minLength":1},"description":"Requires view=images. Exact current-session image references to inspect together. Select only images needed for the current comparison. Omit to list references; [] releases pixels. Do not combine with before or limit."},
                     "before":{"type":"integer","minimum":1},
                     "limit":{"type":"integer","minimum":1,"maximum":50},
                     "recordId":{"type":"string","description":"Exact ToolRecord ID; requires view=tools."},
@@ -364,6 +369,17 @@ mod tests {
         assert!(found["plugins"].as_array().unwrap().iter().any(|plugin| {
             plugin["uri"] == "plugin://computer-use@builtin" && plugin["enabled"] == true
         }));
+        let first = tools.call("plugin.search", json!({"limit":1})).unwrap();
+        assert_eq!(first["plugins"].as_array().unwrap().len(), 1);
+        assert_eq!(first["nextOffset"], 1);
+        let second = tools
+            .call(
+                "plugin.search",
+                json!({"limit":1,"offset":first["nextOffset"]}),
+            )
+            .unwrap();
+        assert_eq!(second["total"], first["total"]);
+        assert_ne!(second["plugins"][0]["uri"], first["plugins"][0]["uri"]);
         assert!(tools.computer_use_instance.is_none());
     }
 

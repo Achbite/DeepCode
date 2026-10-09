@@ -15,6 +15,7 @@ import type {
   PluginSelectionInput,
   PlanResponse,
   SessionProjection,
+  HostWindowBinding,
 } from '@deepcode/protocol';
 import { CONVERSATION_COMMAND_VERSION } from '@deepcode/protocol';
 import { getLlmProfiles, patchLlmProfiles } from '../services/apiClient';
@@ -101,7 +102,8 @@ export interface LocalAgentState {
   editMessage(messageId: string, text: string, expectedRevision: number): Promise<CommandReply>;
   attachSessionDirectory(canonicalRoot: string): Promise<void>;
   detachSessionDirectory(workspaceId: string): Promise<void>;
-  respondInteraction(response: string): Promise<CommandReply>;
+  respondInteraction(response: string, interactionId?: string): Promise<CommandReply>;
+  rebindHost(hostBinding: HostWindowBinding): Promise<CommandReply>;
   setPermissions(patches: UserSettings): Promise<CommandReply>;
   revokeAuthorization(authorityId: string): Promise<CommandReply>;
   respondApproval(decision: 'allow' | 'deny', authorizationScope?: ShellAuthorizationScope): Promise<CommandReply>;
@@ -575,11 +577,21 @@ const store = create<LocalAgentState>((set, get) => ({
     }
   },
 
-  respondInteraction: async (response) => {
+  rebindHost: async (hostBinding) => {
+    const { sessionId, projection } = get();
+    const run = projection?.run;
+    if (!sessionId || run?.status !== 'waiting' || !run.hostBinding) throw new Error('host_rebind_not_waiting');
+    return submitCommandAndReconcile(set, get, {
+      schemaVersion: CONVERSATION_COMMAND_VERSION, type: 'run.host.rebind', commandId: `command:${crypto.randomUUID()}`,
+      sessionId, runId: run.runId, expectedHostBinding: run.hostBinding, hostBinding,
+    });
+  },
+  respondInteraction: async (response, interactionId) => {
     const state = get();
     const sessionId = requiredSession(state);
-    const interaction = state.projection?.pendingInteraction;
-    if (!interaction || !response.trim()) throw new Error('interaction_response_missing');
+    const interaction = interactionId ? state.projection?.interactions.find(item => item.interactionId === interactionId)
+      : state.projection?.pendingInteraction;
+    if (!interaction || interaction.status !== 'pending' || !response.trim()) throw new Error('interaction_response_missing');
     return await submitDecision(
       set,
       get,

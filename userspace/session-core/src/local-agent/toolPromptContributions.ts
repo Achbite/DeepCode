@@ -11,8 +11,6 @@ import type {
 import { LoopFailure } from './loopFailure.js';
 import { CORE_TOOL_ORDER } from './providerToolCodec.js';
 
-const MAX_TOOL_PROMPT_PROVIDERS = 128;
-const MAX_TOOL_PROMPT_CONTRIBUTIONS = 128;
 const MAX_TOOL_PROMPT_GUIDELINES = 8;
 const MAX_PROMPT_SNIPPET_LENGTH = 512;
 const MAX_PROMPT_GUIDELINE_LENGTH = 1_024;
@@ -24,12 +22,11 @@ const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/u;
 export function decodeToolPromptProviderSnapshots(
   value: unknown,
 ): readonly ToolPromptProviderSnapshot[] {
-  if (!Array.isArray(value) || value.length > MAX_TOOL_PROMPT_PROVIDERS) {
+  if (!Array.isArray(value)) {
     throw new Error('tool_prompt_providers_invalid');
   }
   const seenProviders = new Set<string>();
   const seenContributions = new Set<string>();
-  let contributionCount = 0;
   return Object.freeze(value.map((candidate): ToolPromptProviderSnapshot => {
     const fields = ['providerRef', 'origin', 'contributions'];
     if (isRecord(candidate) && Object.hasOwn(candidate, 'pluginUri')) fields.push('pluginUri');
@@ -39,17 +36,12 @@ export function decodeToolPromptProviderSnapshots(
       || seenProviders.has(candidate.providerRef)
       || candidate.origin !== 'coreBuiltin' && candidate.origin !== 'extension'
       || !Array.isArray(candidate.contributions)
-      || candidate.contributions.length > MAX_TOOL_PROMPT_CONTRIBUTIONS
       || candidate.origin === 'coreBuiltin' && candidate.pluginUri !== undefined
       || candidate.origin === 'extension'
         && (typeof candidate.pluginUri !== 'string'
           || !PLUGIN_URI_PATTERN.test(candidate.pluginUri))
     ) throw new Error('tool_prompt_providers_invalid');
     seenProviders.add(candidate.providerRef);
-    contributionCount += candidate.contributions.length;
-    if (contributionCount > MAX_TOOL_PROMPT_CONTRIBUTIONS) {
-      throw new Error('tool_prompt_providers_invalid');
-    }
     const contributions = Object.freeze(candidate.contributions.map((contribution) => {
       const decoded = decodeToolPromptContribution(contribution);
       if (seenContributions.has(decoded.contributionRef)) {

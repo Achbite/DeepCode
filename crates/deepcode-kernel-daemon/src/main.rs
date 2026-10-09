@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod api_response;
+mod artifact_resources;
 mod command_denylist;
 mod config_root_lease;
 mod config_setup;
@@ -42,6 +43,7 @@ mod session_environment;
 mod session_service;
 mod settings_api;
 mod state;
+mod tool_images;
 mod utils;
 mod workspace_api;
 

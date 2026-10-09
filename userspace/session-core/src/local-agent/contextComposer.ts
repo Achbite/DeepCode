@@ -19,6 +19,7 @@ import {
   SESSION_CONTROL_PLAN_PUBLISH,
   SESSION_CONTROL_TODO_UPDATE,
   SESSION_CONTROL_PLUGIN_ACTIVATE,
+  SESSION_CONTROL_ARTIFACT_PRESENT,
 } from '@deepcode/protocol';
 import { LoopFailure } from './loopFailure.js';
 import type {
@@ -77,6 +78,7 @@ export async function buildAgentProviderRequest(input: {
     planPublish: providerWireName(input.runtime, SESSION_CONTROL_PLAN_PUBLISH),
     todoUpdate: providerWireName(input.runtime, SESSION_CONTROL_TODO_UPDATE),
     pluginActivate: providerWireName(input.runtime, SESSION_CONTROL_PLUGIN_ACTIVATE),
+    artifactPresent: providerWireName(input.runtime, SESSION_CONTROL_ARTIFACT_PRESENT),
   };
   const runtimeTools = hasWorkspaceBindings
     ? input.runtime.tools
@@ -89,7 +91,7 @@ export async function buildAgentProviderRequest(input: {
     ? [{ type: 'webSearch', providerToolType: input.runtime.webSearch.providerToolType }]
     : [];
   const controlTools = sessionControlToolDefinitions().filter(tool => tool.name === SESSION_CONTROL_PLUGIN_ACTIVATE
-    ? hasPluginDiscovery : hasWorkspaceBindings || tool.name === SESSION_CONTROL_INTERACTION_REQUEST);
+    ? hasPluginDiscovery : hasWorkspaceBindings || tool.name === SESSION_CONTROL_INTERACTION_REQUEST || tool.name === SESSION_CONTROL_ARTIFACT_PRESENT);
   const toolCodec = createProviderToolCodec(
     runtimeTools,
     controlTools,
@@ -154,6 +156,12 @@ export async function buildAgentProviderRequest(input: {
   if (imageReader) instructions.push({ contributionId: 'session:images', contributionKind: 'sessionControls',
     label: 'Image context', message: { role: 'system', content: visualContextInstruction(input.sessionId, imageReader) } });
   const selected = [...instructions, ...journalMessages, ...visualContextMessages(input.events, input.runId)];
+  const resolvedQuestions = new Set(input.events.flatMap(event => event.type === 'interaction.resolved' ? [event.payload.interactionId] : []));
+  const pendingQuestions = input.events.flatMap(event => event.type === 'interaction.requested' && event.runId === input.runId
+    && event.payload.mode === 'continue' && !resolvedQuestions.has(event.payload.interactionId)
+    ? [{ interactionId: event.payload.interactionId, prompt: event.payload.prompt, options: event.payload.options }] : []);
+  if (pendingQuestions.length) selected.push({ contributionId: 'session:unanswered-questions', contributionKind: 'sessionControls',
+    label: 'Unanswered questions', message: { role: 'system', content: `These questions remain unanswered. Continue independent work only; do not choose an answer for the user. When independent work is complete, explain what is ready and what awaits the user; Session will wait. ${JSON.stringify(pendingQuestions)}` } });
   assertContextContributions(selected);
   const journalCodecsByCallId = providerMessageCodecsByCallId(input.events);
   const providerSelected = selected.map<ContextMessageContribution>((contribution) => ({
@@ -209,6 +217,7 @@ export function messagesFromJournal(
   workspaceBindings: readonly WorkspaceBindingDisplay[],
 ): ContextMessageContribution[] {
   const messages: ContextMessageContribution[] = [];
+  const pendingHostRebinds: ContextMessageContribution[] = [];
   const completionResults = new Map<string, ContextMessageContribution>();
   const processes = new Map(events.flatMap(event => event.type === 'process.updated'
     ? [[event.callId, event.payload.job] as const] : []));
@@ -239,6 +248,12 @@ export function messagesFromJournal(
       ? [[event.payload.interactionId, event.callId] as const]
       : []
   )));
+  const interactions = new Map(events.flatMap(event => event.type === 'interaction.requested'
+    ? [[event.payload.interactionId, event] as const] : []));
+  const responses = new Map(events.flatMap(event => event.type === 'interaction.resolved'
+    ? [[event.payload.commandId, event.payload] as const] : []));
+  const repliesByMessage = new Map(events.flatMap(event => event.type === 'input.accepted' && responses.has(event.payload.commandId)
+    ? [[event.payload.messageId, responses.get(event.payload.commandId)!] as const] : []));
   const retainedRunInputId = runInputMessageEvent(events, runId)?.payload.messageId;
   const runs = events.filter((event): event is Extract<SessionEvent, { type: 'run.started' }> => event.type === 'run.started');
   const runForInput = new Map(runs.map((event) => [event.payload.inputMessageId, event]));
@@ -300,7 +315,13 @@ export function messagesFromJournal(
         label: event.payload.role === 'user' ? '用户消息' : 'Assistant 消息',
         message: {
           role: event.payload.role,
-          content: messageContentForModel(event.payload, messageBindings),
+          content: (() => {
+            const reply = repliesByMessage.get(event.payload.messageId);
+            const question = reply && interactions.get(reply.interactionId);
+            const content = messageContentForModel(event.payload, messageBindings);
+            return question?.payload.mode === 'continue'
+              ? `User response to question ${reply!.interactionId}: ${question.payload.prompt}\n\n${content}` : content;
+          })(),
           ...reasoning,
         },
       });
@@ -319,8 +340,7 @@ export function messagesFromJournal(
         });
       }
     } else if (event.type === 'interaction.requested') {
-      if (orderedProviderCallIds.has(event.callId)) continue;
-      attachToolCall(messages, {
+      if (!orderedProviderCallIds.has(event.callId)) attachToolCall(messages, {
         callId: event.callId,
         providerCallId: event.payload.providerCallId,
         name: SESSION_CONTROL_INTERACTION_REQUEST,
@@ -329,9 +349,17 @@ export function messagesFromJournal(
           prompt: event.payload.prompt,
           options: event.payload.options,
           allowFreeform: event.payload.allowFreeform,
+          ...(event.payload.mode ? { mode: event.payload.mode } : {}),
         },
       });
+      if (event.payload.mode === 'continue') completionResults.set(event.callId, {
+        contributionId: `interaction-pending:${event.payload.interactionId}`, contributionKind: 'journalMessages',
+        label: 'Question awaiting user', message: { role: 'tool', toolCallId: event.callId, providerCallId: event.payload.providerCallId,
+          content: JSON.stringify({ interactionId: event.payload.interactionId, status: 'pending',
+            nextAction: 'Continue independent work. The answer will arrive as user input; do not assume an answer or repeat this question.' }) },
+      });
     } else if (event.type === 'interaction.resolved') {
+      if (interactions.get(event.payload.interactionId)?.payload.mode === 'continue') continue;
       const callId = interactionCallIds.get(event.payload.interactionId);
       if (!callId) {
         throw new LoopFailure('interaction_call_identity_missing', '交互请求缺少 LogicalCallId。');
@@ -459,6 +487,16 @@ export function messagesFromJournal(
           }),
         },
       });
+    } else if (event.type === 'artifacts.presented') {
+      if (!orderedProviderCallIds.has(event.callId)) attachToolCall(messages, {
+        callId: event.callId, providerCallId: event.payload.providerCallId,
+        name: SESSION_CONTROL_ARTIFACT_PRESENT, input: { items: event.payload.items },
+      });
+      completionResults.set(event.callId, {
+        contributionId: `artifact-presentation:${event.callId}`, contributionKind: 'journalMessages', label: 'Artifacts presented',
+        message: { role: 'tool', toolCallId: event.callId, providerCallId: event.payload.providerCallId,
+          content: JSON.stringify({ accepted: true, items: event.payload.items.map(item => ({ ...item, uri: `artifact://${item.artifactId}` })) }) },
+      });
     } else if (event.type === 'session.plugins.activated') {
       if (!orderedProviderCallIds.has(event.callId)) {
         attachToolCall(messages, { callId: event.callId, providerCallId: event.payload.providerCallId,
@@ -539,6 +577,13 @@ export function messagesFromJournal(
           }),
         },
       });
+    } else if (event.type === 'run.host.rebound') {
+      // Rebinding happens while a tool is waiting. Its notice belongs to the next
+      // Agent request, after the pending result, not inside the call/result pair.
+      pendingHostRebinds.push({ contributionId: `host-rebind:${event.sequence}`, contributionKind: 'journalMessages', label: 'GUI target changed',
+        message: { role: 'user', content: `The user explicitly selected a new GUI window for subsequent calls: ${JSON.stringify(event.payload.hostBinding)}. All earlier observationId and previewId handles belong to the previous GUI and are invalid here. Observe again or open a new preview before interacting; do not replay previous actions.` } });
+    } else if (event.type === 'context.composed' && event.payload.purpose === 'agent') {
+      messages.push(...pendingHostRebinds.splice(0));
     } else if (event.type === 'provider.turn.settled' && event.payload.outcome === 'completed') {
       if (event.payload.toolCallInputs) {
         messages.push({
@@ -610,6 +655,7 @@ export function messagesFromJournal(
       }
     }
   }
+  messages.push(...pendingHostRebinds);
   if (completionResults.size > 0) {
     throw new LoopFailure(
       'provider_call_result_completion_missing',
@@ -780,6 +826,7 @@ function providerCallIdsFromEvents(events: readonly SessionEvent[]): Map<string,
       && event.type !== 'plan.published'
       && event.type !== 'session.control.rejected'
       && event.type !== 'session.plugins.activated'
+      && event.type !== 'artifacts.presented'
     ) continue;
     const providerCallId = event.payload.providerCallId;
     const existing = byLogicalCallId.get(event.callId);

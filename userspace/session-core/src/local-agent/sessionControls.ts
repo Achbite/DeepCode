@@ -12,6 +12,7 @@ import {
   SESSION_CONTROL_PLAN_PUBLISH,
   SESSION_CONTROL_TODO_UPDATE,
   SESSION_CONTROL_PLUGIN_ACTIVATE,
+  SESSION_CONTROL_ARTIFACT_PRESENT,
 } from '@deepcode/protocol';
 
 export interface SessionControlWireNames {
@@ -19,6 +20,7 @@ export interface SessionControlWireNames {
   planPublish: string;
   todoUpdate: string;
   pluginActivate: string;
+  artifactPresent: string;
 }
 
 export function confirmedPlanExecutionInstruction(): string {
@@ -30,13 +32,14 @@ export function sessionControlInstructions(
   hasWorkspaceBindings = true,
   hasPluginDiscovery = false,
 ): string {
-  const decisions = ` Ask for missing information or decisions with ${names.interactionRequest}; confirmation opens a panel and resumes this run after the answer. Correct rejected inputs; Kernel handles permission approval.`;
-  const plugins = hasPluginDiscovery ? ` Discover plugins when the task needs unlisted capabilities. ${names.pluginActivate} loads enabled plugins for this run; activation in a previous run does not make those tools available now. The current tool list is authoritative. User mentions are optional guidance. Loading does not grant tool permissions. Call it alone, then use the new tools.` : '';
+  const decisions = ` Ask for missing information or decisions with ${names.interactionRequest}. Use mode=continue for clarification questions when other independent analysis or work can proceed: the question stays visible, the tool returns a pending receipt, and the user's eventual answer arrives as user input at a later request boundary. Continue only work that does not depend on that answer; never assume silence selects an option. Finish independent work with a clear response; Session then waits for unanswered questions and resumes this same run after answers. Use mode=wait (default) when no independent work remains; confirmations always wait. Ask early and do not repeatedly ask the same unresolved question. Correct rejected inputs; Kernel handles execution permission approval separately.`;
+  const plugins = hasPluginDiscovery ? ` The current tool list contains loaded capabilities, not every installed capability. For an external-program task, choose the interface that supports the requested operation: use an available CLI or suitable MCP tools for program operations, and GUI tools for interface-specific actions or visual confirmation. Combine interfaces as needed; programmatic calls do not require screenshots. When a needed capability is absent, use plugin search before concluding it is unavailable or asking the user to select a plugin. Search by a short capability or product name using the search tool's declared matching rules; a query with no matches does not mean the catalog is empty. Choose relevant enabled, available results, then call ${names.pluginActivate} alone to load their tools and instructions for the next request. Continue with those tools instead of repeatedly rediscovering an already loaded capability. User mentions are optional guidance. Activation in a previous run does not make those tools available now; the current tool list is authoritative. Loading does not grant tool permissions.` : '';
+  const delivery = ` Tool artifacts are archived runtime resources, not automatically user deliverables. Use ${names.artifactPresent} to explicitly select completed results or review materials the user should see. Temporary scripts, logs and observation screenshots stay intermediate unless requested as results. For a file or URL without an artifact reference, first use artifact.prepare for a file or artifact.preview for a live URL. Present updated versions under the same deliveryId; cite the returned resource URI in final prose, using Markdown images for visual review. Presentation does not resend pixels to the model.`;
   const progress = ` For multi-step work, use ${names.todoUpdate} when useful. Keep phases few and meaningful, merging similar work; choose the count to fit the task. Skip trivial work and unchanged updates; no update is required per tool call or before answering. Send the complete current list in one update, optionally alongside ordinary calls. Todo grants no permissions and does not gate completion; keep unfinished work honest.`;
   if (!hasWorkspaceBindings) {
-    return `Explicit commentary is progress and may continue without calls; unphased text without calls is the final answer. ${names.interactionRequest} must be the only call in its turn. No workspace is bound to this run; do not invent a workspace handle or request workspace operations.${progress}${decisions}${plugins}`;
+    return `Explicit commentary is progress and may continue without calls; unphased text without calls is the final answer. ${names.interactionRequest} must be the only call in its turn. No workspace is bound to this run; do not invent a workspace handle or request workspace operations.${progress}${decisions}${plugins}${delivery}`;
   }
-  return `Explicit commentary is progress and may continue without calls; unphased text without calls is the final answer. ${names.interactionRequest} and ${names.planPublish} must each be the only call in their turn. Use a logical workspace handle from the Session binding list and workspace-relative paths; never invent or expose a workspaceId.${progress}${decisions}${plugins}`;
+  return `Explicit commentary is progress and may continue without calls; unphased text without calls is the final answer. ${names.interactionRequest} and ${names.planPublish} must each be the only call in their turn. Use a logical workspace handle from the Session binding list and workspace-relative paths; never invent or expose a workspaceId.${progress}${decisions}${plugins}${delivery}`;
 }
 
 const INTERACTION_SCHEMA: JsonObject = {
@@ -44,6 +47,7 @@ const INTERACTION_SCHEMA: JsonObject = {
   additionalProperties: false,
   required: ['kind', 'prompt', 'allowFreeform'],
   properties: {
+    mode: { type: 'string', enum: ['wait', 'continue'], description: 'continue asks a question without pausing independent work. Unanswered questions still prevent final run completion. Confirmations must wait. Omit for wait.' },
     kind: { type: 'string', enum: ['question', 'confirmation'] },
     prompt: { type: 'string', minLength: 1, description: 'Markdown prose. Use actual paragraph breaks, not literal backslash-n text.' },
     options: {
@@ -160,6 +164,7 @@ const PLAN_SCHEMA: JsonObject = {
 };
 
 export type SessionControlCall =
+  | { kind: 'artifactPresent'; callId: string; items: ArtifactPresentationInput[] }
   | { kind: 'pluginActivate'; callId: string; pluginUris: string[] }
   | {
       kind: 'todoUpdate';
@@ -177,6 +182,8 @@ export type SessionControlCall =
       draft: PlanPublicationDraft | PlanScopeExtension;
     };
 
+export interface ArtifactPresentationInput { artifactId: string; label: string; deliveryId?: string }
+
 export interface PlanPublicationDraft {
   title: string;
   summary: string;
@@ -193,10 +200,20 @@ export interface PlanScopeExtension {
 export function sessionControlToolDefinitions(): readonly ProviderToolDefinition[] {
   return [
     {
+      name: SESSION_CONTROL_ARTIFACT_PRESENT,
+      description: 'Select archived resources to deliver for user review or as requested results. Observations, temporary scripts and runtime logs are not outputs by default. Supply exact artifactIds returned by tools; use artifact.prepare for a file or artifact.preview for a URL first. Updating a delivered resource reuses its deliveryId. Returns references to cite or embed in final prose. Does not resend images to the model. Submit this control alone; items may contain all needed deliveries.',
+      inputSchema: { type: 'object', additionalProperties: false, required: ['items'], properties: {
+        items: { type: 'array', minItems: 1, items: { type: 'object', additionalProperties: false,
+          required: ['artifactId', 'label'], properties: {
+            artifactId: {type:'string',minLength:1}, label: {type:'string',minLength:1}, deliveryId: {type:'string',minLength:1},
+          } } },
+      } },
+    },
+    {
       name: SESSION_CONTROL_PLUGIN_ACTIVATE,
       description: 'Load installed, enabled plugins needed for the current task. Discover exact URIs with plugin search first. User mentions are optional and remain separate user guidance. This adds plugin tools/instructions to the next request in this run; it does not install, enable disabled plugins, change settings or authorize their effects. Must be the only call in its turn.',
       inputSchema: { type: 'object', additionalProperties: false, required: ['pluginUris'], properties: {
-        pluginUris: { type: 'array', minItems: 1, maxItems: 16, uniqueItems: true,
+        pluginUris: { type: 'array', minItems: 1, uniqueItems: true,
           items: { type: 'string', pattern: '^plugin://[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$' } },
       } },
     },
@@ -237,14 +254,26 @@ export function decodeSessionControlCall(
     && name !== SESSION_CONTROL_PLAN_PUBLISH
     && name !== SESSION_CONTROL_TODO_UPDATE
     && name !== SESSION_CONTROL_PLUGIN_ACTIVATE
+    && name !== SESSION_CONTROL_ARTIFACT_PRESENT
   ) return null;
   const canonicalCallId = requiredIdentifier(callId, 'callId');
+  if (name === SESSION_CONTROL_ARTIFACT_PRESENT) {
+    assertExactKeys(input, ['items']);
+    if (!Array.isArray(input.items) || !input.items.length) throw new SessionControlError('artifact_presentation_invalid', 'items must select at least one resource.');
+    const items = input.items.map((item): ArtifactPresentationInput => {
+      if (!isRecord(item)) throw new SessionControlError('artifact_presentation_invalid', 'Each delivery must be an object.');
+      assertExactKeys(item, ['artifactId', 'label', 'deliveryId'], ['deliveryId']);
+      return { artifactId: requiredIdentifier(item.artifactId, 'artifactId'), label: requiredText(item.label, 'label'),
+        ...(item.deliveryId === undefined ? {} : {deliveryId: requiredIdentifier(item.deliveryId, 'deliveryId')}) };
+    });
+    return {kind:'artifactPresent', callId:canonicalCallId, items};
+  }
   if (name === SESSION_CONTROL_PLUGIN_ACTIVATE) {
     assertExactKeys(input, ['pluginUris']);
-    if (!Array.isArray(input.pluginUris) || input.pluginUris.length < 1 || input.pluginUris.length > 16
+    if (!Array.isArray(input.pluginUris) || input.pluginUris.length < 1
       || input.pluginUris.some(uri => typeof uri !== 'string' || !/^plugin:\/\/[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(uri))
       || new Set(input.pluginUris).size !== input.pluginUris.length) {
-      throw new SessionControlError('plugin_selection_invalid', 'pluginUris 必须包含 1 至 16 个不重复的已发现插件 URI。');
+      throw new SessionControlError('plugin_selection_invalid', 'pluginUris 必须包含 至少一个不重复的已发现插件 URI。');
     }
     return { kind: 'pluginActivate', callId: canonicalCallId, pluginUris: input.pluginUris as string[] };
   }
@@ -278,7 +307,11 @@ export function decodeSessionControlCall(
 }
 
 function decodeInteraction(value: Record<string, unknown>): ModelInteractionRequest {
-  assertExactKeys(value, ['kind', 'prompt', 'options', 'allowFreeform'], ['options']);
+  assertExactKeys(value, ['kind', 'prompt', 'options', 'allowFreeform', 'mode'], ['options', 'mode']);
+  if (value.mode !== undefined && value.mode !== 'wait' && value.mode !== 'continue'
+    || value.mode === 'continue' && value.kind !== 'question') {
+    throw new SessionControlError('session_control_interaction_mode_invalid', '只有澄清问题可以选择继续独立工作；确认必须等待。');
+  }
   if (value.kind !== 'question' && value.kind !== 'confirmation') {
     throw new SessionControlError(
       'session_control_interaction_kind_invalid',
@@ -292,6 +325,7 @@ function decodeInteraction(value: Record<string, unknown>): ModelInteractionRequ
     );
   }
   const request: ModelInteractionRequest = {
+    ...(value.mode ? { mode: value.mode } : {}),
     kind: value.kind,
     prompt: requiredText(value.prompt, 'prompt'),
     allowFreeform: value.allowFreeform,

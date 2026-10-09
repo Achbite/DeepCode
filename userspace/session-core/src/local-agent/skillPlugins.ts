@@ -24,7 +24,6 @@ export function decodeRunPluginConfig(value: unknown): RunPluginConfig {
     ])
     || !isIdentifier(value.extensionGenerationRef)
     || !Array.isArray(value.selectedPlugins)
-    || value.selectedPlugins.length > 16
   ) {
     throw new Error('run_plugin_config_invalid');
   }
@@ -42,7 +41,6 @@ export function decodeRunPluginConfig(value: unknown): RunPluginConfig {
       || item.displayName.length > 160
       || typeof item.capabilitySummary !== 'string'
       || !item.capabilitySummary.trim()
-      || new TextEncoder().encode(item.capabilitySummary).byteLength > 4 * 1024
     ) {
       throw new Error('run_selected_plugin_config_invalid');
     }
@@ -68,6 +66,7 @@ export function runtimeInstructions(
     planPublish: 'plan_publish',
     todoUpdate: 'todo_update',
     pluginActivate: 'plugin_activate',
+    artifactPresent: 'artifact_present',
   },
 ): readonly InstructionContribution[] {
   const instructions: InstructionContribution[] = [

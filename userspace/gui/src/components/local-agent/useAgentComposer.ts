@@ -39,7 +39,10 @@ export function useAgentComposer(
   const profiles = useLocalAgentStore((state) => state.profiles);
   const selectedProfileId = useLocalAgentStore((state) => state.selectedProfileId);
   const projection = useLocalAgentStore((state) => state.projection);
-  const pendingInteraction = projection?.pendingInteraction ?? null;
+  // Deferred questions stay answerable in their transcript cards while normal
+  // steering and cancellation remain available in the running composer.
+  const question = projection?.pendingInteraction ?? null;
+  const pendingInteraction = question?.mode === 'continue' && projection?.run?.status === 'running' ? null : question;
   const pendingApproval = projection?.pendingApproval ?? null;
   const pendingPlan = projection?.pendingPlan ?? null;
   const pendingScopeAddition = pendingPlan ? planScopeAddition(projection?.plans.find((plan) => (
