@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFile } from 'node:fs/promises';
+import { decodeRunPluginConfig } from '../dist/local-agent/skillPlugins.js';
 import { InMemoryCommandJournal } from './support/memoryJournal.mjs';
 import { createProviderToolAliases } from '../dist/local-agent/providerToolCodec.js';
 import { sessionControlToolDefinitions } from '../dist/index.js';
@@ -10,6 +12,13 @@ import {
 
 const discoveryTool = { toolBindingRef: 'binding:plugin-search', name: 'plugin.search', description: 'Discover plugins.',
   inputSchema: { type: 'object', properties: {} }, possibleEffects: ['localRead'], availability: 'callable', origin: 'coreBuiltin' };
+
+test('the actual builtin Computer Use instructions satisfy the Session plugin configuration contract', async () => {
+  const capabilitySummary = await readFile(new URL('../../../plugins/computer-use/README.md', import.meta.url), 'utf8');
+  const plugin = { uri: 'plugin://computer-use@builtin', displayName: 'Computer Use', capabilitySummary };
+  const decoded = decodeRunPluginConfig({ extensionGenerationRef: 'generation:computer-use', permissions: {}, selectedPlugins: [plugin] });
+  assert.deepEqual(decoded.selectedPlugins, [plugin]);
+});
 
 test('Agent plugin activation and explicit user mentions coexist across request boundaries', async t => {
   for (const surface of ['aggregate', 'responses']) {

@@ -16,7 +16,7 @@ export function decodeConversationReadQuery(value: unknown): ConversationReadQue
     || !identifier(query.sessionId)
     || (query.view !== undefined && (typeof query.view !== 'string' || !['summary', 'messages', 'tools', 'plans', 'context', 'reasoning', 'images'].includes(query.view)))
     || (query.imageIds !== undefined && (query.view !== 'images' || !Array.isArray(query.imageIds)
-      || query.imageIds.length > 8 || query.imageIds.some(id => !identifier(id))
+      || query.imageIds.some(id => !identifier(id))
       || new Set(query.imageIds).size !== query.imageIds.length || query.before !== undefined || query.limit !== undefined))
     || (query.before !== undefined && (!Number.isSafeInteger(query.before) || Number(query.before) < 1))
     || (query.limit !== undefined && (!Number.isInteger(query.limit) || Number(query.limit) < 1 || Number(query.limit) > 50))

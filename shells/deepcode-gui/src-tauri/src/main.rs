@@ -1333,7 +1333,7 @@ fn spawn_host_processes_if_available(
         .env(HOST_SHELL_TOKEN_ENV, host_tokens.daemon_token())
         .env(deepcode_host_connection::HOST_LIFETIME_ENV, "automatic")
         .env(HOST_INSTANCE_ID_ENV, host_tokens.instance_id())
-        .stdin(Stdio::null());
+        .stdin(Stdio::piped());
     if let Err(error) = configure_process_capture(
         &mut proxy_command,
         diagnostic.map(|value| value.directory.as_path()),

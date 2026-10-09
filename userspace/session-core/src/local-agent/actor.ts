@@ -127,8 +127,9 @@ export class SessionActor {
   async hasActiveWork(): Promise<boolean> {
     if (this.#loopFailure) return false;
     const run = (await this.loadSnapshot()).state.run;
+    // Waiting releases the Provider turn, not the in-memory run bindings owned by this Host.
     return this.#active !== undefined
-      || (run != null && run.status !== 'waiting' && !isTerminal(run.status));
+      || (run != null && !isTerminal(run.status));
   }
 
   async dispose(): Promise<void> {
@@ -174,6 +175,8 @@ export class SessionActor {
     }
 
     switch (command.type) {
+      case 'run.host.rebind':
+        return await this.handleHostRebind(command);
       case 'session.permissions.set':
         return await this.handlePermissions(command);
       case 'approval.revoke':
@@ -201,6 +204,45 @@ export class SessionActor {
       case 'plan.respond':
         return await this.handlePlan(command);
     }
+  }
+
+  private async handleHostRebind(command: Extract<ConversationCommand, { type: 'run.host.rebind' }>): Promise<CommandReply> {
+    const snapshot = await this.loadSnapshot();
+    const run = snapshot.state.run;
+    if (this.#active || run?.runId !== command.runId || run.status !== 'waiting') {
+      return this.recordRejection(command, 'host_rebind_not_waiting', '仅可为已暂停等待用户的任务重新选择窗口。');
+    }
+    const same = (a: typeof run.hostBinding, b: typeof run.hostBinding) => a?.hostInstanceId === b?.hostInstanceId && a?.windowLabel === b?.windowLabel;
+    if (!run.hostBinding || !same(run.hostBinding, command.expectedHostBinding)) {
+      return this.recordRejection(command, 'host_rebind_target_changed', '任务绑定已变化，请查看当前状态后再选择窗口。');
+    }
+    if (same(run.hostBinding, command.hostBinding)) {
+      return this.recordRejection(command, 'host_rebind_unchanged', '任务已经使用当前窗口。');
+    }
+    const runtime = snapshot.state.runRuntimeSnapshots[command.runId];
+    let prepared;
+    try {
+      prepared = await this.#composition.runPreparation.prepare({
+        sessionId: this.sessionId, runId: command.runId, profileId: runtime.provider.profileId,
+        environment: runtime.environment,
+        ...(runtime.provider.reasoningEffortOverride ? { reasoningEffortOverride: runtime.provider.reasoningEffortOverride } : {}),
+        ...recoveryPluginSelection(snapshot, command.runId, runtime),
+        rebindHost: { commandId: command.commandId, expectedBinding: command.expectedHostBinding, hostBinding: command.hostBinding },
+      });
+    } catch (error) {
+      const failure = errorFact(asError(error));
+      return this.recordRejection(command, failure.code, failure.message);
+    }
+    const { extensionGenerationRef, kernelCatalogSnapshotRef, instructions, tools, toolPromptContributions,
+      providerToolAliases, selectedPlugins } = prepared.runtimeSnapshot;
+    const preparedBinding = prepared.runtimeSnapshot.environment.hostBinding as typeof command.hostBinding | undefined;
+    if (!same(preparedBinding, command.hostBinding)) {
+      return this.recordRejection(command, 'host_rebind_preparation_mismatch', '准备的工具目录未绑定到所选窗口。');
+    }
+    return this.commitCommand(command, [{ type: 'run.host.rebound', sessionId: this.sessionId, runId: command.runId,
+      payload: { commandId: command.commandId, previousBinding: command.expectedHostBinding, hostBinding: command.hostBinding,
+        toolView: { extensionGenerationRef, kernelCatalogSnapshotRef, instructions, tools, toolPromptContributions, providerToolAliases, selectedPlugins } },
+    }], acceptedReply(command));
   }
 
   private async handlePermissions(command: Extract<ConversationCommand, { type: 'session.permissions.set' }>): Promise<CommandReply> {
@@ -631,57 +673,48 @@ export class SessionActor {
   private async handleInteraction(
     command: Extract<ConversationCommand, { type: 'interaction.respond' }>,
   ): Promise<CommandReply> {
-    const snapshot = await this.loadSnapshot();
-    const interaction = snapshot.state.pendingInteraction;
-    if (
-      !interaction
-      || interaction.interactionId !== command.interactionId
-      || interaction.runId !== command.runId
-      || snapshot.state.run?.runId !== command.runId
-      || snapshot.state.run.status !== 'waiting'
-      || snapshot.state.run.waitingReason !== 'userInput'
-    ) {
-      return await this.recordRejection(
-        command,
-        'interaction_not_pending',
-        '该交互请求已经关闭或不属于当前运行。',
-      );
+    let resume = false;
+    const reply = await this.withWrite(async () => {
+      const snapshot = await this.loadSnapshot();
+      const interaction = snapshot.state.interactions.find(item => item.interactionId === command.interactionId
+        && item.runId === command.runId && item.status === 'pending');
+      const run = snapshot.state.run;
+      const continuing = interaction?.mode === 'continue';
+      if (!interaction || run?.runId !== command.runId || !['running', 'waiting'].includes(run.status)
+        || !continuing && (run.status !== 'waiting' || run.waitingReason !== 'userInput')) {
+        return this.commitCommandWithinWrite(command, [], { ...acceptedReply(command), status: 'rejected',
+          error: { code: 'interaction_not_pending', message: '该交互请求已经关闭或不属于当前运行。' } });
+      }
+      const response = command.response.trim();
+      if (!validInteractionResponse(interaction, response)) {
+        return this.commitCommandWithinWrite(command, [], { ...acceptedReply(command), status: 'rejected',
+          error: { code: 'interaction_response_invalid', message: '响应不符合当前交互请求。' } });
+      }
+      const messageId = this.#nextId('message');
+      const events: NewSessionEvent[] = [continuing ? {
+        type: 'input.queued', sessionId: this.sessionId, runId: command.runId,
+        payload: { commandId: command.commandId, messageId, text: response, interactionId: interaction.interactionId },
+      } : {
+        type: 'input.accepted', sessionId: this.sessionId,
+        payload: { commandId: command.commandId, messageId, text: response },
+      }, {
+        type: 'interaction.resolved', sessionId: this.sessionId, runId: command.runId,
+        payload: { interactionId: interaction.interactionId, commandId: command.commandId, response },
+      }];
+      if (!continuing) events.push({ type: 'message.committed', sessionId: this.sessionId, runId: command.runId,
+        payload: { messageId, role: 'user', content: response } });
+      // A reply never answers an outstanding Plan/permission or another blocking question.
+      resume = run.status === 'waiting' && run.waitingReason === 'userInput'
+        && !snapshot.state.interactions.some(item => item !== interaction && item.runId === run.runId
+          && item.status === 'pending' && item.mode !== 'continue');
+      return this.commitCommandWithinWrite(command, events, acceptedReply(command));
+    });
+    if (resume) {
+      // The waiting fact may be visible just before the owned Loop task returns.
+      // Join that task; never start a second Loop beside it.
+      if (this.#active) await this.#active.task;
+      this.startLoop({ type: 'resume', runId: command.runId });
     }
-    const response = command.response.trim();
-    if (!validInteractionResponse(interaction, response)) {
-      return await this.recordRejection(
-        command,
-        'interaction_response_invalid',
-        '响应不符合当前交互请求。',
-      );
-    }
-
-    const messageId = this.#nextId('message');
-    const events: NewSessionEvent[] = [
-      {
-        type: 'input.accepted',
-        sessionId: this.sessionId,
-        payload: { commandId: command.commandId, messageId, text: command.response },
-      },
-      {
-        type: 'interaction.resolved',
-        sessionId: this.sessionId,
-        runId: command.runId,
-        payload: {
-          interactionId: command.interactionId,
-          commandId: command.commandId,
-          response: command.response,
-        },
-      },
-      {
-        type: 'message.committed',
-        sessionId: this.sessionId,
-        runId: command.runId,
-        payload: { messageId, role: 'user', content: command.response },
-      },
-    ];
-    const reply = await this.commitCommand(command, events, acceptedReply(command));
-    this.startLoop({ type: 'resume', runId: command.runId });
     return reply;
   }
 

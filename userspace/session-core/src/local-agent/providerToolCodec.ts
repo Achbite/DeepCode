@@ -312,7 +312,7 @@ export function providerMessageCodecsByCallId(
       views.set(event.payload.runtimeSnapshot.kernelCatalogSnapshotRef, event.payload.runtimeSnapshot);
       continue;
     }
-    if (event.type === 'run.tools.prepared') {
+    if (event.type === 'run.tools.prepared' || event.type === 'run.host.rebound') {
       const base = runtimes.get(event.runId);
       if (!base) throw new LoopFailure('provider_tool_call_runtime_missing', '工具视图缺少所属 run。');
       views.set(event.payload.toolView.kernelCatalogSnapshotRef, { ...base.runtimeSnapshot, ...event.payload.toolView });

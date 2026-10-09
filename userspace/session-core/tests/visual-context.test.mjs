@@ -4,6 +4,9 @@ import { imageCatalog, readImageReferences, visualContextMessages } from '../dis
 import { decodeConversationReadQuery, readConversation } from '../dist/local-agent/conversationRead.js';
 import { withProviderAttempts } from '../dist/local-agent/providerAttempts.js';
 import { ProviderReportedFailure } from '../dist/local-agent/loopFailure.js';
+import { InMemoryCommandJournal } from './support/memoryJournal.mjs';
+import { actorWith, fakeRunPreparation, emptyKernel, completedExecutionReply, providerEvent,
+  createSession, messageCommand, readEvents, waitForProjection, workspaceBinding } from './local-agent-fixtures.mjs';
 
 const sessionId = 'session:images', runId = 'run:images';
 function history() {
@@ -18,37 +21,123 @@ function history() {
 }
 const file = id => ({ referenceId: id, workspaceId: 'input:images', logicalPath: `${id}.png`, mediaType: 'image/png', displayName: id, kind: 'file' });
 const ids = messages => messages.map(message => JSON.parse(message.message.content.slice('Current visual inputs: '.length)).imageId);
-const observe = (append, id) => append('tool.completed', { record: {
-  toolName: 'browser.observe', input: {}, outcome: 'completed', output: { modelImages: [{ artifactId: id }] },
+const observe = (append, id, purpose = 'observation') => append('tool.completed', { record: {
+  toolName: 'browser.observe', input: {}, outcome: 'completed', output: { modelImages: [{ artifactId: id, ...(purpose ? { purpose } : {}) }] },
 } }, { callId: `call:${id}` });
 const choose = (append, imageIds, outcome = 'completed') => append('tool.completed', { record: {
   toolName: 'session.read', input: { sessionId, view: 'images', imageIds }, outcome,
   ...(outcome === 'completed' ? { output: {} } : { error: { code: 'session_image_not_found' } }),
 } }, { callId: 'call:read' });
+const compose = (append, events, providerRequestId = `request:${events.length}`, purpose = 'agent') => {
+  append('context.composed', { providerRequestId, purpose, messages: visualContextMessages(events, runId).map(message => ({
+    contributionId: message.contributionId,
+  })) });
+  return providerRequestId;
+};
+const settle = (append, providerRequestId, outcome = 'completed', purpose = 'agent') => (
+  append('provider.turn.settled', { providerRequestId, purpose, outcome })
+);
 
-test('visual inputs retain run attachments, replace observation batches and reload exact old images', () => {
+test('GUI observations are consumed by a successful request and exact archived images can be reopened once', () => {
   const { events, append } = history();
   append('message.committed', { role: 'user', messageId: 'input', filesystemReferences: [file('design')] }, { runId: undefined });
   append('run.started', { inputMessageId: 'input' });
   assert.deepEqual(ids(visualContextMessages(events, runId)), ['design']);
-  append('context.composed', { purpose: 'agent' });
+  compose(append, events);
   observe(append, 'before');
   observe(append, 'detail');
   assert.deepEqual(ids(visualContextMessages(events, runId)), ['design', 'before', 'detail']);
-  append('context.composed', { purpose: 'agent' });
+  const request = compose(append, events);
   append('tool.completed', { record: { toolName: 'fs.read', input: {}, outcome: 'completed', output: { content: 'code' } } });
   assert.deepEqual(ids(visualContextMessages(events, runId)), ['design', 'before', 'detail']);
+  settle(append, request);
+  assert.deepEqual(ids(visualContextMessages(events, runId)), ['design']);
   observe(append, 'after');
   assert.deepEqual(ids(visualContextMessages(events, runId)), ['design', 'after']);
   choose(append, ['before', 'after']);
   const compared = visualContextMessages(events, runId);
   assert.deepEqual(ids(compared), ['before', 'after']);
   assert.deepEqual(compared[0].message.toolImages, [{ callId: 'call:before', artifactId: 'before' }]);
+  const comparison = compose(append, events);
   choose(append, ['missing'], 'failed');
+  assert.deepEqual(visualContextMessages(events, runId), compared);
+  settle(append, comparison);
+  assert.deepEqual(visualContextMessages(events, runId), []);
+  choose(append, ['before', 'after']);
   assert.deepEqual(visualContextMessages(events, runId), compared);
   choose(append, []);
   assert.deepEqual(visualContextMessages(events, runId), []);
   assert.equal(imageCatalog(events).size, 4);
+});
+
+test('reference images retain their lifetime and unrelated or unsuccessful requests do not consume observations', () => {
+  const { events, append } = history();
+  observe(append, 'reference', null);
+  observe(append, 'screen');
+  const rejected = compose(append, events);
+  settle(append, rejected, 'failed');
+  const review = compose(append, events, 'request:review', 'approvalReview');
+  settle(append, review, 'completed', 'approvalReview');
+  assert.deepEqual(ids(visualContextMessages(events, runId)), ['reference', 'screen']);
+  const successful = compose(append, events);
+  settle(append, successful);
+  assert.deepEqual(ids(visualContextMessages(events, runId)), ['reference']);
+  assert.equal(imageCatalog(events).size, 2, 'consumption never deletes archived references');
+});
+
+test('only the observations actually selected into a completed request are consumed', () => {
+  const { events, append } = history();
+  observe(append, 'first');
+  const first = compose(append, events);
+  observe(append, 'second');
+  settle(append, first);
+  assert.deepEqual(ids(visualContextMessages(events, runId)), ['second']);
+});
+
+test('explicit GUI rebind clears old observation selection and keeps the archive readable', () => {
+  const { events, append } = history();
+  append('message.committed', { role: 'user', messageId: 'input', filesystemReferences: [file('design')] }, { runId: undefined });
+  append('run.started', { inputMessageId: 'input' });
+  observe(append, 'old-window');
+  append('run.host.rebound', {});
+  assert.deepEqual(ids(visualContextMessages(events, runId)), ['design']);
+  assert.equal(readImageReferences(events, ['old-window']).length, 1);
+  observe(append, 'new-window');
+  assert.deepEqual(ids(visualContextMessages(events, runId)), ['design', 'new-window']);
+});
+
+test('the Session loop sends an observation once while subsequent tool history retains its archive reference', async t => {
+  const journal = new InMemoryCommandJournal(), sessionId = 'session:image-lifetime';
+  await createSession(journal, sessionId, [workspaceBinding]);
+  const requests = [], executions = [];
+  const tool = { toolBindingRef: 'binding:read', name: 'fs.read', description: 'Read a file.',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+    possibleEffects: ['workspaceRead'], availability: 'callable', origin: 'coreBuiltin' };
+  const actor = actorWith(journal, sessionId, { async *stream(request) {
+    requests.push(structuredClone(request));
+    assert.ok(requests.length <= 3);
+    if (requests.length < 3) {
+      yield providerEvent(request.requestId, 'tool.call', { callId: `native:${requests.length}`, name: 'fs_read',
+        input: { workspace: 'primary', path: requests.length === 1 ? 'screen.png' : 'notes.txt' } });
+    } else {
+      yield providerEvent(request.requestId, 'text.delta', { text: 'Checked the image and notes.' });
+    }
+    yield providerEvent(request.requestId, 'completed', {});
+  } }, emptyKernel({ async execute(request) {
+    executions.push(request);
+    return completedExecutionReply(request, executions.length === 1
+      ? { modelImages: [{ artifactId: 'artifact:screen', purpose: 'observation' }],
+        artifacts: [{ artifactId: 'artifact:screen', uri: 'artifact://screen', label: 'Screen', contentMode: 'fixed' }] }
+      : { content: 'Notes contain no images.' });
+  } }), fakeRunPreparation({ tools: [tool], contextWindowTokens: 32768 }).port, 'image-lifetime');
+  t.after(() => actor.dispose());
+  await actor.submit(messageCommand(sessionId, 'command:start', 'Inspect the screenshot, then read the notes.'));
+  await waitForProjection(actor, state => state.run?.status === 'completed');
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests.map(request => request.messages.flatMap(message => message.toolImages ?? [])),
+    [[], [{ callId: executions[0].callId, artifactId: 'artifact:screen' }], []]);
+  assert.ok(requests[2].messages.some(message => message.role === 'tool' && message.content.includes('artifact:screen')));
+  assert.equal(imageCatalog(await readEvents(journal, sessionId)).size, 1);
 });
 
 test('a new run carries references without pixels and can reopen images across a compaction', () => {
@@ -93,7 +182,7 @@ test('retry preserves selected attachment and observation images in the request 
   const requests = [], facts = [];
   const request = { requestId: 'request:images', sessionId, runId, purpose: 'agent',
     messages: selected.map(contribution => contribution.message) };
-  append('context.composed', { purpose: 'agent' });
+  compose(append, events, request.requestId);
   await withProviderAttempts(request, { nextId: kind => `${kind}:${facts.length}`, commit: async event => {
     facts.push(event); append(event.type, event.payload);
   }, updateAssistantDraft() {} },
@@ -111,4 +200,6 @@ test('retry preserves selected attachment and observation images in the request 
     [{ callId: 'call:observation', artifactId: 'observation' }]);
   assert.deepEqual(visualContextMessages(events, runId), selected, 'attempt lifecycle events must not consume the selected images');
   assert.equal(facts.at(-1).payload.phase, 'completed');
+  settle(append, request.requestId);
+  assert.deepEqual(visualContextMessages(events, runId), []);
 });

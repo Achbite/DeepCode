@@ -14,6 +14,7 @@ export const SESSION_CONTROL_INTERACTION_REQUEST = 'interaction.request' as cons
 export const SESSION_CONTROL_PLAN_PUBLISH = 'plan.publish' as const;
 export const SESSION_CONTROL_TODO_UPDATE = 'todo.update' as const;
 export const SESSION_CONTROL_PLUGIN_ACTIVATE = 'plugin.activate' as const;
+export const SESSION_CONTROL_ARTIFACT_PRESENT = 'artifact.present' as const;
 
 export type JsonObject = Record<string, unknown>;
 
@@ -235,7 +236,10 @@ export type PlanResponse =
 
 export type MessageFeedback = 'up' | 'down';
 
+export interface HostWindowBinding { hostInstanceId: string; windowLabel: string }
+
 export type ConversationCommand =
+  | { schemaVersion: typeof CONVERSATION_COMMAND_VERSION; type: 'run.host.rebind'; commandId: string; sessionId: string; runId: string; expectedHostBinding: HostWindowBinding; hostBinding: HostWindowBinding }
   | { schemaVersion: typeof CONVERSATION_COMMAND_VERSION; type: 'session.permissions.set'; commandId: string; sessionId: string; patches: UserSettings }
   | { schemaVersion: typeof CONVERSATION_COMMAND_VERSION; type: 'approval.revoke'; commandId: string; sessionId: string; runId: string; authorityId: string }
   | {
@@ -438,6 +442,8 @@ export interface InteractionOption {
 }
 
 export interface ModelInteractionRequest {
+  /** wait blocks immediately; continue leaves a question open during independent work. */
+  mode?: 'wait' | 'continue';
   kind: 'question' | 'confirmation';
   prompt: string;
   options?: InteractionOption[];
@@ -647,6 +653,10 @@ export interface EffectPreview {
 }
 
 export type SessionEvent =
+  | (SessionEventBase & { type: 'artifacts.presented'; runId: string; callId: string; payload: {
+      providerCallId: string;
+      items: Array<{ artifactId: string; label: string; deliveryId: string }>;
+    } })
   | (SessionEventBase & { type: 'session.permissions.updated'; payload: { commandId: string; patches: UserSettings } })
   | (SessionEventBase & { type: 'approval.revoked'; runId: string; payload: { commandId: string; authorityId: string } })
   | (SessionEventBase & { type: 'approval.reviewed'; runId: string; callId: string; payload: { approvalId: string; providerRequestId: string; decision: 'allow' | 'deny' | 'ask'; reason: string } })
@@ -680,6 +690,7 @@ export type SessionEvent =
       type: 'input.queued';
       runId: string;
       payload: {
+        interactionId?: string;
         pluginCatalogRevision?: string;
         commandId: string;
         messageId: string;
@@ -698,6 +709,11 @@ export type SessionEvent =
         pluginSelections?: PluginSelectionInput[];
       guidanceReferences?: GuidanceReference[];
       };
+    })
+  | (SessionEventBase & {
+      type: 'run.host.rebound';
+      runId: string;
+      payload: { commandId: string; previousBinding: HostWindowBinding; hostBinding: HostWindowBinding; toolView: PreparedRequestToolView };
     })
   | (SessionEventBase & {
       type: 'run.tools.prepared';
@@ -1043,6 +1059,8 @@ export type SessionTimelineItem =
     };
 
 export interface InteractionProjection extends ModelInteractionRequest {
+  status: 'pending' | 'answered' | 'closed';
+  response?: string;
   interactionId: string;
   runId: string;
   callId: string;
@@ -1146,6 +1164,8 @@ export type RunProjectionStatus = typeof RUN_PROJECTION_STATUSES[number];
 
 export interface RunProjection {
   runId: string;
+  /** Current GUI target, changed only by an explicit user rebind command. */
+  hostBinding?: HostWindowBinding;
   profileId: string;
   reasoningEffort?: LlmReasoningEffort;
   thinking?: LlmThinkingMode;
@@ -1271,11 +1291,22 @@ export interface ArtifactProjection {
   recordId: string;
   contentType: string;
   contentMode: 'fixed' | 'live';
+  /** Kernel-observed content modification, when available. */
+  modifiedAt?: string;
+  resourceKey?: string;
   createdAt: string;
   sourcePage?: JsonObject;
   workspaceId?: string;
   logicalPath?: string;
   uri?: string;
+}
+
+export interface DeliverableProjection extends ArtifactProjection {
+  deliveryId: string;
+  presentationRunId: string;
+  presentedAt: string;
+  updatedAt: string;
+  sequence: number;
 }
 
 export interface SessionDisplayProjection {
@@ -1288,6 +1319,7 @@ export interface SessionModelSettings {
 }
 
 export interface QueuedInputProjection {
+  interactionId?: string;
   pluginCatalogRevision?: string;
   commandId: string;
   messageId: string;
@@ -1323,6 +1355,8 @@ export interface SessionProjection {
   /** Session-owned semantic transcript order. Shells render this list without re-sorting it. */
   timeline: SessionTimelineItem[];
   assistantDraft: AssistantDraftProjection | null;
+  interactions: InteractionProjection[];
+  /** Current reply target, derived from interactions. Only run.status indicates whether the Loop waits. */
   pendingInteraction: InteractionProjection | null;
   pendingApproval: ApprovalProjection | null;
   plans: PlanProjection[];
@@ -1338,6 +1372,7 @@ export interface SessionProjection {
   activities: ActivityProjection[];
   fileChangeRounds?: Array<{ runId: string; recordIds: string[] }>;
   artifacts: ArtifactProjection[];
+  deliverables: DeliverableProjection[];
   terminalError: LocalAgentError | null;
 }
 
@@ -1596,6 +1631,7 @@ export type PreparedRequestToolView = Pick<RunRuntimeSnapshot,
   | 'toolPromptContributions' | 'providerToolAliases' | 'selectedPlugins'>;
 
 export interface PrepareRunRuntimeRequest {
+  rebindHost?: { commandId: string; expectedBinding: HostWindowBinding; hostBinding: HostWindowBinding };
   /** Refresh previously selected sources; disabled/removed sources withdraw at this request boundary. */
   refreshPlugins?: boolean;
   environment?: JsonObject;
