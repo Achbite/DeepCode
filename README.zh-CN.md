@@ -1,21 +1,45 @@
 # DeepCode
 
-**0.6.3** · [English](README.md)
+### 在一个工作台里，完成代码修改、程序操作与结果审核。
 
-DeepCode 是优先在本机工作的编程 Agent，提供桌面 GUI、用于脚本的 CLI 和交互式 TUI。三种入口共享对话、工具记录、模型连接和权限设置。
+优先在本机工作的编程 Agent，提供桌面和终端入口。让 Agent 处理项目文件、执行工具、打开预览，在同一对话中查看结果并继续修改。
 
-![DeepCode 桌面工作台：项目导航、对话输入以及任务和产出面板](assets/readme/desktop-workspace.png)
+**[快速使用](#快速使用) · [下载](https://github.com/Achbite/DeepCode/releases) · [产品指南](docs/product/operations.md) · [English](README.md)**
 
-左侧管理项目与对话，中间处理当前任务，右侧查看任务进度和产出。
+![DeepCode 中文任务演示：在对话旁查看项目交付看板的实时预览](assets/readme/workspace-zh.jpg)
 
-![DeepCode 对话界面：排版后的回答、来源链接和模型用量](assets/readme/conversation.png)
+*在 macOS 应用中，从 CSV 生成交互式看板。真实任务演示，使用虚构的项目数据。*
 
-在对话中阅读排版后的回答和来源链接，同时查看上下文与模型用量信息。
+## 从需求到结果，留在同一个工作台
+
+| 处理项目 | 看到变化 | 掌握执行范围 |
+| --- | --- | --- |
+| 读取代码、修改文件、运行命令、检查 diff。桌面 GUI、CLI、TUI 共享对话和模型连接。 | 打开浏览器预览、检查页面，在同一对话中继续修改。并排阅读 Markdown、HTML、图片和 PDF。 | 审核修改方案与执行申请。可手动批准或委托模型审查；无法确定的执行申请交回用户决定。 |
+
+### 描述任务，再把结果改到满意。
+
+> 基于 `delivery-data.csv` 做一个项目交付看板，展示四个关键指标、每周趋势和项目明细，支持按项目筛选。打开预览，检查效果，交付自包含 HTML 文件。
+
+将[示例 CSV](examples/delivery-dashboard/delivery-data.csv) 放入自己的项目文件夹，即可尝试这个任务。
+
+Agent 可以读取数据、提出修改计划、生成页面，再通过浏览器检查结果。继续在对话中提出调整意见；交付的文件和预览保留在产出面板，方便打开和审核。
+
+![DeepCode 在同一对话中审核修改后的中文看板](assets/readme/review-zh.jpg)
+
+*真实的后续修改。观察截图、临时脚本和日志留在执行历史；产出面板展示明确交付给用户查看的结果。*
+
+### 按任务选择合适的操作方式
+
+- **CLI、MCP 与 GUI 配合使用：** 命令行适合的工作直接调用 CLI，结构化操作可使用合适的 MCP 接口，需要确认界面效果时再使用视觉交互。Agent 可按需发现并激活已登记的插件。
+- **连接自己的模型服务：** 配置 API 或支持的订阅连接，查看上下文估算、Provider 返回的 Token 与缓存用量。
+- **边工作边澄清：** Agent 可以先提出问题，继续不依赖答案的工作。用户回复接入同一任务，未答问题保留等待裁决。
+- **审核具体结果：** 交付文件、实时预览与固定版本引用留在对话中。Markdown 和 HTML 支持只读预览及源码切换；交互式 HTML 可在浏览器中打开。
+
+演示来自当前 macOS 开发构建，使用虚构数据。GUI 各平台支持浏览器检查；原生视口截图和外部桌面控制目前需要 macOS。PDF 导出需要配置[文档运行环境](skills/deepcode-documents/SKILL.md)。
 
 ## 快速使用
 
 按[从源码编译](#从源码编译)生成当前程序包，也可在 [Releases](https://github.com/Achbite/DeepCode/releases) 有对应产物时下载。安装包与解压版的入口如下：
-
 
 | 平台                  | 安装或启动方式                                                                                                     |
 | ------------------- | ----------------------------------------------------------------------------------------------------------- |
@@ -23,8 +47,15 @@ DeepCode 是优先在本机工作的编程 Agent，提供桌面 GUI、用于脚�
 | Windows x64         | 运行 `DeepCode-<version>-win64-setup.exe`，再从开始菜单打开 DeepCode；解压版打开 `DeepCode-GUI.exe`。                         |
 | Linux x64 / ARM64   | 解压对应架构的程序包后运行 `./DeepCode-GUI`。                                                                             |
 
+1. **打开 DeepCode。** 从安装入口或解压后的程序包启动。
+2. **连接模型。** 在 **设置 → 模型与服务** 中添加 API 连接，或登录支持的 Coding Plan。
+3. **选择项目并描述任务。** 选择模型、提交需求，审核修改方案并查看结果。
 
-在 **设置 → 模型与服务** 中添加 API 连接，或登录支持的 Coding Plan。新建对话、选择模型，即可描述任务。项目菜单中的 **管理工作区** 用于配置文件夹和执行环境；Windows 项目可以选择本地 Shell 或 WSL。
+项目菜单中的 **管理工作区** 用于配置文件夹和执行环境；Windows 项目可以选择本地 Shell 或 WSL。
+
+GUI 支持向消息附加文件或文件夹、查看产物和 diff，以及让 Agent 打开 HTML 预览。浏览器批注仅通过工具栏按钮或 Esc 退出。新对话继承上次提交任务使用的模型及该模型记住的推理强度。重载界面使用 macOS 的 **Cmd+Shift+R**，其他平台使用 **Ctrl+Shift+R**。
+
+## 也可以在终端中使用
 
 同一程序包也提供终端入口：
 
@@ -41,13 +72,34 @@ DeepCode 是优先在本机工作的编程 Agent，提供桌面 GUI、用于脚�
 
 `-C` 显式选择工作目录；省略时创建独立对话，使用 `--session <id>` 可以继续已有对话。更多命令见 `--help`，连接与订阅配置见 [模型与服务](docs/product/model-services.md)。
 
-GUI 支持向消息附加文件或文件夹、查看产物和 diff，以及让 Agent 打开 HTML 预览。浏览器批注仅通过工具栏按钮或 Esc 退出。新对话继承上次提交任务使用的模型及该模型记住的推理强度。重载界面使用 macOS 的 **Cmd+Shift+R**，其他平台使用 **Ctrl+Shift+R**。
+<details>
+<summary>平台依赖、权限与本地数据</summary>
 
 Windows Setup 会在缺少 WebView2 Evergreen Runtime 时安装它，解压版需自行准备该依赖。Linux GUI 需要 GTK/WebKitGTK。macOS 程序包使用 ad-hoc 签名；即使应用路径相同，重新构建也可能使已有的辅助功能和屏幕录制授权失效。安装并授权目标构建后，应通过 `computer.control status` 核对实际 GUI 进程。配置、持久数据、缓存、临时文件和日志分别使用对应的平台目录，详见[安装与用户文件](docs/distribution.md)。
+
+</details>
+
+## 扩展工作台
+
+添加 Skill、CLI 工具、MCP 连接和 UI 插件。为接入能力填写实际支持的任务与操作，帮助 Agent 按用途发现。登记使插件可被发现，激活加载工具和说明，执行仍遵循配置的权限。
+
+- [插件发现与配置](docs/product/operations.md#settings-and-extensions)
+- [Computer Use：浏览器与桌面控制](plugins/computer-use/README.md)
+- [UI 插件接口与示例](docs/product/ui-plugins.md)
+- [模型、订阅与用量](docs/product/model-services.md)
+- [工作区环境与权限](docs/product/execution-environments.md)
+
+## 架构与运行
+
+Session 负责唯一的 Agent Loop 和会话状态，Kernel 负责工具与执行权限，GUI、CLI、TUI 展示共享结果。任务进度、审批、上下文、资源交付和 Host 生命周期详见[运行管理](docs/product/operations.md)。
+
+工作区文件和会话日志存储在本机。选中的提示词、上下文和图片会发送给配置的模型服务，接入的工具也可能与各自服务通信。使用本地模型连接时，模型请求留在本机。
 
 ## 从源码编译
 
 先安装 Docker 和 GNU Make。Windows 请在已启用 Docker 集成的 WSL2 中运行构建命令。打包 macOS 还需要宿主机的 Xcode Command Line Tools、`rust-toolchain.toml` 指定的 Rust 工具链和 Node.js。
+
+下列命令从 `main` 编译稳定发布版本；持续开发版本使用 `dev-main`。
 
 ```bash
 git clone --branch main https://github.com/Achbite/DeepCode.git
@@ -57,14 +109,12 @@ make shell
 
 `make shell` 准备开发容器；macOS 上还会启动当前 worktree 的原生构建通道。在容器中执行下列命令，或保持容器运行后从宿主机执行：
 
-
 | 目标平台                | 编译命令                                      | 输出目录                                  |
 | ------------------- | ----------------------------------------- | ------------------------------------- |
 | macOS Apple Silicon | `bash ./build.sh --stage package-macos`   | `bin/macos-arm64/`                    |
 | Windows x64         | `bash ./build.sh --stage package-windows` | `bin/win64/`                          |
 | Linux，与容器架构一致       | `bash ./build.sh --stage package-linux`   | `bin/linux-x64/` 或 `bin/linux-arm64/` |
 | 所有可用平台              | `bash ./build.sh`                         | 上述受支持平台的目录                            |
-
 
 共享 TypeScript、GUI、Linux 程序和 Windows 交叉编译都在 Docker 中执行。macOS 原生编译与签名通过通道交给 Mac 宿主。不可用的平台会明确列出，构建错误仍会返回失败。每个平台也会在 `bin/` 生成带版本号的压缩包，macOS 另生成 PKG，Windows 另生成 Setup 安装包。用户配置和会话保存在程序目录之外，不会进入程序包。
 
@@ -75,28 +125,6 @@ make ui-update UI_PACKAGE=bin/macos-arm64
 ```
 
 其他平台替换为 `bin/win64` 或对应 Linux 目录。此命令构建并复制 GUI 资源；macOS 资源更新在宿主机运行以完成签名，随后重载界面。它不会替换正在运行的 Session 或 Kernel；修改这些服务的源码或内置产品说明后，需要构建对应服务或程序包并重启。插件的更新时机见[运行管理](docs/product/operations.md#updates)。
-
-## 产品介绍
-
-- <strong>处理项目任务：</strong> 读取和修改文件、搜索代码、执行 Bash 或 PowerShell、检查 diff。工作区访问和外部操作遵循配置的权限策略。
-- <strong>查看任务进度：</strong> 任务面板展示 Agent 维护的阶段列表和状态，同类工作可以合并为一个阶段。阶段进度与工具结果、Plan 审批分别呈现。
-- <strong>预览并持续修改：</strong> 检查内置浏览器的 DOM 并与页面交互，选取元素或区域批注，在同一对话中继续修改。原生视口截图目前需要 macOS；Windows 和 Linux 保留 DOM 检查及批注元数据。原始附件保持只读，可编辑副本可以放在 DeepCode 管理的会话目录中。
-- <strong>使用模型服务：</strong> API 连接与订阅服务分别配置和查看用量。Provider 返回的 Token、缓存计数与上下文估算分开呈现。
-- <strong>控制外部程序：</strong> Agent 按任务选择可用的 CLI、合适的 MCP 工具或 GUI 交互。Git 操作可以直接使用 CLI，确认界面呈现则需要视觉观察。当前工具缺少所需能力时，Agent 可以搜索已登记插件，并在本次运行中按需激活；用户明确选择插件是可选方式。登记使插件可被发现，激活加载工具和说明，执行仍遵循权限。外部桌面控制目前支持 macOS，遵循允许、询问或拒绝的外部操作权限设置，也可使用“替我批准”逐次自动审查；依据不足时交由用户决定。GUI 审批后恢复观察时的原窗口，目标位置或尺寸改变时要求重新观察。
-- <strong>扩展工具与界面：</strong> 添加 Skill、CLI 工具、MCP 连接和 UI 插件。为外部连接填写产品和支持任务的用途说明，帮助 Agent 按能力发现；CLI 检索还使用 manifest 中的工具名称和说明。见[插件发现与配置](docs/product/operations.md#settings-and-extensions)。
-- <strong>审核任务结果：</strong> 产出面板展示 Agent 明确交付的结果和审核材料；观察截图、临时脚本与日志默认留在执行历史。文件和预览更新复用同一产出项，按最近更新时间排序；最终正文可以引用固定版本并展示可展开的图片。
-- <strong>重开窗口后继续：</strong> 等待回答或审批的任务保留原 Host；重开 GUI 后，可显式选择“使用当前 GUI 继续”。后续调用使用新窗口，旧观察与预览句柄需重新获取，待回答或审批内容保留。
-- <strong>边分析边澄清：</strong> Agent 可先提出问题，继续不依赖答案的分析，并在下一次模型请求时纳入用户回答。未答问题保留在对话中；独立工作结束后，本轮保持等待裁决。
-- <strong>生成与阅读文档：</strong> 生成 HTML、Markdown、PDF 产物。文件阅读器展示文本源码和 PDF，HTML 页面可在内置浏览器中打开。PDF 阅读使用内置 Web 阅读器，PDF 生成需要安装[文档运行环境](skills/deepcode-documents/SKILL.md)。
-
-工作区数据、会话日志和工具执行保留在本机。选中的提示词、上下文和图片会发送给配置的模型服务；如果模型服务也在本机运行，则无需发送到远程 Provider。
-
-Session 负责 Agent Loop 和会话状态，Kernel 负责工具与执行权限，GUI、CLI、TUI 展示共享结果。具体说明见：
-
-- [模型、订阅与用量](docs/product/model-services.md)
-- [Shell、工作区环境与权限](docs/product/execution-environments.md)
-- [运行管理与本地数据](docs/product/operations.md)
-- [Computer Use](plugins/computer-use/README.md) · [UI 插件](docs/product/ui-plugins.md)
 
 ## 开发检查
 

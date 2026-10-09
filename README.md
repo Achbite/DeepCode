@@ -1,21 +1,45 @@
 # DeepCode
 
-**0.6.3** · [中文](README.zh-CN.md)
+### Build, inspect, and review your work in one agent workspace.
 
-DeepCode is a local-first coding agent with a desktop GUI, a CLI for scripts, and an interactive terminal UI. All three share conversations, tool records, model connections, and permissions.
+A local-first coding agent for the desktop and terminal. Work with your files, run tools, preview the result, and keep the conversation alongside it.
 
-![DeepCode desktop workspace with project navigation, conversation input, and task and output panels](assets/readme/desktop-workspace.png)
+**[Quick start](#quick-start) · [Downloads](https://github.com/Achbite/DeepCode/releases) · [Product guide](docs/product/operations.md) · [中文](README.zh-CN.md)**
 
-The desktop workspace keeps projects and conversations on the left, the active conversation in the center, and tasks and outputs on the right.
+![DeepCode running an English dashboard task, with the conversation and live preview side by side](assets/readme/workspace-en.jpg)
 
-![DeepCode conversation showing a formatted response, source links, and model usage](assets/readme/conversation.png)
+*From a CSV to an interactive dashboard in the macOS app. Real task demonstration with fictional project data.*
 
-Review formatted responses and source links alongside context and model usage information.
+## One place for the whole task
+
+| Work with your project | See what changed | Keep control |
+| --- | --- | --- |
+| Read code, edit files, run commands, and inspect diffs. Use the desktop GUI, CLI, or TUI with shared conversations and model connections. | Open a live browser preview, inspect the page, and ask for another revision in the same conversation. Read Markdown, HTML, images, and PDFs alongside your work. | Review proposed changes and execution requests. Choose manual or delegated approval; uncertain execution requests return to you. |
+
+### Start with a task. Refine the result.
+
+> Build a delivery dashboard from `delivery-data.csv`. Include four key metrics, a weekly trend, project details, and a project filter. Open a preview, check it, and deliver a self-contained HTML file.
+
+Try it with the [sample CSV](examples/delivery-dashboard/delivery-data.csv) in your own project folder.
+
+The Agent can read the data, propose its changes, build the page, and use the browser to check its work. Continue with feedback in the same conversation; delivered files and previews stay available in the output panel.
+
+![DeepCode reviewing an updated English dashboard in the same conversation](assets/readme/review-en.jpg)
+
+*An actual follow-up revision. Observation screenshots and temporary logs remain in execution history; the output panel contains results explicitly delivered for review.*
+
+### Choose the right interface for the job
+
+- **CLI, MCP, or GUI:** use a program's CLI when it fits, an available MCP integration for structured operations, and visual interaction when the task needs the rendered interface. The Agent can discover and activate relevant installed plugins as it works.
+- **Your model connection:** configure API services or supported subscription connections. Context estimates, provider-reported token usage, and cache usage remain visible.
+- **Questions without losing momentum:** the Agent can ask a clarification question and continue independent work. Your reply joins the same task; unanswered questions remain available for a decision.
+- **Results you can inspect:** delivered files, live previews, and fixed-version references stay with the conversation. Markdown and HTML have a read-only preview and source view; interactive HTML opens in the browser.
+
+The demos use the current macOS development build and fictional data. Browser inspection is available across the GUI platforms; native viewport screenshots and external desktop control currently require macOS. PDF export requires the [document runtime](skills/deepcode-documents/SKILL.md).
 
 ## Quick start
 
 Build the current package using [Build from source](#build-from-source), or use a matching package from [Releases](https://github.com/Achbite/DeepCode/releases) when one is available. Choose an installer or a portable package:
-
 
 | Platform            | Install or launch                                                                                                                       |
 | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
@@ -23,8 +47,15 @@ Build the current package using [Build from source](#build-from-source), or use 
 | Windows x64         | Run `DeepCode-<version>-win64-setup.exe`, then open DeepCode from the Start menu. The portable package contains `DeepCode-GUI.exe`.     |
 | Linux x64 / ARM64   | Extract the package for your architecture and run `./DeepCode-GUI`.                                                                     |
 
+1. **Open DeepCode** from the installed or extracted package.
+2. **Connect a model** in **Settings → Models and services**: add an API connection or sign in to a supported Coding Plan.
+3. **Choose your project and describe the task.** Select a model, submit your request, and review proposed changes.
 
-In **Settings → Models and services**, add an API connection or sign in to a supported Coding Plan. Create a conversation, select a model, and describe the task. Use a project's **Manage workspace** menu to choose its folders and execution environment. Windows projects can select a local shell or WSL.
+Use a project's **Manage workspace** menu to choose its folders and execution environment. Windows projects can select a local shell or WSL.
+
+In the GUI, attach files or folders to a message, open artifacts and diffs, or ask the Agent to open an HTML preview. Browser annotations stay active until you leave with the toolbar button or Esc. New conversations inherit the last model used for a submitted task and its remembered reasoning level. Use **Cmd+Shift+R** on macOS or **Ctrl+Shift+R** elsewhere to reload the interface.
+
+## Prefer the terminal?
 
 The same package includes terminal interfaces:
 
@@ -41,13 +72,34 @@ After installation with PKG or Windows Setup, use `deepcode-cli` and `deepcode-t
 
 `-C` explicitly selects a workspace. Omit it for an independent conversation, or use `--session <id>` to continue one. Run `--help` for more commands. Connection and subscription setup is covered in [Models and services](docs/product/model-services.md).
 
-In the GUI, attach files or folders to a message, open artifacts and diffs, or ask the Agent to open an HTML preview. Browser annotations stay active until you leave with the toolbar button or Esc. New conversations inherit the last model used for a submitted task and its remembered reasoning level. Use **Cmd+Shift+R** on macOS or **Ctrl+Shift+R** elsewhere to reload the interface.
+<details>
+<summary>Platform dependencies, permissions, and local data</summary>
 
 Windows Setup installs WebView2 Evergreen Runtime if it is missing; portable Windows packages require it to be installed separately. Linux GUI requires GTK/WebKitGTK. The macOS package is ad-hoc signed; a rebuild can invalidate existing Accessibility and Screen Recording authorization even at the same app path. Verify the executing GUI with `computer.control status` after installing and authorizing the intended build. Configuration, persistent data, caches, temporary files and logs use separate platform directories. See [installation and user files](docs/distribution.md).
+
+</details>
+
+## Extend your workspace
+
+Add Skills, CLI tools, MCP connections, or UI plugins. Describe the operations an integration supports so the Agent can find it by capability. Registration makes a plugin discoverable; activation loads its tools and guidance, and execution follows the configured permissions.
+
+- [Plugin discovery and configuration](docs/product/operations.md#settings-and-extensions)
+- [Computer Use: browser and desktop control](plugins/computer-use/README.md)
+- [UI plugin API and example](docs/product/ui-plugins.md)
+- [Models, subscriptions and usage](docs/product/model-services.md)
+- [Workspace environments and permissions](docs/product/execution-environments.md)
+
+## Under the hood
+
+Session owns the Agent Loop and conversation state. Kernel owns tools and execution permissions. GUI, CLI, and TUI present their shared results. [Product operations](docs/product/operations.md) describes task progress, approval, context, resource delivery, and Host lifetime.
+
+Workspace files and conversation journals are stored locally. Selected prompts, context, and images are sent to your configured model service; connected tools may also communicate with their own services. A local model connection keeps model requests on your machine.
 
 ## Build from source
 
 Install Docker and GNU Make. On Windows, run the build commands in WSL2 with Docker integration enabled. macOS packaging additionally needs the host's Xcode Command Line Tools, Rust toolchain from `rust-toolchain.toml`, and Node.js.
+
+The commands below build the stable release from `main`. Use `dev-main` for ongoing development.
 
 ```bash
 git clone --branch main https://github.com/Achbite/DeepCode.git
@@ -57,14 +109,12 @@ make shell
 
 `make shell` prepares the development container. On macOS it also starts the worktree's native build bridge. Run the desired command inside that container, or from the host while it is running:
 
-
 | Target                        | Command                                   | Output                                 |
 | ----------------------------- | ----------------------------------------- | -------------------------------------- |
 | macOS Apple Silicon           | `bash ./build.sh --stage package-macos`   | `bin/macos-arm64/`                     |
 | Windows x64                   | `bash ./build.sh --stage package-windows` | `bin/win64/`                           |
 | Linux, container architecture | `bash ./build.sh --stage package-linux`   | `bin/linux-x64/` or `bin/linux-arm64/` |
 | All available platforms       | `bash ./build.sh`                         | The supported directories above        |
-
 
 Shared TypeScript and GUI assets, Linux binaries, and Windows cross-compilation run in Docker. macOS native compilation and signing run on the Mac host through the bridge. Unsupported platforms are reported explicitly; build failures remain failures. Each package also produces a versioned archive under `bin/`; macOS adds a PKG installer and Windows adds a Setup executable. User configuration and sessions live outside the program directory and are excluded from packages.
 
@@ -75,28 +125,6 @@ make ui-update UI_PACKAGE=bin/macos-arm64
 ```
 
 Choose `bin/win64` or the Linux package directory for those platforms. This command builds and copies the GUI bundle; run macOS resource updates on the host for signing, then reload the interface. It does not replace the running Session or Kernel. Changes to their source or bundled product guidance require a corresponding service/package build and restart. Plugin update timing is described in [product operations](docs/product/operations.md#updates).
-
-## What DeepCode does
-
-- <strong>Work on projects:</strong> read and edit files, search code, run Bash or PowerShell, and inspect diffs. Workspace access and external effects follow the configured permission policy.
-- <strong>Follow task progress:</strong> the task panel shows the Agent's phase list and current statuses. Related work can share a phase; the list stays separate from tool results and Plan approval.
-- <strong>Preview and iterate:</strong> inspect an internal browser's DOM and interact with its pages, annotate elements or regions, and continue editing from the same conversation. Native viewport screenshots currently require macOS; Windows and Linux keep DOM inspection and annotation metadata. Attached originals stay read-only; editable copies can live in a DeepCode-managed session directory.
-- <strong>Use your model service:</strong> API connections and subscription services have separate configuration and usage views. Provider-reported token/cache counts remain distinct from context estimates.
-- <strong>Control external programs:</strong> the Agent chooses an available CLI, a suitable MCP tool, or GUI interaction for the task. Git operations can use CLI; checking a rendered interface needs visual observation. When a needed capability is absent from the current tools, the Agent can search installed plugins and activate relevant ones for the current run. Explicit mentions are optional. Registration makes a plugin discoverable; activation loads its tools and guidance, while execution still follows permissions. External desktop control currently supports macOS and follows the configured external permission policy: allow, ask or deny. “Approve for me” reviews individual calls and hands uncertain requests to the user. After GUI approval, input restores the exact observed window; changed geometry requires another observation.
-- <strong>Extend the tools and interface:</strong> add Skills, CLI tools, MCP connections and UI plugins. Give an external connection a description of its products and supported tasks so the Agent can find it by capability. CLI discovery also uses tool names and descriptions from the manifest. See [plugin discovery and configuration](docs/product/operations.md#settings-and-extensions).
-- <strong>Review results:</strong> the output panel shows results and review material explicitly presented by the Agent. Observation screenshots, temporary scripts and logs remain in execution history. Updated files and previews reuse their delivery entry; final answers can cite fixed versions and include expandable images.
-- <strong>Continue after reopening:</strong> tasks waiting for an answer or approval retain their original Host. Choose <strong>Continue in this window</strong> to explicitly use the reopened GUI for subsequent requests. Observe or open previews again; the pending answer or approval remains separate.
-- <strong>Clarify while working:</strong> Ask questions early, continue independent analysis, and incorporate replies at the next model request. Unanswered questions remain in the conversation and keep the run waiting after independent work is complete.
-- <strong>Create and read documents:</strong> generate HTML, Markdown and PDF artifacts. The file reader shows text source and PDFs; open HTML in the internal browser to view the page. PDF reading uses the bundled web reader; PDF generation needs the [document runtime prerequisites](skills/deepcode-documents/SKILL.md).
-
-Workspace data, journals and tool execution stay local. The selected prompts, context and images are sent to your configured model service unless that service also runs locally.
-
-Session owns the Agent Loop and conversation state; Kernel owns tools and execution permissions; the GUI, CLI and TUI present their shared results. Details belong in the product docs:
-
-- [Models, subscriptions and usage](docs/product/model-services.md)
-- [Shells, workspace environments and permissions](docs/product/execution-environments.md)
-- [Operations and local data](docs/product/operations.md)
-- [Computer Use](plugins/computer-use/README.md) · [UI plugins](docs/product/ui-plugins.md)
 
 ## Development checks
 
