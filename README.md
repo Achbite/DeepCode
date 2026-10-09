@@ -4,6 +4,14 @@
 
 DeepCode is a local-first coding agent with a desktop GUI, a CLI for scripts, and an interactive terminal UI. All three share conversations, tool records, model connections, and permissions.
 
+![DeepCode desktop workspace with project navigation, conversation input, and task and output panels](assets/readme/desktop-workspace.png)
+
+The desktop workspace keeps projects and conversations on the left, the active conversation in the center, and tasks and outputs on the right.
+
+![DeepCode conversation showing a formatted response, source links, and model usage](assets/readme/conversation.png)
+
+Review formatted responses and source links alongside context and model usage information.
+
 ## Quick start
 
 Build the current package using [Build from source](#build-from-source), or use a matching package from [Releases](https://github.com/Achbite/DeepCode/releases) when one is available. Choose an installer or a portable package:
@@ -77,7 +85,7 @@ Choose `bin/win64` or the Linux package directory for those platforms. This comm
 - <strong>Control external programs:</strong> the Agent chooses an available CLI, a suitable MCP tool, or GUI interaction for the task. Git operations can use CLI; checking a rendered interface needs visual observation. When a needed capability is absent from the current tools, the Agent can search installed plugins and activate relevant ones for the current run. Explicit mentions are optional. Registration makes a plugin discoverable; activation loads its tools and guidance, while execution still follows permissions. External desktop control currently supports macOS and follows the configured external permission policy: allow, ask or deny. “Approve for me” reviews individual calls and hands uncertain requests to the user. After GUI approval, input restores the exact observed window; changed geometry requires another observation.
 - <strong>Extend the tools and interface:</strong> add Skills, CLI tools, MCP connections and UI plugins. Give an external connection a description of its products and supported tasks so the Agent can find it by capability. CLI discovery also uses tool names and descriptions from the manifest. See [plugin discovery and configuration](docs/product/operations.md#settings-and-extensions).
 - <strong>Review results:</strong> the output panel shows results and review material explicitly presented by the Agent. Observation screenshots, temporary scripts and logs remain in execution history. Updated files and previews reuse their delivery entry; final answers can cite fixed versions and include expandable images.
-- <strong>Continue after reopening:</strong> tasks waiting for an answer or approval retain their original Host. Choose **Continue in this window** to explicitly use the reopened GUI for subsequent requests. Observe or open previews again; the pending answer or approval remains separate.
+- <strong>Continue after reopening:</strong> tasks waiting for an answer or approval retain their original Host. Choose <strong>Continue in this window</strong> to explicitly use the reopened GUI for subsequent requests. Observe or open previews again; the pending answer or approval remains separate.
 - <strong>Clarify while working:</strong> Ask questions early, continue independent analysis, and incorporate replies at the next model request. Unanswered questions remain in the conversation and keep the run waiting after independent work is complete.
 - <strong>Create and read documents:</strong> generate HTML, Markdown and PDF artifacts. The file reader shows text source and PDFs; open HTML in the internal browser to view the page. PDF reading uses the bundled web reader; PDF generation needs the [document runtime prerequisites](skills/deepcode-documents/SKILL.md).
 
