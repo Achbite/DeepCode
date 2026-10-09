@@ -4,6 +4,14 @@
 
 DeepCode 是优先在本机工作的编程 Agent，提供桌面 GUI、用于脚本的 CLI 和交互式 TUI。三种入口共享对话、工具记录、模型连接和权限设置。
 
+![DeepCode 桌面工作台：项目导航、对话输入以及任务和产出面板](assets/readme/desktop-workspace.png)
+
+左侧管理项目与对话，中间处理当前任务，右侧查看任务进度和产出。
+
+![DeepCode 对话界面：排版后的回答、来源链接和模型用量](assets/readme/conversation.png)
+
+在对话中阅读排版后的回答和来源链接，同时查看上下文与模型用量信息。
+
 ## 快速使用
 
 按[从源码编译](#从源码编译)生成当前程序包，也可在 [Releases](https://github.com/Achbite/DeepCode/releases) 有对应产物时下载。安装包与解压版的入口如下：
