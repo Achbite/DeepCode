@@ -26,6 +26,7 @@ pub(crate) struct ProviderRuntimeSnapshot {
 pub(crate) struct ProviderRuntimeBinding {
     snapshot: ProviderRuntimeSnapshot,
     profile: ResolvedLlmProfile,
+    codex_turn_state: crate::provider_transport::CodexTurnState,
 }
 
 impl ProviderRuntimeBinding {
@@ -37,8 +38,19 @@ impl ProviderRuntimeBinding {
         self.profile.clone()
     }
 
+    pub(crate) fn codex_request_context(
+        &self,
+        session_id: &str,
+    ) -> crate::provider_transport::CodexRequestContext {
+        crate::provider_transport::CodexRequestContext {
+            session_id: session_id.to_owned(),
+            turn_state: self.codex_turn_state.clone(),
+        }
+    }
+
     pub(crate) fn approval_reviewer(&self, effort: Option<&str>) -> Result<Self, String> {
         let mut binding = self.clone();
+        binding.codex_turn_state = Default::default();
         if let Some(effort) = effort {
             binding.profile = with_reasoning_override(binding.profile, Some(effort))?;
             binding.snapshot.reasoning_effort = Some(effort.to_string());
@@ -201,7 +213,11 @@ fn capture_binding(
             Some(_) => return Err("LLM Profile hostedWebSearch 无法映射。".to_string()),
         },
     };
-    Ok(ProviderRuntimeBinding { snapshot, profile })
+    Ok(ProviderRuntimeBinding {
+        snapshot,
+        profile,
+        codex_turn_state: Default::default(),
+    })
 }
 
 fn selected_profile_id(gui: &GuiState, requested: Option<&str>) -> Result<String, String> {
@@ -282,8 +298,19 @@ mod tests {
                 hosted_web_search: "web_search",
             },
             profile,
+            codex_turn_state: Default::default(),
         };
         let reviewer = main.approval_reviewer(Some("low")).unwrap();
+        let main_context = main.codex_request_context("session:model");
+        main_context
+            .turn_state
+            .set(reqwest::header::HeaderValue::from_static("main-route"))
+            .unwrap();
+        assert!(reviewer
+            .codex_request_context("session:model")
+            .turn_state
+            .get()
+            .is_none());
         assert_ne!(
             reviewer.snapshot.provider_runtime_ref,
             main.snapshot.provider_runtime_ref
@@ -331,6 +358,31 @@ mod tests {
                 )
                 .is_ok());
         }
+        let resumed = registry
+            .resolve(
+                "session:model",
+                "run:model",
+                "provider-runtime:main",
+                "profile:main",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            resumed
+                .codex_request_context("session:model")
+                .turn_state
+                .get(),
+            main_context.turn_state.get()
+        );
+        assert!(registry
+            .resolve(
+                "session:model",
+                "run:other",
+                "provider-runtime:main",
+                "profile:main",
+                None
+            )
+            .is_err());
         registry.release("session:model", "run:model").unwrap();
         for binding in [&main, &reviewer] {
             assert!(registry

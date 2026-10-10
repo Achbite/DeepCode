@@ -6,6 +6,8 @@ The execution approval model has separate provider/model and reasoning selection
 
 Coding Plan is a service category. The first adapter is OpenAI Codex. DeepCode implements browser PKCE and device-code authentication through the Host, independent of an installed Codex CLI. Credentials stay in the existing local secret store. The GUI receives account labels and flow state; cancelling or leaving authentication releases the flow. Logout removes that connection's credential and cancels its login. Requests use the subscription's dedicated Responses transport, while API keys use the API connection's endpoint.
 
+Codex requests use the existing Session ID as their stable `session-id` header and `prompt_cache_key`. The Provider runtime retains the first `x-codex-turn-state` returned during a run and sends it with subsequent requests, including retries. This routing state is separate for approval reviews and is released with the run; it does not create another conversation history or change earlier input. These Codex conventions are not sent to ordinary API connections. Cache availability remains a provider fact, not a guaranteed hit rate.
+
 Quota is a timestamped response from the provider, not an estimate from local tokens. Its windows retain the supplied reset time and used percentage. A failed refresh displays its error. Subscription fees and subscription usage are not counted as metered API cost.
 
 ## Web search citations
@@ -25,6 +27,8 @@ The Host indexes physical Provider calls with connection, model, Session, run an
 The bundled price catalog covers the configured OpenAI and DeepSeek API models at their official HTTPS endpoints. Rates and source URLs are recorded in `config/defaults/model-prices.json`. Each call keeps the applicable price snapshot, returned model, service tier and long-context rule. DeepSeek peak/off-peak rates use the physical request's start time in UTC; later price changes do not reprice recorded calls. Unknown model rates, nonofficial endpoints and adapters without a price entry remain unpriced. They still expose the tokens and calls reported by the provider.
 
 Unknown cache-write usage does not silently become zero. The display is a local estimate of model tokens, not an account invoice; it excludes additional provider tool charges, taxes and subscription fees.
+
+Responses usage preserves `input_tokens_details.cache_write_tokens` when supplied, including an explicit zero. Missing values remain unknown. Request archives retain the wire body and whether a Codex turn-state token was sent or received; they do not retain authentication headers or the opaque routing token.
 
 The usage widget and cost details share a display currency preference. USD is the default; CNY estimates use a fixed rate of 1 USD = 7 CNY. The context menu opens a small widget settings dialog. Original usage records remain in USD.
 

@@ -1309,6 +1309,7 @@ pub(crate) async fn local_agent_provider_stream(
         state.local_agent.provider_transport.client.clone(),
         body.provider_attempt_id,
         profile,
+        runtime.codex_request_context(&body.session_id),
         request_envelope,
         request_id,
         archive_directory,

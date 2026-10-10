@@ -682,11 +682,13 @@ struct PreparedProviderRequest {
     kind: ProviderStreamKind,
     body: Vec<u8>,
     hosted_web_search_enabled: bool,
+    codex: Option<crate::provider_transport::CodexRequestContext>,
 }
 
 fn prepare_provider_request(
     profile: &ResolvedLlmProfile,
     envelope: &ProviderRequestInput,
+    codex: Option<&crate::provider_transport::CodexRequestContext>,
 ) -> Result<PreparedProviderRequest, ProviderTransportError> {
     let kind = ProviderStreamKind::from_profile_kind(&profile.kind)
         .ok_or_else(|| ProviderTransportError::new("provider_kind_unsupported"))?;
@@ -698,7 +700,7 @@ fn prepare_provider_request(
             "provider_hosted_tool_unsupported",
         ));
     }
-    let provider_body = match kind {
+    let mut provider_body = match kind {
         ProviderStreamKind::OpenAiCompatible => {
             openai_compatible_request_body(profile, messages, &tools, true)
         }
@@ -707,6 +709,14 @@ fn prepare_provider_request(
         }
         ProviderStreamKind::Anthropic => anthropic_stream_request_body(profile, messages, &tools)?,
         ProviderStreamKind::Ollama => ollama_stream_request_body(profile, messages, &tools),
+    };
+    let codex = if profile.connection.adapter_id == "openai-codex" {
+        let context =
+            codex.ok_or_else(|| ProviderTransportError::new("provider_codex_context_missing"))?;
+        provider_body["prompt_cache_key"] = json!(context.session_id);
+        Some(context.clone())
+    } else {
+        None
     };
     let body = serde_json::to_vec(&provider_body).map_err(|error| {
         ProviderTransportError::message(
@@ -721,6 +731,7 @@ fn prepare_provider_request(
         kind,
         body,
         hosted_web_search_enabled: !hosted_tools.is_empty(),
+        codex,
     })
 }
 
@@ -784,6 +795,13 @@ fn build_provider_request(
             )
             .header("OpenAI-Beta", "responses=experimental")
             .header("Accept", "text/event-stream");
+    }
+    if let Some(context) = &prepared.codex {
+        // ChatGPT uses session-id for affinity; the body key alone is insufficient.
+        request = request.header("session-id", &context.session_id);
+        if let Some(token) = context.turn_state.get() {
+            request = request.header("x-codex-turn-state", token.clone());
+        }
     }
     Ok(request)
 }
@@ -916,6 +934,10 @@ async fn probe_profile(
     profile: &ResolvedLlmProfile,
     usage_call: &mut crate::model_usage::UsageCall,
 ) -> Result<LlmStreamProbeResult, ProviderTransportError> {
+    let codex = crate::provider_transport::CodexRequestContext {
+        session_id: format!("probe:{}:{}", profile.connection.id, profile.model),
+        turn_state: Default::default(),
+    };
     let prepared = prepare_provider_request(
         profile,
         &ProviderRequestInput {
@@ -936,6 +958,7 @@ async fn probe_profile(
             tools: vec![],
             hosted_tools: vec![],
         },
+        Some(&codex),
     )?;
     let kind = prepared.kind;
     let mut response = build_provider_request(client, profile, &prepared)?
@@ -1002,6 +1025,7 @@ pub(crate) fn local_agent_provider_stream_response(
     client: reqwest::Client,
     provider_attempt_id: Option<String>,
     profile: ResolvedLlmProfile,
+    codex: crate::provider_transport::CodexRequestContext,
     request_envelope: ProviderRequestInput,
     request_id: String,
     archive_directory: std::path::PathBuf,
@@ -1025,7 +1049,7 @@ pub(crate) fn local_agent_provider_stream_response(
                 return;
             }
         };
-        let prepared = match prepare_provider_request(&profile, &request_envelope) {
+        let prepared = match prepare_provider_request(&profile, &request_envelope, Some(&codex)) {
             Ok(prepared) => prepared,
             Err(error) => {
                 let (packet, _) = archived_provider_event(
@@ -1046,6 +1070,7 @@ pub(crate) fn local_agent_provider_stream_response(
                 json!({
                     "method": "POST", "url": provider_request_url(&profile, kind),
                     "model": profile.model, "apiSurface": profile.kind,
+                    "codexTurnStateSent": prepared.codex.as_ref().map(|context| context.turn_state.get().is_some()),
                 }),
             )
             .and_then(|()| archive.bytes("request.body", &prepared.body))
@@ -1095,6 +1120,7 @@ pub(crate) fn local_agent_provider_stream_response(
                 "statusCode": response.status().as_u16(),
                 "url": crate::provider_transport::safe_detail(response.url().as_str(), profile.api_key.as_deref()),
                 "contentType": response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                "codexTurnStateReceived": prepared.codex.as_ref().map(|_| response.headers().contains_key("x-codex-turn-state")),
             })) {
                 yield Ok::<Bytes, Infallible>(Bytes::from(provider_event(&request_id, provider_attempt_id.as_deref(), "failed",
                     json!({"code": "execution_archive_failed", "message": error.to_string()}))));
@@ -1123,6 +1149,12 @@ pub(crate) fn local_agent_provider_stream_response(
             );
             yield Ok::<Bytes, Infallible>(Bytes::from(packet));
             return;
+        }
+        if let Some(context) = &prepared.codex {
+            if let Some(token) = response.headers().get("x-codex-turn-state") {
+                // Codex retains the first token for the turn, including across retries.
+                let _ = context.turn_state.set(token.clone());
+            }
         }
         let mut framer = ProviderEnvelopeFramer::new(kind);
         let mut accumulator = ProviderStreamAccumulator::new(kind);
@@ -1684,6 +1716,123 @@ pub(crate) fn split_system_messages(
 mod tests {
     use super::*;
 
+    fn test_codex_context(session_id: &str) -> crate::provider_transport::CodexRequestContext {
+        crate::provider_transport::CodexRequestContext {
+            session_id: session_id.into(),
+            turn_state: Default::default(),
+        }
+    }
+
+    fn prepare_test_request(
+        profile: &ResolvedLlmProfile,
+        envelope: &ProviderRequestInput,
+    ) -> Result<PreparedProviderRequest, ProviderTransportError> {
+        prepare_provider_request(
+            profile,
+            envelope,
+            Some(&test_codex_context("session:wire-test")),
+        )
+    }
+
+    #[tokio::test]
+    async fn codex_affinity_uses_session_identity_and_first_turn_token() {
+        use axum::{http::HeaderMap, routing::post, Json, Router};
+        use std::sync::Mutex;
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let captured = received.clone();
+        let server = Router::new().route("/responses", post(move |headers: HeaderMap, Json(body): Json<Value>| {
+            let captured = captured.clone();
+            async move {
+                let mut received = captured.lock().unwrap();
+                received.push((headers, body));
+                let token = if received.len() == 1 { "first-route" } else { "later-route" };
+                ([("content-type", "text/event-stream"), ("x-codex-turn-state", token)],
+                 "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":0,\"input_tokens_details\":{\"cached_tokens\":8,\"cache_write_tokens\":4}}}}\n\n")
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+        let directory = std::env::temp_dir().join(format!(
+            "deepcode-codex-{}",
+            crate::utils::new_runtime_ref("test")
+                .unwrap()
+                .replace(':', "-")
+        ));
+        let usage = Arc::new(
+            crate::model_usage::UsageStore::open(&directory.join("usage.sqlite3")).unwrap(),
+        );
+        let mut profile = test_profile("responses");
+        profile.connection.adapter_id = "openai-codex".into();
+        profile.connection.base_url = format!("http://{address}");
+        profile.api_key = Some("test-provider-key".into());
+        profile.account_id = Some("test-account".into());
+        let context = test_codex_context("session:conversation");
+        let client = crate::provider_transport::ProviderTransport::new()
+            .unwrap()
+            .client;
+        for n in 0..3 {
+            let response = local_agent_provider_stream_response(
+                client.clone(),
+                None,
+                profile.clone(),
+                context.clone(),
+                provider_input(
+                    json!({"messages":[{"role":"user","content":"Continue."}],"tools":[],"hostedTools":[]}),
+                ),
+                format!("request:{n}"),
+                directory.join(n.to_string()),
+                json!({"sessionId":"session:conversation","runId":"run:one","requestId":format!("request:{n}")}),
+                usage.clone(),
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let output = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(output.contains("\"type\":\"completed\""), "{output}");
+        }
+        task.abort();
+        let _ = task.await;
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 3);
+        for (i, (headers, body)) in received.iter().enumerate() {
+            assert_eq!(headers["session-id"], "session:conversation");
+            assert_eq!(body["prompt_cache_key"], "session:conversation");
+            assert_eq!(
+                headers
+                    .get("x-codex-turn-state")
+                    .map(|v| v.to_str().unwrap()),
+                if i == 0 { None } else { Some("first-route") }
+            );
+            assert_eq!(
+                body, &received[0].1,
+                "routing state must not rewrite context"
+            );
+        }
+        drop(received);
+        let mut public_profile = test_profile("responses");
+        public_profile.api_key = Some("public-api-test-key".into());
+        let public = prepare_provider_request(
+            &public_profile,
+            &provider_input(json!({"messages":[],"tools":[],"hostedTools":[]})),
+            Some(&context),
+        )
+        .unwrap();
+        let public_request = build_provider_request(&client, &public_profile, &public)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(public_request.headers().get("session-id").is_none());
+        assert!(public_request.headers().get("x-codex-turn-state").is_none());
+        assert!(serde_json::from_slice::<Value>(&public.body)
+            .unwrap()
+            .get("prompt_cache_key")
+            .is_none());
+        drop(usage);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn upstream_http_errors_keep_details_and_header_directives_without_retrying() {
         let body = br#"{"error":{"code":"server_is_overloaded","type":"service_unavailable_error","message":"Try again later.","headers":{"x-retry-metadata":"BODY_DIRECTIVE"}}}"#;
@@ -1827,7 +1976,7 @@ mod tests {
             "hostedTools": []
         }));
         for kind in ["openaiCompatible", "responses", "anthropic", "ollama"] {
-            let prepared = prepare_provider_request(&test_profile(kind), &envelope)
+            let prepared = prepare_test_request(&test_profile(kind), &envelope)
                 .expect("normal tool request must prepare");
             let body: Value =
                 serde_json::from_slice(&prepared.body).expect("provider request body must decode");
@@ -1849,7 +1998,7 @@ mod tests {
         let mut profile = test_profile("openaiCompatible");
         profile.provider_flavor = Some("deepseek".to_string());
         profile.thinking = Some("enabled".to_string());
-        let prepared = prepare_provider_request(
+        let prepared = prepare_test_request(
             &profile,
             &provider_input(json!({
                 "messages": [{ "role": "user", "content": "Execute the confirmed step." }],
@@ -1888,7 +2037,7 @@ mod tests {
             "status": "failed",
             "action": { "type": "open_page", "url": "https://example.com/unavailable" },
         });
-        let prepared = prepare_provider_request(
+        let prepared = prepare_test_request(
             &profile,
             &provider_input(json!({
                 "messages": [
@@ -1978,7 +2127,7 @@ mod tests {
                 },
             )
             .collect::<Vec<_>>();
-        let prepared = prepare_provider_request(
+        let prepared = prepare_test_request(
             &test_profile("responses"),
             &provider_input(json!({
                 "messages": [
@@ -2018,7 +2167,7 @@ mod tests {
     fn responses_replays_rejected_raw_arguments_and_result_without_repair() {
         let item = json!({"type":"function_call","call_id":"native:bad","name":"fs_read","arguments":"{\"path\":","status":"completed"});
         let rejection = json!({"status":"inputRejected","executed":false,"error":{"code":"provider_tool_call_arguments_invalid","message":"Invalid JSON object."}}).to_string();
-        let prepared = prepare_provider_request(&test_profile("responses"), &provider_input(json!({
+        let prepared = prepare_test_request(&test_profile("responses"), &provider_input(json!({
             "messages":[
                 {"role":"user","content":"Read source."},
                 {"role":"assistant","content":"","providerOutputBlocks":[{
@@ -2045,7 +2194,7 @@ mod tests {
                 "inputSchema": bash.input_schema }],
             "hostedTools": [{ "type": "webSearch", "providerToolType": "web_search" }]
         }));
-        let prepared = prepare_provider_request(&test_profile("responses"), &input).unwrap();
+        let prepared = prepare_test_request(&test_profile("responses"), &input).unwrap();
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
         let function = body["tools"]
             .as_array()
@@ -2080,7 +2229,7 @@ mod tests {
 
     #[test]
     fn responses_request_rejects_invalid_hosted_tool_instead_of_rewriting_it() {
-        let error = prepare_provider_request(
+        let error = prepare_test_request(
             &test_profile("responses"),
             &provider_input(json!({
                 "messages": [{ "role": "user", "content": "Search." }],
@@ -2267,6 +2416,7 @@ mod tests {
                     .client,
                 None,
                 profile,
+                test_codex_context("session:archive"),
                 provider_input(json!({
                     "messages":[{"role":"user","content":"归档检查"}], "tools":[], "hostedTools":[],
                 })),
@@ -2366,7 +2516,7 @@ mod tests {
         let input = provider_input(
             json!({"messages":[{"role":"system","content":"Use the project instructions."},{"role":"user","content":"Explain the module."}],"tools":[],"hostedTools":[]}),
         );
-        let prepared = prepare_provider_request(&profile, &input).unwrap();
+        let prepared = prepare_test_request(&profile, &input).unwrap();
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
         assert_eq!(body["store"], false);
         assert_eq!(body["instructions"], "Use the project instructions.");
