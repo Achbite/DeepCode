@@ -86,7 +86,11 @@ for (const ending of ['completed', 'cancelled', 'watch-failed']) test(`managed c
   assert.equal(closed, true);
   if (!stop) {
     assert.equal(calls, 3);
-    assert.ok(requests[2].messages.some(m => m.role === 'tool' && JSON.parse(m.content).process?.status === 'completed'));
+    assert.deepEqual(requests[2].messages.slice(0, requests[1].messages.length), requests[1].messages,
+      'a process update must append facts without rewriting the previous request');
+    const updates = requests[2].messages.slice(requests[1].messages.length)
+      .filter(m => m.role === 'user').map(m => JSON.parse(m.content));
+    assert.ok(updates.some(m => m.type === 'process.updated' && m.process.status === 'completed'));
   }
   const updates = (await readEvents(journal,sessionId)).filter(e => e.type === 'process.updated');
   assert.equal(updates.filter(e => e.payload.job.status !== 'active').length,1);

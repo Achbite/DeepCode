@@ -186,7 +186,7 @@ function admitEvent(snapshot: LoopSnapshot, event: NewSessionEvent): void {
         throw new Error('tool_request_binding_missing');
       }
       const hosted = event.payload.tools.filter((tool) => tool.origin === 'providerHosted').length;
-      if (hosted !== Number(event.payload.purpose === 'agent' && runtime.webSearch.owner === 'providerHosted')) {
+      if (hosted !== Number(event.payload.purpose !== 'approvalReview' && runtime.webSearch.owner === 'providerHosted')) {
         throw new Error('context_composition_search_owner_mismatch');
       }
       break;

@@ -50,6 +50,7 @@ pub(crate) struct LlmToolDefinition {
 }
 
 pub(crate) struct ProviderRequestInput {
+    pub(crate) answer_only: bool,
     pub(crate) messages: Vec<LocalProviderMessage>,
     pub(crate) tools: Vec<LlmToolDefinition>,
     pub(crate) hosted_tools: Vec<LocalProviderHostedTool>,
@@ -710,6 +711,30 @@ fn prepare_provider_request(
         ProviderStreamKind::Anthropic => anthropic_stream_request_body(profile, messages, &tools)?,
         ProviderStreamKind::Ollama => ollama_stream_request_body(profile, messages, &tools),
     };
+    if envelope.answer_only && (!tools.is_empty() || !hosted_tools.is_empty()) {
+        // Admission permits definitions in answer-only requests only for compaction.
+        // DeepSeek Responses changes input rendering with tool_choice:none.
+        // Keep function-only summaries aligned with normal turns; Session's text
+        // consumer rejects any emitted call without executing it. Hosted tools
+        // still require provider-side prohibition to prevent remote execution.
+        let deepseek_summary = profile.connection.adapter_id == "deepseek"
+            && kind == ProviderStreamKind::Responses
+            && hosted_tools.is_empty();
+        if !deepseek_summary {
+            provider_body["tool_choice"] = match kind {
+                ProviderStreamKind::OpenAiCompatible | ProviderStreamKind::Responses => {
+                    json!("none")
+                }
+                ProviderStreamKind::Anthropic => json!({"type": "none"}),
+                ProviderStreamKind::Ollama => {
+                    return Err(ProviderTransportError::message(
+                        "provider_tool_choice_unsupported",
+                        "Ollama 无法在保留工具定义时强制禁止工具调用。",
+                    ))
+                }
+            };
+        }
+    }
     let codex = if profile.connection.adapter_id == "openai-codex" {
         let context =
             codex.ok_or_else(|| ProviderTransportError::new("provider_codex_context_missing"))?;
@@ -730,7 +755,7 @@ fn prepare_provider_request(
     Ok(PreparedProviderRequest {
         kind,
         body,
-        hosted_web_search_enabled: !hosted_tools.is_empty(),
+        hosted_web_search_enabled: !envelope.answer_only && !hosted_tools.is_empty(),
         codex,
     })
 }
@@ -941,6 +966,7 @@ async fn probe_profile(
     let prepared = prepare_provider_request(
         profile,
         &ProviderRequestInput {
+            answer_only: true,
             messages: vec![LocalProviderMessage {
                 role: "user".into(),
                 content: "Reply with OK.".into(),
@@ -1958,6 +1984,7 @@ mod tests {
 
     fn provider_input(value: Value) -> ProviderRequestInput {
         ProviderRequestInput {
+            answer_only: value["responseConstraint"] == "answerOnly",
             messages: serde_json::from_value(value["messages"].clone()).unwrap(),
             tools: serde_json::from_value(value["tools"].clone()).unwrap(),
             hosted_tools: serde_json::from_value(value["hostedTools"].clone()).unwrap(),
@@ -1991,6 +2018,83 @@ mod tests {
             assert_eq!(name, "fixture_tool");
             assert_eq!(schema, &envelope.tools[0].input_schema);
         }
+    }
+
+    #[test]
+    fn answer_only_retains_definitions_but_disables_tool_execution() {
+        let envelope = provider_input(json!({
+            "responseConstraint": "answerOnly",
+            "messages": [{"role": "user", "content": "Summarize the preceding work."}],
+            "tools": [{"name": "fixture_tool", "description": "Inspect a fixture.",
+                "inputSchema": {"type": "object"}}],
+            "hostedTools": []
+        }));
+        for kind in ["openaiCompatible", "responses", "anthropic"] {
+            let prepared = prepare_test_request(&test_profile(kind), &envelope).unwrap();
+            let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+            assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                body["tool_choice"],
+                if kind == "anthropic" {
+                    json!({"type": "none"})
+                } else {
+                    json!("none")
+                }
+            );
+        }
+        assert_eq!(
+            prepare_test_request(&test_profile("ollama"), &envelope)
+                .unwrap_err()
+                .code,
+            "provider_tool_choice_unsupported"
+        );
+
+        let mut codex = test_profile("responses");
+        codex.connection.adapter_id = "openai-codex".into();
+        let mut hosted = envelope;
+        hosted.hosted_tools.push(LocalProviderHostedTool {
+            tool_type: "webSearch".into(),
+            provider_tool_type: "web_search".into(),
+        });
+        let prepared = prepare_test_request(&codex, &hosted).unwrap();
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(body["tool_choice"], "none");
+        assert!(!prepared.hosted_web_search_enabled);
+    }
+
+    #[test]
+    fn deepseek_function_summary_preserves_normal_request_rendering() {
+        let mut profile = test_profile("responses");
+        profile.connection.adapter_id = "deepseek".into();
+        let mut envelope = provider_input(json!({
+            "messages": [{"role": "user", "content": "Summarize without calling tools."}],
+            "tools": [{"name": "fixture_tool", "description": "Inspect a fixture.",
+                "inputSchema": {"type": "object"}}],
+            "hostedTools": []
+        }));
+        let normal = prepare_test_request(&profile, &envelope).unwrap();
+        envelope.answer_only = true;
+        let summary = prepare_test_request(&profile, &envelope).unwrap();
+        assert_eq!(summary.body, normal.body);
+        assert!(!summary.hosted_web_search_enabled);
+
+        envelope.hosted_tools.push(LocalProviderHostedTool {
+            tool_type: "webSearch".into(),
+            provider_tool_type: "web_search".into(),
+        });
+        let hosted = prepare_test_request(&profile, &envelope).unwrap();
+        let body: Value = serde_json::from_slice(&hosted.body).unwrap();
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(body["tool_choice"], "none");
+        assert!(!hosted.hosted_web_search_enabled);
+
+        // Approval review retains an empty catalog, not the conversation tools.
+        envelope.tools.clear();
+        envelope.hosted_tools.clear();
+        let review = prepare_test_request(&profile, &envelope).unwrap();
+        let body: Value = serde_json::from_slice(&review.body).unwrap();
+        assert!(body.get("tools").is_none());
     }
 
     #[test]

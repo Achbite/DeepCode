@@ -1265,6 +1265,7 @@ pub(crate) async fn local_agent_provider_stream(
         );
     }
     let mut request_envelope = ProviderRequestInput {
+        answer_only: body.response_constraint == "answerOnly",
         messages: body.messages,
         tools: body.tools,
         hosted_tools: body.hosted_tools,
@@ -1365,15 +1366,19 @@ fn validate_local_provider_request(body: &LocalProviderRequest) -> Result<(), St
                 return Err("普通 Agent 请求必须使用固定的完整输出预算。".to_string());
             }
         }
-        "contextCompaction" | "approvalReview" => {
+        "contextCompaction" => {
+            if body.response_constraint != "answerOnly" || body.max_output_tokens == 0 {
+                return Err("上下文压缩必须使用 answerOnly 和固定的完整输出预算。".to_string());
+            }
+        }
+        "approvalReview" => {
             if body.response_constraint != "answerOnly"
                 || !body.tools.is_empty()
                 || !body.hosted_tools.is_empty()
                 || body.max_output_tokens == 0
             {
                 return Err(
-                    "上下文压缩请求必须使用 answerOnly、空工具目录和固定的完整输出预算。"
-                        .to_string(),
+                    "自动审批请求必须使用 answerOnly、空工具目录和固定的完整输出预算。".to_string(),
                 );
             }
         }
@@ -1624,8 +1629,8 @@ fn validate_provider_search_binding(
     match runtime.web_search_owner.as_str() {
         "providerHosted" => {
             let request_matches_purpose = match purpose {
-                "agent" => hosted_search_requested,
-                "contextCompaction" | "approvalReview" => hosted_tools.is_empty(),
+                "agent" | "contextCompaction" => hosted_search_requested,
+                "approvalReview" => hosted_tools.is_empty(),
                 _ => false,
             };
             if runtime.api_surface != "responses"
@@ -1756,7 +1761,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_hosted_search_is_agent_only_and_compaction_remains_tool_free() {
+    fn compaction_retains_hosted_definitions_and_approval_remains_tool_free() {
         let runtime = RunProviderRuntime {
             reasoning_effort_override: None,
             provider_runtime_ref: "provider-runtime:test".to_string(),
@@ -1778,11 +1783,17 @@ mod tests {
             std::slice::from_ref(&hosted_tool),
         )
         .is_ok());
-        assert!(validate_provider_search_binding(&runtime, "contextCompaction", &[]).is_ok());
+        assert!(validate_provider_search_binding(&runtime, "approvalReview", &[]).is_ok());
         assert!(validate_provider_search_binding(&runtime, "agent", &[]).is_err());
+        assert!(validate_provider_search_binding(&runtime, "contextCompaction", &[]).is_err());
+        assert!(validate_provider_search_binding(
+            &runtime,
+            "contextCompaction",
+            std::slice::from_ref(&hosted_tool)
+        )
+        .is_ok());
         assert!(
-            validate_provider_search_binding(&runtime, "contextCompaction", &[hosted_tool],)
-                .is_err()
+            validate_provider_search_binding(&runtime, "approvalReview", &[hosted_tool]).is_err()
         );
     }
 }

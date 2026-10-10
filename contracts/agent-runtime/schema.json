@@ -616,7 +616,13 @@
         {
           "if": {"properties": {"purpose": {"enum": ["contextCompaction", "approvalReview"]}}},
           "then": {
-            "properties": {"responseConstraint": {"const": "answerOnly"}, "tools": {"maxItems": 0}, "hostedTools": {"maxItems": 0}}
+            "properties": {"responseConstraint": {"const": "answerOnly"}}
+          }
+        },
+        {
+          "if": {"properties": {"purpose": {"const": "approvalReview"}}},
+          "then": {
+            "properties": {"tools": {"maxItems": 0}, "hostedTools": {"maxItems": 0}}
           }
         }
       ],

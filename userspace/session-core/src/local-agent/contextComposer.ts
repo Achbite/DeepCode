@@ -52,15 +52,26 @@ type CompletedProviderTurnEvent = ProviderTurnSettledEvent & {
   payload: Extract<ProviderTurnSettledEvent['payload'], { outcome: 'completed' }>;
 };
 
-export async function buildAgentProviderRequest(input: {
+type ConversationRequestInput = {
   sessionId: string;
   runId: string;
   runtime: RunRuntimeSnapshot;
   events: readonly SessionEvent[];
-  responseConstraint: 'normal';
   workspaceBindings: readonly WorkspaceBindingDisplay[];
   providerRequestId: string;
+};
+
+export async function buildAgentProviderRequest(input: ConversationRequestInput & {
+  responseConstraint: 'normal';
 }): Promise<PreparedProviderRequest> {
+  return buildConversationProviderRequest({ ...input, purpose: 'agent' });
+}
+
+/** Agent and summary requests share one conversation prefix and tool codec. */
+export function buildConversationProviderRequest(input: ConversationRequestInput & (
+  | { purpose: 'agent'; responseConstraint: 'normal' }
+  | { purpose: 'contextCompaction'; responseConstraint: 'answerOnly'; summaryInstruction: string }
+)): PreparedProviderRequest {
   const toolTerminals = new Set(input.events.flatMap((event) => (
     event.type === 'tool.completed' || event.type === 'tool.input-rejected' || event.type === 'tool.interrupted'
       ? [event.callId] : []
@@ -155,13 +166,19 @@ export async function buildAgentProviderRequest(input: {
   const imageReader = toolCodec.wireByCanonical.get('session.read');
   if (imageReader) instructions.push({ contributionId: 'session:images', contributionKind: 'sessionControls',
     label: 'Image context', message: { role: 'system', content: visualContextInstruction(input.sessionId, imageReader) } });
-  const selected = [...instructions, ...journalMessages, ...visualContextMessages(input.events, input.runId)];
+  const selected = [...instructions, ...journalMessages,
+    ...(input.purpose === 'agent' ? visualContextMessages(input.events, input.runId) : [])];
   const resolvedQuestions = new Set(input.events.flatMap(event => event.type === 'interaction.resolved' ? [event.payload.interactionId] : []));
   const pendingQuestions = input.events.flatMap(event => event.type === 'interaction.requested' && event.runId === input.runId
     && event.payload.mode === 'continue' && !resolvedQuestions.has(event.payload.interactionId)
     ? [{ interactionId: event.payload.interactionId, prompt: event.payload.prompt, options: event.payload.options }] : []);
   if (pendingQuestions.length) selected.push({ contributionId: 'session:unanswered-questions', contributionKind: 'sessionControls',
     label: 'Unanswered questions', message: { role: 'system', content: `These questions remain unanswered. Continue independent work only; do not choose an answer for the user. When independent work is complete, explain what is ready and what awaits the user; Session will wait. ${JSON.stringify(pendingQuestions)}` } });
+  if (input.purpose === 'contextCompaction') selected.push({
+    contributionId: `context-compaction:${input.providerRequestId}:instructions`,
+    contributionKind: 'sessionControls', label: '上下文压缩指令',
+    message: { role: 'user', content: input.summaryInstruction },
+  });
   assertContextContributions(selected);
   const journalCodecsByCallId = providerMessageCodecsByCallId(input.events);
   const providerSelected = selected.map<ContextMessageContribution>((contribution) => ({
@@ -175,7 +192,7 @@ export async function buildAgentProviderRequest(input: {
     runId: input.runId,
     providerRuntimeRef: input.runtime.provider.providerRuntimeRef,
     profileId: input.runtime.provider.profileId,
-    purpose: 'agent',
+    purpose: input.purpose,
     responseConstraint: input.responseConstraint,
     maxOutputTokens: input.runtime.provider.maxOutputTokens,
     workspaceBindings: input.workspaceBindings.map((binding) => ({ ...binding })),
@@ -196,7 +213,7 @@ export async function buildAgentProviderRequest(input: {
     toolCodec,
     receipt: buildContextCompositionReceipt(
       request.requestId,
-      'agent',
+      input.purpose,
       input.responseConstraint,
       providerSelected,
       toolCodec.kernelDefinitions,
@@ -218,9 +235,12 @@ export function messagesFromJournal(
 ): ContextMessageContribution[] {
   const messages: ContextMessageContribution[] = [];
   const pendingHostRebinds: ContextMessageContribution[] = [];
+  const pendingProcessUpdates = new Map<string, ContextMessageContribution>();
+  const flushProcessUpdates = () => {
+    messages.push(...pendingProcessUpdates.values());
+    pendingProcessUpdates.clear();
+  };
   const completionResults = new Map<string, ContextMessageContribution>();
-  const processes = new Map(events.flatMap(event => event.type === 'process.updated'
-    ? [[event.callId, event.payload.job] as const] : []));
   const approvalsByCallId = new Map(events.flatMap((event) => (
     event.type === 'approval.resolved' ? [[event.callId, event.payload] as const] : []
   )));
@@ -571,11 +591,18 @@ export function messagesFromJournal(
           providerCallId: requiredProviderCallId(providerCallIdByLogicalCallId, event.callId),
           content: JSON.stringify({
             ...toolResultForModel(event.payload.record),
-            ...(processes.has(event.callId) ? { process: processContext(processes.get(event.callId)!) } : {}),
             ...(approval ? { approval: { decision: approval.decision, scope: approval.authorizationScope ?? 'call',
               ...(approval.reason ? { reason: approval.reason } : {}) } } : {}),
           }),
         },
+      });
+    } else if (event.type === 'process.updated') {
+      // Coalesce the feed only until the next request. Once observed, its
+      // snapshot stays in history; a later status must not rewrite a tool result.
+      pendingProcessUpdates.set(event.payload.job.jobId, {
+        contributionId: `process-update:${event.eventId}`, contributionKind: 'journalMessages',
+        label: 'Managed process update', message: { role: 'user',
+          content: JSON.stringify({ type: 'process.updated', process: processContext(event.payload.job) }) },
       });
     } else if (event.type === 'run.host.rebound') {
       // Rebinding happens while a tool is waiting. Its notice belongs to the next
@@ -583,6 +610,7 @@ export function messagesFromJournal(
       pendingHostRebinds.push({ contributionId: `host-rebind:${event.sequence}`, contributionKind: 'journalMessages', label: 'GUI target changed',
         message: { role: 'user', content: `The user explicitly selected a new GUI window for subsequent calls: ${JSON.stringify(event.payload.hostBinding)}. All earlier observationId and previewId handles belong to the previous GUI and are invalid here. Observe again or open a new preview before interacting; do not replay previous actions.` } });
     } else if (event.type === 'context.composed' && event.payload.purpose === 'agent') {
+      flushProcessUpdates();
       messages.push(...pendingHostRebinds.splice(0));
     } else if (event.type === 'provider.turn.settled' && event.payload.outcome === 'completed') {
       if (event.payload.toolCallInputs) {
@@ -655,6 +683,7 @@ export function messagesFromJournal(
       }
     }
   }
+  flushProcessUpdates();
   messages.push(...pendingHostRebinds);
   if (completionResults.size > 0) {
     throw new LoopFailure(
@@ -1181,7 +1210,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function processContext(job: import('@deepcode/protocol').ManagedProcessSnapshot): unknown {
-  // Keep one latest snapshot per job. Its output remains tool data in the original call/result pair.
+  // Bound each appended snapshot; the complete output remains in Kernel storage.
   const { result, output, ...status } = job;
   const details = isRecord(result) ? { ...result } : result;
   if (isRecord(details)) { delete details.stdout; delete details.stderr; }

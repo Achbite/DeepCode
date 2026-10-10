@@ -5,21 +5,10 @@ import type {
   SessionEvent,
   WorkspaceBindingDisplay,
 } from '@deepcode/protocol';
-import { LOCAL_AGENT_PROTOCOL_VERSION } from '@deepcode/protocol';
 import {
-  assertContextContributions,
-  buildContextCompositionReceipt,
-  cloneModelMessage,
-  messagesFromJournal,
+  buildConversationProviderRequest,
   runInputMessageEvent,
 } from './contextComposer.js';
-import type { ContextMessageContribution } from './plugins.js';
-import {
-  createProviderToolCodec,
-  encodeProviderMessage,
-  providerMessageCodecsByCallId,
-} from './providerToolCodec.js';
-import { sessionControlToolDefinitions } from './sessionControls.js';
 import type { SessionState } from './reducer.js';
 
 export type ContextCompactionRequestEvent = Extract<
@@ -34,7 +23,7 @@ export interface PreparedContextCompaction {
 
 const COMPACTION_INSTRUCTIONS = `Summarize the supplied Session history into a factual handoff that another agent can continue from.
 Preserve the user's goal, confirmed decisions, constraints, unresolved issues, exact identifiers, paths, commands, errors, completed and pending work, active Plan and Todo state, and tool results.
-Separate facts, inferences, and unknowns. Do not answer the task or take action. Return only the Markdown summary.`;
+Separate facts, inferences, and unknowns. Do not answer the task, call tools, or take action. Return only the concise Markdown summary; omit repetitive logs and obsolete details rather than copying the transcript.`;
 
 export function prepareContextCompaction(input: {
   sessionId: string;
@@ -46,78 +35,22 @@ export function prepareContextCompaction(input: {
 }): PreparedContextCompaction {
   const cutoff = input.requestEvent.payload.coveredThroughSequence;
   const sourceEvents = input.events.filter((event) => event.sequence <= cutoff);
-  const sourceMessages = messagesFromJournal(
-    sourceEvents,
-    input.runId,
-    input.workspaceBindings,
-  );
   const focus = 'focus' in input.requestEvent.payload
     ? input.requestEvent.payload.focus
     : undefined;
-  const selected: ContextMessageContribution[] = [
-    {
-      contributionId: `context-compaction:${input.requestEvent.payload.compactionId}:instructions`,
-      contributionKind: 'instructions',
-      label: '上下文压缩指令',
-      message: { role: 'system', content: COMPACTION_INSTRUCTIONS },
-    },
-    ...sourceMessages,
-  ];
-  if (focus) {
-    selected.push({
-      contributionId: `context-compaction:${input.requestEvent.payload.compactionId}:focus`,
-      contributionKind: 'instructions',
-      label: '后续任务焦点',
-      message: {
-        role: 'system',
-        content: `Prioritize existing facts relevant to the following future-work focus, but do not answer it:\n${focus}`,
-      },
-    });
-  }
-  assertContextContributions(selected);
-  const toolCodec = createProviderToolCodec(
-    input.runtime.tools,
-    sessionControlToolDefinitions(),
-    input.runtime.providerToolAliases,
-    input.workspaceBindings,
-  );
-  const journalCodecsByCallId = providerMessageCodecsByCallId(sourceEvents);
-  const providerSelected = selected.map<ContextMessageContribution>((contribution) => ({
-    ...contribution,
-    message: encodeProviderMessage(contribution.message, toolCodec, journalCodecsByCallId),
-  }));
-  const request: ProviderRequest = {
-    protocolVersion: LOCAL_AGENT_PROTOCOL_VERSION,
-    requestId: input.requestEvent.payload.providerRequestId,
+  const { request, receipt } = buildConversationProviderRequest({
     sessionId: input.sessionId,
     runId: input.runId,
-    providerRuntimeRef: input.runtime.provider.providerRuntimeRef,
-    profileId: input.runtime.provider.profileId,
+    runtime: input.runtime,
+    events: sourceEvents,
+    workspaceBindings: input.workspaceBindings,
+    providerRequestId: input.requestEvent.payload.providerRequestId,
     purpose: 'contextCompaction',
     responseConstraint: 'answerOnly',
-    maxOutputTokens: input.runtime.provider.maxOutputTokens,
-    workspaceBindings: input.workspaceBindings.map((binding) => ({ ...binding })),
-    messages: providerSelected.map((item) => cloneModelMessage(item.message)),
-    tools: [],
-    hostedTools: [],
-  };
-  return {
-    request,
-    receipt: buildContextCompositionReceipt(
-      request.requestId,
-      'contextCompaction',
-      'answerOnly',
-      providerSelected,
-      [],
-      [],
-      [],
-      toolCodec.canonicalByWire,
-      [],
-      input.runtime,
-      input.workspaceBindings,
-      sourceEvents,
-    ),
-  };
+    summaryInstruction: COMPACTION_INSTRUCTIONS + (focus
+      ? `\n\nPrioritize existing facts relevant to the following future-work focus, but do not answer it:\n${focus}` : ''),
+  });
+  return { request, receipt };
 }
 
 export function pendingContextCompaction(

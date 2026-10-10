@@ -2203,14 +2203,21 @@ test('explicit /focus and same-runtime pressure compact only after a successful 
   await verifyPressureCompaction();
 });
 
-test('completed compaction rejects invalid output as a known failure without retrying', async (t) => {
-  for (const [name, output, completion, code] of [
+test('compaction rejects invalid output without executing tools or retrying and preserves completion state', async (t) => {
+  for (const [name, output, completion, code, outcome = 'failed'] of [
     ['empty', [], {}, 'context_compaction_empty'],
     ['mismatch', [
       ['text.delta', { text: 'Streamed summary.' }],
       ['assistant.message', { messageId: 'summary:mismatch', content: 'Different summary.' }],
     ], {}, 'provider_message_mismatch'],
     ['usage', [], { usage: { inputTokens: -1 } }, 'provider_usage_invalid'],
+    ['tool-call', [
+      ['tool.call', { callId: 'provider:summary-tool', name: 'fs_read', input: { path: 'fixture.txt' } }],
+    ], {}, 'context_compaction_tool_call_invalid', 'indeterminate'],
+    ['native-tool-call', [
+      ['output.item.completed', { outputIndex: 0, item: { type: 'function_call',
+        id: 'fc_summary', call_id: 'summary-tool', name: 'fs_read', arguments: '{"path":"fixture.txt"}' } }],
+    ], {}, 'context_compaction_tool_call_invalid', 'indeterminate'],
   ]) await t.test(name, async (t) => {
     const journal = new InMemoryCommandJournal(), sessionId = `session:completed-compaction-${name}`;
     await createSession(journal, sessionId);
@@ -2226,13 +2233,20 @@ test('completed compaction rejects invalid output as a known failure without ret
     await actor.submit({ schemaVersion: 'deepcode.command.v3', type: 'context.focus',
       sessionId, commandId: 'command:focus', task: 'Summarize the known facts.' });
     const result = await waitForProjection(actor, value => ['failed', 'indeterminate'].includes(value.run?.status));
-    assert.equal(result.run.status, 'failed');
-    assert.equal(result.terminalError.code, code);
+    assert.equal(result.run.status, outcome);
+    if (outcome === 'failed') assert.equal(result.terminalError.code, code);
+    else {
+      assert.equal(result.terminalError.code, 'provider_turn_outcome_unknown');
+      assert.match(result.terminalError.message, new RegExp(code));
+    }
     assert.equal(sends, 1);
     assert.equal(preparation.released.length, 1);
     const events = await readEvents(journal, sessionId);
-    assert.equal(singleEvent(events, 'provider.turn.settled').payload.outcome, 'failed');
+    assert.equal(singleEvent(events, 'provider.turn.settled').payload.outcome, outcome);
+    const attempt = events.find(event => event.type === 'provider.attempt.updated' && event.payload.phase === 'failed');
+    assert.equal(attempt.payload.error.code, code);
     assert.equal(events.some(event => event.type === 'context.compacted'), false);
+    assert.equal(events.some(event => event.type === 'tool.requested' || event.type === 'tool.completed'), false);
   });
 });
 
@@ -3825,6 +3839,9 @@ async function verifyExplicitFocusCompaction() {
   const preparation = fakeRunPreparation({
     contextWindowTokens: 2_000,
     maxOutputTokens: 120,
+    apiSurface: 'responses',
+    hostedWebSearch: 'web_search',
+    webSearch: { owner: 'providerHosted', providerToolType: 'web_search' },
   });
   const requests = [];
   let agentTurn = 0;
@@ -3834,15 +3851,14 @@ async function verifyExplicitFocusCompaction() {
       if (request.purpose === 'contextCompaction') {
         assert.equal(request.responseConstraint, 'answerOnly');
         assert.equal(request.maxOutputTokens, 120);
-        assert.deepEqual(request.tools, []);
-        assert.ok(request.messages.some((message) => (
-          message.role === 'system'
-          && message.content?.startsWith('Summarize the supplied Session history into a factual handoff')
-        )));
-        assert.ok(request.messages.some((message) => (
-          message.role === 'system'
-          && message.content === 'Prioritize existing facts relevant to the following future-work focus, but do not answer it:\nPreserve the selected facts.'
-        )));
+        assert.deepEqual(request.tools, requests[0].tools);
+        assert.deepEqual(request.hostedTools, requests[0].hostedTools);
+        assert.equal(request.hostedTools.length, 1, 'focus retains the supplied hosted definition under answerOnly');
+        assert.deepEqual(request.messages.slice(0, requests[0].messages.length), requests[0].messages,
+          'summary must preserve the preceding conversation prefix');
+        assert.equal(request.messages.at(-1).role, 'user');
+        assert.match(request.messages.at(-1).content, /^Summarize the supplied Session history into a factual handoff/);
+        assert.match(request.messages.at(-1).content, /future-work focus, but do not answer it:\nPreserve the selected facts\.$/);
         yield providerEvent(request.requestId, 'assistant.message', {
           messageId: 'provider-message:focus-summary',
           content: 'Durable focus summary.',
