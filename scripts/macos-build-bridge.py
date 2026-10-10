@@ -46,6 +46,9 @@ def request_host(operation, shared=None, output=None, timeout=3600):
     worker = json.loads(WORKER.read_text())
     directory = Path(tempfile.mkdtemp(prefix='request-', dir=BRIDGE))
     request = {'workerId': worker['workerId'], 'operation': operation}
+    # Forward the public identity selector explicitly; credentials stay in the host keychain.
+    if 'DEEPCODE_MACOS_SIGN_IDENTITY' in os.environ:
+        request['signingIdentity'] = os.environ['DEEPCODE_MACOS_SIGN_IDENTITY']
     if operation == 'package':
         shared = Path(shared).resolve()
         request.update(
@@ -187,6 +190,8 @@ def serve(container_id):
                     else:
                         arguments = ['bash', str(PACKAGER)]
                         environment = os.environ.copy()
+                        if 'signingIdentity' in request:
+                            environment['DEEPCODE_MACOS_SIGN_IDENTITY'] = request['signingIdentity']
                         if operation == 'check':
                             arguments.append('--check')
                         elif operation == 'package':

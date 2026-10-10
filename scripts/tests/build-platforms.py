@@ -15,6 +15,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'scripts'))
+import macos_signing
+
 spec = importlib.util.spec_from_file_location('package_runtime', ROOT / 'scripts/package-runtime.py')
 package = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package)
@@ -124,6 +127,26 @@ class BuildTests(unittest.TestCase):
 
 
 class BridgeCleanupTests(unittest.TestCase):
+    def test_request_forwards_explicit_signing_selection(self):
+        with tempfile.TemporaryDirectory(prefix='deepcode-signing-request-') as directory:
+            root = Path(directory)
+            worker = root / 'worker.json'
+            worker.write_text(json.dumps({'workerId': 'owned-worker'}))
+            captured = []
+            write_json = bridge.write_json
+
+            def record_request(path, value):
+                captured.append(value)
+                write_json(path, value)
+                write_json(path.parent / 'result.json', {'exitCode': 0, 'message': ''})
+
+            with patch.object(bridge, 'BRIDGE', root), patch.object(bridge, 'WORKER', worker), \
+                    patch.object(bridge, 'write_json', side_effect=record_request), \
+                    patch.dict(os.environ, {'DEEPCODE_MACOS_SIGN_IDENTITY': 'selected-certificate'}):
+                self.assertEqual(bridge.request_host('check'), 0)
+            self.assertEqual(captured, [{'workerId': 'owned-worker', 'operation': 'check',
+                                         'signingIdentity': 'selected-certificate'}])
+
     def test_worker_publication_failure_releases_watcher(self):
         with tempfile.TemporaryDirectory(prefix='deepcode-worker-') as directory:
             root = Path(directory)
@@ -202,6 +225,46 @@ class BridgeCleanupTests(unittest.TestCase):
             self.assertEqual(result['exitCode'], 7)
             self.assertIn('owned group permission denied', result['message'])
             log.close.assert_called_once()
+
+
+class MacosSigningTests(unittest.TestCase):
+    def test_identity_is_explicit_and_never_falls_back_to_ad_hoc(self):
+        fingerprint = 'A' * 40
+        listing = f'  1) {fingerprint} "DeepCode Local Development"\n  1 valid identities found\n'
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(macos_signing.subprocess, 'run', return_value=Mock(stdout=listing)) as command:
+            self.assertEqual(macos_signing.signing_identity(), fingerprint)
+            command.return_value.stdout = '0 valid identities found\n'
+            with self.assertRaisesRegex(ValueError, 'found 0'):
+                macos_signing.signing_identity()
+            command.return_value.stdout = listing + f'  2) {"B" * 40} "DeepCode Local Development"\n'
+            with self.assertRaisesRegex(ValueError, 'found 2'):
+                macos_signing.signing_identity()
+        with patch.dict(os.environ, {'DEEPCODE_MACOS_SIGN_IDENTITY': '-'}), \
+                patch.object(macos_signing.subprocess, 'run') as command:
+            with self.assertRaisesRegex(ValueError, 'ad-hoc'):
+                macos_signing.signing_identity()
+            command.assert_not_called()
+
+    def test_native_components_have_stable_identifiers_and_vendor_node_is_preserved(self):
+        import plistlib
+        with tempfile.TemporaryDirectory(prefix='deepcode-native-sign-') as directory:
+            app = Path(directory) / 'DeepCode-GUI.app'
+            write(app, 'Contents/Info.plist', plistlib.dumps({
+                'CFBundleIdentifier': 'com.achbite.deepcode.gui', 'CFBundleExecutable': 'DeepCode-GUI'}))
+            for name in ('DeepCode-GUI', 'deepcode-kernel', 'deepcode-host-web'):
+                write(app, 'Contents/MacOS/' + name, b'owned native binary')
+            write(app, 'Contents/Resources/node/bin/node', b'vendor signed node')
+            with patch.object(macos_signing.subprocess, 'run') as command:
+                macos_signing.sign_app(app, 'certificate', native_components=True)
+            commands = [call.args[0] for call in command.call_args_list]
+            self.assertEqual([call[-1] for call in commands], [
+                str(app / 'Contents/MacOS/deepcode-host-web'),
+                str(app / 'Contents/MacOS/deepcode-kernel'), str(app), str(app)])
+            self.assertIn('com.achbite.deepcode.gui.deepcode-host-web', commands[0])
+            self.assertIn('com.achbite.deepcode.gui.deepcode-kernel', commands[1])
+            self.assertTrue(all('--deep' not in call for call in commands[:-1]))
+            self.assertIn('--verify', commands[-1])
 
 
 class PublicationTests(unittest.TestCase):

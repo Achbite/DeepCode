@@ -12,6 +12,8 @@ import tarfile
 import tempfile
 import zipfile
 
+from macos_signing import sign_app, signing_identity
+
 
 def copy_js_package(source, target):
     target.mkdir(parents=True)
@@ -60,6 +62,7 @@ def assemble(args):
     version = json.loads((root / 'package.json').read_text())['version']
     macos = args.platform == 'macos-arm64'
     windows = args.platform == 'win64'
+    identity = signing_identity() if macos else None
     app = stage / 'DeepCode-GUI.app'
     binaries = app / 'Contents/MacOS' if macos else stage
     resources = app / 'Contents/Resources' if macos else stage
@@ -105,8 +108,7 @@ export DEEPCODE_KERNEL_BIN="$APP_DIR/MacOS/deepcode-kernel"
 exec "$APP_DIR/MacOS/deepcode-''' + shell.lower() + '''" "$@"
 ''')
             launcher.chmod(0o755)
-        subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(app)], check=True)
-        subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
+        sign_app(app, identity, native_components=True)
     documentation = 'DeepCode-GUI.app/Contents/Resources/docs/' if macos else 'docs/'
     (stage / 'README.md').write_text((root / 'docs/distribution.md').read_text().replace('(product/', '(' + documentation + 'product/'))
 

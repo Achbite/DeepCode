@@ -75,7 +75,7 @@ GUI 支持向消息附加文件或文件夹、查看产物和 diff，以及让 A
 <details>
 <summary>平台依赖、权限与本地数据</summary>
 
-Windows Setup 会在缺少 WebView2 Evergreen Runtime 时安装它，解压版需自行准备该依赖。Linux GUI 需要 GTK/WebKitGTK。macOS 程序包使用 ad-hoc 签名；即使应用路径相同，重新构建也可能使已有的辅助功能和屏幕录制授权失效。安装并授权目标构建后，应通过 `computer.control status` 核对实际 GUI 进程。配置、持久数据、缓存、临时文件和日志分别使用对应的平台目录，详见[安装与用户文件](docs/distribution.md)。
+Windows Setup 会在缺少 WebView2 Evergreen Runtime 时安装它，解压版需自行准备该依赖。Linux GUI 需要 GTK/WebKitGTK。macOS 全量打包和 UI 更新复用固定签名身份，使正常更新可以保留辅助功能和屏幕录制授权；从早期 ad-hoc 构建切换时可能需要授权一次。通过 `computer.control status` 核对实际 GUI 进程。配置、持久数据、缓存、临时文件和日志分别使用对应的平台目录，详见[安装与用户文件](docs/distribution.md)。
 
 </details>
 
@@ -118,7 +118,9 @@ make shell
 
 共享 TypeScript、GUI、Linux 程序和 Windows 交叉编译都在 Docker 中执行。macOS 原生编译与签名通过通道交给 Mac 宿主。不可用的平台会明确列出，构建错误仍会返回失败。每个平台也会在 `bin/` 生成带版本号的压缩包，macOS 另生成 PKG，Windows 另生成 Setup 安装包。用户配置和会话保存在程序目录之外，不会进入程序包。
 
-只更新已有程序包的前端：
+macOS 本地开发（包括 fork）先在 Mac 宿主终端执行一次 `bash scripts/setup-macos-signing.sh`。每位开发者使用自己登录钥匙串里的固定签名身份，切换分支和克隆目录后，全量打包与 UI 更新仍共同复用；此配置不需要 Apple 开发者账号，私钥不会写入仓库或程序包。已有签名身份时，可用 `DEEPCODE_MACOS_SIGN_IDENTITY` 指定名称或证书指纹。身份不可用时构建会在替换已安装程序包前停止，详见[macOS 签名](docs/product/operations.md#macos-signing)。
+
+只更新已有程序包的前端；目标为 macOS 时，在 Mac 宿主终端执行，以便签名访问本机钥匙串：
 
 ```bash
 make ui-update UI_PACKAGE=bin/macos-arm64

@@ -75,7 +75,7 @@ After installation with PKG or Windows Setup, use `deepcode-cli` and `deepcode-t
 <details>
 <summary>Platform dependencies, permissions, and local data</summary>
 
-Windows Setup installs WebView2 Evergreen Runtime if it is missing; portable Windows packages require it to be installed separately. Linux GUI requires GTK/WebKitGTK. The macOS package is ad-hoc signed; a rebuild can invalidate existing Accessibility and Screen Recording authorization even at the same app path. Verify the executing GUI with `computer.control status` after installing and authorizing the intended build. Configuration, persistent data, caches, temporary files and logs use separate platform directories. See [installation and user files](docs/distribution.md).
+Windows Setup installs WebView2 Evergreen Runtime if it is missing; portable Windows packages require it to be installed separately. Linux GUI requires GTK/WebKitGTK. macOS builds and UI updates reuse a persistent signing identity so normal updates can retain Accessibility and Screen Recording authorization. Switching from an earlier ad-hoc build may require authorization once. Verify the executing GUI with `computer.control status`. Configuration, persistent data, caches, temporary files and logs use separate platform directories. See [installation and user files](docs/distribution.md).
 
 </details>
 
@@ -118,7 +118,9 @@ make shell
 
 Shared TypeScript and GUI assets, Linux binaries, and Windows cross-compilation run in Docker. macOS native compilation and signing run on the Mac host through the bridge. Unsupported platforms are reported explicitly; build failures remain failures. Each package also produces a versioned archive under `bin/`; macOS adds a PKG installer and Windows adds a Setup executable. User configuration and sessions live outside the program directory and are excluded from packages.
 
-For a frontend-only update to an existing package:
+For local macOS development, including forks, run `bash scripts/setup-macos-signing.sh` once in a Mac host terminal. Each developer keeps their own signing identity in their login keychain; branches and checkout directories reuse it for both package and UI updates. No Apple developer account is required for this local setup, and private keys are never stored in the repository or package. To select an existing signing identity, set `DEEPCODE_MACOS_SIGN_IDENTITY` to its name or certificate fingerprint. Missing identities stop the build before replacing the installed package. See [macOS signing](docs/product/operations.md#macos-signing).
+
+For a frontend-only update to an existing package, run the following from the Mac host terminal when targeting macOS so signing can access the local keychain:
 
 ```bash
 make ui-update UI_PACKAGE=bin/macos-arm64

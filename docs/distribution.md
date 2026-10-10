@@ -8,6 +8,8 @@ DeepCode 提供图形界面、CLI 和 TUI。三种入口共享模型设置、会
 
 解压版可直接打开 `DeepCode-GUI.app`，或使用同目录的 `DeepCode-CLI.command`、`DeepCode-TUI.command`。移动解压版时应保留这些文件的相对位置。用户文件存放在下表所列目录，与应用位置无关。
 
+macOS 更新需持续使用同一签名身份，以保留辅助功能和屏幕录制授权。首次安装或从早期 ad-hoc 构建切换签名身份时，系统可能要求授权一次；日常更新不应通过重置权限完成。本机开发的固定签名设置见[运行管理](product/operations.md#macos-signing)。
+
 ## Windows
 
 运行 `DeepCode-<version>-win64-setup.exe`。默认程序目录为 `%LOCALAPPDATA%\Programs\DeepCode`。安装器创建开始菜单入口并添加用户 PATH，重新打开终端后可使用 `deepcode`、`deepcode-cli` 和 `deepcode-tui`。

@@ -23,7 +23,8 @@ Usage: bash build.sh [--stage STAGE]...
   native-gui          Build only the Linux native GUI shell.
 Environment: CONTAINER_NAME, WORKDIR_IN_CTNR, DEEPCODE_OUTPUT_DIR,
   CARGO_TARGET_DIR, RUSTC_WRAPPER, SCCACHE_DIR,
-  DEEPCODE_MACOS_CARGO, DEEPCODE_MACOS_NODE_BIN, DEEPCODE_MACOS_CARGO_TARGET_DIR.
+  DEEPCODE_MACOS_CARGO, DEEPCODE_MACOS_NODE_BIN, DEEPCODE_MACOS_CARGO_TARGET_DIR,
+  DEEPCODE_MACOS_SIGN_IDENTITY (default: DeepCode Local Development).
 Tools must already be installed. Package stages use a fresh staging directory;
 Cargo/pnpm caches are retained. User data in existing output directories is retained.
 On Mac, make shell prepares the host bridge before entering Docker.
