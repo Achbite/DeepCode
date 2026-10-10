@@ -426,13 +426,13 @@
   width: 100%;
   border-collapse: collapse;
   table-layout: fixed;
-  font-size: calc(12px * var(--dc-ui-font-scale, 1));
+  font-size: calc(14px * var(--dc-ui-font-scale, 1));
 }
 
 .settings-kv td {
-  padding: 8px 8px;
+  padding: 15px 16px;
   border-bottom: 1px solid var(--line-soft);
-  vertical-align: top;
+  vertical-align: middle;
 }
 
 .settings-kv tr:last-child td {
@@ -440,11 +440,13 @@
 }
 
 .settings-kv td:first-child {
-  width: 118px;
-  color: var(--text-muted);
+  width: auto;
+  color: var(--text-main);
+  font-weight: 650;
 }
 
 .settings-kv td:last-child {
+  width: 240px;
   color: var(--text-main);
   overflow-wrap: anywhere;
 }
@@ -1349,8 +1351,8 @@
     gap: 8px;
   }
 
-  .settings-kv td:first-child {
-    width: 104px;
+  .settings-kv td:last-child {
+    width: 200px;
   }
 }
 
