@@ -46,7 +46,6 @@
     "gui.usageWidget.priced": "已计价 ",
     "gui.usageWidget.coverage": "记录始于 ",
     "gui.usageWidget.hourly": "每小时用量",
-    "gui.usageWidget.refresh": "刷新",
     "gui.usageWidget.todayEstimate": "今日估算",
     "gui.usageWidget.collapse": "收起用量",
     "agent.permission.back": "返回权限列表",

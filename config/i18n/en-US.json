@@ -46,7 +46,6 @@
     "gui.usageWidget.priced": "Priced ",
     "gui.usageWidget.coverage": "Records since ",
     "gui.usageWidget.hourly": "Hourly usage",
-    "gui.usageWidget.refresh": "Refresh",
     "gui.usageWidget.todayEstimate": "today’s estimate",
     "gui.usageWidget.collapse": "Collapse usage",
     "agent.permission.back": "Back to permissions",

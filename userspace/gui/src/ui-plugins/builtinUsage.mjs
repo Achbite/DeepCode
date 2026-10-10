@@ -114,11 +114,12 @@ export default { apply(context) {
       const plan = input.connection.billingMode === 'subscription';
       const windows = plan && data?.windows ? [...data.windows].sort((a,b)=>b.windowDurationSeconds-a.windowDurationSeconds) : [];
       const totals = !plan && data?.totals;
-      const amount = loading ? '…' : error ? text('unavailable') : plan ? windows.length ? remaining(windows[0]) : '—' : totals?.estimatedCost != null ? money(totals.estimatedCost) : totals?.calls === 0 ? text('noCalls') : text('unpriced');
+      const amount = error ? text('unavailable') : loading ? '…' : plan ? windows.length ? remaining(windows[0]) : '—' : totals?.estimatedCost != null ? money(totals.estimatedCost) : totals?.calls === 0 ? text('noCalls') : text('unpriced');
       if(input.expanded && !menu) {
         const detail=node('div',null,'dc-usage__details');detail.dataset.nativeOverlay='';
         detail.append(node('strong',plan ? text('remaining') : text('today')));
         if(error) detail.append(node('p',error,'dc-usage__error'));
+        else if(loading) detail.append(node('small','…'));
         else if(plan) { for(const window of windows) { line(detail,window.label,remaining(window)); if(window.resetsAt) detail.append(node('small',text('resets')+new Date(window.resetsAt).toLocaleString(input.locale))); } }
         else if(totals) { line(detail,text('estimate'),amount);line(detail,text('tokens'),`${totals.inputTokens.toLocaleString()} / ${totals.outputTokens.toLocaleString()}`);line(detail,text('cached'),totals.cacheReadTokens.toLocaleString());line(detail,text('calls'),String(totals.calls));
           if(totals.pricedCalls < totals.calls) detail.append(node('small',text('priced')+`${totals.pricedCalls}/${totals.calls}`));
@@ -126,7 +127,7 @@ export default { apply(context) {
           const chart=node('div',null,'dc-usage__chart'), max=Math.max(1,...data.buckets.map(bucket=>bucket.inputTokens+bucket.outputTokens));chart.setAttribute('aria-label',text('hourly'));
           for(const bucket of data.buckets) { const bar=node('i');bar.style.height=`${(bucket.inputTokens+bucket.outputTokens)/max*100}%`;bar.title=`${bucket.label}: ${bucket.inputTokens+bucket.outputTokens}`;chart.append(bar); }detail.append(chart);
         }
-        detail.append(button(text('refresh'),()=>void refresh(true)));root.append(detail);
+        root.append(detail);
       }
       const summary=node('div',null,'dc-usage__summary');
       const body=button('',()=>scope.actions.setExpanded(!input.expanded),'dc-usage__body');body.setAttribute('aria-expanded',String(input.expanded));
@@ -143,10 +144,12 @@ export default { apply(context) {
       const key=JSON.stringify([input.connection?.id,input.connection?.billingMode,input.modelId,day.getTime(),input.revision]);
       if(input.visibility==='hidden'||!input.connection) {clearTimeout(timer);request?.abort();requestKey='';data=null;render();return;}
       if(!force&&key===requestKey) {render();return;}
+      // Reopening the same query retains its failure until a confirmed success.
+      if(key!==requestKey) error='';
       clearTimeout(timer);requestKey=key;request?.abort();request=new AbortController();const current=request;
-      loading=true;data=null;error='';render();
+      loading=true;data=null;render();
       try { const value=input.connection.billingMode==='subscription' ? await scope.quota.read(current.signal) : await scope.usage.query({from:day.getTime(),to:Math.max(day.getTime()+1,Date.now()),timeZone:Intl.DateTimeFormat().resolvedOptions().timeZone,granularity:'hour',connectionId:input.connection.id,modelId:input.modelId},current.signal);
-        if(current.signal.aborted||scope.signal.aborted)return;data=value;
+        if(current.signal.aborted||scope.signal.aborted)return;data=value;error='';
       } catch(reason) {if(current.signal.aborted||scope.signal.aborted)return;error=reason instanceof Error?reason.message:String(reason);}
       if(current.signal.aborted||scope.signal.aborted)return;
       loading=false;render();const tomorrow=new Date(day);tomorrow.setDate(tomorrow.getDate()+1);timer=setTimeout(()=>void refresh(true),Math.max(1,tomorrow.getTime()-Date.now()));
@@ -161,7 +164,13 @@ export default { apply(context) {
     document.addEventListener('pointerdown',dismiss,true);document.addEventListener('keydown',escape);
     void refresh();
     return {
-      update(next) { if (next.visibility !== input.visibility) { menu = false; cancelDrag(); } input = next; void refresh(); },
+      update(next) {
+        if (next.visibility !== input.visibility) { menu = false; cancelDrag(); }
+        const opened = next.expanded && !input.expanded;
+        input = next;
+        // Provider responses advance the revision; opening the details also reads current usage.
+        void refresh(opened);
+      },
       dispose() {
         request?.abort(); clearTimeout(timer); cancelDrag(); sizeObserver.disconnect();
         document.removeEventListener('pointerdown',dismiss,true); document.removeEventListener('keydown',escape);

@@ -8,6 +8,11 @@ import { normalizeUiLanguage } from '../i18n';
 import { usageWidgetLabels } from './usageWidgetLabels';
 import { useUsageCostDisplay } from './usageCost';
 
+/** Every provider response advances these counters, so the widget reconciles usage after each one. */
+export function usageRevision(history: ReadonlyArray<{ providerCallCount: number; inputTokens: number; outputTokens: number }> | undefined) {
+  return (history ?? []).reduce((total, run) => total + run.providerCallCount + run.inputTokens + run.outputTokens, 0);
+}
+
 export function UsageWidget({ readerLayout, hidden }: {
   readerLayout: ConversationReaderLayout;
   hidden: boolean;
@@ -17,7 +22,7 @@ export function UsageWidget({ readerLayout, hidden }: {
   const locale = normalizeUiLanguage(useSettingsStore(state => state.effectiveSettings['workbench.language']));
   const profile = useLocalAgentStore(state => state.profiles.find(profile => profile.id === state.selectedProfileId));
   const connection = useLocalAgentStore(state => state.connections.find(connection => connection.id === profile?.connectionId)) ?? null;
-  const revision = useLocalAgentStore(state => state.projection?.tokenUsageHistory.length ?? 0);
+  const revision = useLocalAgentStore(state => usageRevision(state.projection?.tokenUsageHistory));
   const patch = useSettingsStore(state => state.patchUserSetting);
   const [expanded, setExpanded] = useState(false);
   const [readerVisibility, setReaderVisibility] = useState<'summary' | 'collapsed'>('collapsed');

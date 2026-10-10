@@ -3414,7 +3414,18 @@ test('startup opens a new draft even when history exists, and status failure doe
 });
 
 
-test('usage widget preserves outside dismissal and docks collapsed dragging to the nearest edge', async (t) => {
+test('usage revision advances with every provider response inside a run', async (t) => {
+  const { usageRevision } = await loadGuiModule(t, '/src/ui-plugins/UsageWidget.tsx');
+  assert.equal(usageRevision(undefined), 0);
+  assert.equal(usageRevision([]), 0);
+  const round = { providerCallCount: 1, inputTokens: 900, outputTokens: 120 };
+  const first = usageRevision([round]);
+  assert.equal(first, 1021);
+  assert.notEqual(usageRevision([{ ...round, outputTokens: 260 }]), first, 'a later response in the same run changes the revision');
+  assert.notEqual(usageRevision([{ ...round, providerCallCount: 2 }]), first, 'a completion without usage still changes the revision');
+});
+
+async function createUsageWidgetHarness(t) {
   const { default: plugin } = await import('../src/ui-plugins/builtinUsage.mjs');
   const { usageWidgetLabels } = await loadGuiModule(t, '/src/ui-plugins/usageWidgetLabels.ts');
   class Element {
@@ -3456,9 +3467,20 @@ test('usage widget preserves outside dismissal and docks collapsed dragging to t
     try { if (view && !disposed) view.dispose(); }
     finally { for (const [key, value] of Object.entries(old)) { if (value === undefined) delete globalThis[key]; else globalThis[key] = value; } }
   });
-  let mount;
-  plugin.apply({ addStyle() {}, register(slot, renderer) { assert.equal(slot, 'usage.widget'); mount = renderer; } });
-  const container = new Element(), changes = [];
+  let renderer;
+  plugin.apply({ addStyle() {}, register(slot, render) { assert.equal(slot, 'usage.widget'); renderer = render; } });
+  const container = new Element();
+  return {
+    Element, listeners, container, usageWidgetLabels,
+    mount(input, scope) { view = renderer(container, input, scope); return view; },
+    dispose() { view.dispose(); disposed = true; },
+  };
+}
+
+test('usage widget preserves outside dismissal and docks collapsed dragging to the nearest edge', async (t) => {
+  const { Element, listeners, container, usageWidgetLabels, mount, dispose } = await createUsageWidgetHarness(t);
+  const changes = [];
+  let view;
   let input = { visibility: 'summary', expanded: true, locale: 'zh-CN', revision: 0, modelId: 'codex',
     labels: usageWidgetLabels('zh-CN'), costDisplay: { currency: 'USD', usdRate: 1 },
     connection: { id: 'connection:quota', name: 'Codex', billingMode: 'subscription' } };
@@ -3467,7 +3489,7 @@ test('usage widget preserves outside dismissal and docks collapsed dragging to t
     setExpanded(value) { changes.push(value); input = { ...input, expanded: value }; view.update(input); },
     setUsageVisibility() { assert.fail('outside dismissal must not hide the summary or change its preference'); },
   };
-  view = mount(container, input, { signal: new AbortController().signal,
+  view = mount(input, { signal: new AbortController().signal,
     quota: { async read() { reads++; return { windows: [{ label: 'Codex', usedPercent: 21, windowDurationSeconds: 300 }] }; } },
     actions,
   });
@@ -3479,14 +3501,13 @@ test('usage widget preserves outside dismissal and docks collapsed dragging to t
   let detail = root.querySelectorAll('.dc-usage__details')[0];
   pointer(detail);
   assert.deepEqual(changes, [], 'inside details are not an outside click');
-  const refresh = detail.children.find(child => child.textContent === '刷新');
-  pointer(refresh); refresh.onclick(); await Promise.resolve();
-  assert.equal(reads, 2);
-  assert.equal(root.querySelectorAll('.dc-usage__details').length, 1, 'refresh keeps the details open');
+  assert.equal(detail.children.some(child => child.textContent === '刷新'), false, 'the details no longer offer a manual refresh');
   input = { ...input, locale: 'en-US', labels: usageWidgetLabels('en-US') }; view.update(input);
-  assert.ok(root.querySelectorAll('.dc-usage__details')[0].children.some(child => child.textContent === 'Refresh'));
-  assert.equal(root.querySelectorAll('.dc-usage__details')[0].children.some(child => child.textContent === '刷新'), false);
-  assert.equal(reads, 2, 'language changes redraw without another quota request');
+  assert.ok(root.querySelectorAll('.dc-usage__details')[0].children.some(child => child.textContent === usageWidgetLabels('en-US').remaining));
+  assert.equal(root.querySelectorAll('.dc-usage__details')[0].children.some(child => child.textContent === usageWidgetLabels('zh-CN').remaining), false);
+  assert.equal(reads, 1, 'language changes redraw without another quota request');
+  input = { ...input, revision: 1 }; view.update(input);
+  assert.equal(reads, 2, 'every provider response refreshes usage without a manual action');
   pointer(new Element());
   assert.deepEqual(changes, [false]);
   assert.equal(root.querySelectorAll('.dc-usage__details').length, 0);
@@ -3494,6 +3515,7 @@ test('usage widget preserves outside dismissal and docks collapsed dragging to t
   pointer(new Element());
   assert.deepEqual(changes, [false], 'collapsed details do not emit repeated updates');
   root.querySelectorAll('.dc-usage__body')[0].onclick();
+  assert.equal(reads, 3, 'reopening the details fetches current usage');
   assert.equal(root.querySelectorAll('.dc-usage__details').length, 1, 'the card can be reopened');
   root.oncontextmenu({ preventDefault() {} });
   assert.equal(root.querySelectorAll('.dc-usage__menu').length, 1);
@@ -3553,10 +3575,68 @@ test('usage widget preserves outside dismissal and docks collapsed dragging to t
   assert.equal(parseFloat(root.style.left), 0);
   assert.equal(parseFloat(root.style.top), 8, 'movement stays inside the existing boundary');
   assert.equal(root.captures.size, 0, 'cancelling a drag releases pointer capture');
-  view.dispose(); disposed = true;
+  dispose();
   assert.equal(listeners.size, 0, 'capture listeners and existing drag listeners are all removed');
   assert.equal(container.children.length, 0);
 });
+
+for (const billingMode of ['subscription', 'metered']) {
+  test(`usage widget preserves ${billingMode} read failures until a reopened request succeeds`, async (t) => {
+    const { container, usageWidgetLabels, mount, dispose, listeners } = await createUsageWidgetHarness(t);
+    const requests = [];
+    const read = signal => new Promise((resolve, reject) => requests.push({ resolve, reject, signal }));
+    let input = { visibility: 'summary', expanded: true, locale: 'en-US', revision: 0, modelId: 'test-model',
+      labels: usageWidgetLabels('en-US'), costDisplay: { currency: 'USD', usdRate: 1 },
+      connection: { id: 'connection:usage', name: 'Usage', billingMode } };
+    const view = mount(input, { signal: new AbortController().signal, actions: {},
+      quota: { read }, usage: { query: (_query, signal) => read(signal) } });
+    const root = container.children[0];
+    const text = element => [element.textContent ?? '', ...element.children.map(text)].join(' ');
+    const update = patch => { input = { ...input, ...patch }; view.update(input); };
+    const response = value => billingMode === 'subscription'
+      ? { windows: [{ label: 'Quota', usedPercent: 100 - value, windowDurationSeconds: 300 }] }
+      : { totals: { estimatedCost: value / 100, inputTokens: 10, outputTokens: 1, cacheReadTokens: 0, calls: 1, pricedCalls: 1 },
+          coverageFrom: 0, query: { from: 0 }, buckets: [] };
+    const oldValue = billingMode === 'subscription' ? '79%' : '$0.79';
+    const newValue = billingMode === 'subscription' ? '42%' : '$0.42';
+
+    requests[0].resolve(response(79));
+    await Promise.resolve();
+    assert.ok(text(root).includes(oldValue));
+    update({ expanded: false });
+    update({ expanded: true });
+    assert.equal(requests.length, 2);
+    requests[1].reject(new Error('original_usage_read_failure'));
+    await Promise.resolve();
+    assert.equal(root.querySelectorAll('.dc-usage__error')[0]?.textContent, 'original_usage_read_failure');
+    assert.equal(text(root).includes(oldValue), false);
+
+    update({ expanded: false });
+    update({ expanded: true });
+    assert.equal(requests.length, 3);
+    assert.equal(root.querySelectorAll('.dc-usage__error')[0]?.textContent, 'original_usage_read_failure',
+      'reopening must not erase the failure while the new request is pending');
+    assert.equal(text(root).includes(oldValue), false, 'a pending request cannot reinstate the old successful value');
+    if (billingMode === 'metered') assert.ok(text(root).includes(input.labels.unavailable));
+    requests[2].resolve(response(42));
+    await Promise.resolve();
+    assert.equal(root.querySelectorAll('.dc-usage__error').length, 0, 'only a successful result clears the failure');
+    assert.ok(text(root).includes(newValue));
+
+    update({ expanded: false });
+    update({ expanded: true });
+    assert.equal(text(root).includes(newValue), false, 'every refresh withdraws the previous value until confirmed');
+    requests[3].reject(new Error('previous_connection_failure'));
+    await Promise.resolve();
+    update({ connection: { ...input.connection, id: 'connection:other' } });
+    assert.equal(root.querySelectorAll('.dc-usage__error').length, 0, 'a different query must not inherit the previous connection failure');
+    assert.equal(text(root).includes(newValue), false);
+    dispose();
+    assert.equal(requests.at(-1).signal.aborted, true);
+    assert.equal(listeners.size, 0);
+    assert.equal(container.children.length, 0);
+  });
+}
 
 test('settings contributions compose while tool renderers match their declared operation', async (t) => {
   const { UiPluginRuntime } = await loadGuiModule(t, '/src/ui-plugins/runtime.ts');
